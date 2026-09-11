@@ -79,6 +79,7 @@ a2a-coding/
 ## 前置要求
 
 - Node.js ≥ 22.5（会话/任务库用内置 `node:sqlite`）。
+- **orch agent 与 `orch/`（MCP 桥）必须同机**：桥是本地 stdio MCP server，由 orch agent 作为子进程拉起。执行机器（Launcher + 项目 Agent）可在本机或远端。
 - 执行机器需在 PATH 上有 `opencode` CLI（launcher 会拉起 `opencode serve` 与包装器）。
 - orch（**任意支持本地 stdio MCP 的 agent**，如 opencode / Claude Code / Codex / Cursor）与执行机器的 CLI 都已配好模型 provider，否则无法调用模型。
 - Windows / macOS 均可，单元内的 CLI 参数已做跨平台处理。
@@ -112,9 +113,11 @@ npm install
 npm run build        # 产出 dist/bridge/index.js
 ```
 
-### 3. 把 MCP 桥配进 orch（示例为 opencode）
+### 3. 把 MCP 桥配进 orch agent
 
 把下面这段加入 orch 宿主的 MCP 配置后重启 orch。下例为 opencode 的 `opencode.json`；**任何支持本地 stdio MCP 的 agent**（Claude Code、Codex、Cursor 等）同理，仅配置位置与格式不同：
+
+> ⚠️ **同机约束**：桥（`orch/` 单元）是**本地 stdio MCP server**，由 orch agent 作为子进程拉起，因此**必须与 orch agent 部署在同一台机器**（当前版本不支持把桥放远端用 HTTP 连）。
 
 ```json
 {
