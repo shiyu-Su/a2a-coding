@@ -15,3 +15,11 @@ machine/agents/
 # 单元实际配置（不入库；模板见 config.json.default）
 machine/config/config.json
 orch/config/config.json
+
+# 本地保留（不推送公开仓库）：内部流程/设计与回归工具
+/CLAUDE.md
+/planlog.md
+/CLAUDE.template.md
+/planlog.md.template
+/doc/
+/.omo/skills/

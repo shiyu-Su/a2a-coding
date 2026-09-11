@@ -60,10 +60,8 @@ a2a-coding/
 │  ├─ scripts/verify-session-persist.mjs
 │  ├─ agents/                     # 运行态：launcher 生成的包装器配置（git 忽略）
 │  └─ .a2a/                       # 运行态：包装器会话映射 sessions.json（git 忽略）
-├─ .omo/skills/regression-test/   # 回归测试 skill（纯 node，无依赖）
-├─ package.json                   # 仓级 dev manifest（version / type / regression）
-├─ CHANGELOG.md  README.md  planlog.md  CLAUDE.md
-└─ doc/v0.1.0/                    # 需求确认单 + 改造文档
+├─ package.json                   # 仓级 dev manifest（version / type）
+└─ CHANGELOG.md  README.md
 ```
 
 ## 前置要求
@@ -194,23 +192,9 @@ orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自
 
 环境变量 `MACHINES_CONFIG` 可指定其他清单文件；缺省为 `config/config.json`（模板 `config/config.json.default`）。
 
-## 回归测试
-
-```bash
-node .omo/skills/regression-test/index.js
-# 或
-npm run regression
-```
-
-skill 只做静态检查（不联网、不启动 launcher / bridge / `opencode serve`），覆盖项目结构、单元自包含、无跨单元 import、配置样例、会话补丁、trace 处理、空闲回收与租约续约、入口脚本、两单元 `tsc --noEmit`、文档收尾，共 60 条断言。执行后写入 `reports/v0.1.0/regression-report.json`。
-
 ## 文档索引
 
-- [doc/v0.1.0/A2A最小闭环-需求确认单.md](doc/v0.1.0/A2A最小闭环-需求确认单.md)
-- [doc/v0.1.0/A2A最小闭环-改造文档.md](doc/v0.1.0/A2A最小闭环-改造文档.md)
-- [planlog.md](planlog.md)：版本待办与已实现清单
 - [CHANGELOG.md](CHANGELOG.md)：版本变更记录
-- [CLAUDE.md](CLAUDE.md)：项目规范与需求/发版流程
 
 ## 已知边界
 

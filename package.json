@@ -5,8 +5,5 @@
   "type": "module",
   "engines": {
     "node": ">=22.5"
-  },
-  "scripts": {
-    "regression": "node .omo/skills/regression-test/index.js"
   }
 }
