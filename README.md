@@ -1,8 +1,8 @@
 # a2a-coding
 
-基于 A2A 的分布式 Code Agent 协作：以 orch Agent 为统一入口，把分布在不同机器上的 Code Agent（OpenCode / Codex / Claude Code）组织起来，让需求讨论留在本地、执行放到远端。
+基于 A2A 的 Code Agent 协作：以 orch Agent 为统一入口，按「项目」组织 Code Agent（OpenCode / Codex / Claude Code），让需求讨论留在 orch、执行交给各项目自己的 Agent。
 
-目标是在多机、多环境协作开发时，orch 只管派发任务；目标机器的执行 Agent 按需拉起，在对应 workspace 实际执行，结果回传 orch，用完退出但会话可继承。
+目标是开发协作时 orch 只管派发任务；目标项目的执行 Agent 按需拉起，在对应 workspace 实际执行，结果回传 orch，用完退出但会话可继承。架构不依赖「必须跨机器」：同一台机器上跑 orch 与 Launcher 同样成立，链路只是简化为本机调用，详见「部署形态」。
 
 ## 架构
 
@@ -31,6 +31,18 @@ A2A 包装器 + 前置 opencode serve
 - 静态分布：项目到机器的映射来自配置，没有自注册、心跳、TTL 或服务发现。
 - 按需幂等：派发任务才 `ensure`，已在运行直接复用端点。
 - 用完退出：项目 Agent 空闲超时自动回收，会话靠 `contextId` 续接。
+
+## 部署形态
+
+「机器」是一个逻辑单位，可以是远端主机，也可以是本机；「项目 → 机器」的映射全部来自静态配置，因此同一套架构天然支持以下形态：
+
+| 形态 | 说明 |
+|------|------|
+| 跨机跨环境 | orch 在一台机器上讨论，执行 Agent 在另一台机器上运行（例：Windows 的 orch + Mac 上的执行 Agent），跨机通信走 A2A。 |
+| 同机多项目 | 同一台机器上一份 Launcher 管理多个项目，各项目独立 `workspace` 与 A2A 端口，前后端 / 多项目并行协作。 |
+| 多角色 | 同一项目或不同项目分别绑定开发 / 审查 / 测试 Agent，按任务选择派发目标。 |
+
+同机即「机器 = 本机」：项目照样解析到本机的 Launcher，只是链路从跨机 A2A 简化为本机调用，架构与跨机完全一致。反向代理带来的网络可达性、认证与安全边界等额外注意事项只在跨机时出现，详见「已知边界」。
 
 ## 目录结构
 
@@ -82,6 +94,8 @@ npm run launcher     # 先 tsc 构建，再运行 dist/launcher/index.js
 ```
 
 Launcher 按 `machine/config/config.json` 监听（模板见 `machine/config/config.json.default`；可用环境变量 `MACHINE_CONFIG` 指定其他文件），暴露这些接口：
+
+> 同机部署时，orch 与 Launcher 在同一台机器上按下面同样的步骤安装，orch 的 `launcherUrl` 指向 `http://localhost:<port>` 即可。
 
 | 接口 | 作用 |
 |------|------|
@@ -191,6 +205,31 @@ orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自
 ```
 
 环境变量 `MACHINES_CONFIG` 可指定其他清单文件；缺省为 `config/config.json`（模板 `config/config.json.default`）。
+
+### 同机多项目示例
+
+同一台机器上跑两个项目时，只需在**一份** machine 配置里多写几个 `projects[]`，各自用不同 `workspace` 与 `a2aPort`：
+
+`machine/config/config.json`：
+
+```json
+{
+  "machineId": "local",
+  "launcher": { "port": 3100, "idleStopMs": 300000 },
+  "projects": [
+    { "projectId": "frontend", "workspace": "/abs/path/to/frontend", "agentKind": "opencode", "a2aPort": 3010 },
+    { "projectId": "backend",  "workspace": "/abs/path/to/backend",  "agentKind": "opencode", "a2aPort": 3011 }
+  ]
+}
+```
+
+`orch/config/config.json`（同机：只需一条机器项，指向本机 Launcher）：
+
+```json
+{ "machines": [ { "machineId": "local", "launcherUrl": "http://localhost:3100" } ] }
+```
+
+orch 用 `project`（如 `frontend` / `backend`）派发到对应项目；同机多项目仅需在**一份** machine 配置里多写几个 `projects[]`。
 
 ## 文档索引
 
