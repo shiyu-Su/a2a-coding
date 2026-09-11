@@ -1,0 +1,6 @@
+{
+  "name": "a2a-coding-regression-test",
+  "private": true,
+  "type": "commonjs",
+  "description": "a2a-coding 回归测试 skill（CommonJS runner；根 package.json 为 type:module，故此处显式声明）"
+}

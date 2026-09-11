@@ -1,0 +1,20 @@
+{
+  "$schema": "https://opencode.ai/config.json",
+  "plugin": ["oh-my-openagent@latest"],
+  "mcp": {
+    "codegraph": {
+      "type": "local",
+      "command": ["codegraph", "serve", "--mcp"],
+      "enabled": true
+    },
+    "a2a": {
+      "type": "local",
+      "command": ["node", "G:/code/a2a-coding/orch/dist/bridge/index.js"],
+      "environment": {
+        "MACHINES_CONFIG": "G:/code/a2a-coding/orch/config/config.json",
+        "SESSION_DB": "G:/code/a2a-coding/orch/data/sessions.sqlite"
+      },
+      "enabled": true
+    }
+  }
+}

@@ -1,0 +1,25 @@
+{
+  "name": "@a2a-coding/machine",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.json",
+    "launcher": "npm run build && node dist/launcher/index.js",
+    "postinstall": "patch-package"
+  },
+  "dependencies": {
+    "a2a-opencode": "^1.7.2",
+    "express": "^4.21.2"
+  },
+  "devDependencies": {
+    "@types/express": "^4.17.21",
+    "@types/node": "^22.10.0",
+    "patch-package": "^8.0.1",
+    "typescript": "^5.7.0"
+  }
+}

@@ -1,0 +1,12 @@
+{
+  "machineId": "<machine-id>",
+  "launcher": { "port": 3100, "idleStopMs": 300000 },
+  "projects": [
+    {
+      "projectId": "<project-id>",
+      "workspace": "<absolute path to the project on this machine>",
+      "agentKind": "opencode",
+      "a2aPort": 3010
+    }
+  ]
+}

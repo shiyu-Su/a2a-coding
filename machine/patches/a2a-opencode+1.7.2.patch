@@ -1,0 +1,90 @@
+diff --git a/node_modules/a2a-opencode/dist/opencode/session-manager.js b/node_modules/a2a-opencode/dist/opencode/session-manager.js
+index bd06bf0..e6574d5 100644
+--- a/node_modules/a2a-opencode/dist/opencode/session-manager.js
++++ b/node_modules/a2a-opencode/dist/opencode/session-manager.js
+@@ -5,6 +5,8 @@
+  * Extracted from executor to keep each module focused.
+  */
+ import { logger } from "../utils/logger.js";
++import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
++import { dirname, join } from "node:path";
+ const log = logger.child("sessions");
+ // ─── Auto-Allow Permissions ─────────────────────────────────────────────────
+ const AUTO_ALLOW_PERMISSIONS = [
+@@ -24,6 +26,7 @@ export class SessionManager {
+     sessionCfg;
+     autoApprove;
+     directory;
++    persistPath;
+     contextMap = new Map();
+     taskMap = new Map(); // taskId → sessionId
+     taskContexts = new Map(); // taskId → contextId
+@@ -33,6 +36,35 @@ export class SessionManager {
+         this.sessionCfg = sessionCfg;
+         this.autoApprove = features.autoApprovePermissions;
+         this.directory = directory;
++        this.persistPath = join(this.directory ?? process.cwd(), ".a2a", "sessions.json");
++        this.loadPersisted();
++    }
++    /** Load persisted contextId → sessionId map, skipping entries older than TTL. */
++    loadPersisted() {
++        try {
++            const data = JSON.parse(readFileSync(this.persistPath, "utf8"));
++            const now = Date.now();
++            for (const [contextId, entry] of Object.entries(data)) {
++                if (entry && typeof entry.sessionId === "string" && now - entry.lastUsed <= this.sessionCfg.ttl) {
++                    this.contextMap.set(contextId, { sessionId: entry.sessionId, lastUsed: entry.lastUsed });
++                }
++            }
++        }
++        catch {
++            // No persisted map yet (or unreadable); start empty.
++        }
++    }
++    /** Persist the contextId → sessionId map to disk. */
++    persist() {
++        if (!this.sessionCfg.reuseByContext)
++            return;
++        try {
++            mkdirSync(dirname(this.persistPath), { recursive: true });
++            writeFileSync(this.persistPath, JSON.stringify(Object.fromEntries(this.contextMap)), "utf8");
++        }
++        catch (err) {
++            log.warn("Failed to persist sessions", { error: String(err) });
++        }
+     }
+     /** Start periodic session cleanup. */
+     startCleanup() {
+@@ -47,8 +79,10 @@ export class SessionManager {
+                     cleaned++;
+                 }
+             }
+-            if (cleaned > 0)
++            if (cleaned > 0) {
++                this.persist();
+                 log.info("Cleaned expired sessions", { count: cleaned });
++            }
+         }, this.sessionCfg.cleanupInterval);
+         if (this.cleanupTimer.unref)
+             this.cleanupTimer.unref();
+@@ -71,10 +105,12 @@ export class SessionManager {
+                 entry.lastUsed = Date.now();
+                 try {
+                     await this.client.sessionGet(entry.sessionId, this.directory || undefined);
++                    this.persist();
+                     return entry.sessionId;
+                 }
+                 catch {
+                     this.contextMap.delete(contextId);
++                    this.persist();
+                 }
+             }
+         }
+@@ -85,6 +121,7 @@ export class SessionManager {
+         });
+         if (this.sessionCfg.reuseByContext) {
+             this.contextMap.set(contextId, { sessionId: session.id, lastUsed: Date.now() });
++            this.persist();
+         }
+         log.info("Session ready", { sessionId: session.id, contextId });
+         return session.id;

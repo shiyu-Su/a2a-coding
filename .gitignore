@@ -1,0 +1,17 @@
+node_modules/
+dist/
+*.log
+.env
+reports/
+**/.omo/run-continuation/
+.codegraph/
+Thumbs.db
+
+# 运行时产物（会话/任务库、包装器会话映射、生成的包装器配置）
+orch/data/
+machine/.a2a/
+machine/agents/
+
+# 单元实际配置（不入库；模板见 config.json.default）
+machine/config/config.json
+orch/config/config.json

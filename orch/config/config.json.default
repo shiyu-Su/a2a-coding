@@ -1,0 +1,5 @@
+{
+  "machines": [
+    { "machineId": "<machine-id>", "launcherUrl": "http://<host>:3100" }
+  ]
+}
