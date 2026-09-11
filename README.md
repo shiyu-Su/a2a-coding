@@ -12,7 +12,7 @@
 用户
   │ 需求讨论 / 任务派发
   ▼
-orch Agent（opencode）
+orch Agent（任意 MCP host，示例为 opencode）
   │ MCP stdio，固定 4 个泛型工具
   ▼
 MCP 薄桥（orch/）
@@ -80,7 +80,7 @@ a2a-coding/
 
 - Node.js ≥ 22.5（会话/任务库用内置 `node:sqlite`）。
 - 执行机器需在 PATH 上有 `opencode` CLI（launcher 会拉起 `opencode serve` 与包装器）。
-- orch 与执行机器的 opencode 已配好模型 provider（`opencode auth login` 或 opencode 配置），否则执行 Agent 无法调用模型。
+- orch（**任意支持本地 stdio MCP 的 agent**，如 opencode / Claude Code / Codex / Cursor）与执行机器的 CLI 都已配好模型 provider，否则无法调用模型。
 - Windows / macOS 均可，单元内的 CLI 参数已做跨平台处理。
 
 ## 快速开始
@@ -112,9 +112,9 @@ npm install
 npm run build        # 产出 dist/bridge/index.js
 ```
 
-### 3. 把 MCP 桥配进 orch 的 opencode
+### 3. 把 MCP 桥配进 orch（示例为 opencode）
 
-在 orch 机器的 `opencode.json` 里加入 `mcp.a2a`，然后重启 orch：
+把下面这段加入 orch 宿主的 MCP 配置后重启 orch。下例为 opencode 的 `opencode.json`；**任何支持本地 stdio MCP 的 agent**（Claude Code、Codex、Cursor 等）同理，仅配置位置与格式不同：
 
 ```json
 {
@@ -134,6 +134,8 @@ npm run build        # 产出 dist/bridge/index.js
 ```
 
 把 `command` 的路径换成实际部署路径即可。`MACHINES_CONFIG` 与 `SESSION_DB` 缺省时分别回退到 orch 单元根的 `config/config.json` 与 `./data/sessions.sqlite`。
+
+> 若 orch 不是 opencode，按该 agent 的方式登记同一个 stdio MCP server（`command` 与环境变量一致）即可——桥本身不绑定任何宿主。
 
 ### 4. 通过 MCP 工具派发任务
 
