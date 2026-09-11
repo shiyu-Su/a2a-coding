@@ -210,7 +210,6 @@ skill 只做静态检查（不联网、不启动 launcher / bridge / `opencode s
 - [doc/v0.1.0/A2A最小闭环-改造文档.md](doc/v0.1.0/A2A最小闭环-改造文档.md)
 - [planlog.md](planlog.md)：版本待办与已实现清单
 - [CHANGELOG.md](CHANGELOG.md)：版本变更记录
-- `A2A协作实施方案-v2-方案B.md`：设计总纲（其中「注册中心」部分已调整为「静态分布 + 启动器」）
 - [CLAUDE.md](CLAUDE.md)：项目规范与需求/发版流程
 
 ## 已知边界
