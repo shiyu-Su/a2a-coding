@@ -105,14 +105,19 @@ Launcher 按 `machine/config/config.json` 监听（模板见 `machine/config/con
 
 | 接口 | 作用 |
 |------|------|
-| `GET  /health` | 健康检查 |
+| `GET  /health` | 健康检查（自报线协议版本 `protocolVersion`） |
 | `GET  /projects` | 本机项目清单 + 运行态 |
 | `POST /projects/{projectId}/ensure` | 幂等启动，返回 A2A 端点 |
 | `POST /projects/{projectId}/stop` | 停止项目 Agent |
 
+> **线协议版本化（Bridge ⇄ Launcher，v0.1.2）**：Launcher 在 `GET /health` 自报 `protocolVersion`（`"major.minor"`，单一事实源见 [PROTOCOL.md](PROTOCOL.md)）；桥**首触一台机器**（首个 `/projects` / `ensure` 前）先握手校验，机器主版本不在桥侧可支持清单（`SUPPORTED_PEER_PROTOCOL_MAJORS`）内即**拒绝派发**并给出升级指引——杜绝「新请求体被旧 Launcher 静默忽略」的假象。成功校验进程内缓存（后续调用不再握手，`grep "\[a2a-bridge\] protocol handshake"` 可见各机版本台账）；失败不缓存负项，机器升级后下一轮调用自动恢复，无需重启桥。版本规则：加可选字段 → minor+1；删字段 / 改语义 / 加必填请求体 → major+1（详见 PROTOCOL.md 的版本规则、握手语义与演进记录表）。
+
 > **启动自检**（缺省开，`launcher.startupCheck=false` 跳过）：监听端口前对本机全部项目逐个 `ensure` 拉起 → 经 A2A 发送一条真实最小任务 → 校验任务完成且响应非空 → `stop` 回收。全部通过才进入对外服务；任一失败即打印项目 / 阶段 / 原因并**退出（非零）**，从源头避免「机器看似起来、一用就废」。每个项目消耗一次极小模型调用；自检与真实任务同链路，因此能暴露认证 / 模型 / provider 缺配。
 >
 > 另外每次拉起 Agent 时，Launcher 日志会打印该项目的**配置快照**：配置获取层级（项目 agentConfig / 用户级配置文件路径）+ endpoint / 模型 id（值标注来源 agentConfig / env / 用户配置），便于核对项目实际生效的模型与网关。
+
+> **任务执行日志（三端统一，v0.1.2）**：任一端真实任务（orch 派发或自检触发）在 Launcher 日志中可见统一的三段观测——
+> `[a2a-task] start taskId=… contextId=… promptLen=…` → `[a2a-task] end taskId=… contextId=… state=completed|failed|canceled responseChars=… durationMs=…`（failed 行附单行截断 `error=`）→ 自检路径另有 `[self-check] <projectId> 通过：taskId=… contextId=… state=… responseChars=… durationMs=…`（同套字段，耗时口径为发送 → 终态）；settle 失败行附带任务错误文本。三端格式逐字段一致，`grep "\[a2a-task\]"` 可直接对齐观测；该日志由三端 wrapper 补丁直写 stdout，不受 wrapper `logging.level` 影响。
 
 ### 2. orch 机器：安装桥并构建
 

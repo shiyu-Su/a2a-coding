@@ -1,8 +1,44 @@
 diff --git a/node_modules/a2a-codex/dist/codex/executor.js b/node_modules/a2a-codex/dist/codex/executor.js
-index c5706de..f6c52e7 100644
+index c5706de..1d37f69 100644
 --- a/node_modules/a2a-codex/dist/codex/executor.js
 +++ b/node_modules/a2a-codex/dist/codex/executor.js
-@@ -130,8 +130,10 @@ export class CodexExecutor {
+@@ -19,6 +19,17 @@ import { extractUserText } from "./prompt-builder.js";
+ import { resolveTransport, AgentEventEmitter, materializeMemory, bootstrapSubAgents, publishTask, publishStatus, publishFinalArtifact, publishStreamingChunk, publishLastChunkMarker, } from "@a2a-wrapper/core";
+ import { logger } from "../utils/logger.js";
+ const log = logger.child("executor");
++// v0.1.2 统一任务执行日志（[a2a-task]）：直写 stdout，不受 logging.level 影响，供 Launcher 观测开始/结束/耗时。
++const __a2aTaskLog = {
++    start(taskId, contextId, promptLen) {
++        console.log(`[a2a-task] start taskId=${taskId} contextId=${contextId} promptLen=${promptLen}`);
++    },
++    end(taskId, contextId, state, responseChars, startedAt, error) {
++        const durationMs = Date.now() - startedAt;
++        const suffix = error ? ` error=${JSON.stringify(String(error).slice(0, 300))}` : "";
++        console.log(`[a2a-task] end taskId=${taskId} contextId=${contextId} state=${state} responseChars=${responseChars} durationMs=${durationMs}${suffix}`);
++    },
++};
+ export class CodexExecutor {
+     config;
+     client = null;
+@@ -90,6 +101,7 @@ export class CodexExecutor {
+     // ── Task Execution ───────────────────────────────────────────────────────
+     async execute(ctx, bus) {
+         const { taskId, contextId, userMessage, task } = ctx;
++        let __taskT0 = null;
+         await this.initialize();
+         const agentId = this.config.agentCard.name.toLowerCase().replace(/\s+/g, "-");
+         const transport = resolveTransport(this.config.events, bus, taskId, contextId, this.customTransport);
+@@ -111,7 +123,8 @@ export class CodexExecutor {
+             const session = this.sessionManager.getOrCreate(contextId, () => this.client.startThread(threadOpts));
+             // Extract user prompt
+             const promptText = extractUserText(userMessage);
+-            log.info("Executing task", { taskId, contextId, promptLen: promptText.length });
++            __taskT0 = Date.now();
++            __a2aTaskLog.start(taskId, contextId, promptText.length);
+             // Serialize execution — queue behind any in-progress turn for this context
+             const abortController = new AbortController();
+             this.sessionManager.trackExecution(taskId, contextId, abortController);
+@@ -130,8 +143,10 @@ export class CodexExecutor {
                          // Capture thread_id from first event
                          if (event.type === "thread.started" && session.threadId === null) {
                              const tid = mapper.handleEvent(event);
@@ -14,6 +50,37 @@ index c5706de..f6c52e7 100644
                              continue;
                          }
                          // Accumulate agent_message text across item.updated snapshots
+@@ -163,6 +178,7 @@ export class CodexExecutor {
+                         publishFinalArtifact(bus, taskId, contextId, finalText);
+                     }
+                     publishStatus(bus, taskId, contextId, "completed", undefined, true);
++                    __a2aTaskLog.end(taskId, contextId, "completed", finalText.length, __taskT0);
+                     bus.finished();
+                 }
+                 catch (err) {
+@@ -170,12 +186,14 @@ export class CodexExecutor {
+                         (err.name === "AbortError" || err.message.includes("abort") || err.message.includes("canceled"));
+                     if (isAbort) {
+                         log.info("Task execution aborted", { taskId });
++                        __a2aTaskLog.end(taskId, contextId, "canceled", 0, __taskT0);
+                         // cancelTask already published the canceled status
+                     }
+                     else {
+                         const msg = sanitizeMessage(err instanceof Error ? err.message : String(err));
+                         log.error("Task execution failed", { taskId, error: msg });
+                         publishStatus(bus, taskId, contextId, "failed", msg, true);
++                        __a2aTaskLog.end(taskId, contextId, "failed", 0, __taskT0, msg);
+                         bus.finished();
+                     }
+                 }
+@@ -193,6 +211,7 @@ export class CodexExecutor {
+             const msg = sanitizeMessage(outerErr instanceof Error ? outerErr.message : String(outerErr));
+             log.error("Executor outer error", { taskId, error: msg });
+             publishStatus(bus, taskId, contextId, "failed", msg, true);
++            if (__taskT0 !== null) __a2aTaskLog.end(taskId, contextId, "failed", 0, __taskT0, msg);
+             bus.finished();
+             this.sessionManager?.untrackExecution(taskId);
+         }
 diff --git a/node_modules/a2a-codex/dist/codex/session-manager.js b/node_modules/a2a-codex/dist/codex/session-manager.js
 index 3cf12dc..c0f92b3 100644
 --- a/node_modules/a2a-codex/dist/codex/session-manager.js

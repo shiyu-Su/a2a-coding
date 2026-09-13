@@ -6,6 +6,20 @@
  *   machine 侧同名类型见 `src/machine/types.ts`，修改时需两侧同步。
  */
 
+/**
+ * Bridge ⇄ Launcher 线协议版本（单一事实源：仓库根 PROTOCOL.md；machine 侧同名常量见
+ * machine/types.ts，修改需两侧同步并由契约测试锁定）。
+ * 规则：加可选字段 minor+1；删字段 / 改语义 / 加必填请求体 major+1。
+ */
+export const PROTOCOL_VERSION = "1.0";
+
+/**
+ * 桥可支持的对端（Launcher）主版本清单。主版本升级时按 PROTOCOL.md 维护流程
+ * 显式决策：保留旧主版本支持则留清单并维护对应行为分支（按握手缓存的机器
+ * 完整版本号分支）；放弃支持则移出（旧机被拒绝并获升级指引）。
+ */
+export const SUPPORTED_PEER_PROTOCOL_MAJORS: readonly number[] = [1];
+
 /** 执行层 Agent 类型（决定 A2A 包装器与 CLI 参数） */
 export type AgentKind = "opencode" | "codex" | "claude";
 

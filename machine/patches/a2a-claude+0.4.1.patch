@@ -1,8 +1,60 @@
 diff --git a/node_modules/a2a-claude/dist/claude/executor.js b/node_modules/a2a-claude/dist/claude/executor.js
-index dabcfba..c84cf90 100644
+index dabcfba..97bdaa1 100644
 --- a/node_modules/a2a-claude/dist/claude/executor.js
 +++ b/node_modules/a2a-claude/dist/claude/executor.js
-@@ -316,8 +316,10 @@ export class ClaudeExecutor {
+@@ -22,6 +22,17 @@ import { BackgroundTaskTracker } from "./background-tasks.js";
+ import { resolveTransport, AgentEventEmitter, createDeferred, materializeMemory, bootstrapSubAgents, publishTask, publishStatus, publishFinalArtifact, publishStreamingChunk, publishLastChunkMarker, } from "@a2a-wrapper/core";
+ import { logger } from "../utils/logger.js";
+ const log = logger.child("executor");
++// v0.1.2 统一任务执行日志（[a2a-task]）：直写 stdout，不受 logging.level 影响，供 Launcher 观测开始/结束/耗时。
++const __a2aTaskLog = {
++    start(taskId, contextId, promptLen) {
++        console.log(`[a2a-task] start taskId=${taskId} contextId=${contextId} promptLen=${promptLen}`);
++    },
++    end(taskId, contextId, state, responseChars, startedAt, error) {
++        const durationMs = Date.now() - startedAt;
++        const suffix = error ? ` error=${JSON.stringify(String(error).slice(0, 300))}` : "";
++        console.log(`[a2a-task] end taskId=${taskId} contextId=${contextId} state=${state} responseChars=${responseChars} durationMs=${durationMs}${suffix}`);
++    },
++};
+ const VALID_PERMISSION_MODES = new Set(["acceptEdits", "dontAsk", "plan", "bypassPermissions"]);
+ const VALID_EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
+ const VALID_THINKING_TYPES = new Set(["adaptive", "enabled", "disabled"]);
+@@ -172,6 +183,7 @@ export class ClaudeExecutor {
+     // ── Task Execution ───────────────────────────────────────────────────────
+     async execute(ctx, bus) {
+         const { taskId, contextId, userMessage, task } = ctx;
++        let __taskT0 = null;
+         await this.initialize();
+         const agentId = this.config.agentCard.name.toLowerCase().replace(/\s+/g, "-");
+         const transport = resolveTransport(this.config.events, bus, taskId, contextId, this.customTransport);
+@@ -189,7 +201,8 @@ export class ClaudeExecutor {
+             }
+             const session = this.sessionManager.getOrCreate(contextId);
+             const promptText = extractUserText(userMessage);
+-            log.info("Executing task", { taskId, contextId, promptLen: promptText.length });
++            __taskT0 = Date.now();
++            __a2aTaskLog.start(taskId, contextId, promptText.length);
+             const abortController = new AbortController();
+             this.sessionManager.trackExecution(taskId, contextId, abortController);
+             const turnFn = async () => {
+@@ -253,6 +266,7 @@ export class ClaudeExecutor {
+                     // failed task, so the client just starts a new task on the same
+                     // contextId once the limit resets.
+                     publishStatus(bus, taskId, contextId, "failed", renderRateLimitMessage(snapshot), true, rateLimitMetadata(snapshot));
++                    __a2aTaskLog.end(taskId, contextId, "failed", finalText.length, __taskT0, renderRateLimitMessage(snapshot));
+                     terminalPublished = true;
+                     bus.finished();
+                 };
+@@ -278,6 +292,7 @@ export class ClaudeExecutor {
+                 /** Single definition of the successful ending, mirroring endTurnRateLimited. */
+                 const endTurnCompleted = () => {
+                     publishStatus(bus, taskId, contextId, "completed", undefined, true);
++                    __a2aTaskLog.end(taskId, contextId, "completed", finalText.length, __taskT0);
+                     terminalPublished = true;
+                     bus.finished();
+                 };
+@@ -316,8 +331,10 @@ export class ClaudeExecutor {
                              mapper.handleBackgroundTasks(backgroundTasks.snapshot());
                          }
                          if (msg.type === "system" && msg.subtype === "init" && session.sessionId === null) {
@@ -14,6 +66,50 @@ index dabcfba..c84cf90 100644
                          }
                          // Safety-system refusal with no fallback model → fail the task
                          // with a generic message (spec §4.4). Never echo refusal details.
+@@ -378,6 +395,7 @@ export class ClaudeExecutor {
+                     }
+                     if (resultError) {
+                         publishStatus(bus, taskId, contextId, "failed", sanitizeMessage(resultError), true);
++                        __a2aTaskLog.end(taskId, contextId, "failed", finalText.length, __taskT0, resultError);
+                         terminalPublished = true;
+                         bus.finished();
+                         return;
+@@ -414,6 +432,7 @@ export class ClaudeExecutor {
+                         const msg = `Prompt timed out after ${promptTimeout}ms.`;
+                         log.error("Task execution timed out", { taskId });
+                         publishStatus(bus, taskId, contextId, "failed", msg, true);
++                        __a2aTaskLog.end(taskId, contextId, "failed", finalText.length, __taskT0, msg);
+                         terminalPublished = true;
+                         bus.finished();
+                     }
+@@ -452,16 +471,19 @@ export class ClaudeExecutor {
+                         const msg = `Prompt timed out after ${promptTimeout}ms.`;
+                         log.error("Task execution timed out", { taskId });
+                         publishStatus(bus, taskId, contextId, "failed", msg, true);
++                        __a2aTaskLog.end(taskId, contextId, "failed", finalText.length, __taskT0, msg);
+                         bus.finished();
+                     }
+                     else if (isAbort) {
+                         log.info("Task execution aborted", { taskId });
++                        __a2aTaskLog.end(taskId, contextId, "canceled", finalText.length, __taskT0);
+                         // cancelTask already published the canceled status
+                     }
+                     else {
+                         const msg = sanitizeMessage(err instanceof Error ? err.message : String(err));
+                         log.error("Task execution failed", { taskId, error: msg });
+                         publishStatus(bus, taskId, contextId, "failed", msg, true);
++                        __a2aTaskLog.end(taskId, contextId, "failed", finalText.length, __taskT0, msg);
+                         bus.finished();
+                     }
+                 }
+@@ -482,6 +504,7 @@ export class ClaudeExecutor {
+             const msg = sanitizeMessage(outerErr instanceof Error ? outerErr.message : String(outerErr));
+             log.error("Executor outer error", { taskId, error: msg });
+             publishStatus(bus, taskId, contextId, "failed", msg, true);
++            if (__taskT0 !== null) __a2aTaskLog.end(taskId, contextId, "failed", 0, __taskT0, msg);
+             bus.finished();
+             this.sessionManager?.untrackExecution(taskId);
+         }
 diff --git a/node_modules/a2a-claude/dist/claude/session-manager.js b/node_modules/a2a-claude/dist/claude/session-manager.js
 index d9d4bc0..08825a6 100644
 --- a/node_modules/a2a-claude/dist/claude/session-manager.js

@@ -55,13 +55,19 @@ export interface SelfCheckFailure {
   hint?: string;
 }
 
-/** 自检通过明细：响应长度与耗时（观测用，不打印响应内容；endpoint/model 由启动配置快照行输出） */
+/** 自检通过明细：统一字段（与 wrapper `[a2a-task]` 结束行同套同口径，观测用，不打印响应内容） */
 export interface SelfCheckPass {
   projectId: string;
+  /** 任务 id（Message 直返路径无任务句柄，打印 `-`） */
+  taskId: string | null;
+  /** A2A 上下文 id（自检生成，与发出消息同源） */
+  contextId: string;
+  /** 任务终态（正常为 completed） */
+  state: string;
   /** agent 响应文本长度（字符数） */
-  responseLength: number;
-  /** 该项目自检总耗时（毫秒，含 ensure / 发送 / 轮询全程） */
-  elapsedMs: number;
+  responseChars: number;
+  /** 任务执行耗时：发送 → 终态（毫秒，与 wrapper 结束行 durationMs 同口径；ensure 拉起耗时不混入） */
+  durationMs: number;
 }
 
 /** 单项目自检结果：失败（SelfCheckFailure，以 stage 判别）或通过（SelfCheckPass） */
@@ -130,6 +136,23 @@ function resultText(result: unknown): string {
   }
   if (chunks.length === 0) chunks.push(textFromParts(o["parts"]));
   return chunks.join("\n");
+}
+
+/**
+ * 提取任务 status.message 文本（失败原因；与任务结果保障的 text 落库口径同源）。
+ */
+function statusMessageText(result: unknown): string {
+  if (typeof result !== "object" || result === null) return "";
+  const status = (result as Record<string, unknown>)["status"];
+  if (typeof status !== "object" || status === null) return "";
+  const message = (status as Record<string, unknown>)["message"];
+  if (typeof message !== "object" || message === null) return "";
+  return textFromParts((message as Record<string, unknown>)["parts"]);
+}
+
+/** 压缩为单行并截断（失败原因可能含换行或超长，须保持日志行形状） */
+function singleLine(text: string): string {
+  return text.replace(/\s+/g, " ").trim().slice(0, 300);
 }
 
 /**
@@ -227,6 +250,9 @@ async function checkProject(
     // message/send（真实最小任务；新 contextId = 新会话，不续接历史）。
     // configuration.blocking=false → 服务端翻译为 returnImmediately：立即返回 task
     // 句柄，等待移至下方 tasks/get 轮询，避免 HTTP 请求挂满整个模型耗时。
+    // taskStartedAt 记「发送 → 终态」的任务执行段耗时（与 wrapper 结束行同口径）。
+    const contextId = randomUUID();
+    const taskStartedAt = Date.now();
     let taskId: string | null = null;
     let settled: unknown;
     try {
@@ -238,7 +264,7 @@ async function checkProject(
             role: "user",
             parts: [{ kind: "text", text: prompt }],
             messageId: randomUUID(),
-            contextId: randomUUID(),
+            contextId,
           },
           configuration: { blocking: false },
         },
@@ -280,12 +306,13 @@ async function checkProject(
       const state = taskStateOf(settled);
       if (state !== "completed") {
         const timedOut = remaining() <= 0;
+        const errorText = singleLine(statusMessageText(settled));
         return {
           projectId: project.projectId,
           stage: "settle",
           reason: timedOut
             ? `自检超时（${timeoutMs}ms）：任务未达终态`
-            : `任务终态为 ${state ?? "unknown"}（要求 completed）`,
+            : `任务终态为 ${state ?? "unknown"}（要求 completed）${errorText ? `：${errorText}` : ""}`,
           hint: hintFor(project.agentKind, "settle"),
         };
       }
@@ -301,8 +328,11 @@ async function checkProject(
     }
     return {
       projectId: project.projectId,
-      responseLength: text.length,
-      elapsedMs: Date.now() - startedAt,
+      taskId,
+      contextId,
+      state: taskStateOf(settled) ?? "completed",
+      responseChars: text.length,
+      durationMs: Date.now() - taskStartedAt,
     };
   } finally {
     clearInterval(renewTimer);
@@ -333,7 +363,7 @@ export async function runStartupSelfCheck(
       failures.push(outcome);
     } else {
       console.log(
-        `[self-check] ${project.projectId} 通过：agent 返回 ${outcome.responseLength} 字符，耗时 ${(outcome.elapsedMs / 1000).toFixed(1)}s`,
+        `[self-check] ${project.projectId} 通过：taskId=${outcome.taskId ?? "-"} contextId=${outcome.contextId} state=${outcome.state} responseChars=${outcome.responseChars} durationMs=${outcome.durationMs}`,
       );
     }
   }

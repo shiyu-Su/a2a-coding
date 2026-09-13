@@ -2,6 +2,31 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.1.2] - 2026-09-13
+
+### Added
+
+- **三端任务执行日志统一（含自检场景）**（REQ-v0.1.2-2026-09-13-01）：三端 wrapper 统一任务观测日志——开始行 `[a2a-task] start taskId=… contextId=… promptLen=…`、结束行 `[a2a-task] end … state=completed|failed|canceled responseChars=… durationMs=…`（failed 行附单行截断 `error=`），直写 stdout、不受各端 `logging.level` 影响，并替换原风格不一的「开始」日志；取消路径（codex / claude）同样有结束行。Launcher 启动自检 `[self-check]` 结果行对齐同套字段（耗时口径 = 发送 → 终态），settle 失败行附带任务错误文本（与「任务结果保障」的 text 落库同源）。`grep "[a2a-task]"` 可跨三端对齐观测。
+- **线协议版本化（Bridge ⇄ Launcher 契约）**（REQ-v0.1.2-2026-09-13-02，v0.2.0 拆仓前置）：
+  - 新增 `PROTOCOL.md`（仓库根，入库）为线协议**单一事实源**：端点/字段、版本规则（加可选字段 → minor+1；删字段 / 改语义 / 加必填请求体 → major+1）、握手语义、可支持对端版本维护流程（`SUPPORTED_PEER_PROTOCOL_MAJORS` 显式决策）与演进记录表（含对端最低要求）；
+  - Launcher `GET /health` 自报 `protocolVersion`（`"major.minor"`，当前 `1.0`）；
+  - 桥**首触一台机器**（首个 `/projects` / `ensure` 前）先握手校验：机器主版本不在支持清单内即拒绝派发（`protocol_version_mismatch`，含机器 ID、实测版本、可支持清单与升级指引）；`protocolVersion` 缺失/非法按「未版本化旧版 Launcher」拒绝；机器不可达为连接失败语义，不与版本问题混淆；
+  - 成功校验进程内缓存（后续调用不再握手）；失败不缓存负项——机器升级后下一轮调用自动恢复，无需重启桥；并发首触按 machineId 去重；
+  - `locateProject` 将协议拒绝与普通不可达分开归集：项目无法定位且存在协议拒绝时报 `protocol_version_mismatch`，不误报 `project_not_found`；
+  - 桥观测日志统一走 stderr（`[a2a-bridge]` 前缀），不混入 MCP stdio 协议通道；`[a2a-bridge] protocol handshake` 行含两侧版本，即各机版本台账。
+
+### Changed
+
+- 桥 MCP server 版本串随发布更新（原硬编码 `0.1.0` 滞后于 v0.1.1）。
+
+### Verified
+
+- 新增契约用例 `test-protocol-version.js`（28 断言：两侧常量与 PROTOCOL.md 三方一致、支持清单与演进表互锁、握手行为）随全量回归通过；
+- 四场景运行时夹具验证：成功后不再握手、机器原地升级同进程自愈、死端口连接语义不误报、非终结态 status/cancel 拒绝且不 ensure、终结态快路径零网络；
+- 真实链路验证：桥对升级前旧 Launcher 正确拒绝（未版本化文案 + 升级指引）、Launcher 升级后握手通过、真实 codex 任务经桥全链路完成（返回结构与改造前一致）、启动自检真实任务通过；
+- 三端任务日志经自检与真实任务实测（REQ-01 用户测试记录见 planlog 归档）。
+- 回归测试全量通过（报告见 `reports/v0.1.2/regression-report.json`；`reports/` 不入库）。
+
 ## [v0.1.1] - 2026-09-13
 
 ### Added

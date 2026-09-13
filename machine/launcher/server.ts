@@ -1,13 +1,13 @@
 /**
  * Launcher HTTP 接口（本机常驻）：
- *   GET  /health                         健康检查
+ *   GET  /health                         健康检查（自报线协议版本，见 PROTOCOL.md）
  *   GET  /projects                       项目清单 + 运行态
  *   POST /projects/:projectId/ensure     幂等启动（已在跑则复用）
  *   POST /projects/:projectId/stop       停止项目 Agent
  * 仅监听配置端口；跨机鉴权由反向代理补足（本版本 Out of Scope）。
  */
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
-import type { ApiError } from "../types.js";
+import { PROTOCOL_VERSION, type ApiError } from "../types.js";
 import { AgentManager, AgentStartError, ProjectNotFoundError } from "./manager.js";
 import { errorMessage } from "./process.js";
 
@@ -35,7 +35,7 @@ export function createLauncherApp(manager: AgentManager): Express {
   app.use(express.json());
 
   app.get("/health", (_req: Request, res: Response) => {
-    res.json({ ok: true });
+    res.json({ ok: true, protocolVersion: PROTOCOL_VERSION });
   });
 
   app.get("/projects", (_req: Request, res: Response) => {

@@ -7,6 +7,9 @@
  * - `a2a_task_status(taskId)`            查询任务态（远端 A2A `tasks/get`，回写本地存储）
  * - `a2a_cancel(taskId)`                 取消任务（远端 A2A `tasks/cancel`，回写本地存储）
  *
+ * 首触一台机器先经 `GET /health` 握手校验线协议版本（PROTOCOL.md）；主版本不受
+ * 支持即拒绝派发（fail-fast），杜绝新请求体被旧 Launcher 静默忽略。
+ *
  * 依赖：
  * - `@a2a-js/sdk`（A2A Client；v1.1.0：`ClientFactory` + `JsonRpcTransportFactory`/`RestTransportFactory`）
  * - `../session/store.js`（任务态持久化；CLI 会话由包装器按 A2A `contextId` 持有）
@@ -32,13 +35,15 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { appRootFromModule } from "../app-root.js";
 import { loadMachinesConfig } from "../config.js";
-import type {
-  AgentKind,
-  MachineRef,
-  ProjectStatus,
-  RiskLevel,
-  TaskRecord,
-  TaskState as DomainTaskState,
+import {
+  PROTOCOL_VERSION,
+  SUPPORTED_PEER_PROTOCOL_MAJORS,
+  type AgentKind,
+  type MachineRef,
+  type ProjectStatus,
+  type RiskLevel,
+  type TaskRecord,
+  type TaskState as DomainTaskState,
 } from "../types.js";
 import {
   createTask,
@@ -195,6 +200,87 @@ async function fetchJson(
 }
 
 // ---------------------------------------------------------------------------
+// 线协议握手（PROTOCOL.md：桥首触机器时 GET /health 校验 protocolVersion）
+// ---------------------------------------------------------------------------
+
+type ProtocolCheck =
+  | { ok: true; version: string }
+  | { ok: false; code: string; error: string };
+
+/** 已通过握手校验的机器：machineId → 该机自报完整版本号（供按机器版本的行为分支查用） */
+const protocolVerified = new Map<string, string>();
+/** in-flight 握手去重：并发首触同一机器只发一次 /health */
+const protocolHandshakes = new Map<string, Promise<ProtocolCheck>>();
+
+function parseProtocolMajor(version: string): number | null {
+  const m = /^(\d+)\./.exec(version.trim());
+  return m === null ? null : Number(m[1]);
+}
+
+/**
+ * 首触握手（幂等）：每机器成功校验一次后本进程内不再重复；
+ * 失败不缓存负项——机器升级后下一次调用自动重新握手，无需重启桥。
+ */
+async function ensureProtocol(machine: MachineRef): Promise<ProtocolCheck> {
+  const verified = protocolVerified.get(machine.machineId);
+  if (verified !== undefined) return { ok: true, version: verified };
+
+  const inflight = protocolHandshakes.get(machine.machineId);
+  if (inflight !== undefined) return inflight;
+
+  const check = performHandshake(machine).finally(() => {
+    protocolHandshakes.delete(machine.machineId);
+  });
+  protocolHandshakes.set(machine.machineId, check);
+  return check;
+}
+
+async function performHandshake(machine: MachineRef): Promise<ProtocolCheck> {
+  const url = `${trimTrailingSlash(machine.launcherUrl)}/health`;
+  const res = await fetchJson(
+    url,
+    { method: "GET", headers: { accept: "application/json" } },
+    LAUNCHER_TIMEOUT_MS,
+  );
+  if (!res.ok) {
+    console.error(
+      `[a2a-bridge] protocol handshake: ${machine.machineId} 失败（${res.status}）：${res.error}`,
+    );
+    return {
+      ok: false,
+      code: "launcher_unreachable",
+      error: `机器 ${machine.machineId} 线协议握手失败：GET ${url}（${res.status}）：${res.error}`,
+    };
+  }
+  const o = asRecord(res.data);
+  const raw = o === null ? null : asNonEmptyString(o["protocolVersion"]);
+  // 缺失 / 非法 = 未版本化的旧版 Launcher（v0.1.1 及更早），主版本视为 0
+  const actual = raw ?? "0.0";
+  const major = parseProtocolMajor(actual);
+  if (major === null || !SUPPORTED_PEER_PROTOCOL_MAJORS.includes(major)) {
+    const actualDesc =
+      raw === null ? "未版本化的旧版 Launcher（无 protocolVersion）" : actual;
+    console.error(
+      `[a2a-bridge] protocol handshake: ${machine.machineId} v=${actualDesc} 不受支持（本桥 v${PROTOCOL_VERSION}，可支持主版本：${SUPPORTED_PEER_PROTOCOL_MAJORS.join(", ")}）`,
+    );
+    return {
+      ok: false,
+      code: "protocol_version_mismatch",
+      error:
+        `机器 ${machine.machineId}（${machine.launcherUrl}）线协议版本 ${actualDesc} 不受支持` +
+        `（本桥线协议版本 ${PROTOCOL_VERSION}，可支持主版本：${SUPPORTED_PEER_PROTOCOL_MAJORS.join(", ")}）。` +
+        `请升级该机器 machine 单元（Launcher）后重试；升级后无需重启桥，下一次调用自动重新握手。`,
+    };
+  }
+  protocolVerified.set(machine.machineId, actual);
+  // 桥内观测日志统一走 stderr，避免混入 MCP stdio 协议通道
+  console.error(
+    `[a2a-bridge] protocol handshake: ${machine.machineId} v=${actual} 通过（本桥 v${PROTOCOL_VERSION}）`,
+  );
+  return { ok: true, version: actual };
+}
+
+// ---------------------------------------------------------------------------
 // 项目定位（project -> machine；懒加载缓存，无中心注册）
 // ---------------------------------------------------------------------------
 
@@ -250,9 +336,13 @@ function parseProjectList(data: unknown): ProjectStatus[] | null {
 
 type ListResult =
   | { ok: true; projects: ProjectStatus[] }
-  | { ok: false; error: string };
+  | { ok: false; code?: string; error: string };
 
 async function listMachineProjects(machine: MachineRef): Promise<ListResult> {
+  const protocol = await ensureProtocol(machine);
+  if (!protocol.ok) {
+    return { ok: false, code: protocol.code, error: protocol.error };
+  }
   const url = `${trimTrailingSlash(machine.launcherUrl)}/projects`;
   const res = await fetchJson(
     url,
@@ -317,9 +407,15 @@ async function locateProject(projectId: string): Promise<LocateResult> {
     })),
   );
   const unreachable: string[] = [];
+  const protocolRefusals: string[] = [];
   for (const { machine, listed } of scanned) {
     if (!listed.ok) {
-      unreachable.push(`${machine.machineId}: ${listed.error}`);
+      // 协议拒绝与普通不可达分开归集：项目无法定位时优先给出可操作的升级指引
+      if (listed.code === "protocol_version_mismatch") {
+        protocolRefusals.push(listed.error);
+      } else {
+        unreachable.push(`${machine.machineId}: ${listed.error}`);
+      }
       continue;
     }
     const project = listed.projects.find((p) => p.projectId === projectId);
@@ -327,6 +423,13 @@ async function locateProject(projectId: string): Promise<LocateResult> {
       projectIndex.set(projectId, machine.machineId);
       return { ok: true, machine, project };
     }
+  }
+  if (protocolRefusals.length > 0) {
+    return {
+      ok: false,
+      code: "protocol_version_mismatch",
+      error: `未能定位项目 ${projectId}（机器线协议版本不受支持）：${protocolRefusals.join("; ")}`,
+    };
   }
   const suffix =
     unreachable.length > 0 ? `（部分机器不可达：${unreachable.join("; ")}）` : "";
@@ -346,6 +449,10 @@ async function ensureProject(
   machine: MachineRef,
   projectId: string,
 ): Promise<EnsureOutcome> {
+  const protocol = await ensureProtocol(machine);
+  if (!protocol.ok) {
+    return { ok: false, code: protocol.code, error: protocol.error };
+  }
   const url = `${trimTrailingSlash(machine.launcherUrl)}/projects/${encodeURIComponent(projectId)}/ensure`;
   const res = await fetchJson(
     url,
@@ -1032,7 +1139,7 @@ async function handleProjects(): Promise<MachinesView | Failure> {
 // MCP Server（stdio；固定工具面，4 个泛型工具）
 // ---------------------------------------------------------------------------
 
-const server = new McpServer({ name: "a2a-coding-bridge", version: "0.1.0" });
+const server = new McpServer({ name: "a2a-coding-bridge", version: "0.1.2" });
 
 function textResult(payload: unknown): CallToolResult {
   return {

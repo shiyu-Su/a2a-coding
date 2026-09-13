@@ -6,6 +6,13 @@
  *   orch 侧同名类型见 `src/orch/types.ts`，修改时需两侧同步。
  */
 
+/**
+ * Bridge ⇄ Launcher 线协议版本（单一事实源：仓库根 PROTOCOL.md；orch 侧同名常量见
+ * orch/types.ts，修改需两侧同步并由契约测试锁定）。
+ * 规则：加可选字段 minor+1；删字段 / 改语义 / 加必填请求体 major+1。
+ */
+export const PROTOCOL_VERSION = "1.0";
+
 /** 执行层 Agent 类型（决定 A2A 包装器与 CLI 参数） */
 export type AgentKind = "opencode" | "codex" | "claude";
 

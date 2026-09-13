@@ -1,3 +1,59 @@
+diff --git a/node_modules/a2a-opencode/dist/opencode/executor.js b/node_modules/a2a-opencode/dist/opencode/executor.js
+index 1bf46bf..d3399cc 100644
+--- a/node_modules/a2a-opencode/dist/opencode/executor.js
++++ b/node_modules/a2a-opencode/dist/opencode/executor.js
+@@ -20,6 +20,17 @@ import { publishStatus, publishFinalArtifact, publishStreamingChunk, publishLast
+ import { createDeferred, sleep } from "../utils/deferred.js";
+ import { logger } from "../utils/logger.js";
+ const log = logger.child("executor");
++// v0.1.2 统一任务执行日志（[a2a-task]）：直写 stdout，不受 logging.level 影响，供 Launcher 观测开始/结束/耗时。
++const __a2aTaskLog = {
++    start(taskId, contextId, promptLen) {
++        console.log(`[a2a-task] start taskId=${taskId} contextId=${contextId} promptLen=${promptLen}`);
++    },
++    end(taskId, contextId, state, responseChars, startedAt, error) {
++        const durationMs = Date.now() - startedAt;
++        const suffix = error ? ` error=${JSON.stringify(String(error).slice(0, 300))}` : "";
++        console.log(`[a2a-task] end taskId=${taskId} contextId=${contextId} state=${state} responseChars=${responseChars} durationMs=${durationMs}${suffix}`);
++    },
++};
+ // ─── Trace Helpers ──────────────────────────────────────────────────────────
+ const MAX_DATA_SIZE = 100_000;
+ const SENSITIVE_KEYS = new Set([
+@@ -293,6 +304,7 @@ export class OpenCodeExecutor {
+     // ── Execute ─────────────────────────────────────────────────────────────
+     async execute(ctx, bus) {
+         const { taskId, contextId, userMessage, task } = ctx;
++        let __taskT0 = null;
+         await this.initialize();
+         let stream = null;
+         // Extract trace context propagated by the orchestrator via A2A metadata
+@@ -347,7 +359,8 @@ export class OpenCodeExecutor {
+                 this.promptedSessions.add(sessionId);
+             }
+             const promptBody = this.buildPromptBody(promptText);
+-            log.info("Sending prompt", { taskId, sessionId, len: promptText.length });
++            __taskT0 = Date.now();
++            __a2aTaskLog.start(taskId, contextId, promptText.length);
+             // 5. SSE stream
+             const dir = this.config.opencode.projectDirectory || undefined;
+             stream = new EventStreamManager(this.client, {
+@@ -517,6 +530,7 @@ export class OpenCodeExecutor {
+                 publishFinalArtifact(bus, taskId, contextId, accumulatedText);
+             }
+             publishStatus(bus, taskId, contextId, "completed", undefined, true);
++            __a2aTaskLog.end(taskId, contextId, "completed", accumulatedText.length, __taskT0);
+             bus.finished();
+             log.info("Task completed", { taskId, len: accumulatedText.length });
+         }
+@@ -529,6 +543,7 @@ export class OpenCodeExecutor {
+                 : `Error: ${msg}`;
+             log.error("Execution failed", { taskId, error: msg });
+             publishStatus(bus, taskId, contextId, "failed", userMsg, true);
++            if (__taskT0 !== null) __a2aTaskLog.end(taskId, contextId, "failed", 0, __taskT0, msg);
+             bus.finished();
+         }
+         finally {
 diff --git a/node_modules/a2a-opencode/dist/opencode/session-manager.js b/node_modules/a2a-opencode/dist/opencode/session-manager.js
 index bd06bf0..e6574d5 100644
 --- a/node_modules/a2a-opencode/dist/opencode/session-manager.js
