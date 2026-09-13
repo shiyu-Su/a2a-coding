@@ -12,6 +12,9 @@ export type AgentKind = "opencode" | "codex" | "claude";
 /** A2A 任务态 */
 export type TaskState = "working" | "completed" | "failed" | "input-required";
 
+/** 项目风险级别（决定 CLI 权限参数） */
+export type RiskLevel = "read" | "write" | "full";
+
 /** orch 侧：机器清单中的一条 */
 export interface MachineRef {
   machineId: string;
@@ -33,6 +36,8 @@ export interface ProjectStatus {
   status: "online" | "offline";
   endpoint: string | null;
   startedAt: string | null;
+  /** 项目风险级别（launcher 配置；缺省视为未声明） */
+  risk?: RiskLevel;
 }
 
 /** POST /projects/{id}/ensure 返回 */
@@ -66,6 +71,8 @@ export interface TaskRecord {
   contextId: string;
   state: TaskState;
   artifactsJson: string | null;
+  /** 任务结果纯文本（成功 = artifacts 文本；失败 = status.message 错误原因）；旧记录可能为 null */
+  text: string | null;
   updatedAt: string;
 }
 

@@ -13,6 +13,7 @@ export type {
   LaunchRequest,
   LaunchSpec,
   PermissionRisk,
+  PermissionSpec,
 } from "./types.js";
 export { wrapperConfigPath } from "./types.js";
 

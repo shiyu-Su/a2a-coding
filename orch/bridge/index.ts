@@ -36,6 +36,7 @@ import type {
   AgentKind,
   MachineRef,
   ProjectStatus,
+  RiskLevel,
   TaskRecord,
   TaskState as DomainTaskState,
 } from "../types.js";
@@ -45,6 +46,7 @@ import {
   updateTaskState,
   close as closeSessionStore,
 } from "../session/store.js";
+import { startTaskWatcher, WATCHER_MAX_CONSECUTIVE_FAILURES } from "./task-watcher.js";
 
 // ---------------------------------------------------------------------------
 // 配置与超时（全部可通过环境变量覆盖；显式超时，避免跨机调用挂死）
@@ -74,14 +76,16 @@ const LAUNCHER_ENSURE_TIMEOUT_MS = readPositiveIntEnv(
 const A2A_REQUEST_TIMEOUT_MS = readPositiveIntEnv("A2A_REQUEST_TIMEOUT_MS", 30_000);
 /** A2A Agent Card 拉取超时 */
 const A2A_CARD_TIMEOUT_MS = readPositiveIntEnv("A2A_CARD_TIMEOUT_MS", 15_000);
-/** `a2a_call` 同步等待预算；超出则返回 taskId 供轮询 */
-const SYNC_BUDGET_MS = readPositiveIntEnv("SYNC_BUDGET_MS", 120_000);
+/** `a2a_call` 同步等待预算；到点仍未终态则返回 working + taskId 供轮询（半异步；须小于 host MCP client 请求超时） */
+const SYNC_BUDGET_MS = readPositiveIntEnv("SYNC_BUDGET_MS", 30_000);
 /** 任务轮询间隔 */
 const POLL_INTERVAL_MS = readPositiveIntEnv("POLL_INTERVAL_MS", 1_000);
 /** 任务轮询期间的租约续期间隔（周期性重呼 launcher `ensure`，防止空闲自动停止误杀运行中任务） */
 const LEASE_RENEW_INTERVAL_MS = readPositiveIntEnv("LEASE_RENEW_INTERVAL_MS", 5_000);
 
 const AGENT_KINDS: readonly AgentKind[] = ["opencode", "codex", "claude"];
+
+const RISK_LEVELS: readonly RiskLevel[] = ["read", "write", "full"];
 
 // ---------------------------------------------------------------------------
 // 通用小工具（unknown 收窄，避免 any）
@@ -108,6 +112,10 @@ function asNonEmptyString(v: unknown): string | null {
 
 function isAgentKind(v: string): v is AgentKind {
   return (AGENT_KINDS as readonly string[]).includes(v);
+}
+
+function isRiskLevel(v: unknown): v is RiskLevel {
+  return typeof v === "string" && (RISK_LEVELS as readonly string[]).includes(v);
 }
 
 function nowIso(): string {
@@ -208,7 +216,8 @@ function parseProjectStatus(v: unknown): ProjectStatus | null {
     typeof a2aPortRaw === "number" && Number.isInteger(a2aPortRaw)
       ? a2aPortRaw
       : 0;
-  return {
+  const riskRaw = o["risk"];
+  const parsed: ProjectStatus = {
     projectId,
     workspace,
     agentKind,
@@ -217,6 +226,8 @@ function parseProjectStatus(v: unknown): ProjectStatus | null {
     endpoint: asNonEmptyString(o["endpoint"]),
     startedAt: asNonEmptyString(o["startedAt"]),
   };
+  if (isRiskLevel(riskRaw)) parsed.risk = riskRaw;
+  return parsed;
 }
 
 function parseProjectList(data: unknown): ProjectStatus[] | null {
@@ -562,6 +573,48 @@ function taskText(task: Task): string {
   return artifactChunks.join("\n\n");
 }
 
+/** 本地记录是否已终结（终结态结果由本地存档直接作答，不再查询远端） */
+function isLocalTerminalState(state: DomainTaskState): boolean {
+  return state === "completed" || state === "failed";
+}
+
+/** 从本地存档的 artifactsJson（ArtifactSummary[]）拼接文本；规则对齐 partsToText/taskText，兼容无 text 的旧记录 */
+function textFromArchivedArtifacts(artifactsJson: string | null): string {
+  if (artifactsJson === null) return "";
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(artifactsJson);
+  } catch {
+    return "";
+  }
+  if (!Array.isArray(parsed)) return "";
+  const chunks: string[] = [];
+  for (const artifact of parsed) {
+    const o = asRecord(artifact);
+    if (o === null) continue;
+    const parts = o["parts"];
+    if (!Array.isArray(parts)) continue;
+    const partChunks: string[] = [];
+    for (const part of parts) {
+      const p = asRecord(part);
+      if (p === null) continue;
+      const kind = p["kind"];
+      if (kind === "text" && typeof p["text"] === "string") partChunks.push(p["text"]);
+      else if (kind === "data") partChunks.push(stringifyUnknown(p["data"]));
+      else if (kind === "url" && typeof p["url"] === "string") partChunks.push(p["url"]);
+      // raw：与 partsToText 一致，跳过二进制
+    }
+    const text = partChunks.join("\n");
+    if (text.length > 0) chunks.push(text);
+  }
+  return chunks.join("\n\n");
+}
+
+/** 同步预算到点的 working 返回文案：指引轮询 + 中断恢复路径 */
+function workingGuidanceText(taskId: string, contextId: string): string {
+  return `任务仍在执行中。请用 a2a_task_status(taskId="${taskId}") 轮询结果；不要重复 a2a_call（同一任务会重复执行）。若任务因 agent 回收而中断，可携带同 contextId（${contextId}）调用 a2a_call 续接会话继续。`;
+}
+
 function buildSendRequest(text: string, contextId: string): SendMessageRequest {
   const message: Message = {
     messageId: randomUUID(),
@@ -709,6 +762,57 @@ async function handleCall(
             await ensureProject(located.machine, projectId);
           },
         );
+
+    // 半异步：同步预算到点仍未终态 —— 落库 working、启动后台看护（轮询+续约至终态并落库）、立即返回句柄
+    if (!terminalOrInterrupted(taskStateOf(settled))) {
+      createTask({
+        taskId: settled.id,
+        projectId,
+        contextId,
+        state: "working",
+        artifactsJson: JSON.stringify(summarizeArtifacts(settled.artifacts)),
+        text: null,
+      });
+      const started = startTaskWatcher({
+        taskId: settled.id,
+        poll: () =>
+          client.getTask(
+            { tenant: "", id: settled.id, historyLength: undefined },
+            { signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS) },
+          ),
+        renew: async () => {
+          await ensureProject(located.machine, projectId);
+        },
+        isSettled: (task) => terminalOrInterrupted(taskStateOf(task)),
+        persist: (task) => {
+          const state = mapTaskState(taskStateOf(task));
+          updateTaskState(
+            task.id,
+            state,
+            JSON.stringify(summarizeArtifacts(task.artifacts)),
+            taskText(task),
+          );
+          console.log(`[a2a-bridge] 后台看护：任务 ${task.id} 已终态（${state}），结果落库`);
+        },
+        pollIntervalMs: POLL_INTERVAL_MS,
+        renewIntervalMs: LEASE_RENEW_INTERVAL_MS,
+        maxConsecutiveFailures: WATCHER_MAX_CONSECUTIVE_FAILURES,
+      });
+      if (started) {
+        console.log(
+          `[a2a-bridge] 任务 ${settled.id} 超出同步预算（${SYNC_BUDGET_MS}ms），转后台看护`,
+        );
+      }
+      return {
+        ok: true,
+        text: workingGuidanceText(settled.id, contextId),
+        artifacts: [],
+        taskId: settled.id,
+        status: "working",
+        contextId,
+      };
+    }
+
     const status = mapTaskState(taskStateOf(settled));
     const artifacts = summarizeArtifacts(settled.artifacts);
     createTask({
@@ -717,6 +821,7 @@ async function handleCall(
       contextId,
       state: status,
       artifactsJson: JSON.stringify(artifacts),
+      text: taskText(settled),
     });
     return {
       ok: true,
@@ -759,6 +864,27 @@ async function handleTaskStatus(taskId: string): Promise<TaskStatusOutcome> {
       error: `未知任务 ${taskId}（本地任务存储无记录）`,
     };
   }
+
+  // 本地快路径：终结态结果是最终事实（落库时已 settle），直接以本地存档作答；
+  // 不 ensure、不碰远端——远端任务态不持久化（agent 回收后重 ensure 是新进程，只会 Task not found）
+  if (isLocalTerminalState(record.state)) {
+    let artifacts: ArtifactSummary[] = [];
+    try {
+      const parsed: unknown = JSON.parse(record.artifactsJson ?? "[]");
+      if (Array.isArray(parsed)) artifacts = parsed as ArtifactSummary[];
+    } catch {
+      artifacts = [];
+    }
+    return {
+      ok: true,
+      taskId,
+      status: record.state,
+      text: record.text ?? textFromArchivedArtifacts(record.artifactsJson),
+      artifacts,
+      updatedAt: record.updatedAt,
+    };
+  }
+
   const located = await locateProject(record.projectId);
   if (!located.ok) {
     return { ok: false, code: located.code, error: located.error, task: record };
@@ -787,7 +913,7 @@ async function handleTaskStatus(taskId: string): Promise<TaskStatusOutcome> {
     );
     const status = mapTaskState(taskStateOf(task));
     const artifacts = summarizeArtifacts(task.artifacts);
-    updateTaskState(taskId, status, JSON.stringify(artifacts));
+    updateTaskState(taskId, status, JSON.stringify(artifacts), taskText(task));
     return {
       ok: true,
       taskId,
@@ -800,7 +926,7 @@ async function handleTaskStatus(taskId: string): Promise<TaskStatusOutcome> {
     return {
       ok: false,
       code: "a2a_get_task_failed",
-      error: `A2A tasks/get 失败：${toMessage(err)}`,
+      error: `A2A tasks/get 失败：${toMessage(err)}。任务可能已随 agent 回收而中断；可携带同 contextId（${record.contextId}）调用 a2a_call 续接会话继续。`,
       task: record,
     };
   }
@@ -854,7 +980,7 @@ async function handleCancel(taskId: string): Promise<CancelOutcome> {
     );
     const status = mapTaskState(taskStateOf(task));
     const artifacts = summarizeArtifacts(task.artifacts);
-    updateTaskState(taskId, status, JSON.stringify(artifacts));
+    updateTaskState(taskId, status, JSON.stringify(artifacts), taskText(task));
     return {
       ok: true,
       taskId,

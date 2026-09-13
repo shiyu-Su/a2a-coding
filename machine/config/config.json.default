@@ -1,12 +1,27 @@
 {
   "machineId": "<machine-id>",
-  "launcher": { "port": 3100, "idleStopMs": 300000 },
+  "launcher": { "port": 3100, "idleStopMs": 300000, "startupCheck": true, "startupCheckTimeoutMs": 120000 },
   "projects": [
     {
       "projectId": "<project-id>",
       "workspace": "<absolute path to the project on this machine>",
       "agentKind": "opencode",
-      "a2aPort": 3010
+      "a2aPort": 3010,
+      "risk": "write"
+    },
+    {
+      "projectId": "<codex-project-id>",
+      "workspace": "<absolute path to the codex project on this machine>",
+      "agentKind": "codex",
+      "a2aPort": 3011,
+      "risk": "write"
+    },
+    {
+      "projectId": "<claude-project-id>",
+      "workspace": "<absolute path to the claude project on this machine>",
+      "agentKind": "claude",
+      "a2aPort": 3012,
+      "risk": "read"
     }
   ]
 }

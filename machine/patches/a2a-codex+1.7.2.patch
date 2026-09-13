@@ -1,0 +1,128 @@
+diff --git a/node_modules/a2a-codex/dist/codex/executor.js b/node_modules/a2a-codex/dist/codex/executor.js
+index c5706de..f6c52e7 100644
+--- a/node_modules/a2a-codex/dist/codex/executor.js
++++ b/node_modules/a2a-codex/dist/codex/executor.js
+@@ -130,8 +130,10 @@ export class CodexExecutor {
+                         // Capture thread_id from first event
+                         if (event.type === "thread.started" && session.threadId === null) {
+                             const tid = mapper.handleEvent(event);
+-                            if (tid)
++                            if (tid) {
+                                 session.threadId = tid;
++                                this.sessionManager.persist();
++                            }
+                             continue;
+                         }
+                         // Accumulate agent_message text across item.updated snapshots
+diff --git a/node_modules/a2a-codex/dist/codex/session-manager.js b/node_modules/a2a-codex/dist/codex/session-manager.js
+index 3cf12dc..c0f92b3 100644
+--- a/node_modules/a2a-codex/dist/codex/session-manager.js
++++ b/node_modules/a2a-codex/dist/codex/session-manager.js
+@@ -6,6 +6,8 @@
+  * Tracks active executions for cancellation support.
+  */
+ import { logger } from "../utils/logger.js";
++import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
++import { dirname, join } from "node:path";
+ const log = logger.child("session-manager");
+ // ─── SessionManager ───────────────────────────────────────────────────────────
+ export class SessionManager {
+@@ -16,9 +18,61 @@ export class SessionManager {
+     /** taskId → active execution */
+     activeExecutions = new Map();
+     cleanupTimer = null;
++    persistPath;
+     constructor(client, config) {
+         this.client = client;
+         this.config = config;
++        this.persistPath = join(this.config.codex?.workingDirectory ?? process.cwd(), ".a2a", "sessions.json");
++        this.loadPersisted();
++    }
++    /**
++     * Load the persisted contextId → threadId map, resuming each Codex thread.
++     * Entries outside TTL or failing to resume are skipped; this never throws.
++     */
++    loadPersisted() {
++        try {
++            const data = JSON.parse(readFileSync(this.persistPath, "utf8"));
++            const ttl = this.config.session.ttl ?? 3_600_000;
++            const now = Date.now();
++            for (const [contextId, entry] of Object.entries(data)) {
++                if (!entry || typeof entry.threadId !== "string")
++                    continue;
++                const lastAccessedAt = entry.lastAccessedAt ?? entry.createdAt ?? 0;
++                if (now - lastAccessedAt > ttl) {
++                    log.debug("Skipping expired persisted session", { contextId, threadId: entry.threadId });
++                    continue;
++                }
++                try {
++                    const thread = this.client.resumeThread(entry.threadId, this.buildThreadOptions());
++                    this.sessions.set(contextId, {
++                        contextId,
++                        threadId: entry.threadId,
++                        thread,
++                        createdAt: entry.createdAt ?? entry.lastAccessedAt ?? Date.now(),
++                        lastAccessedAt: entry.lastAccessedAt ?? Date.now(),
++                        executionQueue: Promise.resolve(),
++                    });
++                }
++                catch (err) {
++                    log.warn("Failed to resume persisted Codex thread", { contextId, threadId: entry.threadId, error: String(err) });
++                }
++            }
++        }
++        catch {
++            // No persisted map yet (or unreadable); start empty.
++        }
++    }
++    /** Persist the contextId → threadId map to disk. */
++    persist() {
++        try {
++            mkdirSync(dirname(this.persistPath), { recursive: true });
++            writeFileSync(this.persistPath, JSON.stringify(Object.fromEntries([...this.sessions.entries()]
++                .filter(([, s]) => typeof s.threadId === "string" && s.threadId)
++                .map(([ctx, s]) => [ctx, { threadId: s.threadId, createdAt: s.createdAt, lastAccessedAt: s.lastAccessedAt }]))), "utf8");
++        }
++        catch (err) {
++            log.warn("Failed to persist sessions", { error: String(err) });
++        }
+     }
+     /**
+      * Get an existing session for the contextId, or create a new one using the
+@@ -39,6 +93,7 @@ export class SessionManager {
+                 }
+                 log.info("Session TTL expired, starting new thread", { contextId, age });
+                 this.sessions.delete(contextId);
++                this.persist();
+             }
+         }
+         const thread = threadFactory();
+@@ -52,6 +107,7 @@ export class SessionManager {
+         };
+         if (contextId) {
+             this.sessions.set(contextId, session);
++            this.persist();
+         }
+         log.info("Started new Codex thread", { contextId });
+         return session;
+@@ -83,6 +139,7 @@ export class SessionManager {
+             return;
+         this.cleanupTimer = setInterval(() => {
+             const now = Date.now();
++            let deleted = 0;
+             for (const [contextId, session] of this.sessions.entries()) {
+                 if (now - session.lastAccessedAt > ttl) {
+                     // Do not remove if there is an active execution for this context
+@@ -93,8 +150,12 @@ export class SessionManager {
+                     }
+                     log.info("TTL cleanup: removing stale session", { contextId, threadId: session.threadId });
+                     this.sessions.delete(contextId);
++                    deleted++;
+                 }
+             }
++            if (deleted > 0) {
++                this.persist();
++            }
+         }, interval);
+     }
+     /** Stop the cleanup timer. */

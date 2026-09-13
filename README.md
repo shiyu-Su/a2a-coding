@@ -1,6 +1,6 @@
 # a2a-coding
 
-基于 A2A 的 Code Agent 协作：以 orch Agent 为统一入口，按「项目」组织 Code Agent（OpenCode / Codex / Claude Code），让需求讨论留在 orch、执行交给各项目自己的 Agent。
+基于 A2A 的 Code Agent 协作：以 orch Agent 为统一入口，按「项目」组织 Code Agent，**三端均支持**（OpenCode / Codex / Claude Code），让需求讨论留在 orch、执行交给各项目自己的 Agent。
 
 目标是开发协作时 orch 只管派发任务；目标项目的执行 Agent 按需拉起，在对应 workspace 实际执行，结果回传 orch，用完退出但会话可继承。架构不依赖「必须跨机器」：同一台机器上跑 orch 与 Launcher 同样成立，链路只是简化为本机调用，详见「部署形态」。
 
@@ -21,9 +21,9 @@ MCP 薄桥（orch/）
   ▼  HTTP JSON（GET /projects、POST ensure/stop、GET /health）
 每机 Launcher（machine/）
   │  · 本机项目配置 + Agent 生命周期 + 空闲回收
-  ▼  拉起包装器（a2a-opencode）
-A2A 包装器 + 前置 opencode serve
-  │  CLI（opencode run）
+  ▼  拉起包装器（a2a-opencode / a2a-codex / a2a-claude，按 agentKind）
+A2A 包装器（opencode 另需前置 opencode serve，codex / claude 无前置后端）
+  │  CLI（opencode run / codex exec / claude -p）
   ▼
 目标 workspace 执行，结果经 A2A 回传 orch
 ```
@@ -58,18 +58,19 @@ a2a-coding/
 │  ├─ opencode.json               # 样例：把 mcp.a2a 配进 orch 的 opencode
 │  ├─ types.ts  config.ts  app-root.ts
 │  ├─ bridge/index.ts             # MCP 薄桥：a2a_projects / a2a_call / a2a_task_status / a2a_cancel
-│  ├─ session/store.ts            # 会话/任务库（node:sqlite）
+│  ├─ bridge/task-watcher.ts      # 任务后台看护（结果保障：轮询 + 续约至终态并落库）
+│  ├─ session/store.ts            # 会话/任务库（node:sqlite；tasks 含 state/artifacts/text）
 │  └─ data/                       # 运行态：sessions.sqlite（git 忽略）
 ├─ machine/                       # 部署单元 2（每台执行机器）：每机常驻
-│  ├─ package.json                # @a2a-coding/machine：express / a2a-opencode
+│  ├─ package.json                # @a2a-coding/machine：express / a2a-opencode / a2a-codex / a2a-claude
 │  ├─ tsconfig.json
 │  ├─ config/config.json          # 本机项目配置（实际，git 忽略）
 │  ├─ config/config.json.default  # 本机项目配置模板（入库）
 │  ├─ types.ts  config.ts
-│  ├─ launcher/{index,server,manager,ports,process,agent-config,app-root}.ts
+│  ├─ launcher/{index,server,manager,ports,process,agent-config,self-check,config-snapshot,app-root}.ts
 │  ├─ adapters/{index,types,json,opencode,codex,claude}.ts
-│  ├─ patches/a2a-opencode+1.7.2.patch     # 会话落盘补丁（patch-package）
-│  ├─ scripts/verify-session-persist.mjs
+│  ├─ patches/                    # 会话落盘补丁（patch-package）：a2a-opencode / a2a-codex / a2a-claude
+│  ├─ scripts/                    # 验证脚本：verify-session-persist{,-codex,-claude}.mjs、verify-config-precedence.mjs
 │  ├─ agents/                     # 运行态：launcher 生成的包装器配置（git 忽略）
 │  └─ .a2a/                       # 运行态：包装器会话映射 sessions.json（git 忽略）
 ├─ package.json                   # 仓级 dev manifest（version / type）
@@ -80,7 +81,11 @@ a2a-coding/
 
 - Node.js ≥ 22.5（会话/任务库用内置 `node:sqlite`）。
 - **orch agent 与 `orch/`（MCP 桥）必须同机**：桥是本地 stdio MCP server，由 orch agent 作为子进程拉起。执行机器（Launcher + 项目 Agent）可在本机或远端。
-- 执行机器需在 PATH 上有 `opencode` CLI（launcher 会拉起 `opencode serve` 与包装器）。
+- 执行机器按项目 `agentKind` 准备对应的 CLI 与认证（Launcher 从自身进程环境继承）：
+  - `opencode`：PATH 上有 `opencode` CLI（三端中**唯一**需要预装 CLI 的 kind）；Launcher 会先拉起 `opencode serve` 作为前置后端。
+  - `codex`：**无需在 PATH 安装全局 `codex` CLI**——`a2a-codex` 依赖已内置 codex 运行时（`@openai/codex` + 对应平台包，`npm install` 按 OS/arch 自动选择，SDK 自动解析）；仅需认证（`OPENAI_API_KEY`，或 `codex login` 生成的 `~/.codex/auth.json`），无前置后端。自定义网关经 `~/.codex/config.toml` 的 `[model_providers.*]` 配置：`base_url` 须为 **OpenAI 兼容**地址，注意 codex 会在其后拼接 `/responses`（`wire_api = "responses"`），网关地址需含版本段（如 `https://…/v1`）。如需指定其它 codex 版本/二进制，可用 `agentConfig.codex.codexPathOverride`。
+  - `claude`：**无需在 PATH 安装全局 `claude` CLI**——`a2a-claude` 依赖已内置 Claude Code 运行时（`@anthropic-ai/claude-agent-sdk` + 对应平台包，`npm install` 按 OS/arch 自动选择）。默认**加载用户级配置**（`settingSources: ["user"]`，读取 `~/.claude/settings.json` 的模型 / 网关 / 认证 `env`），交互式 Claude Code 已配好的用户开箱即用。项目可显式覆盖：`agentConfig.claude.settingSources: []` 恢复完全隔离（此时需把 `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` 注入 **Launcher 进程环境**）；模型可写在该项目 `agentConfig.claude.model`（优先于用户配置）。如需指定其它 Claude Code 版本/二进制，可用 `agentConfig.claude.executablePathOverride`。
+- codex 项目的 `workspace` 默认只需指向一个目录，不必是 Git 仓库（Launcher 默认注入 `codex.skipGitRepoCheck: true`）；若要强制 Git 校验，可在该项目的 `agentConfig.codex` 里覆盖为 `false`。
 - orch（**任意支持本地 stdio MCP 的 agent**，如 opencode / Claude Code / Codex / Cursor）与执行机器的 CLI 都已配好模型 provider，否则无法调用模型。
 - Windows / macOS 均可，单元内的 CLI 参数已做跨平台处理。
 
@@ -104,6 +109,10 @@ Launcher 按 `machine/config/config.json` 监听（模板见 `machine/config/con
 | `GET  /projects` | 本机项目清单 + 运行态 |
 | `POST /projects/{projectId}/ensure` | 幂等启动，返回 A2A 端点 |
 | `POST /projects/{projectId}/stop` | 停止项目 Agent |
+
+> **启动自检**（缺省开，`launcher.startupCheck=false` 跳过）：监听端口前对本机全部项目逐个 `ensure` 拉起 → 经 A2A 发送一条真实最小任务 → 校验任务完成且响应非空 → `stop` 回收。全部通过才进入对外服务；任一失败即打印项目 / 阶段 / 原因并**退出（非零）**，从源头避免「机器看似起来、一用就废」。每个项目消耗一次极小模型调用；自检与真实任务同链路，因此能暴露认证 / 模型 / provider 缺配。
+>
+> 另外每次拉起 Agent 时，Launcher 日志会打印该项目的**配置快照**：配置获取层级（项目 agentConfig / 用户级配置文件路径）+ endpoint / 模型 id（值标注来源 agentConfig / env / 用户配置），便于核对项目实际生效的模型与网关。
 
 ### 2. orch 机器：安装桥并构建
 
@@ -138,6 +147,8 @@ npm run build        # 产出 dist/bridge/index.js
 
 把 `command` 的路径换成实际部署路径即可。`MACHINES_CONFIG` 与 `SESSION_DB` 缺省时分别回退到 orch 单元根的 `config/config.json` 与 `./data/sessions.sqlite`。
 
+> 桥的同步等待预算由环境变量 `SYNC_BUDGET_MS`（默认 30000ms）控制：任务超过该时长未完成即返回 `working + taskId`（桥转后台看护至终态并落库），由调用方 `a2a_task_status` 轮询。**该值必须小于 orch agent 的 MCP 客户端请求超时**（`@modelcontextprotocol/sdk` 默认 60s，超时抛 -32001），否则长任务的句柄返回会被客户端超时截断，调用方拿不到 taskId、重试还会重复执行任务。
+
 > 若 orch 不是 opencode，按该 agent 的方式登记同一个 stdio MCP server（`command` 与环境变量一致）即可——桥本身不绑定任何宿主。
 
 ### 4. 通过 MCP 工具派发任务
@@ -145,8 +156,8 @@ npm run build        # 产出 dist/bridge/index.js
 工具面固定为 4 个泛型工具：
 
 - `a2a_projects()`：列出所有已配置机器及其本机项目（含运行态与 A2A 端点）。
-- `a2a_call(project, message, contextId?)`：解析项目到机器，幂等启动 Agent，经 A2A 派发一轮任务，返回文本结果与 artifacts。
-- `a2a_task_status(taskId)`：查询任务态，并回写本地任务存储。
+- `a2a_call(project, message, contextId?)`：解析项目到机器，幂等 ensure，经 A2A 派发一轮任务。≤30s 完成的任务直接返回文本结果与 artifacts；更长的任务返回 `working + taskId`（桥转后台看护至终态并落库），按返回文案用 `a2a_task_status` 轮询。
+- `a2a_task_status(taskId)`：查询任务态并回写本地任务存储。已终结任务（completed / failed）由桥本地存档直接作答（不唤醒远端 Agent）；未终结任务走远端实时查询。
 - `a2a_cancel(taskId)`：取消任务，并回写本地任务存储。
 
 示例（在 orch 里）：
@@ -168,12 +179,24 @@ a2a_call(project="machine", message="把刚才的结果按类型分组", context
 - `machineId`：机器标识，需与 orch 机器清单一致。
 - `launcher.port`：Launcher 监听端口。
 - `launcher.idleStopMs`：空闲回收时长（毫秒）。项目 Agent 超过该时长没有 `ensure` 调用就自动 `stop`；缺省 300000（5 分钟），`0` 或负值表示禁用。
+- `launcher.startupCheck`（可选）：启动自检开关，缺省 `true`（见「快速开始」的自检说明）；`false` 跳过自检直接进入服务。
+- `launcher.startupCheckTimeoutMs`（可选）：每个项目自检的总超时（毫秒），缺省 `120000`。
+- `launcher.startupCheckPrompt`（可选）：自检 prompt，缺省 `Reply with exactly: OK`。
 - `projects[]`：本机项目列表，每项含：
   - `projectId`：项目标识，全局唯一。
   - `workspace`：执行目录。
   - `agentKind`：`opencode` / `codex` / `claude`。
   - `a2aPort`：该项目 A2A Server 监听端口。
+  - `risk`（可选）：项目风险档位，`read` / `write` / `full`，缺省 `write`。决定包装器传给底层 CLI 的权限 / 沙箱参数，遵循「最小权限」。
   - `agentConfig`（可选）：包装器配置片段，顶层键如 `model` / `mcp` / `events` / `systemPrompt`。launcher 会把它与默认项 `{ "events": { "enabled": false } }` 深合并，写入 `agents/<agentKind>.<projectId>.json`，经 `--config` 传给包装器，再与包装器内置默认值深合并。
+
+`risk` 到各端权限参数的映射（`write` 为默认，恰等于三端包装器内置默认；opencode 只有自动放行开 / 关一个旋钮，`write` 与 `full` 相同）：
+
+| risk | opencode | codex（`--sandbox`） | claude（`--permission-mode`） |
+|------|----------|----------------------|-------------------------------|
+| `read` | `--no-auto-approve` | `read-only` | `plan` |
+| `write`（默认） | `--auto-approve` | `workspace-write` | `acceptEdits` |
+| `full` | `--auto-approve` | `danger-full-access` | `bypassPermissions` + 配置 `claude.dangerouslyAllowBypassPermissions=true` |
 
 样例：
 
@@ -244,6 +267,7 @@ orch 用 `project`（如 `frontend` / `backend`）派发到对应项目；同机
 
 - 执行层入站鉴权依赖反向代理补足（`a2a-wrapper` 默认没有入站鉴权）。
 - 跨机鉴权尚未实现（计划反向代理 TLS + Bearer，预留 mTLS）。
-- Codex / Claude Code 暂缓：`machine/adapters/` 已有骨架，依赖安装、配置生成与生命周期随后续版本补齐。
+- 三端均已完成真实模型端到端验证（拉起 → 派发 → 执行 → 回传，退出后携带同一 `contextId` 续接）：opencode（v0.1.0）、claude（用户级 `~/.claude/settings.json` 网关认证，无需注入 env）、codex（`~/.codex/config.toml` 自定义 provider + 兼容网关）。
+- 任务结果保障的边界：终态结果持久在桥的 SQLite（两侧进程重启均不丢）；**执行中（未终态）任务跨 wrapper / 桥任一侧重启会中断丢失**（任务态仅存于 wrapper 进程内存；彻底消除需 wrapper 任务态持久化，未来项）。
 - 设备本身当 Agent 需自建中继，非本期范围。
 - 多实例 + 工作区隔离（模型 C）仅预留扩展点，本版本不实现。

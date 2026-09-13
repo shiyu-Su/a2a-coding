@@ -1,0 +1,100 @@
+diff --git a/node_modules/a2a-claude/dist/claude/executor.js b/node_modules/a2a-claude/dist/claude/executor.js
+index dabcfba..c84cf90 100644
+--- a/node_modules/a2a-claude/dist/claude/executor.js
++++ b/node_modules/a2a-claude/dist/claude/executor.js
+@@ -316,8 +316,10 @@ export class ClaudeExecutor {
+                             mapper.handleBackgroundTasks(backgroundTasks.snapshot());
+                         }
+                         if (msg.type === "system" && msg.subtype === "init" && session.sessionId === null) {
+-                            if (typeof msg.session_id === "string")
++                            if (typeof msg.session_id === "string") {
+                                 session.sessionId = msg.session_id;
++                                this.sessionManager.persist();
++                            }
+                         }
+                         // Safety-system refusal with no fallback model → fail the task
+                         // with a generic message (spec §4.4). Never echo refusal details.
+diff --git a/node_modules/a2a-claude/dist/claude/session-manager.js b/node_modules/a2a-claude/dist/claude/session-manager.js
+index d9d4bc0..08825a6 100644
+--- a/node_modules/a2a-claude/dist/claude/session-manager.js
++++ b/node_modules/a2a-claude/dist/claude/session-manager.js
+@@ -6,14 +6,59 @@
+  * Tracks active executions (abort controller + query handle) for cancellation.
+  */
+ import { logger } from "../utils/logger.js";
++import { mkdirSync, readFileSync, writeFileSync } from "node:fs";
++import { dirname, join } from "node:path";
+ const log = logger.child("session-manager");
+ export class SessionManager {
+     config;
+     sessions = new Map();
+     activeExecutions = new Map();
+     cleanupTimer = null;
++    persistPath;
+     constructor(config) {
+         this.config = config;
++        this.persistPath = join(this.config.claude?.workingDirectory ?? process.cwd(), ".a2a", "sessions.json");
++        this.loadPersisted();
++    }
++    /** Load the persisted contextId → sessionId map, skipping entries older than TTL. */
++    loadPersisted() {
++        try {
++            const data = JSON.parse(readFileSync(this.persistPath, "utf8"));
++            const now = Date.now();
++            const ttl = this.config.session.ttl ?? 0;
++            for (const [contextId, entry] of Object.entries(data)) {
++                if (!entry || typeof entry.sessionId !== "string")
++                    continue;
++                const createdAt = entry.createdAt ?? entry.lastAccessedAt ?? now;
++                const lastAccessedAt = entry.lastAccessedAt ?? now;
++                // ttl <= 0 disables expiry entirely.
++                if (ttl > 0 && now - createdAt >= ttl)
++                    continue;
++                this.sessions.set(contextId, {
++                    contextId,
++                    sessionId: entry.sessionId,
++                    createdAt,
++                    lastAccessedAt,
++                    executionQueue: Promise.resolve(),
++                });
++            }
++        }
++        catch {
++            // No persisted map yet (or unreadable); start empty.
++        }
++    }
++    /** Persist the contextId → sessionId map to disk. */
++    persist() {
++        try {
++            mkdirSync(dirname(this.persistPath), { recursive: true });
++            const data = Object.fromEntries([...this.sessions.entries()]
++                .filter(([, s]) => typeof s.sessionId === "string" && s.sessionId)
++                .map(([ctx, s]) => [ctx, { sessionId: s.sessionId, createdAt: s.createdAt, lastAccessedAt: s.lastAccessedAt }]));
++            writeFileSync(this.persistPath, JSON.stringify(data), "utf8");
++        }
++        catch (err) {
++            log.warn("Failed to persist sessions", { error: String(err) });
++        }
+     }
+     getOrCreate(contextId) {
+         const sessionCfg = this.config.session;
+@@ -45,8 +90,10 @@ export class SessionManager {
+             lastAccessedAt: Date.now(),
+             executionQueue: Promise.resolve(),
+         };
+-        if (contextId)
++        if (contextId) {
+             this.sessions.set(contextId, session);
++            this.persist();
++        }
+         log.info("Created new Claude session record", { contextId });
+         return session;
+     }
+@@ -97,6 +144,7 @@ export class SessionManager {
+                     }
+                     log.info("TTL cleanup: removing stale session", { contextId, sessionId: session.sessionId });
+                     this.sessions.delete(contextId);
++                    this.persist();
+                 }
+             }
+         }, interval);

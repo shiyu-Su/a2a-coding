@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import type { AgentKind, MachineConfig, ProjectConfig } from "./types.js";
+import type { AgentKind, MachineConfig, ProjectConfig, RiskLevel } from "./types.js";
 
 const AGENT_KINDS: readonly AgentKind[] = ["opencode", "codex", "claude"];
 
@@ -33,6 +33,25 @@ function asIdleStopMs(v: unknown, ctx: string): number {
   return v;
 }
 
+function asBool(v: unknown, ctx: string): boolean {
+  if (typeof v !== "boolean") fail(`${ctx} 必须是布尔值`);
+  return v;
+}
+
+function asPositiveInt(v: unknown, ctx: string): number {
+  if (typeof v !== "number" || !Number.isInteger(v) || v <= 0) {
+    fail(`${ctx} 必须是正整数`);
+  }
+  return v;
+}
+
+function asRiskLevel(v: unknown, ctx: string): RiskLevel {
+  if (v !== "read" && v !== "write" && v !== "full") {
+    fail(`${ctx} 必须是 read / write / full`);
+  }
+  return v;
+}
+
 function parseProject(v: unknown, idx: number): ProjectConfig {
   const o = asRecord(v, `projects[${idx}]`);
   const agentKind = asString(o["agentKind"], `projects[${idx}].agentKind`);
@@ -49,6 +68,11 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
   if (agentConfig !== undefined) {
     // 包装器配置片段：必须是普通对象（非 null / 非数组）
     project.agentConfig = asRecord(agentConfig, `projects[${idx}].agentConfig`);
+  }
+  const risk = o["risk"];
+  if (risk !== undefined) {
+    // 任务风险档位：缺省不写（由 launcher 取 write），写了必须是三值之一
+    project.risk = asRiskLevel(risk, `projects[${idx}].risk`);
   }
   return project;
 }
@@ -72,6 +96,24 @@ export function loadMachineConfig(path: string): MachineConfig {
   const idleStopMs = launcher["idleStopMs"];
   if (idleStopMs !== undefined) {
     launcherConfig.idleStopMs = asIdleStopMs(idleStopMs, "launcher.idleStopMs");
+  }
+  const startupCheck = launcher["startupCheck"];
+  if (startupCheck !== undefined) {
+    launcherConfig.startupCheck = asBool(startupCheck, "launcher.startupCheck");
+  }
+  const startupCheckTimeoutMs = launcher["startupCheckTimeoutMs"];
+  if (startupCheckTimeoutMs !== undefined) {
+    launcherConfig.startupCheckTimeoutMs = asPositiveInt(
+      startupCheckTimeoutMs,
+      "launcher.startupCheckTimeoutMs",
+    );
+  }
+  const startupCheckPrompt = launcher["startupCheckPrompt"];
+  if (startupCheckPrompt !== undefined) {
+    launcherConfig.startupCheckPrompt = asString(
+      startupCheckPrompt,
+      "launcher.startupCheckPrompt",
+    );
   }
   return {
     machineId: asString(o["machineId"], "machineId"),

@@ -15,6 +15,7 @@ import type {
 } from "../types.js";
 import { writeAgentConfig } from "./agent-config.js";
 import { appRootFromModule } from "./app-root.js";
+import { describeAgentConfig } from "./config-snapshot.js";
 import { allocateFreePort, waitForHttpOk, waitForPort } from "./ports.js";
 import {
   errorMessage,
@@ -177,22 +178,30 @@ export class AgentManager {
   }
 
   private async start(project: ProjectConfig): Promise<EnsureResult> {
+    // 风险档位 → 权限映射：缺省 write（= 三端包装器内置默认，v0.1.0 行为不变）
+    const risk = project.risk ?? "write";
     const adapter = getAdapter(project.agentKind);
+    const perm = adapter.permission(risk);
 
     // cwd 必须存在，否则 spawn 会以误导性的 cmd.exe ENOENT 失败
     if (!existsSync(project.workspace)) {
       throw new AgentStartError(project.projectId, `workspace 不存在：${project.workspace}`);
     }
 
-    // 生成包装器配置（默认关闭 events，合并项目 agentConfig），经 --config 传给包装器；
+    // 生成包装器配置（DEFAULT ← baseConfig ← agentConfig ← risk 配置补丁），经 --config 传给包装器；
     // 生成失败即终止启动，避免已拉起 serve 后才失败
     const appRoot = appRootFromModule(import.meta.url);
     let configPath: string;
     try {
-      configPath = writeAgentConfig(project, appRoot);
+      configPath = writeAgentConfig(project, appRoot, adapter.baseConfig(), perm.config);
     } catch (err) {
       throw new AgentStartError(project.projectId, `生成包装器配置失败：${errorMessage(err)}`);
     }
+
+    // 启动配置快照（每次拉起都打）：配置获取层级 + endpoint / 模型 id（配置面解析，观测用）
+    const snapshot = describeAgentConfig(project, configPath);
+    console.log(`[launcher] agent ${project.projectId} 配置层级：${snapshot.hierarchy}`);
+    console.log(`[launcher] agent ${project.projectId} endpoint=${snapshot.endpoint}，model=${snapshot.model}`);
 
     // opencode 项目：先确保前置 `opencode serve`（cwd=workspace，本机空闲端口）
     let backend: OpencodeBackend | null = null;
@@ -205,6 +214,7 @@ export class AgentManager {
       workspace: project.workspace,
       a2aPort: project.a2aPort,
       configPath,
+      permissionArgs: perm.args,
       ...(backend !== null ? { backendUrl: backend.url } : {}),
     });
 

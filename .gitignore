@@ -23,3 +23,6 @@ orch/config/config.json
 /planlog.md.template
 /doc/
 /.omo/skills/
+
+# 本地规划文档（不入库）
+/未来发展方向0912-gpt.md

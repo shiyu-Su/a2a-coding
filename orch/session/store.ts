@@ -45,6 +45,8 @@ export interface TaskCreateInput {
   contextId: string;
   state: TaskState;
   artifactsJson?: string | null;
+  /** 任务结果纯文本（成功 = artifacts 文本；失败 = status.message 错误原因） */
+  text?: string | null;
   updatedAt?: string;
 }
 
@@ -106,6 +108,7 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     contextId: readString(row, "context_id"),
     state,
     artifactsJson: readNullableString(row, "artifacts_json"),
+    text: readNullableString(row, "text"),
     updatedAt: readString(row, "updated_at"),
   };
 }
@@ -128,6 +131,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   context_id    TEXT NOT NULL,
   state         TEXT NOT NULL,
   artifacts_json TEXT,
+  text          TEXT,
   updated_at    TEXT NOT NULL
 )`;
 
@@ -147,6 +151,12 @@ export class SessionStore {
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec(SESSIONS_DDL);
     this.db.exec(TASKS_DDL);
+    // 旧库迁移：此前版本的 tasks 表无 text 列（列已存在时 ALTER 失败，忽略）
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN text TEXT");
+    } catch {
+      // 列已存在
+    }
   }
 
   /** 查询会话映射；不存在返回 null */
@@ -197,13 +207,14 @@ export class SessionStore {
     this.db
       .prepare(
         `INSERT INTO tasks
-           (task_id, project_id, context_id, state, artifacts_json, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+           (task_id, project_id, context_id, state, artifacts_json, text, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(task_id) DO UPDATE SET
            project_id = excluded.project_id,
            context_id = excluded.context_id,
            state = excluded.state,
            artifacts_json = excluded.artifacts_json,
+           text = excluded.text,
            updated_at = excluded.updated_at`,
       )
       .run(
@@ -212,6 +223,7 @@ export class SessionStore {
         rec.contextId,
         rec.state,
         rec.artifactsJson ?? null,
+        rec.text ?? null,
         updatedAt,
       );
     const stored = this.getTask(rec.taskId);
@@ -222,26 +234,26 @@ export class SessionStore {
   }
 
   /**
-   * 更新任务态；`artifactsJson` 省略时保留原值，传 null 时清空。
-   * 任务不存在返回 null。
+   * 更新任务态；`artifactsJson` / `text` 未提供时保留原值（COALESCE）。
+   * 任务不存在时无效果，返回 null。
    */
   updateTaskState(
     taskId: string,
     state: TaskState,
     artifactsJson?: string | null,
+    text?: string | null,
   ): TaskRecord | null {
     const updatedAt = nowIso();
-    if (artifactsJson === undefined) {
-      this.db
-        .prepare("UPDATE tasks SET state = ?, updated_at = ? WHERE task_id = ?")
-        .run(state, updatedAt, taskId);
-    } else {
-      this.db
-        .prepare(
-          "UPDATE tasks SET state = ?, artifacts_json = ?, updated_at = ? WHERE task_id = ?",
-        )
-        .run(state, artifactsJson, updatedAt, taskId);
-    }
+    this.db
+      .prepare(
+        `UPDATE tasks
+         SET state = ?,
+             artifacts_json = COALESCE(?, artifacts_json),
+             text = COALESCE(?, text),
+             updated_at = ?
+         WHERE task_id = ?`,
+      )
+      .run(state, artifactsJson ?? null, text ?? null, updatedAt, taskId);
     return this.getTask(taskId);
   }
 
@@ -249,7 +261,7 @@ export class SessionStore {
   getTask(taskId: string): TaskRecord | null {
     const row = this.db
       .prepare(
-        `SELECT task_id, project_id, context_id, state, artifacts_json, updated_at
+        `SELECT task_id, project_id, context_id, state, artifacts_json, text, updated_at
          FROM tasks WHERE task_id = ?`,
       )
       .get(taskId);
@@ -297,8 +309,9 @@ export function updateTaskState(
   taskId: string,
   state: TaskState,
   artifactsJson?: string | null,
+  text?: string | null,
 ): TaskRecord | null {
-  return getDefaultStore().updateTaskState(taskId, state, artifactsJson);
+  return getDefaultStore().updateTaskState(taskId, state, artifactsJson, text);
 }
 
 /** 查询任务记录（默认存储） */
