@@ -46,7 +46,7 @@ A2A 包装器（opencode 另需前置 opencode serve，codex / claude 无前置�
 
 ## 目录结构
 
-代码按部署单元组织，`orch/` 与 `machine/` 各自完全自包含（各自的 `package.json` / `tsconfig.json` / `node_modules/` / `dist/` / `config/`）。单元之间只通过线协议耦合，线协议类型两侧各自声明，修改时必须同步。
+代码按部署单元组织，`orch/` 与 `machine/` 各自完全自包含（各自的 `package.json` / `tsconfig.json` / `node_modules/` / `dist/` / `config/`）。单元之间只通过线协议耦合：线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单一事实源，类型两侧各自声明、由契约测试（`test-protocol-version`）锁定一致；修改协议时先改 PROTOCOL.md 再同步两侧实现。
 
 ```
 a2a-coding/
@@ -266,6 +266,7 @@ orch 用 `project`（如 `frontend` / `backend`）派发到对应项目；同机
 
 ## 文档索引
 
+- [PROTOCOL.md](PROTOCOL.md)：Bridge ⇄ Launcher 线协议契约（端点/字段、版本规则、握手语义、可支持对端版本维护流程、演进记录表）
 - [CHANGELOG.md](CHANGELOG.md)：版本变更记录
 
 ## 已知边界
