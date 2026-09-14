@@ -1,5 +1,15 @@
 {
+  "_comment": "callback：orch 回调端点（默认关 enabled=false）。开启后桥在 host:port 上监听 POST /callback 接收 worker push 通知；仅同机/受信网络 opt-in（跨机回调鉴权待 v0.7.0）。host 缺省 127.0.0.1、port 缺省 3200（避开 Launcher 3100 与项目 A2A 3010-3012）；可选 token 用于校验推送请求（省略则不校验，字段名 token）。machines[].pushCallback：该机项目是否接收 orch push 回调（缺省 false）；仅当 callback.enabled 与该位同时为 true 时，派发才内联注册回调。",
+  "callback": {
+    "enabled": false,
+    "host": "127.0.0.1",
+    "port": 3200
+  },
   "machines": [
-    { "machineId": "<machine-id>", "launcherUrl": "http://<host>:3100" }
+    {
+      "machineId": "<machine-id>",
+      "launcherUrl": "http://<host>:3100",
+      "pushCallback": false
+    }
   ]
 }

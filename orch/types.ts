@@ -23,8 +23,12 @@ export const SUPPORTED_PEER_PROTOCOL_MAJORS: readonly number[] = [1];
 /** 执行层 Agent 类型（决定 A2A 包装器与 CLI 参数） */
 export type AgentKind = "opencode" | "codex" | "claude";
 
-/** A2A 任务态 */
-export type TaskState = "working" | "completed" | "failed" | "input-required";
+/**
+ * A2A 任务态。
+ * `blocked` 为 **orch 本地专属**（v0.4.0 失败传播：上游失败 → 下游置 blocked），
+ * **不映射 A2A**（A2A 无此态；派发/查询一律按 `working` 语义处理）。
+ */
+export type TaskState = "working" | "completed" | "failed" | "input-required" | "blocked";
 
 /**
  * Feature 状态（v0.3.0）。
@@ -54,6 +58,14 @@ export interface FeatureRecord {
   title: string;
   /** 需求原文（截断，可空） */
   requirement: string | null;
+  /** Feature 级会话上下文（跨任务 / 跨 worker 启停复用；可空） */
+  contextId: string | null;
+  /** 统一方案（分析汇总产出，供审批与派发注入；可空） */
+  plan: string | null;
+  /** 决策记录（JSON 字符串；可空） */
+  decisions: string | null;
+  /** 契约（JSON 字符串；可空） */
+  contracts: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -63,6 +75,8 @@ export interface FeatureCreateInput {
   featureId: string;
   title: string;
   requirement?: string | null;
+  /** Feature 级会话上下文（可空；亦可后续经 `updateFeatureContext` 写入） */
+  contextId?: string | null;
   /** 缺省 `discussing` */
   state?: FeatureState;
   createdAt?: string;
@@ -76,11 +90,31 @@ export type RiskLevel = "read" | "write" | "full";
 export interface MachineRef {
   machineId: string;
   launcherUrl: string;
+  /**
+   * 该机项目是否接收 orch push 回调（v0.4.0 §2.6；缺省 false）。
+   * 仅当 orch `callback.enabled` 与该位**同时**为真时，派发才内联注册回调（路径 1）。
+   */
+  pushCallback?: boolean;
+}
+
+/**
+ * orch 回调端点配置（v0.4.0 §2.6 worker 回调）。
+ * 默认关；开启后桥在 `host:port` 上监听 `POST /callback` 接收 worker push 通知。
+ * `host` 默认 loopback（跨机回调鉴权待 v0.7.0）；`token` 可选，命中则校验通知请求。
+ */
+export interface CallbackConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  /** 可选校验令牌（worker push 以 `X-A2A-Notification-Token` 回传；缺省不校验） */
+  token?: string;
 }
 
 /** orch 侧：机器清单 */
 export interface MachinesConfig {
   machines: MachineRef[];
+  /** orch 回调端点（v0.4.0；缺省 = 关闭） */
+  callback?: CallbackConfig;
 }
 
 /** 项目 + 运行态（GET /projects 返回；bridge 消费的 launcher 线协议） */
@@ -121,6 +155,19 @@ export interface SessionRecord {
   lastUsedAt: string;
 }
 
+/**
+ * 下游任务对上游产物的引用（`tasks.input_artifacts` 元素；v0.4.0）。
+ * 两种定位方式任选其一：`artifactId` 直指主键；或 `producerTaskId`（+可选 `name`）按上游匹配。
+ */
+export interface InputArtifactRef {
+  /** 上游节点（本地 taskId） */
+  producerTaskId?: string;
+  /** 产物名（配 `producerTaskId` 定位，如 `api.yaml`） */
+  name?: string;
+  /** 产物主键（直接定位，优先于 producerTaskId+name） */
+  artifactId?: string;
+}
+
 /** 任务记录 */
 export interface TaskRecord {
   /**
@@ -141,10 +188,48 @@ export interface TaskRecord {
   featureId: string | null;
   /** 前置任务（本地 taskId 数组，环/悬空引用由调度器校验）；NULL = 无依赖 */
   dependencies: string[] | null;
+  /** 下游声明的上游产物引用（v0.4.0；NULL = 无输入产物） */
+  inputArtifacts: InputArtifactRef[] | null;
   /** Feature 节点派发后远端 A2A 任务 id；独立任务为 NULL（taskId 即远端 id） */
   remoteTaskId: string | null;
   /** Feature 排队节点的待派发消息全文；派发后保留（作为可重派依据） */
   dispatchMessage: string | null;
+}
+
+/** 产物登记记录（落 SQLite `artifacts` 表；v0.4.0） */
+export interface ArtifactRecord {
+  /** 主键：`${producerTaskId}:${remoteArtifactId}`（避免跨任务 id 冲突） */
+  artifactId: string;
+  /** 归属 Feature */
+  featureId: string;
+  /** 上游节点（本地 taskId） */
+  producerTaskId: string;
+  /** 产物名（如 `api.yaml`） */
+  name: string;
+  /** mediaType（可空） */
+  mime: string | null;
+  /** 内容引用（本地落位 / 远端 uri；可空） */
+  uri: string | null;
+  /** 字节大小（可空） */
+  size: number | null;
+  /** 内容哈希（可空） */
+  contentHash: string | null;
+  createdAt: string;
+}
+
+/** 事件收件箱记录（落 SQLite `events` 表；v0.4.0） */
+export interface EventRecord {
+  /** 自增游标（`listEvents(since)` 以此为序） */
+  eventId: number;
+  featureId: string | null;
+  taskId: string | null;
+  /** `task.settled` / `task.blocked` / `feature.state`（后续可扩展 push.received 等） */
+  kind: string;
+  /** 变化后的状态串（可空） */
+  state: string | null;
+  /** 附加载荷（JSON 字符串；可空） */
+  payload: string | null;
+  createdAt: string;
 }
 
 /** `a2a_tasks` 列表项：本地任务记录 + 陈旧标记 */

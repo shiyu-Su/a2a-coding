@@ -36,7 +36,7 @@ a2a-coding 让开发协作时 orch 只管派发任务；目标项目的执行 Ag
 ```mermaid
 flowchart TD
     USER([用户]) -->|需求讨论 / 任务派发| ORCH["orch Agent<br/>任意 MCP host（示例 opencode）"]
-    ORCH -->|"MCP stdio<br/>泛型工具 5 + Feature 工具组 5"| BRIDGE["MCP 薄桥 · orch/<br/>项目 → 机器解析 · 幂等 ensure · A2A Client · 任务态落库"]
+    ORCH -->|"MCP stdio<br/>泛型工具 7 + Feature 工具组 5"| BRIDGE["MCP 薄桥 · orch/<br/>项目 → 机器解析 · 幂等 ensure · A2A Client · 任务态落库"]
     BRIDGE -->|"HTTP JSON<br/>GET /projects · POST ensure/stop · GET /health"| LAUNCHER["每机 Launcher · machine/<br/>本机项目配置 · Agent 生命周期 · 空闲回收"]
     LAUNCHER -->|拉起包装器（按 agentKind）| WRAP["A2A 包装器<br/>a2a-opencode / a2a-codex / a2a-claude"]
     WRAP -->|" CLI<br/>opencode run / codex exec / claude -p"| WS["目标 workspace 执行"]
@@ -70,8 +70,8 @@ flowchart TD
 - ✅ **静态分布，无中心注册**：项目到机器的映射来自配置，不做自注册、心跳、TTL 或服务发现。
 - ✅ **每机常驻 Launcher**：管理本机项目 Agent 生命周期，暴露 `health` / `projects` / `ensure` / `stop` 接口。
 - ✅ **按需幂等启动**：派发任务才 `ensure`，已在运行直接复用同一 A2A 端点，不重复拉起。
-- ✅ **泛型 MCP 工具面**：orch 只经 `a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` 通信，agent 增减无需重连或刷新工具面。
-- ✅ **Feature 编排**：把一个需求作为 Feature，经状态机 + 串行 Task DAG 调度器跨项目自动派发，中途可停下审批 / 澄清。
+- ✅ **泛型 MCP 工具面**：orch 只经 `a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` / `a2a_events` / `a2a_wait` 通信，agent 增减无需重连或刷新工具面。
+- ✅ **Feature 编排**：把一个需求作为 Feature，经状态机 + 拓扑并行 Task DAG 调度器跨项目自动派发，中途可停下审批 / 澄清；上游失败向下游传播 `blocked`，不带病继续。
 - ✅ **会话映射持久化**：`contextId ↔ sessionId` 落 SQLite（`node:sqlite`），两侧进程重启均不丢。
 - ✅ **任务态回传与兜底找回**：任务态与结果落库；丢失 `taskId` 句柄可用 `a2a_tasks` 找回。
 - ✅ **最小权限**：项目 `risk` 档位（`read` / `write` / `full`）映射到各端权限 / 沙箱参数。
@@ -175,7 +175,7 @@ npm run status       # 查看 pid / host:port / health / startedAt
 
 ## 使用示例
 
-工具面为「**泛型工具 5 + Feature 工具组 5**」，在 orch 里直接调用：
+工具面为「**泛型工具 7 + Feature 工具组 5**」，在 orch 里直接调用：
 
 ```text
 a2a_projects()
@@ -192,7 +192,7 @@ Feature 编排（把一个需求作为 Feature 推进）：
 a2a_feature_create(title="给登录页加记住我", requirement="…")
 # 2) 推进主链到等待审批后停下
 a2a_feature_advance(featureId="<id>", to="waiting_approval")
-# 3) 用户放行，桥内串行 Task DAG 调度器按 dependencies 自动派发
+# 3) 用户放行，桥内 Task DAG 调度器按 dependencies 拓扑派发（同层并行）
 a2a_feature_approve(featureId="<id>")
 # 4) 任务需澄清时 Feature 停 needs_input，补齐答案续推
 a2a_feature_advance(featureId="<id>", to="executing", answer="…")
@@ -224,6 +224,7 @@ a2a_feature_advance(featureId="<id>", to="executing", answer="…")
 | `projects[].a2aPort` | 该项目 A2A Server 监听端口 | - | 是 |
 | `projects[].risk` | 项目风险档位，`read` / `write` / `full`，决定包装器传给底层 CLI 的权限 / 沙箱参数 | `write` | 否 |
 | `projects[].agentConfig` | 包装器配置片段，顶层键如 `model` / `mcp` / `events` / `systemPrompt`；launcher 会与默认项 `{ "events": { "enabled": false } }` 深合并，写入 `agents/<agentKind>.<projectId>.json`，经 `--config` 传给包装器，再与包装器内置默认值深合并 | - | 否 |
+| `projects[].agentConfig.agentCard.pushNotifications` | worker push 能力开关；`true` 时项目 Agent 可向 orch 回调端点推送状态变化（配合 orch `callback` + `pushCallback` 使用） | `false`（默认关） | 否 |
 
 `risk` 到各端权限参数的映射（`write` 为默认，恰等于三端包装器内置默认；opencode 只有自动放行开 / 关一个旋钮，`write` 与 `full` 相同）：
 
@@ -257,15 +258,28 @@ a2a_feature_advance(featureId="<id>", to="executing", answer="…")
 
 ### orch：`orch/config/config.json`
 
-orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自持（实际配置 `config/config.json` 不入库，首次部署从 `config/config.json.default` 复制并填入真实机器地址）。字段为 `machines[]`，每项含 `machineId` + `launcherUrl`。
+orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自持（实际配置 `config/config.json` 不入库，首次部署从 `config/config.json.default` 复制并填入真实机器地址）。字段为 `machines[]`（每项含 `machineId` + `launcherUrl`）与可选的 `callback`。
+
+| 字段 | 说明 | 默认值 | 必填 |
+|------|------|--------|------|
+| `machines[].machineId` | 机器标识，需与本机 Launcher 配置一致 | - | 是 |
+| `machines[].launcherUrl` | 该机 Launcher 地址（如 `http://localhost:3100`） | - | 是 |
+| `machines[].pushCallback` | 按机 opt-in：允许该机 worker 向 orch 回调端点推送状态变化（需配合 `callback` 与项目 `agentConfig.agentCard.pushNotifications`） | `false` | 否 |
+| `callback.enabled` | 开启 orch HTTP 事件端点（`POST /callback`），接收 worker push；**默认关**，仅同机 / 受信网络 opt-in | `false` | 否 |
+| `callback.host` | 事件端点绑定地址（建议 loopback） | `127.0.0.1` | 否 |
+| `callback.port` | 事件端点监听端口 | - | `callback.enabled=true` 时是 |
+| `callback.token` | 事件端点校验令牌（worker 推送时携带）；不填则不校验 | 不校验 | 否 |
 
 ```json
 {
   "machines": [
-    { "machineId": "win-dev", "launcherUrl": "http://localhost:3100" }
-  ]
+    { "machineId": "win-dev", "launcherUrl": "http://localhost:3100", "pushCallback": false }
+  ],
+  "callback": { "enabled": false, "host": "127.0.0.1", "port": 3200, "token": "<可选>" }
 }
 ```
+
+> `callback` 默认关闭：跨机回调受鉴权边界约束（跨机鉴权待后续），当前仅同机 / 受信网络可 opt-in。关闭或端点不可达时，任务终态仍由 `task-watcher` 轮询对账兜底落库。
 
 环境变量 `MACHINES_CONFIG` 可指定其他清单文件；缺省为 `config/config.json`（模板 `config/config.json.default`）。
 
@@ -326,17 +340,19 @@ Bridge ⇄ Launcher 的线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单�
 
 ### MCP 工具面
 
-#### 泛型工具（5 个）
+#### 泛型工具（7 个）
 
 - `a2a_projects()`：列出所有已配置机器及其本机项目（含运行态与 A2A 端点）。
 - `a2a_call(project, message, contextId?, wait?)`：解析项目到机器，幂等 ensure，经 A2A 派发一轮任务。默认半异步：≤30s 完成直接返回文本结果与 artifacts，更长返回 `working + taskId` 并用 `a2a_task_status` 轮询；`wait=false` 时永远立即返回 `working + taskId + contextId`（不进入同步轮询，后台看护照常落库）。
 - `a2a_task_status(taskId)`：查询任务态并回写本地任务存储。已终结任务（completed / failed / input-required）由桥本地存档直接作答（不唤醒远端 Agent）；未终结任务走远端实时查询。
 - `a2a_tasks(project, [state], [limit])`：按项目列出本地任务记录（默认 `updatedAt` 倒序、默认 20 条、最多 100），每条含 `prompt` 片段 / state / text / contextId / updatedAt / stale。用于丢失 `taskId` 句柄后的兜底找回。
 - `a2a_cancel(taskId)`：取消任务，并回写本地任务存储。
+- `a2a_events(since?)`：读取事件收件箱增量（任务结算 / 阻塞、Feature 流转、worker push）。省略 `since` 则自进程读游标起；无变化时廉价空返回。
+- `a2a_wait(timeoutMs?)`：长轮询等待新事件（推送优先唤醒 + 定时对账），最多 `timeoutMs`（内部上限低于同步预算）；超时无事件则 `timedOut=true`。
 
 #### Feature 工具组（5 个）
 
-把一个需求作为 Feature 编排：`a2a_feature_create` 建 Feature → orch 组织各项目分析、汇总方案 → `a2a_feature_advance` 推进到 `waiting_approval` 停下 → 用户 `a2a_feature_approve` 放行 → 桥内串行 Task DAG 调度器按 `dependencies` 自动派发各项目任务并推进至完成；任务需澄清时 Feature 停 `needs_input`，`a2a_feature_advance(..., answer=…)` 续推。
+把一个需求作为 Feature 编排：`a2a_feature_create` 建 Feature → orch 组织各项目分析、汇总方案 → `a2a_feature_advance` 推进到 `waiting_approval` 停下 → 用户 `a2a_feature_approve` 放行 → 桥内 Task DAG 调度器（**同层拓扑并行** + 失败传播）按 `dependencies` 自动派发各项目任务并推进至完成；任务需澄清时 Feature 停 `needs_input`，`a2a_feature_advance(..., answer=…)` 续推。
 
 - `a2a_feature_create(title, requirement?, contextId?)`：新建 Feature（`discussing`），返回 `featureId`。
 - `a2a_feature_status(featureId?)`：查看 Feature 详情 / 列表（state + tasks 摘要）。
@@ -344,7 +360,7 @@ Bridge ⇄ Launcher 的线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单�
 - `a2a_feature_approve(featureId)`：审批门——`waiting_approval → executing`。
 - `a2a_feature_cancel(featureId)`：任意非终态 → `cancelled`。
 
-`a2a_call` 增可选 `featureId` / `dependencies`：带 `featureId` = 登记该 Feature 的队列节点（由调度器按 `dependencies` 串行派发）；不带则与既有行为一致（立即派发）。
+`a2a_call` 增可选 `featureId` / `dependencies`：带 `featureId` = 登记该 Feature 的队列节点（由调度器按 `dependencies` 拓扑派发，同层并行）；不带则与既有行为一致（立即派发）。
 
 #### 任务态
 
@@ -363,12 +379,12 @@ a2a-coding/
 │  ├─ config/config.json.default  # 机器清单模板（入库）
 │  ├─ opencode.json               # 样例：把 mcp.a2a 配进 orch 的 opencode
 │  ├─ types.ts  config.ts  app-root.ts
-│  ├─ bridge/index.ts             # MCP 薄桥：泛型 5 + Feature 工具组 5；派发主链 dispatchTask
+│  ├─ bridge/index.ts             # MCP 薄桥：泛型 7 + Feature 工具组 5；派发主链 dispatchTask
 │  ├─ bridge/task-watcher.ts      # 任务后台看护（轮询 + 续约至终态落库；onSettled 供调度器接驳）
-│  ├─ bridge/scheduler.ts         # 串行 Task DAG 调度器（Feature 编排；启动恢复 + 单任务门闩）
+│  ├─ bridge/scheduler.ts         # 拓扑并行 Task DAG 调度器（失败传播 blocked / 启动恢复）
 │  ├─ bridge/feature-tools.ts     # Feature 工具组 handler（create / status / advance / approve / cancel）
 │  ├─ feature/state-machine.ts    # Feature 状态机（9 主态 + 异常态；纯函数，非法流转 fail-fast）
-│  ├─ session/store.ts            # 会话/任务库（node:sqlite；sessions + tasks + features）
+│  ├─ session/store.ts            # 会话/任务库（node:sqlite；sessions + tasks + features + artifacts + events）
 │  └─ data/                       # 运行态：sessions.sqlite（git 忽略）
 ├─ machine/                       # 部署单元 2（每台执行机器）：每机常驻
 │  ├─ package.json                # @a2a-coding/machine：express / a2a-opencode / a2a-codex / a2a-claude

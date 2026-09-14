@@ -4,11 +4,13 @@
   "launcher": { "port": 3100, "idleStopMs": 300000, "startupCheck": true, "startupCheckTimeoutMs": 120000, "shutdownEndpoint": false },
   "projects": [
     {
+      "_comment": "可选：A2A push 回调能力（按机器/项目 opt-in，默认不开启）。将 agentConfig.agentCard.pushNotifications 设为 true 即对本项目开启；缺省或写 false = 不开启（沿用轮询对账）。回调 url/token 无需在此配置——由 orch 经 A2A message/send 的 configuration.taskPushNotificationConfig 内联下发，故无需改 ensure 或线协议。仅限同机/受信网络使用；跨机回调鉴权待 v0.7.0。",
       "projectId": "<project-id>",
       "workspace": "<absolute path to the project on this machine>",
       "agentKind": "opencode",
       "a2aPort": 3010,
-      "risk": "write"
+      "risk": "write",
+      "agentConfig": { "agentCard": { "pushNotifications": false } }
     },
     {
       "projectId": "<codex-project-id>",

@@ -18,6 +18,8 @@
  * 跨 MCP 边界的错误一律结构化返回（`{ ok: false, code, error }`），不抛出。
  */
 import { randomUUID } from "node:crypto";
+import { createServer } from "node:http";
+import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { join } from "node:path";
 import {
   ClientFactory,
@@ -26,7 +28,7 @@ import {
   RestTransportFactory,
 } from "@a2a-js/sdk/client";
 import type { Client } from "@a2a-js/sdk/client";
-import { Role, TaskState as A2aTaskState } from "@a2a-js/sdk";
+import { Role, TaskState as A2aTaskState, taskStateFromJSON } from "@a2a-js/sdk";
 import type {
   Artifact,
   Message,
@@ -45,6 +47,11 @@ import {
   PROTOCOL_VERSION,
   SUPPORTED_PEER_PROTOCOL_MAJORS,
   type AgentKind,
+  type ArtifactRecord,
+  type CallbackConfig,
+  type EventRecord,
+  type FeatureRecord,
+  type InputArtifactRef,
   type MachineRef,
   type ProjectStatus,
   type RiskLevel,
@@ -53,18 +60,26 @@ import {
   type TaskState as DomainTaskState,
 } from "../types.js";
 import {
+  appendEvent,
   createTask,
+  getArtifact,
   getFeature,
   getTask,
+  latestEventId,
+  listArtifactsByFeature,
+  listArtifactsByProducer,
+  listEvents,
   listTasks,
   markTaskDispatched,
   pruneTasks,
   truncatePrompt,
   updateTaskState,
+  upsertArtifact,
   close as closeSessionStore,
 } from "../session/store.js";
 import {
   isTaskWatched,
+  notifyTaskPush,
   startTaskWatcher,
   WATCHER_MAX_CONSECUTIVE_FAILURES,
 } from "./task-watcher.js";
@@ -112,6 +127,23 @@ const SYNC_BUDGET_MS = readPositiveIntEnv("SYNC_BUDGET_MS", 30_000);
 const POLL_INTERVAL_MS = readPositiveIntEnv("POLL_INTERVAL_MS", 1_000);
 /** 任务轮询期间的租约续期间隔（周期性重呼 launcher `ensure`，防止空闲自动停止误杀运行中任务） */
 const LEASE_RENEW_INTERVAL_MS = readPositiveIntEnv("LEASE_RENEW_INTERVAL_MS", 5_000);
+/** 派发注入上游产物时的内联字符上限；超出仅保留头部 + 截断说明（完整内容按 uri 引用） */
+const ARTIFACT_INLINE_MAX_CHARS = readPositiveIntEnv("ARTIFACT_INLINE_MAX_CHARS", 4_000);
+
+/** 回调端点默认配置（`config.callback` 缺省时；默认关） */
+const DEFAULT_CALLBACK_CONFIG: CallbackConfig = { enabled: false, host: "127.0.0.1", port: 3200 };
+/** 回调请求体字节上限（防御性；超出即 400） */
+const CALLBACK_MAX_BODY_BYTES = readPositiveIntEnv("CALLBACK_MAX_BODY_BYTES", 1_048_576);
+/** 回调事件落库 payload 截断上限（事件表只作收件箱，不存全量 Task） */
+const CALLBACK_PAYLOAD_MAX_CHARS = readPositiveIntEnv("CALLBACK_PAYLOAD_MAX_CHARS", 2_000);
+/** `a2a_events` 单次返回条数上限 */
+const EVENTS_PAGE_LIMIT = readPositiveIntEnv("EVENTS_PAGE_LIMIT", 100);
+/** `a2a_wait` 除订阅唤醒外对 DB 的轮询对账间隔（兜底：非回调路径写入的事件） */
+const EVENT_WAIT_POLL_MS = readPositiveIntEnv("EVENT_WAIT_POLL_MS", 500);
+/** `a2a_wait` 内部 cap：须 < `SYNC_BUDGET_MS`（宿主 MCP 请求超时），留 5s 余量 */
+const EVENT_WAIT_MAX_MS = Math.max(1_000, SYNC_BUDGET_MS - 5_000);
+/** 事件 kind：收到 worker push 回调（v0.4.0 §2.6） */
+const EVENT_PUSH_RECEIVED = "push.received";
 
 const AGENT_KINDS: readonly AgentKind[] = ["opencode", "codex", "claude"];
 
@@ -386,6 +418,37 @@ function loadMachines(): { ok: true; machines: MachineRef[] } | { ok: false; err
       error: `加载机器清单失败（${MACHINES_CONFIG_PATH}）：${toMessage(err)}`,
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// worker 回调配置（v0.4.0 §2.6：push 内联注册 + 本地事件端点；默认关）
+// ---------------------------------------------------------------------------
+
+/** 回调端点配置（懒加载 + 进程内缓存；加载失败回落默认关闭） */
+let cachedCallbackConfig: CallbackConfig | null = null;
+let callbackConfigLoaded = false;
+
+function callbackConfig(): CallbackConfig {
+  if (!callbackConfigLoaded) {
+    callbackConfigLoaded = true;
+    try {
+      cachedCallbackConfig = loadMachinesConfig(MACHINES_CONFIG_PATH).callback ?? null;
+    } catch (err) {
+      console.error(`[a2a-bridge] 加载回调配置失败：${toMessage(err)}`);
+      cachedCallbackConfig = null;
+    }
+  }
+  return cachedCallbackConfig ?? DEFAULT_CALLBACK_CONFIG;
+}
+
+/**
+ * 该机器本次派发是否内联注册 push 回调（路径 1，v0.4.0 §2.6）：
+ * 需 orch `callback.enabled` 与该机 `pushCallback` **同时**为真；返回回调 `url`/`token`。
+ */
+function pushCallbackFor(machine: MachineRef): { url: string; token: string } | null {
+  const cb = callbackConfig();
+  if (!cb.enabled || machine.pushCallback !== true) return null;
+  return { url: `http://${cb.host}:${cb.port}/callback`, token: cb.token ?? "" };
 }
 
 /** 解析 project -> machine（命中缓存时仅向该机核对；未命中时全量扫描并写缓存） */
@@ -683,9 +746,15 @@ function taskText(task: Task): string {
   return artifactChunks.join("\n\n");
 }
 
-/** 本地记录是否已终结（终结态结果由本地存档直接作答，不再查询远端） */
+/**
+ * 本地记录是否已终结（终结态结果由本地存档直接作答，不再查询远端）。
+ * `blocked` 为 orch 本地专属终态（v0.4.0 失败传播，不映射 A2A）：被阻塞节点不会再派发，
+ * 直接以本地存档作答，避免误查远端。
+ */
 function isLocalTerminalState(state: DomainTaskState): boolean {
-  return state === "completed" || state === "failed" || state === "input-required";
+  return (
+    state === "completed" || state === "failed" || state === "input-required" || state === "blocked"
+  );
 }
 
 /** 从本地存档的 artifactsJson（ArtifactSummary[]）拼接文本；规则对齐 partsToText/taskText，兼容无 text 的旧记录 */
@@ -736,7 +805,11 @@ function workingGuidanceText(taskId: string, contextId: string): string {
   return `任务仍在执行中。请用 a2a_task_status(taskId="${taskId}") 轮询结果；不要重复 a2a_call（同一任务会重复执行）。若任务因 agent 回收而中断，可携带同 contextId（${contextId}）调用 a2a_call 续接会话继续。`;
 }
 
-function buildSendRequest(text: string, contextId: string): SendMessageRequest {
+function buildSendRequest(
+  text: string,
+  contextId: string,
+  push: { url: string; token: string } | null,
+): SendMessageRequest {
   const message: Message = {
     messageId: randomUUID(),
     contextId,
@@ -760,7 +833,18 @@ function buildSendRequest(text: string, contextId: string): SendMessageRequest {
     message,
     configuration: {
       acceptedOutputModes: ["text/plain", "application/json"],
-      taskPushNotificationConfig: undefined,
+      // v0.4.0 §2.6：按 opt-in 内联注册回调（内联注册时 taskId 必须为空，A2A 规范）
+      taskPushNotificationConfig:
+        push === null
+          ? undefined
+          : {
+              tenant: "",
+              id: randomUUID(),
+              taskId: "",
+              url: push.url,
+              token: push.token,
+              authentication: undefined,
+            },
       returnImmediately: true,
     },
     metadata: undefined,
@@ -869,6 +953,8 @@ function deferWorkingTask(
       );
       console.log(`[a2a-bridge] 后台看护：任务 ${task.id} 已终态（${state}），结果落库`);
     },
+    // v0.4.0 §2.6：可选订阅推送（命中即提前对账；无推送时与纯轮询等价）
+    subscribePush: true,
     pollIntervalMs: POLL_INTERVAL_MS,
     renewIntervalMs: LEASE_RENEW_INTERVAL_MS,
     maxConsecutiveFailures: WATCHER_MAX_CONSECUTIVE_FAILURES,
@@ -933,9 +1019,12 @@ async function dispatchTask(
 
   let result: SendMessageResult;
   try {
-    result = await client.sendMessage(buildSendRequest(text, contextId), {
-      signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS),
-    });
+    result = await client.sendMessage(
+      buildSendRequest(text, contextId, pushCallbackFor(located.machine)),
+      {
+        signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS),
+      },
+    );
   } catch (err) {
     return {
       ok: false,
@@ -1013,13 +1102,231 @@ async function handleCall(
 }
 
 // ---------------------------------------------------------------------------
-// Feature 编排接线（v0.3.0）：节点登记 + 调度器派发
+// Feature 编排接线（v0.3.0 登记 + 调度器派发；v0.4.0 Context / 上游产物注入）
 // ---------------------------------------------------------------------------
+
+/** 产物摘要各 part 中首个非空 mediaType（无则 null） */
+function firstPartMime(parts: readonly ArtifactPartSummary[]): string | null {
+  for (const part of parts) {
+    if (typeof part.mediaType === "string" && part.mediaType.length > 0) return part.mediaType;
+  }
+  return null;
+}
+
+/** 产物摘要各 part 中首个 url（内容引用；无则 null） */
+function artifactUriOf(parts: readonly ArtifactPartSummary[]): string | null {
+  for (const part of parts) {
+    if (part.kind === "url" && part.url.length > 0) return part.url;
+  }
+  return null;
+}
+
+/** 产物摘要各 part 中首个 raw 字节数（其余 kind 无字节语义；无则 null） */
+function artifactSizeOf(parts: readonly ArtifactPartSummary[]): number | null {
+  for (const part of parts) {
+    if (part.kind === "raw") return part.bytes;
+  }
+  return null;
+}
+
+/**
+ * 把一次 settle 的产物摘要登记为 `artifacts` 行（v0.4.0 §2.3）。
+ * 主键 `${producerTaskId}:${remoteArtifactId}` 避免跨任务 id 冲突；登记 best-effort，
+ * 单条失败只记日志、不阻断任务落库。
+ */
+function registerArtifacts(
+  featureId: string,
+  producerTaskId: string,
+  artifacts: readonly ArtifactSummary[],
+): void {
+  for (const artifact of artifacts) {
+    const artifactId = `${producerTaskId}:${artifact.artifactId}`;
+    try {
+      upsertArtifact({
+        artifactId,
+        featureId,
+        producerTaskId,
+        name: artifact.name.length > 0 ? artifact.name : artifact.artifactId,
+        mime: firstPartMime(artifact.parts),
+        uri: artifactUriOf(artifact.parts),
+        size: artifactSizeOf(artifact.parts),
+        contentHash: null,
+      });
+    } catch (err) {
+      console.error(`[a2a-bridge] 产物登记失败（${artifactId}）：${toMessage(err)}`);
+    }
+  }
+}
+
+/** 内联内容按上限截断（大产物仅保留头部 + 截断说明，完整内容按 uri 引用） */
+function truncateInline(text: string): string {
+  if (text.length <= ARTIFACT_INLINE_MAX_CHARS) return text;
+  return `${text.slice(0, ARTIFACT_INLINE_MAX_CHARS)}\n…（已截断，全文 ${text.length} 字符，完整内容见 uri 引用）`;
+}
+
+/** 把归档产物摘要的 parts 拼为可注入文本（text/data 内联；url/raw 以引用形式） */
+function artifactContentText(parts: readonly ArtifactPartSummary[]): string | null {
+  const chunks: string[] = [];
+  for (const part of parts) {
+    switch (part.kind) {
+      case "text":
+        chunks.push(truncateInline(part.text));
+        break;
+      case "data":
+        chunks.push(truncateInline(stringifyUnknown(part.data)));
+        break;
+      case "url":
+        chunks.push(`（引用）${part.url}`);
+        break;
+      case "raw":
+        chunks.push(
+          `（二进制产物 ${part.filename.length > 0 ? part.filename : "artifact"}，${part.bytes} 字节，见 uri 引用）`,
+        );
+        break;
+    }
+  }
+  return chunks.length === 0 ? null : chunks.join("\n");
+}
+
+interface ResolvedInputArtifact {
+  ref: InputArtifactRef;
+  record: ArtifactRecord | null;
+}
+
+/**
+ * 把单条输入引用展开为已登记的产物行：
+ * - `artifactId` 直指（命中全键，或按 `:${artifactId}` 后缀匹配）；
+ * - `producerTaskId`（+可选 `name`）按生产节点匹配，未给 name 时展开其全部产物；
+ * - 未命中以 `record: null` 占位，注入时如实说明。
+ */
+function resolveArtifactRefs(
+  refs: readonly InputArtifactRef[],
+  featureId: string,
+): ResolvedInputArtifact[] {
+  const out: ResolvedInputArtifact[] = [];
+  for (const ref of refs) {
+    const artifactId = ref.artifactId;
+    if (artifactId !== undefined && artifactId.length > 0) {
+      const direct = getArtifact(artifactId);
+      if (direct !== null) {
+        out.push({ ref, record: direct });
+        continue;
+      }
+      const suffix = `:${artifactId}`;
+      const hit = listArtifactsByFeature(featureId, 1000).find((a) =>
+        a.artifactId.endsWith(suffix),
+      );
+      out.push({ ref, record: hit ?? null });
+      continue;
+    }
+    const producerTaskId = ref.producerTaskId;
+    if (producerTaskId !== undefined && producerTaskId.length > 0) {
+      const produced = listArtifactsByProducer(producerTaskId, 1000);
+      const name = ref.name;
+      const filtered =
+        name !== undefined && name.length > 0 ? produced.filter((a) => a.name === name) : produced;
+      if (filtered.length === 0) {
+        out.push({ ref, record: null });
+        continue;
+      }
+      for (const record of filtered) out.push({ ref, record });
+      continue;
+    }
+    out.push({ ref, record: null });
+  }
+  return out;
+}
+
+/** 未命中产物时的引用描述（供注入段如实说明） */
+function describeArtifactRef(ref: InputArtifactRef): string {
+  if (ref.artifactId !== undefined && ref.artifactId.length > 0) {
+    return `artifactId=${ref.artifactId}`;
+  }
+  const parts: string[] = [];
+  if (ref.producerTaskId !== undefined) parts.push(`producerTaskId=${ref.producerTaskId}`);
+  if (ref.name !== undefined) parts.push(`name=${ref.name}`);
+  return parts.length > 0 ? parts.join(", ") : "(空引用)";
+}
+
+/**
+ * 渲染一条已登记产物：元信息（来源 / mediaType / size / uri）+ 尽力从生产节点归档摘要
+ * 取回内容（按 `artifact_id` 全键或 `name` 匹配），大文本按 `ARTIFACT_INLINE_MAX_CHARS` 截断。
+ */
+function renderRegisteredArtifact(record: ArtifactRecord, producer: TaskRecord | null): string {
+  const meta: string[] = [`来自上游任务 ${record.producerTaskId}`];
+  if (record.mime !== null) meta.push(`mediaType ${record.mime}`);
+  if (record.size !== null) meta.push(`size ${record.size}`);
+  if (record.uri !== null) meta.push(`uri ${record.uri}`);
+  const header = `### ${record.name}（${meta.join("，")}）`;
+  if (producer === null || producer.artifactsJson === null) return header;
+  const prefix = `${record.producerTaskId}:`;
+  const summaries = parseArchivedArtifacts(producer.artifactsJson);
+  const match = summaries.find(
+    (s) => `${prefix}${s.artifactId}` === record.artifactId || s.name === record.name,
+  );
+  if (match === undefined) return header;
+  const content = artifactContentText(match.parts);
+  return content === null ? header : `${header}\n${content}`;
+}
+
+/** 解析节点 `inputArtifacts` 并拼为 `<input-artifacts>` 段；无引用返回 null */
+function renderInputArtifacts(node: TaskRecord): string | null {
+  const refs = node.inputArtifacts;
+  const featureId = node.featureId;
+  if (refs === null || refs.length === 0 || featureId === null) return null;
+  const resolved = resolveArtifactRefs(refs, featureId);
+  if (resolved.length === 0) return null;
+  const sections: string[] = [];
+  for (const item of resolved) {
+    if (item.record === null) {
+      sections.push(
+        `### 未找到产物（${describeArtifactRef(item.ref)}）\n（上游未完成或产物尚未登记）`,
+      );
+      continue;
+    }
+    sections.push(renderRegisteredArtifact(item.record, getTask(item.record.producerTaskId)));
+  }
+  return `<input-artifacts>\n${sections.join("\n\n")}\n</input-artifacts>`;
+}
+
+/** 渲染 Feature Context（plan / decisions / contracts）为 `<feature-context>` 段；全空返回 null */
+function renderFeatureContext(feature: FeatureRecord): string | null {
+  const sections: string[] = [];
+  if (feature.plan !== null && feature.plan.length > 0) {
+    sections.push(`## 统一方案（plan）\n${feature.plan}`);
+  }
+  if (feature.decisions !== null && feature.decisions.length > 0) {
+    sections.push(`## 决策记录（decisions）\n${feature.decisions}`);
+  }
+  if (feature.contracts !== null && feature.contracts.length > 0) {
+    sections.push(`## 契约（contracts）\n${feature.contracts}`);
+  }
+  if (sections.length === 0) return null;
+  return `<feature-context>\n${sections.join("\n\n")}\n</feature-context>`;
+}
+
+/**
+ * 组合节点派发消息：Feature Context + 上游产物输入段（若有）+ 原派发消息。
+ * 无任何注入内容时与原消息逐字一致（保证既有行为不变）。
+ */
+function buildNodeDispatchMessage(node: TaskRecord, feature: FeatureRecord | null): string {
+  const base = node.dispatchMessage ?? node.prompt ?? "";
+  const blocks: string[] = [];
+  if (feature !== null) {
+    const context = renderFeatureContext(feature);
+    if (context !== null) blocks.push(context);
+  }
+  const inputs = renderInputArtifacts(node);
+  if (inputs !== null) blocks.push(inputs);
+  if (blocks.length === 0) return base;
+  return `${blocks.join("\n\n")}\n\n---\n\n${base}`;
+}
 
 /**
  * `a2a_call` 带 `featureId` —— 登记一个 Feature DAG 节点（本地 id），
- * 不立即派发；由调度器在依赖满足后按序派发（串行、每 Feature 单任务门闩）。
- * 仅 `executing` 的 Feature 可挂载任务；`dependencies` 引用同 Feature 内的本地 taskId。
+ * 不立即派发；由调度器在依赖满足后按拓扑并行派发（每 Feature 批门闩）。
+ * `analyzing`（分析扇出）/ `executing` 的 Feature 均可挂载任务；
+ * `dependencies` 引用同 Feature 内的本地 taskId；`inputs` 声明本节点引用的上游产物。
  */
 function registerFeatureNode(
   projectId: string,
@@ -1027,6 +1334,7 @@ function registerFeatureNode(
   contextIdInput: string | undefined,
   featureId: string,
   dependencies: readonly string[],
+  inputs?: readonly InputArtifactRef[] | undefined,
 ): CallOutcome {
   const contextId =
     contextIdInput !== undefined && contextIdInput.length > 0 ? contextIdInput : randomUUID();
@@ -1034,16 +1342,17 @@ function registerFeatureNode(
   if (feature === null) {
     return { ok: false, code: "feature_not_found", error: `未知 Feature ${featureId}`, contextId };
   }
-  if (feature.state !== "executing") {
+  if (feature.state !== "analyzing" && feature.state !== "executing") {
     return {
       ok: false,
       code: "feature_state_invalid",
-      error: `Feature ${featureId} 当前为 ${feature.state}，仅 executing 可挂载任务`,
+      error: `Feature ${featureId} 当前为 ${feature.state}，仅 analyzing / executing 可挂载任务`,
       contextId,
     };
   }
   const localTaskId = randomUUID();
   const deps = dependencies.length > 0 ? Array.from(new Set(dependencies)) : null;
+  const inputRefs = inputs !== undefined && inputs.length > 0 ? Array.from(inputs) : null;
   createTask({
     taskId: localTaskId,
     projectId,
@@ -1053,6 +1362,7 @@ function registerFeatureNode(
     prompt: message,
     featureId,
     dependencies: deps,
+    inputArtifacts: inputRefs,
     dispatchMessage: message,
   });
   scheduler.kick();
@@ -1070,15 +1380,24 @@ function registerFeatureNode(
 }
 
 /**
- * 调度器注入的节点派发：复用 `dispatchTask` 派发节点消息，落库远端 id，
- * 未终态转后台看护（`onSettled` 回调调度器续推 DAG）。
+ * 远端 A2A 任务 id → 本地 Feature 节点 id（v0.4.0 §2.6 回调回写用）。
+ * 回调只携带远端 id，而 Feature 节点本地 id 与远端不同（独立任务二者相同）；
+ * 进程内映射，桥重启后靠轮询对账兜底（推送配置本身亦为 worker 端 in-memory）。
+ */
+const remoteTaskIndex = new Map<string, string>();
+
+/**
+ * 调度器注入的节点派发：派发前注入 Feature Context（plan/decisions/contracts）与已完成上游
+ * 产物（`inputArtifacts`），复用 `dispatchTask` 派发节点消息，落库远端 id，未终态转后台看护
+ * （`onSettled` 回调调度器续推 DAG）；settle 时把 `summarizeArtifacts` 登记为 `artifacts` 行。
  */
 async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchResult> {
   const featureId = node.featureId;
   if (featureId === null) {
     return { ok: false, error: `任务 ${node.taskId} 无 Feature 归属` };
   }
-  const message = node.dispatchMessage ?? node.prompt ?? "";
+  const feature = getFeature(featureId);
+  const message = buildNodeDispatchMessage(node, feature);
 
   const sent = await dispatchTask(node.projectId, message, node.contextId, true);
   if (!sent.ok) {
@@ -1092,15 +1411,14 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
   const { task, client, machine } = sent;
   const remoteTaskId = task.id;
   const state = mapTaskState(taskStateOf(task));
+  // 回调回写映射：远端 id → 本地节点 id（推送只带远端 id）
+  remoteTaskIndex.set(remoteTaskId, node.taskId);
 
-  // 远端已终态：直接落库
+  // 远端已终态：登记产物 + 直接落库
   if (terminalOrInterrupted(taskStateOf(task))) {
-    updateTaskState(
-      node.taskId,
-      state,
-      JSON.stringify(summarizeArtifacts(task.artifacts)),
-      taskText(task),
-    );
+    const artifacts = summarizeArtifacts(task.artifacts);
+    registerArtifacts(featureId, node.taskId, artifacts);
+    updateTaskState(node.taskId, state, JSON.stringify(artifacts), taskText(task));
     markTaskDispatched(node.taskId, remoteTaskId);
     return { ok: true, settled: { state, text: taskText(task) } };
   }
@@ -1120,12 +1438,9 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
     isSettled: (task) => terminalOrInterrupted(taskStateOf(task)),
     persist: (task) => {
       const st = mapTaskState(taskStateOf(task));
-      updateTaskState(
-        node.taskId,
-        st,
-        JSON.stringify(summarizeArtifacts(task.artifacts)),
-        taskText(task),
-      );
+      const artifacts = summarizeArtifacts(task.artifacts);
+      registerArtifacts(featureId, node.taskId, artifacts);
+      updateTaskState(node.taskId, st, JSON.stringify(artifacts), taskText(task));
       console.log(
         `[a2a-bridge] Feature 节点 ${node.taskId}（远端 ${remoteTaskId}）已终态（${st}）`,
       );
@@ -1142,6 +1457,8 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
         text: taskText(task),
       });
     },
+    // v0.4.0 §2.6：可选订阅推送（命中即提前对账；无推送时与纯轮询等价）
+    subscribePush: true,
     pollIntervalMs: POLL_INTERVAL_MS,
     renewIntervalMs: LEASE_RENEW_INTERVAL_MS,
     maxConsecutiveFailures: WATCHER_MAX_CONSECUTIVE_FAILURES,
@@ -1392,6 +1709,316 @@ async function handleTasks(
 }
 
 // ---------------------------------------------------------------------------
+// 事件收件箱（v0.4.0 §2.6：a2a_events / a2a_wait）
+// ---------------------------------------------------------------------------
+
+/** 进程内读游标（`since` 省略时以它为起点；进程重启回落库内最大 `eventId`） */
+let eventsCursor: number | null = null;
+
+/** 取当前游标（首次读取时按库内最大 `eventId` 初始化） */
+function currentEventsCursor(): number {
+  if (eventsCursor === null) eventsCursor = latestEventId();
+  return eventsCursor;
+}
+
+/** 推进游标（只前进不回退） */
+function advanceEventsCursor(cursor: number): void {
+  eventsCursor = Math.max(currentEventsCursor(), cursor);
+}
+
+/** 长轮询订阅者（事件写入时经 `signalEvents` 唤醒，避免空等到超时） */
+const eventWaiters = new Set<() => void>();
+
+/** 唤醒全部 `a2a_wait` 订阅者 */
+function signalEvents(): void {
+  if (eventWaiters.size === 0) return;
+  const waiters = Array.from(eventWaiters);
+  eventWaiters.clear();
+  for (const wake of waiters) {
+    try {
+      wake();
+    } catch (err) {
+      console.error(`[a2a-bridge] 事件订阅唤醒异常：${toMessage(err)}`);
+    }
+  }
+}
+
+/** 注册一次性唤醒（定时或 `signalEvents` 唤醒，取先到者） */
+function waitForSignal(timeoutMs: number): Promise<void> {
+  return new Promise((resolve) => {
+    const done = (): void => {
+      clearTimeout(timer);
+      eventWaiters.delete(wake);
+      resolve();
+    };
+    const wake = (): void => done();
+    const timer = setTimeout(done, timeoutMs);
+    eventWaiters.add(wake);
+  });
+}
+
+interface EventsOutcome {
+  ok: true;
+  cursor: number;
+  count: number;
+  events: EventRecord[];
+}
+
+interface WaitOutcome extends EventsOutcome {
+  timedOut: boolean;
+}
+
+/** 读取 `events` 增量；无变化时以 `latestEventId()` 廉价空返回（不查 events 表） */
+function handleEvents(since?: number): EventsOutcome {
+  const cursor = since === undefined ? currentEventsCursor() : Math.max(since, 0);
+  if (latestEventId() <= cursor) {
+    advanceEventsCursor(cursor);
+    return { ok: true, cursor, count: 0, events: [] };
+  }
+  const events = listEvents({ since: cursor, limit: EVENTS_PAGE_LIMIT });
+  const last = events.length > 0 ? (events[events.length - 1]?.eventId ?? cursor) : cursor;
+  advanceEventsCursor(last);
+  return { ok: true, cursor: eventsCursor ?? last, count: events.length, events };
+}
+
+/**
+ * 长轮询：等待 `cursor` 之后的新事件，最多 `timeoutMs`（内部 cap < `SYNC_BUDGET_MS`）。
+ * 推送路径写入事件时经 `signalEvents()` 立即唤醒；非推送路径（调度器落库）由定时对账兜底。
+ */
+async function handleWait(timeoutMs?: number): Promise<WaitOutcome> {
+  const cursor = currentEventsCursor();
+  const waitMs = Math.min(Math.max(timeoutMs ?? EVENT_WAIT_MAX_MS, 0), EVENT_WAIT_MAX_MS);
+  const deadline = Date.now() + waitMs;
+  for (;;) {
+    if (latestEventId() > cursor) {
+      const events = listEvents({ since: cursor, limit: EVENTS_PAGE_LIMIT });
+      const last = events.length > 0 ? (events[events.length - 1]?.eventId ?? cursor) : cursor;
+      advanceEventsCursor(last);
+      return {
+        ok: true,
+        cursor: eventsCursor ?? last,
+        count: events.length,
+        events,
+        timedOut: false,
+      };
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) {
+      return { ok: true, cursor, count: 0, events: [], timedOut: true };
+    }
+    await waitForSignal(Math.min(remaining, EVENT_WAIT_POLL_MS));
+  }
+}
+
+// ---------------------------------------------------------------------------
+// HTTP 事件端点（v0.4.0 §2.6：worker push 回调；默认关、绑 loopback、token 可选）
+// ---------------------------------------------------------------------------
+
+/** 事件端点 listener（未启用 / 已关闭时为 null） */
+let callbackServer: Server | null = null;
+
+interface PushInfo {
+  /** 远端 A2A 任务 id（push 载荷携带） */
+  remoteTaskId: string | null;
+  /** 远端任务态（A2A 状态串，如 `TASK_STATE_COMPLETED`；无则 null） */
+  state: string | null;
+}
+
+/** 取 stream 载荷（兼容 `{statusUpdate:…}` 与 `{payload:{statusUpdate:…}}` 两种形态） */
+function pickStreamRecord(parsed: unknown): Record<string, unknown> | null {
+  const root = asRecord(parsed);
+  if (root === null) return null;
+  const nested = asRecord(root["payload"]);
+  if (
+    nested !== null &&
+    (nested["task"] !== undefined ||
+      nested["statusUpdate"] !== undefined ||
+      nested["artifactUpdate"] !== undefined ||
+      nested["message"] !== undefined)
+  ) {
+    return nested;
+  }
+  return root;
+}
+
+function readTaskStateString(container: Record<string, unknown>): string | null {
+  const status = asRecord(container["status"]);
+  return status === null ? null : asNonEmptyString(status["state"]);
+}
+
+/** 解析 push 载荷：定位远端任务 id 与（若有）任务态串 */
+function parsePushInfo(parsed: unknown): PushInfo {
+  const rec = pickStreamRecord(parsed);
+  if (rec === null) return { remoteTaskId: null, state: null };
+  const task = asRecord(rec["task"]);
+  if (task !== null) {
+    return { remoteTaskId: asNonEmptyString(task["id"]), state: readTaskStateString(task) };
+  }
+  const statusUpdate = asRecord(rec["statusUpdate"]);
+  if (statusUpdate !== null) {
+    return {
+      remoteTaskId: asNonEmptyString(statusUpdate["taskId"]),
+      state: readTaskStateString(statusUpdate),
+    };
+  }
+  const artifactUpdate = asRecord(rec["artifactUpdate"]);
+  if (artifactUpdate !== null) {
+    return { remoteTaskId: asNonEmptyString(artifactUpdate["taskId"]), state: null };
+  }
+  const message = asRecord(rec["message"]);
+  if (message !== null) {
+    return { remoteTaskId: asNonEmptyString(message["taskId"]), state: null };
+  }
+  return { remoteTaskId: null, state: null };
+}
+
+/** 由远端 id 定位本地任务（独立任务 `taskId` 即远端 id；Feature 节点查进程内映射） */
+function resolveLocalTaskId(remoteOrLocalId: string): string | null {
+  if (getTask(remoteOrLocalId) !== null) return remoteOrLocalId;
+  return remoteTaskIndex.get(remoteOrLocalId) ?? null;
+}
+
+/**
+ * 命中本地任务时回写任务态（推送仅作「提前感知」，完整 artifacts/text 由轮询对账补齐）。
+ * 只采纳 `completed` / `failed` / `input-required`（`working` 不提前改写；`blocked` 为本地专属）。
+ */
+function applyPushedTaskState(localTaskId: string, a2aState: string): void {
+  let stateEnum: A2aTaskState;
+  try {
+    stateEnum = taskStateFromJSON(a2aState);
+  } catch {
+    return; // 未知状态串：忽略，交由轮询对账
+  }
+  const mapped = mapTaskState(stateEnum);
+  if (mapped !== "completed" && mapped !== "failed" && mapped !== "input-required") return;
+  const current = getTask(localTaskId);
+  if (current === null || isLocalTerminalState(current.state)) return;
+  updateTaskState(localTaskId, mapped);
+}
+
+/** 处理一次 push：写 `push.received` 事件 + 命中本地任务回写任务态 + 唤醒订阅 + 调度器 kick */
+function applyPushNotification(raw: string): { taskId: string | null; localTaskId: string | null } {
+  const parsed: unknown = JSON.parse(raw);
+  const info = parsePushInfo(parsed);
+  const localTaskId = info.remoteTaskId === null ? null : resolveLocalTaskId(info.remoteTaskId);
+  const featureId = localTaskId === null ? null : (getTask(localTaskId)?.featureId ?? null);
+  appendEvent({
+    featureId,
+    taskId: info.remoteTaskId,
+    kind: EVENT_PUSH_RECEIVED,
+    state: info.state,
+    payload:
+      raw.length > CALLBACK_PAYLOAD_MAX_CHARS ? raw.slice(0, CALLBACK_PAYLOAD_MAX_CHARS) : raw,
+  });
+  if (localTaskId !== null && info.state !== null) {
+    applyPushedTaskState(localTaskId, info.state);
+  }
+  // 唤醒看护（推送优先，立即对账）+ 唤醒长轮询订阅 + 驱动 Feature 调度
+  const wakeKey = localTaskId ?? info.remoteTaskId;
+  if (wakeKey !== null) notifyTaskPush(wakeKey);
+  signalEvents();
+  scheduler.kick();
+  return { taskId: info.remoteTaskId, localTaskId };
+}
+
+function respondJson(res: ServerResponse, status: number, payload: unknown): void {
+  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
+  res.end(JSON.stringify(payload));
+}
+
+function readHeaderValue(req: IncomingMessage, name: string): string | null {
+  const raw = req.headers[name];
+  if (Array.isArray(raw)) return raw.length > 0 ? (raw[0] ?? null) : null;
+  return raw ?? null;
+}
+
+/** 校验回调 token（可选；支持 `X-A2A-Notification-Token` 与 `Authorization: Bearer`） */
+function callbackTokenOk(req: IncomingMessage, expected: string): boolean {
+  const direct = readHeaderValue(req, "x-a2a-notification-token");
+  if (direct !== null && direct.length > 0) return direct === expected;
+  const auth = readHeaderValue(req, "authorization");
+  if (auth !== null && auth.startsWith("Bearer ")) return auth.slice(7) === expected;
+  return false;
+}
+
+/** 读取请求体（含字节上限；超限抛错） */
+async function readRequestBody(req: IncomingMessage, maxBytes: number): Promise<string> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
+    total += buf.length;
+    if (total > maxBytes) throw new Error(`回调请求体超过上限（${maxBytes} 字节）`);
+    chunks.push(buf);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
+async function handleCallbackRequest(
+  req: IncomingMessage,
+  res: ServerResponse,
+  cfg: CallbackConfig,
+): Promise<void> {
+  try {
+    const path = (req.url ?? "").split("?")[0];
+    if (req.method !== "POST" || path !== "/callback") {
+      respondJson(res, 404, { ok: false, error: "not_found" });
+      return;
+    }
+    if (cfg.token !== undefined && cfg.token.length > 0 && !callbackTokenOk(req, cfg.token)) {
+      respondJson(res, 401, { ok: false, error: "unauthorized" });
+      return;
+    }
+    const raw = await readRequestBody(req, CALLBACK_MAX_BODY_BYTES);
+    const applied = applyPushNotification(raw);
+    respondJson(res, 200, { ok: true, taskId: applied.taskId, localTaskId: applied.localTaskId });
+  } catch (err) {
+    console.error(`[a2a-bridge] 回调处理失败：${toMessage(err)}`);
+    respondJson(res, 400, { ok: false, error: toMessage(err) });
+  }
+}
+
+/** 是否 loopback 主机（用于绑定告警：跨机回调鉴权待 v0.7.0） */
+function isLoopbackHost(host: string): boolean {
+  return host === "localhost" || host === "::1" || /^127\./.test(host);
+}
+
+/** 启动 HTTP 事件端点（幂等；`enabled=false` 时不启动） */
+function startCallbackServer(cfg: CallbackConfig): void {
+  if (!cfg.enabled || callbackServer !== null) return;
+  if (!isLoopbackHost(cfg.host)) {
+    console.error(
+      `[a2a-bridge] 警告：回调端点绑定非 loopback 地址 ${cfg.host}` +
+        `（仅同机/受信网络 opt-in；跨机回调鉴权待 v0.7.0）`,
+    );
+  }
+  const server = createServer((req, res) => {
+    void handleCallbackRequest(req, res, cfg);
+  });
+  server.on("error", (err) => {
+    console.error(`[a2a-bridge] 回调端点错误：${toMessage(err)}`);
+  });
+  server.listen(cfg.port, cfg.host, () => {
+    console.error(`[a2a-bridge] 回调端点已监听 http://${cfg.host}:${cfg.port}/callback`);
+  });
+  // 不因 listener 持有进程：桥退出 / shutdown 关闭（规避「桥孤儿进程」）
+  if (typeof server.unref === "function") server.unref();
+  callbackServer = server;
+}
+
+/** 关闭 HTTP 事件端点（幂等；纳入 shutdown / 信号路径） */
+function stopCallbackServer(): void {
+  const server = callbackServer;
+  callbackServer = null;
+  if (server === null) return;
+  try {
+    server.close();
+  } catch (err) {
+    console.error(`[a2a-bridge] 回调端点关闭失败：${toMessage(err)}`);
+  }
+}
+
+// ---------------------------------------------------------------------------
 // MCP Server（stdio；固定工具面，5 个泛型工具）
 // ---------------------------------------------------------------------------
 
@@ -1438,7 +2065,7 @@ server.registerTool(
     inputSchema: {
       project: z.string().min(1).describe("目标项目 ID"),
       state: z
-        .enum(["working", "completed", "failed", "input-required"])
+        .enum(["working", "completed", "failed", "input-required", "blocked"])
         .optional()
         .describe("按任务态过滤；省略返回全部"),
       limit: z
@@ -1482,13 +2109,25 @@ server.registerTool(
         .string()
         .optional()
         .describe(
-          "挂载到 Feature：提供时任务作为 DAG 节点登记（返回本地 taskId），由调度器在依赖满足后自动串行派发；省略则按现状立即派发。仅 executing 的 Feature 可挂载。",
+          "挂载到 Feature：提供时任务作为 DAG 节点登记（返回本地 taskId），由调度器在依赖满足后自动串行派发；省略则按现状立即派发。仅 analyzing / executing 的 Feature 可挂载。",
         ),
       dependencies: z
         .array(z.string())
         .optional()
         .describe(
           "前置任务本地 taskId 数组（仅 featureId 提供时生效；前一任务终态后才派发下一个）",
+        ),
+      inputs: z
+        .array(
+          z.object({
+            producerTaskId: z.string().optional().describe("上游节点本地 taskId"),
+            name: z.string().optional().describe("产物名（配 producerTaskId 定位）"),
+            artifactId: z.string().optional().describe("产物主键（优先，支持后缀匹配）"),
+          }),
+        )
+        .optional()
+        .describe(
+          "本节点引用的上游产物（仅 featureId 提供时生效）：{producerTaskId, name} 或 {artifactId}；派发时解析并注入完成的上游产物内容/引用",
         ),
     },
   },
@@ -1501,6 +2140,7 @@ server.registerTool(
           args.contextId,
           args.featureId,
           args.dependencies ?? [],
+          args.inputs,
         );
         return outcome.ok ? textResult(outcome) : errorResult(outcome);
       }
@@ -1553,6 +2193,52 @@ server.registerTool(
   },
 );
 
+server.registerTool(
+  "a2a_events",
+  {
+    description:
+      "读取事件收件箱增量（任务结算/阻塞、Feature 流转、worker push）。省略 since 则自进程读游标起；无变化时廉价空返回。",
+    inputSchema: {
+      since: z
+        .number()
+        .int()
+        .nonnegative()
+        .optional()
+        .describe("游标：仅返回 eventId 大于它的新事件；省略则用进程读游标"),
+    },
+  },
+  async (args) => {
+    try {
+      return textResult(handleEvents(args.since));
+    } catch (err) {
+      return internalError(err);
+    }
+  },
+);
+
+server.registerTool(
+  "a2a_wait",
+  {
+    description:
+      "长轮询等待新事件（推送优先唤醒 + 定时对账），最多 timeoutMs（内部上限低于同步预算）；超时无事件则 timedOut=true。",
+    inputSchema: {
+      timeoutMs: z
+        .number()
+        .int()
+        .positive()
+        .optional()
+        .describe("最长等待毫秒；省略用内部上限（cap < SYNC_BUDGET_MS）"),
+    },
+  },
+  async (args) => {
+    try {
+      return textResult(await handleWait(args.timeoutMs));
+    } catch (err) {
+      return internalError(err);
+    }
+  },
+);
+
 // ---------------------------------------------------------------------------
 // MCP Server（Feature 工具组；静态注册，零重连）
 // ---------------------------------------------------------------------------
@@ -1565,7 +2251,10 @@ server.registerTool(
     inputSchema: {
       title: z.string().min(1).describe("Feature 标题（需求的简短摘要）"),
       requirement: z.string().optional().describe("需求原文（可选）"),
-      contextId: z.string().optional().describe("预留：orch 侧会话上下文（本版仅回显）"),
+      contextId: z
+        .string()
+        .optional()
+        .describe("Feature 级会话上下文（落 features.context_id，跨任务 / 跨 worker 启停复用）"),
     },
   },
   async (args) => {
@@ -1586,7 +2275,7 @@ server.registerTool(
   "a2a_feature_status",
   {
     description:
-      "查询 Feature 详情（state + tasks 摘要）；省略 featureId 时列出全部 Feature（含任务数）。",
+      "查询 Feature 详情（state + tasks 摘要 + artifacts）；省略 featureId 时列出全部 Feature（含任务数）。",
     inputSchema: {
       featureId: z.string().optional().describe("Feature ID；省略则列出全部"),
     },
@@ -1614,7 +2303,18 @@ server.registerTool(
         .describe(
           "目标状态：discussing / analyzing / planning / waiting_approval / executing / integrating / testing / reviewing / completed / needs_input / failed / cancelled（非法后继被状态机拒绝）",
         ),
-      note: z.string().optional().describe("备注（本版仅回显）"),
+      note: z
+        .string()
+        .optional()
+        .describe("统一方案 / 备注：落 Feature Context 的 plan（供审批与派发注入）"),
+      decisions: z
+        .string()
+        .optional()
+        .describe("决策记录（JSON 字符串；落 Feature Context 的 decisions）"),
+      contracts: z
+        .string()
+        .optional()
+        .describe("契约（JSON 字符串；落 Feature Context 的 contracts）"),
       answer: z
         .string()
         .optional()
@@ -1627,6 +2327,8 @@ server.registerTool(
         featureId: args.featureId,
         to: args.to,
         note: args.note,
+        decisions: args.decisions,
+        contracts: args.contracts,
         answer: args.answer,
       });
       if (!outcome.ok) return errorResult(outcome);
@@ -1702,6 +2404,8 @@ async function main(): Promise<void> {
   }
   // 启动串行 Task DAG 调度器（进程内异步循环，不阻塞 stdio）
   scheduler.start();
+  // 启动 worker 回调端点（v0.4.0 §2.6；`callback.enabled` 默认关，关闭时 startCallbackServer 空操作）
+  startCallbackServer(callbackConfig());
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
@@ -1711,6 +2415,7 @@ async function main(): Promise<void> {
 
 function shutdown(): void {
   scheduler.stop();
+  stopCallbackServer();
   closeSessionStore();
   void server
     .close()

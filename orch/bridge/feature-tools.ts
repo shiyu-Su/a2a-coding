@@ -4,9 +4,10 @@
  * 纯数据层处理器：只依赖 `session/store.ts` 与 `feature/state-machine.ts`，
  * 不触碰 A2A / 不触发调度（调度 kick 由 `bridge/index.ts` 在工具返回后统一发起）。
  *
- * - `handleFeatureCreate`  新建 Feature（`discussing`）
- * - `handleFeatureStatus`  查询单个 Feature 详情 / 全部列表（state + tasks 摘要）
- * - `handleFeatureAdvance` orch agent 驱动主链推进（状态机校验合法后继；`answer` 用于 needs_input 补齐）
+ * - `handleFeatureCreate`  新建 Feature（`discussing`；落 `contextId` 到 `features.context_id`）
+ * - `handleFeatureStatus`  查询单个 Feature 详情 / 全部列表（state + tasks 摘要 + artifacts）
+ * - `handleFeatureAdvance` orch agent 驱动主链推进（状态机校验合法后继；`note`→plan、
+ *                          `decisions`/`contracts` 可选落 Feature Context；`answer` 用于 needs_input 补齐）
  * - `handleFeatureApprove` 审批门：`waiting_approval → executing`
  * - `handleFeatureCancel`  任意非终态 → `cancelled`
  */
@@ -14,18 +15,27 @@ import { randomUUID } from "node:crypto";
 import {
   createFeature,
   getFeature,
+  listArtifactsByFeature,
   listFeatureTasks,
   listFeatures,
   rearmTask,
+  updateFeatureContext,
   updateFeatureState,
 } from "../session/store.js";
+import type { FeatureContextPatch } from "../session/store.js";
 import {
   allowedTransitions,
   canTransition,
   isFeatureState,
   isTerminalFeatureState,
 } from "../feature/state-machine.js";
-import type { FeatureRecord, FeatureState, TaskRecord } from "../types.js";
+import type {
+  ArtifactRecord,
+  FeatureRecord,
+  FeatureState,
+  InputArtifactRef,
+  TaskRecord,
+} from "../types.js";
 
 /** Feature 工具失败外壳（桥转为 `errorResult`） */
 export interface FeatureToolFailure {
@@ -42,6 +52,8 @@ export interface FeatureTaskSummary {
   prompt: string | null;
   remoteTaskId: string | null;
   dependencies: string[] | null;
+  /** 下游声明的上游产物引用（v0.4.0；NULL = 无输入产物） */
+  inputArtifacts: InputArtifactRef[] | null;
   updatedAt: string;
 }
 
@@ -53,6 +65,7 @@ function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
     prompt: rec.prompt,
     remoteTaskId: rec.remoteTaskId,
     dependencies: rec.dependencies,
+    inputArtifacts: rec.inputArtifacts,
     updatedAt: rec.updatedAt,
   };
 }
@@ -64,7 +77,7 @@ function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
 export interface FeatureCreateArgs {
   title: string;
   requirement?: string;
-  /** 预留：orch 侧会话上下文（本版 features 表无该列，仅回显） */
+  /** Feature 级会话上下文（落 `features.context_id`，跨任务 / 跨 worker 启停复用） */
   contextId?: string;
 }
 
@@ -73,7 +86,7 @@ export interface FeatureCreateSuccess {
   featureId: string;
   state: FeatureState;
   title: string;
-  /** 回显入参 contextId（本版未持久化） */
+  /** 回显入参 contextId（已随 createFeature 持久化到 features.context_id） */
   contextId?: string;
 }
 
@@ -89,10 +102,11 @@ export function handleFeatureCreate(
     featureId,
     title,
     requirement: args.requirement ?? null,
+    contextId: args.contextId ?? null,
     state: "discussing",
   });
   const success: FeatureCreateSuccess = { ok: true, featureId: rec.featureId, state: rec.state, title: rec.title };
-  if (args.contextId !== undefined) success.contextId = args.contextId;
+  if (rec.contextId !== null) success.contextId = rec.contextId;
   return success;
 }
 
@@ -108,6 +122,8 @@ export interface FeatureStatusSuccess {
   ok: true;
   feature?: FeatureRecord;
   tasks?: FeatureTaskSummary[];
+  /** 该 Feature 已登记的产物（v0.4.0；仅单 Feature 查询返回） */
+  artifacts?: ArtifactRecord[];
   features?: Array<FeatureRecord & { taskCount: number }>;
 }
 
@@ -120,7 +136,8 @@ export function handleFeatureStatus(
       return { ok: false, code: "feature_not_found", error: `未知 Feature ${args.featureId}` };
     }
     const tasks = listFeatureTasks(feature.featureId, { limit: 1000 }).map(summarizeTask);
-    return { ok: true, feature, tasks };
+    const artifacts = listArtifactsByFeature(feature.featureId, 1000);
+    return { ok: true, feature, tasks, artifacts };
   }
   const features = listFeatures({ limit: 1000 }).map((f) => ({
     ...f,
@@ -136,8 +153,12 @@ export function handleFeatureStatus(
 export interface FeatureAdvanceArgs {
   featureId: string;
   to: string;
-  /** 备注（本版未持久化，仅回显 / 日志） */
+  /** 统一方案 / 备注：落 Feature Context 的 `plan`（供审批与派发注入） */
   note?: string;
+  /** 决策记录（JSON 字符串；落 Feature Context 的 `decisions`） */
+  decisions?: string;
+  /** 契约（JSON 字符串；落 Feature Context 的 `contracts`） */
+  contracts?: string;
   /** needs_input 补齐：以同 contextId 续接待澄清任务 */
   answer?: string;
 }
@@ -185,6 +206,15 @@ export function handleFeatureAdvance(
         answer.length > 0 ? `${base}\n\n[用户澄清]\n${answer}` : base,
       );
     }
+  }
+
+  // Feature Context 落库（v0.4.0 §2.5）：note → plan；decisions / contracts 可选
+  const patch: FeatureContextPatch = {};
+  if (args.note !== undefined) patch.plan = args.note;
+  if (args.decisions !== undefined) patch.decisions = args.decisions;
+  if (args.contracts !== undefined) patch.contracts = args.contracts;
+  if (Object.keys(patch).length > 0) {
+    updateFeatureContext(feature.featureId, patch);
   }
 
   const updated = updateFeatureState(feature.featureId, args.to);

@@ -13,9 +13,12 @@ import { DatabaseSync } from "node:sqlite";
 import { FEATURE_STATES, isFeatureState } from "../feature/state-machine.js";
 import type {
   AgentKind,
+  ArtifactRecord,
+  EventRecord,
   FeatureCreateInput,
   FeatureRecord,
   FeatureState,
+  InputArtifactRef,
   SessionRecord,
   TaskRecord,
   TaskState,
@@ -51,9 +54,23 @@ export function truncatePrompt(text: string, max = PROMPT_MAX_CHARS): string {
 }
 
 const AGENT_KINDS: readonly AgentKind[] = ["opencode", "codex", "claude"];
-const TASK_STATES: readonly TaskState[] = ["working", "completed", "failed", "input-required"];
+// `blocked` 为 orch 本地专属态（v0.4.0 失败传播），纳入校验清单但与 A2A 无对应
+const TASK_STATES: readonly TaskState[] = [
+  "working",
+  "completed",
+  "failed",
+  "input-required",
+  "blocked",
+];
 // Feature 状态清单复用状态机模块（单一事实源），此处仅 re-export 供调用方枚举
 export const FEATURE_STATE_VALUES: readonly FeatureState[] = FEATURE_STATES;
+
+/** 事件 kind：任务结算（completed / failed / input-required） */
+export const EVENT_TASK_SETTLED = "task.settled";
+/** 事件 kind：任务被失败传播阻塞（blocked） */
+export const EVENT_TASK_BLOCKED = "task.blocked";
+/** 事件 kind：Feature 状态流转 */
+export const EVENT_FEATURE_STATE = "feature.state";
 
 /** `upsertSession` 入参：时间戳缺省时由存储层补齐（UTC ISO 8601） */
 export interface SessionUpsertInput {
@@ -81,6 +98,8 @@ export interface TaskCreateInput {
   featureId?: string | null;
   /** 前置任务本地 id 数组（v0.3.0；缺省 null = 无依赖） */
   dependencies?: string[] | null;
+  /** 下游声明的上游产物引用（v0.4.0；缺省 null = 无输入产物） */
+  inputArtifacts?: InputArtifactRef[] | null;
   /** 远端 A2A 任务 id（Feature 节点派发后回填；缺省 null） */
   remoteTaskId?: string | null;
   /** Feature 排队节点待派发消息全文（v0.3.0；缺省 null） */
@@ -109,6 +128,44 @@ export interface ListFeaturesOptions {
 export interface PruneTasksOptions {
   retentionDays?: number;
   maxPerProject?: number;
+}
+
+/** `updateFeatureContext` 入参：仅提供的字段被更新（undefined = 保留原值） */
+export interface FeatureContextPatch {
+  contextId?: string | null;
+  plan?: string | null;
+  decisions?: string | null;
+  contracts?: string | null;
+}
+
+/** `upsertArtifact` 入参：`createdAt` 缺省时由存储层补齐 */
+export interface ArtifactUpsertInput {
+  artifactId: string;
+  featureId: string;
+  producerTaskId: string;
+  name: string;
+  mime?: string | null;
+  uri?: string | null;
+  size?: number | null;
+  contentHash?: string | null;
+  createdAt?: string;
+}
+
+/** `appendEvent` 入参：`createdAt` 缺省时由存储层补齐 */
+export interface EventAppendInput {
+  featureId?: string | null;
+  taskId?: string | null;
+  kind: string;
+  state?: string | null;
+  payload?: string | null;
+  createdAt?: string;
+}
+
+/** `listEvents` 入参：游标与条数上限 */
+export interface ListEventsOptions {
+  /** 仅返回 `event_id > since` 的事件（缺省 0 = 从头） */
+  since?: number;
+  limit?: number;
 }
 
 function nowIso(): string {
@@ -158,7 +215,12 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
 /** tasks 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToTask） */
 const TASK_COLUMNS =
   "task_id, project_id, context_id, state, artifacts_json, text, prompt, " +
-  "feature_id, dependencies, remote_task_id, dispatch_message, updated_at";
+  "feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, updated_at";
+
+/** features 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToFeature） */
+const FEATURE_COLUMNS =
+  "feature_id, state, title, requirement, context_id, plan, decisions, contracts, " +
+  "created_at, updated_at";
 
 /** 解析 `dependencies` 列（JSON 数组字符串）；非法即数据损坏（fail-fast） */
 function readDependencies(row: Record<string, unknown>): string[] | null {
@@ -183,6 +245,29 @@ function readDependencies(row: Record<string, unknown>): string[] | null {
   return deps;
 }
 
+/** 解析 `input_artifacts` 列（InputArtifactRef[] JSON 字符串）；非法即数据损坏（fail-fast） */
+function readInputArtifacts(row: Record<string, unknown>): InputArtifactRef[] | null {
+  const raw = readNullableString(row, "input_artifacts");
+  if (raw === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`[session-store] 列 input_artifacts 数据损坏：非法 JSON`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`[session-store] 列 input_artifacts 数据损坏：期望 JSON 数组`);
+  }
+  const refs: InputArtifactRef[] = [];
+  for (const v of parsed) {
+    if (typeof v !== "object" || v === null || Array.isArray(v)) {
+      throw new Error(`[session-store] 列 input_artifacts 数据损坏：数组元素非对象`);
+    }
+    refs.push(v as InputArtifactRef);
+  }
+  return refs;
+}
+
 function rowToTask(row: Record<string, unknown>): TaskRecord {
   const state = readString(row, "state");
   if (!isTaskState(state)) {
@@ -199,6 +284,7 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     updatedAt: readString(row, "updated_at"),
     featureId: readNullableString(row, "feature_id"),
     dependencies: readDependencies(row),
+    inputArtifacts: readInputArtifacts(row),
     remoteTaskId: readNullableString(row, "remote_task_id"),
     dispatchMessage: readNullableString(row, "dispatch_message"),
   };
@@ -214,8 +300,40 @@ function rowToFeature(row: Record<string, unknown>): FeatureRecord {
     state,
     title: readString(row, "title"),
     requirement: readNullableString(row, "requirement"),
+    contextId: readNullableString(row, "context_id"),
+    plan: readNullableString(row, "plan"),
+    decisions: readNullableString(row, "decisions"),
+    contracts: readNullableString(row, "contracts"),
     createdAt: readString(row, "created_at"),
     updatedAt: readString(row, "updated_at"),
+  };
+}
+
+function rowToArtifact(row: Record<string, unknown>): ArtifactRecord {
+  const size = row["size"];
+  return {
+    artifactId: readString(row, "artifact_id"),
+    featureId: readString(row, "feature_id"),
+    producerTaskId: readString(row, "producer_task_id"),
+    name: readString(row, "name"),
+    mime: readNullableString(row, "mime"),
+    uri: readNullableString(row, "uri"),
+    size: size === null || size === undefined ? null : Number(size),
+    contentHash: readNullableString(row, "content_hash"),
+    createdAt: readString(row, "created_at"),
+  };
+}
+
+function rowToEvent(row: Record<string, unknown>): EventRecord {
+  const eventId = row["event_id"];
+  return {
+    eventId: Number(eventId),
+    featureId: readNullableString(row, "feature_id"),
+    taskId: readNullableString(row, "task_id"),
+    kind: readString(row, "kind"),
+    state: readNullableString(row, "state"),
+    payload: readNullableString(row, "payload"),
+    createdAt: readString(row, "created_at"),
   };
 }
 
@@ -252,6 +370,32 @@ CREATE TABLE IF NOT EXISTS features (
   updated_at  TEXT NOT NULL
 )`;
 
+/** 产物登记表（v0.4.0 §2.3） */
+const ARTIFACTS_DDL = `
+CREATE TABLE IF NOT EXISTS artifacts (
+  artifact_id      TEXT PRIMARY KEY,
+  feature_id       TEXT NOT NULL,
+  producer_task_id TEXT NOT NULL,
+  name             TEXT NOT NULL,
+  mime             TEXT,
+  uri              TEXT,
+  size             INTEGER,
+  content_hash     TEXT,
+  created_at       TEXT NOT NULL
+)`;
+
+/** 事件收件箱表（v0.4.0 §2.6） */
+const EVENTS_DDL = `
+CREATE TABLE IF NOT EXISTS events (
+  event_id   INTEGER PRIMARY KEY AUTOINCREMENT,
+  feature_id TEXT,
+  task_id    TEXT,
+  kind       TEXT NOT NULL,
+  state      TEXT,
+  payload    TEXT,
+  created_at TEXT NOT NULL
+)`;
+
 /**
  * SQLite 会话/任务存储。
  * 桥（bridge）进程内通常使用模块级默认单例（见文件底部的导出函数）。
@@ -269,6 +413,8 @@ export class SessionStore {
     this.db.exec(SESSIONS_DDL);
     this.db.exec(TASKS_DDL);
     this.db.exec(FEATURES_DDL);
+    this.db.exec(ARTIFACTS_DDL);
+    this.db.exec(EVENTS_DDL);
     // 旧库迁移：此前版本的 tasks 表无 text 列（列已存在时 ALTER 失败，忽略）
     try {
       this.db.exec("ALTER TABLE tasks ADD COLUMN text TEXT");
@@ -294,6 +440,20 @@ export class SessionStore {
         // 列已存在
       }
     }
+    // v0.4.0 迁移：tasks 加 input_artifacts（下游引用的上游产物，JSON 数组）
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN input_artifacts TEXT");
+    } catch {
+      // 列已存在
+    }
+    // v0.4.0 迁移：features 加 Feature Context 列（context_id / plan / decisions / contracts）
+    for (const column of ["context_id TEXT", "plan TEXT", "decisions TEXT", "contracts TEXT"]) {
+      try {
+        this.db.exec(`ALTER TABLE features ADD COLUMN ${column}`);
+      } catch {
+        // 列已存在
+      }
+    }
     // 按项目 + updated_at 倒序的列表查询索引
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS idx_tasks_project_updated ON tasks(project_id, updated_at DESC)",
@@ -302,7 +462,15 @@ export class SessionStore {
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS idx_features_state_updated ON features(state, updated_at DESC)",
     );
-    this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_feature ON tasks(feature_id, updated_at DESC)");
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_tasks_feature ON tasks(feature_id, updated_at DESC)",
+    );
+    // v0.4.0：artifacts 按 Feature / 生产者节点查询；events 按 Feature 顺序读取
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_artifacts_feature ON artifacts(feature_id)");
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_artifacts_producer ON artifacts(producer_task_id)",
+    );
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_events_feature ON events(feature_id, event_id)");
   }
 
   /** 查询会话映射；不存在返回 null */
@@ -349,12 +517,16 @@ export class SessionStore {
       rec.dependencies === undefined || rec.dependencies === null
         ? null
         : JSON.stringify(rec.dependencies);
+    const inputArtifacts =
+      rec.inputArtifacts === undefined || rec.inputArtifacts === null
+        ? null
+        : JSON.stringify(rec.inputArtifacts);
     this.db
       .prepare(
         `INSERT INTO tasks
            (task_id, project_id, context_id, state, artifacts_json, text, prompt,
-            feature_id, dependencies, remote_task_id, dispatch_message, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(task_id) DO UPDATE SET
            project_id = excluded.project_id,
            context_id = excluded.context_id,
@@ -364,6 +536,7 @@ export class SessionStore {
            prompt = excluded.prompt,
            feature_id = excluded.feature_id,
            dependencies = excluded.dependencies,
+           input_artifacts = excluded.input_artifacts,
            remote_task_id = excluded.remote_task_id,
            dispatch_message = excluded.dispatch_message,
            updated_at = excluded.updated_at`,
@@ -378,6 +551,7 @@ export class SessionStore {
         prompt,
         rec.featureId ?? null,
         dependencies,
+        inputArtifacts,
         rec.remoteTaskId ?? null,
         rec.dispatchMessage ?? null,
         updatedAt,
@@ -392,6 +566,8 @@ export class SessionStore {
   /**
    * 更新任务态；`artifactsJson` / `text` 未提供时保留原值（COALESCE）。
    * 任务不存在时无效果，返回 null。
+   * v0.4.0：状态发生**变化**且新态非 `working` 时，自动写事件收件箱
+   * （`blocked` → `task.blocked`；`completed`/`failed`/`input-required` → `task.settled`）。
    */
   updateTaskState(
     taskId: string,
@@ -399,6 +575,7 @@ export class SessionStore {
     artifactsJson?: string | null,
     text?: string | null,
   ): TaskRecord | null {
+    const previous = this.getTask(taskId);
     const updatedAt = nowIso();
     this.db
       .prepare(
@@ -410,14 +587,29 @@ export class SessionStore {
          WHERE task_id = ?`,
       )
       .run(state, artifactsJson ?? null, text ?? null, updatedAt, taskId);
-    return this.getTask(taskId);
+    const stored = this.getTask(taskId);
+    if (stored !== null && previous !== null && previous.state !== stored.state) {
+      const kind =
+        stored.state === "blocked"
+          ? EVENT_TASK_BLOCKED
+          : stored.state === "working"
+            ? null
+            : EVENT_TASK_SETTLED;
+      if (kind !== null) {
+        this.appendEvent({
+          featureId: stored.featureId,
+          taskId: stored.taskId,
+          kind,
+          state: stored.state,
+        });
+      }
+    }
+    return stored;
   }
 
   /** 查询任务记录；不存在返回 null */
   getTask(taskId: string): TaskRecord | null {
-    const row = this.db
-      .prepare(`SELECT ${TASK_COLUMNS} FROM tasks WHERE task_id = ?`)
-      .get(taskId);
+    const row = this.db.prepare(`SELECT ${TASK_COLUMNS} FROM tasks WHERE task_id = ?`).get(taskId);
     return row === undefined ? null : rowToTask(row);
   }
 
@@ -492,15 +684,24 @@ export class SessionStore {
     const updatedAt = rec.updatedAt ?? createdAt;
     this.db
       .prepare(
-        `INSERT INTO features (feature_id, state, title, requirement, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?)
+        `INSERT INTO features (feature_id, state, title, requirement, context_id, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(feature_id) DO UPDATE SET
            state = excluded.state,
            title = excluded.title,
            requirement = excluded.requirement,
+           context_id = COALESCE(excluded.context_id, context_id),
            updated_at = excluded.updated_at`,
       )
-      .run(rec.featureId, state, rec.title, rec.requirement ?? null, createdAt, updatedAt);
+      .run(
+        rec.featureId,
+        state,
+        rec.title,
+        rec.requirement ?? null,
+        rec.contextId ?? null,
+        createdAt,
+        updatedAt,
+      );
     const stored = this.getFeature(rec.featureId);
     if (stored === null) {
       throw new Error(`[session-store] createFeature 后未能读回记录：${rec.featureId}`);
@@ -511,22 +712,58 @@ export class SessionStore {
   /** 查询 Feature；不存在返回 null */
   getFeature(featureId: string): FeatureRecord | null {
     const row = this.db
-      .prepare(
-        `SELECT feature_id, state, title, requirement, created_at, updated_at
-         FROM features WHERE feature_id = ?`,
-      )
+      .prepare(`SELECT ${FEATURE_COLUMNS} FROM features WHERE feature_id = ?`)
       .get(featureId);
     return row === undefined ? null : rowToFeature(row);
   }
 
-  /** 更新 Feature 态；Feature 不存在时无效果，返回 null */
+  /**
+   * 更新 Feature 态；Feature 不存在时无效果，返回 null。
+   * v0.4.0：状态发生变化时自动写 `feature.state` 事件。
+   */
   updateFeatureState(featureId: string, state: FeatureState): FeatureRecord | null {
     if (!isFeatureState(state)) {
       throw new Error(`[session-store] updateFeatureState 非法 Feature 态：${String(state)}`);
     }
+    const previous = this.getFeature(featureId);
     this.db
       .prepare("UPDATE features SET state = ?, updated_at = ? WHERE feature_id = ?")
       .run(state, nowIso(), featureId);
+    const stored = this.getFeature(featureId);
+    if (stored !== null && previous !== null && previous.state !== stored.state) {
+      this.appendEvent({ featureId, taskId: null, kind: EVENT_FEATURE_STATE, state });
+    }
+    return stored;
+  }
+
+  /**
+   * 更新 Feature Context（context_id / plan / decisions / contracts）。
+   * 仅提供的字段被写入（undefined = 保留原值）；Feature 不存在时返回 null。
+   */
+  updateFeatureContext(featureId: string, patch: FeatureContextPatch): FeatureRecord | null {
+    const sets: string[] = [];
+    const params: Array<string | null> = [];
+    if (patch.contextId !== undefined) {
+      sets.push("context_id = ?");
+      params.push(patch.contextId);
+    }
+    if (patch.plan !== undefined) {
+      sets.push("plan = ?");
+      params.push(patch.plan);
+    }
+    if (patch.decisions !== undefined) {
+      sets.push("decisions = ?");
+      params.push(patch.decisions);
+    }
+    if (patch.contracts !== undefined) {
+      sets.push("contracts = ?");
+      params.push(patch.contracts);
+    }
+    if (sets.length === 0) return this.getFeature(featureId);
+    sets.push("updated_at = ?");
+    params.push(nowIso());
+    params.push(featureId);
+    this.db.prepare(`UPDATE features SET ${sets.join(", ")} WHERE feature_id = ?`).run(...params);
     return this.getFeature(featureId);
   }
 
@@ -543,11 +780,123 @@ export class SessionStore {
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")} ` : "";
     const rows = this.db
       .prepare(
-        `SELECT feature_id, state, title, requirement, created_at, updated_at
+        `SELECT ${FEATURE_COLUMNS}
          FROM features ${where}ORDER BY updated_at DESC LIMIT ?`,
       )
       .all(...params) as Array<Record<string, unknown>>;
     return rows.map(rowToFeature);
+  }
+
+  // ------------------------------------------------------------------
+  // Artifact 注册表（v0.4.0）
+  // ------------------------------------------------------------------
+
+  /** 写入/覆盖产物记录（同 id 覆盖），返回落库后的记录 */
+  upsertArtifact(rec: ArtifactUpsertInput): ArtifactRecord {
+    const createdAt = rec.createdAt ?? nowIso();
+    this.db
+      .prepare(
+        `INSERT INTO artifacts
+           (artifact_id, feature_id, producer_task_id, name, mime, uri, size, content_hash, created_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(artifact_id) DO UPDATE SET
+           feature_id = excluded.feature_id,
+           producer_task_id = excluded.producer_task_id,
+           name = excluded.name,
+           mime = excluded.mime,
+           uri = excluded.uri,
+           size = excluded.size,
+           content_hash = excluded.content_hash`,
+      )
+      .run(
+        rec.artifactId,
+        rec.featureId,
+        rec.producerTaskId,
+        rec.name,
+        rec.mime ?? null,
+        rec.uri ?? null,
+        rec.size ?? null,
+        rec.contentHash ?? null,
+        createdAt,
+      );
+    const stored = this.getArtifact(rec.artifactId);
+    if (stored === null) {
+      throw new Error(`[session-store] upsertArtifact 后未能读回记录：${rec.artifactId}`);
+    }
+    return stored;
+  }
+
+  /** 查询产物；不存在返回 null */
+  getArtifact(artifactId: string): ArtifactRecord | null {
+    const row = this.db.prepare("SELECT * FROM artifacts WHERE artifact_id = ?").get(artifactId);
+    return row === undefined ? null : rowToArtifact(row);
+  }
+
+  /** 按 Feature 列出产物（created_at 升序；limit 默认 100，clamp 到 [1,1000]） */
+  listArtifactsByFeature(featureId: string, limit = 100): ArtifactRecord[] {
+    const capped = Math.min(Math.max(limit, 1), 1000);
+    const rows = this.db
+      .prepare("SELECT * FROM artifacts WHERE feature_id = ? ORDER BY created_at ASC LIMIT ?")
+      .all(featureId, capped) as Array<Record<string, unknown>>;
+    return rows.map(rowToArtifact);
+  }
+
+  /** 按生产者节点列出产物（created_at 升序；limit 默认 100，clamp 到 [1,1000]） */
+  listArtifactsByProducer(producerTaskId: string, limit = 100): ArtifactRecord[] {
+    const capped = Math.min(Math.max(limit, 1), 1000);
+    const rows = this.db
+      .prepare("SELECT * FROM artifacts WHERE producer_task_id = ? ORDER BY created_at ASC LIMIT ?")
+      .all(producerTaskId, capped) as Array<Record<string, unknown>>;
+    return rows.map(rowToArtifact);
+  }
+
+  // ------------------------------------------------------------------
+  // 事件收件箱（v0.4.0）
+  // ------------------------------------------------------------------
+
+  /** 追加事件，返回落库后的记录（`eventId` 由 AUTOINCREMENT 分配） */
+  appendEvent(rec: EventAppendInput): EventRecord {
+    const createdAt = rec.createdAt ?? nowIso();
+    const info = this.db
+      .prepare(
+        `INSERT INTO events (feature_id, task_id, kind, state, payload, created_at)
+         VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        rec.featureId ?? null,
+        rec.taskId ?? null,
+        rec.kind,
+        rec.state ?? null,
+        rec.payload ?? null,
+        createdAt,
+      );
+    return {
+      eventId: Number(info.lastInsertRowid),
+      featureId: rec.featureId ?? null,
+      taskId: rec.taskId ?? null,
+      kind: rec.kind,
+      state: rec.state ?? null,
+      payload: rec.payload ?? null,
+      createdAt,
+    };
+  }
+
+  /** 按游标列出事件（`event_id > since`，升序；limit 默认 100，clamp 到 [1,1000]） */
+  listEvents(opts: ListEventsOptions = {}): EventRecord[] {
+    const since = Math.max(opts.since ?? 0, 0);
+    const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
+    const rows = this.db
+      .prepare("SELECT * FROM events WHERE event_id > ? ORDER BY event_id ASC LIMIT ?")
+      .all(since, limit) as Array<Record<string, unknown>>;
+    return rows.map(rowToEvent);
+  }
+
+  /** 当前最大事件 id（空表返回 0）；用于游标回落 */
+  latestEventId(): number {
+    const row = this.db.prepare("SELECT COALESCE(MAX(event_id), 0) AS max_id FROM events").get() as
+      Record<string, unknown> | undefined;
+    if (row === undefined) return 0;
+    return Number(row["max_id"]);
   }
 
   /**
@@ -555,6 +904,9 @@ export class SessionStore {
    * 超期按 `updated_at` 早于 `retentionDays`；超量按每项目保留最新 `maxPerProject` 条。
    * v0.3.0：**排除活跃 Feature 的任务**（其 `feature_id` 非空且所属 Feature 未终态），
    * 避免误删在飞编排的证据。
+   * v0.4.0 复核：`blocked` 属非 working，但**活跃 Feature 的 `blocked` 任务同样受 `prunable`
+   * 保护**（其所属 Feature 非终态 → 不满足 `feature_id IS NULL` 也不在终态集合内），
+   * 仅当所属 Feature 已终态（completed/failed/cancelled）时才随 `blocked` 一并归档。
    */
   pruneTasks(opts: PruneTasksOptions = {}): number {
     const retentionDays = opts.retentionDays ?? TASK_RETENTION_DAYS;
@@ -565,9 +917,7 @@ export class SessionStore {
       "(feature_id IS NULL OR feature_id IN (" +
       "SELECT feature_id FROM features WHERE state IN ('completed','failed','cancelled')))";
     const expired = this.db
-      .prepare(
-        `DELETE FROM tasks WHERE state <> 'working' AND updated_at < ? AND ${prunable}`,
-      )
+      .prepare(`DELETE FROM tasks WHERE state <> 'working' AND updated_at < ? AND ${prunable}`)
       .run(cutoffIso).changes;
     const overflow = this.db
       .prepare(
@@ -638,10 +988,7 @@ export function listTasks(opts: ListTasksOptions): TaskRecord[] {
 }
 
 /** 按 Feature 列出任务节点（默认存储） */
-export function listFeatureTasks(
-  featureId: string,
-  opts?: ListFeatureTasksOptions,
-): TaskRecord[] {
+export function listFeatureTasks(featureId: string, opts?: ListFeatureTasksOptions): TaskRecord[] {
   return getDefaultStore().listFeatureTasks(featureId, opts);
 }
 
@@ -668,6 +1015,49 @@ export function getFeature(featureId: string): FeatureRecord | null {
 /** 更新 Feature 态（默认存储） */
 export function updateFeatureState(featureId: string, state: FeatureState): FeatureRecord | null {
   return getDefaultStore().updateFeatureState(featureId, state);
+}
+
+/** 更新 Feature Context（默认存储） */
+export function updateFeatureContext(
+  featureId: string,
+  patch: FeatureContextPatch,
+): FeatureRecord | null {
+  return getDefaultStore().updateFeatureContext(featureId, patch);
+}
+
+/** 写入/覆盖产物记录（默认存储） */
+export function upsertArtifact(rec: ArtifactUpsertInput): ArtifactRecord {
+  return getDefaultStore().upsertArtifact(rec);
+}
+
+/** 查询产物（默认存储） */
+export function getArtifact(artifactId: string): ArtifactRecord | null {
+  return getDefaultStore().getArtifact(artifactId);
+}
+
+/** 按 Feature 列出产物（默认存储） */
+export function listArtifactsByFeature(featureId: string, limit?: number): ArtifactRecord[] {
+  return getDefaultStore().listArtifactsByFeature(featureId, limit);
+}
+
+/** 按生产者节点列出产物（默认存储） */
+export function listArtifactsByProducer(producerTaskId: string, limit?: number): ArtifactRecord[] {
+  return getDefaultStore().listArtifactsByProducer(producerTaskId, limit);
+}
+
+/** 追加事件（默认存储） */
+export function appendEvent(rec: EventAppendInput): EventRecord {
+  return getDefaultStore().appendEvent(rec);
+}
+
+/** 按游标列出事件（默认存储） */
+export function listEvents(opts?: ListEventsOptions): EventRecord[] {
+  return getDefaultStore().listEvents(opts);
+}
+
+/** 当前最大事件 id（默认存储） */
+export function latestEventId(): number {
+  return getDefaultStore().latestEventId();
 }
 
 /** 列出 Feature（默认存储） */

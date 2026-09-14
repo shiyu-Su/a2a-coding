@@ -2,6 +2,31 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.4.0] - 2026-09-14
+
+### Added
+
+- **单 Feature 内并行与协作（需求内并行）**（REQ-v0.4.0-2026-09-14-01）：
+  - **拓扑并行 + 失败传播**（`orch/bridge/scheduler.ts`）：由「每 Feature 单在飞」改为**同层无依赖 Task 并发派发**（就绪判定 `find→filter` + 整批 `Promise.all`）；新增**三层防重派**（Feature 批门闩 / 节点级在飞标记「先置位后 await」/ tick 守卫）；**失败传播**——上游 `failed` → 沿 `dependencies` 反向**传递闭包**把下游置 `blocked`，Feature 收敛 `failed`。`TaskState` 新增 `blocked`；`recover()` 并行语义重写。
+  - **Artifact 注册与下游引用**（`orch/session/store.ts` + `bridge/index.ts`）：新增 `artifacts` 表；任务 settle 登记产物；下游经 `a2a_call(inputs=[{producerTaskId,name} | {artifactId}])` **显式引用**上游产物，桥派发时**注入**下游 input（`tasks.input_artifacts`）。
+  - **Feature Context**：`features` 增 `contextId` / `plan` / `decisions` / `contracts`；`a2a_feature_create(contextId)`、`a2a_feature_advance(note=…)`（+ `decisions`/`contracts`）落库，派发时注入。
+  - **分析扇出**：`registerFeatureNode` 放开 `analyzing` 态可挂载（扇出复用拓扑并行）。
+  - **worker 回调与收件箱**：orch 内嵌 loopback HTTP 事件端点 `POST /callback`（**默认关**，`callback{enabled,host,port,token?}` 配置）；派发经 A2A `configuration.taskPushNotificationConfig` **内联注册**回调（路径 1，不动线协议）；worker 状态变化推送 → 桥记 `events`；新增 `events` 表 + `a2a_events(since?)` 收件箱 + `a2a_wait(timeoutMs?)` 长轮询；`task-watcher` 增 `subscribePush`（推送优先、轮询对账兜底）。**跨机回调**受鉴权约束，延后 v0.7.0（本版仅同机 opt-in）。
+
+### Changed
+
+- **MCP 工具面**由「泛型 5 + Feature 工具组 5」扩为「**泛型 7 + Feature 工具组 5**」（新增 `a2a_events` / `a2a_wait`）。
+- 三处 `package.json`（根 / orch / machine）版本号升至 `0.4.0`。
+- **线协议不变**（`PROTOCOL.md` / `PROTOCOL_VERSION` 保持 `1.0`）；**machine 单元无源码改动**（仅 `config.json.default` 加 push 能力 opt-in 样例）。
+- `orch/config/config.json.default` 增 `callback` 与 `machines[].pushCallback` 样例（默认关）。
+
+### Verified
+
+- 门禁：orch 单测 **23/23**；orch / machine `typecheck`·`build`·`lint` 全绿；`npm ci` **四补丁重放 clean**。
+- 全量回归 **457/457**。
+- **真机 E2E（v0.4.0 桥）**：E2E#1 拓扑并行（同层并发）/ Artifact 注入（`P3 got: P1 done`）/ Feature Context 注入（`sees-plan: yes`）/ `a2a_events` 收件箱；E2E#2 失败传播（`Q1 failed → Q2 blocked` → Feature `failed`，事件链 `task.settled(failed)`→`task.blocked`→`feature.state(failed)`）；**(乙)** push 回调 `/callback` 端到端（`push.received`，token 校验通过）、codex / claude ② 标记路径（`input-required` / `failed`）。
+- **未覆盖（遗留）**：跨机回调（v0.7.0 鉴权）、`recover()`（未在 Feature 在飞时重启桥）、`input-required` 跨 wrapper 重启持久化。
+
 ## [v0.3.1] - 2026-09-14
 
 ### Fixed
