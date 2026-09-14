@@ -2,7 +2,7 @@
  * Agent 子进程工具：spawn（Windows 走 shell 以解析 .cmd 包装器）、
  * stdout/stderr 逐行转发（不吞 stderr）、终止（Windows 杀进程树）。
  */
-import { spawn, type ChildProcess, type StdioOptions } from "node:child_process";
+import { spawn, spawnSync, type ChildProcess, type StdioOptions } from "node:child_process";
 import { delimiter, resolve } from "node:path";
 import type { Readable } from "node:stream";
 import type { LaunchSpec } from "../adapters/types.js";
@@ -113,20 +113,73 @@ function waitForExit(child: ChildProcess): Promise<void> {
   });
 }
 
-/** Windows 杀进程树（shell 包装会多出 cmd.exe 中间层，普通 kill 杀不干净） */
-function killTreeWindows(pid: number): Promise<void> {
-  return new Promise<void>((resolve) => {
-    const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
-      windowsHide: true,
-      stdio: "ignore",
+/**
+ * 异步杀进程树（shell 包装会多出 cmd.exe 中间层，普通 kill 杀不干净）。
+ * win32 走 `taskkill /T /F`；POSIX 走 `process.kill(pid, "SIGKILL")`。
+ * 供 `terminateChild` 与 `manager` 复用。
+ */
+export function killProcessTree(pid: number): Promise<void> {
+  if (process.platform === "win32") {
+    return new Promise<void>((resolve) => {
+      const killer = spawn("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+      killer.once("exit", () => {
+        resolve();
+      });
+      killer.once("error", () => {
+        resolve();
+      });
     });
-    killer.once("exit", () => {
-      resolve();
-    });
-    killer.once("error", () => {
-      resolve();
-    });
-  });
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    // 进程可能已退出，忽略
+  }
+  return Promise.resolve();
+}
+
+/**
+ * 同步杀进程树：`process.on("exit")` 中不可 await，必须同步完成。
+ * win32 → `spawnSync("taskkill", ["/pid", pid, "/T", "/F"])`；POSIX → `process.kill(pid, "SIGKILL")`。
+ * 任何失败都降级为 `child.kill()`，绝不抛出（exit 钩子内抛错会被忽略且污染退出码）。
+ */
+export function killProcessTreeSync(child: ChildProcess): void {
+  const pid = child.pid;
+  if (pid === undefined) {
+    try {
+      child.kill();
+    } catch {
+      // 进程可能已退出，忽略
+    }
+    return;
+  }
+  if (process.platform === "win32") {
+    try {
+      spawnSync("taskkill", ["/pid", String(pid), "/T", "/F"], {
+        windowsHide: true,
+        stdio: "ignore",
+      });
+    } catch {
+      try {
+        child.kill();
+      } catch {
+        // 进程可能已退出，忽略
+      }
+    }
+    return;
+  }
+  try {
+    process.kill(pid, "SIGKILL");
+  } catch {
+    try {
+      child.kill();
+    } catch {
+      // 进程可能已退出，忽略
+    }
+  }
 }
 
 /** 终止子进程：先优雅、后强杀；Windows 走 taskkill /T /F */
@@ -134,7 +187,7 @@ export async function terminateChild(child: ChildProcess, graceMs = KILL_GRACE_M
   if (hasExited(child)) return;
 
   if (process.platform === "win32" && typeof child.pid === "number") {
-    await killTreeWindows(child.pid);
+    await killProcessTree(child.pid);
     if (!hasExited(child)) child.kill();
     await waitForExit(child);
     return;

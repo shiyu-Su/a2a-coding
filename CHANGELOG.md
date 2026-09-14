@@ -2,6 +2,27 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.2.1] - 2026-09-14
+
+### Added
+
+- **Launcher 跨平台启停脚本**（REQ-v0.2.1-2026-09-14-01）：新增 `machine/scripts/launcherctl.mjs`（纯 Node ESM、零第三方依赖、无需构建），子命令 `start` / `stop` / `restart` / `status` / `logs`；`machine/package.json` 增对应 npm scripts。`start` 以 `spawn(detached:true, stdio→日志文件, windowsHide:true).unref()` 跨平台后台化（POSIX `setsid` / Windows `DETACHED_PROCESS`），脱离终端存活、stdout/stderr 重定向到 `machine/.a2a/logs/launcher.log`；幂等（已在运行即提示并 exit 0）；spawn 后轮询 `/health` 确认就绪。`stop` **默认「pidfile + 发信号」**（POSIX `SIGTERM` 优雅 / Windows `taskkill /T /F` 强制树杀），配置 `launcher.shutdownEndpoint=true` 时改用 `POST /shutdown` 优雅停止（端点失败回落）；`status` 读 pidfile + 端口探测 + `/health`，区分运行中 / 未运行 / pidfile 陈旧；`restart` = stop → 等端口释放 → start；`logs` 支持 `--lines N` 与 `--follow`。**bridge 不纳入**（stdio MCP server，无独立常驻进程）。**为 machine 单元运维配套，`PROTOCOL.md` 不变。**
+- **Launcher 启动自检前的单实例互斥**（REQ-v0.2.1-2026-09-14-02）：`launcher/index.ts` 启动顺序改为**先 `listen(launcher.port)` 再自检**——端口即 OS 级原子锁，第二个实例在 `listen` 阶段即 `EADDRINUSE` 退出、**不进入自检**，根除「双实例自检阶段 a2a 端口（3010/3011）撞车」竞态（原 `EADDRINUSE 3011 → fetch failed → fail-fast`）。就绪门：自检通过前业务路由返回 503（`/health` 仍 200 并报 `status: starting|ok`）；自检失败有界关闭端口（`closeIdleConnections()` + 1s `closeAllConnections()` 兜底）后非零退出。
+- **Launcher pidfile 与可选优雅停止端点**（REQ-v0.2.1-2026-09-14-02）：`listen` 成功后写 `machine/.a2a/launcher.pid`（JSON `{pid,port,host,startedAt}`），优雅退出 / `exit` 路径删除。新增可选 `POST /shutdown`（配置 `launcher.shutdownEndpoint`，**默认关闭**），触发与 SIGINT/SIGTERM 共享的幂等优雅停止；仅接受 loopback 来源（可选 `shutdownToken`）。新增可选 `launcher.listenHost`（**默认保持现状**，不改变既有可达性）。修正启动日志如实打印实际绑定 host（原注释/日志称 127.0.0.1、代码实际绑全网卡）。
+- **wrapper `listen` 错误结构化退出补丁**（REQ-v0.2.1-2026-09-14-02）：补丁 `@a2a-wrapper/core`（`dist/server/factory.js`）将 `app.listen` 包为 Promise（`once('listening')` / `once('error', reject)`），使 `EADDRINUSE` 以 rejection 经 `main().catch` 结构化退出（不再未处理 `error` 事件致进程崩溃 / `UV_HANDLE_CLOSING` assertion）；三端 `a2a-opencode` / `a2a-codex` / `a2a-claude` 的 `dist/cli.js` 信号路径与 `main().catch` 均改 `process.exit(0/1)` → `process.exitCode =`（等事件循环 drain 后退出）。`machine/package.json` 的 `postinstall` 加 `--error-on-fail`，三端 wrapper 依赖版本收紧为精确值。
+
+### Changed
+
+- Launcher 退出清理统一走 `allChildren` 生命周期注册表（spawn 返回即注册，覆盖 `waitForPort` 注册前的在途子进程与 backend `opencode serve`）；`shutdown()` / `killAllSync()` 遍历之；`killAllSync()` 改**树杀**（win32 `spawnSync taskkill /T /F`、POSIX `SIGKILL`），修复原 Windows 下 `child.kill()` 漏杀 cmd.exe 子孙；`shuttingDown` 守卫避免退出中复活状态。
+- `machine/launcher/server.ts` 注册可选 `/shutdown` 与就绪门中间件；`config.ts` / `types.ts` 增 `listenHost` / `shutdownEndpoint` / `shutdownToken` 可选字段。
+- 三处 `package.json`（根 / orch / machine）版本号升至 `0.2.1`。
+
+### Verified
+
+- 功能测试（2026-09-14，宿主全程执行，隔离沙箱）：REQ-02 —— 双实例并发第二个 `EADDRINUSE` 且不进自检；自检失败 fail-fast 关端口 + 删 pidfile；真实 `a2a-opencode` 端口冲突结构化退出（exit 1、无 `UV_HANDLE_CLOSING`）；`POST /shutdown` 非 loopback → 403、loopback → 优雅停止并回收 wrapper + `opencode serve`；`exit` 钩子在途子进程树杀 0 残留。REQ-01 —— `start` 后台化（脱离终端、日志入文件、pidfile、`/health`）、幂等 start 不起第二实例、`status` 三态、`stop` 端点与回落双路径、`restart`、`logs --lines` / `--follow`。
+- 门禁（machine）：`typecheck` / `build` / `lint` / `format:check` 均 exit 0。
+- 回归测试全量通过（报告见 `reports/v0.2.1/regression-report.json`；`reports/` 不入库）。
+
 ## [v0.2.0] - 2026-09-14
 
 ### Added

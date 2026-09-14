@@ -96,8 +96,24 @@ a2a-coding/
 ```bash
 cd machine
 npm install          # postinstall 自动执行 patch-package，应用会话落盘补丁
-npm run launcher     # 先 tsc 构建，再运行 dist/launcher/index.js
+npm run launcher     # 前台运行：先 tsc 构建，再运行 dist/launcher/index.js
 ```
+
+#### 后台启停（v0.2.1，跨平台）
+
+同一条命令在 **Windows / Linux / macOS** 均可让 Launcher 脱离终端后台常驻；日志写入 `machine/.a2a/logs/launcher.log`：
+
+```bash
+npm run start                 # 后台启动（已在运行则提示并退出 0）
+npm run status                # 查看 pid / host:port / health / startedAt
+npm run stop                  # 停止（POSIX 发 SIGTERM 优雅退出；Windows taskkill /T /F 强制树杀）
+npm run restart               # 停止后重新后台拉起
+npm run logs                  # 输出日志全文
+npm run logs -- --lines 50    # 仅看尾部 50 行
+npm run logs -- --follow      # 持续跟踪（等价 tail -f，Ctrl+C 退出）
+```
+
+> 脚本为 `machine/scripts/launcherctl.mjs`（纯 Node ESM，零第三方依赖、无需构建）。端口读配置 `launcher.port`，`MACHINE_CONFIG` 可指定其他配置文件；pidfile 位于 `machine/.a2a/launcher.pid`（由 Launcher 写）。`start` 会轮询 `/health` 至可达（端口在启动自检前即监听）；`stop` 优先按配置 `launcher.shutdownEndpoint=true` 走 `POST /shutdown` 优雅停止，端点不可用时回落到发信号。pidfile 缺失 / 陈旧时只做端口探测提示，**不误杀**。前台命令 `npm run launcher` 行为不变，其进程同样可被 `status` 发现、被 `stop` 停止。
 
 Launcher 按 `machine/config/config.json` 监听（模板见 `machine/config/config.json.default`；可用环境变量 `MACHINE_CONFIG` 指定其他文件），暴露这些接口：
 
@@ -109,10 +125,13 @@ Launcher 按 `machine/config/config.json` 监听（模板见 `machine/config/con
 | `GET  /projects` | 本机项目清单 + 运行态 |
 | `POST /projects/{projectId}/ensure` | 幂等启动，返回 A2A 端点 |
 | `POST /projects/{projectId}/stop` | 停止项目 Agent |
+| `POST /shutdown` | 优雅停止 Launcher（**可选**，`launcher.shutdownEndpoint=true` 时注册；仅接受 loopback 来源） |
+
+> **单实例与启动顺序（v0.2.1）**：Launcher **先 `listen` 端口再自检**，端口绑定即单实例互斥锁——重复启动的第二实例在 `listen` 阶段即 `EADDRINUSE` 退出，**不进入自检**，从根上杜绝双实例撞 a2a 端口。`'listening'` 后写 pidfile `<machine 根>/.a2a/launcher.pid`（JSON `{ pid, port, host, startedAt }`，UTC ISO-8601；供启停脚本读取，**非锁**，陈旧无害），优雅退出 / fail-fast / `process exit` 均删除。**就绪门**：自检通过前 `GET /health` 仍 `200` 但报 `status:"starting"`，业务路由（`/projects*`）返回 `503`；通过后 `status:"ok"`。
 
 > **线协议版本化（Bridge ⇄ Launcher，v0.1.2）**：Launcher 在 `GET /health` 自报 `protocolVersion`（`"major.minor"`，单一事实源见 [PROTOCOL.md](PROTOCOL.md)）；桥**首触一台机器**（首个 `/projects` / `ensure` 前）先握手校验，机器主版本不在桥侧可支持清单（`SUPPORTED_PEER_PROTOCOL_MAJORS`）内即**拒绝派发**并给出升级指引——杜绝「新请求体被旧 Launcher 静默忽略」的假象。成功校验进程内缓存（后续调用不再握手，`grep "\[a2a-bridge\] protocol handshake"` 可见各机版本台账）；失败不缓存负项，机器升级后下一轮调用自动恢复，无需重启桥。版本规则：加可选字段 → minor+1；删字段 / 改语义 / 加必填请求体 → major+1（详见 PROTOCOL.md 的版本规则、握手语义与演进记录表）。
 
-> **启动自检**（缺省开，`launcher.startupCheck=false` 跳过）：监听端口前对本机全部项目逐个 `ensure` 拉起 → 经 A2A 发送一条真实最小任务 → 校验任务完成且响应非空 → `stop` 回收。全部通过才进入对外服务；任一失败即打印项目 / 阶段 / 原因并**退出（非零）**，从源头避免「机器看似起来、一用就废」。每个项目消耗一次极小模型调用；自检与真实任务同链路，因此能暴露认证 / 模型 / provider 缺配。
+> **启动自检**（缺省开，`launcher.startupCheck=false` 跳过）：先 `listen` 端口（单实例互斥，见上），随后对本机全部项目逐个 `ensure` 拉起 → 经 A2A 发送一条真实最小任务 → 校验任务完成且响应非空 → `stop` 回收。全部通过才放行业务路由；任一失败即打印项目 / 阶段 / 原因，**关闭端口 → 回收子进程 → 删 pidfile → 退出（非零）**，从源头避免「机器看似起来、一用就废」。每个项目消耗一次极小模型调用；自检与真实任务同链路，因此能暴露认证 / 模型 / provider 缺配。
 >
 > 另外每次拉起 Agent 时，Launcher 日志会打印该项目的**配置快照**：配置获取层级（项目 agentConfig / 用户级配置文件路径）+ endpoint / 模型 id（值标注来源 agentConfig / env / 用户配置），便于核对项目实际生效的模型与网关。
 
@@ -188,6 +207,9 @@ a2a_call(project="machine", message="把刚才的结果按类型分组", context
 - `launcher.startupCheck`（可选）：启动自检开关，缺省 `true`（见「快速开始」的自检说明）；`false` 跳过自检直接进入服务。
 - `launcher.startupCheckTimeoutMs`（可选）：每个项目自检的总超时（毫秒），缺省 `120000`。
 - `launcher.startupCheckPrompt`（可选）：自检 prompt，缺省 `Reply with exactly: OK`。
+- `launcher.listenHost`（可选）：Launcher 绑定地址。**缺省不设置 = 绑定全部网卡**（保持既有行为，避免跨机直连回归）；启用 `shutdownEndpoint` 时建议设为 `127.0.0.1`。
+- `launcher.shutdownEndpoint`（可选）：`true` 时注册 `POST /shutdown`（仅接受 loopback 来源），缺省 `false`。反代转发后源地址为 loopback，**Caddy / 反向代理必须 deny `/shutdown`**。
+- `launcher.shutdownToken`（可选）：`POST /shutdown` 的 Bearer 令牌（`Authorization: Bearer <token>`）；缺省不校验。
 - `projects[]`：本机项目列表，每项含：
   - `projectId`：项目标识，全局唯一。
   - `workspace`：执行目录。

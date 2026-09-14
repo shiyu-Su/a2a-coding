@@ -1,6 +1,7 @@
 {
+  "_comment": "可选字段：listenHost 省略 = 绑定全部网卡（保持现状）；启用 shutdownEndpoint=true 时建议 listenHost=127.0.0.1，并由反向代理 deny /shutdown（反代转发后源地址为 loopback，会绕过 loopback 校验）。",
   "machineId": "<machine-id>",
-  "launcher": { "port": 3100, "idleStopMs": 300000, "startupCheck": true, "startupCheckTimeoutMs": 120000 },
+  "launcher": { "port": 3100, "idleStopMs": 300000, "startupCheck": true, "startupCheckTimeoutMs": 120000, "shutdownEndpoint": false },
   "projects": [
     {
       "projectId": "<project-id>",

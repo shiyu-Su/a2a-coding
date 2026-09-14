@@ -1,3 +1,28 @@
+diff --git a/node_modules/a2a-opencode/dist/cli.js b/node_modules/a2a-opencode/dist/cli.js
+index 841e74b..c2b0ef8 100644
+--- a/node_modules/a2a-opencode/dist/cli.js
++++ b/node_modules/a2a-opencode/dist/cli.js
+@@ -179,13 +179,17 @@ async function main() {
+     const shutdown = async (signal) => {
+         log.info(`${signal} received, shutting down...`);
+         await handle.shutdown();
+-        process.exit(0);
++        // REQ-v0.2.1-2026-09-14-02: let the event loop drain instead of process.exit(0)
++        // (avoids UV_HANDLE_CLOSING assertion while stdout/handles are still closing).
++        process.exitCode = 0;
+     };
+     process.on("SIGINT", () => shutdown("SIGINT"));
+     process.on("SIGTERM", () => shutdown("SIGTERM"));
+ }
+ main().catch((err) => {
+     log.error("Fatal error", { error: err.message, stack: err.stack });
+-    process.exit(1);
++    // REQ-v0.2.1-2026-09-14-02: set exitCode and let the loop drain instead of
++    // process.exit(1), which aborts with UV_HANDLE_CLOSING on Windows.
++    process.exitCode = 1;
+ });
+ //# sourceMappingURL=cli.js.map
+\ No newline at end of file
 diff --git a/node_modules/a2a-opencode/dist/opencode/executor.js b/node_modules/a2a-opencode/dist/opencode/executor.js
 index 1bf46bf..d3399cc 100644
 --- a/node_modules/a2a-opencode/dist/opencode/executor.js

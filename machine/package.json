@@ -1,6 +1,6 @@
 {
   "name": "@a2a-coding/machine",
-  "version": "0.2.0",
+  "version": "0.2.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -13,12 +13,17 @@
     "format:check": "prettier --check .",
     "build": "tsc -p tsconfig.json",
     "launcher": "npm run build && node dist/launcher/index.js",
-    "postinstall": "patch-package"
+    "start": "node scripts/launcherctl.mjs start",
+    "stop": "node scripts/launcherctl.mjs stop",
+    "restart": "node scripts/launcherctl.mjs restart",
+    "status": "node scripts/launcherctl.mjs status",
+    "logs": "node scripts/launcherctl.mjs logs",
+    "postinstall": "patch-package --error-on-fail"
   },
   "dependencies": {
-    "a2a-claude": "^0.4.1",
-    "a2a-codex": "^1.7.2",
-    "a2a-opencode": "^1.7.2",
+    "a2a-claude": "0.4.1",
+    "a2a-codex": "1.7.2",
+    "a2a-opencode": "1.7.2",
     "express": "^4.21.2"
   },
   "devDependencies": {

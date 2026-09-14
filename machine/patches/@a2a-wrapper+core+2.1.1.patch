@@ -1,5 +1,5 @@
 diff --git a/node_modules/@a2a-wrapper/core/dist/server/factory.js b/node_modules/@a2a-wrapper/core/dist/server/factory.js
-index e1c9612..ca82640 100644
+index e1c9612..18487b4 100644
 --- a/node_modules/@a2a-wrapper/core/dist/server/factory.js
 +++ b/node_modules/@a2a-wrapper/core/dist/server/factory.js
 @@ -52,9 +52,10 @@
@@ -23,7 +23,30 @@ index e1c9612..ca82640 100644
      const requestHandler = new DefaultRequestHandler(agentCard, taskStore, executor, // executor satisfies AgentExecutor at runtime; cast avoids coupling core to SDK's full AgentExecutor shape
      undefined, // eventBusManager (SDK default)
      undefined, // pushNotificationStore
-@@ -255,6 +256,7 @@ export async function createA2AServer(config, executorFactory, options) {
+@@ -243,8 +244,20 @@ export async function createA2AServer(config, executorFactory, options) {
+         options.registerRoutes(app, executor);
+     }
+     // ── 6. Start listening ──────────────────────────────────────────────────
+-    const httpServer = app.listen(port, hostname, () => {
+-        options?.onListening?.({ port, hostname, advertiseHost, advertiseProtocol: advertiseProto });
++    // REQ-v0.2.1-2026-09-14-02: surface async listen errors (e.g. EADDRINUSE) as a
++    // rejected promise so callers' `main().catch` exits structurally instead of Node
++    // crashing on an unhandled 'error' event (UV_HANDLE_CLOSING assertion).
++    const httpServer = await new Promise((resolve, reject) => {
++        const listener = app.listen(port, hostname, () => {
++            options?.onListening?.({ port, hostname, advertiseHost, advertiseProtocol: advertiseProto });
++            resolve(listener);
++        });
++        listener.once("error", reject);
++    });
++    // Keep an error listener attached after startup so a later socket error does not
++    // become an unhandled 'error' event (which would crash the process).
++    httpServer.on("error", (err) => {
++        console.error(`[a2a-wrapper] HTTP server error after startup: ${err?.message ?? String(err)}`);
+     });
+     // ── 7. Return handle ───────────────────────────────────────────────────
+     return {
+@@ -255,6 +268,7 @@ export async function createA2AServer(config, executorFactory, options) {
          async shutdown() {
              httpServer.close();
              await executor.shutdown();

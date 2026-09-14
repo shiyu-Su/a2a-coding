@@ -112,6 +112,19 @@ export function loadMachineConfig(path: string): MachineConfig {
   if (startupCheckPrompt !== undefined) {
     launcherConfig.startupCheckPrompt = asString(startupCheckPrompt, "launcher.startupCheckPrompt");
   }
+  const listenHost = launcher["listenHost"];
+  if (listenHost !== undefined) {
+    // 可选绑定地址；缺省不写 → 保持现有绑定行为（绑全部网卡）
+    launcherConfig.listenHost = asString(listenHost, "launcher.listenHost");
+  }
+  const shutdownEndpoint = launcher["shutdownEndpoint"];
+  if (shutdownEndpoint !== undefined) {
+    launcherConfig.shutdownEndpoint = asBool(shutdownEndpoint, "launcher.shutdownEndpoint");
+  }
+  const shutdownToken = launcher["shutdownToken"];
+  if (shutdownToken !== undefined) {
+    launcherConfig.shutdownToken = asString(shutdownToken, "launcher.shutdownToken");
+  }
   return {
     machineId: asString(o["machineId"], "machineId"),
     launcher: launcherConfig,

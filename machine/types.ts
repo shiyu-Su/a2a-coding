@@ -59,6 +59,18 @@ export interface MachineConfig {
     startupCheckTimeoutMs?: number;
     /** 自检发送的最小任务 prompt；缺省内置极短串（最小化 token 消耗） */
     startupCheckPrompt?: string;
+    /**
+     * Launcher 监听地址（可选）。**缺省不设置 = 交由 Node 绑定全部网卡**（保持 v0.2.0
+     * 现状，避免跨机直连回归）。启用 `shutdownEndpoint` 时建议设为 `127.0.0.1`。
+     */
+    listenHost?: string;
+    /**
+     * 优雅停止端点 `POST /shutdown`：缺省 `false`（不注册）。启用后仅接受 loopback
+     * 来源；反代转发会使源地址变为 loopback，故 Caddy / 反向代理必须 deny `/shutdown`。
+     */
+    shutdownEndpoint?: boolean;
+    /** `POST /shutdown` 可选 Bearer 令牌；缺省不校验（配合 loopback 收窄使用） */
+    shutdownToken?: string;
   };
   projects: ProjectConfig[];
 }

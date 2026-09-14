@@ -20,6 +20,7 @@ import { allocateFreePort, waitForHttpOk, waitForPort } from "./ports.js";
 import {
   errorMessage,
   hasExited,
+  killProcessTreeSync,
   pipeChildOutput,
   spawnAgentProcess,
   terminateChild,
@@ -72,9 +73,30 @@ export class AgentManager {
   private readonly running = new Map<string, RunningAgent>();
   /** 进行中的 ensure（防并发重复拉起同一项目） */
   private readonly pending = new Map<string, Promise<EnsureResult>>();
+  /**
+   * 唯一子进程生命周期注册表（spawn 返回即注册）：
+   * key 形如 `${projectId}:agent` / `${projectId}:serve`。这是退出清理的**唯一事实源**，
+   * 覆盖 `running` 与「spawn→注册窗口」的 child（含后台 `opencode serve`）。
+   */
+  private readonly allChildren = new Map<string, ChildProcess>();
+  /** 退出中标志：置位后 `start()` 拒绝拉起，`running.set` 前二次校验，防止僵死注册 */
+  private shuttingDown = false;
 
   constructor(config: MachineConfig) {
     this.config = config;
+  }
+
+  /**
+   * 登记子进程（spawn 返回后**立即**调用，早于 `waitForPort` / `running.set`）。
+   * `exit`/`error` 时自动移除，保证「spawn→注册窗口」归零（退出清理不漏）。
+   */
+  private trackChild(key: string, child: ChildProcess): void {
+    this.allChildren.set(key, child);
+    const untrack = (): void => {
+      if (this.allChildren.get(key) === child) this.allChildren.delete(key);
+    };
+    child.once("exit", untrack);
+    child.once("error", untrack);
   }
 
   /** 有效空闲回收时长（ms）：缺省 DEFAULT_IDLE_STOP_MS；`0`/负值表示禁用自动回收 */
@@ -178,6 +200,9 @@ export class AgentManager {
   }
 
   private async start(project: ProjectConfig): Promise<EnsureResult> {
+    if (this.shuttingDown) {
+      throw new AgentStartError(project.projectId, "Launcher 正在退出，拒绝启动新 Agent");
+    }
     // 风险档位 → 权限映射：缺省 write（= 三端包装器内置默认，v0.1.0 行为不变）
     const risk = project.risk ?? "write";
     const adapter = getAdapter(project.agentKind);
@@ -227,10 +252,22 @@ export class AgentManager {
       if (backend !== null) await terminateChild(backend.child);
       throw new AgentStartError(project.projectId, errorMessage(err));
     }
+    // spawn 返回即注册（先于 waitForPort / running.set），退出清理不再漏
+    this.trackChild(`${project.projectId}:agent`, child);
     const endpoint = agentEndpoint(project.a2aPort);
 
     // 子进程输出不吞：stdout/stderr 逐行转发，便于诊断启动失败
     pipeChildOutput(child, `[agent:${project.projectId}]`);
+
+    // 记录退出码/信号：用于 waitForPort 中止时给出结构化失败原因（如 wrapper EADDRINUSE 非零退出）
+    const exitState: { code: number | null; signal: NodeJS.Signals | null } = {
+      code: null,
+      signal: null,
+    };
+    child.once("exit", (code, signal) => {
+      exitState.code = code;
+      exitState.signal = signal;
+    });
 
     // spawn 失败（命令不存在/无法执行）会触发 error 事件；必须监听，否则未处理异常会杀死 Launcher
     const spawnState: { error: Error | null } = { error: null };
@@ -271,8 +308,21 @@ export class AgentManager {
     } catch (err) {
       await terminateChild(child);
       if (backend !== null) await terminateChild(backend.child);
-      const reason = spawnState.error !== null ? errorMessage(spawnState.error) : errorMessage(err);
+      // 早退快速失败：wrapper 因端口冲突等原因非零退出时，不等满 waitForPort 超时
+      const reason =
+        spawnState.error !== null
+          ? errorMessage(spawnState.error)
+          : hasExited(child)
+            ? `包装器进程提前退出（code=${String(exitState.code)}, signal=${String(exitState.signal)}）`
+            : errorMessage(err);
       throw new AgentStartError(project.projectId, reason);
+    }
+
+    // 退出中：清理后拒绝注册（避免 shutdown 已跑完却又登记出「僵尸在线」）
+    if (this.shuttingDown) {
+      await terminateChild(child);
+      if (backend !== null) await terminateChild(backend.child);
+      throw new AgentStartError(project.projectId, "Launcher 正在退出，已中止启动");
     }
 
     this.running.set(project.projectId, {
@@ -312,6 +362,8 @@ export class AgentManager {
       args: ["serve", "--port", String(servePort), "--hostname", "127.0.0.1"],
     };
     const child = spawnAgentProcess(spec, project.workspace);
+    // spawn 返回即注册（早于健康等待），退出清理覆盖半启动 serve
+    this.trackChild(`${project.projectId}:serve`, child);
     pipeChildOutput(child, `[serve:${project.projectId}]`);
 
     const spawnState: { error: Error | null } = { error: null };
@@ -362,37 +414,23 @@ export class AgentManager {
     return { projectId, stopped: true };
   }
 
-  /** 停止所有 Agent 及其前置 serve（进程退出前调用） */
+  /** 停止所有 Agent 及其前置 serve（进程退出前调用）：遍历唯一注册表 allChildren */
   async shutdown(): Promise<void> {
-    const entries = [...this.running.values()];
-    for (const entry of entries) this.clearIdleTimer(entry);
+    this.shuttingDown = true;
+    for (const entry of this.running.values()) this.clearIdleTimer(entry);
     this.running.clear();
-    await Promise.all(
-      entries.flatMap((entry) => {
-        const tasks: Array<Promise<void>> = [terminateChild(entry.child)];
-        if (entry.serveChild !== null) tasks.push(terminateChild(entry.serveChild));
-        return tasks;
-      }),
-    );
+    const children = [...this.allChildren.values()];
+    this.allChildren.clear();
+    await Promise.all(children.map((child) => terminateChild(child)));
   }
 
-  /** 同步兜底清理（process exit 事件中不可 await） */
+  /** 同步兜底清理（process exit 事件中不可 await）：对 allChildren 逐个树杀 */
   killAllSync(): void {
-    for (const entry of this.running.values()) {
-      this.clearIdleTimer(entry);
-      try {
-        entry.child.kill();
-      } catch {
-        // 进程可能已退出，忽略
-      }
-      if (entry.serveChild !== null) {
-        try {
-          entry.serveChild.kill();
-        } catch {
-          // 进程可能已退出，忽略
-        }
-      }
-    }
+    this.shuttingDown = true;
+    for (const entry of this.running.values()) this.clearIdleTimer(entry);
     this.running.clear();
+    const children = [...this.allChildren.values()];
+    this.allChildren.clear();
+    for (const child of children) killProcessTreeSync(child);
   }
 }
