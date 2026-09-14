@@ -23,11 +23,30 @@ index 841e74b..c2b0ef8 100644
  });
  //# sourceMappingURL=cli.js.map
 \ No newline at end of file
+diff --git a/node_modules/a2a-opencode/dist/config/defaults.js b/node_modules/a2a-opencode/dist/config/defaults.js
+index aad693c..c069214 100644
+--- a/node_modules/a2a-opencode/dist/config/defaults.js
++++ b/node_modules/a2a-opencode/dist/config/defaults.js
+@@ -42,7 +42,8 @@ export const DEFAULTS = Object.freeze({
+     },
+     features: {
+         autoApprovePermissions: true,
+-        autoAnswerQuestions: true,
++        // v0.3.1 机制①: 原生提问上报 input-required，不自动替用户答
++        autoAnswerQuestions: false,
+         streamArtifactChunks: false,
+         enablePollingFallback: true,
+     },
 diff --git a/node_modules/a2a-opencode/dist/opencode/executor.js b/node_modules/a2a-opencode/dist/opencode/executor.js
-index 1bf46bf..d3399cc 100644
+index 1bf46bf..3b6ee15 100644
 --- a/node_modules/a2a-opencode/dist/opencode/executor.js
 +++ b/node_modules/a2a-opencode/dist/opencode/executor.js
-@@ -20,6 +20,17 @@ import { publishStatus, publishFinalArtifact, publishStreamingChunk, publishLast
+@@ -16,10 +16,21 @@ import { EventStreamManager } from "./event-stream.js";
+ import { PermissionHandler } from "./permission-handler.js";
+ import { SessionManager } from "./session-manager.js";
+ import { registerMcpServers } from "./mcp-manager.js";
+-import { publishStatus, publishFinalArtifact, publishStreamingChunk, publishLastChunkMarker, publishTask, extractUserText, resolveTransport, AgentEventEmitter, materializeMemory, WELL_KNOWN_PATHS, bootstrapSubAgents, } from "@a2a-wrapper/core";
++import { publishStatus, publishFinalArtifact, publishStreamingChunk, publishLastChunkMarker, publishTask, extractUserText, resolveOutcome, resolveTransport, AgentEventEmitter, materializeMemory, WELL_KNOWN_PATHS, bootstrapSubAgents, } from "@a2a-wrapper/core";
  import { createDeferred, sleep } from "../utils/deferred.js";
  import { logger } from "../utils/logger.js";
  const log = logger.child("executor");
@@ -45,7 +64,85 @@ index 1bf46bf..d3399cc 100644
  // ─── Trace Helpers ──────────────────────────────────────────────────────────
  const MAX_DATA_SIZE = 100_000;
  const SENSITIVE_KEYS = new Set([
-@@ -293,6 +304,7 @@ export class OpenCodeExecutor {
+@@ -64,6 +75,12 @@ export class OpenCodeExecutor {
+     initialized = false;
+     /** Track which sessions have already received the system prompt. */
+     promptedSessions = new Set();
++    /**
++     * 机制① (v0.3.1): contextId → pending native question awaiting a user
++     * answer. Populated when a `question.asked` is surfaced as `input-required`
++     * and consumed on the next turn in the same context.
++     */
++    pendingQuestions = new Map();
+     /** Optional custom event transport supplied via programmatic API. */
+     customTransport;
+     constructor(config) {
+@@ -159,6 +176,7 @@ export class OpenCodeExecutor {
+         this.permissionHandler = new PermissionHandler(this.client, {
+             autoApproveAll: this.config.features.autoApprovePermissions,
+             autoAnswerQuestions: this.config.features.autoAnswerQuestions,
++            onQuestionAsked: (req, ctx) => this.handleQuestionSuspension(req, ctx),
+         });
+         // Session manager
+         this.sessionManager = new SessionManager(this.client, this.config.session, this.config.features, oc.projectDirectory ?? "");
+@@ -168,6 +186,7 @@ export class OpenCodeExecutor {
+     }
+     async shutdown() {
+         this.sessionManager?.shutdown();
++        this.pendingQuestions.clear();
+         if (this.client) {
+             this.client.cleanup();
+             this.client = null;
+@@ -175,6 +194,48 @@ export class OpenCodeExecutor {
+         this.initialized = false;
+         log.info("Executor shut down");
+     }
++    // ── Native Question Suspension (机制① v0.3.1) ────────────────────────────
++    /**
++     * Called by the permission handler when OpenCode asks a native question and
++     * auto-answering is disabled. Records the pending question for the context,
++     * publishes an `input-required` task state carrying the question text, and
++     * signals the active turn to suspend. Returns true so the handler leaves the
++     * question untouched (no fabricated answer, no rejection).
++     *
++     * @returns {boolean} true when the question was surfaced; false when no
++     *                    execution context is available (handler falls through).
++     */
++    handleQuestionSuspension(req, ctx) {
++        if (!ctx?.bus || !ctx?.taskId || !ctx?.contextId)
++            return false;
++        const questionText = this.formatQuestionText(req?.questions);
++        this.pendingQuestions.set(ctx.contextId, {
++            requestId: req.id,
++            sessionId: ctx.sessionId,
++            questions: Array.isArray(req?.questions) ? req.questions : [],
++        });
++        publishStatus(ctx.bus, ctx.taskId, ctx.contextId, "input-required", questionText);
++        log.info("Native question surfaced as input-required", { taskId: ctx.taskId, questionId: req.id });
++        if (typeof ctx.onSuspend === "function")
++            ctx.onSuspend();
++        return true;
++    }
++    /** Render native questions (text + options) into a human-readable prompt. */
++    formatQuestionText(questions) {
++        const list = Array.isArray(questions) ? questions : [];
++        if (list.length === 0)
++            return "The agent needs your input to continue.";
++        return list
++            .map((q) => {
++                const header = typeof q?.header === "string" && q.header ? `${q.header}: ` : "";
++                const text = typeof q?.question === "string" ? q.question : "";
++                const options = Array.isArray(q?.options) && q.options.length > 0
++                    ? `\nOptions: ${q.options.map((o) => o?.label).filter(Boolean).join(" | ")}`
++                    : "";
++                return `${header}${text}${options}`;
++            })
++            .join("\n");
++    }
+     // ── Context Build ───────────────────────────────────────────────────────
+     /**
+      * Build (or refresh) the domain context file by sending a prompt to OpenCode.
+@@ -293,6 +354,7 @@ export class OpenCodeExecutor {
      // ── Execute ─────────────────────────────────────────────────────────────
      async execute(ctx, bus) {
          const { taskId, contextId, userMessage, task } = ctx;
@@ -53,7 +150,41 @@ index 1bf46bf..d3399cc 100644
          await this.initialize();
          let stream = null;
          // Extract trace context propagated by the orchestrator via A2A metadata
-@@ -347,7 +359,8 @@ export class OpenCodeExecutor {
+@@ -320,9 +382,32 @@ export class OpenCodeExecutor {
+             // 3. Session
+             const sessionId = await this.sessionManager.getOrCreate(contextId);
+             this.sessionManager.trackTask(taskId, sessionId, contextId);
++            // 3b. 机制①: if a native question from a previous turn is still
++            //     pending for this context, the incoming message answers it and
++            //     resumes the SAME opencode turn (no new prompt).
++            let resumingQuestion = this.pendingQuestions.get(contextId) ?? null;
++            if (resumingQuestion && resumingQuestion.sessionId !== sessionId) {
++                this.pendingQuestions.delete(contextId);
++                resumingQuestion = null;
++            }
++            // Suspension signal for native questions (①): resolved by the
++            // question handler, observed by the completion race below.
++            const { promise: suspendedPromise, resolve: resolveSuspended } = createDeferred();
++            let suspendedForInput = false;
++            const executionCtx = {
++                bus,
++                taskId,
++                contextId,
++                sessionId,
++                isSuspended: () => suspendedForInput,
++                onSuspend: () => {
++                    suspendedForInput = true;
++                    resolveSuspended();
++                },
++            };
+             // 4. Build prompt (prepend system prompt on first message in session)
+             let promptText = extractUserText(userMessage);
+-            if (this.config.opencode.systemPrompt && !this.promptedSessions.has(sessionId)) {
++            if (!resumingQuestion && this.config.opencode.systemPrompt && !this.promptedSessions.has(sessionId)) {
+                 const mode = this.config.opencode.systemPromptMode ?? "append";
+                 let injectedPrompt = this.config.opencode.systemPrompt;
+                 if (mode === "replace") {
+@@ -347,7 +432,8 @@ export class OpenCodeExecutor {
                  this.promptedSessions.add(sessionId);
              }
              const promptBody = this.buildPromptBody(promptText);
@@ -63,15 +194,97 @@ index 1bf46bf..d3399cc 100644
              // 5. SSE stream
              const dir = this.config.opencode.projectDirectory || undefined;
              stream = new EventStreamManager(this.client, {
-@@ -517,6 +530,7 @@ export class OpenCodeExecutor {
+@@ -355,7 +441,7 @@ export class OpenCodeExecutor {
+                 directory: dir,
+                 reconnect: { maxRetries: 5, initialDelay: 1_000 },
+             });
+-            this.permissionHandler.attachToStream(stream);
++            this.permissionHandler.attachToStream(stream, executionCtx);
+             // 6. Completion tracking
+             const { promise: done, resolve: resolveDone, reject: rejectDone } = createDeferred();
+             let accumulatedText = "";
+@@ -475,29 +561,51 @@ export class OpenCodeExecutor {
+                 log.warn("SSE connection failed", { error: e.message });
+                 streamingFailed = true;
+             }
+-            await this.permissionHandler.handlePending(dir);
+-            // 8. Send prompt
+-            await this.client.sessionPromptAsync(sessionId, promptBody, dir);
+-            // 9. Await completion
++            await this.permissionHandler.handlePending(dir, executionCtx);
++            // 8. Kick the backend turn: resume a pending question (①) or send the prompt.
++            if (resumingQuestion) {
++                const userAnswer = extractUserText(userMessage);
++                const questions = Array.isArray(resumingQuestion.questions) ? resumingQuestion.questions : [];
++                const answers = questions.length > 0
++                    ? questions.map(() => [userAnswer])
++                    : [[userAnswer]];
++                await this.client.questionReply(resumingQuestion.requestId, answers, dir);
++                this.pendingQuestions.delete(contextId);
++                log.info("Resumed pending question", { taskId, requestId: resumingQuestion.requestId });
++            }
++            else {
++                await this.client.sessionPromptAsync(sessionId, promptBody, dir);
++            }
++            // 9. Await completion (or suspension for a native question — ①)
+             const timeoutMs = this.config.timeouts.prompt;
+             if (streamingFailed && this.config.features.enablePollingFallback) {
+-                accumulatedText = await this.pollForCompletion(sessionId, taskId, contextId, bus);
++                accumulatedText = await this.pollForCompletion(sessionId, taskId, contextId, bus, executionCtx);
+             }
+             else {
+                 const timeout = new Promise((_, rej) => setTimeout(() => rej(new Error(`Prompt timeout after ${timeoutMs}ms`)), timeoutMs));
+                 try {
+-                    await Promise.race([done, timeout]);
++                    await Promise.race([done, timeout, suspendedPromise]);
+                 }
+                 catch (e) {
+-                    if (!accumulatedText) {
+-                        const msgs = await this.client.sessionMessages(sessionId, dir);
+-                        accumulatedText = this.extractResponseText(msgs);
+-                    }
+                     if (!e.message.includes("timeout"))
+                         throw e;
++                    // ③ v0.3.1: a prompt timeout is a failure, not a completion.
++                    // Rethrow so the outer catch publishes `failed` (no fake `completed`).
+                     log.warn("Prompt timed out", { taskId, timeoutMs });
++                    throw e;
+                 }
+             }
++            // 9b. Suspension short-circuit (①): `input-required` was already
++            //     published by the question handler — end the turn without a
++            //     terminal `completed`.
++            if (suspendedForInput) {
++                stream.disconnect();
++                stream = null;
++                __a2aTaskLog.end(taskId, contextId, "input-required", 0, __taskT0);
++                log.info("Task suspended awaiting user input", { taskId });
++                bus.finished();
++                return;
++            }
+             // 10. Disconnect
+             stream.disconnect();
+             stream = null;
+@@ -516,9 +624,16 @@ export class OpenCodeExecutor {
+             else {
                  publishFinalArtifact(bus, taskId, contextId, accumulatedText);
              }
-             publishStatus(bus, taskId, contextId, "completed", undefined, true);
-+            __a2aTaskLog.end(taskId, contextId, "completed", accumulatedText.length, __taskT0);
+-            publishStatus(bus, taskId, contextId, "completed", undefined, true);
++            const outcome = resolveOutcome(accumulatedText);
++            publishStatus(bus, taskId, contextId, outcome.state, outcome.message, true);
++            __a2aTaskLog.end(taskId, contextId, outcome.state, accumulatedText.length, __taskT0);
              bus.finished();
-             log.info("Task completed", { taskId, len: accumulatedText.length });
+-            log.info("Task completed", { taskId, len: accumulatedText.length });
++            if (outcome.state === "completed") {
++                log.info("Task completed", { taskId, len: accumulatedText.length });
++            }
++            else {
++                log.info("Task ended non-completed", { taskId, state: outcome.state, len: accumulatedText.length });
++            }
          }
-@@ -529,6 +543,7 @@ export class OpenCodeExecutor {
+         catch (error) {
+             const msg = error.message ?? String(error);
+@@ -529,6 +644,7 @@ export class OpenCodeExecutor {
                  : `Error: ${msg}`;
              log.error("Execution failed", { taskId, error: msg });
              publishStatus(bus, taskId, contextId, "failed", userMsg, true);
@@ -79,6 +292,143 @@ index 1bf46bf..d3399cc 100644
              bus.finished();
          }
          finally {
+@@ -551,18 +667,24 @@ export class OpenCodeExecutor {
+             }
+         }
+         const ctxId = this.sessionManager?.getContextForTask(taskId) ?? "";
++        if (ctxId)
++            this.pendingQuestions.delete(ctxId);
+         publishStatus(bus, taskId, ctxId, "canceled", undefined, true);
+         bus.finished();
+     }
+     // ── Polling Fallback ────────────────────────────────────────────────────
+-    async pollForCompletion(sessionId, taskId, contextId, bus) {
++    async pollForCompletion(sessionId, taskId, contextId, bus, executionCtx) {
+         log.info("Polling fallback", { sessionId });
+         const dir = this.config.opencode.projectDirectory || undefined;
+         const start = Date.now();
+         const lastTool = new Map();
+         while (Date.now() - start < (this.config.timeouts.prompt ?? 300_000)) {
+             await sleep(this.config.timeouts.pollingInterval ?? 2_000);
+-            await this.permissionHandler.handlePending(dir);
++            await this.permissionHandler.handlePending(dir, executionCtx);
++            if (executionCtx?.isSuspended?.()) {
++                log.info("Suspended during polling", { sessionId });
++                return "";
++            }
+             try {
+                 const statuses = await this.client.sessionStatus(dir);
+                 const st = statuses[sessionId];
+@@ -605,12 +727,9 @@ export class OpenCodeExecutor {
+             }
+         }
+         log.warn("Polling timed out", { sessionId });
+-        try {
+-            return this.extractResponseText(await this.client.sessionMessages(sessionId, dir));
+-        }
+-        catch {
+-            return "";
+-        }
++        // ③ v0.3.1: polling exhaustion is a timeout → surface it as a failure
++        // (rethrow) instead of returning partial text that finalizes as `completed`.
++        throw new Error(`Prompt timeout after ${this.config.timeouts.prompt ?? 300_000}ms`);
+     }
+     // ── Message Helpers ─────────────────────────────────────────────────────
+     /**
+diff --git a/node_modules/a2a-opencode/dist/opencode/permission-handler.js b/node_modules/a2a-opencode/dist/opencode/permission-handler.js
+index 0994329..0e19b6b 100644
+--- a/node_modules/a2a-opencode/dist/opencode/permission-handler.js
++++ b/node_modules/a2a-opencode/dist/opencode/permission-handler.js
+@@ -19,16 +19,28 @@ export class PermissionHandler {
+             autoApproveAll: config?.autoApproveAll ?? true,
+             autoApprovePermissions: config?.autoApprovePermissions ?? [],
+             defaultPermissionReply: config?.defaultPermissionReply ?? "always",
+-            autoAnswerQuestions: config?.autoAnswerQuestions ?? true,
++            // v0.3.1 机制①: default OFF — a native question must surface as
++            // `input-required`, never be answered on the user's behalf.
++            autoAnswerQuestions: config?.autoAnswerQuestions ?? false,
+             questionAnswerer: config?.questionAnswerer,
++            onQuestionAsked: config?.onQuestionAsked,
+         };
+         log.info("Created", {
+             autoApproveAll: this.cfg.autoApproveAll,
+             autoAnswer: this.cfg.autoAnswerQuestions,
+         });
+     }
+-    /** Wire into an EventStreamManager. */
+-    attachToStream(stream) {
++    /**
++     * Wire into an EventStreamManager.
++     *
++     * @param stream - The per-execution event stream.
++     * @param ctx    - Optional execution context `{ bus, taskId, contextId,
++     *                 sessionId, onSuspend }`. When present, a native question
++     *                 is surfaced as `input-required` (机制①) instead of being
++     *                 auto-answered/rejected. Omitted for non-task streams
++     *                 (e.g. context building).
++     */
++    attachToStream(stream, ctx) {
+         stream.on("permission.asked", (event) => {
+             const props = event.properties;
+             if (props?.id)
+@@ -37,9 +49,9 @@ export class PermissionHandler {
+         stream.on("question.asked", (event) => {
+             const props = event.properties;
+             if (props?.id)
+-                this.handleQuestion(props).catch((e) => log.error("Question handling failed", { id: props.id, error: e.message }));
++                this.handleQuestion(props, ctx).catch((e) => log.error("Question handling failed", { id: props.id, error: e.message }));
+         });
+-        log.info("Attached to event stream");
++        log.info("Attached to event stream", { taskId: ctx?.taskId });
+     }
+     // ── Permission ──────────────────────────────────────────────────────────
+     async handlePermission(req) {
+@@ -61,7 +73,7 @@ export class PermissionHandler {
+         }
+     }
+     // ── Question ────────────────────────────────────────────────────────────
+-    async handleQuestion(req) {
++    async handleQuestion(req, ctx) {
+         if (this.handledQs.has(req.id))
+             return;
+         this.handledQs.add(req.id);
+@@ -80,6 +92,18 @@ export class PermissionHandler {
+                 }
+             }
+         }
++        // v0.3.1 机制①: hand the question to the execution so it can publish
++        // `input-required` and suspend. Returns true when the caller took over.
++        if (!this.cfg.autoAnswerQuestions && this.cfg.onQuestionAsked) {
++            try {
++                if (await this.cfg.onQuestionAsked(req, ctx))
++                    return;
++            }
++            catch (e) {
++                this.handledQs.delete(req.id);
++                throw e;
++            }
++        }
+         if (!this.cfg.autoAnswerQuestions) {
+             log.info("Auto-answer disabled, rejecting", { id: req.id });
+             try {
+@@ -104,7 +128,7 @@ export class PermissionHandler {
+     }
+     // ── Pending Poll ────────────────────────────────────────────────────────
+     /** Poll and handle any pending permissions/questions (safety net). */
+-    async handlePending(directory) {
++    async handlePending(directory, ctx) {
+         try {
+             const [perms, qs] = await Promise.all([
+                 this.client.permissionList(directory),
+@@ -113,7 +137,7 @@ export class PermissionHandler {
+             for (const p of perms)
+                 await this.handlePermission(p);
+             for (const q of qs)
+-                await this.handleQuestion(q);
++                await this.handleQuestion(q, ctx);
+         }
+         catch (e) {
+             log.warn("Pending poll failed", { error: e.message });
 diff --git a/node_modules/a2a-opencode/dist/opencode/session-manager.js b/node_modules/a2a-opencode/dist/opencode/session-manager.js
 index bd06bf0..e6574d5 100644
 --- a/node_modules/a2a-opencode/dist/opencode/session-manager.js

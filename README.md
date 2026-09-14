@@ -300,6 +300,27 @@ orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自
 
 orch 用 `project`（如 `frontend` / `backend`）派发到对应项目；同机多项目仅需在**一份** machine 配置里多写几个 `projects[]`。
 
+## 任务态上报约定（v0.3.1）
+
+worker（各项目 A2A 包装器）在**一轮执行结束时**，按以下约定把「需澄清 / 失败」**如实反映为 A2A 任务态**（修复 v0.3.0「worker 只在文本里说、任务态恒 `completed`」的真机缺口）：
+
+- **需要用户拍板**时，在回复**末尾**输出：
+
+  ````
+  ```a2a-outcome
+  {"state":"input-required","question":"<要问用户的问题>"}
+  ```
+  ````
+
+- **确认无法完成 / 阻塞**时输出 `{"state":"failed","reason":"<原因>"}`；
+- **正常完成不要输出该块**（无标记 = `completed`）。
+
+包装器解析（`@a2a-wrapper/core` 的 `resolveOutcome`）后发布对应 A2A 任务态：`input-required → Feature needs_input`（用户经 `a2a_feature_advance(..., answer=…)` 答复后续推）；`failed → Feature failed`。
+
+- **约定由 machine 侧自动注入**（`launcher/agent-config.ts` + 各适配器；三端键：opencode `systemPrompt`、claude `systemPromptAppend`、codex `developerInstructions`）——**orch 侧无需配置**。
+- **opencode** 另有原生提问通道：`question.asked` 会发布 `input-required` 并挂起（**不再自动代答**）。
+- **已知边界**：`input-required` 跨 wrapper 重启保留；但 opencode 的待答问题登记表仅进程内存；claude 若项目显式设 `customSystemPrompt` 会与默认注入互斥。
+
 ## 文档索引
 
 - [PROTOCOL.md](PROTOCOL.md)：Bridge ⇄ Launcher 线协议契约（端点/字段、版本规则、握手语义、可支持对端版本维护流程、演进记录表）

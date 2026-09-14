@@ -21,6 +21,7 @@ import type {
   PermissionSpec,
 } from "./types.js";
 import { wrapperConfigPath } from "./types.js";
+import { A2A_OUTCOME_CONVENTION } from "../launcher/agent-config.js";
 
 export class ClaudeAdapter implements Adapter {
   readonly kind: AgentKind = "claude";
@@ -64,6 +65,9 @@ export class ClaudeAdapter implements Adapter {
     // 默认加载用户级配置（~/.claude/settings.json 的模型 / 网关 / 认证 env），
     // 与 opencode / codex「默认继承用户配置」语义一致；
     // 项目可经 agentConfig.claude.settingSources 覆盖（如 [] 恢复完全隔离）。
-    return { claude: { settingSources: ["user"] } };
+    // v0.3.1 机制②：注入「a2a-outcome」约定（append 到 claude_code preset）。
+    return {
+      claude: { settingSources: ["user"], systemPromptAppend: A2A_OUTCOME_CONVENTION },
+    };
   }
 }

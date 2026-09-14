@@ -2,6 +2,24 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.3.1] - 2026-09-14
+
+### Fixed
+
+- **worker 任务态上报缺失（v0.3.0 真机缺口修复）**（REQ-v0.3.1-2026-09-14-01）：v0.3.0 真机 E2E 证明其前提「worker 会把需澄清/失败如实反映到 A2A 任务态」**不成立**——worker 的「需澄清/失败」只出现在**回复文本**，任务态恒为 `completed`，导致 Feature 不进入 `needs_input`（澄清点失效、agent 自编答案）、失败被**误判成功**。本版在 **machine 侧**修复（**orch 零改动、`PROTOCOL.md`/`PROTOCOL_VERSION` 不变**）：
+  - **② 约定式状态标记（三端统一）**：`@a2a-wrapper/core` 新增并导出 `resolveOutcome`（解析回复末尾最后一个 `a2a-outcome` JSON 块 → `input-required`/`failed`/`completed`；**无标记/非法一律回退 `completed`**）；三端 executor 收口接入。
+  - **三端约定注入**：`machine/launcher/agent-config.ts` + 各适配器向 worker 注入统一约定文案（opencode `systemPrompt` / claude `systemPromptAppend` / codex `developerInstructions`——后者原为死配置，经 `a2a-codex` 补丁接通）。
+  - **① opencode 原生提问上报**：`question.asked` **不再自动替用户答**（`autoAnswerQuestions` 默认改 `false`）→ 发布 `input-required` + 挂起；答复经同 `contextId` 续跑（`questionReply` 回填）。
+  - **③ opencode 超时不再假 `completed`**：prompt 超时（含轮询兜底路径）收敛为 `failed`。
+  - **④ codex 挂起无终态修复**：接线 `timeouts.prompt`（计时器 + 流读取竞速，即便 SDK 忽略 abort 也收敛）→ 挂起**必然**收敛 `failed`（用户取消仍 `canceled`）。
+  - **⑤ `input-required` 持久化放宽**：`FileTaskStore` 跨进程重启**保留 `input-required`**（`working` 仍按既有 `interrupted → failed` 收敛）。
+
+### Verified
+
+- machine 门禁 `typecheck` / `build` / `lint` 全绿；`npm ci` **四补丁重放 clean**；全量回归 **364/364**。
+- **真机 E2E 自测（Step 3，opencode）**：worker needs_input → 任务态 `input-required`；worker failure → `failed`；Feature 级 `needs_input` **停** → `advance(answer)` **续推** → 完成；Feature 级 failure → **`failed`**。
+- **已知边界**（如实）：真实「人答」闭环与 **codex/claude 的 ② 标记路径**由 **v0.4.0 实跑**承担验证（用户决定**以自测为准**验收）；opencode ① 的 `pendingQuestions` 仅进程内存、不跨重启；claude `systemPromptAppend` 与 `customSystemPrompt` 互斥；项目 `agentConfig` 可覆盖约定。
+
 ## [v0.3.0] - 2026-09-14
 
 ### Added

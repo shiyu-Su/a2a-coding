@@ -25,11 +25,15 @@ index 5355292..fc7c945 100644
  //# sourceMappingURL=cli.js.map
 \ No newline at end of file
 diff --git a/node_modules/a2a-codex/dist/codex/executor.js b/node_modules/a2a-codex/dist/codex/executor.js
-index c5706de..1d37f69 100644
+index c5706de..0f3ab74 100644
 --- a/node_modules/a2a-codex/dist/codex/executor.js
 +++ b/node_modules/a2a-codex/dist/codex/executor.js
-@@ -19,6 +19,17 @@ import { extractUserText } from "./prompt-builder.js";
- import { resolveTransport, AgentEventEmitter, materializeMemory, bootstrapSubAgents, publishTask, publishStatus, publishFinalArtifact, publishStreamingChunk, publishLastChunkMarker, } from "@a2a-wrapper/core";
+@@ -16,9 +16,20 @@ import { EventMapper, sanitizeMessage } from "./event-mapper.js";
+ import { validateMcpServers, toCodexMcpEntry } from "./mcp-adapter.js";
+ import { CODEX_BACKEND_PATHS } from "./backend-paths.js";
+ import { extractUserText } from "./prompt-builder.js";
+-import { resolveTransport, AgentEventEmitter, materializeMemory, bootstrapSubAgents, publishTask, publishStatus, publishFinalArtifact, publishStreamingChunk, publishLastChunkMarker, } from "@a2a-wrapper/core";
++import { resolveTransport, AgentEventEmitter, materializeMemory, bootstrapSubAgents, publishTask, publishStatus, publishFinalArtifact, publishStreamingChunk, publishLastChunkMarker, resolveOutcome, } from "@a2a-wrapper/core";
  import { logger } from "../utils/logger.js";
  const log = logger.child("executor");
 +// v0.1.2 统一任务执行日志（[a2a-task]）：直写 stdout，不受 logging.level 影响，供 Launcher 观测开始/结束/耗时。
@@ -54,7 +58,7 @@ index c5706de..1d37f69 100644
          await this.initialize();
          const agentId = this.config.agentCard.name.toLowerCase().replace(/\s+/g, "-");
          const transport = resolveTransport(this.config.events, bus, taskId, contextId, this.customTransport);
-@@ -111,7 +123,8 @@ export class CodexExecutor {
+@@ -111,11 +123,34 @@ export class CodexExecutor {
              const session = this.sessionManager.getOrCreate(contextId, () => this.client.startThread(threadOpts));
              // Extract user prompt
              const promptText = extractUserText(userMessage);
@@ -64,7 +68,66 @@ index c5706de..1d37f69 100644
              // Serialize execution — queue behind any in-progress turn for this context
              const abortController = new AbortController();
              this.sessionManager.trackExecution(taskId, contextId, abortController);
-@@ -130,8 +143,10 @@ export class CodexExecutor {
+             const turnFn = async () => {
++                // ④ v0.3.1: `timeouts.prompt` was declared but never used, so a hung
++                // backend left the task `working` forever. Bound the turn so it always
++                // reaches a detectable terminal. A value <= 0 disables the bound
++                // (mirrors the claude executor).
++                const promptTimeout = this.config.timeouts?.prompt ?? 600_000;
++                let timedOut = false;
++                let timeoutTimer = null;
++                // Rejects on timeout and aborts the backend stream. Declared outside the
++                // try so the `finally` can clear the timer.
++                const timeoutError = new Promise((_, reject) => {
++                    if (typeof promptTimeout === "number" && promptTimeout > 0) {
++                        timeoutTimer = setTimeout(() => {
++                            // Reject before aborting so the timeout (not the resulting
++                            // AbortError) wins the race and is classified as a failure.
++                            timedOut = true;
++                            reject(new Error(`Prompt timeout after ${promptTimeout}ms`));
++                            abortController.abort();
++                        }, promptTimeout);
++                        if (typeof timeoutTimer.unref === "function")
++                            timeoutTimer.unref();
++                    }
++                });
+                 try {
+                     publishStatus(bus, taskId, contextId, "working", "Processing request...");
+                     let finalText = "";
+@@ -123,15 +158,39 @@ export class CodexExecutor {
+                     const agentMessageText = new Map();
+                     const streamArtifactId = `response-${taskId}`;
+                     let streamArtifactStarted = false;
+-                    const { events } = await session.thread.runStreamed(promptText, {
+-                        signal: abortController.signal,
+-                    });
+-                    for await (const event of events) {
++                    // v0.3.1: the @openai/codex-sdk ThreadOptions exposes no instructions
++                    // channel, so the declared `codex.developerInstructions` is wired here
++                    // by prepending it to every turn's prompt as developer context.
++                    const developerInstructions = this.config.codex.developerInstructions;
++                    const effectivePrompt = developerInstructions
++                        ? `${developerInstructions}\n\n---\n${promptText}`
++                        : promptText;
++                    const { events } = await Promise.race([
++                        session.thread.runStreamed(effectivePrompt, {
++                            signal: abortController.signal,
++                        }),
++                        timeoutError,
++                    ]);
++                    // Race every stream read against the timeout so the `for await` always
++                    // settles even if a hung backend ignores the abort signal.
++                    const guardedEvents = {
++                        async *[Symbol.asyncIterator]() {
++                            while (true) {
++                                const next = await Promise.race([events.next(), timeoutError]);
++                                if (next.done)
++                                    return;
++                                yield next.value;
++                            }
++                        },
++                    };
++                    for await (const event of guardedEvents) {
                          // Capture thread_id from first event
                          if (event.type === "thread.started" && session.threadId === null) {
                              const tid = mapper.handleEvent(event);
@@ -76,17 +139,48 @@ index c5706de..1d37f69 100644
                              continue;
                          }
                          // Accumulate agent_message text across item.updated snapshots
-@@ -163,6 +178,7 @@ export class CodexExecutor {
+@@ -155,6 +214,16 @@ export class CodexExecutor {
+                         }
+                         mapper.handleEvent(event);
+                     }
++                    // ④: a timer abort can end the stream cleanly (no throw), so the
++                    // timeout must be reported here too — never as `completed`.
++                    if (timedOut) {
++                        const timeoutMsg = `Prompt timeout after ${promptTimeout}ms`;
++                        log.error("Task execution timed out", { taskId });
++                        publishStatus(bus, taskId, contextId, "failed", timeoutMsg, true);
++                        __a2aTaskLog.end(taskId, contextId, "failed", 0, __taskT0, timeoutMsg);
++                        bus.finished();
++                        return;
++                    }
+                     // Publish artifact
+                     if (this.config.features.streamArtifactChunks && streamArtifactStarted) {
+                         publishLastChunkMarker(bus, taskId, contextId, streamArtifactId, finalText);
+@@ -162,24 +231,40 @@ export class CodexExecutor {
+                     else {
                          publishFinalArtifact(bus, taskId, contextId, finalText);
                      }
-                     publishStatus(bus, taskId, contextId, "completed", undefined, true);
-+                    __a2aTaskLog.end(taskId, contextId, "completed", finalText.length, __taskT0);
+-                    publishStatus(bus, taskId, contextId, "completed", undefined, true);
++                    // ② v0.3.1: resolve the worker's declared `a2a-outcome` marker.
++                    const outcome = resolveOutcome(finalText);
++                    publishStatus(bus, taskId, contextId, outcome.state, outcome.message, true);
++                    __a2aTaskLog.end(taskId, contextId, outcome.state, finalText.length, __taskT0);
                      bus.finished();
                  }
                  catch (err) {
-@@ -170,12 +186,14 @@ export class CodexExecutor {
+                     const isAbort = err instanceof Error &&
                          (err.name === "AbortError" || err.message.includes("abort") || err.message.includes("canceled"));
-                     if (isAbort) {
+-                    if (isAbort) {
++                    if (isAbort && timedOut) {
++                        // ④ v0.3.1: our own timer aborted the turn — report a timeout
++                        // failure rather than silently swallowing it as a user cancel.
++                        const timeoutMsg = `Prompt timeout after ${promptTimeout}ms`;
++                        log.error("Task execution timed out", { taskId });
++                        publishStatus(bus, taskId, contextId, "failed", timeoutMsg, true);
++                        __a2aTaskLog.end(taskId, contextId, "failed", 0, __taskT0, timeoutMsg);
++                        bus.finished();
++                    }
++                    else if (isAbort) {
                          log.info("Task execution aborted", { taskId });
 +                        __a2aTaskLog.end(taskId, contextId, "canceled", 0, __taskT0);
                          // cancelTask already published the canceled status
@@ -99,7 +193,13 @@ index c5706de..1d37f69 100644
                          bus.finished();
                      }
                  }
-@@ -193,6 +211,7 @@ export class CodexExecutor {
+                 finally {
++                    if (timeoutTimer)
++                        clearTimeout(timeoutTimer);
+                     this.sessionManager?.untrackExecution(taskId);
+                 }
+             };
+@@ -193,6 +278,7 @@ export class CodexExecutor {
              const msg = sanitizeMessage(outerErr instanceof Error ? outerErr.message : String(outerErr));
              log.error("Executor outer error", { taskId, error: msg });
              publishStatus(bus, taskId, contextId, "failed", msg, true);

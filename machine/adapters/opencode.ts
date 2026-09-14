@@ -18,6 +18,7 @@ import type {
   PermissionRisk,
   PermissionSpec,
 } from "./types.js";
+import { A2A_OUTCOME_CONVENTION } from "../launcher/agent-config.js";
 
 export class OpenCodeAdapter implements Adapter {
   readonly kind: AgentKind = "opencode";
@@ -52,6 +53,10 @@ export class OpenCodeAdapter implements Adapter {
   }
 
   baseConfig(): Record<string, unknown> {
-    return {};
+    // v0.3.1 机制②：注入「a2a-outcome」约定，使 worker 在需人工拍板 / 无法完成时
+    // 于回复末尾输出结构化块（append 模式，不替换既有 systemPrompt）。
+    return {
+      opencode: { systemPrompt: A2A_OUTCOME_CONVENTION, systemPromptMode: "append" },
+    };
   }
 }

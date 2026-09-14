@@ -17,9 +17,42 @@ import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ProjectConfig } from "../types.js";
 
-/** 默认覆盖项：关闭 events（trace / 中间调用）输出 */
+/**
+ * v0.3.1 机制②：「显式状态标记」约定文案（三端统一、简短、确定性）。
+ *
+ * worker 在「需要人工拍板」或「确认无法完成」时，于回复末尾输出一个
+ * fenced `a2a-outcome` JSON 块；`@a2a-wrapper/core` 的 `resolveOutcome`
+ * 在收口点解析后映射为标准 A2A 任务态（input-required / failed）；正常完成
+ * 不输出该块（回退 completed）。文案经三端 wrapper 的 systemPrompt 类通道注入。
+ */
+const A2A_OUTCOME_CONVENTION_LINES = [
+  "A2A task outcome convention (follow exactly):",
+  "1) If you need the user to decide something before you can continue, end your reply with this fenced block (replace the placeholder):",
+  "```a2a-outcome",
+  '{"state":"input-required","question":"<the question for the user>"}',
+  "```",
+  "2) If you are certain the task cannot be completed or is blocked, end your reply with:",
+  "```a2a-outcome",
+  '{"state":"failed","reason":"<why it is blocked>"}',
+  "```",
+  "3) On a normal successful completion, do NOT output any a2a-outcome block.",
+  "Output at most one such block, and only as the very last thing in your reply.",
+];
+
+/** 三端共用的约定文案（供适配器 baseConfig() 绑定到各自的 systemPrompt 类配置键）。 */
+export const A2A_OUTCOME_CONVENTION = A2A_OUTCOME_CONVENTION_LINES.join("\n");
+
+/**
+ * 默认覆盖项：关闭 events（trace / 中间调用）输出；注入 ② 约定。
+ *
+ * 三端 wrapper 各自只读取自己 kind 段（多余 kind 段被忽略），因此这里一次性写入
+ * 三端键以保证约定「必达」；各适配器 `baseConfig()` 再做 kind 级显式绑定。
+ */
 const DEFAULT_AGENT_CONFIG: Record<string, unknown> = {
   events: { enabled: false },
+  opencode: { systemPrompt: A2A_OUTCOME_CONVENTION, systemPromptMode: "append" },
+  codex: { developerInstructions: A2A_OUTCOME_CONVENTION },
+  claude: { systemPromptAppend: A2A_OUTCOME_CONVENTION },
 };
 
 /** 纯对象判定（排除 null 与数组） */

@@ -1,3 +1,230 @@
+diff --git a/node_modules/@a2a-wrapper/core/dist/events/outcome.d.ts b/node_modules/@a2a-wrapper/core/dist/events/outcome.d.ts
+new file mode 100644
+index 0000000..c93e7a1
+--- /dev/null
++++ b/node_modules/@a2a-wrapper/core/dist/events/outcome.d.ts
+@@ -0,0 +1,42 @@
++/**
++ * @module events/outcome
++ *
++ * Shared "declared outcome" parser (v0.3.1 / REQ-v0.3.1-2026-09-14-01, 机制 ②).
++ * See the module source and the orchestration docs for the reply convention.
++ *
++ * @packageDocumentation
++ */
++
++/**
++ * The A2A task states a declared outcome can map onto, as legacy
++ * lowercase-hyphen strings accepted by
++ * {@link publishStatus | publishStatus(bus, taskId, contextId, state, ...)}.
++ */
++export type OutcomeState = "completed" | "input-required" | "failed";
++
++/**
++ * The result of parsing a worker reply for an `a2a-outcome` marker.
++ *
++ * - `state` is always present and defaults to `"completed"`.
++ * - `question` is set only for `"input-required"`.
++ * - `reason` is set only for `"failed"`.
++ * - `message` is `question ?? reason` — what callers attach as the status
++ *   message text (`undefined` for `"completed"`).
++ */
++export interface ResolvedOutcome {
++  state: OutcomeState;
++  question: string | undefined;
++  reason: string | undefined;
++  message: string | undefined;
++}
++
++/**
++ * Parse a worker reply for a trailing `a2a-outcome` fenced JSON block.
++ *
++ * The last marker wins; a missing block, malformed JSON, a non-object payload,
++ * or an unrecognised `state` all fall back to `{ state: "completed", ... }`.
++ *
++ * @param text - The worker's final reply text.
++ * @returns The resolved outcome.
++ */
++export declare function resolveOutcome(text: string | null | undefined): ResolvedOutcome;
+diff --git a/node_modules/@a2a-wrapper/core/dist/events/outcome.js b/node_modules/@a2a-wrapper/core/dist/events/outcome.js
+new file mode 100644
+index 0000000..7ec569d
+--- /dev/null
++++ b/node_modules/@a2a-wrapper/core/dist/events/outcome.js
+@@ -0,0 +1,149 @@
++/**
++ * @module events/outcome
++ *
++ * Shared "declared outcome" parser (v0.3.1 / REQ-v0.3.1-2026-09-14-01, 机制 ②).
++ *
++ * A2A task state describes whether the *executor* finished its turn, not
++ * whether the *business* goal was met. A worker that needs a human decision —
++ * or that cannot complete the task — signals that today only in its reply
++ * text, so the task still ends up `completed`. `resolveOutcome` closes that
++ * gap: every backend executor (opencode / codex / claude) parses the worker's
++ * final text through this one function right before publishing its final
++ * artifact + status, and maps the result onto a standard A2A task state.
++ *
++ * ### Reply convention
++ *
++ * The worker appends a single fenced JSON block at the **end** of its reply:
++ *
++ * ```text
++ * ```a2a-outcome
++ * {"state":"input-required","question":"<question for the user>"}
++ * ```
++ * ```
++ *
++ * or `{"state":"failed","reason":"<why it could not be completed>"}`.
++ * `completed` may be omitted entirely.
++ *
++ * ### Parsing rules
++ *
++ * - The **last** `a2a-outcome` fenced block in the reply wins (multiple
++ *   markers, or a marker echoed mid-explanation, resolve to the trailing one).
++ * - A missing block, malformed JSON, a non-object payload, or an unrecognised
++ *   `state` all fall back to `completed` — a parsing problem must **never**
++ *   fabricate a `failed`/`input-required` state.
++ * - `question` / `reason` are returned verbatim (non-empty strings only) so
++ *   the caller can attach them as the status message text.
++ *
++ * The function is intentionally pure and free of any A2A/SDK dependency so it
++ * can be unit-tested in isolation and reused by all wrapper backends.
++ *
++ * @packageDocumentation
++ */
++
++/** States a declared outcome may resolve to, as legacy A2A state strings. */
++const OUTCOME_STATES = new Set(["completed", "input-required", "failed"]);
++
++/**
++ * Fenced marker matcher: ```` ```a2a-outcome ```` + newline + body + ```` ``` ````.
++ *
++ * The info string must be exactly `a2a-outcome` (no trailing suffix), and the
++ * body is captured non-greedily up to the next closing fence. The `g` flag
++ * lets us walk to the final block; `lastIndex` is reset before each scan.
++ */
++const OUTCOME_FENCE_RE = /```[ \t]*a2a-outcome[ \t]*\r?\n([\s\S]*?)```/g;
++
++/** An outcome that could not be declared: the safe default is `completed`. */
++const COMPLETED_OUTCOME = Object.freeze({
++  state: "completed",
++  question: undefined,
++  reason: undefined,
++  message: undefined,
++});
++
++/** Normalise a raw `state` token (`"Input_Required"` → `"input-required"`). */
++function normalizeState(value) {
++  if (typeof value !== "string") return "";
++  return value.trim().toLowerCase().replace(/_/g, "-");
++}
++
++/** Return a trimmed non-empty string, or `undefined` for anything else. */
++function readNonEmptyString(value) {
++  if (typeof value !== "string") return undefined;
++  const trimmed = value.trim();
++  return trimmed.length > 0 ? trimmed : undefined;
++}
++
++/**
++ * Parse a worker reply for a declared `a2a-outcome` marker.
++ *
++ * @param {string | null | undefined} text - The worker's final reply text.
++ * @returns {{
++ *   state: "completed" | "input-required" | "failed",
++ *   question: string | undefined,
++ *   reason: string | undefined,
++ *   message: string | undefined,
++ * }} The resolved outcome. `message` is `question` (input-required) or
++ *     `reason` (failed) and is what callers pass as `publishStatus` message
++ *     text; it is `undefined` for `completed` and for markers without text.
++ *
++ * @example
++ * ```js
++ * const outcome = resolveOutcome(replyText);
++ * publishFinalArtifact(bus, taskId, contextId, replyText);
++ * publishStatus(bus, taskId, contextId, outcome.state, outcome.message, true);
++ * ```
++ */
++export function resolveOutcome(text) {
++  if (typeof text !== "string" || text.length === 0) {
++    return { ...COMPLETED_OUTCOME };
++  }
++
++  // Walk every candidate block; keep the body of the last one (last wins).
++  let lastBody;
++  try {
++    OUTCOME_FENCE_RE.lastIndex = 0;
++    let match;
++    while ((match = OUTCOME_FENCE_RE.exec(text)) !== null) {
++      lastBody = match[1];
++    }
++  } catch {
++    return { ...COMPLETED_OUTCOME };
++  }
++  if (lastBody === undefined) {
++    return { ...COMPLETED_OUTCOME };
++  }
++
++  let parsed;
++  try {
++    parsed = JSON.parse(lastBody.trim());
++  } catch {
++    return { ...COMPLETED_OUTCOME };
++  }
++  if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
++    return { ...COMPLETED_OUTCOME };
++  }
++
++  const state = normalizeState(parsed.state);
++  if (!OUTCOME_STATES.has(state)) {
++    return { ...COMPLETED_OUTCOME };
++  }
++  if (state === "input-required") {
++    const question = readNonEmptyString(parsed.question);
++    return {
++      state: "input-required",
++      question,
++      reason: undefined,
++      message: question,
++    };
++  }
++  if (state === "failed") {
++    const reason = readNonEmptyString(parsed.reason);
++    return {
++      state: "failed",
++      question: undefined,
++      reason,
++      message: reason,
++    };
++  }
++  return { ...COMPLETED_OUTCOME };
++}
+diff --git a/node_modules/@a2a-wrapper/core/dist/index.d.ts b/node_modules/@a2a-wrapper/core/dist/index.d.ts
+index 7717e73..bf61391 100644
+--- a/node_modules/@a2a-wrapper/core/dist/index.d.ts
++++ b/node_modules/@a2a-wrapper/core/dist/index.d.ts
+@@ -23,6 +23,7 @@ export { deepMerge, substituteEnvTokens, substituteEnvTokensInString, substitute
+ export type { SkillConfig, AgentCardConfig, ServerConfig, SessionConfig, BaseFeatureFlags, TimeoutConfig, LoggingConfig, EventsConfig, BaseMcpServerConfig, BaseAgentConfig, } from "./config/types.js";
+ export { loadConfigFile, resolveConfig } from "./config/loader.js";
+ export { publishTask, publishStatus, publishFinalArtifact, publishStreamingChunk, publishLastChunkMarker, publishTraceArtifact, publishThoughtArtifact, } from "./events/event-publisher.js";
++export { resolveOutcome, type OutcomeState, type ResolvedOutcome } from "./events/outcome.js";
+ export { extractUserText } from "./events/part-utils.js";
+ export { A2ATransport, HttpTransport, AgentEventEmitter, resolveTransport, createTransport, wrapTransport, } from "./events/transport.js";
+ export type { EventTransport, EventTransportFn, AgentEvent, EventType, } from "./events/transport.js";
+diff --git a/node_modules/@a2a-wrapper/core/dist/index.js b/node_modules/@a2a-wrapper/core/dist/index.js
+index e2ce186..ac2414d 100644
+--- a/node_modules/@a2a-wrapper/core/dist/index.js
++++ b/node_modules/@a2a-wrapper/core/dist/index.js
+@@ -24,6 +24,7 @@ export { deepMerge, substituteEnvTokens, substituteEnvTokensInString, substitute
+ export { loadConfigFile, resolveConfig } from "./config/loader.js";
+ // ─── Events ─────────────────────────────────────────────────────────────────
+ export { publishTask, publishStatus, publishFinalArtifact, publishStreamingChunk, publishLastChunkMarker, publishTraceArtifact, publishThoughtArtifact, } from "./events/event-publisher.js";
++export { resolveOutcome } from "./events/outcome.js";
+ export { extractUserText } from "./events/part-utils.js";
+ // ─── Event Transport ────────────────────────────────────────────────────────
+ export { A2ATransport, HttpTransport, AgentEventEmitter, resolveTransport, createTransport, wrapTransport, } from "./events/transport.js";
 diff --git a/node_modules/@a2a-wrapper/core/dist/server/factory.js b/node_modules/@a2a-wrapper/core/dist/server/factory.js
 index e1c9612..18487b4 100644
 --- a/node_modules/@a2a-wrapper/core/dist/server/factory.js
@@ -56,10 +283,10 @@ index e1c9612..18487b4 100644
  }
 diff --git a/node_modules/@a2a-wrapper/core/dist/server/file-task-store.js b/node_modules/@a2a-wrapper/core/dist/server/file-task-store.js
 new file mode 100644
-index 0000000..51e9d45
+index 0000000..5f1f82e
 --- /dev/null
 +++ b/node_modules/@a2a-wrapper/core/dist/server/file-task-store.js
-@@ -0,0 +1,343 @@
+@@ -0,0 +1,358 @@
 +/**
 + * File-backed A2A TaskStore (v0.2.0 / REQ-v0.2.0-2026-09-13-01).
 + *
@@ -74,9 +301,12 @@ index 0000000..51e9d45
 + * immediately; it is still kept in memory for the current process so
 + * `tasks/get` keeps working until restart.
 + *
-+ * On start-up every persisted entry (necessarily non-terminal) is recovered
-+ * to a terminal `failed` status carrying an "interrupted" message, so clients
-+ * never observe a task stuck in `working` forever.
++ * On start-up persisted entries are reconciled as follows: `input-required`
++ * tasks are **kept** as a suspended state (they legitimately wait for a human
++ * answer, possibly across restarts), while every other non-terminal state
++ * (`working`, `submitted`, …) is converged to a terminal `failed` status
++ * carrying an "interrupted" message, so clients never observe a task stuck in
++ * `working` forever.
 + *
 + * Serialization goes through the SDK's protobuf `MessageFns`
 + * (`Task.toJSON` / `Task.fromJSON`) so proto oneofs / `Buffer` byte parts
@@ -181,8 +411,9 @@ index 0000000..51e9d45
 +        : join(process.cwd(), ".a2a", "tasks.json");
 +    this.#load();
 +    const recovered = this.#recoverInterrupted();
-+    // Recovered tasks are now terminal, i.e. removed from the persisted set;
-+    // write that back so a further restart does not re-report them.
++    // Converged tasks are now terminal, i.e. removed from the persisted set;
++    // write that back so a further restart does not re-report them. Suspended
++    // `input-required` tasks are left untouched on disk.
 +    if (recovered > 0) this.flush();
 +  }
 +
@@ -226,14 +457,25 @@ index 0000000..51e9d45
 +  }
 +
 +  /**
-+   * Transition every loaded (non-terminal) task to a terminal `failed` state
-+   * carrying the "interrupted" message. Returns the number recovered.
++   * Reconcile tasks left non-terminal by a previous process.
++   *
++   * `input-required` is a *suspended* state that legitimately outlives the
++   * process (a worker waiting for the user to answer), so it is preserved
++   * as-is — in memory and on disk — across restarts. Every other non-terminal
++   * state (`submitted` / `working` / …) is converged to a terminal `failed`
++   * state carrying the "interrupted" message, preserving the v0.2.0 semantics
++   * so clients never observe a task stuck in `working` forever.
++   *
++   * Returns the number of tasks converged to `failed`.
 +   */
 +  #recoverInterrupted() {
 +    let recovered = 0;
 +    const timestamp = new Date().toISOString();
 +    for (const [taskId, task] of this.#tasks) {
 +      if (isTerminal(task)) continue;
++      if (task?.status?.state === TaskState.TASK_STATE_INPUT_REQUIRED) {
++        continue; // Suspended: keep across restart (awaiting a user answer).
++      }
 +      let message;
 +      try {
 +        message = Message.fromJSON({

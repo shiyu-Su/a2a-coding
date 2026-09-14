@@ -19,6 +19,7 @@ import type {
   PermissionSpec,
 } from "./types.js";
 import { wrapperConfigPath } from "./types.js";
+import { A2A_OUTCOME_CONVENTION } from "../launcher/agent-config.js";
 
 const SANDBOX_BY_RISK: Record<PermissionRisk, string> = {
   read: "read-only",
@@ -54,6 +55,10 @@ export class CodexAdapter implements Adapter {
 
   baseConfig(): Record<string, unknown> {
     // 默认关闭 Git 校验：workspace 仅需指向任意目录（agentConfig 可覆盖为 false）。
-    return { codex: { skipGitRepoCheck: true } };
+    // v0.3.1 机制②：注入「a2a-outcome」约定——codex SDK 无 systemPrompt 通道，
+    // 由 codex 补丁把 developerInstructions 前置到每轮 prompt 作为开发者上下文。
+    return {
+      codex: { skipGitRepoCheck: true, developerInstructions: A2A_OUTCOME_CONVENTION },
+    };
   }
 }
