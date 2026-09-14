@@ -2,6 +2,34 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.3.0] - 2026-09-14
+
+### Added
+
+- **Feature 编排闭环**（REQ-v0.3.0-2026-09-14-01）：从「单次 `a2a_call`」升级为「一个需求 = 一个 Feature」的编排——orch 牵头，跨项目 Task DAG 自动串行推进，中途可停下审批/澄清。
+  - **Feature 状态机**（新增 `orch/feature/state-machine.ts`，纯函数、零副作用）：9 主态 `discussing → analyzing → planning → waiting_approval → executing → integrating → testing → reviewing → completed` + 异常态 `failed` / `cancelled` / `needs_input`；转移表 + `canTransition` / `assertTransition`（非法流转 fail-fast、不落库）。`blocked` 为 v0.4.0 保留态。
+  - **串行 Task DAG 调度器**（新增 `orch/bridge/scheduler.ts`）：**复用** `task-watcher` 作下层单任务看护；`FeatureScheduler` 提供 `start` / `stop` / `kick` / `notifyTaskSettled` / `recover`；tick 判定顺序「失败 → 需澄清 → 全完成 → 在飞门闩 → 就绪派发」；**每 Feature 单任务门闩**（`dispatching` Set）防双重派发；DAG 校验 `validateDag`（环 / 悬空引用 → Feature `failed`）；全部节点 `completed` → **自动 `executing → integrating`**。
+  - **MCP Feature 工具组（5 个）**：`a2a_feature_create` / `a2a_feature_status` / `a2a_feature_advance` / `a2a_feature_approve` / `a2a_feature_cancel`（静态注册、`a2a_` 前缀、零重连）。工具面由「泛型 5」扩为「**泛型 5 + Feature 5**」。
+  - **审批门**：进入 `waiting_approval` 后停下不派发，用户经 `a2a_feature_approve` 放行。
+  - **`needs_input` 恢复契约**：任务 `input-required` → Feature `needs_input`；`a2a_feature_advance(featureId, to="executing", answer=…)` 把 `answer` 并入节点 `dispatch_message`、清 `remote_task_id`，由调度器重新派发续推（同 `contextId` 续接）。
+  - **桥重启恢复**：`main()` 启动时扫描非终态 Feature 纯本地收敛（**不 ensure、不派发**）；`executing` + 已派发 `working` 任务按 wrapper `failed(interrupted)` 语义收敛为任务 `failed` + Feature `failed`（不重派）；`waiting_approval` / `needs_input` 保持挂起。
+
+### Changed
+
+- **数据模型**（`orch/session/store.ts` + `orch/types.ts`）：新增 `features` 表（`feature_id` / `state` / `title` / `requirement` / `created_at` / `updated_at`）；`tasks` 加四列 `feature_id` / `dependencies`（JSON 数组）/ `remote_task_id` / `dispatch_message`（沿用 try-ALTER 迁移）；索引 `idx_features_state_updated`、`idx_tasks_feature`；`pruneTasks` **排除活跃 Feature 的任务证据**。
+- **`a2a_call` 增可选 `featureId` / `dependencies`**：带 `featureId` = 登记该 Feature 的队列节点（不立即派发，由调度器按 `dependencies` 串行派发）；**不带 `featureId` 行为与现状完全一致**（立即派发）。A2A 不接受客户端预置 taskId，故本地 id ↔ 远端 id 分离（`remote_task_id`）。
+- **桥接线**（`orch/bridge/index.ts`）：抽出可复用 `dispatchTask`（locate→ensure→client→send），供 MCP 工具与调度器共用；`main()` 先 `recover()` 再 `scheduler.start()`；`shutdown()` 停调度器。
+- **`task-watcher`**：新增可选 `onSettled(task | null, { abandoned })`，**正常终态与看护放弃路径均回调**。
+- 三处 `package.json`（根 / orch / machine）版本号升至 `0.3.0`。
+- **线协议不变**（`PROTOCOL.md` / `PROTOCOL_VERSION` 保持 `1.0`）；**machine 单元本版无代码改动**（调度走桥内部 A2A client，复用既有 `ensure` / `/projects`）。
+
+### Verified
+
+- 门禁（orch）：`typecheck` / `build` / `lint` 均 exit 0。
+- 新增结构用例 `test-v0.3.0-features.js`（79 断言）通过；离线运行时冒烟 29 项通过：建 Feature、非法流转拒绝且不落库、主链 + 审批门、DAG 环 / 悬空、串行派发次序 `n1→n2→n3`、门闩在飞只派一个、`input-required → needs_input → advance(answer)` 续推、`recover` 收敛 `interrupted`、`pruneTasks` 保留活跃 Feature 任务。
+- 回归测试全量通过（**333/333**，报告见 `reports/v0.3.0/regression-report.json`；`reports/` 不入库）。
+- **真机 E2E（场景级）未跑**，登记为遗留验证项：改前端 → 改后端 → 联调 happy path + 一条 `needs_input` 路径；**决定以 v0.4.0 需求实跑作为该闭环的真实验证**。
+
 ## [v0.2.1] - 2026-09-14
 
 ### Added

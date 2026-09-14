@@ -24,6 +24,13 @@ export interface TaskWatcherOptions {
   isSettled: (task: Task) => boolean;
   /** 终态落库（由注入方实现：state + artifactsJson + text） */
   persist: (task: Task) => void;
+  /**
+   * 看护结束回调（v0.3.0，可选）。
+   * - 正常终态：`task` 为终态任务，`outcome.abandoned=false`（在 `persist` 之后调用）；
+   * - 连续失败超限放弃：`task=null`，`outcome.abandoned=true`（**放弃路径也有回调**）。
+   * 仅供调度器据此推进 Feature DAG 或置 `failed`；不得抛错（实现方自行兜底）。
+   */
+  onSettled?: (task: Task | null, outcome: { abandoned: boolean }) => void;
   pollIntervalMs: number;
   renewIntervalMs: number;
   maxConsecutiveFailures: number;
@@ -52,6 +59,20 @@ function toMessage(err: unknown): string {
   }
 }
 
+/** 安全触发 onSettled：回调异常仅记日志，绝不打断看护收尾 */
+function safeOnSettled(
+  options: TaskWatcherOptions,
+  task: Task | null,
+  outcome: { abandoned: boolean },
+): void {
+  if (options.onSettled === undefined) return;
+  try {
+    options.onSettled(task, outcome);
+  } catch (err) {
+    console.error(`[a2a-bridge] 后台看护 ${options.taskId} onSettled 回调异常：${toMessage(err)}`);
+  }
+}
+
 /** 启动后台看护（fire-and-forget）；同 taskId 已有看护时返回 false（去重） */
 export function startTaskWatcher(options: TaskWatcherOptions): boolean {
   if (watching.has(options.taskId)) return false;
@@ -74,6 +95,7 @@ async function watchLoop(options: TaskWatcherOptions): Promise<void> {
       if (options.isSettled(task)) {
         options.persist(task);
         console.log(`[a2a-bridge] 后台看护 ${taskId}：任务已终态，看护结束`);
+        safeOnSettled(options, task, { abandoned: false });
         return;
       }
     } catch (err) {
@@ -83,6 +105,7 @@ async function watchLoop(options: TaskWatcherOptions): Promise<void> {
       );
       if (consecutiveFailures >= options.maxConsecutiveFailures) {
         console.error(`[a2a-bridge] 后台看护 ${taskId} 连续失败超限，放弃看护`);
+        safeOnSettled(options, null, { abandoned: true });
         return;
       }
     }

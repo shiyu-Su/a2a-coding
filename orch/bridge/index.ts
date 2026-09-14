@@ -54,8 +54,10 @@ import {
 } from "../types.js";
 import {
   createTask,
+  getFeature,
   getTask,
   listTasks,
+  markTaskDispatched,
   pruneTasks,
   truncatePrompt,
   updateTaskState,
@@ -66,6 +68,18 @@ import {
   startTaskWatcher,
   WATCHER_MAX_CONSECUTIVE_FAILURES,
 } from "./task-watcher.js";
+import {
+  FEATURE_ABANDONED_TEXT,
+  FeatureScheduler,
+  type FeatureDispatchResult,
+} from "./scheduler.js";
+import {
+  handleFeatureAdvance,
+  handleFeatureApprove,
+  handleFeatureCancel,
+  handleFeatureCreate,
+  handleFeatureStatus,
+} from "./feature-tools.js";
 
 // ---------------------------------------------------------------------------
 // 配置与超时（全部可通过环境变量覆盖；显式超时，避免跨机调用挂死）
@@ -872,15 +886,30 @@ function deferWorkingTask(
   };
 }
 
-async function handleCall(
+/**
+ * 可复用派发：解析项目→机器 → 幂等 ensure → 建 A2A client → `message/send`；
+ * `wait=true` 时在同步预算内轮询至终态/中断态。**不落库、不启动看护**——
+ * 由调用方决定持久化方式（独立任务用远端 taskId；Feature 节点用本地 id + 调度器看护）。
+ * 供 `a2a_call`（MCP 工具）与 Feature 调度器（`dispatchFeatureNode`）共用。
+ */
+type DispatchOutcome =
+  | { ok: false; code: string; error: string; contextId: string }
+  | { ok: true; contextId: string; kind: "message"; text: string }
+  | {
+      ok: true;
+      contextId: string;
+      kind: "task";
+      task: Task;
+      client: Client;
+      machine: MachineRef;
+    };
+
+async function dispatchTask(
   projectId: string,
   text: string,
-  contextIdInput: string | undefined,
+  contextId: string,
   wait: boolean,
-): Promise<CallOutcome> {
-  const contextId =
-    contextIdInput !== undefined && contextIdInput.length > 0 ? contextIdInput : randomUUID();
-
+): Promise<DispatchOutcome> {
   const located = await locateProject(projectId);
   if (!located.ok) {
     return { ok: false, code: located.code, error: located.error, contextId };
@@ -902,11 +931,9 @@ async function handleCall(
     };
   }
 
-  const request = buildSendRequest(text, contextId);
-
   let result: SendMessageResult;
   try {
-    result = await client.sendMessage(request, {
+    result = await client.sendMessage(buildSendRequest(text, contextId), {
       signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS),
     });
   } catch (err) {
@@ -918,93 +945,219 @@ async function handleCall(
     };
   }
 
-  if (isTaskResult(result)) {
-    const isTerminal = terminalOrInterrupted(taskStateOf(result));
-
-    // 全异步（wait=false）：绝不进入同步轮询，立即返回句柄
-    if (!wait) {
-      if (isTerminal) {
-        // sendMessage 内联已终态：落库并如实返回真实终态（不轮询、不伪作 working）
-        const status = mapTaskState(taskStateOf(result));
-        const artifacts = summarizeArtifacts(result.artifacts);
-        createTask({
-          taskId: result.id,
-          projectId,
-          contextId,
-          state: status,
-          artifactsJson: JSON.stringify(artifacts),
-          text: taskText(result),
-          prompt: truncatePrompt(text),
-        });
-        return {
-          ok: true,
-          text: taskText(result),
-          artifacts,
-          taskId: result.id,
-          status,
-          contextId,
-        };
-      }
-      return deferWorkingTask(
-        client,
-        located.machine,
-        projectId,
-        text,
-        result,
-        contextId,
-        "全异步（wait=false）",
-      );
-    }
-
-    // 半异步（默认）：同步轮询至多 SYNC_BUDGET_MS
-    const settled = isTerminal
-      ? result
-      : await pollTaskUntilSettled(client, result, Date.now() + SYNC_BUDGET_MS, async () => {
-          await ensureProject(located.machine, projectId);
-        });
-
-    // 同步预算到点仍未终态 —— 落库 working、启动后台看护、立即返回句柄
-    if (!terminalOrInterrupted(taskStateOf(settled))) {
-      return deferWorkingTask(
-        client,
-        located.machine,
-        projectId,
-        text,
-        settled,
-        contextId,
-        `超出同步预算（${SYNC_BUDGET_MS}ms）`,
-      );
-    }
-
-    const status = mapTaskState(taskStateOf(settled));
-    const artifacts = summarizeArtifacts(settled.artifacts);
-    createTask({
-      taskId: settled.id,
-      projectId,
-      contextId,
-      state: status,
-      artifactsJson: JSON.stringify(artifacts),
-      text: taskText(settled),
-      prompt: truncatePrompt(text),
-    });
-    return {
-      ok: true,
-      text: taskText(settled),
-      artifacts,
-      taskId: settled.id,
-      status,
-      contextId,
-    };
+  if (!isTaskResult(result)) {
+    return { ok: true, contextId, kind: "message", text: partsToText(result.parts) };
   }
 
+  let settled = result;
+  if (wait && !terminalOrInterrupted(taskStateOf(result))) {
+    settled = await pollTaskUntilSettled(client, result, Date.now() + SYNC_BUDGET_MS, async () => {
+      await ensureProject(located.machine, projectId);
+    });
+  }
+  return { ok: true, contextId, kind: "task", task: settled, client, machine: located.machine };
+}
+
+async function handleCall(
+  projectId: string,
+  text: string,
+  contextIdInput: string | undefined,
+  wait: boolean,
+): Promise<CallOutcome> {
+  const contextId =
+    contextIdInput !== undefined && contextIdInput.length > 0 ? contextIdInput : randomUUID();
+
+  const sent = await dispatchTask(projectId, text, contextId, wait);
+  if (!sent.ok) {
+    return { ok: false, code: sent.code, error: sent.error, contextId };
+  }
+  if (sent.kind === "message") {
+    // 对端直接返回 Message（非 Task）：视为一次完成的交互
+    return { ok: true, text: sent.text, artifacts: [], status: "completed", contextId };
+  }
+
+  const { task, client, machine } = sent;
+  // 未终态 —— 落库 working、启动后台看护、立即返回句柄
+  if (!terminalOrInterrupted(taskStateOf(task))) {
+    return deferWorkingTask(
+      client,
+      machine,
+      projectId,
+      text,
+      task,
+      contextId,
+      wait ? `超出同步预算（${SYNC_BUDGET_MS}ms）` : "全异步（wait=false）",
+    );
+  }
+
+  // 终态：如实落库并返回真实终态
+  const status = mapTaskState(taskStateOf(task));
+  const artifacts = summarizeArtifacts(task.artifacts);
+  createTask({
+    taskId: task.id,
+    projectId,
+    contextId,
+    state: status,
+    artifactsJson: JSON.stringify(artifacts),
+    text: taskText(task),
+    prompt: truncatePrompt(text),
+  });
   return {
     ok: true,
-    text: partsToText(result.parts),
-    artifacts: [],
-    status: "completed",
+    text: taskText(task),
+    artifacts,
+    taskId: task.id,
+    status,
     contextId,
   };
 }
+
+// ---------------------------------------------------------------------------
+// Feature 编排接线（v0.3.0）：节点登记 + 调度器派发
+// ---------------------------------------------------------------------------
+
+/**
+ * `a2a_call` 带 `featureId` —— 登记一个 Feature DAG 节点（本地 id），
+ * 不立即派发；由调度器在依赖满足后按序派发（串行、每 Feature 单任务门闩）。
+ * 仅 `executing` 的 Feature 可挂载任务；`dependencies` 引用同 Feature 内的本地 taskId。
+ */
+function registerFeatureNode(
+  projectId: string,
+  message: string,
+  contextIdInput: string | undefined,
+  featureId: string,
+  dependencies: readonly string[],
+): CallOutcome {
+  const contextId =
+    contextIdInput !== undefined && contextIdInput.length > 0 ? contextIdInput : randomUUID();
+  const feature = getFeature(featureId);
+  if (feature === null) {
+    return { ok: false, code: "feature_not_found", error: `未知 Feature ${featureId}`, contextId };
+  }
+  if (feature.state !== "executing") {
+    return {
+      ok: false,
+      code: "feature_state_invalid",
+      error: `Feature ${featureId} 当前为 ${feature.state}，仅 executing 可挂载任务`,
+      contextId,
+    };
+  }
+  const localTaskId = randomUUID();
+  const deps = dependencies.length > 0 ? Array.from(new Set(dependencies)) : null;
+  createTask({
+    taskId: localTaskId,
+    projectId,
+    contextId,
+    state: "working",
+    // prompt 保留截断片段用于辨识；dispatchMessage 存全文供调度器派发
+    prompt: message,
+    featureId,
+    dependencies: deps,
+    dispatchMessage: message,
+  });
+  scheduler.kick();
+  return {
+    ok: true,
+    text:
+      `已登记 Feature 任务节点，调度器将在依赖满足后自动派发（无需人工催办）：` +
+      `taskId=${localTaskId}，featureId=${featureId}，依赖=${deps === null ? "无" : deps.join(", ")}。` +
+      `用 a2a_feature_status(featureId="${featureId}") 查看进度。`,
+    artifacts: [],
+    taskId: localTaskId,
+    status: "working",
+    contextId,
+  };
+}
+
+/**
+ * 调度器注入的节点派发：复用 `dispatchTask` 派发节点消息，落库远端 id，
+ * 未终态转后台看护（`onSettled` 回调调度器续推 DAG）。
+ */
+async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchResult> {
+  const featureId = node.featureId;
+  if (featureId === null) {
+    return { ok: false, error: `任务 ${node.taskId} 无 Feature 归属` };
+  }
+  const message = node.dispatchMessage ?? node.prompt ?? "";
+
+  const sent = await dispatchTask(node.projectId, message, node.contextId, true);
+  if (!sent.ok) {
+    return { ok: false, error: sent.error };
+  }
+  if (sent.kind === "message") {
+    updateTaskState(node.taskId, "completed", null, sent.text);
+    return { ok: true, settled: { state: "completed", text: sent.text } };
+  }
+
+  const { task, client, machine } = sent;
+  const remoteTaskId = task.id;
+  const state = mapTaskState(taskStateOf(task));
+
+  // 远端已终态：直接落库
+  if (terminalOrInterrupted(taskStateOf(task))) {
+    updateTaskState(
+      node.taskId,
+      state,
+      JSON.stringify(summarizeArtifacts(task.artifacts)),
+      taskText(task),
+    );
+    markTaskDispatched(node.taskId, remoteTaskId);
+    return { ok: true, settled: { state, text: taskText(task) } };
+  }
+
+  // 未终态：回填远端 id + 转后台看护（看护终态/放弃均经 onSettled 续推 DAG）
+  markTaskDispatched(node.taskId, remoteTaskId);
+  const started = startTaskWatcher({
+    taskId: node.taskId,
+    poll: () =>
+      client.getTask(
+        { tenant: "", id: remoteTaskId, historyLength: undefined },
+        { signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS) },
+      ),
+    renew: async () => {
+      await ensureProject(machine, node.projectId);
+    },
+    isSettled: (task) => terminalOrInterrupted(taskStateOf(task)),
+    persist: (task) => {
+      const st = mapTaskState(taskStateOf(task));
+      updateTaskState(
+        node.taskId,
+        st,
+        JSON.stringify(summarizeArtifacts(task.artifacts)),
+        taskText(task),
+      );
+      console.log(
+        `[a2a-bridge] Feature 节点 ${node.taskId}（远端 ${remoteTaskId}）已终态（${st}）`,
+      );
+    },
+    onSettled: (task, outcome) => {
+      // 看护放弃路径：本地置 failed 并令 Feature failed
+      if (outcome.abandoned || task === null) {
+        updateTaskState(node.taskId, "failed", null, FEATURE_ABANDONED_TEXT);
+        scheduler.notifyTaskSettled(featureId, node.taskId, { state: "failed", text: null });
+        return;
+      }
+      scheduler.notifyTaskSettled(featureId, node.taskId, {
+        state: mapTaskState(taskStateOf(task)),
+        text: taskText(task),
+      });
+    },
+    pollIntervalMs: POLL_INTERVAL_MS,
+    renewIntervalMs: LEASE_RENEW_INTERVAL_MS,
+    maxConsecutiveFailures: WATCHER_MAX_CONSECUTIVE_FAILURES,
+  });
+  if (started) {
+    console.log(
+      `[a2a-bridge] Feature 节点 ${node.taskId} 已派发（远端 ${remoteTaskId}），转后台看护`,
+    );
+  }
+  return { ok: true };
+}
+
+/** 进程级调度器（生命周期随桥进程；main() 启动循环 + 恢复） */
+const scheduler = new FeatureScheduler({
+  dispatch: (node) => dispatchFeatureNode(node),
+});
 
 interface TaskStatusSuccess {
   ok: true;
@@ -1311,7 +1464,7 @@ server.registerTool(
   "a2a_call",
   {
     description:
-      "向目标项目派发一轮任务：解析项目→机器，按需幂等启动其 Agent（ensure），经 A2A 发送消息并返回文本结果 + artifacts。传入相同 contextId 可续接上下文；返回 contextId 便于继续追问。wait=false 时立即返回句柄（全异步，不进入同步等待）。",
+      "向目标项目派发一轮任务：解析项目→机器，按需幂等启动其 Agent（ensure），经 A2A 发送消息并返回文本结果 + artifacts。传入相同 contextId 可续接上下文；返回 contextId 便于继续追问。wait=false 时立即返回句柄（全异步，不进入同步等待）。提供 featureId 时改为登记 Feature DAG 节点（不立即派发），由调度器按 dependencies 串行自动派发。",
     inputSchema: {
       project: z.string().min(1).describe("目标项目 ID（静态分布配置中的 projectId）"),
       message: z.string().min(1).describe("发给执行 Agent 的任务内容"),
@@ -1325,10 +1478,32 @@ server.registerTool(
         .describe(
           "true/省略=半异步（同步等待至多 SYNC_BUDGET_MS 再返回）；false=全异步，立即返回 working + taskId + contextId，由后台看护在终态时落库",
         ),
+      featureId: z
+        .string()
+        .optional()
+        .describe(
+          "挂载到 Feature：提供时任务作为 DAG 节点登记（返回本地 taskId），由调度器在依赖满足后自动串行派发；省略则按现状立即派发。仅 executing 的 Feature 可挂载。",
+        ),
+      dependencies: z
+        .array(z.string())
+        .optional()
+        .describe(
+          "前置任务本地 taskId 数组（仅 featureId 提供时生效；前一任务终态后才派发下一个）",
+        ),
     },
   },
   async (args) => {
     try {
+      if (args.featureId !== undefined && args.featureId.length > 0) {
+        const outcome = registerFeatureNode(
+          args.project,
+          args.message,
+          args.contextId,
+          args.featureId,
+          args.dependencies ?? [],
+        );
+        return outcome.ok ? textResult(outcome) : errorResult(outcome);
+      }
       const outcome = await handleCall(
         args.project,
         args.message,
@@ -1379,6 +1554,129 @@ server.registerTool(
 );
 
 // ---------------------------------------------------------------------------
+// MCP Server（Feature 工具组；静态注册，零重连）
+// ---------------------------------------------------------------------------
+
+server.registerTool(
+  "a2a_feature_create",
+  {
+    description:
+      "新建 Feature（一条需求，初始态 discussing）。返回 featureId 供后续 advance/approve/cancel/status 引用。",
+    inputSchema: {
+      title: z.string().min(1).describe("Feature 标题（需求的简短摘要）"),
+      requirement: z.string().optional().describe("需求原文（可选）"),
+      contextId: z.string().optional().describe("预留：orch 侧会话上下文（本版仅回显）"),
+    },
+  },
+  async (args) => {
+    try {
+      const outcome = handleFeatureCreate({
+        title: args.title,
+        requirement: args.requirement,
+        contextId: args.contextId,
+      });
+      return outcome.ok ? textResult(outcome) : errorResult(outcome);
+    } catch (err) {
+      return internalError(err);
+    }
+  },
+);
+
+server.registerTool(
+  "a2a_feature_status",
+  {
+    description:
+      "查询 Feature 详情（state + tasks 摘要）；省略 featureId 时列出全部 Feature（含任务数）。",
+    inputSchema: {
+      featureId: z.string().optional().describe("Feature ID；省略则列出全部"),
+    },
+  },
+  async (args) => {
+    try {
+      const outcome = handleFeatureStatus({ featureId: args.featureId });
+      return outcome.ok ? textResult(outcome) : errorResult(outcome);
+    } catch (err) {
+      return internalError(err);
+    }
+  },
+);
+
+server.registerTool(
+  "a2a_feature_advance",
+  {
+    description:
+      "orch agent 驱动 Feature 主链推进（如 discussing→analyzing→planning→waiting_approval、integrating→testing→reviewing→completed）；状态机校验合法后继，非法流转被拒。needs_input 恢复用 to=executing 并携带 answer。",
+    inputSchema: {
+      featureId: z.string().min(1).describe("Feature ID"),
+      to: z
+        .string()
+        .min(1)
+        .describe(
+          "目标状态：discussing / analyzing / planning / waiting_approval / executing / integrating / testing / reviewing / completed / needs_input / failed / cancelled（非法后继被状态机拒绝）",
+        ),
+      note: z.string().optional().describe("备注（本版仅回显）"),
+      answer: z
+        .string()
+        .optional()
+        .describe("needs_input→executing 时的人工澄清内容，以同 contextId 续接待澄清任务"),
+    },
+  },
+  async (args) => {
+    try {
+      const outcome = handleFeatureAdvance({
+        featureId: args.featureId,
+        to: args.to,
+        note: args.note,
+        answer: args.answer,
+      });
+      if (!outcome.ok) return errorResult(outcome);
+      scheduler.kick();
+      return textResult(outcome);
+    } catch (err) {
+      return internalError(err);
+    }
+  },
+);
+
+server.registerTool(
+  "a2a_feature_approve",
+  {
+    description: "审批门：用户放行 Feature（waiting_approval → executing）；非该态调用被拒。",
+    inputSchema: {
+      featureId: z.string().min(1).describe("Feature ID"),
+    },
+  },
+  async (args) => {
+    try {
+      const outcome = handleFeatureApprove({ featureId: args.featureId });
+      if (!outcome.ok) return errorResult(outcome);
+      scheduler.kick();
+      return textResult(outcome);
+    } catch (err) {
+      return internalError(err);
+    }
+  },
+);
+
+server.registerTool(
+  "a2a_feature_cancel",
+  {
+    description: "取消 Feature（任意非终态 → cancelled）；调度器随之停止该 Feature。",
+    inputSchema: {
+      featureId: z.string().min(1).describe("Feature ID"),
+    },
+  },
+  async (args) => {
+    try {
+      const outcome = handleFeatureCancel({ featureId: args.featureId });
+      return outcome.ok ? textResult(outcome) : errorResult(outcome);
+    } catch (err) {
+      return internalError(err);
+    }
+  },
+);
+
+// ---------------------------------------------------------------------------
 // 启动（stdio）
 // ---------------------------------------------------------------------------
 
@@ -1391,14 +1689,28 @@ async function main(): Promise<void> {
   } catch (err) {
     console.error(`[a2a-bridge] 启动清理任务记录失败：${toMessage(err)}`);
   }
+  // 桥重启恢复：扫描非终态 Feature 纯本地收敛（不 ensure、不派发）
+  try {
+    const recovered = scheduler.recover();
+    if (recovered.scanned > 0 || recovered.interruptedTasks > 0) {
+      console.error(
+        `[a2a-bridge] 桥重启恢复：扫描非终态 Feature ${recovered.scanned}，收敛 failed ${recovered.failedFeatures}（interrupted 任务 ${recovered.interruptedTasks}）`,
+      );
+    }
+  } catch (err) {
+    console.error(`[a2a-bridge] 桥重启恢复失败：${toMessage(err)}`);
+  }
+  // 启动串行 Task DAG 调度器（进程内异步循环，不阻塞 stdio）
+  scheduler.start();
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    "[a2a-bridge] MCP stdio server ready: a2a_projects / a2a_tasks / a2a_call / a2a_task_status / a2a_cancel",
+    "[a2a-bridge] MCP stdio server ready: a2a_projects / a2a_tasks / a2a_call / a2a_task_status / a2a_cancel / a2a_feature_create / a2a_feature_status / a2a_feature_advance / a2a_feature_approve / a2a_feature_cancel",
   );
 }
 
 function shutdown(): void {
+  scheduler.stop();
   closeSessionStore();
   void server
     .close()

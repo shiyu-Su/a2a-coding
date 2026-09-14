@@ -13,7 +13,7 @@
   │ 需求讨论 / 任务派发
   ▼
 orch Agent（任意 MCP host，示例为 opencode）
-  │ MCP stdio，固定 5 个泛型工具
+  │ MCP stdio，泛型工具 5 + Feature 工具组 5
   ▼
 MCP 薄桥（orch/）
   │  · 解析「项目 → 机器」（静态机器清单 + 懒加载索引）
@@ -57,9 +57,12 @@ a2a-coding/
 │  ├─ config/config.json.default  # 机器清单模板（入库）
 │  ├─ opencode.json               # 样例：把 mcp.a2a 配进 orch 的 opencode
 │  ├─ types.ts  config.ts  app-root.ts
-│  ├─ bridge/index.ts             # MCP 薄桥：a2a_projects / a2a_call / a2a_task_status / a2a_cancel / a2a_tasks
-│  ├─ bridge/task-watcher.ts      # 任务后台看护（结果保障：轮询 + 续约至终态并落库）
-│  ├─ session/store.ts            # 会话/任务库（node:sqlite；tasks 含 state/artifacts/text/prompt + listTasks/pruneTasks）
+│  ├─ bridge/index.ts             # MCP 薄桥：泛型 5 + Feature 工具组 5；派发主链 dispatchTask
+│  ├─ bridge/task-watcher.ts      # 任务后台看护（轮询 + 续约至终态落库；onSettled 供调度器接驳）
+│  ├─ bridge/scheduler.ts         # 串行 Task DAG 调度器（Feature 编排；启动恢复 + 单任务门闩）
+│  ├─ bridge/feature-tools.ts     # Feature 工具组 handler（create / status / advance / approve / cancel）
+│  ├─ feature/state-machine.ts    # Feature 状态机（9 主态 + 异常态；纯函数，非法流转 fail-fast）
+│  ├─ session/store.ts            # 会话/任务库（node:sqlite；sessions + tasks + features）
 │  └─ data/                       # 运行态：sessions.sqlite（git 忽略）
 ├─ machine/                       # 部署单元 2（每台执行机器）：每机常驻
 │  ├─ package.json                # @a2a-coding/machine：express / a2a-opencode / a2a-codex / a2a-claude
@@ -177,13 +180,23 @@ npm run build        # 产出 dist/bridge/index.js
 
 ### 4. 通过 MCP 工具派发任务
 
-工具面固定为 5 个泛型工具：
+工具面为「**泛型工具 5 + Feature 工具组 5**」（v0.3.0 起）：
 
 - `a2a_projects()`：列出所有已配置机器及其本机项目（含运行态与 A2A 端点）。
 - `a2a_call(project, message, contextId?, wait?)`：解析项目到机器，幂等 ensure，经 A2A 派发一轮任务。默认半异步：≤30s 完成直接返回文本结果与 artifacts，更长返回 `working + taskId` 并用 `a2a_task_status` 轮询；**`wait=false` 时永远立即返回** `working + taskId + contextId`（不进入同步轮询，后台看护照常落库）。
 - `a2a_task_status(taskId)`：查询任务态并回写本地任务存储。已终结任务（completed / failed / input-required）由桥本地存档直接作答（不唤醒远端 Agent）；未终结任务走远端实时查询。
 - `a2a_tasks(project, [state], [limit])`：按项目列出本地任务记录（默认 `updatedAt` 倒序、默认 20 条、最多 100），每条含 `prompt` 片段 / state / text / contextId / updatedAt / stale。用于**丢失 taskId 句柄后的兜底找回**。
 - `a2a_cancel(taskId)`：取消任务，并回写本地任务存储。
+
+**Feature 工具组（5 个，v0.3.0）**——把一个需求作为 **Feature** 编排：orch 不再是逐任务催办，而是 `a2a_feature_create` 建 Feature → orch 组织各项目分析、汇总方案 → `a2a_feature_advance` 推进到 `waiting_approval` 停下 → 用户 `a2a_feature_approve` 放行 → 桥内**串行 Task DAG 调度器**按 `dependencies` 自动派发各项目任务并推进至完成；任务需澄清时 Feature 停 `needs_input`，`a2a_feature_advance(..., answer=…)` 续推。调度器为**代码组件**，LLM 不参与等待/轮询。
+
+- `a2a_feature_create(title, requirement?, contextId?)`：新建 Feature（`discussing`），返回 `featureId`。
+- `a2a_feature_status(featureId?)`：查看 Feature 详情 / 列表（state + tasks 摘要）。
+- `a2a_feature_advance(featureId, to, note?, answer?)`：推进状态机主链（校验合法后继，非法流转被拒）；`answer` 用于 `needs_input` 补齐后续推。
+- `a2a_feature_approve(featureId)`：审批门——`waiting_approval → executing`。
+- `a2a_feature_cancel(featureId)`：任意非终态 → `cancelled`。
+
+`a2a_call` 增可选 `featureId` / `dependencies`：带 `featureId` = 登记该 Feature 的队列节点（由调度器按 `dependencies` 串行派发）；**不带则与既有行为一致**（立即派发）。
 
 示例（在 orch 里）：
 

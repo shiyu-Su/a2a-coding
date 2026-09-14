@@ -26,6 +26,49 @@ export type AgentKind = "opencode" | "codex" | "claude";
 /** A2A 任务态 */
 export type TaskState = "working" | "completed" | "failed" | "input-required";
 
+/**
+ * Feature 状态（v0.3.0）。
+ * 主链（9）：discussing → analyzing → planning → waiting_approval → executing →
+ * integrating → testing → reviewing → completed；
+ * 异常态（3）：needs_input / failed / cancelled；终态：completed / failed / cancelled。
+ * 合法流转由 `orch/feature/state-machine.ts` 纯模块强制（非法流转 fail-fast）。
+ */
+export type FeatureState =
+  | "discussing"
+  | "analyzing"
+  | "planning"
+  | "waiting_approval"
+  | "executing"
+  | "integrating"
+  | "testing"
+  | "reviewing"
+  | "completed"
+  | "needs_input"
+  | "failed"
+  | "cancelled";
+
+/** Feature 记录（落 SQLite `features` 表） */
+export interface FeatureRecord {
+  featureId: string;
+  state: FeatureState;
+  title: string;
+  /** 需求原文（截断，可空） */
+  requirement: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** `createFeature` 入参：时间戳 / state 缺省时由存储层补齐 */
+export interface FeatureCreateInput {
+  featureId: string;
+  title: string;
+  requirement?: string | null;
+  /** 缺省 `discussing` */
+  state?: FeatureState;
+  createdAt?: string;
+  updatedAt?: string;
+}
+
 /** 项目风险级别（决定 CLI 权限参数） */
 export type RiskLevel = "read" | "write" | "full";
 
@@ -80,6 +123,10 @@ export interface SessionRecord {
 
 /** 任务记录 */
 export interface TaskRecord {
+  /**
+   * 本地任务标识。独立单任务 = 远端 A2A 任务 id；Feature 节点 = orch 本地分配
+   * 的节点 id（远端 id 见 `remoteTaskId`）。`dependencies` 引用本字段。
+   */
   taskId: string;
   projectId: string;
   contextId: string;
@@ -90,6 +137,14 @@ export interface TaskRecord {
   /** 派发时的原始 prompt 片段（落库前截断）；旧记录可能为 null */
   prompt: string | null;
   updatedAt: string;
+  /** 归属 Feature（NULL = 独立单任务） */
+  featureId: string | null;
+  /** 前置任务（本地 taskId 数组，环/悬空引用由调度器校验）；NULL = 无依赖 */
+  dependencies: string[] | null;
+  /** Feature 节点派发后远端 A2A 任务 id；独立任务为 NULL（taskId 即远端 id） */
+  remoteTaskId: string | null;
+  /** Feature 排队节点的待派发消息全文；派发后保留（作为可重派依据） */
+  dispatchMessage: string | null;
 }
 
 /** `a2a_tasks` 列表项：本地任务记录 + 陈旧标记 */

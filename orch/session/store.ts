@@ -10,7 +10,16 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type { AgentKind, SessionRecord, TaskRecord, TaskState } from "../types.js";
+import { FEATURE_STATES, isFeatureState } from "../feature/state-machine.js";
+import type {
+  AgentKind,
+  FeatureCreateInput,
+  FeatureRecord,
+  FeatureState,
+  SessionRecord,
+  TaskRecord,
+  TaskState,
+} from "../types.js";
 
 /** 默认数据库文件（相对进程 cwd） */
 export const DEFAULT_SESSION_DB = "./data/sessions.sqlite";
@@ -43,6 +52,8 @@ export function truncatePrompt(text: string, max = PROMPT_MAX_CHARS): string {
 
 const AGENT_KINDS: readonly AgentKind[] = ["opencode", "codex", "claude"];
 const TASK_STATES: readonly TaskState[] = ["working", "completed", "failed", "input-required"];
+// Feature 状态清单复用状态机模块（单一事实源），此处仅 re-export 供调用方枚举
+export const FEATURE_STATE_VALUES: readonly FeatureState[] = FEATURE_STATES;
 
 /** `upsertSession` 入参：时间戳缺省时由存储层补齐（UTC ISO 8601） */
 export interface SessionUpsertInput {
@@ -66,12 +77,31 @@ export interface TaskCreateInput {
   /** 派发时的原始 prompt 片段（落库前经 truncatePrompt 截断）；缺省为 null */
   prompt?: string | null;
   updatedAt?: string;
+  /** 归属 Feature（v0.3.0；缺省 null = 独立单任务） */
+  featureId?: string | null;
+  /** 前置任务本地 id 数组（v0.3.0；缺省 null = 无依赖） */
+  dependencies?: string[] | null;
+  /** 远端 A2A 任务 id（Feature 节点派发后回填；缺省 null） */
+  remoteTaskId?: string | null;
+  /** Feature 排队节点待派发消息全文（v0.3.0；缺省 null） */
+  dispatchMessage?: string | null;
 }
 
 /** `listTasks` 入参：按项目（可选状态）取最近任务 */
 export interface ListTasksOptions {
   projectId: string;
   state?: TaskState;
+  limit?: number;
+}
+
+/** `listFeatureTasks` 入参：按 Feature 取任务节点（本地 id） */
+export interface ListFeatureTasksOptions {
+  limit?: number;
+}
+
+/** `listFeatures` 入参：可选状态过滤 / 条数上限 */
+export interface ListFeaturesOptions {
+  state?: FeatureState;
   limit?: number;
 }
 
@@ -125,6 +155,34 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
   };
 }
 
+/** tasks 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToTask） */
+const TASK_COLUMNS =
+  "task_id, project_id, context_id, state, artifacts_json, text, prompt, " +
+  "feature_id, dependencies, remote_task_id, dispatch_message, updated_at";
+
+/** 解析 `dependencies` 列（JSON 数组字符串）；非法即数据损坏（fail-fast） */
+function readDependencies(row: Record<string, unknown>): string[] | null {
+  const raw = readNullableString(row, "dependencies");
+  if (raw === null) return null;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`[session-store] 列 dependencies 数据损坏：非法 JSON`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`[session-store] 列 dependencies 数据损坏：期望 JSON 数组`);
+  }
+  const deps: string[] = [];
+  for (const v of parsed) {
+    if (typeof v !== "string") {
+      throw new Error(`[session-store] 列 dependencies 数据损坏：数组元素非 string`);
+    }
+    deps.push(v);
+  }
+  return deps;
+}
+
 function rowToTask(row: Record<string, unknown>): TaskRecord {
   const state = readString(row, "state");
   if (!isTaskState(state)) {
@@ -138,6 +196,25 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     artifactsJson: readNullableString(row, "artifacts_json"),
     text: readNullableString(row, "text"),
     prompt: readNullableString(row, "prompt"),
+    updatedAt: readString(row, "updated_at"),
+    featureId: readNullableString(row, "feature_id"),
+    dependencies: readDependencies(row),
+    remoteTaskId: readNullableString(row, "remote_task_id"),
+    dispatchMessage: readNullableString(row, "dispatch_message"),
+  };
+}
+
+function rowToFeature(row: Record<string, unknown>): FeatureRecord {
+  const state = readString(row, "state");
+  if (!isFeatureState(state)) {
+    throw new Error(`[session-store] 列 state 数据损坏：非法 Feature 态 ${state}`);
+  }
+  return {
+    featureId: readString(row, "feature_id"),
+    state,
+    title: readString(row, "title"),
+    requirement: readNullableString(row, "requirement"),
+    createdAt: readString(row, "created_at"),
     updatedAt: readString(row, "updated_at"),
   };
 }
@@ -165,6 +242,16 @@ CREATE TABLE IF NOT EXISTS tasks (
   updated_at    TEXT NOT NULL
 )`;
 
+const FEATURES_DDL = `
+CREATE TABLE IF NOT EXISTS features (
+  feature_id  TEXT PRIMARY KEY,
+  state       TEXT NOT NULL,
+  title       TEXT NOT NULL,
+  requirement TEXT,
+  created_at  TEXT NOT NULL,
+  updated_at  TEXT NOT NULL
+)`;
+
 /**
  * SQLite 会话/任务存储。
  * 桥（bridge）进程内通常使用模块级默认单例（见文件底部的导出函数）。
@@ -181,6 +268,7 @@ export class SessionStore {
     this.db.exec("PRAGMA journal_mode = WAL;");
     this.db.exec(SESSIONS_DDL);
     this.db.exec(TASKS_DDL);
+    this.db.exec(FEATURES_DDL);
     // 旧库迁移：此前版本的 tasks 表无 text 列（列已存在时 ALTER 失败，忽略）
     try {
       this.db.exec("ALTER TABLE tasks ADD COLUMN text TEXT");
@@ -193,10 +281,28 @@ export class SessionStore {
     } catch {
       // 列已存在
     }
+    // v0.3.0 迁移：tasks 加 feature_id / dependencies / remote_task_id / dispatch_message
+    for (const column of [
+      "feature_id TEXT",
+      "dependencies TEXT",
+      "remote_task_id TEXT",
+      "dispatch_message TEXT",
+    ]) {
+      try {
+        this.db.exec(`ALTER TABLE tasks ADD COLUMN ${column}`);
+      } catch {
+        // 列已存在
+      }
+    }
     // 按项目 + updated_at 倒序的列表查询索引
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS idx_tasks_project_updated ON tasks(project_id, updated_at DESC)",
     );
+    // Feature 列表（按状态 + updated_at 倒序）与按 Feature 取任务节点的索引
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_features_state_updated ON features(state, updated_at DESC)",
+    );
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_feature ON tasks(feature_id, updated_at DESC)");
   }
 
   /** 查询会话映射；不存在返回 null */
@@ -239,11 +345,16 @@ export class SessionStore {
     const updatedAt = rec.updatedAt ?? nowIso();
     const prompt =
       rec.prompt === undefined || rec.prompt === null ? null : truncatePrompt(rec.prompt);
+    const dependencies =
+      rec.dependencies === undefined || rec.dependencies === null
+        ? null
+        : JSON.stringify(rec.dependencies);
     this.db
       .prepare(
         `INSERT INTO tasks
-           (task_id, project_id, context_id, state, artifacts_json, text, prompt, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+           (task_id, project_id, context_id, state, artifacts_json, text, prompt,
+            feature_id, dependencies, remote_task_id, dispatch_message, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(task_id) DO UPDATE SET
            project_id = excluded.project_id,
            context_id = excluded.context_id,
@@ -251,6 +362,10 @@ export class SessionStore {
            artifacts_json = excluded.artifacts_json,
            text = excluded.text,
            prompt = excluded.prompt,
+           feature_id = excluded.feature_id,
+           dependencies = excluded.dependencies,
+           remote_task_id = excluded.remote_task_id,
+           dispatch_message = excluded.dispatch_message,
            updated_at = excluded.updated_at`,
       )
       .run(
@@ -261,6 +376,10 @@ export class SessionStore {
         rec.artifactsJson ?? null,
         rec.text ?? null,
         prompt,
+        rec.featureId ?? null,
+        dependencies,
+        rec.remoteTaskId ?? null,
+        rec.dispatchMessage ?? null,
         updatedAt,
       );
     const stored = this.getTask(rec.taskId);
@@ -297,12 +416,35 @@ export class SessionStore {
   /** 查询任务记录；不存在返回 null */
   getTask(taskId: string): TaskRecord | null {
     const row = this.db
-      .prepare(
-        `SELECT task_id, project_id, context_id, state, artifacts_json, text, prompt, updated_at
-         FROM tasks WHERE task_id = ?`,
-      )
+      .prepare(`SELECT ${TASK_COLUMNS} FROM tasks WHERE task_id = ?`)
       .get(taskId);
     return row === undefined ? null : rowToTask(row);
+  }
+
+  /**
+   * Feature 节点派发落库：回填远端 id，保持 state（working）以便看护接管。
+   * 任务不存在时无效果，返回 null。
+   */
+  markTaskDispatched(taskId: string, remoteTaskId: string): TaskRecord | null {
+    this.db
+      .prepare("UPDATE tasks SET remote_task_id = ?, updated_at = ? WHERE task_id = ?")
+      .run(remoteTaskId, nowIso(), taskId);
+    return this.getTask(taskId);
+  }
+
+  /**
+   * needs_input 恢复：将任务节点重新置为待派发（state=working、清远端 id、
+   * 更新待派发消息），供调度器以同 contextId 续接。任务不存在时返回 null。
+   */
+  rearmTask(taskId: string, dispatchMessage: string): TaskRecord | null {
+    this.db
+      .prepare(
+        `UPDATE tasks
+         SET state = 'working', remote_task_id = NULL, dispatch_message = ?, updated_at = ?
+         WHERE task_id = ?`,
+      )
+      .run(dispatchMessage, nowIso(), taskId);
+    return this.getTask(taskId);
   }
 
   /** 按项目列出任务（updated_at 倒序；可选状态过滤；limit 默认 20，clamp 到 [1,100]） */
@@ -317,32 +459,124 @@ export class SessionStore {
     params.push(limit);
     const rows = this.db
       .prepare(
-        `SELECT task_id, project_id, context_id, state, artifacts_json, text, prompt, updated_at
-         FROM tasks WHERE ${clauses.join(" AND ")} ORDER BY updated_at DESC LIMIT ?`,
+        `SELECT ${TASK_COLUMNS} FROM tasks WHERE ${clauses.join(" AND ")}
+         ORDER BY updated_at DESC LIMIT ?`,
       )
       .all(...params) as Array<Record<string, unknown>>;
     return rows.map(rowToTask);
   }
 
+  /** 按 Feature 列出任务节点（updated_at 升序 = 派发次序；limit 默认 100，clamp 到 [1,1000]） */
+  listFeatureTasks(featureId: string, opts: ListFeatureTasksOptions = {}): TaskRecord[] {
+    const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
+    const rows = this.db
+      .prepare(
+        `SELECT ${TASK_COLUMNS} FROM tasks WHERE feature_id = ?
+         ORDER BY updated_at ASC LIMIT ?`,
+      )
+      .all(featureId, limit) as Array<Record<string, unknown>>;
+    return rows.map(rowToTask);
+  }
+
+  // ------------------------------------------------------------------
+  // Feature CRUD（v0.3.0）
+  // ------------------------------------------------------------------
+
+  /** 创建/覆盖 Feature 记录（state 缺省 `discussing`），返回落库后的记录 */
+  createFeature(rec: FeatureCreateInput): FeatureRecord {
+    const state = rec.state ?? "discussing";
+    if (!isFeatureState(state)) {
+      throw new Error(`[session-store] createFeature 非法 Feature 态：${String(state)}`);
+    }
+    const createdAt = rec.createdAt ?? nowIso();
+    const updatedAt = rec.updatedAt ?? createdAt;
+    this.db
+      .prepare(
+        `INSERT INTO features (feature_id, state, title, requirement, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?)
+         ON CONFLICT(feature_id) DO UPDATE SET
+           state = excluded.state,
+           title = excluded.title,
+           requirement = excluded.requirement,
+           updated_at = excluded.updated_at`,
+      )
+      .run(rec.featureId, state, rec.title, rec.requirement ?? null, createdAt, updatedAt);
+    const stored = this.getFeature(rec.featureId);
+    if (stored === null) {
+      throw new Error(`[session-store] createFeature 后未能读回记录：${rec.featureId}`);
+    }
+    return stored;
+  }
+
+  /** 查询 Feature；不存在返回 null */
+  getFeature(featureId: string): FeatureRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT feature_id, state, title, requirement, created_at, updated_at
+         FROM features WHERE feature_id = ?`,
+      )
+      .get(featureId);
+    return row === undefined ? null : rowToFeature(row);
+  }
+
+  /** 更新 Feature 态；Feature 不存在时无效果，返回 null */
+  updateFeatureState(featureId: string, state: FeatureState): FeatureRecord | null {
+    if (!isFeatureState(state)) {
+      throw new Error(`[session-store] updateFeatureState 非法 Feature 态：${String(state)}`);
+    }
+    this.db
+      .prepare("UPDATE features SET state = ?, updated_at = ? WHERE feature_id = ?")
+      .run(state, nowIso(), featureId);
+    return this.getFeature(featureId);
+  }
+
+  /** 列出 Feature（updated_at 倒序；可选状态过滤；limit 默认 100，clamp 到 [1,1000]） */
+  listFeatures(opts: ListFeaturesOptions = {}): FeatureRecord[] {
+    const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
+    const clauses: string[] = [];
+    const params: Array<string | number> = [];
+    if (opts.state !== undefined) {
+      clauses.push("state = ?");
+      params.push(opts.state);
+    }
+    params.push(limit);
+    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")} ` : "";
+    const rows = this.db
+      .prepare(
+        `SELECT feature_id, state, title, requirement, created_at, updated_at
+         FROM features ${where}ORDER BY updated_at DESC LIMIT ?`,
+      )
+      .all(...params) as Array<Record<string, unknown>>;
+    return rows.map(rowToFeature);
+  }
+
   /**
    * 清理保留策略：删除超期 / 每项目超量的**非 working** 任务记录，返回删除条数。
    * 超期按 `updated_at` 早于 `retentionDays`；超量按每项目保留最新 `maxPerProject` 条。
+   * v0.3.0：**排除活跃 Feature 的任务**（其 `feature_id` 非空且所属 Feature 未终态），
+   * 避免误删在飞编排的证据。
    */
   pruneTasks(opts: PruneTasksOptions = {}): number {
     const retentionDays = opts.retentionDays ?? TASK_RETENTION_DAYS;
     const maxPerProject = opts.maxPerProject ?? TASK_MAX_PER_PROJECT;
     const cutoffIso = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
+    // 仅「无 Feature 归属」或「所属 Feature 已终态」的任务可被清理
+    const prunable =
+      "(feature_id IS NULL OR feature_id IN (" +
+      "SELECT feature_id FROM features WHERE state IN ('completed','failed','cancelled')))";
     const expired = this.db
-      .prepare("DELETE FROM tasks WHERE state <> 'working' AND updated_at < ?")
+      .prepare(
+        `DELETE FROM tasks WHERE state <> 'working' AND updated_at < ? AND ${prunable}`,
+      )
       .run(cutoffIso).changes;
     const overflow = this.db
       .prepare(
-        `DELETE FROM tasks WHERE state <> 'working' AND task_id IN (
+        `DELETE FROM tasks WHERE state <> 'working' AND ${prunable} AND task_id IN (
            SELECT task_id FROM (
              SELECT task_id,
                     ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC) AS rn
              FROM tasks
-             WHERE state <> 'working'
+             WHERE state <> 'working' AND ${prunable}
            ) WHERE rn > ?
          )`,
       )
@@ -401,6 +635,44 @@ export function getTask(taskId: string): TaskRecord | null {
 /** 按项目列出任务（默认存储） */
 export function listTasks(opts: ListTasksOptions): TaskRecord[] {
   return getDefaultStore().listTasks(opts);
+}
+
+/** 按 Feature 列出任务节点（默认存储） */
+export function listFeatureTasks(
+  featureId: string,
+  opts?: ListFeatureTasksOptions,
+): TaskRecord[] {
+  return getDefaultStore().listFeatureTasks(featureId, opts);
+}
+
+/** Feature 节点派发落库：回填远端 id（默认存储） */
+export function markTaskDispatched(taskId: string, remoteTaskId: string): TaskRecord | null {
+  return getDefaultStore().markTaskDispatched(taskId, remoteTaskId);
+}
+
+/** needs_input 恢复：重排任务节点（默认存储） */
+export function rearmTask(taskId: string, dispatchMessage: string): TaskRecord | null {
+  return getDefaultStore().rearmTask(taskId, dispatchMessage);
+}
+
+/** 创建/覆盖 Feature 记录（默认存储） */
+export function createFeature(rec: FeatureCreateInput): FeatureRecord {
+  return getDefaultStore().createFeature(rec);
+}
+
+/** 查询 Feature（默认存储） */
+export function getFeature(featureId: string): FeatureRecord | null {
+  return getDefaultStore().getFeature(featureId);
+}
+
+/** 更新 Feature 态（默认存储） */
+export function updateFeatureState(featureId: string, state: FeatureState): FeatureRecord | null {
+  return getDefaultStore().updateFeatureState(featureId, state);
+}
+
+/** 列出 Feature（默认存储） */
+export function listFeatures(opts?: ListFeaturesOptions): FeatureRecord[] {
+  return getDefaultStore().listFeatures(opts);
 }
 
 /** 清理保留策略（默认存储） */
