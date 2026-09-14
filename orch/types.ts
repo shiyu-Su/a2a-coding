@@ -87,7 +87,25 @@ export interface TaskRecord {
   artifactsJson: string | null;
   /** 任务结果纯文本（成功 = artifacts 文本；失败 = status.message 错误原因）；旧记录可能为 null */
   text: string | null;
+  /** 派发时的原始 prompt 片段（落库前截断）；旧记录可能为 null */
+  prompt: string | null;
   updatedAt: string;
+}
+
+/** `a2a_tasks` 列表项：本地任务记录 + 陈旧标记 */
+export interface TaskListItem {
+  taskId: string;
+  contextId: string;
+  state: TaskState;
+  /** 派发时的原始 prompt 片段（截断），用于辨识任务 */
+  prompt: string | null;
+  /** 结果文本（本地 text，缺省回退归档 artifacts 文本） */
+  text: string;
+  /** 归档 artifacts 摘要（ArtifactSummary[]；由 bridge 侧收窄） */
+  artifacts: unknown;
+  updatedAt: string;
+  /** working 且判定不可达（无在飞看护 / 项目不在线）时为 true */
+  stale: boolean;
 }
 
 /** 统一错误外壳（对外 HTTP / 工具返回） */

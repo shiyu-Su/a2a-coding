@@ -201,7 +201,9 @@ export class AgentManager {
     // 启动配置快照（每次拉起都打）：配置获取层级 + endpoint / 模型 id（配置面解析，观测用）
     const snapshot = describeAgentConfig(project, configPath);
     console.log(`[launcher] agent ${project.projectId} 配置层级：${snapshot.hierarchy}`);
-    console.log(`[launcher] agent ${project.projectId} endpoint=${snapshot.endpoint}，model=${snapshot.model}`);
+    console.log(
+      `[launcher] agent ${project.projectId} endpoint=${snapshot.endpoint}，model=${snapshot.model}`,
+    );
 
     // opencode 项目：先确保前置 `opencode serve`（cwd=workspace，本机空闲端口）
     let backend: OpencodeBackend | null = null;

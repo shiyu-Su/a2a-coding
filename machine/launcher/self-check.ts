@@ -359,7 +359,9 @@ export async function runStartupSelfCheck(
     console.log(`[self-check] ${project.projectId}（${project.agentKind}）自检中…`);
     const outcome = await checkProject(manager, project, prompt, timeoutMs);
     if ("stage" in outcome) {
-      console.error(`[self-check] ${project.projectId} 失败（${outcome.stage}）：${outcome.reason}`);
+      console.error(
+        `[self-check] ${project.projectId} 失败（${outcome.stage}）：${outcome.reason}`,
+      );
       failures.push(outcome);
     } else {
       console.log(

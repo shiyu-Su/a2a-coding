@@ -1,0 +1,9 @@
+# 依赖 / 构建产物 / 运行态产物 / 工具缓存 / 本机运行时配置
+# （不参与 prettier 的 format / format:check）
+node_modules/
+dist/
+data/
+.a2a/
+.codegraph/
+.omo/
+config/config.json

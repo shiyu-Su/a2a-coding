@@ -10,17 +10,14 @@
 import type { Server } from "node:http";
 import { join } from "node:path";
 import { loadMachineConfig } from "../config.js";
+import { pruneStaleAgentConfigs } from "./agents-prune.js";
 import { appRootFromModule } from "./app-root.js";
 import { AgentManager, DEFAULT_IDLE_STOP_MS } from "./manager.js";
 import { runStartupSelfCheck } from "./self-check.js";
 import { createLauncherApp } from "./server.js";
 
 /** 缺省机器配置：源码运行与构建运行均以 machine 单元根（含 package.json）为基准解析 */
-const DEFAULT_MACHINE_CONFIG = join(
-  appRootFromModule(import.meta.url),
-  "config",
-  "config.json",
-);
+const DEFAULT_MACHINE_CONFIG = join(appRootFromModule(import.meta.url), "config", "config.json");
 
 const configPath = process.env["MACHINE_CONFIG"] ?? DEFAULT_MACHINE_CONFIG;
 const machine = loadMachineConfig(configPath);
@@ -58,6 +55,15 @@ process.on("exit", () => {
 });
 
 async function boot(): Promise<void> {
+  // 清理不属于当前 projects[] 的过期包装器配置（早于启动自检与监听端口）
+  const appRoot = appRootFromModule(import.meta.url);
+  const prune = pruneStaleAgentConfigs(appRoot, machine.projects);
+  if (prune.removed.length > 0) {
+    console.log(
+      `[launcher] 清理过期包装器配置 ${prune.removed.length} 个：${prune.removed.join(", ")}`,
+    );
+  }
+
   // 启动自检（缺省开）：全部项目通过才对外监听；失败 fail-fast 退出
   if (machine.launcher.startupCheck ?? true) {
     const result = await runStartupSelfCheck(manager, machine);

@@ -38,7 +38,8 @@ function deepMerge(
   const merged: Record<string, unknown> = { ...base };
   for (const [key, value] of Object.entries(override)) {
     const existing = merged[key];
-    merged[key] = isPlainObject(existing) && isPlainObject(value) ? deepMerge(existing, value) : value;
+    merged[key] =
+      isPlainObject(existing) && isPlainObject(value) ? deepMerge(existing, value) : value;
   }
   return merged;
 }

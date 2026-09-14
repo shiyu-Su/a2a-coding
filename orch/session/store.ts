@@ -10,23 +10,39 @@
 import { mkdirSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
-import type {
-  AgentKind,
-  SessionRecord,
-  TaskRecord,
-  TaskState,
-} from "../types.js";
+import type { AgentKind, SessionRecord, TaskRecord, TaskState } from "../types.js";
 
 /** 默认数据库文件（相对进程 cwd） */
 export const DEFAULT_SESSION_DB = "./data/sessions.sqlite";
 
+/** 从环境变量读取正整数；缺失 / 非法 / 非正时回退 fallback */
+function readPositiveIntEnv(name: string, fallback: number): number {
+  const raw = process.env[name];
+  if (raw === undefined) return fallback;
+  const n = Number(raw);
+  if (!Number.isFinite(n) || n <= 0) return fallback;
+  return Math.floor(n);
+}
+
+/** prompt 片段最大字符数（可配，默认 500） */
+const PROMPT_MAX_CHARS = readPositiveIntEnv("TASK_PROMPT_MAX_CHARS", 500);
+
+/** 任务记录保留天数（按 updated_at 超期清理；可配，默认 7 天） */
+const TASK_RETENTION_DAYS = readPositiveIntEnv("TASK_RETENTION_DAYS", 7);
+
+/** 每项目保留的最新任务条数（非 working；可配，默认 200） */
+const TASK_MAX_PER_PROJECT = readPositiveIntEnv("TASK_MAX_PER_PROJECT", 200);
+
+/**
+ * 截断 prompt 片段（默认 `PROMPT_MAX_CHARS` 字符）。
+ * 落库前调用，仅存片段、不存全文。
+ */
+export function truncatePrompt(text: string, max = PROMPT_MAX_CHARS): string {
+  return text.length <= max ? text : text.slice(0, max);
+}
+
 const AGENT_KINDS: readonly AgentKind[] = ["opencode", "codex", "claude"];
-const TASK_STATES: readonly TaskState[] = [
-  "working",
-  "completed",
-  "failed",
-  "input-required",
-];
+const TASK_STATES: readonly TaskState[] = ["working", "completed", "failed", "input-required"];
 
 /** `upsertSession` 入参：时间戳缺省时由存储层补齐（UTC ISO 8601） */
 export interface SessionUpsertInput {
@@ -47,7 +63,22 @@ export interface TaskCreateInput {
   artifactsJson?: string | null;
   /** 任务结果纯文本（成功 = artifacts 文本；失败 = status.message 错误原因） */
   text?: string | null;
+  /** 派发时的原始 prompt 片段（落库前经 truncatePrompt 截断）；缺省为 null */
+  prompt?: string | null;
   updatedAt?: string;
+}
+
+/** `listTasks` 入参：按项目（可选状态）取最近任务 */
+export interface ListTasksOptions {
+  projectId: string;
+  state?: TaskState;
+  limit?: number;
+}
+
+/** `pruneTasks` 入参：保留策略阈值覆盖（缺省用环境变量 / 内置默认） */
+export interface PruneTasksOptions {
+  retentionDays?: number;
+  maxPerProject?: number;
 }
 
 function nowIso(): string {
@@ -70,10 +101,7 @@ function readString(row: Record<string, unknown>, key: string): string {
   return v;
 }
 
-function readNullableString(
-  row: Record<string, unknown>,
-  key: string,
-): string | null {
+function readNullableString(row: Record<string, unknown>, key: string): string | null {
   const v = row[key];
   if (v === null || v === undefined) return null;
   if (typeof v !== "string") {
@@ -109,6 +137,7 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     state,
     artifactsJson: readNullableString(row, "artifacts_json"),
     text: readNullableString(row, "text"),
+    prompt: readNullableString(row, "prompt"),
     updatedAt: readString(row, "updated_at"),
   };
 }
@@ -132,6 +161,7 @@ CREATE TABLE IF NOT EXISTS tasks (
   state         TEXT NOT NULL,
   artifacts_json TEXT,
   text          TEXT,
+  prompt        TEXT,
   updated_at    TEXT NOT NULL
 )`;
 
@@ -157,6 +187,16 @@ export class SessionStore {
     } catch {
       // 列已存在
     }
+    // 旧库迁移：此前版本的 tasks 表无 prompt 列（列已存在时 ALTER 失败，忽略）
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN prompt TEXT");
+    } catch {
+      // 列已存在
+    }
+    // 按项目 + updated_at 倒序的列表查询索引
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_tasks_project_updated ON tasks(project_id, updated_at DESC)",
+    );
   }
 
   /** 查询会话映射；不存在返回 null */
@@ -184,14 +224,7 @@ export class SessionStore {
            agent_kind = excluded.agent_kind,
            last_used_at = excluded.last_used_at`,
       )
-      .run(
-        rec.projectId,
-        rec.contextId,
-        rec.sessionId,
-        rec.agentKind,
-        createdAt,
-        lastUsedAt,
-      );
+      .run(rec.projectId, rec.contextId, rec.sessionId, rec.agentKind, createdAt, lastUsedAt);
     const stored = this.getSession(rec.projectId, rec.contextId);
     if (stored === null) {
       throw new Error(
@@ -204,17 +237,20 @@ export class SessionStore {
   /** 创建/覆盖任务记录，返回落库后的记录 */
   createTask(rec: TaskCreateInput): TaskRecord {
     const updatedAt = rec.updatedAt ?? nowIso();
+    const prompt =
+      rec.prompt === undefined || rec.prompt === null ? null : truncatePrompt(rec.prompt);
     this.db
       .prepare(
         `INSERT INTO tasks
-           (task_id, project_id, context_id, state, artifacts_json, text, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+           (task_id, project_id, context_id, state, artifacts_json, text, prompt, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(task_id) DO UPDATE SET
            project_id = excluded.project_id,
            context_id = excluded.context_id,
            state = excluded.state,
            artifacts_json = excluded.artifacts_json,
            text = excluded.text,
+           prompt = excluded.prompt,
            updated_at = excluded.updated_at`,
       )
       .run(
@@ -224,6 +260,7 @@ export class SessionStore {
         rec.state,
         rec.artifactsJson ?? null,
         rec.text ?? null,
+        prompt,
         updatedAt,
       );
     const stored = this.getTask(rec.taskId);
@@ -261,11 +298,56 @@ export class SessionStore {
   getTask(taskId: string): TaskRecord | null {
     const row = this.db
       .prepare(
-        `SELECT task_id, project_id, context_id, state, artifacts_json, text, updated_at
+        `SELECT task_id, project_id, context_id, state, artifacts_json, text, prompt, updated_at
          FROM tasks WHERE task_id = ?`,
       )
       .get(taskId);
     return row === undefined ? null : rowToTask(row);
+  }
+
+  /** 按项目列出任务（updated_at 倒序；可选状态过滤；limit 默认 20，clamp 到 [1,100]） */
+  listTasks(opts: ListTasksOptions): TaskRecord[] {
+    const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100);
+    const clauses: string[] = ["project_id = ?"];
+    const params: Array<string | number> = [opts.projectId];
+    if (opts.state !== undefined) {
+      clauses.push("state = ?");
+      params.push(opts.state);
+    }
+    params.push(limit);
+    const rows = this.db
+      .prepare(
+        `SELECT task_id, project_id, context_id, state, artifacts_json, text, prompt, updated_at
+         FROM tasks WHERE ${clauses.join(" AND ")} ORDER BY updated_at DESC LIMIT ?`,
+      )
+      .all(...params) as Array<Record<string, unknown>>;
+    return rows.map(rowToTask);
+  }
+
+  /**
+   * 清理保留策略：删除超期 / 每项目超量的**非 working** 任务记录，返回删除条数。
+   * 超期按 `updated_at` 早于 `retentionDays`；超量按每项目保留最新 `maxPerProject` 条。
+   */
+  pruneTasks(opts: PruneTasksOptions = {}): number {
+    const retentionDays = opts.retentionDays ?? TASK_RETENTION_DAYS;
+    const maxPerProject = opts.maxPerProject ?? TASK_MAX_PER_PROJECT;
+    const cutoffIso = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
+    const expired = this.db
+      .prepare("DELETE FROM tasks WHERE state <> 'working' AND updated_at < ?")
+      .run(cutoffIso).changes;
+    const overflow = this.db
+      .prepare(
+        `DELETE FROM tasks WHERE state <> 'working' AND task_id IN (
+           SELECT task_id FROM (
+             SELECT task_id,
+                    ROW_NUMBER() OVER (PARTITION BY project_id ORDER BY updated_at DESC) AS rn
+             FROM tasks
+             WHERE state <> 'working'
+           ) WHERE rn > ?
+         )`,
+      )
+      .run(maxPerProject).changes;
+    return Number(expired) + Number(overflow);
   }
 
   /** 关闭数据库连接（幂等） */
@@ -287,10 +369,7 @@ export function getDefaultStore(): SessionStore {
 }
 
 /** 查询会话映射（默认存储） */
-export function getSession(
-  projectId: string,
-  contextId: string,
-): SessionRecord | null {
+export function getSession(projectId: string, contextId: string): SessionRecord | null {
   return getDefaultStore().getSession(projectId, contextId);
 }
 
@@ -317,6 +396,16 @@ export function updateTaskState(
 /** 查询任务记录（默认存储） */
 export function getTask(taskId: string): TaskRecord | null {
   return getDefaultStore().getTask(taskId);
+}
+
+/** 按项目列出任务（默认存储） */
+export function listTasks(opts: ListTasksOptions): TaskRecord[] {
+  return getDefaultStore().listTasks(opts);
+}
+
+/** 清理保留策略（默认存储） */
+export function pruneTasks(opts?: PruneTasksOptions): number {
+  return getDefaultStore().pruneTasks(opts);
 }
 
 /** 关闭默认存储（幂等；关闭后再次调用会重新打开数据库） */

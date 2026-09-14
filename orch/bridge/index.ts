@@ -1,8 +1,9 @@
 /**
  * MCP 泛型桥（orch 工具面）。
  *
- * 只暴露固定 4 个泛型工具，不按 skill 生成工具、不做动态注册（不发 `tools/list_changed`）：
+ * 只暴露固定 5 个泛型工具，不按 skill 生成工具、不做动态注册（不发 `tools/list_changed`）：
  * - `a2a_projects()`                     聚合各机 `GET /projects`
+ * - `a2a_tasks(project, state?, limit?)` 按项目列出本地任务记录（纯本地 + 只读探测，不 ensure）
  * - `a2a_call(project, message, contextId?)`  解析项目→机器 → 幂等 ensure → A2A message/send
  * - `a2a_task_status(taskId)`            查询任务态（远端 A2A `tasks/get`，回写本地存储）
  * - `a2a_cancel(taskId)`                 取消任务（远端 A2A `tasks/cancel`，回写本地存储）
@@ -18,7 +19,12 @@
  */
 import { randomUUID } from "node:crypto";
 import { join } from "node:path";
-import { ClientFactory, DefaultAgentCardResolver, JsonRpcTransportFactory, RestTransportFactory } from "@a2a-js/sdk/client";
+import {
+  ClientFactory,
+  DefaultAgentCardResolver,
+  JsonRpcTransportFactory,
+  RestTransportFactory,
+} from "@a2a-js/sdk/client";
 import type { Client } from "@a2a-js/sdk/client";
 import { Role, TaskState as A2aTaskState } from "@a2a-js/sdk";
 import type {
@@ -42,16 +48,24 @@ import {
   type MachineRef,
   type ProjectStatus,
   type RiskLevel,
+  type TaskListItem,
   type TaskRecord,
   type TaskState as DomainTaskState,
 } from "../types.js";
 import {
   createTask,
   getTask,
+  listTasks,
+  pruneTasks,
+  truncatePrompt,
   updateTaskState,
   close as closeSessionStore,
 } from "../session/store.js";
-import { startTaskWatcher, WATCHER_MAX_CONSECUTIVE_FAILURES } from "./task-watcher.js";
+import {
+  isTaskWatched,
+  startTaskWatcher,
+  WATCHER_MAX_CONSECUTIVE_FAILURES,
+} from "./task-watcher.js";
 
 // ---------------------------------------------------------------------------
 // 配置与超时（全部可通过环境变量覆盖；显式超时，避免跨机调用挂死）
@@ -73,10 +87,7 @@ const MACHINES_CONFIG_PATH =
 /** Launcher `GET /projects` / `POST .../ensure` 超时 */
 const LAUNCHER_TIMEOUT_MS = readPositiveIntEnv("LAUNCHER_TIMEOUT_MS", 15_000);
 /** Launcher `ensure`（可能触发 Agent 启动）超时 */
-const LAUNCHER_ENSURE_TIMEOUT_MS = readPositiveIntEnv(
-  "LAUNCHER_ENSURE_TIMEOUT_MS",
-  60_000,
-);
+const LAUNCHER_ENSURE_TIMEOUT_MS = readPositiveIntEnv("LAUNCHER_ENSURE_TIMEOUT_MS", 60_000);
 /** 单次 A2A 请求超时 */
 const A2A_REQUEST_TIMEOUT_MS = readPositiveIntEnv("A2A_REQUEST_TIMEOUT_MS", 30_000);
 /** A2A Agent Card 拉取超时 */
@@ -151,8 +162,7 @@ function stringifyUnknown(v: unknown): string {
 // ---------------------------------------------------------------------------
 
 type HttpResult =
-  | { ok: true; status: number; data: unknown }
-  | { ok: false; status: number; error: string };
+  { ok: true; status: number; data: unknown } | { ok: false; status: number; error: string };
 
 function extractErrorMessage(data: unknown): string | null {
   const o = asRecord(data);
@@ -167,11 +177,7 @@ function extractErrorMessage(data: unknown): string | null {
   return asNonEmptyString(o["message"]);
 }
 
-async function fetchJson(
-  url: string,
-  init: RequestInit,
-  timeoutMs: number,
-): Promise<HttpResult> {
+async function fetchJson(url: string, init: RequestInit, timeoutMs: number): Promise<HttpResult> {
   try {
     const res = await fetch(url, {
       ...init,
@@ -203,9 +209,7 @@ async function fetchJson(
 // 线协议握手（PROTOCOL.md：桥首触机器时 GET /health 校验 protocolVersion）
 // ---------------------------------------------------------------------------
 
-type ProtocolCheck =
-  | { ok: true; version: string }
-  | { ok: false; code: string; error: string };
+type ProtocolCheck = { ok: true; version: string } | { ok: false; code: string; error: string };
 
 /** 已通过握手校验的机器：machineId → 该机自报完整版本号（供按机器版本的行为分支查用） */
 const protocolVerified = new Map<string, string>();
@@ -258,8 +262,7 @@ async function performHandshake(machine: MachineRef): Promise<ProtocolCheck> {
   const actual = raw ?? "0.0";
   const major = parseProtocolMajor(actual);
   if (major === null || !SUPPORTED_PEER_PROTOCOL_MAJORS.includes(major)) {
-    const actualDesc =
-      raw === null ? "未版本化的旧版 Launcher（无 protocolVersion）" : actual;
+    const actualDesc = raw === null ? "未版本化的旧版 Launcher（无 protocolVersion）" : actual;
     console.error(
       `[a2a-bridge] protocol handshake: ${machine.machineId} v=${actualDesc} 不受支持（本桥 v${PROTOCOL_VERSION}，可支持主版本：${SUPPORTED_PEER_PROTOCOL_MAJORS.join(", ")}）`,
     );
@@ -294,14 +297,9 @@ function parseProjectStatus(v: unknown): ProjectStatus | null {
   const workspace = typeof o["workspace"] === "string" ? o["workspace"] : "";
   const agentKindRaw = o["agentKind"];
   const agentKind: AgentKind =
-    typeof agentKindRaw === "string" && isAgentKind(agentKindRaw)
-      ? agentKindRaw
-      : "opencode";
+    typeof agentKindRaw === "string" && isAgentKind(agentKindRaw) ? agentKindRaw : "opencode";
   const a2aPortRaw = o["a2aPort"];
-  const a2aPort =
-    typeof a2aPortRaw === "number" && Number.isInteger(a2aPortRaw)
-      ? a2aPortRaw
-      : 0;
+  const a2aPort = typeof a2aPortRaw === "number" && Number.isInteger(a2aPortRaw) ? a2aPortRaw : 0;
   const riskRaw = o["risk"];
   const parsed: ProjectStatus = {
     projectId,
@@ -335,8 +333,7 @@ function parseProjectList(data: unknown): ProjectStatus[] | null {
 }
 
 type ListResult =
-  | { ok: true; projects: ProjectStatus[] }
-  | { ok: false; code?: string; error: string };
+  { ok: true; projects: ProjectStatus[] } | { ok: false; code?: string; error: string };
 
 async function listMachineProjects(machine: MachineRef): Promise<ListResult> {
   const protocol = await ensureProtocol(machine);
@@ -431,8 +428,7 @@ async function locateProject(projectId: string): Promise<LocateResult> {
       error: `未能定位项目 ${projectId}（机器线协议版本不受支持）：${protocolRefusals.join("; ")}`,
     };
   }
-  const suffix =
-    unreachable.length > 0 ? `（部分机器不可达：${unreachable.join("; ")}）` : "";
+  const suffix = unreachable.length > 0 ? `（部分机器不可达：${unreachable.join("; ")}）` : "";
   return {
     ok: false,
     code: "project_not_found",
@@ -441,14 +437,10 @@ async function locateProject(projectId: string): Promise<LocateResult> {
 }
 
 type EnsureOutcome =
-  | { ok: true; endpoint: string; started: boolean }
-  | { ok: false; code: string; error: string };
+  { ok: true; endpoint: string; started: boolean } | { ok: false; code: string; error: string };
 
 /** `POST {launcher}/projects/{id}/ensure`（幂等启动），返回 A2A 端点 */
-async function ensureProject(
-  machine: MachineRef,
-  projectId: string,
-): Promise<EnsureOutcome> {
+async function ensureProject(machine: MachineRef, projectId: string): Promise<EnsureOutcome> {
   const protocol = await ensureProtocol(machine);
   if (!protocol.ok) {
     return { ok: false, code: protocol.code, error: protocol.error };
@@ -573,8 +565,7 @@ function summarizeArtifactPart(part: Part): ArtifactPartSummary | null {
  */
 function isTraceArtifact(a: Artifact): boolean {
   return (
-    a.name.toLowerCase().startsWith("trace.") ||
-    a.artifactId.toLowerCase().startsWith("trace.")
+    a.name.toLowerCase().startsWith("trace.") || a.artifactId.toLowerCase().startsWith("trace.")
   );
 }
 
@@ -667,9 +658,7 @@ function terminalOrInterrupted(state: A2aTaskState): boolean {
 
 function taskText(task: Task): string {
   const statusText =
-    task.status?.message === undefined
-      ? ""
-      : partsToText(task.status.message.parts);
+    task.status?.message === undefined ? "" : partsToText(task.status.message.parts);
   if (statusText.length > 0) return statusText;
   const artifactChunks: string[] = [];
   for (const artifact of task.artifacts) {
@@ -682,7 +671,7 @@ function taskText(task: Task): string {
 
 /** 本地记录是否已终结（终结态结果由本地存档直接作答，不再查询远端） */
 function isLocalTerminalState(state: DomainTaskState): boolean {
-  return state === "completed" || state === "failed";
+  return state === "completed" || state === "failed" || state === "input-required";
 }
 
 /** 从本地存档的 artifactsJson（ArtifactSummary[]）拼接文本；规则对齐 partsToText/taskText，兼容无 text 的旧记录 */
@@ -715,6 +704,17 @@ function textFromArchivedArtifacts(artifactsJson: string | null): string {
     if (text.length > 0) chunks.push(text);
   }
   return chunks.join("\n\n");
+}
+
+/** 解析本地归档 `artifactsJson`（ArtifactSummary[]）；缺省 / 非法返回 [] */
+function parseArchivedArtifacts(artifactsJson: string | null): ArtifactSummary[] {
+  if (artifactsJson === null) return [];
+  try {
+    const parsed: unknown = JSON.parse(artifactsJson);
+    return Array.isArray(parsed) ? (parsed as ArtifactSummary[]) : [];
+  } catch {
+    return [];
+  }
 }
 
 /** 同步预算到点的 working 返回文案：指引轮询 + 中断恢复路径 */
@@ -811,15 +811,75 @@ interface Failure {
 
 type CallOutcome = CallSuccess | Failure;
 
+/**
+ * 落库 working + 启动后台看护（轮询 + 续约至终态并落库）+ 返回 working 指引。
+ * 半异步（wait=true 且同步预算耗尽）与全异步（wait=false 且未终态）共用。
+ * `promptText` 为派发时的原始 prompt（落库截断，REQ-02 联动）；`reason` 仅用于日志。
+ */
+function deferWorkingTask(
+  client: Client,
+  machine: MachineRef,
+  projectId: string,
+  promptText: string,
+  settled: Task,
+  contextId: string,
+  reason: string,
+): CallSuccess {
+  createTask({
+    taskId: settled.id,
+    projectId,
+    contextId,
+    state: "working",
+    artifactsJson: JSON.stringify(summarizeArtifacts(settled.artifacts)),
+    text: null,
+    prompt: truncatePrompt(promptText),
+  });
+  const started = startTaskWatcher({
+    taskId: settled.id,
+    poll: () =>
+      client.getTask(
+        { tenant: "", id: settled.id, historyLength: undefined },
+        { signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS) },
+      ),
+    renew: async () => {
+      await ensureProject(machine, projectId);
+    },
+    isSettled: (task) => terminalOrInterrupted(taskStateOf(task)),
+    persist: (task) => {
+      const state = mapTaskState(taskStateOf(task));
+      updateTaskState(
+        task.id,
+        state,
+        JSON.stringify(summarizeArtifacts(task.artifacts)),
+        taskText(task),
+      );
+      console.log(`[a2a-bridge] 后台看护：任务 ${task.id} 已终态（${state}），结果落库`);
+    },
+    pollIntervalMs: POLL_INTERVAL_MS,
+    renewIntervalMs: LEASE_RENEW_INTERVAL_MS,
+    maxConsecutiveFailures: WATCHER_MAX_CONSECUTIVE_FAILURES,
+  });
+  if (started) {
+    console.log(`[a2a-bridge] 任务 ${settled.id} ${reason}，转后台看护`);
+  }
+  return {
+    ok: true,
+    text: workingGuidanceText(settled.id, contextId),
+    artifacts: [],
+    taskId: settled.id,
+    status: "working",
+    contextId,
+  };
+}
+
 async function handleCall(
   projectId: string,
   text: string,
   contextIdInput: string | undefined,
+  wait: boolean,
 ): Promise<CallOutcome> {
   const contextId =
-    contextIdInput !== undefined && contextIdInput.length > 0
-      ? contextIdInput
-      : randomUUID();
+    contextIdInput !== undefined && contextIdInput.length > 0 ? contextIdInput : randomUUID();
 
   const located = await locateProject(projectId);
   if (!located.ok) {
@@ -859,65 +919,61 @@ async function handleCall(
   }
 
   if (isTaskResult(result)) {
-    const settled = terminalOrInterrupted(taskStateOf(result))
-      ? result
-      : await pollTaskUntilSettled(
-          client,
-          result,
-          Date.now() + SYNC_BUDGET_MS,
-          async () => {
-            await ensureProject(located.machine, projectId);
-          },
-        );
+    const isTerminal = terminalOrInterrupted(taskStateOf(result));
 
-    // 半异步：同步预算到点仍未终态 —— 落库 working、启动后台看护（轮询+续约至终态并落库）、立即返回句柄
-    if (!terminalOrInterrupted(taskStateOf(settled))) {
-      createTask({
-        taskId: settled.id,
-        projectId,
-        contextId,
-        state: "working",
-        artifactsJson: JSON.stringify(summarizeArtifacts(settled.artifacts)),
-        text: null,
-      });
-      const started = startTaskWatcher({
-        taskId: settled.id,
-        poll: () =>
-          client.getTask(
-            { tenant: "", id: settled.id, historyLength: undefined },
-            { signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS) },
-          ),
-        renew: async () => {
-          await ensureProject(located.machine, projectId);
-        },
-        isSettled: (task) => terminalOrInterrupted(taskStateOf(task)),
-        persist: (task) => {
-          const state = mapTaskState(taskStateOf(task));
-          updateTaskState(
-            task.id,
-            state,
-            JSON.stringify(summarizeArtifacts(task.artifacts)),
-            taskText(task),
-          );
-          console.log(`[a2a-bridge] 后台看护：任务 ${task.id} 已终态（${state}），结果落库`);
-        },
-        pollIntervalMs: POLL_INTERVAL_MS,
-        renewIntervalMs: LEASE_RENEW_INTERVAL_MS,
-        maxConsecutiveFailures: WATCHER_MAX_CONSECUTIVE_FAILURES,
-      });
-      if (started) {
-        console.log(
-          `[a2a-bridge] 任务 ${settled.id} 超出同步预算（${SYNC_BUDGET_MS}ms），转后台看护`,
-        );
+    // 全异步（wait=false）：绝不进入同步轮询，立即返回句柄
+    if (!wait) {
+      if (isTerminal) {
+        // sendMessage 内联已终态：落库并如实返回真实终态（不轮询、不伪作 working）
+        const status = mapTaskState(taskStateOf(result));
+        const artifacts = summarizeArtifacts(result.artifacts);
+        createTask({
+          taskId: result.id,
+          projectId,
+          contextId,
+          state: status,
+          artifactsJson: JSON.stringify(artifacts),
+          text: taskText(result),
+          prompt: truncatePrompt(text),
+        });
+        return {
+          ok: true,
+          text: taskText(result),
+          artifacts,
+          taskId: result.id,
+          status,
+          contextId,
+        };
       }
-      return {
-        ok: true,
-        text: workingGuidanceText(settled.id, contextId),
-        artifacts: [],
-        taskId: settled.id,
-        status: "working",
+      return deferWorkingTask(
+        client,
+        located.machine,
+        projectId,
+        text,
+        result,
         contextId,
-      };
+        "全异步（wait=false）",
+      );
+    }
+
+    // 半异步（默认）：同步轮询至多 SYNC_BUDGET_MS
+    const settled = isTerminal
+      ? result
+      : await pollTaskUntilSettled(client, result, Date.now() + SYNC_BUDGET_MS, async () => {
+          await ensureProject(located.machine, projectId);
+        });
+
+    // 同步预算到点仍未终态 —— 落库 working、启动后台看护、立即返回句柄
+    if (!terminalOrInterrupted(taskStateOf(settled))) {
+      return deferWorkingTask(
+        client,
+        located.machine,
+        projectId,
+        text,
+        settled,
+        contextId,
+        `超出同步预算（${SYNC_BUDGET_MS}ms）`,
+      );
     }
 
     const status = mapTaskState(taskStateOf(settled));
@@ -929,6 +985,7 @@ async function handleCall(
       state: status,
       artifactsJson: JSON.stringify(artifacts),
       text: taskText(settled),
+      prompt: truncatePrompt(text),
     });
     return {
       ok: true,
@@ -958,9 +1015,7 @@ interface TaskStatusSuccess {
   updatedAt: string;
 }
 
-type TaskStatusOutcome =
-  | TaskStatusSuccess
-  | (Failure & { task?: TaskRecord });
+type TaskStatusOutcome = TaskStatusSuccess | (Failure & { task?: TaskRecord });
 
 async function handleTaskStatus(taskId: string): Promise<TaskStatusOutcome> {
   const record = getTask(taskId);
@@ -975,13 +1030,7 @@ async function handleTaskStatus(taskId: string): Promise<TaskStatusOutcome> {
   // 本地快路径：终结态结果是最终事实（落库时已 settle），直接以本地存档作答；
   // 不 ensure、不碰远端——远端任务态不持久化（agent 回收后重 ensure 是新进程，只会 Task not found）
   if (isLocalTerminalState(record.state)) {
-    let artifacts: ArtifactSummary[] = [];
-    try {
-      const parsed: unknown = JSON.parse(record.artifactsJson ?? "[]");
-      if (Array.isArray(parsed)) artifacts = parsed as ArtifactSummary[];
-    } catch {
-      artifacts = [];
-    }
+    const artifacts = parseArchivedArtifacts(record.artifactsJson);
     return {
       ok: true,
       taskId,
@@ -1135,11 +1184,65 @@ async function handleProjects(): Promise<MachinesView | Failure> {
   return { machines: entries };
 }
 
+interface TasksView {
+  ok: true;
+  projectId: string;
+  reachable: boolean;
+  notice?: string;
+  tasks: TaskListItem[];
+}
+
+/**
+ * 按项目列出本地任务记录（纯本地 + 只读探测）。
+ * 绝不 `ensureProject`（避免「列个表就把 Agent 拉起」）；`stale` 判定仅用本地看护信号 +
+ * 一次只读可达性探测（`locateProject`：`/health` + `/projects`），不做逐任务远端查询。
+ */
+async function handleTasks(
+  projectId: string,
+  state?: DomainTaskState,
+  limit?: number,
+): Promise<TasksView | Failure> {
+  try {
+    pruneTasks();
+  } catch (err) {
+    console.error(`[a2a-bridge] 任务保留策略清理失败：${toMessage(err)}`);
+  }
+
+  const records = listTasks({ projectId, state, limit });
+
+  let reachable = true;
+  let notice: string | undefined;
+  if (records.some((r) => r.state === "working")) {
+    const located = await locateProject(projectId);
+    reachable = located.ok && located.project.status === "online";
+    if (!located.ok) {
+      notice = located.error;
+    } else if (!reachable) {
+      notice = `项目 ${projectId} 当前非在线（status=offline）`;
+    }
+  }
+
+  const tasks: TaskListItem[] = records.map((record) => ({
+    taskId: record.taskId,
+    contextId: record.contextId,
+    state: record.state,
+    prompt: record.prompt,
+    text: record.text ?? textFromArchivedArtifacts(record.artifactsJson),
+    artifacts: parseArchivedArtifacts(record.artifactsJson),
+    updatedAt: record.updatedAt,
+    stale: record.state === "working" && (!reachable || !isTaskWatched(record.taskId)),
+  }));
+
+  const view: TasksView = { ok: true, projectId, reachable, tasks };
+  if (notice !== undefined) view.notice = notice;
+  return view;
+}
+
 // ---------------------------------------------------------------------------
-// MCP Server（stdio；固定工具面，4 个泛型工具）
+// MCP Server（stdio；固定工具面，5 个泛型工具）
 // ---------------------------------------------------------------------------
 
-const server = new McpServer({ name: "a2a-coding-bridge", version: "0.1.2" });
+const server = new McpServer({ name: "a2a-coding-bridge", version: "0.2.0" });
 
 function textResult(payload: unknown): CallToolResult {
   return {
@@ -1175,10 +1278,40 @@ server.registerTool(
 );
 
 server.registerTool(
+  "a2a_tasks",
+  {
+    description:
+      "按项目列出本地任务记录（默认按 updatedAt 倒序、默认 20 条）。用于句柄丢失后找回任务；prompt 为落库片段。",
+    inputSchema: {
+      project: z.string().min(1).describe("目标项目 ID"),
+      state: z
+        .enum(["working", "completed", "failed", "input-required"])
+        .optional()
+        .describe("按任务态过滤；省略返回全部"),
+      limit: z
+        .number()
+        .int()
+        .positive()
+        .max(100)
+        .optional()
+        .describe("返回条数上限，默认 20，最大 100"),
+    },
+  },
+  async (args) => {
+    try {
+      const outcome = await handleTasks(args.project, args.state, args.limit);
+      return "ok" in outcome && outcome.ok === false ? errorResult(outcome) : textResult(outcome);
+    } catch (err) {
+      return internalError(err);
+    }
+  },
+);
+
+server.registerTool(
   "a2a_call",
   {
     description:
-      "向目标项目派发一轮任务：解析项目→机器，按需幂等启动其 Agent（ensure），经 A2A 发送消息并返回文本结果 + artifacts。传入相同 contextId 可续接上下文；返回 contextId 便于继续追问。",
+      "向目标项目派发一轮任务：解析项目→机器，按需幂等启动其 Agent（ensure），经 A2A 发送消息并返回文本结果 + artifacts。传入相同 contextId 可续接上下文；返回 contextId 便于继续追问。wait=false 时立即返回句柄（全异步，不进入同步等待）。",
     inputSchema: {
       project: z.string().min(1).describe("目标项目 ID（静态分布配置中的 projectId）"),
       message: z.string().min(1).describe("发给执行 Agent 的任务内容"),
@@ -1186,11 +1319,22 @@ server.registerTool(
         .string()
         .optional()
         .describe("会话上下文 ID；续接同一上下文时传入，省略则自动新建并在返回中给出"),
+      wait: z
+        .boolean()
+        .optional()
+        .describe(
+          "true/省略=半异步（同步等待至多 SYNC_BUDGET_MS 再返回）；false=全异步，立即返回 working + taskId + contextId，由后台看护在终态时落库",
+        ),
     },
   },
   async (args) => {
     try {
-      const outcome = await handleCall(args.project, args.message, args.contextId);
+      const outcome = await handleCall(
+        args.project,
+        args.message,
+        args.contextId,
+        args.wait ?? true,
+      );
       return outcome.ok ? textResult(outcome) : errorResult(outcome);
     } catch (err) {
       return internalError(err);
@@ -1201,8 +1345,7 @@ server.registerTool(
 server.registerTool(
   "a2a_task_status",
   {
-    description:
-      "查询任务态（A2A tasks/get），并回写本地任务存储；返回状态、文本与 artifacts。",
+    description: "查询任务态（A2A tasks/get），并回写本地任务存储；返回状态、文本与 artifacts。",
     inputSchema: {
       taskId: z.string().min(1).describe("a2a_call 返回的 taskId"),
     },
@@ -1240,10 +1383,18 @@ server.registerTool(
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  try {
+    const pruned = pruneTasks();
+    if (pruned > 0) {
+      console.error(`[a2a-bridge] 启动清理任务记录：删除 ${pruned} 条`);
+    }
+  } catch (err) {
+    console.error(`[a2a-bridge] 启动清理任务记录失败：${toMessage(err)}`);
+  }
   const transport = new StdioServerTransport();
   await server.connect(transport);
   console.error(
-    "[a2a-bridge] MCP stdio server ready: a2a_projects / a2a_call / a2a_task_status / a2a_cancel",
+    "[a2a-bridge] MCP stdio server ready: a2a_projects / a2a_tasks / a2a_call / a2a_task_status / a2a_cancel",
   );
 }
 

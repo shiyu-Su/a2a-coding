@@ -11,6 +11,7 @@ Thumbs.db
 orch/data/
 machine/.a2a/
 machine/agents/
+orch/.a2a/
 
 # 单元实际配置（不入库；模板见 config.json.default）
 machine/config/config.json
@@ -23,6 +24,9 @@ orch/config/config.json
 /planlog.md.template
 /doc/
 /.omo/skills/
+
+# ZCode 工作区配置（本机：编排宿主路径守卫 hook）
+/.zcode/
 
 # 本地规划文档（不入库）
 /未来发展方向0912-gpt.md

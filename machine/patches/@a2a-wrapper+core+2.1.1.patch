@@ -1,0 +1,382 @@
+diff --git a/node_modules/@a2a-wrapper/core/dist/server/factory.js b/node_modules/@a2a-wrapper/core/dist/server/factory.js
+index e1c9612..ca82640 100644
+--- a/node_modules/@a2a-wrapper/core/dist/server/factory.js
++++ b/node_modules/@a2a-wrapper/core/dist/server/factory.js
+@@ -52,9 +52,10 @@
+ import express from "express";
+ import { AGENT_CARD_PATH, A2A_VERSION_HEADER, AgentCard } from "@a2a-js/sdk";
+ import { generateAgentCardSignature } from "@a2a-js/sdk";
+-import { DefaultRequestHandler, InMemoryTaskStore } from "@a2a-js/sdk/server";
++import { DefaultRequestHandler } from "@a2a-js/sdk/server";
+ import { jsonRpcHandler, restHandler, UserBuilder, } from "@a2a-js/sdk/server/express";
+ import { buildAgentCard, buildAgentCardForUrls, buildLegacyAgentCard } from "./agent-card.js";
++import { FileTaskStore, resolveTaskStorePath } from "./file-task-store.js";
+ /**
+  * Resolves `AgentCardConfig.signing` (env-var-indirected JWK + key metadata)
+  * into {@link AgentCardSigningOptions}, or `undefined` when signing isn't
+@@ -156,7 +157,7 @@ export async function createA2AServer(config, executorFactory, options) {
+         ? generateAgentCardSignature(signingOptions.privateKey, signingOptions.protectedHeader, signingOptions.header)
+         : undefined;
+     // ── 3. A2A SDK request handler ──────────────────────────────────────────
+-    const taskStore = new InMemoryTaskStore();
++    const taskStore = new FileTaskStore(resolveTaskStorePath(config));
+     const requestHandler = new DefaultRequestHandler(agentCard, taskStore, executor, // executor satisfies AgentExecutor at runtime; cast avoids coupling core to SDK's full AgentExecutor shape
+     undefined, // eventBusManager (SDK default)
+     undefined, // pushNotificationStore
+@@ -255,6 +256,7 @@ export async function createA2AServer(config, executorFactory, options) {
+         async shutdown() {
+             httpServer.close();
+             await executor.shutdown();
++            taskStore.flush();
+         },
+     };
+ }
+diff --git a/node_modules/@a2a-wrapper/core/dist/server/file-task-store.js b/node_modules/@a2a-wrapper/core/dist/server/file-task-store.js
+new file mode 100644
+index 0000000..51e9d45
+--- /dev/null
++++ b/node_modules/@a2a-wrapper/core/dist/server/file-task-store.js
+@@ -0,0 +1,343 @@
++/**
++ * File-backed A2A TaskStore (v0.2.0 / REQ-v0.2.0-2026-09-13-01).
++ *
++ * Replaces `InMemoryTaskStore` so that in-flight (non-terminal) task state
++ * survives a wrapper process restart. Persisted to a single
++ * `<workspace>/.a2a/tasks.json`, mirroring the existing session-persist
++ * patch-package pattern (see the per-wrapper session-manager modules).
++ *
++ * Retention policy (issuance review v3, "方案 ②"): **only non-terminal tasks
++ * are persisted**. As soon as a task reaches a terminal state
++ * (completed / failed / canceled / rejected) it is removed from disk
++ * immediately; it is still kept in memory for the current process so
++ * `tasks/get` keeps working until restart.
++ *
++ * On start-up every persisted entry (necessarily non-terminal) is recovered
++ * to a terminal `failed` status carrying an "interrupted" message, so clients
++ * never observe a task stuck in `working` forever.
++ *
++ * Serialization goes through the SDK's protobuf `MessageFns`
++ * (`Task.toJSON` / `Task.fromJSON`) so proto oneofs / `Buffer` byte parts
++ * round-trip correctly (raw `JSON.stringify` would corrupt them).
++ *
++ * All read/write failures are swallowed (logged) — this store must never
++ * throw uncaught exceptions into the A2A request path.
++ *
++ * @module server/file-task-store
++ */
++import { randomUUID } from "node:crypto";
++import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
++import { dirname, join } from "node:path";
++import { Message, Task, TaskState } from "@a2a-js/sdk";
++
++/** Terminal states, mirroring the SDK's TERMINAL_STATE_LIST. */
++const TERMINAL_STATES = new Set([
++  TaskState.TASK_STATE_COMPLETED,
++  TaskState.TASK_STATE_FAILED,
++  TaskState.TASK_STATE_CANCELED,
++  TaskState.TASK_STATE_REJECTED,
++]);
++
++/** Default page size, mirroring the SDK's DEFAULT_PAGE_SIZE. */
++const DEFAULT_PAGE_SIZE = 50;
++
++/** Coalesce consecutive non-terminal writes within this window (ms). */
++const FLUSH_DEBOUNCE_MS = 200;
++
++/** Message attached to tasks recovered after a wrapper restart. */
++const INTERRUPTED_MESSAGE =
++  "任务因包装器进程重启而中断（interrupted），未产出终态；请重新发起或重试。";
++
++/** A task is terminal when its status.state is one of the four terminal states. */
++function isTerminal(task) {
++  return TERMINAL_STATES.has(task?.status?.state);
++}
++
++/**
++ * Resolve the on-disk task store path, i.e. `<baseDir>/.a2a/tasks.json`.
++ *
++ * Priority: `config.a2a.stateDir` → backend working directory
++ * (`opencode.projectDirectory` / `codex.workingDirectory` /
++ * `claude.workingDirectory`) → `process.cwd()` (the Launcher always spawns the
++ * wrapper with `cwd = project.workspace`). Never throws.
++ *
++ * @param {object} [config] Resolved wrapper config.
++ * @returns {string} Absolute-ish path to `tasks.json`.
++ */
++export function resolveTaskStorePath(config) {
++  let baseDir = "";
++  try {
++    const explicit = config?.a2a?.stateDir;
++    if (typeof explicit === "string" && explicit.length > 0) {
++      baseDir = explicit;
++    }
++    if (!baseDir) {
++      const candidates = [
++        config?.opencode?.projectDirectory,
++        config?.codex?.workingDirectory,
++        config?.claude?.workingDirectory,
++      ];
++      for (const candidate of candidates) {
++        if (typeof candidate === "string" && candidate.length > 0) {
++          baseDir = candidate;
++          break;
++        }
++      }
++    }
++  } catch {
++    // Ignore malformed config; fall through to cwd.
++  }
++  if (!baseDir) baseDir = process.cwd();
++  return join(baseDir, ".a2a", "tasks.json");
++}
++
++/**
++ * A2A `TaskStore` implementation persisted to a single JSON file.
++ *
++ * Implements the SDK `TaskStore` contract (`save` / `load` / `list`) plus a
++ * synchronous `flush()` used at shutdown. Tenant/owner scoping is
++ * intentionally ignored — the wrapper runs locally with
++ * `UserBuilder.noAuthentication`, so `taskId` alone is the key.
++ */
++export class FileTaskStore {
++  /** Absolute path to the persisted `tasks.json`. */
++  #filePath;
++  /** All tasks seen by this process (terminal + non-terminal), for tasks/get. */
++  #tasks = new Map();
++  /** JSON snapshots to persist — non-terminal tasks only. */
++  #persisted = new Map();
++  /** Pending debounced flush timer, or null. */
++  #flushTimer = null;
++
++  /**
++   * @param {string} filePath Path to `tasks.json`.
++   */
++  constructor(filePath) {
++    this.#filePath =
++      typeof filePath === "string" && filePath.length > 0
++        ? filePath
++        : join(process.cwd(), ".a2a", "tasks.json");
++    this.#load();
++    const recovered = this.#recoverInterrupted();
++    // Recovered tasks are now terminal, i.e. removed from the persisted set;
++    // write that back so a further restart does not re-report them.
++    if (recovered > 0) this.flush();
++  }
++
++  /** Load persisted non-terminal tasks; back up and reset on corrupt JSON. */
++  #load() {
++    let raw;
++    try {
++      raw = readFileSync(this.#filePath, "utf8");
++    } catch {
++      return; // No file yet (or unreadable) — start empty.
++    }
++    try {
++      const parsed = JSON.parse(raw);
++      if (parsed === null || typeof parsed !== "object" || Array.isArray(parsed)) {
++        throw new Error("tasks.json is not an object map");
++      }
++      for (const [taskId, json] of Object.entries(parsed)) {
++        try {
++          const task = Task.fromJSON(json);
++          const id = typeof task.id === "string" && task.id.length > 0 ? task.id : taskId;
++          this.#tasks.set(id, task);
++          this.#persisted.set(id, json);
++        } catch (err) {
++          console.warn(`[file-task-store] 跳过无法解析的任务 ${taskId}：${String(err)}`);
++        }
++      }
++    } catch (err) {
++      const stamp = new Date().toISOString().replace(/[:.]/g, "-");
++      const backup = `${this.#filePath}.corrupt-${stamp}`;
++      try {
++        renameSync(this.#filePath, backup);
++        console.warn(`[file-task-store] tasks.json 损坏，已备份为 ${backup}：${String(err)}`);
++      } catch (backupErr) {
++        console.warn(
++          `[file-task-store] tasks.json 解析失败且备份失败：${String(backupErr)}（原因：${String(err)}）`,
++        );
++      }
++      this.#tasks.clear();
++      this.#persisted.clear();
++    }
++  }
++
++  /**
++   * Transition every loaded (non-terminal) task to a terminal `failed` state
++   * carrying the "interrupted" message. Returns the number recovered.
++   */
++  #recoverInterrupted() {
++    let recovered = 0;
++    const timestamp = new Date().toISOString();
++    for (const [taskId, task] of this.#tasks) {
++      if (isTerminal(task)) continue;
++      let message;
++      try {
++        message = Message.fromJSON({
++          messageId: randomUUID(),
++          contextId: typeof task.contextId === "string" ? task.contextId : "",
++          taskId: typeof task.id === "string" ? task.id : taskId,
++          role: "ROLE_AGENT",
++          parts: [{ text: INTERRUPTED_MESSAGE }],
++        });
++      } catch {
++        message = undefined;
++      }
++      task.status = { state: TaskState.TASK_STATE_FAILED, message, timestamp };
++      this.#persisted.delete(taskId);
++      recovered++;
++    }
++    return recovered;
++  }
++
++  /**
++   * Save a task. Non-terminal tasks are queued for a debounced atomic write;
++   * terminal tasks are dropped from disk immediately (kept in memory).
++   *
++   * @param {object} task
++   * @param {unknown} [_context]
++   */
++  async save(task, _context) {
++    try {
++      const id = task.id;
++      this.#tasks.set(id, structuredClone(task));
++      if (isTerminal(task)) {
++        this.#persisted.delete(id);
++        this.flush();
++      } else {
++        this.#persisted.set(id, Task.toJSON(task));
++        this.#scheduleFlush();
++      }
++    } catch (err) {
++      console.warn(`[file-task-store] 保存任务失败：${String(err)}`);
++    }
++  }
++
++  /**
++   * Load a task by id, returning a clone so callers cannot mutate the store.
++   *
++   * @param {string} taskId
++   * @param {unknown} [_context]
++   * @returns {Promise<object | undefined>}
++   */
++  async load(taskId, _context) {
++    try {
++      const task = this.#tasks.get(taskId);
++      return task === undefined ? undefined : structuredClone(task);
++    } catch (err) {
++      console.warn(`[file-task-store] 读取任务失败：${String(err)}`);
++      return undefined;
++    }
++  }
++
++  /**
++   * List tasks (mirrors InMemoryTaskStore filtering / ordering / pagination).
++   *
++   * @param {object} params
++   * @param {unknown} [_context]
++   */
++  async list(params, _context) {
++    const {
++      contextId,
++      status,
++      pageSize = DEFAULT_PAGE_SIZE,
++      pageToken,
++      statusTimestampAfter,
++      includeArtifacts = false,
++    } = params ?? {};
++
++    let tasks = Array.from(this.#tasks.values());
++    if (contextId) {
++      tasks = tasks.filter((task) => task.contextId === contextId);
++    }
++    if (status !== undefined && status !== TaskState.TASK_STATE_UNSPECIFIED) {
++      tasks = tasks.filter((task) => task.status?.state === status);
++    }
++    if (statusTimestampAfter) {
++      const filterTime = new Date(statusTimestampAfter).getTime();
++      tasks = tasks.filter(
++        (task) =>
++          task.status?.timestamp &&
++          new Date(task.status.timestamp).getTime() > filterTime,
++      );
++    }
++    tasks.sort((taskA, taskB) => {
++      const timeA = taskA.status?.timestamp || "";
++      const timeB = taskB.status?.timestamp || "";
++      if (timeB !== timeA) {
++        return timeB.localeCompare(timeA);
++      }
++      return taskB.id.localeCompare(taskA.id);
++    });
++
++    const totalSize = tasks.length;
++    if (pageToken) {
++      let decoded;
++      try {
++        decoded = Buffer.from(pageToken, "base64").toString("utf-8");
++      } catch {
++        throw new Error("Token is not a valid base64-encoded cursor.");
++      }
++      const [cursorTimestamp, ...idParts] = decoded.split("|");
++      if (idParts.length === 0) {
++        throw new Error("Invalid page token format.");
++      }
++      const cursorId = idParts.join("|");
++      const cursorIndex = tasks.findIndex(
++        (task) => (task.status?.timestamp || "") === cursorTimestamp && task.id === cursorId,
++      );
++      tasks = cursorIndex !== -1 ? tasks.slice(cursorIndex + 1) : [];
++    }
++
++    const paginatedTasks = tasks.slice(0, pageSize);
++    const resultTasks = paginatedTasks.map((task) => {
++      const taskCopy = structuredClone(task);
++      if (!includeArtifacts) {
++        taskCopy.artifacts = [];
++      }
++      return taskCopy;
++    });
++
++    let nextPageToken = "";
++    if (paginatedTasks.length > 0 && tasks.length > paginatedTasks.length) {
++      const lastTask = paginatedTasks[paginatedTasks.length - 1];
++      const lastTime = lastTask.status?.timestamp || "";
++      nextPageToken = Buffer.from(`${lastTime}|${lastTask.id}`).toString("base64");
++    }
++
++    return { tasks: resultTasks, nextPageToken, pageSize, totalSize };
++  }
++
++  /**
++   * Atomically flush the non-terminal task set to disk (tmp + rename).
++   * Never throws. Also cancels any pending debounced flush.
++   */
++  flush() {
++    if (this.#flushTimer !== null) {
++      clearTimeout(this.#flushTimer);
++      this.#flushTimer = null;
++    }
++    try {
++      mkdirSync(dirname(this.#filePath), { recursive: true });
++      const data = Object.fromEntries(this.#persisted);
++      const tmp = `${this.#filePath}.tmp-${process.pid}`;
++      writeFileSync(tmp, JSON.stringify(data), "utf8");
++      renameSync(tmp, this.#filePath);
++    } catch (err) {
++      console.warn(`[file-task-store] 写盘失败：${String(err)}`);
++    }
++  }
++
++  /** Schedule a coalesced flush for non-terminal saves. */
++  #scheduleFlush() {
++    if (this.#flushTimer !== null) return;
++    this.#flushTimer = setTimeout(() => {
++      this.#flushTimer = null;
++      this.flush();
++    }, FLUSH_DEBOUNCE_MS);
++    if (typeof this.#flushTimer.unref === "function") {
++      this.#flushTimer.unref();
++    }
++  }
++}

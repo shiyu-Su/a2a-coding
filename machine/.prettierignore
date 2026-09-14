@@ -1,0 +1,9 @@
+node_modules/
+dist/
+agents/
+.a2a/
+data/
+.omo/
+.codegraph/
+reports/
+package-lock.json

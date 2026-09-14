@@ -13,7 +13,7 @@
   │ 需求讨论 / 任务派发
   ▼
 orch Agent（任意 MCP host，示例为 opencode）
-  │ MCP stdio，固定 4 个泛型工具
+  │ MCP stdio，固定 5 个泛型工具
   ▼
 MCP 薄桥（orch/）
   │  · 解析「项目 → 机器」（静态机器清单 + 懒加载索引）
@@ -57,9 +57,9 @@ a2a-coding/
 │  ├─ config/config.json.default  # 机器清单模板（入库）
 │  ├─ opencode.json               # 样例：把 mcp.a2a 配进 orch 的 opencode
 │  ├─ types.ts  config.ts  app-root.ts
-│  ├─ bridge/index.ts             # MCP 薄桥：a2a_projects / a2a_call / a2a_task_status / a2a_cancel
+│  ├─ bridge/index.ts             # MCP 薄桥：a2a_projects / a2a_call / a2a_task_status / a2a_cancel / a2a_tasks
 │  ├─ bridge/task-watcher.ts      # 任务后台看护（结果保障：轮询 + 续约至终态并落库）
-│  ├─ session/store.ts            # 会话/任务库（node:sqlite；tasks 含 state/artifacts/text）
+│  ├─ session/store.ts            # 会话/任务库（node:sqlite；tasks 含 state/artifacts/text/prompt + listTasks/pruneTasks）
 │  └─ data/                       # 运行态：sessions.sqlite（git 忽略）
 ├─ machine/                       # 部署单元 2（每台执行机器）：每机常驻
 │  ├─ package.json                # @a2a-coding/machine：express / a2a-opencode / a2a-codex / a2a-claude
@@ -67,7 +67,7 @@ a2a-coding/
 │  ├─ config/config.json          # 本机项目配置（实际，git 忽略）
 │  ├─ config/config.json.default  # 本机项目配置模板（入库）
 │  ├─ types.ts  config.ts
-│  ├─ launcher/{index,server,manager,ports,process,agent-config,self-check,config-snapshot,app-root}.ts
+│  ├─ launcher/{index,server,manager,ports,process,agent-config,self-check,config-snapshot,agents-prune,app-root}.ts
 │  ├─ adapters/{index,types,json,opencode,codex,claude}.ts
 │  ├─ patches/                    # 会话落盘补丁（patch-package）：a2a-opencode / a2a-codex / a2a-claude
 │  ├─ scripts/                    # 验证脚本：verify-session-persist{,-codex,-claude}.mjs、verify-config-precedence.mjs
@@ -158,11 +158,12 @@ npm run build        # 产出 dist/bridge/index.js
 
 ### 4. 通过 MCP 工具派发任务
 
-工具面固定为 4 个泛型工具：
+工具面固定为 5 个泛型工具：
 
 - `a2a_projects()`：列出所有已配置机器及其本机项目（含运行态与 A2A 端点）。
-- `a2a_call(project, message, contextId?)`：解析项目到机器，幂等 ensure，经 A2A 派发一轮任务。≤30s 完成的任务直接返回文本结果与 artifacts；更长的任务返回 `working + taskId`（桥转后台看护至终态并落库），按返回文案用 `a2a_task_status` 轮询。
-- `a2a_task_status(taskId)`：查询任务态并回写本地任务存储。已终结任务（completed / failed）由桥本地存档直接作答（不唤醒远端 Agent）；未终结任务走远端实时查询。
+- `a2a_call(project, message, contextId?, wait?)`：解析项目到机器，幂等 ensure，经 A2A 派发一轮任务。默认半异步：≤30s 完成直接返回文本结果与 artifacts，更长返回 `working + taskId` 并用 `a2a_task_status` 轮询；**`wait=false` 时永远立即返回** `working + taskId + contextId`（不进入同步轮询，后台看护照常落库）。
+- `a2a_task_status(taskId)`：查询任务态并回写本地任务存储。已终结任务（completed / failed / input-required）由桥本地存档直接作答（不唤醒远端 Agent）；未终结任务走远端实时查询。
+- `a2a_tasks(project, [state], [limit])`：按项目列出本地任务记录（默认 `updatedAt` 倒序、默认 20 条、最多 100），每条含 `prompt` 片段 / state / text / contextId / updatedAt / stale。用于**丢失 taskId 句柄后的兜底找回**。
 - `a2a_cancel(taskId)`：取消任务，并回写本地任务存储。
 
 示例（在 orch 里）：
@@ -274,6 +275,6 @@ orch 用 `project`（如 `frontend` / `backend`）派发到对应项目；同机
 - 执行层入站鉴权依赖反向代理补足（`a2a-wrapper` 默认没有入站鉴权）。
 - 跨机鉴权尚未实现（计划反向代理 TLS + Bearer，预留 mTLS）。
 - 三端均已完成真实模型端到端验证（拉起 → 派发 → 执行 → 回传，退出后携带同一 `contextId` 续接）：opencode（v0.1.0）、claude（用户级 `~/.claude/settings.json` 网关认证，无需注入 env）、codex（`~/.codex/config.toml` 自定义 provider + 兼容网关）。
-- 任务结果保障的边界：终态结果持久在桥的 SQLite（两侧进程重启均不丢）；**执行中（未终态）任务跨 wrapper / 桥任一侧重启会中断丢失**（任务态仅存于 wrapper 进程内存；彻底消除需 wrapper 任务态持久化，未来项）。
+- 任务结果保障的边界：终态结果持久在桥的 SQLite（两侧进程重启均不丢）。v0.2.0 起 wrapper 任务态落盘 `<workspace>/.a2a/tasks.json`（只存非终态），wrapper 重启会把在途任务补写为 `failed`（中断）终态——任务不再永久悬挂；但**在途任务的原始结果不保留**（需重新发起或重试）。
 - 设备本身当 Agent 需自建中继，非本期范围。
 - 多实例 + 工作区隔离（模型 C）仅预留扩展点，本版本不实现。

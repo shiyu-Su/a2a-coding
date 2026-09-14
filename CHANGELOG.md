@@ -2,6 +2,26 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.2.0] - 2026-09-14
+
+### Added
+
+- **wrapper 任务态持久化**（REQ-v0.2.0-2026-09-13-01，路线 A：patch-package 补丁 `@a2a-wrapper/core@2.1.1`）：三端 wrapper 的任务态由纯内存改为落盘 `<workspace>/.a2a/tasks.json`（`FileTaskStore` 实现 SDK `TaskStore`，一份 core 补丁覆盖三端）。**保留策略（方案②）**：只持久化非终态任务，终态即时从盘上移除（进程内仍可查）；启动装载时对文件中残留的非终态任务补写 `failed` 终态（状态消息含 `interrupted`）——wrapper 重启后任务不再永久悬挂，桥轮询可得到明确终态。写放大控制（非终态 200ms 防抖 + 原子写 tmp/rename）、坏 JSON 备份容错（不抛未捕获异常）。补丁经「删依赖 → `npm install`（`postinstall` 重放）→ `patch-package --error-on-fail`」验证可重放。**线协议不变**（属 A2A 层行为改进）。
+- **`a2a_tasks(project, [state], [limit])` 任务列表工具**（REQ-v0.2.0-2026-09-13-02）：MCP 工具面由 4 个泛型工具扩为 **5 个**。按项目列出本地任务记录（默认按 `updatedAt` 倒序、默认 20 条、最多 100；可按 `state` 过滤），作为丢失 `taskId` 句柄后的兜底找回入口。`tasks` 表新增 `prompt` 列（落库时截断，默认 500 字符，`TASK_PROMPT_MAX_CHARS` 可配），列表可辨识「这条问的是什么」；新增 `(project_id, updated_at DESC)` 索引与保留策略 `pruneTasks`（超期 `TASK_RETENTION_DAYS`=7 天、每项目超量 `TASK_MAX_PER_PROJECT`=200，均排除 `working`；启动与每次列任务时机会式清理）。`working` 且不可达（项目 offline 或无在飞看护）的记录标 `stale`。`a2a_task_status` 的本地终结快路径纳入 `input-required`。**为纯桥内变更，`PROTOCOL.md` 不变**。
+- **`a2a_call` 可选参数 `wait`**（REQ-v0.2.0-2026-09-13-03）：`wait=false` 时永远立即返回 `working + taskId + contextId`（不进入同步轮询，后台看护照常启动保证结果落库）；`sendMessage` 同步返回已终态时如实返回终态。省略或 `wait=true` 时保持原半异步行为完全不变。**桥内入参，`PROTOCOL.md` 不变**。
+- **`agents/` 过期包装器配置清理**（REQ-v0.2.0-2026-09-13-05）：Launcher 启动时（早于启动自检与监听）按当前 `projects[]` 白名单清理 `agents/<kind>.<projectId>.json` 中的过期项，日志打印 `[launcher] 清理过期包装器配置 N 个：…`；仅删匹配 `^(opencode|codex|claude)\..+\.json$` 且不在白名单的文件，不误删其它文件/目录。
+- **lint/format 工程基线**（REQ-v0.2.0-2026-09-13-06）：orch / machine 两单元各自接入 ESLint（flat config + `typescript-eslint` + 规则 `@typescript-eslint/no-explicit-any`）+ Prettier（`printWidth: 100`、`endOfLine: auto`）+ `lint` / `format` / `format:check` 脚本 + `.prettierignore`。摸底确认两单元显式 `any` 均为 0（价值在防回归）。
+
+### Changed
+
+- orch / machine 部分源码按 Prettier `printWidth: 100` 重排（**纯空白/换行层，无逻辑改动**；`endOfLine: auto` 下 orch 保持 CRLF、machine 保持 LF，未发生整批换行改写）。
+- 三处 `package.json`（根 / orch / machine）版本号升至 `0.2.0`。
+
+### Verified
+
+- 功能测试（2026-09-14，用户确认通过）：REQ-01 长任务中途重启 wrapper → `failed(interrupted)`、working 落盘/终态移除；REQ-02 `a2a_tasks` 字段与 `prompt` 落库；REQ-03 `wait=false` 立即返回并轮询到终态；REQ-05 真实 Launcher 重启清理过期配置；REQ-06 两单元 `lint` / `prettier --check` 均 exit 0；双项目冒烟（`machine` + `orch` 均派发完成）。
+- 回归测试全量通过（报告见 `reports/v0.2.0/regression-report.json`；`reports/` 不入库）。
+
 ## [v0.1.2] - 2026-09-13
 
 ### Added

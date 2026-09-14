@@ -32,6 +32,11 @@ export interface TaskWatcherOptions {
 /** 进程内看护去重表：同一 taskId 只允许一个看护循环 */
 const watching = new Set<string>();
 
+/** 该 taskId 当前是否有在飞的后台看护（供 a2a_tasks 判定 working 任务是否 stale） */
+export function isTaskWatched(taskId: string): boolean {
+  return watching.has(taskId);
+}
+
 function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);

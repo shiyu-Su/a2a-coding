@@ -110,10 +110,7 @@ export function loadMachineConfig(path: string): MachineConfig {
   }
   const startupCheckPrompt = launcher["startupCheckPrompt"];
   if (startupCheckPrompt !== undefined) {
-    launcherConfig.startupCheckPrompt = asString(
-      startupCheckPrompt,
-      "launcher.startupCheckPrompt",
-    );
+    launcherConfig.startupCheckPrompt = asString(startupCheckPrompt, "launcher.startupCheckPrompt");
   }
   return {
     machineId: asString(o["machineId"], "machineId"),

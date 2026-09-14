@@ -132,7 +132,9 @@ function generatedSettingSources(configPath: string): string[] {
     claude !== null && typeof claude === "object" && !Array.isArray(claude)
       ? (claude as Record<string, unknown>)["settingSources"]
       : undefined;
-  return Array.isArray(settingSources) ? settingSources.filter((s): s is string => typeof s === "string") : [];
+  return Array.isArray(settingSources)
+    ? settingSources.filter((s): s is string => typeof s === "string")
+    : [];
 }
 
 /** 单次 Agent 启动的配置快照：配置层级 + endpoint / 模型 id */
@@ -143,7 +145,10 @@ export interface AgentConfigSnapshot {
 }
 
 /** 汇总单次启动的配置面快照（launcher 与 self-check 共用）；快照遵循 settingSources 隔离语义 */
-export function describeAgentConfig(project: ProjectConfig, configPath: string): AgentConfigSnapshot {
+export function describeAgentConfig(
+  project: ProjectConfig,
+  configPath: string,
+): AgentConfigSnapshot {
   const userSettingsLoaded =
     project.agentKind !== "claude" || generatedSettingSources(configPath).includes("user");
   return {
