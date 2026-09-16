@@ -83,6 +83,8 @@ flowchart TD
 - ✅ **失败自动化（v0.4.1）**：任务遇 `infra` 类失败（典型如 600s 超时）**不再直接判死** —— 引擎先把该节点**中性化**（下游不被连坐），再派**取证节点**（等目标 project 空闲回收后进场，确保无写者）读出「已改集 D / 未改集 R / 门禁 / 稳定位」，据此**同 `contextId` 续一次**或停下要人决策；全程由桥内代码推进，宿主无需轮询。
 - ✅ **孤儿进程回收（v0.4.1）**：Launcher 启动时**对账清理**进程账本里的无主孤儿 —— 这是唯一能修「孤儿占住 `a2aPort` ⇒ 新 Launcher 自检 `EADDRINUSE` ⇒ 服务起不来」的动作；另提供只读兜底 `npm run reap`（默认只列不杀，`--clean` 才清，红线：pidfile 存活一律禁清）。
 
+- ✅ **只读工作台（网页端）**：orch 侧常驻桥可另起一个**只读 HTTP 服务**（默认仅常驻形态、仅 `owner`、绑 `127.0.0.1`、端口 **3300**），以「当前宿主下的项目成员（含在线态）」+「任务引擎内的任务情况（Feature / Task 状态）」两面板呈现实时进度；数据只读自桥的 SQLite 与 Launcher `GET /projects`，**不改线协议、不做第二编排入口**。
+
 ## 演示 / 截图
 
 暂无。本项目以 CLI / MCP 与常驻服务为主，没有可视化界面，仓库暂未提供演示视频或截图。
@@ -317,17 +319,24 @@ orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自
 | `callback.host` | 事件端点绑定地址（建议 loopback） | `127.0.0.1` | 否 |
 | `callback.port` | 事件端点监听端口 | - | `callback.enabled=true` 时是 |
 | `callback.token` | 事件端点校验令牌（worker 推送时携带）；不填则不校验 | 不校验 | 否 |
+| `web.enabled` | 只读工作台开关（页面 + `/api/*`）；**仅常驻（http）形态 + 仅 `owner` 实例**真正 bind | `true` | 否 |
+| `web.host` | 只读工作台绑定地址（建议 loopback） | `127.0.0.1` | 否 |
+| `web.port` | 只读工作台监听端口 | `3300` | 否 |
+| `web.allowStdio` | stdio 形态下是否也开工作台；缺省 `false`（stdio 下桥是宿主 agent 的子进程，开页面会形成「页面依赖 agent」的循环） | `false` | 否 |
 
 ```json
 {
   "machines": [
     { "machineId": "win-dev", "launcherUrl": "http://localhost:3100", "pushCallback": false }
   ],
-  "callback": { "enabled": false, "host": "127.0.0.1", "port": 3200, "token": "<可选>" }
+  "callback": { "enabled": false, "host": "127.0.0.1", "port": 3200, "token": "<可选>" },
+  "web": { "enabled": true, "host": "127.0.0.1", "port": 3300, "allowStdio": false }
 }
 ```
 
 > `callback` 默认关闭：跨机回调受鉴权边界约束（跨机鉴权待后续），当前仅同机 / 受信网络可 opt-in。关闭或端点不可达时，任务终态仍由 `task-watcher` 轮询对账兜底落库。
+
+> `web`（只读工作台）：缺省**仅常驻（`transport.mode=http`）形态 + 仅 `owner` 实例**提供页面（`allowStdio: false` —— stdio 形态下桥是宿主 agent 的子进程，开页面会形成「页面依赖 agent」的循环）；端口被占 ⇒ **warn 降级、不伤 MCP**；只读、仅 loopback、**无鉴权** ⇒ 暴露到本机之外须先有 v0.7.0 的跨机鉴权。`/api/events` **直连 `listEvents`**，不会推移宿主收件箱的读游标。
 
 环境变量 `MACHINES_CONFIG` 可指定其他清单文件；缺省为 `config/config.json`（模板 `config/config.json.default`）。
 
@@ -386,6 +395,18 @@ Launcher 按 `machine/config/config.json` 监听（模板见 `machine/config/con
 
 Bridge ⇄ Launcher 的线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单一事实源（端点 / 字段、版本规则、握手语义、演进记录表）。
 
+### 只读工作台 HTTP 接口（orch 侧，可选）
+
+| 接口 | 作用 |
+|------|------|
+| `GET /` | 单页工作台（两面板：当前宿主下的项目成员含在线态 · 任务引擎内的任务情况） |
+| `GET /api/projects` | 项目成员（machine × project + 在线态 + `observedAt`；**字段白名单**，不含 `workspace` / `agentConfig`） |
+| `GET /api/features` | Feature 列表与状态 |
+| `GET /api/tasks` | 任务列表（含耗时 = `finished_at - started_at`，任一端为 `NULL` 则不显示耗时） |
+| `GET /api/events?since=` | 事件流增量（**不影响宿主收件箱游标**） |
+
+默认仅常驻（`transport.mode=http`）形态、仅 `owner` 实例、绑 `127.0.0.1`、端口 `3300`；**只读**，不改线协议、**不是第二编排入口**（审批 / 澄清 / cancel 等操作端留后续版本）。
+
 ### MCP 工具面
 
 #### 泛型工具（7 个）
@@ -429,7 +450,8 @@ a2a-coding/
 │  ├─ types.ts  config.ts  app-root.ts
 │  ├─ bridge/index.ts             # MCP 薄桥：泛型 7 + Feature 工具组 5；派发主链 dispatchTask
 │  ├─ bridge/register-tools.ts    # 工具注册：createServer(core) 工厂 + registerTools(server, core)
-│  ├─ bridge/transports/{stdio,http}.ts  # 接入面：stdio（缺省）/ stateless Streamable HTTP（/mcp /health /shutdown）
+│  ├─ bridge/transports/{stdio,http,web}.ts  # 接入面：stdio（缺省）/ stateless Streamable HTTP（/mcp /health /shutdown）/ 只读工作台 HTTP（/ · /api/*）
+│  ├─ bridge/web/html.ts          # 只读工作台单页（两面板，纯函数渲染）
 │  ├─ runtime/{lifecycle,core-lease}.ts  # 启停编排与排空 + core 租约（单调度权，role owner/follower）
 │  ├─ scripts/bridgectl.mjs       # 桥启停脚本（start/stop/restart/status/logs）
 │  ├─ tools/mcp-http-probe.mjs    # 独立 MCP HTTP 探测客户端

@@ -62,42 +62,82 @@ function gitCmd(workspace: string | null, args: string): string {
 /**
  * 解析取证节点回报的结构化结论（§2.5；§2.3 ④ 的输入）。
  *
- * 容忍：```json 围栏、前后夹带说明文字、`data` part 被序列化后的整串。
- * **形状不合 / 解析失败一律返回 `null`** ⇒ 调度器按「无证据」交人（fail-safe：
- * 宁可让人拍板，也不拿一份半解析的证据去自动重试）。
+ * 取串分三级（v0.5.0 D4 / §2.1–§2.2）：
+ * 1. **原始整串** —— 保留既有 `candidate[0]` 语义（`data` part 可能被序列化成整串 JSON）；
+ * 2. **fence-aware 主路径**：优先提取 ```json / 无标签 ``` 围栏内内容并解析（非贪婪、容忍 CRLF；
+ *    多围栏按出现顺序逐个试，取**首个形状合法**者）。真实取证报告在证据块**前后**都有散文，
+ *    块前散文里含平衡花括号（`flow.agentConfig = {"agentCard":{"pushNotifications":true}}`）
+ *    ⇒ 「首 `{` → 末 `}`」一类边界会被直接锚死，主路径是唯一能稳定救回它的路径；
+ * 3. **升序候选兜底**：`start` 枚举**所有 `{`（升序）**，每个起点对 `}` 做**升序**扫描，
+ *    首个 `JSON.parse` 成功**且形状合法**者胜（`{"a":{"b":1}}` 必须升序才能命中外层配对，
+ *    不可用 `lastIndexOf` 递减）。
+ *
+ * **未闭合围栏**（有头无尾）⇒ ② 抽取为空 ⇒ 自动落到 ③。
+ *
+ * **形状校验（二级 / 三级共用）**：`stable`/`gatesOk` 必须为 `boolean`、`d`/`r` 必须为 `Array`；
+ * 不通过 ⇒ 试下一候选。**形状不合 / 解析失败一律返回 `null`** ⇒ 调度器按「无证据」交人
+ * （fail-safe：宁可让人拍板，也不拿一份半解析的证据去自动重试，更不得静默错判为成功）。
  */
 export function parseEvidenceResult(text: string): EvidenceResult | null {
   const trimmed = text.trim();
   if (trimmed.length === 0) return null;
 
-  const candidates: string[] = [trimmed];
-  const start = trimmed.indexOf("{");
-  const end = trimmed.lastIndexOf("}");
-  if (start >= 0 && end > start) candidates.push(trimmed.slice(start, end + 1));
+  // ① 原始整串（`data` part 可能被序列化成整串 JSON）
+  const direct = toEvidenceResult(trimmed);
+  if (direct !== null) return direct;
 
-  for (const candidate of candidates) {
-    let parsed: unknown;
-    try {
-      parsed = JSON.parse(candidate);
-    } catch {
-      continue;
+  // ② fence-aware 主路径：```json / 无标签 ```（非贪婪 + 容忍 CRLF；多围栏按序试）
+  for (const body of fenceBodies(trimmed)) {
+    const fenced = toEvidenceResult(body.trim());
+    if (fenced !== null) return fenced;
+  }
+
+  // ③ 升序候选兜底：起点枚举所有 `{`（升序），每点对 `}` 升序扫描
+  for (let start = trimmed.indexOf("{"); start >= 0; start = trimmed.indexOf("{", start + 1)) {
+    for (let end = trimmed.indexOf("}", start); end >= 0; end = trimmed.indexOf("}", end + 1)) {
+      const hit = toEvidenceResult(trimmed.slice(start, end + 1));
+      if (hit !== null) return hit;
     }
-    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) continue;
-    const o = parsed as Record<string, unknown>;
-    const stable = o["stable"];
-    const gatesOk = o["gatesOk"];
-    const d = o["d"];
-    const r = o["r"];
-    if (typeof stable !== "boolean" || typeof gatesOk !== "boolean") continue;
-    if (!Array.isArray(d) || !Array.isArray(r)) continue;
-    return {
-      stable,
-      gatesOk,
-      d: d.filter((x): x is string => typeof x === "string"),
-      r: r.filter((x): x is string => typeof x === "string"),
-    };
   }
   return null;
+}
+
+/**
+ * 取出 ```json / 无标签 ``` 围栏的正文（按出现顺序）：非贪婪、容忍 CRLF。
+ *
+ * **未闭合围栏（有头无尾）不会被匹配** ⇒ 不在返回清单里 ⇒ 调用方自动回退到升序 brace-scan。
+ */
+function fenceBodies(text: string): string[] {
+  const bodies: string[] = [];
+  for (const m of text.matchAll(/```(?:json)?[ \t]*\r?\n?([\s\S]*?)```/gi)) {
+    const body = m[1];
+    if (typeof body === "string") bodies.push(body);
+  }
+  return bodies;
+}
+
+/** 单个候选串 → `EvidenceResult`：`JSON.parse` + 形状校验 + `d`/`r` 静默剔除非字符串元素 */
+function toEvidenceResult(candidate: string): EvidenceResult | null {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(candidate);
+  } catch {
+    return null;
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return null;
+  const o = parsed as Record<string, unknown>;
+  const stable = o["stable"];
+  const gatesOk = o["gatesOk"];
+  const d = o["d"];
+  const r = o["r"];
+  if (typeof stable !== "boolean" || typeof gatesOk !== "boolean") return null;
+  if (!Array.isArray(d) || !Array.isArray(r)) return null;
+  return {
+    stable,
+    gatesOk,
+    d: d.filter((x): x is string => typeof x === "string"),
+    r: r.filter((x): x is string => typeof x === "string"),
+  };
 }
 
 /** 单个归档产物摘要的文本（text/data/url 三类 part 拼接；`raw` 跳过二进制） */
@@ -133,6 +173,12 @@ function renderUnknown(v: unknown): string {
  *    新 `contextId` 不继承旧上下文也能独立完成；
  * 3. **只报事实、不做决策** —— 只要求它采集并回报 `stable`/`d`/`r`/门禁，「是否重试/是否交人」
  *    由 orch 判定（引擎不替宿主拍板）。
+ *
+ * 模板侧的三条**降概率**约束（v0.5.0 D4 §2.3；正确性由 `parseEvidenceResult` 的 fence 主路径承担，
+ * 故**不**强约束「JSON 块必须置于报告最末」）：输出样例必须是**可直接 `JSON.parse` 的合法 JSON**
+ * （`true 或 false` / `none | partial | full` 一类说明移到块外正文，避免 worker 照抄成「默认值误导」）；
+ * 「JSON 块之后不得再出现 `{` 或 `}` 字符」（块前/块后散文里的裸花括号是解析边界被锚死的元凶）；
+ * 多文件**逐行**列出、不用 `{a,b,c}` 缩写。
  */
 export function buildEvidenceMessage(input: EvidenceMessageInput): string {
   const workspaceLine =
@@ -177,19 +223,24 @@ export function buildEvidenceMessage(input: EvidenceMessageInput): string {
     "   **宁可报 false，也不要猜 true**；判 false 时请写清是哪一项不满足。",
     "",
     `## 4. 输出（登记为 artifact，建议名 \`${EVIDENCE_ARTIFACT_NAME}\`）`,
-    "严格用下面这个形状（字段名不要改）：",
+    "严格用下面这个形状（字段名不要改）。下面是**可直接 `JSON.parse` 的合法示例**；",
+    "示例值只示范格式、**不是默认结论**，必须按你的实测填写：",
     "",
     "```json",
     "{",
-    '  "stable": true 或 false,',
+    '  "stable": false,',
     '  "d": ["已改集：本需求范围内、确实改过的文件"],',
     '  "r": ["未改集：本需求要求但尚未完成的文件或事项"],',
-    '  "gatesOk": true 或 false,',
-    '  "completion": "none | partial | full（或 0-100）",',
+    '  "gatesOk": true,',
+    '  "completion": "full",',
     '  "reason": "一句话说明判断依据"',
     "}",
     "```",
     "",
+    "- 取值口径（写在 JSON 块**之外**，不要塞进块内）：`stable` 与 `gatesOk` 只能取 `true` 或 `false`；",
+    "  `completion` 只能取 `none` / `partial` / `full` 三者之一（不要写成区间或并列描述）；",
+    "- **JSON 块之后不得再出现 `{` 或 `}` 字符**；",
+    "- 多文件**逐行**列出，不要用 `{a,b,c}` 缩写；",
     "- `d` 与 `r` 都要给**具体文件路径**，不要只写「部分完成」；",
     "- 若 `stable=false`，仍要给出你在不稳定状态下已看到的 d / r，并说明「为什么判不稳定」；",
     "- 不要给整改建议、不要替 orch 决定下一步该做什么 —— 只报事实。",

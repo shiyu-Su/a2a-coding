@@ -1,5 +1,5 @@
 {
-  "_comment": "transport：桥 transport（v0.4.1 桥常驻化，可选段）。mode 取值 stdio|http，缺省 stdio（旧配置无此段时零改动可用、行为不变）；mode=http 时桥常驻监听 http.host:http.port+http.path，缺省 host=127.0.0.1、port=8787、path=/mcp（避开 Launcher 3100、项目 A2A 3010-3012、回调 3200）。callback：orch 回调端点（默认关 enabled=false）。开启后桥在 host:port 上监听 POST /callback 接收 worker push 通知；仅同机/受信网络 opt-in（跨机回调鉴权待 v0.7.0）。host 缺省 127.0.0.1、port 缺省 3200（避开 Launcher 3100 与项目 A2A 3010-3012）；可选 token 用于校验推送请求（省略则不校验，字段名 token）。machines[].pushCallback：该机项目是否接收 orch push 回调（缺省 false）；仅当 callback.enabled 与该位同时为 true 时，派发才内联注册回调。",
+  "_comment": "transport：桥 transport（v0.4.1 桥常驻化，可选段）。mode 取值 stdio|http，缺省 stdio（旧配置无此段时零改动可用、行为不变）；mode=http 时桥常驻监听 http.host:http.port+http.path，缺省 host=127.0.0.1、port=8787、path=/mcp（避开 Launcher 3100、项目 A2A 3010-3012、回调 3200）。web：网页端只读工作台（v0.5.0，可选段）。缺省 {enabled:true, host:127.0.0.1, port:3300, allowStdio:false}（3300 避开 Launcher 3100 / 项目 A2A 3010-3012 / MCP http 8787 / 回调 3200）。enabled 仅在常驻（transport.mode=http）形态下生效，stdio 形态不读它；allowStdio 是唯一允许 stdio 形态也 bind 的开关（缺省 false），置 true 时必须 server.unref()，否则会持住事件循环、让桥子进程不随宿主退出；实际是否 bind 由运行时判定 (mode===http ? enabled : allowStdio) && role===owner，且 host 非 loopback 一律拒起（本段只承载配置，不实现监听）。callback：orch 回调端点（默认关 enabled=false）。开启后桥在 host:port 上监听 POST /callback 接收 worker push 通知；仅同机/受信网络 opt-in（跨机回调鉴权待 v0.7.0）。host 缺省 127.0.0.1、port 缺省 3200（避开 Launcher 3100 与项目 A2A 3010-3012）；可选 token 用于校验推送请求（省略则不校验，字段名 token）。machines[].pushCallback：该机项目是否接收 orch push 回调（缺省 false）；仅当 callback.enabled 与该位同时为 true 时，派发才内联注册回调。",
   "transport": {
     "mode": "stdio",
     "http": {
@@ -7,6 +7,12 @@
       "port": 8787,
       "path": "/mcp"
     }
+  },
+  "web": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 3300,
+    "allowStdio": false
   },
   "callback": {
     "enabled": false,

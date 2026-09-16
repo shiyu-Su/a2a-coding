@@ -2,6 +2,41 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.5.0] - 2026-09-16
+
+> 主题：**网页端只读工作台**（原 v0.8.0 提前；「一版本一需求」生效后的首个版本）。本版同时收口 REQ-03「失败自动化」后半链暴露的两个缺陷 —— **D4 取证报告解析脆弱** 与 **D5 续派时序**（D3 并入 D5 同源同修）。**线协议不变**（`PROTOCOL.md` / `PROTOCOL_VERSION` = `1.0`）；**`machine` 单元本版零源码改动**（仅 `package.json` 版本号）。
+
+### Added
+
+- **网页端只读工作台**（REQ-v0.5.0-2026-09-16-01）：`orch` 单元新增**只读 HTTP 服务** —— `bridge/transports/web.ts`（`/` · `/api/projects` · `/api/features` · `/api/tasks` · `/api/events`）+ `bridge/web/html.ts`（单页；**两个面板** = 当前宿主下的**项目成员**〔machine × project，含在线态〕+ 任务引擎内的**任务情况**〔Feature / Task 状态〕）。数据源 = `sessions.sqlite` + Launcher `GET /projects`；**只读、绑 `127.0.0.1`、不改线协议、不做第二编排入口**。
+  - 配置：`orch/config/config.json` 新增 **`web` 段**（`enabled` / `host` / `port`〔默认 **3300**〕/ `allowStdio`）；**默认仅常驻（http）形态提供页面、stdio 形态默认不开**（避免「页面依赖 agent 子进程」的循环依赖）；**仅 `role=owner` bind**（`follower` 不 bind，页面显示 `role`）；端口被占 ⇒ **warn 降级、不伤 MCP**。
+  - 展示口径：`/api/projects` 走**字段白名单**（裁剪 `workspace` / `agentConfig`）；`/api/events` **直连 `listEvents`**（不复用有状态的 `handleEvents`，避免推移宿主收件箱游标）；最小自动刷新间隔 15s。
+  - 耗时基础建设：`tasks` 增 **`created_at` / `started_at` / `finished_at`** 三列（含迁移；终态口径 `{completed, failed, blocked}`，`rearm` 时清空），页面按 `finished_at - started_at` 显示耗时；老数据留 `NULL`。
+
+### Fixed
+
+- **取证报告结构化解析脆弱（D4）**（REQ-v0.5.0-2026-09-16-03）：`parseEvidenceResult` 由「第一个 `{` → 最后一个 `}`」切片改为 **fence-aware 主路径**（优先取 ```json 围栏内容）+ **升序候选兜底**（枚举所有 `{`、逐个升序 `}`、首个 `JSON.parse` 成功**且形状合法**者胜；兜底同样过形状校验）；`resolveEvidence` 优先取名为 `evidence.json` 的 artifact；取证消息模板 3 行非法样例**合法化** + 追加「JSON 块之后不得再出现 `{` / `}`」「多文件逐行」。**修因**：报告在 JSON 块**之后**又列工作区脏改（含花括号）⇒ 旧切片混入尾文 ⇒ `JSON.parse` 失败 ⇒ `resolveEvidence` 返回 `null` ⇒ Feature 停 `needs_input`，REQ-03 后半链跑不到。
+- **续派时序修复（D5，含 D3 合并）**（REQ-v0.5.0-2026-09-16-04）：四处在 `orch/bridge/` —— **A** `index.ts` push 预写采纳集合收窄为 `completed` / `input-required`（**停止 `failed` 预写** ⇒ 结构性关闭 D3-flaky）；**B** 删除 push 回调里抢跑的 `scheduler.kick()`（**push 只更新状态、不驱动流转**）；**C** `scheduler.ts` 收敛侧**硬闸** `hasPendingEvidenceDecision`（`pendingEvidence.has(featureId) && nodes.some(isEvidenceNode)` ⇒ 决策未落时不得推进 `integrating`）；**D** 两个「交人」出口补 `pendingEvidence.delete`（四出口统一「**决策即清**」，防闸自造死锁）。**修因**：收敛判定抢在 re-arm 之前 ⇒ Feature 先被判 `integrating`，而 `tick` 只扫 `executing` ⇒ **`task.retry` 之后实际续派永不发生**（节点 `remote_task_id` 恒为 `NULL`）。
+
+### Changed
+
+- **三处 `package.json` 版本号升至 `0.5.0`**（根 / `orch` / `machine`；**根为版本源**，`lib/common.getVersion()` 读取它）。
+- **`orch/config/config.json.default` 增 `web` 段样例**（`enabled: true` / 端口 3300 / `allowStdio: false`）。
+- **页面按用户 Step 3 反馈收起「事件流」面板**（实现级增补，改造文档 v5）：面板从页面移除，`/api/events` **接口保留**（供调试与未来交互面）。
+
+### Verified
+
+- 门禁：`orch` `typecheck` 0 / `lint` 0 / `npm test` **140/140**（含 D5 新增 **T1–T4**，并附**变异测试**证明用例承重 —— 移除硬闸 ⇒ T1/T2 红、谓词改裸 `has` ⇒ T4 红）；`machine` 本版**零源码改动**。
+- **全量回归 687/687**（v0.4.1 基线 603；新增 v0.5.0 三条用例：`test-v0.5.0-web-workbench.js`〔只读工作台〕· `test-v0.5.0-evidence-parse.js`〔D4〕· `test-v0.5.0-retry-timing.js`〔D5：四处改动结构锁 + 防回退 + 防 vacuous〕；报告落 `reports/v0.5.0/`。⚠ 用例总数随「当前版本的改造文档份数」浮动 —— `test-doc-final` 按 `doc/v{version}/` 逐份检查，故 v0.4.1 时点 689 → 发布时点 687，**非用例丢失**）。
+- **真机**：常驻桥 `role=owner`；只读页面 `GET http://127.0.0.1:3300/` **200**，`/api/*` 白名单与 `events` 游标行为实测符合预期。**D4 真机**：`parsed` → 决策 `retry` → `rearmForRetry` → **全库首条 `task.retry`**。**D5 真机两轮（受控中断法，桥重启加载新构建后）**：① **续派 kill-shot** —— `task.retry` 后节点拿到**新的非空 `remote_task_id`**（修前恒 `NULL`）；② **序判据** —— 节点续跑至 `completed` 后 **`feature.state=integrating` 晚于 `task.retry`**（间隔 52s ⇒ 硬闸未卡死）；负向机检：`feature.state=failed` 计数 **0**、`failure_kind IS NULL` 的失败节点 **0**；并顺带验证「**重试用尽 ⇒ `needs_input`**」路径（未判 `failed`、未困死 `executing`）。
+
+### 未覆盖（遗留验证，**不得算通过**）
+
+- **实际场景验收观察**（用户 2026-09-16 裁定）：D4 / D5 的验收目前均为**受控构造**（宿主主动中断目标项目 agent）；**真实需求自然走到 `retry` 路径的长期观察留待后续**，按 Step 3 规范登记，不并入本版验收。
+- **桥重启后硬闸失效（D-2）**：`pendingEvidence` 为**进程内态** ⇒ 重启后硬闸失效（窗口极窄：需恰在「终态落库 ↔ `onSettled`」之间重启）。**人工判据**：重启后 Feature 停 `integrating` 却**缺 `task.retry`** ⇒ 按 **D5** 处置；`failed` 且 `failure_kind IS NULL` ⇒ 按 **D3** 处置。
+- 其余登记项：**V6**（push 唤醒被批门闩吞 ⇒ 续推延到下一 tick ≤1.5s）· **迟到的重复 push 可覆盖 re-arm 后节点**（决策后窗口仍在）· `a2a_task_status` / `a2a_cancel` 在本地**非终态**时用**本地 id** 查远端（工具面缺陷）· `watchLoop` 的 `persist()` **不在 try/catch 内** · **远端终态丢失无兜底**（wrapper 终态只留内存、重启即失）· 取证产物「建议名 `evidence.json`」**未生效**（wrapper 原文发布为 `response`、`uri` 为 `NULL`）⇒ 命名候选属死路径。
+- **跨版本提醒（v0.5.1）**：D5 落地后，若 `scheduler.ts` 中另三个「交人」出口（`:615` / `:641` / `:986`）仍未清 `pendingEvidence`，硬闸可能把 Feature 困在 `executing` ⇒ **v0.5.1 实施时须把「出口即清」扩到这三处**（本版不动）。
+
 ## [v0.4.1] - 2026-09-16
 
 > 主题：**需求流程引擎化 + 编排内核常驻化 + 失败自动化 + 执行准入**（本版本含 4 条需求；「一版本一需求」约束**自 v0.4.1 之后的下一个版本起**生效，**本版豁免**）。

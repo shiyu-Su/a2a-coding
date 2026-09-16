@@ -6,6 +6,7 @@ import type {
   MachinesConfig,
   TransportConfig,
   TransportMode,
+  WebConfig,
 } from "./types.js";
 
 function fail(msg: string): never {
@@ -109,7 +110,45 @@ function parseTransport(v: unknown): TransportConfig {
   return { mode, http };
 }
 
-/** 加载并校验「orch 侧机器清单」（含可选回调端点 / 桥 transport 配置） */
+/**
+ * 网页端只读工作台缺省（v0.5.0 §2.2）。
+ * `port` 取 3300：避开 Launcher 3100、项目 A2A 3010-3012、MCP http 8787 与回调 3200。
+ */
+const DEFAULT_WEB_ENABLED = true;
+const DEFAULT_WEB_HOST = "127.0.0.1";
+const DEFAULT_WEB_PORT = 3300;
+const DEFAULT_WEB_ALLOW_STDIO = false;
+
+/**
+ * 解析 `web` 配置段（v0.5.0 网页端只读工作台；段可选，缺省字段补默认值）。
+ *
+ * 语义（本节点只解析与暴露配置，**不实现 bind**）：
+ * - `enabled`（缺省 `true`）**只在常驻（`transport.mode === "http"`）形态下生效**；
+ *   stdio 形态**不读它**（避免「`enabled = true` 但无效果」的歧义）。
+ * - `allowStdio`（缺省 `false`）= **唯一**允许 stdio 形态也 bind 的显式开关
+ *   （运行时开启时必须 `server.unref()`）。
+ * - 运行时 bind 判定式：`(mode === "http" ? web.enabled : web.allowStdio) && role === "owner"`。
+ * - `host` 只校验**非空字符串**；**非 loopback 不在此拒绝**（loopback 拒起属运行时）。
+ * - `port` 非法（非整数 / 越界 / 类型错）一律结构化报错（复用 `fail`），不静默降级。
+ */
+function parseWeb(v: unknown): WebConfig {
+  const w = asRecord(v, "web");
+  const enabledRaw = w["enabled"];
+  const hostRaw = w["host"];
+  const portRaw = w["port"];
+  const allowStdioRaw = w["allowStdio"];
+  return {
+    enabled: enabledRaw === undefined ? DEFAULT_WEB_ENABLED : asBool(enabledRaw, "web.enabled"),
+    host: hostRaw === undefined ? DEFAULT_WEB_HOST : asString(hostRaw, "web.host"),
+    port: portRaw === undefined ? DEFAULT_WEB_PORT : asPort(portRaw, "web.port"),
+    allowStdio:
+      allowStdioRaw === undefined
+        ? DEFAULT_WEB_ALLOW_STDIO
+        : asBool(allowStdioRaw, "web.allowStdio"),
+  };
+}
+
+/** 加载并校验「orch 侧机器清单」（含可选回调端点 / 桥 transport / 网页端只读工作台配置） */
 export function loadMachinesConfig(path: string): MachinesConfig {
   const raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
   const o = asRecord(raw, "machines config");
@@ -119,6 +158,8 @@ export function loadMachinesConfig(path: string): MachinesConfig {
   const callback = callbackRaw === undefined ? undefined : parseCallback(callbackRaw);
   const transportRaw = o["transport"];
   const transport = transportRaw === undefined ? defaultTransport() : parseTransport(transportRaw);
+  const webRaw = o["web"];
+  const web = parseWeb(webRaw === undefined ? {} : webRaw);
   return {
     machines: machines.map((m, i): MachineRef => {
       const r = asRecord(m, `machines[${i}]`);
@@ -134,5 +175,6 @@ export function loadMachinesConfig(path: string): MachinesConfig {
     }),
     callback,
     transport,
+    web,
   };
 }

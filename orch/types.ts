@@ -139,6 +139,25 @@ export interface TransportConfig {
   http: HttpTransportConfig;
 }
 
+/**
+ * orch 网页端只读工作台配置（v0.5.0 §2.2）。
+ *
+ * 配置文件内**可选**，解析后恒补齐为完整对象（缺省见 `config.ts`）。
+ * 语义（本段只承载「解析后的配置」，是否 bind 由运行时决定）：
+ * - `enabled`（缺省 `true`）**只在常驻（`transport.mode === "http"`）形态下生效**；
+ *   stdio 形态**不读它**（避免「`enabled = true` 但无效果」的歧义）。
+ * - `allowStdio`（缺省 `false`）= **唯一**允许 stdio 形态也 bind 的显式开关；
+ *   开启时运行时**必须 `server.unref()`**（否则持住事件循环 ⇒ 破「桥随宿主退出」不变量 ⇒ 子进程泄漏）。
+ * - 运行时 bind 判定式为 `(mode === "http" ? web.enabled : web.allowStdio) && role === "owner"`。
+ * - `host` 非 loopback 由**运行时**拒起，**不在解析层拒绝**（loopback 校验属运行时）。
+ */
+export interface WebConfig {
+  enabled: boolean;
+  host: string;
+  port: number;
+  allowStdio: boolean;
+}
+
 /** orch 侧：机器清单 */
 export interface MachinesConfig {
   machines: MachineRef[];
@@ -146,6 +165,8 @@ export interface MachinesConfig {
   callback?: CallbackConfig;
   /** 桥 transport（v0.4.1；配置缺省时解析为 `mode = "stdio"` 旧行为） */
   transport: TransportConfig;
+  /** 网页端只读工作台（v0.5.0；配置缺省时解析为 `{ true, "127.0.0.1", 3300, false }`） */
+  web: WebConfig;
 }
 
 /** 项目 + 运行态（GET /projects 返回；bridge 消费的 launcher 线协议） */
@@ -215,6 +236,24 @@ export interface TaskRecord {
   /** 派发时的原始 prompt 片段（落库前截断）；旧记录可能为 null */
   prompt: string | null;
   updatedAt: string;
+  /**
+   * **登记时刻**（v0.5.0 三时刻列，UTC ISO 8601）。`createTask()` 首次落库时写，
+   * `ON CONFLICT` **不更新** ⇒ 恒为首次登记时刻；v0.5.0 之前的老记录**不回填，为 null**。
+   */
+  createdAt: string | null;
+  /**
+   * **首次开工时刻**（v0.5.0，UTC ISO 8601）。两个写入点：
+   * `createTask()` 且 `state === "working"`；`markTaskDispatched()` **仅当为 NULL 才填**。
+   * ⇒ 「只填一次」：重派 / 条件重试**不重置**起点。未开工（含 `input-required` 等）与老记录为 null。
+   */
+  startedAt: string | null;
+  /**
+   * **完成时刻**（v0.5.0，UTC ISO 8601）。终态口径 = **`{completed, failed, blocked}`**
+   * （**不含** `working` / `input-required`），故 **不变量：`finishedAt !== null` ⇔ 已完成**。
+   * 写入点：`createTask()` 终态时 / `compareAndSwapTaskState()` 转入终态时；清空点：
+   * `rearmTask()` / `rearmForRetry()`（回到未完成）。老记录为 null。
+   */
+  finishedAt: string | null;
   /** 归属 Feature（NULL = 独立单任务） */
   featureId: string | null;
   /** 前置任务（本地 taskId 数组，环/悬空引用由调度器校验）；NULL = 无依赖 */

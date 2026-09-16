@@ -5,6 +5,7 @@
  * （含 `updateTaskState`/`updateFeatureState` 集中写事件）、`inputArtifacts` 往返，
  * 以及 `pruneTasks` 对活跃 Feature 的 `blocked` 任务的保护。
  * v0.4.1：追加存储加固三项——busy timeout、默认库路径锚定 orch 单元根、CAS 条件更新。
+ * v0.5.0：追加三时刻列（`created_at` / `started_at` / `finished_at`）的写入时机与旧库迁移。
  *
  * 运行：`npm test`（先 `tsc` 构建，再 `node --test dist/test/`）。
  */
@@ -16,6 +17,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { appRootFromModule } from "../app-root.js";
+import type { TaskState } from "../types.js";
 import {
   DEFAULT_SESSION_DB,
   EVENT_FEATURE_STATE,
@@ -651,5 +653,175 @@ test("markTaskFailureKind：落库 failure_kind、updated_at 不变、不存在�
     assert.equal(store.markTaskFailureKind("missing", "infra"), false);
   } finally {
     store.close();
+  }
+});
+
+/** `finished_at` 终态口径（与 store 内 `FINISHED_TASK_STATES` 对齐；用于不变量断言） */
+const FINISHED_STATES = ["completed", "failed", "blocked"] as const;
+
+/** 终态口径成员判定（`as const` 元组的 `includes` 收窄到字面量，此处放宽回 `TaskState`） */
+function isFinishedState(state: TaskState): boolean {
+  return (FINISHED_STATES as readonly TaskState[]).includes(state);
+}
+
+test("v0.5.0 三时刻列：created_at 首次为准、started_at 仅 NULL 才填、finished_at 仅三终态写", () => {
+  const store = newStore();
+  try {
+    // ① createTask(working)：created_at / started_at 落库，finished_at 为 NULL
+    const created = store.createTask({
+      taskId: "t-moments",
+      projectId: "p1",
+      contextId: "c1",
+      state: "working",
+    });
+    assert.equal(typeof created.createdAt, "string", "working 登记应写 created_at");
+    assert.equal(created.createdAt, created.updatedAt, "首次落库：created_at 与 updated_at 同源");
+    assert.equal(typeof created.startedAt, "string", "working 登记应写 started_at");
+    assert.equal(created.finishedAt, null, "working 不得写 finished_at");
+
+    // ② 同 id upsert：created_at / started_at **不被覆盖**（首次为准），updated_at 照常刷新
+    const laterIso = "2030-01-01T00:00:00.000Z";
+    const again = store.createTask({
+      taskId: "t-moments",
+      projectId: "p1",
+      contextId: "c1",
+      state: "working",
+      updatedAt: laterIso,
+    });
+    assert.equal(again.updatedAt, laterIso, "updated_at 照常被 upsert 刷新");
+    assert.equal(again.createdAt, created.createdAt, "upsert 不得覆盖 created_at（首次为准）");
+    assert.equal(again.startedAt, created.startedAt, "upsert 不得重置 started_at（首次开工为准）");
+    assert.equal(again.finishedAt, null);
+
+    // ③ markTaskDispatched：**仅当 started_at IS NULL 才填**（幂等、不覆盖重派）
+    //    登记态非 working ⇒ started_at 为 NULL（如 input-required = 等澄清）
+    store.createTask({
+      taskId: "t-idem",
+      projectId: "p1",
+      contextId: "c1",
+      state: "input-required",
+    });
+    assert.equal(store.getTask("t-idem")?.startedAt, null, "非 working 登记不写 started_at");
+    const firstDispatch = store.markTaskDispatched("t-idem", "remote-A");
+    assert.equal(typeof firstDispatch?.startedAt, "string", "首次派发补 started_at");
+    const secondDispatch = store.markTaskDispatched("t-idem", "remote-B");
+    assert.equal(
+      secondDispatch?.startedAt,
+      firstDispatch?.startedAt,
+      "重派不得覆盖 started_at（仅 NULL 才填）",
+    );
+    assert.equal(secondDispatch?.remoteTaskId, "remote-B", "remote_task_id 照常回填最新");
+
+    // ④ createTask 终态：仅 completed / failed / blocked 写 finished_at
+    for (const state of FINISHED_STATES) {
+      const rec = store.createTask({
+        taskId: `t-fin-${state}`,
+        projectId: "p1",
+        contextId: "c1",
+        state,
+      });
+      assert.equal(typeof rec.finishedAt, "string", `${state} 应写 finished_at`);
+      assert.equal(rec.finishedAt, rec.updatedAt, `${state}：finished_at 与本次 updated_at 同源`);
+    }
+    // working / input-required 是中间态 ⇒ 不得写（独立单任务走 handleCall 直接 createTask(终态)，
+    // 故 createTask 这一写口必须覆盖；此处同时锁住"非终态不写"）
+    for (const state of ["working", "input-required"] as TaskState[]) {
+      const rec = store.createTask({
+        taskId: `t-nofin-${state}`,
+        projectId: "p1",
+        contextId: "c1",
+        state,
+      });
+      assert.equal(rec.finishedAt, null, `${state} 不得写 finished_at`);
+    }
+
+    // ⑤ CAS 写口：working → 终态落 finished_at；working → input-required 不落
+    store.createTask({ taskId: "t-cas", projectId: "p1", contextId: "c1", state: "working" });
+    assert.equal(store.getTask("t-cas")?.finishedAt, null);
+    assert.equal(store.compareAndSwapTaskState("t-cas", "working", "completed", null, "ok"), true);
+    assert.equal(typeof store.getTask("t-cas")?.finishedAt, "string", "CAS 转终态应写 finished_at");
+
+    store.createTask({ taskId: "t-cas2", projectId: "p1", contextId: "c1", state: "working" });
+    assert.equal(store.compareAndSwapTaskState("t-cas2", "working", "input-required"), true);
+    assert.equal(store.getTask("t-cas2")?.finishedAt, null, "input-required ≠ 已完成，不写");
+
+    // ⑥ rearmTask / rearmForRetry 清空 finished_at（回到"未完成"）
+    store.createTask({ taskId: "t-rearm", projectId: "p1", contextId: "c1", state: "completed" });
+    const beforeRearm = store.getTask("t-rearm");
+    assert.equal(typeof beforeRearm?.finishedAt, "string");
+    const rearmed = store.rearmTask("t-rearm", "resume");
+    assert.equal(rearmed?.state, "working");
+    assert.equal(rearmed?.finishedAt, null, "rearmTask 必须清 finished_at");
+    assert.equal(rearmed?.createdAt, beforeRearm?.createdAt, "rearm 不改 created_at");
+    assert.equal(rearmed?.startedAt, beforeRearm?.startedAt, "rearm 不改 started_at（不重置起点）");
+
+    store.createTask({ taskId: "t-rearm2", projectId: "p1", contextId: "c1", state: "failed" });
+    assert.equal(typeof store.getTask("t-rearm2")?.finishedAt, "string");
+    assert.equal(store.rearmForRetry("t-rearm2", "orig"), true);
+    assert.equal(store.getTask("t-rearm2")?.finishedAt, null, "rearmForRetry 必须清 finished_at");
+
+    // ⑦ 不变量全表抽查：有 finished_at ⇔ state ∈ 终态口径
+    for (const t of store.listTasks({ projectId: "p1", limit: 100 })) {
+      assert.equal(
+        t.finishedAt !== null,
+        isFinishedState(t.state),
+        `${t.taskId}(${t.state}) 破坏不变量「有 finished_at ⇔ 已完成」`,
+      );
+    }
+  } finally {
+    store.close();
+  }
+});
+
+test("v0.5.0 迁移：旧库补三时刻列幂等、老行留 NULL（不回填）、新列可回读", () => {
+  const dbPath = join(tmpdir(), `a2a-v050-moments-${process.pid}-${Date.now()}.sqlite`);
+  try {
+    // ① 造「旧库」：tasks 表**无三时刻列** + 一条老行
+    const legacy = openStoreDatabase(dbPath);
+    legacy.exec(
+      "CREATE TABLE tasks (task_id TEXT PRIMARY KEY, project_id TEXT NOT NULL, " +
+        "context_id TEXT NOT NULL, state TEXT NOT NULL, artifacts_json TEXT, updated_at TEXT NOT NULL)",
+    );
+    legacy.exec(
+      "INSERT INTO tasks (task_id, project_id, context_id, state, updated_at) " +
+        "VALUES ('legacy-m', 'p1', 'c1', 'completed', '2026-09-15T00:00:00.000Z')",
+    );
+    legacy.close();
+
+    // ② 首次打开 = 迁移（try-ALTER 补 3 列）；再开一次 = 迁移重复执行（幂等，不应抛）
+    new SessionStore(dbPath).close();
+    const store = new SessionStore(dbPath);
+    try {
+      const row = store.getTask("legacy-m");
+      assert.equal(row?.createdAt, null, "老数据不回填 created_at（留 NULL）");
+      assert.equal(row?.startedAt, null, "老数据不回填 started_at（留 NULL）");
+      assert.equal(row?.finishedAt, null, "老数据不回填 finished_at（留 NULL）");
+      assert.equal(row?.state, "completed", "补列不得改写既有列");
+      assert.equal(row?.updatedAt, "2026-09-15T00:00:00.000Z");
+    } finally {
+      store.close();
+    }
+
+    // ③ 新列可写回并读回（TASK_COLUMNS / rowToTask 已覆盖三列）
+    const raw = openStoreDatabase(dbPath);
+    raw.exec(
+      "UPDATE tasks SET created_at = '2026-01-01T00:00:00.000Z', " +
+        "started_at = '2026-01-01T00:00:01.000Z', finished_at = '2026-01-01T00:00:02.000Z' " +
+        "WHERE task_id = 'legacy-m'",
+    );
+    raw.close();
+    const store2 = new SessionStore(dbPath);
+    try {
+      const row = store2.getTask("legacy-m");
+      assert.equal(row?.createdAt, "2026-01-01T00:00:00.000Z");
+      assert.equal(row?.startedAt, "2026-01-01T00:00:01.000Z");
+      assert.equal(row?.finishedAt, "2026-01-01T00:00:02.000Z");
+    } finally {
+      store2.close();
+    }
+  } finally {
+    rmSync(dbPath, { force: true });
+    rmSync(`${dbPath}-wal`, { force: true });
+    rmSync(`${dbPath}-shm`, { force: true });
   }
 });

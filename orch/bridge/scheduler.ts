@@ -515,6 +515,13 @@ export class FeatureScheduler {
    * 取证节点自身 id 无需在此保存：识别靠**消息角色标记**（`isEvidenceNode`）；重试目标靠本映射。
    * 进程内态（桥重启后靠 `exhausted` + `state='failed'` 的**单一扫描**兜底，见 `resolveRetryTarget`；
    * 上界基线回退到失败节点的 `updated_at`，见 `evidenceWaitedMs`）。
+   *
+   * ⚠️ **出口即清**（v0.5.0 D5）：`handleEvidenceSettled` 的**全部决策出口**（`retry` / `settle` /
+   * 两处「交人」）都必须 `delete(featureId)` —— 「决策已落」与「map 有条目」必须一一对应，
+   * 否则硬闸 {@link FeatureScheduler.hasPendingEvidenceDecision} 会在 Feature 回到 `executing` 后
+   * 继续拦下 `all_completed` ⇒ **Feature 永久卡在 `executing`（死锁）**。
+   * 本版只覆盖 `handleEvidenceSettled` 的四个出口；`needsInputFeature` 的其余调用点
+   * （取证节点自身失败 / 派发失败等）不产生 `all_completed` 路径 ⇒ 闸不被触发，留 v0.5.1 收口。
    */
   private readonly pendingEvidence = new Map<
     string,
@@ -661,11 +668,16 @@ export class FeatureScheduler {
     const decision = decideEvidenceOutcome(evidence, target?.retryCount ?? 0, this.maxRetry);
 
     if (decision.kind === "needs_input") {
+      // 「出口即清」：决策已落（交人）⇒ 必须清 map，否则硬闸 `hasPendingEvidenceDecision`
+      // 在本 Feature 回到 `executing` 后仍拦下 `all_completed` ⇒ Feature 永久卡死（新造死锁）。
+      this.pendingEvidence.delete(feature.featureId);
       this.needsInputFeature(feature, `取证决策：交人（${decision.reason}）`);
       return;
     }
     if (decision.kind === "retry") {
       if (target === null) {
+        // 「出口即清」：同上 —— 降级交人同样是**决策已落**的终局出口。
+        this.pendingEvidence.delete(feature.featureId);
         this.needsInputFeature(feature, "取证决策：应重试但未定位到失败节点（交人）");
         return;
       }
@@ -690,6 +702,27 @@ export class FeatureScheduler {
     // settle：按成功收口（仍须宿主跑验收/回归才算真通过）
     this.pendingEvidence.delete(feature.featureId);
     this.kick();
+  }
+
+  /**
+   * 硬闸谓词（v0.5.0 D5）：是否**存在「待决策取证流」** ⇒ 阻止 `all_completed` 推进 `integrating`。
+   *
+   * 判定 = ① 本 Feature 有**未清**的 `pendingEvidence` 条目（决策尚未落）**且** ② 节点集内
+   * **确实存在取证节点**（`isEvidenceNode`，消息角色标记）。
+   *
+   * ⚠️ **不得**再加「取证节点**未终态**」：D5 主场景里取证节点**恰恰已是 `completed`**（正因如此
+   * 收敛才会提前成立）—— 加上"未终态"正好漏掉要挡的那一例。
+   * ⚠️ **不得**用裸 `this.pendingEvidence.has(...)`：`registerEvidenceNode` 缺省未注入时，
+   * map 可能有条目却**没有**取证节点（结构性负例，见单测 T4）；裸 `has` 会把该 Feature 误困在
+   * `executing`（新造死锁）。
+   *
+   * 同步、纯读（无 `await`、无副作用），沿用既有纯函数 `isEvidenceNode`（零新 import）。
+   */
+  private hasPendingEvidenceDecision(
+    feature: FeatureRecord,
+    nodes: readonly TaskRecord[],
+  ): boolean {
+    return this.pendingEvidence.has(feature.featureId) && nodes.some((n) => isEvidenceNode(n));
   }
 
   /**
@@ -953,6 +986,11 @@ export class FeatureScheduler {
       return;
     }
     if (convergence.kind === "all_completed") {
+      // v0.5.0 D5 硬闸：存在「待决策取证流」时**不得**推进 `integrating`。
+      // 能走到 `retry` 的前提正是「取证节点已终态 ⇒ 全部节点终态」⇒ 不加此闸，收敛必然先一步
+      // 推走 Feature（tick 只扫 `executing`）⇒ re-arm 后节点永不续派。同步、无 `await`（在
+      // `transition` 之前完成判定，避免与看护回调交错）。
+      if (this.hasPendingEvidenceDecision(feature, nodes)) return;
       this.transition(feature, "integrating", "全部任务达终态（调度器自动）");
       return;
     }

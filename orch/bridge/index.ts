@@ -59,6 +59,7 @@ import {
   type TaskState as DomainTaskState,
   type TransportConfig,
   type TransportMode,
+  type WebConfig,
 } from "../types.js";
 import {
   appendEvent,
@@ -126,6 +127,7 @@ import {
   type HttpTransportHandle,
 } from "./transports/http.js";
 import { startStdioTransport } from "./transports/stdio.js";
+import { startWebTransport, type WebTransportOutcome } from "./transports/web.js";
 // 挂载态常量（单一事实源在 register-tools.ts）：index → register-tools 的运行时 import 安全
 // （register-tools 对 index 仅 **type-only** 引用，擦除后无环）
 import { MOUNTABLE_FEATURE_STATES } from "./register-tools.js";
@@ -2135,7 +2137,15 @@ function resolveLocalTaskId(remoteOrLocalId: string): string | null {
 
 /**
  * 命中本地任务时回写任务态（推送仅作「提前感知」，完整 artifacts/text 由轮询对账补齐）。
- * 只采纳 `completed` / `failed` / `input-required`（`working` 不提前改写；`blocked` 为本地专属）。
+ * 只采纳 `completed` / `input-required`（`working` 不提前改写；`blocked` 为本地专属）。
+ *
+ * ⚠️ **不采纳 `failed`**（v0.5.0 D3/D5）：push 由 SDK fire-and-forget 代发、无 ack/重试、可重复/
+ * 迟到/乱序 ⇒ 提前把 `failed` 写库会留下「**已写 failed、尚未分类/中性化**」的窗口，周期 tick
+ * 撞上即把 Feature 判 `failed`（D3-flaky）；同理 `completed` 预写会让收敛抢在 re-arm 之前
+ * （D5-flaky，故本版再删 push 回调里的 `kick()`）。
+ * 收窄后 **`failed` 的唯一写者** = 看护 `persist`（`task-watcher.ts`）/ 看护放弃回调 /
+ * 派发失败（`scheduler.ts`，同步完成 propagate + failFeature）—— 三者皆为同栈相邻序列，
+ * 任何 `kick()` 都插不进「已写 `failed`、未分类」的窗口。
  */
 function applyPushedTaskState(localTaskId: string, a2aState: string): void {
   let stateEnum: A2aTaskState;
@@ -2145,13 +2155,13 @@ function applyPushedTaskState(localTaskId: string, a2aState: string): void {
     return; // 未知状态串：忽略，交由轮询对账
   }
   const mapped = mapTaskState(stateEnum);
-  if (mapped !== "completed" && mapped !== "failed" && mapped !== "input-required") return;
+  if (mapped !== "completed" && mapped !== "input-required") return;
   const current = getTask(localTaskId);
   if (current === null || isLocalTerminalState(current)) return;
   updateTaskState(localTaskId, mapped);
 }
 
-/** 处理一次 push：写 `push.received` 事件 + 命中本地任务回写任务态 + 唤醒订阅 + 调度器 kick */
+/** 处理一次 push：写 `push.received` 事件 + 命中本地任务回写任务态 + 唤醒看护/订阅（**不驱动流转**） */
 function applyPushNotification(raw: string): { taskId: string | null; localTaskId: string | null } {
   const parsed: unknown = JSON.parse(raw);
   const info = parsePushInfo(parsed);
@@ -2168,11 +2178,12 @@ function applyPushNotification(raw: string): { taskId: string | null; localTaskI
   if (localTaskId !== null && info.state !== null) {
     applyPushedTaskState(localTaskId, info.state);
   }
-  // 唤醒看护（推送优先，立即对账）+ 唤醒长轮询订阅 + 驱动 Feature 调度
+  // 只唤醒看护（推送优先，立即对账）+ 唤醒长轮询订阅；**不** kick 调度器（v0.5.0 D5）：
+  // push 须幂等、不得驱动流转 —— 收敛交给看护 `onSettled` / 周期 tick（延迟 ≤ FEATURE_TICK_MS，
+  // 无契约含义）；且在 push 回调同栈内 kick() 会让收敛抢在 re-arm 之前（D5 确定性倒置）。
   const wakeKey = localTaskId ?? info.remoteTaskId;
   if (wakeKey !== null) notifyTaskPush(wakeKey);
   signalEvents();
-  scheduler.kick();
   return { taskId: info.remoteTaskId, localTaskId };
 }
 
@@ -2341,6 +2352,11 @@ export function createCore(): BridgeCore {
 let activeServer: McpServer | null = null;
 /** 常驻 HTTP 接入面句柄（http 模式；停机第一步先停收新请求） */
 let activeHttp: HttpTransportHandle | null = null;
+/**
+ * 只读网页接面句柄（v0.5.0 §2.5；**仅在形态门 + `owner` 同时成立时**才有值）。
+ * 未启用 / follower / 端口被占 ⇒ 保持 `null`（「无页面」为合法状态，MCP 工具面不受影响）。
+ */
+let activeWeb: WebTransportOutcome | null = null;
 /** 运行时编排（两接入面共用：core 租约 / 后台循环归属 / pidfile / 排空停机） */
 let activeRuntime: BridgeRuntime | null = null;
 /** 停机重入守卫（信号与 `POST /shutdown` 可能并发到达） */
@@ -2382,6 +2398,34 @@ function transportConfig(): TransportConfig {
 
 function transportMode(): TransportMode {
   return transportConfig().mode;
+}
+
+/** web 配置缺失 / 非法时的兜底（取值与 `config.ts` 缺省一致：常驻启用、stdio 不启用、127.0.0.1:3300） */
+const FALLBACK_WEB: WebConfig = {
+  enabled: true,
+  host: "127.0.0.1",
+  port: 3300,
+  allowStdio: false,
+};
+
+/** 网页只读工作台配置（懒加载 + 进程内缓存；读取失败回落默认，与 transport 同策略） */
+let cachedWebConfig: WebConfig | null = null;
+let webConfigLoaded = false;
+
+function webConfig(): WebConfig {
+  if (!webConfigLoaded) {
+    webConfigLoaded = true;
+    try {
+      cachedWebConfig = loadMachinesConfig(MACHINES_CONFIG_PATH).web;
+    } catch (err) {
+      bridgeLog.error(
+        "a2a-bridge",
+        `加载 web 配置失败（回落默认：常驻启用 / stdio 不启用）：${toMessage(err)}`,
+      );
+      cachedWebConfig = null;
+    }
+  }
+  return cachedWebConfig ?? FALLBACK_WEB;
 }
 
 /**
@@ -2430,6 +2474,55 @@ function logRecoverySummary(recovery: unknown): void {
 }
 
 /**
+ * 网页只读接面接线（v0.5.0 §2.5）：**必须在 `runtime.start()` 之后**调用（否则拿不到 `role`）。
+ *
+ * 判定式（单一表达式，与 `config.ts` / `types.ts` 注释同源）：
+ * `(mode === "http" ? web.enabled : web.allowStdio) && role === "owner"`。
+ * - follower **一律不 bind**（同机多桥互抢端口随之消失）；http 形态不读 `allowStdio`，
+ *   stdio 形态不读 `enabled`（见 `config.ts` 语义收窄）；
+ * - stdio 缺省不 bind：桥是 orch agent 的子进程，由它提供页面会与「网页启动 agent」构成死循环；
+ * - **不 throw**：非 loopback / 端口被占 / 未启用 ⇒ 不 bind 且不报错（`startWebTransport` 自吞，
+ *   返回未启用句柄）；「无页面」是合法状态，**MCP 工具面不受影响**；
+ * - stdio 形态 bind 时 `unref`（否则 listener 持住事件循环 ⇒ 桥不随宿主退出 ⇒ 子进程泄漏）。
+ */
+async function startWebIfEnabled(mode: TransportMode, readiness: RuntimeReadiness): Promise<void> {
+  const web = webConfig();
+  // 顺序反转（§2.5 (a)）：此处已过 `runtime.start()` ⇒ `readiness.role` 是权威角色
+  const shapeEnabled = mode === "http" ? web.enabled : web.allowStdio;
+  if (!shapeEnabled || readiness.role !== "owner") {
+    bridgeLog.info(
+      "a2a-bridge",
+      `网页接面不 bind（mode=${mode}，role=${readiness.role}，形态门=${shapeEnabled ? "开" : "关"}）：` +
+        `无页面属合法状态，MCP 工具面不受影响`,
+      { host: web.host, port: web.port },
+    );
+    return;
+  }
+
+  try {
+    activeWeb = await startWebTransport({
+      core: createCore(),
+      host: web.host,
+      port: web.port,
+      // 页面标识（role / pid / startedAt）来自 lifecycle；此处恒非 null（已过 `runtime.start()`）
+      readiness: (): { role: string; pid: number; startedAt: string } => ({
+        role: readiness.role,
+        pid: readiness.pid,
+        startedAt: readiness.startedAt,
+      }),
+      version: BRIDGE_VERSION,
+      unref: mode === "stdio",
+    });
+  } catch (err) {
+    // 兜底：网页接面**绝不允许**拖垮 MCP 工具面（契约上 `startWebTransport` 不 throw）
+    bridgeLog.error(
+      "a2a-bridge",
+      `网页接面接线异常（已忽略，MCP 工具面不受影响）：${toMessage(err)}`,
+    );
+  }
+}
+
+/**
  * stdio 接入面（默认）：接入面 + 生命周期编排。
  * 相对旧路径唯一的行为差异是**多一道 core 租约门闩**：owner 照常跑 scheduler/watcher；
  * follower（他进程已持调度权）只提供工具面（§2.4 / §2.8 单桥约束）。
@@ -2441,24 +2534,31 @@ async function startStdioBridge(): Promise<void> {
   logRecoverySummary(readiness.recovery);
   // 启动 worker 回调端点（v0.4.0 §2.6；`callback.enabled` 默认关，关闭时 startCallbackServer 空操作）
   startCallbackServer(callbackConfig());
-  activeServer = await startStdioTransport(createCore());
+  const core = createCore();
+  activeServer = await startStdioTransport(core);
   console.error(
     `[a2a-bridge] MCP stdio server ready（role=${readiness.role}）: a2a_projects / a2a_tasks / a2a_call / a2a_task_status / a2a_cancel / a2a_feature_create / a2a_feature_status / a2a_feature_advance / a2a_feature_approve / a2a_feature_cancel`,
   );
+  // 网页接面在接入面就绪**之后**接线（缺省不 bind；`allowStdio=true` 时经 unref 了才不持进程）
+  await startWebIfEnabled("stdio", readiness);
 }
 
 /**
  * 常驻接入面（http）：**先 `listen`** —— 端口被占即 fail fast，且此时尚未持锁 / 未写 pidfile
  * （§2.4 第 4 条「端口绑定即单实例互斥」）；随后走 lifecycle 编排。
  * `/health` 在 `recover()` 落地前返回 503 + `status="starting"`（就绪信号晚于 `recover()`，§2.5）。
+ *
+ * ⚠ **顺序反转（v0.5.0 §2.5 (a)）**：网页接面**必须在 `runtime.start()` 之后**按 `role` 决定是否
+ * bind —— 不能沿用 MCP 接入面这套「先 listen 后抢租约」（那时还不知道自己是 owner 还是 follower）。
  */
 async function startHttpBridge(): Promise<void> {
   const { host, port, path } = transportConfig().http;
   let ready = false;
   const runtime = createBridgeRuntime("http");
   activeRuntime = runtime;
+  const core = createCore();
   const handle = await startHttpTransport({
-    core: createCore(),
+    core,
     host,
     port,
     path,
@@ -2480,6 +2580,8 @@ async function startHttpBridge(): Promise<void> {
       shutdown: `http://${host}:${handle.port}/shutdown`,
     },
   );
+  // 网页接面**排在 MCP 就绪之后**接线：它不参与 MCP 就绪语义，且绝不允许拖慢 / 拖垮工具面
+  await startWebIfEnabled("http", readiness);
 }
 
 async function main(): Promise<void> {
@@ -2492,15 +2594,20 @@ async function main(): Promise<void> {
 
 /**
  * 优雅停机（信号 / `POST /shutdown` 共用；§2.5 反序 + 排空）：
- * 停收新请求（HTTP listener）→ 停 scheduler → 排空在飞任务与看护（等待至宽限上限，
- * **不取消**远端 A2A 任务）→ 停 watcher → 关 store → 释放租约 → 删 pidfile →
- * 关 MCP server → 退出。幂等（`stopping` 守卫）。
+ * **关网页接面（最先，`close()` 内含 keep-alive 兜底）** → 停收新请求（HTTP listener）→ 停 scheduler
+ * → 排空在飞任务与看护（等待至宽限上限，**不取消**远端 A2A 任务）→ 停 watcher → 关 store →
+ * 释放租约 → 删 pidfile → 关 MCP server → 退出。幂等（`stopping` 守卫）。
  */
 function shutdown(): void {
   if (stopping) return;
   stopping = true;
   void (async (): Promise<void> => {
     try {
+      // 网页接面**最先关**（§2.5 (e)）：浏览器 keep-alive 会拖住 server.close()，
+      // 故必须早于排空停机；`close()` 已含 closeIdleConnections + 1s 兜底 closeAllConnections。
+      const web = activeWeb;
+      activeWeb = null;
+      if (web !== null) await web.close();
       const handle = activeHttp;
       activeHttp = null;
       if (handle !== null) await handle.close();

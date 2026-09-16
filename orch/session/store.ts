@@ -221,6 +221,11 @@ function isTaskState(v: string): v is TaskState {
   return (TASK_STATES as readonly string[]).includes(v);
 }
 
+/** 该任务态是否算「已完成」（`finished_at` 的唯一写入判据；口径见 `FINISHED_TASK_STATES`） */
+function isFinishedState(state: TaskState): boolean {
+  return (FINISHED_TASK_STATES as readonly string[]).includes(state);
+}
+
 function isFailureKind(v: string): v is FailureKind {
   return (FAILURE_KINDS as readonly string[]).includes(v);
 }
@@ -285,7 +290,8 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
 const TASK_COLUMNS =
   "task_id, project_id, context_id, state, artifacts_json, text, prompt, " +
   "feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, updated_at, " +
-  "retry_count, failure_kind, exhausted, not_before, last_poll_at";
+  "retry_count, failure_kind, exhausted, not_before, last_poll_at, " +
+  "created_at, started_at, finished_at";
 
 /** features 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToFeature） */
 const FEATURE_COLUMNS =
@@ -352,6 +358,11 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     text: readNullableString(row, "text"),
     prompt: readNullableString(row, "prompt"),
     updatedAt: readString(row, "updated_at"),
+    // v0.5.0 三时刻列：一律**可空**（老记录不回填）；`created_at` / `started_at` 正常路径必有值，
+    // 但读侧不得 fail-fast（NULL 是合法历史态，不是数据损坏）
+    createdAt: readNullableString(row, "created_at"),
+    startedAt: readNullableString(row, "started_at"),
+    finishedAt: readNullableString(row, "finished_at"),
     featureId: readNullableString(row, "feature_id"),
     dependencies: readDependencies(row),
     inputArtifacts: readInputArtifacts(row),
@@ -432,8 +443,20 @@ CREATE TABLE IF NOT EXISTS tasks (
   artifacts_json TEXT,
   text          TEXT,
   prompt        TEXT,
-  updated_at    TEXT NOT NULL
+  updated_at    TEXT NOT NULL,
+  created_at    TEXT,
+  started_at    TEXT,
+  finished_at   TEXT
 )`;
+
+/**
+ * `finished_at` 的终态口径（v0.5.0 三时刻列）：**只有这三个态算「已完成」**。
+ *
+ * ⚠️ 与 `scheduler.isLocalTerminalTask`（把 `input-required` 也算本地终态）**刻意不同**：
+ * `input-required` 是**可续推**的中间停靠（澄清后同 `contextId` 续接），不是完成 ⇒
+ * 不得写 `finished_at`。两套集合判据相似但语义不同，改动任一者前先确认「本地终结 ≠ 已完成」。
+ */
+const FINISHED_TASK_STATES: readonly TaskState[] = ["completed", "failed", "blocked"];
 
 const FEATURES_DDL = `
 CREATE TABLE IF NOT EXISTS features (
@@ -529,6 +552,16 @@ export class SessionStore {
       "not_before TEXT",
       "last_poll_at TEXT",
     ]) {
+      try {
+        this.db.exec(`ALTER TABLE tasks ADD COLUMN ${column}`);
+      } catch {
+        // 列已存在
+      }
+    }
+    // v0.5.0 迁移：tasks 加三时刻列（网页端只读工作台展示任务耗时）。
+    // 一律 `TEXT` 且**允许 NULL**：老数据**不回填**（NULL = 该时刻未知 / 未发生），
+    // 故读侧 `rowToTask` 用 `readNullableString` 而非 fail-fast 的 `readString`。
+    for (const column of ["created_at TEXT", "started_at TEXT", "finished_at TEXT"]) {
       try {
         this.db.exec(`ALTER TABLE tasks ADD COLUMN ${column}`);
       } catch {
@@ -638,9 +671,25 @@ export class SessionStore {
     return stored;
   }
 
-  /** 创建/覆盖任务记录，返回落库后的记录 */
+  /**
+   * 创建/覆盖任务记录，返回落库后的记录。
+   *
+   * **v0.5.0 三时刻列**（网页端只读工作台展示耗时；口径见 `types.ts` 的 `TaskRecord`）：
+   * - `created_at`：**登记时刻**，仅 INSERT 写；`ON CONFLICT` **不更新** ⇒ 首次为准
+   *   （参照 `upsertSession` 保留首次 `created_at` 的先例）；
+   * - `started_at`：**首次开工时刻**，`state === "working"` 时填；冲突时 `COALESCE` 保留首次
+   *   —— 与 `markTaskDispatched`「仅 NULL 才填」同一纪律：重派 / 重试不重置起点；
+   * - `finished_at`：**完成时刻**，终态（`completed` / `failed` / `blocked`）时填；冲突时同样
+   *   `COALESCE` 保留首次。**必须在 createTask 也写**：独立单任务走 `handleCall` 直接
+   *   `createTask(state = 终态)`，**从不经过 CAS**（见 `bridge/index.ts` 的 handleCall）。
+   */
   createTask(rec: TaskCreateInput): TaskRecord {
-    const updatedAt = rec.updatedAt ?? nowIso();
+    const now = nowIso();
+    const updatedAt = rec.updatedAt ?? now;
+    // 三时刻与本行首次落库同源（同一 `now`），避免毫秒级漂移
+    const createdAt = now;
+    const startedAt = rec.state === "working" ? now : null;
+    const finishedAt = isFinishedState(rec.state) ? now : null;
     const prompt =
       rec.prompt === undefined || rec.prompt === null ? null : truncatePrompt(rec.prompt);
     const dependencies =
@@ -655,8 +704,9 @@ export class SessionStore {
       .prepare(
         `INSERT INTO tasks
            (task_id, project_id, context_id, state, artifacts_json, text, prompt,
-            feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, updated_at,
+            created_at, started_at, finished_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(task_id) DO UPDATE SET
            project_id = excluded.project_id,
            context_id = excluded.context_id,
@@ -669,7 +719,9 @@ export class SessionStore {
            input_artifacts = excluded.input_artifacts,
            remote_task_id = excluded.remote_task_id,
            dispatch_message = excluded.dispatch_message,
-           updated_at = excluded.updated_at`,
+           updated_at = excluded.updated_at,
+           started_at = COALESCE(started_at, excluded.started_at),
+           finished_at = COALESCE(excluded.finished_at, finished_at)`,
       )
       .run(
         rec.taskId,
@@ -685,6 +737,9 @@ export class SessionStore {
         rec.remoteTaskId ?? null,
         rec.dispatchMessage ?? null,
         updatedAt,
+        createdAt,
+        startedAt,
+        finishedAt,
       );
     const stored = this.getTask(rec.taskId);
     if (stored === null) {
@@ -697,6 +752,10 @@ export class SessionStore {
    * 原子任务态流转（compare-and-swap）：单语句 `UPDATE ... WHERE task_id = ? AND state = ?`，
    * 仅当当前态等于 `expectedFrom` 时才置为 `to`。返回是否实际写入（`changes > 0`）。
    * 作为「读-改-写」的原子替代，防止并发下丢失更新；`artifactsJson` / `text` 未提供时保留原值。
+   *
+   * v0.5.0：**`finished_at` 写口** —— 转入终态（`completed` / `failed` / `blocked`）时落时刻；
+   * 转入非终态（`working` / `input-required`）时**保留原值**，不在此做隐式清空
+   * （清空点是 `rearmTask` / `rearmForRetry`，它们才是"回到未完成"的显式动作）。
    */
   compareAndSwapTaskState(
     taskId: string,
@@ -705,6 +764,8 @@ export class SessionStore {
     artifactsJson?: string | null,
     text?: string | null,
   ): boolean {
+    const now = nowIso();
+    const finishedAt = isFinishedState(to) ? now : null;
     const changes = conditionalStateUpdate(this.db, {
       table: "tasks",
       keyColumn: "task_id",
@@ -714,9 +775,10 @@ export class SessionStore {
       assignments: [
         "artifacts_json = COALESCE(?, artifacts_json)",
         "text = COALESCE(?, text)",
+        "finished_at = COALESCE(?, finished_at)",
         "updated_at = ?",
       ],
-      assignmentParams: [artifactsJson ?? null, text ?? null, nowIso()],
+      assignmentParams: [artifactsJson ?? null, text ?? null, finishedAt, now],
     });
     return changes > 0;
   }
@@ -772,23 +834,36 @@ export class SessionStore {
   /**
    * Feature 节点派发落库：回填远端 id，保持 state（working）以便看护接管。
    * 任务不存在时无效果，返回 null。
+   *
+   * v0.5.0：**`started_at` 写口（仅当 IS NULL 才填）** —— `COALESCE(started_at, ?)` 使
+   * 「首次派发」补时刻、而重派 / 重试**不重置起点**（幂等；与 `createTask` 的 `COALESCE` 同一纪律）。
    */
   markTaskDispatched(taskId: string, remoteTaskId: string): TaskRecord | null {
+    const now = nowIso();
     this.db
-      .prepare("UPDATE tasks SET remote_task_id = ?, updated_at = ? WHERE task_id = ?")
-      .run(remoteTaskId, nowIso(), taskId);
+      .prepare(
+        `UPDATE tasks
+         SET remote_task_id = ?, started_at = COALESCE(started_at, ?), updated_at = ?
+         WHERE task_id = ?`,
+      )
+      .run(remoteTaskId, now, now, taskId);
     return this.getTask(taskId);
   }
 
   /**
    * needs_input 恢复：将任务节点重新置为待派发（state=working、清远端 id、
    * 更新待派发消息），供调度器以同 contextId 续接。任务不存在时返回 null。
+   *
+   * v0.5.0：**同时清 `finished_at`** —— 该节点重新成为"在飞未完成"，
+   * 否则破坏不变量「有 `finished_at` ⇔ 已完成」（网页端会把它显示成已完成）。
+   * `started_at` **保留**（首次开工时刻，续推不改写耗时起点）。
    */
   rearmTask(taskId: string, dispatchMessage: string): TaskRecord | null {
     this.db
       .prepare(
         `UPDATE tasks
-         SET state = 'working', remote_task_id = NULL, dispatch_message = ?, updated_at = ?
+         SET state = 'working', remote_task_id = NULL, dispatch_message = ?, updated_at = ?,
+             finished_at = NULL
          WHERE task_id = ?`,
       )
       .run(dispatchMessage, nowIso(), taskId);
@@ -813,13 +888,17 @@ export class SessionStore {
    *
    * 返回是否命中（`false` = 任务不存在或当前态非 `failed`，**未发生任何写入**；此时
    * `exhausted` 亦**不得**被清）。
+   *
+   * v0.5.0：**同时清 `finished_at`** —— `failed` 是终态口径之一（有 `finished_at`），
+   * 授予重试后节点重新成为在飞未完成 ⇒ 必须清空以维持不变量「有 `finished_at` ⇔ 已完成」。
+   * `started_at` **保留**（首次开工时刻，重试不改写耗时起点）。
    */
   rearmForRetry(taskId: string, dispatchMessage: string): boolean {
     const info = this.db
       .prepare(
         `UPDATE tasks
          SET state = 'working', remote_task_id = NULL, dispatch_message = ?,
-             retry_count = retry_count + 1, exhausted = 0, updated_at = ?
+             retry_count = retry_count + 1, exhausted = 0, updated_at = ?, finished_at = NULL
          WHERE task_id = ? AND state = 'failed'`,
       )
       .run(dispatchMessage, nowIso(), taskId);

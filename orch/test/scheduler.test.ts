@@ -5,7 +5,9 @@
  * - 纯函数：`depStateOf`（依赖三态）/ `computeReadyNodes`（同批就绪）/ `propagateBlocked`
  *   （传递闭包）/ `reduceConvergence`（收敛判定）；
  * - 调度器行为：同层整批并发派发、三层防重派、失败传播置 blocked + Feature failed、
- *   全 completed 自动 integrating、`recover()` 并行收敛语义。
+ *   全 completed 自动 integrating、`recover()` 并行收敛语义；
+ * - v0.5.0 D5 续派时序硬闸（T1–T4）：`pendingEvidence` 未清时 `all_completed` 不得推进
+ *   `integrating`（否则 re-arm 后的续派永久达不到）。
  *
  * 运行：`npm test`（先 `tsc` 构建，再 `node --test dist/test/`）。
  * 隔离：默认库固定 `:memory:`，每个用例先 `close()` 重置为空库。
@@ -16,12 +18,15 @@ import {
   close,
   createFeature,
   createTask,
+  EVENT_FEATURE_STATE,
   getFeature,
   getTask,
   listEvents,
   listFeatureTasks,
   markTaskExhausted,
   rearmForRetry,
+  setTaskNotBefore,
+  updateFeatureState,
   updateTaskState,
 } from "../session/store.js";
 import {
@@ -69,6 +74,10 @@ function task(
     text: null,
     prompt: null,
     updatedAt: "2026-01-01T00:00:00Z",
+    // v0.5.0 三时刻列：调度判定不消费它们，默认取中性值（老记录形态 = 全 NULL）
+    createdAt: null,
+    startedAt: null,
+    finishedAt: null,
     featureId: "f1",
     dependencies,
     inputArtifacts: null,
@@ -1023,4 +1032,185 @@ test("等回收门⑥：探测不在 dispatch 内 await ⇒ drain() 不被长门
   const drained = await scheduler.drain(50);
   assert.equal(drained, true, "门不占 dispatching/inFlightNodes ⇒ 立即可排空（不阻塞停机）");
   assert.ok(getTask("EV")?.notBefore !== null, "节点仍被挡（drain 不改变门）");
+});
+
+// ---------------------------------------------------------------------------
+// v0.5.0 D5：续派时序硬闸（`hasPendingEvidenceDecision`）
+//
+// ⚠️ 本组用例**必须走真实 infra 路径**填 `pendingEvidence`：`updateTaskState("A","failed")`
+//    → `notifyTaskSettled(infra)`，并由 stub **真建取证节点**（镜像 `index.ts:registerEvidenceNode`：
+//    建节点 + `markEvidenceMessage` 角色标记 + `setTaskNotBefore` 初始挡板）。
+//    既有 helper `seedPendingEvidence`（上方）**只建节点、不填 map** ⇒ 用它写本组用例会 **vacuous**
+//    （闸谓词的 `pendingEvidence.has(...)` 恒为假，闸根本不会触发）。
+// ---------------------------------------------------------------------------
+
+/** 取某 Feature 的 `feature.state` 事件（可按目标态过滤）——用于 kill-shot 的「事件数 = 0 / 恰 1」断言 */
+function featureStateEvents(
+  featureId: string,
+  state?: string,
+): Array<{ featureId: string | null; state: string | null }> {
+  return listEvents({ limit: 1000 })
+    .filter((e) => e.kind === EVENT_FEATURE_STATE && e.featureId === featureId)
+    .filter((e) => state === undefined || e.state === state)
+    .map((e) => ({ featureId: e.featureId, state: e.state }));
+}
+
+/**
+ * 镜像 `index.ts:registerEvidenceNode` 的**实质动作**：真建取证节点（含角色标记）+ 初始持久化挡板。
+ * 只记录不建节点的 stub 会让闸谓词的 `nodes.some(isEvidenceNode)` 恒为假 ⇒ 用例 vacuous。
+ */
+function realRegisterEvidenceNode(featureId: string, failedTaskId: string): void {
+  const failed = getTask(failedTaskId);
+  assert.ok(failed !== null, "取证登记时失败节点必须已在库（镜像 index.ts 的前置检查）");
+  const message = markEvidenceMessage("取证：跑 git status / diff / 门禁");
+  createTask({
+    taskId: "EV",
+    projectId: failed.projectId,
+    contextId: "ctx-ev",
+    state: "working",
+    prompt: message,
+    featureId,
+    dispatchMessage: message,
+  });
+  setTaskNotBefore("EV", new Date(Date.now() + EVIDENCE_POLL_MS).toISOString());
+}
+
+/**
+ * 用**公开入口**造「A 以 infra 失败 ⇒ 取证节点已登记」场景（= 闸的前置条件）。
+ * `notifyTaskSettled` 的 infra 分支会真实执行 `markTaskExhausted` + `pendingEvidence.set`
+ * + `registerEvidenceNode`（stub 真建节点）；**不** 走私有 map 直写。
+ */
+function seedRealInfraEvidence(featureId: string, scheduler: FeatureScheduler): void {
+  close();
+  createFeature({ featureId, title: "D5 续派时序", state: "executing" });
+  createTask({
+    taskId: "A",
+    projectId: "p1",
+    contextId: "ctx-A",
+    state: "working",
+    featureId,
+    dispatchMessage: "原始任务内容",
+  });
+  updateTaskState("A", "failed", null, INFRA_TEXT);
+  scheduler.notifyTaskSettled(featureId, "A", { state: "failed", text: INFRA_TEXT });
+}
+
+test("T1（D5 主场景 · push 先行形状）：决策未落时不得 integrating；决策 retry 后续派", async () => {
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    registerEvidenceNode: (featureId, failedTaskId) => realRegisterEvidenceNode(featureId, failedTaskId),
+    resolveEvidence: () => ({ stable: true, d: ["src/a.ts"], r: ["src/b.ts"], gatesOk: false }),
+  });
+  seedRealInfraEvidence("f-d5-t1", scheduler);
+
+  // 前置证据：真实 infra 路径确实生效（否则本组用例 vacuous）
+  assert.equal(getTask("A")?.exhausted, true, "infra 分支必须已中性化（map 的写入路径）");
+  assert.equal(getTask("A")?.state, "failed", "中性化不改写 state");
+  const ev = getTask("EV");
+  assert.ok(ev !== null, "取证节点已由 stub 真建出（镜像 index.ts 的登记动作）");
+  assert.equal(ev.state, "working", "登记时取证节点为待派发 working");
+  assert.equal(isEvidenceNode(ev), true, "角色标记随消息落库 ⇒ 闸谓词第 ② 条成立");
+
+  // 第 1 步：模拟 push 先行，把取证节点预写为 completed（= 收敛会提前成立的 D5 形状）
+  updateTaskState("EV", "completed");
+  scheduler.kick();
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(
+    getFeature("f-d5-t1")?.state,
+    "executing",
+    "kill-shot：存在待决策取证流 ⇒ all_completed 必须被闸拦下（否则续派永不可达）",
+  );
+  assert.equal(featureStateEvents("f-d5-t1", "integrating").length, 0, "不得推进 integrating");
+  assert.equal(featureStateEvents("f-d5-t1", "failed").length, 0, "也不得被判 failed");
+
+  // 第 2 步：看护 settle 取证节点 ⇒ 决策 retry ⇒ 同 ctx 续派
+  scheduler.notifyTaskSettled("f-d5-t1", "EV", { state: "completed", text: "done" });
+  await new Promise((r) => setImmediate(r));
+
+  const retries = taskRetryEvents();
+  assert.equal(retries.length, 1, "恰好 1 条 task.retry（续派 kill-shot）");
+  assert.equal(retries[0]?.taskId, "A");
+  const a = getTask("A");
+  assert.equal(a?.state, "working", "re-arm 后节点回到 working（可被 tick 续派）");
+  assert.equal(a?.retryCount, 1, "retry_count 自增 1");
+  assert.equal(a?.remoteTaskId, null, "清远端 id 以便续派");
+  assert.equal(getFeature("f-d5-t1")?.state, "executing", "重试在飞，Feature 保持 executing");
+});
+
+test("T2（settle 穿闸收口）：闸不挡合法 integrating（恰 1 条）", async () => {
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    registerEvidenceNode: (featureId, failedTaskId) => realRegisterEvidenceNode(featureId, failedTaskId),
+    resolveEvidence: () => ({ stable: true, d: ["x"], r: [], gatesOk: true }),
+  });
+  seedRealInfraEvidence("f-d5-t2", scheduler);
+
+  updateTaskState("EV", "completed");
+  scheduler.kick();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(getFeature("f-d5-t2")?.state, "executing", "决策未落 ⇒ 仍被闸拦下");
+  assert.equal(featureStateEvents("f-d5-t2", "integrating").length, 0);
+
+  scheduler.notifyTaskSettled("f-d5-t2", "EV", { state: "completed", text: "ok" });
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(
+    getFeature("f-d5-t2")?.state,
+    "integrating",
+    "settle 出口已清 map ⇒ 合法 integrating 不得被闸误挡",
+  );
+  assert.equal(featureStateEvents("f-d5-t2", "integrating").length, 1, "恰 1 条");
+  assert.equal(taskRetryEvents().length, 0, "settle 分支不写 task.retry");
+});
+
+test("T3（needs_input 出口清 map / 防死锁 · 锁 A2-1）：回到 executing 后必须能 integrating", async () => {
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    registerEvidenceNode: (featureId, failedTaskId) => realRegisterEvidenceNode(featureId, failedTaskId),
+    resolveEvidence: () => null,
+  });
+  seedRealInfraEvidence("f-d5-t3", scheduler);
+
+  updateTaskState("EV", "completed");
+  scheduler.notifyTaskSettled("f-d5-t3", "EV", { state: "completed", text: "done" });
+  assert.equal(getFeature("f-d5-t3")?.state, "needs_input", "无证据 ⇒ 交人");
+
+  // 澄清补齐后回到 executing（宿主 advance(to=executing, answer=…) 的等价形态）
+  updateFeatureState("f-d5-t3", "executing");
+  scheduler.kick();
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(
+    getFeature("f-d5-t3")?.state,
+    "integrating",
+    "若「交人」出口未清 map ⇒ 闸继续拦 ⇒ 永久停 executing（本用例即红）",
+  );
+  assert.equal(featureStateEvents("f-d5-t3", "integrating").length, 1);
+});
+
+test("T4（无取证节点负例 · 锁 A2-3 结构锚）：map 有条目但无取证节点 ⇒ 不得误困 executing", async () => {
+  // ⚠️ 刻意**不注入** registerEvidenceNode：map 会被填，但**不会**建出取证节点
+  const scheduler = new FeatureScheduler({ dispatch: async () => ({ ok: true }) });
+  close();
+  createFeature({ featureId: "f-d5-t4", title: "无取证节点", state: "executing" });
+  createTask({ taskId: "A", projectId: "p1", contextId: "c1", state: "working", featureId: "f-d5-t4" });
+  createTask({ taskId: "B", projectId: "p1", contextId: "c1", state: "completed", featureId: "f-d5-t4" });
+
+  updateTaskState("A", "failed", null, INFRA_TEXT);
+  scheduler.notifyTaskSettled("f-d5-t4", "A", { state: "failed", text: INFRA_TEXT });
+  assert.equal(getTask("A")?.exhausted, true, "infra 分支仍会中性化并填 map");
+  const a = getTask("A");
+  assert.ok(a !== null, "A 必须存在");
+  assert.equal(isEvidenceNode(a), false, "A 不是取证节点（结构锚：节点集内无取证节点）");
+
+  scheduler.kick();
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(
+    getFeature("f-d5-t4")?.state,
+    "integrating",
+    "裸 `has(map)` 会误困 executing ⇒ 谓词必须同时要求 nodes.some(isEvidenceNode)",
+  );
+  assert.equal(featureStateEvents("f-d5-t4", "integrating").length, 1);
 });
