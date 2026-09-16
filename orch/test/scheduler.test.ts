@@ -7,7 +7,10 @@
  * - 调度器行为：同层整批并发派发、三层防重派、失败传播置 blocked + Feature failed、
  *   全 completed 自动 integrating、`recover()` 并行收敛语义；
  * - v0.5.0 D5 续派时序硬闸（T1–T4）：`pendingEvidence` 未清时 `all_completed` 不得推进
- *   `integrating`（否则 re-arm 后的续派永久达不到）。
+ *   `integrating`（否则 re-arm 后的续派永久达不到）；
+ * - v0.5.1 D2 + D1 收口（T5–T11）：failed 取证节点豁免（不 `failFeature`）、四处「出口即清」、
+ *   兜底扫描（回调永不达 ⇒ 交人）、静默路径留痕（`transition_skipped` / `pending_evidence_discarded`）、
+ *   ⑦ 路径留痕的有痕 / 无痕对偶（T10 / T11，N1′ / N2′）。
  *
  * 运行：`npm test`（先 `tsc` 构建，再 `node --test dist/test/`）。
  * 隔离：默认库固定 `:memory:`，每个用例先 `close()` 重置为空库。
@@ -34,6 +37,8 @@ import {
   EVIDENCE_POLL_MS,
   EVIDENCE_READY_STREAK,
   EVIDENCE_WAIT_MAX_MS,
+  EVENT_FEATURE_TRANSITION_SKIPPED,
+  EVENT_PENDING_EVIDENCE_DISCARDED,
   EVENT_TASK_RETRY,
   FeatureScheduler,
   MAX_RETRY,
@@ -43,8 +48,10 @@ import {
   decideEvidenceOutcome,
   depStateOf,
   isEvidenceNode,
+  isExemptFromFailure,
   isLocalTerminalTask,
   isNeutered,
+  isNeuteredSettled,
   isPastNotBefore,
   markEvidenceMessage,
   propagateBlocked,
@@ -1213,4 +1220,527 @@ test("T4（无取证节点负例 · 锁 A2-3 结构锚）：map 有条目但无�
     "裸 `has(map)` 会误困 executing ⇒ 谓词必须同时要求 nodes.some(isEvidenceNode)",
   );
   assert.equal(featureStateEvents("f-d5-t4", "integrating").length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// v0.5.1：D2（失败豁免）+ D1（留痕）+「出口即清」+ 兜底扫描（T5–T9）
+//
+// ⚠️ 反 vacuous 硬约束：凡断言涉及 `pendingEvidence`（D5-C 闸 / 出口即清 / 兜底清 map）的用例，
+//    一律经 `seedRealInfraEvidence`（**真实 infra 路径**：`updateTaskState(A,failed)` →
+//    `notifyTaskSettled(infra)` → `markTaskExhausted` + `pendingEvidence.set` + stub 真建取证节点）
+//    填充；**绝不**直写私有态。私有态读取（`pendingEvidenceSize`）**只读不写**。
+// ---------------------------------------------------------------------------
+
+/**
+ * 只读探针：调度器私有 `pendingEvidence` 的条目数（T6「出口即清」/ T7「兜底清 map」的断言用）。
+ * ⚠️ **仅读**：条目必须由真实 infra 路径填充（见 `seedRealInfraEvidence`），本探针不得直写。
+ */
+function pendingEvidenceSize(scheduler: FeatureScheduler): number {
+  return (scheduler as unknown as { pendingEvidence: Map<string, unknown> }).pendingEvidence.size;
+}
+
+/** 取指定 kind 的事件（可按 Feature 过滤），payload 已解析 —— T6/T8 的「恰一条 / 不写 feature.state」断言 */
+function eventsOfKind(
+  kind: string,
+  featureId?: string,
+): Array<{
+  featureId: string | null;
+  taskId: string | null;
+  state: string | null;
+  payload: Record<string, unknown>;
+}> {
+  return listEvents({ limit: 1000 })
+    .filter((e) => e.kind === kind)
+    .filter((e) => featureId === undefined || e.featureId === featureId)
+    .map((e) => ({
+      featureId: e.featureId,
+      taskId: e.taskId,
+      state: e.state,
+      payload: JSON.parse(e.payload ?? "{}") as Record<string, unknown>,
+    }));
+}
+
+/** 取 ⑥b 的「待决策被丢弃」事件（`feature.pending_evidence_discarded`） */
+function discardedEvents(featureId: string): ReturnType<typeof eventsOfKind> {
+  return eventsOfKind(EVENT_PENDING_EVIDENCE_DISCARDED, featureId);
+}
+
+test("T5（D2 核心）：failed 取证节点不再 failFeature —— 终局 needs_input，且无 feature.state=failed", async () => {
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    registerEvidenceNode: (featureId, failedTaskId) =>
+      realRegisterEvidenceNode(featureId, failedTaskId),
+    resolveEvidence: () => null,
+  });
+  seedRealInfraEvidence("f-n3-t5", scheduler);
+
+  // 非 vacuous 前置：真实 infra 路径已生效（中性化落库 + map 有条目 + 取证节点真建出）
+  assert.equal(getTask("A")?.exhausted, true, "infra 分支必须已中性化");
+  const ev = getTask("EV");
+  assert.ok(ev !== null, "取证节点已由 stub 真建出（镜像 index.ts 的登记动作）");
+  assert.equal(isEvidenceNode(ev), true, "角色标记随消息落库");
+  assert.equal(
+    pendingEvidenceSize(scheduler),
+    1,
+    "前置：真实 infra 路径已填 map（否则闸 / D2 断言恒真 = 陪跑）",
+  );
+
+  // 取证节点自身失败（回调到达 = `notifyTaskSettled` 的 failed + 取证分支）
+  updateTaskState("EV", "failed", null, INFRA_TEXT);
+  scheduler.notifyTaskSettled("f-n3-t5", "EV", { state: "failed", text: INFRA_TEXT });
+
+  // D2 核心：豁免 ⇒ 不 failFeature；终局是「被问」（needs_input），不是闷声 failed
+  assert.notEqual(getFeature("f-n3-t5")?.state, "failed", "failed 取证节点不得连坐 Feature");
+  assert.equal(getFeature("f-n3-t5")?.state, "needs_input", "终局 = 交人");
+  assert.equal(featureStateEvents("f-n3-t5", "failed").length, 0, "全程不得出现 feature.state=failed");
+  assert.equal(pendingEvidenceSize(scheduler), 0, "取证失败出口 = 决策本体 ⇒ 先清 map（I1）");
+
+  // D2 谓词 kill-shot（判定层）：谓词改回裸 `isNeuteredSettled` ⇒ 下面两行同时变红
+  const snapshot = listFeatureTasks("f-n3-t5", { limit: 1000 });
+  assert.equal(
+    reduceConvergence(snapshot).kind,
+    "all_completed",
+    "D2：failed 取证节点在收敛中豁免 ⇒ 不再判 failed（改回 isNeuteredSettled 即变红）",
+  );
+  assert.equal(
+    snapshot.filter((n) => n.state === "failed" && !isExemptFromFailure(n)).length,
+    0,
+    "D2：failedIds 不得含被豁免的失败节点（否则会对它 propagateFailure）",
+  );
+  const evFailed = getTask("EV");
+  assert.ok(evFailed !== null);
+  assert.equal(isExemptFromFailure(evFailed), true, "证据臂：取证节点 + state=failed ⇒ 豁免");
+
+  // 引擎不会被后续 tick 推翻（pre-fix 的「D1 静默 → 下个 tick failFeature」路径已封死）
+  scheduler.kick();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(getFeature("f-n3-t5")?.state, "needs_input", "tick 后仍 needs_input（不卡 executing、不变 failed）");
+  assert.equal(featureStateEvents("f-n3-t5", "failed").length, 0);
+});
+
+test("T6（出口即清 / I1）：四处出口执行后 map 无条目 ⇒ 人工恢复后仍可 integrating（不被 D5-C 闸永久拦下）", async () => {
+  const seedScheduler = (): FeatureScheduler =>
+    new FeatureScheduler({
+      dispatch: async () => ({ ok: true }),
+      registerEvidenceNode: (featureId, failedTaskId) =>
+        realRegisterEvidenceNode(featureId, failedTaskId),
+    });
+
+  // 出口①：取证节点自身失败（`notifyTaskSettled` 的 failed + 取证分支）
+  {
+    const scheduler = seedScheduler();
+    seedRealInfraEvidence("f-n3-t6a", scheduler);
+    assert.equal(pendingEvidenceSize(scheduler), 1, "前置：真实 infra 路径已填 map");
+
+    updateTaskState("EV", "failed", null, INFRA_TEXT);
+    scheduler.notifyTaskSettled("f-n3-t6a", "EV", { state: "failed", text: INFRA_TEXT });
+    assert.equal(getFeature("f-n3-t6a")?.state, "needs_input");
+    assert.equal(pendingEvidenceSize(scheduler), 0, "出口①：执行后 map 无条目（I1）");
+    assert.equal(discardedEvents("f-n3-t6a").length, 0, "出口①是决策本体 ⇒ **不写** ⑥b 丢弃事件");
+
+    // 人工恢复（等价形态）：处置掉失败取证节点 + 回到 executing ⇒ 必须能 integrating
+    updateTaskState("EV", "completed");
+    updateFeatureState("f-n3-t6a", "executing");
+    scheduler.kick();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(
+      getFeature("f-n3-t6a")?.state,
+      "integrating",
+      "出口①未清 map ⇒ 闸拦下 ⇒ 永久卡 executing",
+    );
+  }
+
+  // 出口②：任务 input-required（`notifyTaskSettled`）
+  {
+    const scheduler = seedScheduler();
+    seedRealInfraEvidence("f-n3-t6b", scheduler);
+    assert.equal(pendingEvidenceSize(scheduler), 1);
+    createTask({
+      taskId: "T2",
+      projectId: "p1",
+      contextId: "c1",
+      state: "input-required",
+      featureId: "f-n3-t6b",
+    });
+
+    scheduler.notifyTaskSettled("f-n3-t6b", "T2", { state: "input-required", text: "请澄清" });
+    assert.equal(getFeature("f-n3-t6b")?.state, "needs_input");
+    assert.equal(pendingEvidenceSize(scheduler), 0, "出口②：执行后 map 无条目（I1）");
+    const discarded = discardedEvents("f-n3-t6b");
+    assert.equal(discarded.length, 1, "⑥b：条目实际存在过 ⇒ 恰一条丢弃留痕");
+    assert.equal(discarded[0]?.payload["code"], "pending_evidence_discarded");
+    assert.equal(discarded[0]?.payload["site"], "notifyTaskSettled");
+    assert.equal(discarded[0]?.taskId, "A", "taskId = 被丢弃条目的 failedTaskId");
+    assert.equal(discarded[0]?.state, null, "实际态由 feature.state 承载 ⇒ 本事件 state 列写 null");
+
+    updateTaskState("T2", "completed");
+    updateTaskState("EV", "completed");
+    updateFeatureState("f-n3-t6b", "executing");
+    scheduler.kick();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(
+      getFeature("f-n3-t6b")?.state,
+      "integrating",
+      "出口②未清 map ⇒ 闸拦下 ⇒ 永久卡 executing",
+    );
+  }
+
+  // 出口③：收敛交人（`advanceExecuting` 的 needs_input 分支）
+  {
+    const scheduler = seedScheduler();
+    seedRealInfraEvidence("f-n3-t6c", scheduler);
+    assert.equal(pendingEvidenceSize(scheduler), 1);
+    updateTaskState("EV", "completed"); // 取证节点已终态（决策尚未落）
+    createTask({
+      taskId: "T2",
+      projectId: "p1",
+      contextId: "c1",
+      state: "input-required",
+      featureId: "f-n3-t6c",
+    });
+
+    scheduler.kick();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(getFeature("f-n3-t6c")?.state, "needs_input", "收敛交人出口");
+    assert.equal(pendingEvidenceSize(scheduler), 0, "出口③：执行后 map 无条目（I1）");
+    const discarded = discardedEvents("f-n3-t6c");
+    assert.equal(discarded.length, 1, "⑥b：恰一条丢弃留痕");
+    assert.equal(discarded[0]?.payload["site"], "reduceConvergence");
+
+    updateTaskState("T2", "completed");
+    updateFeatureState("f-n3-t6c", "executing");
+    scheduler.kick();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(
+      getFeature("f-n3-t6c")?.state,
+      "integrating",
+      "出口③未清 map ⇒ 闸拦下 ⇒ 永久卡 executing",
+    );
+  }
+
+  // 出口④：取证派发失败（`advanceExecuting` 的派发失败 + 取证分支）
+  {
+    const scheduler = new FeatureScheduler({
+      dispatch: async () => ({ ok: false, error: "ensure 超时" }),
+      registerEvidenceNode: (featureId, failedTaskId) =>
+        realRegisterEvidenceNode(featureId, failedTaskId),
+      probeProjectReady: () => ({ ready: true, reason: "offline" }),
+      evidencePollMs: 1,
+    });
+    seedRealInfraEvidence("f-n3-t6d", scheduler);
+    assert.equal(pendingEvidenceSize(scheduler), 1);
+
+    scheduler.kick(); // 门：streak=1 ⇒ 仍挡
+    await gateSleep(5);
+    scheduler.kick(); // 门：streak=2 ⇒ 放行 ⇒ 派发 ⇒ 失败
+    await gateSleep(5);
+
+    assert.equal(getFeature("f-n3-t6d")?.state, "needs_input", "取证派发失败 ⇒ 交人");
+    assert.equal(pendingEvidenceSize(scheduler), 0, "出口④：执行后 map 无条目（I1）");
+    assert.equal(discardedEvents("f-n3-t6d").length, 0, "出口④是决策本体 ⇒ **不写** ⑥b");
+
+    updateTaskState("EV", "completed");
+    updateFeatureState("f-n3-t6d", "executing");
+    scheduler.kick();
+    await new Promise((r) => setImmediate(r));
+    assert.equal(
+      getFeature("f-n3-t6d")?.state,
+      "integrating",
+      "出口④未清 map ⇒ 闸拦下 ⇒ 永久卡 executing",
+    );
+  }
+});
+
+test("T7（兜底扫描）：只写 updateTaskState(EV,failed)、不调 notifyTaskSettled ⇒ tick 后 needs_input + map 清空", async () => {
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    registerEvidenceNode: (featureId, failedTaskId) =>
+      realRegisterEvidenceNode(featureId, failedTaskId),
+  });
+  seedRealInfraEvidence("f-n3-t7", scheduler);
+  assert.equal(pendingEvidenceSize(scheduler), 1, "前置：真实 infra 路径已填 map");
+  const ev = getTask("EV");
+  assert.ok(ev !== null, "取证节点已真建出");
+  assert.equal(isEvidenceNode(ev), true);
+
+  // 模拟「回调永不达」：只把取证节点写为 raw failed，**不调** notifyTaskSettled
+  updateTaskState("EV", "failed", null, INFRA_TEXT);
+  assert.equal(pendingEvidenceSize(scheduler), 1, "无回调 ⇒ map 仍停留（正因如此才需要兜底扫描）");
+
+  scheduler.kick();
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(
+    getFeature("f-n3-t7")?.state,
+    "needs_input",
+    "兜底扫描：failed 取证节点 ⇒ 交人（不 failed、不卡 executing）",
+  );
+  assert.equal(featureStateEvents("f-n3-t7", "failed").length, 0, "D2 豁免 + 兜底交人 ⇒ 不得判 failed");
+  assert.equal(getTask("EV")?.state, "failed", "兜底扫描不改写节点态");
+  assert.equal(pendingEvidenceSize(scheduler), 0, "兜底出口同样清 map（I1）");
+
+  // 反 vacuous / 不卡死：人工处置取证节点后回到 executing ⇒ 不被 D5-C 闸拦下
+  updateTaskState("EV", "completed");
+  updateFeatureState("f-n3-t7", "executing");
+  scheduler.kick();
+  await new Promise((r) => setImmediate(r));
+  assert.equal(
+    getFeature("f-n3-t7")?.state,
+    "integrating",
+    "兜底未清 map ⇒ 闸拦下 ⇒ 永久卡 executing",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// v0.5.1 收口增补：⑦ 路径留痕的**有痕 / 无痕对偶**（N1′ 改动 + N2′ 断言）
+//
+// ⑦ = `advanceExecuting` 的**兜底扫描**（T7 已锁「必然交人 + 清 map」）；本节补的是
+// `discardPendingEvidence(featureId, "advanceExecuting", …)` 的**留痕判据**：
+//   - 有痕（T10）：**有待决策取证流**（`pendingEvidence` 有条目）⇒ 丢弃**未决**流必须留痕（不变量 I3）；
+//   - 无痕（T11）：**无条目** ⇒ 不得凭空补一条（否则每次 ⑦ 交人都刷噪声，掩盖真实丢弃）。
+// ⚠️ 同 T5–T7 的**反 vacuous 硬约束**：map 一律经真实 infra 路径填充（`seedRealInfraEvidence`），
+//    逐个用例前置断言 `pendingEvidenceSize` 取 1 / 0。
+// ---------------------------------------------------------------------------
+
+test("T10（⑦-有痕 / N1′）：兜底扫描交人时丢弃未决取证流 ⇒ 恰一条 pending_evidence_discarded（site=advanceExecuting）", async () => {
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    registerEvidenceNode: (featureId, failedTaskId) =>
+      realRegisterEvidenceNode(featureId, failedTaskId),
+  });
+  seedRealInfraEvidence("f-n3-t10", scheduler);
+
+  // 非 vacuous 前置：真实 infra 路径已填「未决取证流」，且本 Feature 尚无任何丢弃留痕
+  assert.equal(pendingEvidenceSize(scheduler), 1, "前置：真实 infra 路径已填 map（否则本用例恒真 = 陪跑）");
+  const ev = getTask("EV");
+  assert.ok(ev !== null, "取证节点已真建出（镜像 index.ts 的登记动作）");
+  assert.equal(isEvidenceNode(ev), true, "角色标记随消息落库 ⇒ ⑦ 谓词成立");
+  assert.equal(discardedEvents("f-n3-t10").length, 0, "前置：kick 之前无任何 ⑥b 留痕");
+
+  // ⑦ 路径：只把取证节点 raw 写为 failed、**不调** `notifyTaskSettled`（模拟「回调永不达」）
+  updateTaskState("EV", "failed", null, INFRA_TEXT);
+  assert.equal(pendingEvidenceSize(scheduler), 1, "无回调 ⇒ map 仍停留（正因如此才有「未决流可丢弃」）");
+
+  scheduler.kick();
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(getFeature("f-n3-t10")?.state, "needs_input", "兜底扫描：交人");
+  const discarded = discardedEvents("f-n3-t10");
+  assert.equal(
+    discarded.length,
+    1,
+    "⑦-有痕：条目实际存在过 ⇒ 恰一条丢弃留痕（N1′：此处**必须写**，否则丢弃未决流无痕 = 违反 I3）",
+  );
+  assert.equal(discarded[0]?.payload["code"], "pending_evidence_discarded");
+  assert.equal(
+    discarded[0]?.payload["site"],
+    "advanceExecuting",
+    "site 三值枚举的「兜底扫描交人」取值（与 notifyTaskSettled / reduceConvergence 区分）",
+  );
+  assert.equal(discarded[0]?.taskId, "A", "taskId = 被丢弃条目的 failedTaskId");
+  assert.equal(discarded[0]?.state, null, "实际态由 feature.state 承载 ⇒ 本事件 state 列写 null");
+  assert.equal(getTask("EV")?.state, "failed", "兜底扫描不改写节点态（交人 ≠ 抹掉失败事实）");
+  assert.equal(pendingEvidenceSize(scheduler), 0, "兜底出口同样清 map（I1）");
+});
+
+test("T11（⑦-无痕）：⑦ 路径上 pendingEvidence 无条目 ⇒ 不写 pending_evidence_discarded（避免噪声）", async () => {
+  // 场景：节点集内存在 **failed 的取证节点**（⑦ 谓词成立），但本 Feature **无未决取证流**（map 空）
+  // ⇒ 兜底扫描仍应交人，只是「无条目可丢弃」⇒ 不得凭空补一条丢弃留痕。
+  close();
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    registerEvidenceNode: (featureId, failedTaskId) =>
+      realRegisterEvidenceNode(featureId, failedTaskId),
+  });
+  createFeature({ featureId: "f-n3-t11", title: "⑦无痕", state: "executing" });
+  createTask({
+    taskId: "A",
+    projectId: "p1",
+    contextId: "ctx-A",
+    state: "working",
+    featureId: "f-n3-t11",
+    dispatchMessage: "原始任务内容",
+  });
+  updateTaskState("A", "failed", null, INFRA_TEXT); // 非中性化失败节点（⑦ 的判别信号：若走收敛必判 failed）
+  realRegisterEvidenceNode("f-n3-t11", "A"); // 真建取证节点（镜像 index.ts 的登记动作）
+  updateTaskState("EV", "failed", null, INFRA_TEXT);
+
+  // 非 vacuous 前置：⑦ 谓词的第 ① 条（failed 取证节点）成立，第 ② 条（map 有条目）**不**成立
+  assert.equal(pendingEvidenceSize(scheduler), 0, "前置：本场景未决取证流为空（否则断言的是别的路径）");
+  const ev = getTask("EV");
+  assert.ok(ev !== null, "取证节点已真建出");
+  assert.equal(isEvidenceNode(ev), true, "角色标记随消息落库");
+  assert.equal(ev.state, "failed", "取证节点已 raw failed");
+  assert.equal(discardedEvents("f-n3-t11").length, 0);
+
+  scheduler.kick();
+  await new Promise((r) => setImmediate(r));
+
+  // ⑦ 分支先于收敛判定：若无兜底扫描，本场景 A 为非豁免失败 ⇒ 收敛判 `failed`（本断言即红）
+  assert.equal(
+    getFeature("f-n3-t11")?.state,
+    "needs_input",
+    "兜底扫描仍交人（先于收敛判定；证明走的是 ⑦ 分支而非收敛）",
+  );
+  assert.equal(featureStateEvents("f-n3-t11", "failed").length, 0, "不得判 failed");
+  assert.equal(pendingEvidenceSize(scheduler), 0, "无条目 ⇒ 出口后仍为空（I1）");
+  assert.equal(
+    discardedEvents("f-n3-t11").length,
+    0,
+    "⑦-无痕：无条目 ⇒ **不写**丢弃事件（`discardPendingEvidence` 的 `undefined` 早退；写即噪声）",
+  );
+});
+
+test("T8（D1 留痕 / I3）：三处静默 return + 早退各恰一条 transition_skipped，且不产生 feature.state", async () => {
+  // ① 早退：Feature 不存在（`feature === null`）
+  {
+    close();
+    const scheduler = new FeatureScheduler({ dispatch: async () => ({ ok: true }) });
+    scheduler.notifyTaskSettled("f-n3-t8-absent", "T1", { state: "failed", text: "boom" });
+    const skipped = eventsOfKind(EVENT_FEATURE_TRANSITION_SKIPPED, "f-n3-t8-absent");
+    assert.equal(skipped.length, 1, "早退恰一条留痕");
+    assert.equal(skipped[0]?.payload["code"], "early_return_task_settled");
+    assert.equal(skipped[0]?.payload["from"], null);
+    assert.equal(skipped[0]?.taskId, "T1");
+    assert.equal(
+      skipped[0]?.state,
+      null,
+      "态没变 ⇒ events.state 必须为 null（写目标态会让按 state 过滤的消费者误判已交人）",
+    );
+  }
+
+  // ② 早退：Feature 已终态
+  {
+    close();
+    createFeature({ featureId: "f-n3-t8-term", title: "早退-终态", state: "completed" });
+    createTask({
+      taskId: "T1",
+      projectId: "p1",
+      contextId: "c1",
+      state: "working",
+      featureId: "f-n3-t8-term",
+    });
+    const scheduler = new FeatureScheduler({ dispatch: async () => ({ ok: true }) });
+    const before = featureStateEvents("f-n3-t8-term").length;
+    scheduler.notifyTaskSettled("f-n3-t8-term", "T1", { state: "failed", text: "boom" });
+    const skipped = eventsOfKind(EVENT_FEATURE_TRANSITION_SKIPPED, "f-n3-t8-term");
+    assert.equal(skipped.length, 1);
+    assert.equal(skipped[0]?.payload["code"], "early_return_task_settled");
+    assert.equal(skipped[0]?.payload["from"], "completed");
+    assert.equal(getFeature("f-n3-t8-term")?.state, "completed", "早退不改态");
+    assert.equal(
+      featureStateEvents("f-n3-t8-term").length,
+      before,
+      "skip 路径不得写 feature.state（I4 对偶：有 feature.state ⇔ 态真变了）",
+    );
+  }
+
+  // ③ already_needs_input（第二次交人）
+  {
+    close();
+    createFeature({ featureId: "f-n3-t8-ni", title: "已交人", state: "executing" });
+    createTask({
+      taskId: "T2",
+      projectId: "p1",
+      contextId: "c1",
+      state: "working",
+      featureId: "f-n3-t8-ni",
+    });
+    const scheduler = new FeatureScheduler({ dispatch: async () => ({ ok: true }) });
+    scheduler.notifyTaskSettled("f-n3-t8-ni", "T2", { state: "input-required", text: "请澄清" });
+    assert.equal(getFeature("f-n3-t8-ni")?.state, "needs_input", "第一次：合法流转（有 feature.state）");
+    const before = featureStateEvents("f-n3-t8-ni").length;
+
+    scheduler.notifyTaskSettled("f-n3-t8-ni", "T2", { state: "input-required", text: "再澄清" });
+    const skipped = eventsOfKind(EVENT_FEATURE_TRANSITION_SKIPPED, "f-n3-t8-ni");
+    assert.equal(skipped.length, 1, "第二次（已 needs_input）恰一条留痕");
+    assert.equal(skipped[0]?.payload["code"], "already_needs_input");
+    assert.equal(featureStateEvents("f-n3-t8-ni").length, before, "skip 路径不得写 feature.state");
+  }
+
+  // ④ illegal_transition（waiting_approval 的合法后继无 needs_input）
+  {
+    close();
+    createFeature({ featureId: "f-n3-t8-il", title: "非法流转", state: "waiting_approval" });
+    createTask({
+      taskId: "T3",
+      projectId: "p1",
+      contextId: "c1",
+      state: "working",
+      featureId: "f-n3-t8-il",
+    });
+    const scheduler = new FeatureScheduler({ dispatch: async () => ({ ok: true }) });
+    scheduler.notifyTaskSettled("f-n3-t8-il", "T3", { state: "input-required", text: "请澄清" });
+    const skipped = eventsOfKind(EVENT_FEATURE_TRANSITION_SKIPPED, "f-n3-t8-il");
+    assert.equal(skipped.length, 1);
+    assert.equal(skipped[0]?.payload["code"], "illegal_transition");
+    assert.equal(skipped[0]?.payload["from"], "waiting_approval");
+    assert.equal(getFeature("f-n3-t8-il")?.state, "waiting_approval", "非法流转不改态");
+    assert.equal(featureStateEvents("f-n3-t8-il").length, 0, "skip 路径不得写 feature.state");
+  }
+
+  // ⑤ feature_terminal：派发在飞期间 Feature 被并发置终态 ⇒ 派发失败出口的 needsInputFeature 命中终态分支
+  //    注：`feature_not_found`（`current === null`）在本仓**无 Feature 删除 API** ⇒ 测试内不可达（见报告）
+  {
+    close();
+    const scheduler = new FeatureScheduler({
+      dispatch: async () => {
+        updateFeatureState("f-n3-t8-ft", "failed"); // 受控模拟「派发在飞期间被并发判终态」
+        return { ok: false, error: "ensure 超时" };
+      },
+      registerEvidenceNode: (featureId, failedTaskId) =>
+        realRegisterEvidenceNode(featureId, failedTaskId),
+      probeProjectReady: () => ({ ready: true, reason: "offline" }),
+      evidencePollMs: 1,
+    });
+    seedRealInfraEvidence("f-n3-t8-ft", scheduler);
+    scheduler.kick(); // 门：streak=1 ⇒ 仍挡
+    await gateSleep(5);
+    scheduler.kick(); // 门：streak=2 ⇒ 放行 ⇒ 派发 ⇒ 期间置终态 ⇒ 派发失败出口
+    await gateSleep(5);
+
+    const skipped = eventsOfKind(EVENT_FEATURE_TRANSITION_SKIPPED, "f-n3-t8-ft");
+    assert.equal(skipped.length, 1, "feature_terminal 恰一条留痕");
+    assert.equal(skipped[0]?.payload["code"], "feature_terminal");
+    assert.equal(getFeature("f-n3-t8-ft")?.state, "failed", "终态不被改写");
+    assert.equal(
+      featureStateEvents("f-n3-t8-ft", "needs_input").length,
+      0,
+      "skip 路径不得写 feature.state=needs_input",
+    );
+  }
+});
+
+test("T9（语义差异回归 · isNeutered vs isNeuteredSettled）：input-required 的取证节点仍走 needs_input", () => {
+  // ① 纯判定差异：同一节点（exhausted + input-required）上两谓词取值相反 ⇒ `:481` 必须用 `isNeutered`
+  const inputRequired = task("EV", "input-required", null, null, {
+    exhausted: true,
+    dispatchMessage: markEvidenceMessage("取证"),
+  });
+  assert.equal(isNeutered(inputRequired), true, "isNeutered = 「节点是否仍处于中性化状态」");
+  assert.equal(isNeuteredSettled(inputRequired), false, "isNeuteredSettled 自带 state==='failed' ⇒ 判「活跃」");
+  assert.equal(
+    reduceConvergence([task("A", "completed"), inputRequired]).kind,
+    "dispatch",
+    "合并为 isNeuteredSettled 会把仍中性化的节点误判为「待澄清」⇒ 此处变 needs_input（本断言即红）",
+  );
+
+  // ② 运行期：input-required 的取证节点不得被当成 completed / 交 tick 收口 ⇒ Feature needs_input
+  close();
+  createFeature({ featureId: "f-n3-t9", title: "语义差异", state: "executing" });
+  createTask({ taskId: "A", projectId: "p1", contextId: "c1", state: "completed", featureId: "f-n3-t9" });
+  createTask({
+    taskId: "EV",
+    projectId: "p1",
+    contextId: "c1",
+    state: "working",
+    featureId: "f-n3-t9",
+    dispatchMessage: markEvidenceMessage("取证"),
+  });
+  const scheduler = new FeatureScheduler({ dispatch: async () => ({ ok: true }) });
+  scheduler.notifyTaskSettled("f-n3-t9", "EV", { state: "input-required", text: "请澄清" });
+
+  assert.equal(isEvidenceNode(getTask("EV")!), true, "前置：EV 是取证节点");
+  assert.equal(getFeature("f-n3-t9")?.state, "needs_input", "input-required 的取证节点仍交人");
+  assert.equal(featureStateEvents("f-n3-t9", "integrating").length, 0, "不得被当成完成而 integrating");
 });

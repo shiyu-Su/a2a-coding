@@ -43,6 +43,7 @@ import {
   canTransition,
   isTerminalFeatureState,
 } from "../feature/state-machine.js";
+import { bridgeLog } from "./bridge-log.js";
 import type { CoreRole } from "../runtime/core-lease.js";
 import type { FailureKind, FeatureRecord, TaskRecord, TaskState } from "../types.js";
 
@@ -185,6 +186,43 @@ export const EVIDENCE_EVENT_KIND = "task.evidence";
  * **只在 `handleEvidenceSettled` 的 retry 分支写一条**（settle / needs_input / fail 均不写）。
  */
 export const EVENT_TASK_RETRY = "task.retry";
+
+/**
+ * **状态流转被跳过**的事件 kind（v0.5.1 D1）。
+ *
+ * 触发点 = `needsInputFeature` 的**三处静默 `return false`**（`feature_not_found` /
+ * `already_needs_input` / `illegal_transition`，其中 `current === null` 与终态已拆行 ⇒ 五值
+ * 穷举）与 `notifyTaskSettled` 的 Feature 早退（`early_return_task_settled`）⇒ 「静默死信」
+ * 从零留痕变为**必有痕**。
+ *
+ * ⚠️ **不变量：态没变** ⇒ `events.state` 列**必须写 `null`**（该列语义 = 「**实际**流转后的态」；
+ * 写目标态会与「态没变」矛盾，且按 `state` 过滤的消费者会**误判 Feature 已交人**）。目标态放
+ * `payload.to`。
+ * ⚠️ 与 `feature.state`（由 `store.updateFeatureState` 在 CAS 成功且**态变化**时自动写 = **态确实
+ * 变了**）互补且互斥 ⇒ **跳过路径不得写 `feature.state`**。
+ * ⚠️ 常量随**发射模块**落此文件（先例 `EVIDENCE_EVENT_KIND` / `EVENT_TASK_RETRY`）⇒ `store.ts`
+ * 零改动。
+ */
+export const EVENT_FEATURE_TRANSITION_SKIPPED = "feature.transition_skipped";
+
+/**
+ * **「出口即清」丢弃留痕**的事件 kind（v0.5.1 ⑥b）。
+ *
+ * Feature 因「任务 `input-required`」（`notifyTaskSettled`）、「收敛交人」（`reduceConvergence`）
+ * 或「兜底扫描交人」（`advanceExecuting`，v0.5.1 N1′）而离开 `executing` 时，`pendingEvidence` 中的
+ * **未决取证流**被一并丢弃 ⇒ 必须留痕（否则一组已登记的待决策事实会**静默消失**）。
+ *
+ * ⚠️ **独立 kind，不得复用 {@link EVENT_FEATURE_TRANSITION_SKIPPED}**：后者不变量是「态没变」，
+ * 而本事件两个触发点的态**确实变了**（已交人）—— 塞进去会**击穿**「有 `feature.state` ⇒ 态真变了」
+ * 的对偶。
+ * ⚠️ **仅在「条目实际存在」时**写一条（`pendingEvidence.has(featureId)` 为真）；`taskId` = 被丢弃
+ * 条目里的 `failedTaskId`；`events.state` 列同样写 `null`。
+ * ⚠️ 留痕**不受** `needsInputFeature` 返回值影响（即便它因已 `needs_input` 而 `return false`，
+ * 丢弃事实仍须留痕）。
+ * ⚠️ 「取证节点失败」（`notifyTaskSettled` 的 `failed` + 取证分支）与「取证派发失败」两处「交人」
+ * **本身就是决策本体**、`feature.state` 已留痕 ⇒ **不写**本事件。
+ */
+export const EVENT_PENDING_EVIDENCE_DISCARDED = "feature.pending_evidence_discarded";
 
 function readPositiveIntEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -335,6 +373,27 @@ export function isNeuteredSettled(
 }
 
 /**
+ * **失败豁免判定**（v0.5.1 D2）：该节点**已落定的失败事实**可否在收敛判定 / 失败传播中豁免。
+ *
+ * 两条臂：① 已中性化（`exhausted` 的失败节点，由取证流接管）；② 取证节点自身失败
+ * （失败出路是**交人** `needs_input`，不是连坐整个 Feature）。
+ *
+ * ⚠️ **证据臂必须带 `state === "failed"`**（与 `isNeuteredSettled` 同因）：re-arm 后节点仍
+ * `exhausted` 但已回 `working`，此刻是**活跃节点**。不收窄 ⇒ `every()` 会把 `working` /
+ * `blocked` 的取证节点判为「已完成」⇒ `all_completed` **提前成立**，且 `blocked` 取证节点
+ * **掉出**兜底扫描（扫描只认 `failed`）。
+ *
+ * ⚠️ 与 `isNeutered`（判「节点**是否仍处于中性化状态**」）**不可合并**：本谓词判的是
+ * 「**已落定的失败事实可否豁免**」（要求 `state === "failed"`），二者在「已 re-arm 节点」上
+ * 取值**相反**。
+ */
+export function isExemptFromFailure(
+  node: Pick<TaskRecord, "exhausted" | "state" | "dispatchMessage" | "prompt">,
+): boolean {
+  return isNeuteredSettled(node) || (isEvidenceNode(node) && node.state === "failed");
+}
+
+/**
  * 可派时间门判定（v0.4.1 §2.3）：`notBefore` 为 NULL ⇒ 立即可派；否则需 `notBefore <= now`。
  * **无法解析的时间戳按「无门」处理**（不阻塞派发）：该值只由本单元写入（UTC ISO 8601），
  * 出现坏值时宁可派发，也不让一个坏值把 Feature 永久卡在 `executing`。
@@ -467,8 +526,8 @@ export type Convergence =
  * `integrating`，**Feature 永久卡在 `executing`**（最致命的一处）。
  */
 export function reduceConvergence(nodes: readonly TaskRecord[]): Convergence {
-  const failed = nodes.filter((n) => n.state === "failed" && !isNeuteredSettled(n)).length;
-  const blocked = nodes.filter((n) => n.state === "blocked" && !isNeuteredSettled(n)).length;
+  const failed = nodes.filter((n) => n.state === "failed" && !isExemptFromFailure(n)).length;
+  const blocked = nodes.filter((n) => n.state === "blocked" && !isExemptFromFailure(n)).length;
   if (failed > 0 || blocked > 0) {
     return {
       kind: "failed",
@@ -481,7 +540,7 @@ export function reduceConvergence(nodes: readonly TaskRecord[]): Convergence {
   if (nodes.some((n) => n.state === "input-required" && !isNeutered(n))) {
     return { kind: "needs_input", reason: "存在待澄清任务" };
   }
-  if (nodes.length > 0 && nodes.every((n) => n.state === "completed" || isNeuteredSettled(n))) {
+  if (nodes.length > 0 && nodes.every((n) => n.state === "completed" || isExemptFromFailure(n))) {
     return { kind: "all_completed" };
   }
   return { kind: "dispatch" };
@@ -613,12 +672,31 @@ export class FeatureScheduler {
     outcome: { state: TaskState; text: string | null },
   ): void {
     const feature = getFeature(featureId);
-    if (feature === null || isTerminalFeatureState(feature.state)) return;
+    if (feature === null || isTerminalFeatureState(feature.state)) {
+      // v0.5.1 D1（⑤）：早退留痕 —— `feature === null` 与 Feature 已终态**两种情形共用单 code**
+      // （**不拆行**：二者对调用方是同一件事「这个 Feature 不再能承接交人」）。
+      // `to` 写 `null`：本处**无单一目标态**（`failed` / `input-required` 本应 `needs_input`，
+      // `completed` 本应交给 tick 判 `integrating`）⇒ 意向写进 `detail`，不猜一个假目标态。
+      this.logTransitionSkipped({
+        site: "notifyTaskSettled.earlyReturn",
+        featureId,
+        taskId,
+        from: feature?.state ?? null,
+        to: null,
+        code: "early_return_task_settled",
+        detail: `任务 ${taskId} settle（${outcome.state}）时 Feature 不可承接（不存在或已终态）`,
+      });
+      return;
+    }
     const node = getTask(taskId);
     const isEvidence = node !== null && isEvidenceNode(node);
 
     if (outcome.state === "failed") {
       if (isEvidence) {
+        // 「出口即清」（v0.5.1 ⑥）：交人 = **决策本体** ⇒ 先无条件清 map（不变量 I1），否则人工
+        // 恢复后 D5-C 硬闸会永久拦下 `all_completed` ⇒ Feature 永久卡 `executing`（死锁）。
+        // 本处**不写** ⑥b 丢弃事件：决策本体已由 `feature.state` 留痕。
+        this.pendingEvidence.delete(feature.featureId);
         this.needsInputFeature(feature, `取证节点 ${taskId} 失败（按 §2.5 豁免直接交人）`);
         return;
       }
@@ -645,6 +723,13 @@ export class FeatureScheduler {
       return;
     }
     if (outcome.state === "input-required") {
+      // 「出口即清」+ 丢弃留痕（v0.5.1 ⑥ / ⑥b）：顺序 = **先 `delete` → 写事件 → `needsInputFeature`**
+      // （对齐 `handleEvidenceSettled` 既有出口）。留痕不受 `needsInputFeature` 返回值影响。
+      this.discardPendingEvidence(
+        feature.featureId,
+        "notifyTaskSettled",
+        `任务 ${taskId} 需人工澄清`,
+      );
       this.needsInputFeature(feature, `任务 ${taskId} 需人工澄清`);
       return;
     }
@@ -966,7 +1051,7 @@ export class FeatureScheduler {
     // 再触发传播 —— 否则下游被置 `blocked` ⇒ `depStateOf` 就算认了中性化也白费（下游永不可派发），
     // 且 blocked>0 会让 `reduceConvergence` 把 Feature 判 `failed`，中性化被整条击穿。
     const failedIds = nodes
-      .filter((n) => n.state === "failed" && !isNeutered(n))
+      .filter((n) => n.state === "failed" && !isExemptFromFailure(n))
       .map((n) => n.taskId);
     if (failedIds.length > 0) {
       let blockedAny = false;
@@ -976,12 +1061,38 @@ export class FeatureScheduler {
       if (blockedAny) nodes = listFeatureTasks(feature.featureId, { limit: 1000 });
     }
 
+    // v0.5.1（⑦）**兜底扫描**：`executing` 态下存在 **`failed` 的取证节点** ⇒ 交人。
+    // 覆盖「**回调永不达**」的悬挂面 —— 取证节点的失败出路只有 `notifyTaskSettled`（自身失败）与
+    // 「取证派发失败」两条，**都依赖回调到达**；无兜底时要么被误判 Feature `failed`（修 D2 前），
+    // 要么**永久卡 `executing`**（修 D2 后：节点被豁免 ⇒ 视作完成 ⇒ 被 D5-C 硬闸拦下，而 `tick`
+    // 只扫 `executing` ⇒ 无人再救）。
+    // ⚠️ 谓词**不认** `isNeuteredSettled`（豁免证据臂必须收窄到 `state === "failed"`，否则活跃
+    // 节点会被误判为「已完成」）；⚠️ **不得放进 `reduceConvergence`**（导出纯函数 + `pendingEvidence`
+    // 是实例私有进程内态 ⇒ 删除动作**结构上不可能**在纯函数内完成）；⚠️ **不新增独立 tick 循环**
+    // （`advanceExecuting` 已在每 Feature 每 tick 被调用 ⇒ 零新增调度面）。
+    // 顺序 = 先清 map（I1）→ 写 ⑥b 丢弃事件 → 交人 → return，走 {@link discardPendingEvidence}
+    // （v0.5.1 N1′）：与「收敛交人」同构。⚠️ 本处**必须写** ⑥b（`EVENT_PENDING_EVIDENCE_DISCARDED`）——
+    // 多次取证流场景下「兜底扫描交人」会丢弃**未决**取证流，无痕即违反不变量 I3（失败事实必有痕）。
+    // （与「取证节点失败」/「取证派发失败」两处**不同**：那两处「交人」本身就是决策本体、`feature.state`
+    // 已留痕 ⇒ 只 `delete`、不写本事件。）
+    if (nodes.some((n) => isEvidenceNode(n) && n.state === "failed")) {
+      this.discardPendingEvidence(
+        feature.featureId,
+        "advanceExecuting",
+        "兜底扫描：交人时丢弃待决策取证流",
+      );
+      this.needsInputFeature(feature, "取证节点失败：交人");
+      return;
+    }
+
     const convergence = reduceConvergence(nodes);
     if (convergence.kind === "failed") {
       this.failFeature(feature, convergence.reason);
       return;
     }
     if (convergence.kind === "needs_input") {
+      // 「出口即清」+ 丢弃留痕（v0.5.1 ⑥ / ⑥b）：顺序 = **先 `delete` → 写事件 → `needsInputFeature`**。
+      this.discardPendingEvidence(feature.featureId, "reduceConvergence", convergence.reason);
       this.needsInputFeature(feature, convergence.reason);
       return;
     }
@@ -1021,6 +1132,9 @@ export class FeatureScheduler {
           // 取证节点**派发失败**同样豁免（§4.1.8）：本不可达 ⇒ 交人，**不**置 failed / propagate /
           // failFeature（否则 Feature 直接终态，取证与拍板永不可达）。
           if (isEvidenceNode(node)) {
+            // 「出口即清」（v0.5.1 ⑥）：同 `notifyTaskSettled` 的取证失败分支 —— 交人 = **决策本体**
+            // ⇒ 先无条件清 map（I1），本处**不写** ⑥b 丢弃事件（`feature.state` 已留痕）。
+            this.pendingEvidence.delete(feature.featureId);
             this.needsInputFeature(feature, `取证节点 ${node.taskId} 派发失败：${reason}`);
             return;
           }
@@ -1073,12 +1187,130 @@ export class FeatureScheduler {
     return true;
   }
 
+  /**
+   * 记一条「**状态流转被跳过**」留痕（v0.5.1 D1 / I3）：`bridgeLog.warn` + 一条
+   * {@link EVENT_FEATURE_TRANSITION_SKIPPED}（`events.state` 列写 **`null`**，目标态放 `payload.to`）。
+   *
+   * **纯观测、无副作用**：不碰 `feature.state`（不变量 I4「`feature.state` 单写者」+ 与「态没变」
+   * 的互补性）⇒ 调用方各自保留原 `return false` / `return` 语义。
+   */
+  private logTransitionSkipped(args: {
+    site: string;
+    featureId: string;
+    taskId: string | null;
+    from: string | null;
+    to: string | null;
+    code: string;
+    detail: string;
+  }): void {
+    bridgeLog.warn(
+      "a2a-feature",
+      `Feature ${args.featureId} 状态流转跳过（${args.code}）：${args.detail}`,
+      { site: args.site, from: args.from, to: args.to, code: args.code },
+    );
+    appendEvent({
+      featureId: args.featureId,
+      taskId: args.taskId,
+      kind: EVENT_FEATURE_TRANSITION_SKIPPED,
+      state: null,
+      payload: JSON.stringify({
+        site: args.site,
+        from: args.from,
+        to: args.to,
+        code: args.code,
+        detail: args.detail,
+      }),
+    });
+  }
+
+  /**
+   * 「出口即清」+ 丢弃留痕（v0.5.1 ⑥ / ⑥b）：**先无条件** `delete(featureId)`（不变量 I1
+   * 「决策已落 ⇔ `pendingEvidence` 无条目」），再**仅在条目实际存在时**补一条
+   * {@link EVENT_PENDING_EVIDENCE_DISCARDED}（`taskId` = 被丢弃条目的 `failedTaskId`，`state` 列 `null`）。
+   *
+   * ⚠️ 留痕**不受**后续 `needsInputFeature` 返回值影响（即便它因已 `needs_input` 而 `return false`，
+   * 「丢弃」这一事实仍须留痕）⇒ 本方法在 `needsInputFeature` **之前**调用，且自带完成（先 `delete`
+   * → 写事件，顺序不可换）。
+   * ⚠️ 用于三处「出口即清」：任务 `input-required`（`notifyTaskSettled`）、收敛交人
+   * （`reduceConvergence`）、**兜底扫描交人**（`advanceExecuting`，v0.5.1 N1′）；「取证节点失败」/
+   * 「取证派发失败」两处「交人」**就是决策本体** ⇒ 那两处只 `delete`、**不写本事件**。
+   */
+  private discardPendingEvidence(
+    featureId: string,
+    site: "notifyTaskSettled" | "reduceConvergence" | "advanceExecuting",
+    detail: string,
+  ): void {
+    const discarded = this.pendingEvidence.get(featureId);
+    this.pendingEvidence.delete(featureId);
+    if (discarded === undefined) return;
+    appendEvent({
+      featureId,
+      taskId: discarded.failedTaskId,
+      kind: EVENT_PENDING_EVIDENCE_DISCARDED,
+      state: null,
+      payload: JSON.stringify({
+        site,
+        code: "pending_evidence_discarded",
+        failedTaskId: discarded.failedTaskId,
+        detail,
+      }),
+    });
+  }
+
   /** 置 needs_input（仅在允许流转时；记录触发任务由调用方文本说明） */
   private needsInputFeature(feature: FeatureRecord, reason: string): boolean {
     const current = getFeature(feature.featureId);
-    if (current === null || isTerminalFeatureState(current.state)) return false;
-    if (current.state === "needs_input") return false;
-    if (!canTransition(current.state, "needs_input")) return false;
+    // v0.5.1 D1（④）：三处静默 `return false` **各补** log + 一条 `transition_skipped` 事件
+    // （**态没变** ⇒ `state` 列写 `null`，且**不写** `feature.state`）；`:1079` 拆两行使 5 个 code
+    // 全部可达。调用方 6 处一律丢弃返回值，故留痕是**唯一**可观测路径。
+    if (current === null) {
+      this.logTransitionSkipped({
+        site: "needsInputFeature",
+        featureId: feature.featureId,
+        taskId: null,
+        from: null,
+        to: "needs_input",
+        code: "feature_not_found",
+        detail: reason,
+      });
+      return false;
+    }
+    if (isTerminalFeatureState(current.state)) {
+      this.logTransitionSkipped({
+        site: "needsInputFeature",
+        featureId: feature.featureId,
+        taskId: null,
+        from: current.state,
+        to: "needs_input",
+        code: "feature_terminal",
+        detail: reason,
+      });
+      return false;
+    }
+    if (current.state === "needs_input") {
+      this.logTransitionSkipped({
+        site: "needsInputFeature",
+        featureId: feature.featureId,
+        taskId: null,
+        from: current.state,
+        to: "needs_input",
+        code: "already_needs_input",
+        detail: reason,
+      });
+      return false;
+    }
+    if (!canTransition(current.state, "needs_input")) {
+      this.logTransitionSkipped({
+        site: "needsInputFeature",
+        featureId: feature.featureId,
+        taskId: null,
+        from: current.state,
+        to: "needs_input",
+        code: "illegal_transition",
+        detail: reason,
+      });
+      return false;
+    }
     updateFeatureState(current.featureId, "needs_input");
     console.error(`[a2a-feature] Feature ${current.featureId} → needs_input：${reason}`);
     return true;

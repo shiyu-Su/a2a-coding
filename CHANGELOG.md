@@ -2,6 +2,34 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.5.1] - 2026-09-16
+
+> 主题：**失败自动化收口修复**（补丁版，「一版本一需求」）。修 REQ-03「失败自动化」暴露的两条收口缺陷 —— **D2**（收敛判定 / 失败传播**不认「取证节点」** ⇒ 取证节点失败被当普通失败、Feature **闷声 `failed`**）与 **D1**（`needsInputFeature` 三处静默 `return` + `notifyTaskSettled` 终态早退**零留痕**）；并**同批**处理「修 D2 即死锁」的耦合（`pendingEvidence` 出口未清）+ 兜底扫描。**线协议不变**（`PROTOCOL.md` / `PROTOCOL_VERSION` = `1.0`）；**`machine` 单元本版零源码改动**（仅 `package.json` 版本号）。**D3 已由 v0.5.0 的 D5 闭合 ⇒ 本版移出、不重复改造**。
+
+### Added
+
+- **取证节点失败 ⇒ 停车交人**（REQ-v0.5.1-2026-09-16-01 · **D2**）：`orch/bridge/scheduler.ts` 新增**单一谓词** `isExemptFromFailure(n)` = `isNeuteredSettled(n) || (isEvidenceNode(n) && n.state === "failed")` —— **证据臂收窄到 `state === "failed"`**（`isNeuteredSettled` 自带该条件：re-arm 后仍 `exhausted` 但已回 `working` 的**活跃节点不得视作完成**）。`reduceConvergence` 的 failed 计数 / blocked 计数 / `every()` 三处、以及 `advanceExecuting` 的 `failedIds` 均改用该谓词；**`:481`（input-required）保留 `isNeutered`、不合并** —— 二者语义不同（前者判「节点**是否仍处中性化状态**」`exhausted`，后者判「**已落定的失败事实可否豁免**」`exhausted && failed`），合并会把**重试在飞**的节点误判为「待澄清」。
+- **兜底扫描**（同需求 · D2 的必要配套）：`advanceExecuting` 内在 **`failedIds` 传播之后、`reduceConvergence` 之前**同步扫描「`executing` 且存在 `failed` 取证节点」⇒ **先清 map → 交人（`needs_input`）→ return**，覆盖「settle 回调永不达」的悬挂面。**不放进** `reduceConvergence`（导出纯函数 + `pendingEvidence` 是实例私有进程内态 ⇒ 删除动作结构上不可能）。
+- **两个新事件 kind**（同需求 · **D1** 留痕）：
+  - `EVENT_FEATURE_TRANSITION_SKIPPED = "feature.transition_skipped"` —— 覆盖「**态没变**」的静默路径：`needsInputFeature` 四处 `return false`（`code` = `feature_not_found` / `feature_terminal` / `already_needs_input` / `illegal_transition`；其中原单行合并条件**拆两行**使 5 个 `code` 全可达）+ `notifyTaskSettled` 终态早退（`code` = `early_return_task_settled`）。payload `{site, from, to, code, detail}`；**`events.state` 列写 `null`**（目标态只放 `payload.to`）。
+  - `EVENT_PENDING_EVIDENCE_DISCARDED = "feature.pending_evidence_discarded"` —— 覆盖「**待决策取证流被丢弃**」：`:648` / `:985` / **兜底扫描** 三处、且条目实际存在时写一条（`site` 枚举 `notifyTaskSettled` / `reduceConvergence` / `advanceExecuting`）。**不复用** `transition_skipped`（后者不变量是「态没变」，而此处态**确实变了**）。
+
+### Changed
+
+- **不变量「决策已落 ⇔ map 无条目」闭合**：`pendingEvidence.delete` 由 v0.5.0 的「`handleEvidenceSettled` 四处」**扩到全部交人出口** —— `:622`（取证节点失败）/ `:648`（任务 `input-required`）/ `:985`（收敛交人）/ `:1024`（取证派发失败）/ **兜底扫描**；顺序统一为**先无条件 `delete`、再交人**（`:674` / `:681` 已在 `handleEvidenceSettled` 内清、不重复）。依据：**D2 一生效**，未清的出口会在人工恢复后被「待决策取证流」硬闸**永久拦下**（`tick` 只扫 `executing`，无人能救）。
+- **单测 140 → 147**：新增 **T5–T11**（D2 判定层 kill-shot / 四出口后 map 无条目 / 兜底扫描〔模拟回调永不达〕/ D1 各**恰一条**事件且**不产生** `feature.state` / `isNeutered` 语义差异回归 / ⑦ 路径「有痕」「无痕」），全部**经真实 infra 路径**填充 `pendingEvidence`（镜像 `seedRealInfraEvidence`）以防 **vacuous**；并含**变异验证**（移除 ⑦ ⇒ T7 红；谓词回退 ⇒ T5 红；移除出口① `delete` ⇒ T5+T6 红；⑦ 回退成裸 `delete` ⇒ T10 红）+ SHA256 还原证明。
+- **`store.ts` 零改动**：两个新 kind 常量随**发射模块**落 `scheduler.ts`（先例 `EVIDENCE_EVENT_KIND` / `EVENT_TASK_RETRY` / `EVENT_PUSH_RECEIVED`）；`events.kind` 本就是开放字符串、`EVENTS_DDL` 无枚举约束。
+- **引用口径**：落点以**符号名 + 不变式**表述，行号仅作观测值（改造文档附「符号 → 行号」重锚表）。
+
+### Verified
+
+- 门禁：`orch` `typecheck` **0** / `lint` **0** / `npm test` **147/147**；改动**限两个文件** —— `orch/bridge/scheduler.ts`（+248）+ `orch/test/scheduler.test.ts`（+532）。
+- **真机 E2E（受控中断 · 两轮 · 未改任何 `timeouts.prompt`）**：
+  - **happy path 全链**：`failed(infra)` ⇒ **中性化（Feature 未连坐）** ⇒ `task.evidence wait_start` ⇒ **`wait_ready`（真 offline 窗口，73.0s，非 `wait_timeout` 软路径）** ⇒ 取证 settle ⇒ **`parsed`** ⇒ 决策 ⇒ **`task.retry`（`retry_count` 0→1）** ⇒ **同 `contextId` 续派拿到新非空 `remote_task_id`**（修复前此处**恒 `NULL`**）。
+  - **取证节点失败专项**：对**正在运行的取证节点**再次受控中断 ⇒ `task.settled failed` 后 **32ms ⇒ `feature.state = needs_input`**（**非 `failed`、非 `integrating`、未卡 `executing`**）；负向机检 `feature.state=failed` = **0**、**无孤儿取证节点**。
+  - **D1 留痕真机可见**：`feature.transition_skipped`（`from:"cancelled"`、`events.state = null`）—— 修复前该路径**完全静默**。
+- **未覆盖项（不得默认算通过**，详见 `doc/v0.5.1/失败自动化收口修复-改造文档.md` §6-11）：⑦ 兜底扫描的**真机**触发 / `pending_evidence_discarded` 真机 / 「重试用尽 ⇒ 交人」第二跳 / `stable=false` 分支 / 桥重启后闸失效（**D-2**）/ 跨机与 `codex`·`claude`。
+
 ## [v0.5.0] - 2026-09-16
 
 > 主题：**网页端只读工作台**（原 v0.8.0 提前；「一版本一需求」生效后的首个版本）。本版同时收口 REQ-03「失败自动化」后半链暴露的两个缺陷 —— **D4 取证报告解析脆弱** 与 **D5 续派时序**（D3 并入 D5 同源同修）。**线协议不变**（`PROTOCOL.md` / `PROTOCOL_VERSION` = `1.0`）；**`machine` 单元本版零源码改动**（仅 `package.json` 版本号）。
