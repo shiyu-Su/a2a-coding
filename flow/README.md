@@ -62,6 +62,8 @@ node flow/install/uninstall.mjs --target <项目根>
 
 v0.4.1 只把 opencode 路径做到完整可用，其余宿主给接入指引，自动注册留后续版本。
 
+> ⚠️ **两种形态不能共用同一份 orch config**（桥按自己读的 `config.json` 分派 stdio/http），细节见各 `hosts/*.md`。
+
 ## 边界
 
 - 本包只描述**流程与状态机语义**，实现细节（工具名、项目来源、传输）留给运行底座；换操作面、换项目来源、换传输都不改规范。

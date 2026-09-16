@@ -63,7 +63,6 @@ const PROBE_PORT = 8897;
 const TEMP_ROOT = mkdtempSync(join(tmpdir(), "bridgectl-probe-"));
 const DATA_DIR = join(TEMP_ROOT, "data");
 const CONFIG_PATH = join(TEMP_ROOT, "machines.config.json");
-const WORKTREE_ROOT = join(TEMP_ROOT, "worktrees");
 const SESSION_DB = join(DATA_DIR, "sessions.sqlite");
 /** 桥自身写 pidfile 的路径（与 bridgectl 的 `dirname(SESSION_DB)/bridge.pid` 同源） */
 const PIDFILE_PATH = join(DATA_DIR, "bridge.pid");
@@ -126,15 +125,9 @@ function tailLines(text, count) {
 /** 写临时 MACHINES_CONFIG：mode=http + 非默认端口 8897；callback 关闭（不抢 3200） */
 function prepareWorkspace() {
   mkdirSync(DATA_DIR, { recursive: true });
-  mkdirSync(WORKTREE_ROOT, { recursive: true });
   const config = {
     transport: { mode: "http", http: { host: PROBE_HOST, port: PROBE_PORT, path: "/mcp" } },
     callback: { enabled: false, host: PROBE_HOST, port: 3200 },
-    provisioning: {
-      worktreeRoot: WORKTREE_ROOT,
-      integrationBranch: "integration",
-      policy: { featureIsolation: false, contractFreeze: false },
-    },
     // 指向必然无人监听的 loopback 端口：连接立即被拒，不产生长等待
     machines: [
       { machineId: "probe-machine", launcherUrl: "http://127.0.0.1:3199", pushCallback: false },
