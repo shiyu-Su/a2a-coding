@@ -1,6 +1,11 @@
 /**
  * Agent 子进程工具：spawn（Windows 走 shell 以解析 .cmd 包装器）、
- * stdout/stderr 逐行转发（不吞 stderr）、终止（Windows 杀进程树）。
+ * stdout/stderr 逐行转发（不吞 stderr）、终止。
+ *
+ * 终止语义（REQ-v0.4.1-2026-09-15-03 §2.7）：
+ * - **Windows**：`taskkill /T /F` 树杀（既有行为不变）；
+ * - **POSIX**：`spawn` 以 `detached: true` 建**独立进程组**（pgid = child.pid），终止时用
+ *   `process.kill(-pid, …)` **组杀**，覆盖 shell / CLI 派生的**孙进程**（单进程 kill 会漏）。
  */
 import { spawn, spawnSync, type ChildProcess, type StdioOptions } from "node:child_process";
 import { delimiter, resolve } from "node:path";
@@ -65,6 +70,10 @@ export function spawnAgentProcess(spec: LaunchSpec, workspace: string): ChildPro
   return spawn(spec.command, spec.args, {
     cwd: workspace,
     shell: false,
+    // POSIX：建独立进程组（组长 = 本子进程）⇒ 终止时可按组杀覆盖孙进程。
+    // 注意**不 `unref()`**：仍需 stdio 管道与 `exit` 事件跟踪该子进程。
+    // Windows 分支不带该选项（行为不变）。
+    detached: true,
     windowsHide: true,
     stdio,
     env,
@@ -114,8 +123,45 @@ function waitForExit(child: ChildProcess): Promise<void> {
 }
 
 /**
+ * 向**进程组**发信号（POSIX 专用）：`process.kill(-pid, signal)`。
+ *
+ * 组不存在（`ESRCH`，例如该子进程不是组长 / 已退出）时回落单进程信号，保证不静默失效。
+ * 绝不抛出：返回是否至少成功发出一次信号。
+ */
+function signalProcessTree(pid: number, signal: NodeJS.Signals): boolean {
+  // 防 `kill(-1)` / `kill(0)` 这类"广播给自己全部进程"的灾难性误用（正常 pid 恒 > 1）
+  if (pid <= 1) return false;
+  try {
+    process.kill(-pid, signal);
+    return true;
+  } catch {
+    try {
+      process.kill(pid, signal);
+      return true;
+    } catch {
+      // 进程可能已退出，忽略
+      return false;
+    }
+  }
+}
+
+/**
+ * 向"子进程树"发信号：POSIX 有 pid ⇒ 组杀（含孙进程）；无 pid 或非 POSIX ⇒ 退化为对
+ * 直接子进程 `child.kill(signal)`（保持 win32 无 pid 时的既有语义）。绝不抛出。
+ */
+function signalChildTree(child: ChildProcess, signal: NodeJS.Signals): void {
+  const pid = child.pid;
+  if (pid !== undefined && process.platform !== "win32" && signalProcessTree(pid, signal)) return;
+  try {
+    child.kill(signal);
+  } catch {
+    // 进程可能已退出，忽略
+  }
+}
+
+/**
  * 异步杀进程树（shell 包装会多出 cmd.exe 中间层，普通 kill 杀不干净）。
- * win32 走 `taskkill /T /F`；POSIX 走 `process.kill(pid, "SIGKILL")`。
+ * win32 走 `taskkill /T /F`；POSIX 走 `process.kill(-pid, "SIGKILL")` **组杀**（补孙进程）。
  * 供 `terminateChild` 与 `manager` 复用。
  */
 export function killProcessTree(pid: number): Promise<void> {
@@ -133,17 +179,14 @@ export function killProcessTree(pid: number): Promise<void> {
       });
     });
   }
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // 进程可能已退出，忽略
-  }
+  signalProcessTree(pid, "SIGKILL");
   return Promise.resolve();
 }
 
 /**
  * 同步杀进程树：`process.on("exit")` 中不可 await，必须同步完成。
- * win32 → `spawnSync("taskkill", ["/pid", pid, "/T", "/F"])`；POSIX → `process.kill(pid, "SIGKILL")`。
+ * win32 → `spawnSync("taskkill", ["/pid", pid, "/T", "/F"])`；POSIX → 组杀
+ * `process.kill(-pid, "SIGKILL")`。
  * 任何失败都降级为 `child.kill()`，绝不抛出（exit 钩子内抛错会被忽略且污染退出码）。
  */
 export function killProcessTreeSync(child: ChildProcess): void {
@@ -171,18 +214,21 @@ export function killProcessTreeSync(child: ChildProcess): void {
     }
     return;
   }
+  if (signalProcessTree(pid, "SIGKILL")) return;
   try {
-    process.kill(pid, "SIGKILL");
+    child.kill();
   } catch {
-    try {
-      child.kill();
-    } catch {
-      // 进程可能已退出，忽略
-    }
+    // 进程可能已退出，忽略
   }
 }
 
-/** 终止子进程：先优雅、后强杀；Windows 走 taskkill /T /F */
+/**
+ * 终止子进程：先优雅、后强杀。
+ * - Windows：`taskkill /T /F` 树杀（既有行为不变）；
+ * - POSIX：`SIGTERM` → 宽限 `graceMs` → `SIGKILL`，**两者都面向进程组**（覆盖孙进程）。
+ *   SIGTERM 的优雅期**保留**（见报告：让 CLI/包装器有机会 flush / 清理；去掉只会把
+ *   "半写文件"窗口从"通常瞬间"变成"必然停在写入中途"，且失去优雅清理）。
+ */
 export async function terminateChild(child: ChildProcess, graceMs = KILL_GRACE_MS): Promise<void> {
   if (hasExited(child)) return;
 
@@ -193,9 +239,9 @@ export async function terminateChild(child: ChildProcess, graceMs = KILL_GRACE_M
     return;
   }
 
-  child.kill("SIGTERM");
+  signalChildTree(child, "SIGTERM");
   const timer = setTimeout(() => {
-    if (!hasExited(child)) child.kill("SIGKILL");
+    if (!hasExited(child)) signalChildTree(child, "SIGKILL");
   }, graceMs);
   timer.unref();
   await waitForExit(child);

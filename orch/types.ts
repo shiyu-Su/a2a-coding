@@ -31,16 +31,21 @@ export type AgentKind = "opencode" | "codex" | "claude";
 export type TaskState = "working" | "completed" | "failed" | "input-required" | "blocked";
 
 /**
- * Feature 状态（v0.3.0）。
- * 主链（9）：discussing → analyzing → planning → waiting_approval → executing →
- * integrating → testing → reviewing → completed；
+ * 任务失败分类（v0.4.1 超时与失败自动化）。
+ * - `infra`：基础设施类失败（超时 / 中断 / 看护放弃 / 库锁 / 网络）⇒ 走「取证 → 条件重试」；
+ * - `task`：任务本身失败 ⇒ 照旧传播 `blocked` → Feature `failed`（不重试）。
+ * 判据为错误码 + 文本白名单，**未知文本一律安全降级为 `task`**。
+ */
+export type FailureKind = "infra" | "task";
+
+/**
+ * Feature 状态（v0.3.0；v0.4.1 REQ-04 收敛为 6 态主链）。
+ * 主链（6）：waiting_approval → executing → integrating → testing → reviewing → completed；
  * 异常态（3）：needs_input / failed / cancelled；终态：completed / failed / cancelled。
+ * 前段三态（discussing / analyzing / planning）已删除：引擎只做需求实现，Step 0/1 不走引擎。
  * 合法流转由 `orch/feature/state-machine.ts` 纯模块强制（非法流转 fail-fast）。
  */
 export type FeatureState =
-  | "discussing"
-  | "analyzing"
-  | "planning"
   | "waiting_approval"
   | "executing"
   | "integrating"
@@ -77,7 +82,7 @@ export interface FeatureCreateInput {
   requirement?: string | null;
   /** Feature 级会话上下文（可空；亦可后续经 `updateFeatureContext` 写入） */
   contextId?: string | null;
-  /** 缺省 `discussing` */
+  /** 缺省 `waiting_approval`（主链起点 / 审批门停靠点） */
   state?: FeatureState;
   createdAt?: string;
   updatedAt?: string;
@@ -110,11 +115,37 @@ export interface CallbackConfig {
   token?: string;
 }
 
+/**
+ * 桥 transport 模式（v0.4.1 桥常驻化）。
+ * - `stdio`（缺省）：桥随宿主进程内嵌，行为与旧配置完全一致；
+ * - `http`：桥常驻监听 `transport.http`，由宿主经 HTTP 连接。
+ */
+export type TransportMode = "stdio" | "http";
+
+/** `mode = "http"` 时的桥监听参数 */
+export interface HttpTransportConfig {
+  host: string;
+  port: number;
+  path: string;
+}
+
+/**
+ * 桥 transport 配置（v0.4.1）。
+ * 配置文件内**可选**（旧 `config.json` 无 `transport` 键时零改动可用），
+ * 解析后恒补齐为完整对象：缺省 `mode = "stdio"`、`http = { 127.0.0.1, 8787, "/mcp" }`。
+ */
+export interface TransportConfig {
+  mode: TransportMode;
+  http: HttpTransportConfig;
+}
+
 /** orch 侧：机器清单 */
 export interface MachinesConfig {
   machines: MachineRef[];
   /** orch 回调端点（v0.4.0；缺省 = 关闭） */
   callback?: CallbackConfig;
+  /** 桥 transport（v0.4.1；配置缺省时解析为 `mode = "stdio"` 旧行为） */
+  transport: TransportConfig;
 }
 
 /** 项目 + 运行态（GET /projects 返回；bridge 消费的 launcher 线协议） */
@@ -194,6 +225,27 @@ export interface TaskRecord {
   remoteTaskId: string | null;
   /** Feature 排队节点的待派发消息全文；派发后保留（作为可重派依据） */
   dispatchMessage: string | null;
+  /**
+   * 条件重试已用次数（v0.4.1）。`retryCount < 1` 是「**防死循环**」承重门槛：
+   * 倒置为「先取证 → 条件重试」后，去掉门槛会 `fail → 取证 → D 非空 → re-arm → fail → …` 死循环。
+   * **自增点在 re-arm 时**（`rearmForRetry`），**不在 fail 时**。
+   */
+  retryCount: number;
+  /** 失败分类（v0.4.1；未失败 / 未分类为 null） */
+  failureKind: FailureKind | null;
+  /**
+   * 中性化标记（v0.4.1）：该失败节点已被「取证流」接管。下游判定中**视作 completed**、
+   * 不计入 failed/blocked、不参与派发、`a2a_task_status` 视作终态（共 5 处判定）。
+   * **非新 TaskState**（不污染 `state` 的事实语义）。`exhausted` 与 `notBefore` 语义独立，不得混用。
+   */
+  exhausted: boolean;
+  /**
+   * 可派时间门（v0.4.1，UTC ISO 8601；NULL = 无门 = 立即可派）。
+   * 「登记取证节点后**先不派**」的**持久化**门：内存态会在桥重启后丢门 ⇒ 静默绕过硬路径。
+   */
+  notBefore: string | null;
+  /** 最近一次 `GET /projects` 轮询时间（v0.4.1，UTC ISO 8601；NULL = 未轮询），供「等回收门」5s 节流 */
+  lastPollAt: string | null;
 }
 
 /** 产物登记记录（落 SQLite `artifacts` 表；v0.4.0） */

@@ -1,11 +1,14 @@
 /**
  * Feature 状态机（v0.3.0，纯模块 / 零副作用 / 可单测）。
  *
- * 主链（9 态）：
- *   discussing → analyzing → planning → waiting_approval → executing →
- *   integrating → testing → reviewing → completed
+ * 主链（6 态；REQ-v0.4.1-2026-09-16-01 收敛）：
+ *   waiting_approval → executing → integrating → testing → reviewing → completed
  * 异常态（3）：needs_input / failed / cancelled；终态：completed / failed / cancelled。
  * （`blocked` 为源文档保留态，属 v0.4.0 失败传播，本版不实现。）
+ *
+ * 收敛说明：前段三态（`discussing` / `analyzing` / `planning`）已删除 —— 引擎只做需求实现，
+ * Step 0/1（需求访谈 / 方案评估）不走引擎。`waiting_approval → executing` 是**唯一准入**
+ * （`approve` 专用门；`advance` 绕门在工具层被拒，见 `bridge/feature-tools.ts`）。
  *
  * 职责边界：本模块只做「合法流转」的代码强制（`canTransition` / `assertTransition`，
  * 非法流转 fail-fast）；持久化由 `session/store.ts` 承担，桥只做接线。「方案好坏 /
@@ -13,11 +16,8 @@
  */
 import type { FeatureState } from "../types.js";
 
-/** 全部状态（9 主态 + 3 异常态），用于收窄 / 表单枚举 */
+/** 全部状态（6 主态 + 3 异常态），用于收窄 / 表单枚举 */
 export const FEATURE_STATES: readonly FeatureState[] = [
-  "discussing",
-  "analyzing",
-  "planning",
   "waiting_approval",
   "executing",
   "integrating",
@@ -31,9 +31,6 @@ export const FEATURE_STATES: readonly FeatureState[] = [
 
 /** 主链顺序（不含异常态） */
 export const FEATURE_MAIN_CHAIN: readonly FeatureState[] = [
-  "discussing",
-  "analyzing",
-  "planning",
   "waiting_approval",
   "executing",
   "integrating",
@@ -57,9 +54,6 @@ export const TERMINAL_FEATURE_STATES: readonly FeatureState[] = [
  * - `needs_input` 仅回 `executing`（补齐输入续推，按改造文档 §2.2 转移表）。
  */
 const TRANSITIONS: Readonly<Record<FeatureState, readonly FeatureState[]>> = {
-  discussing: ["analyzing", "cancelled", "failed"],
-  analyzing: ["planning", "needs_input", "cancelled", "failed"],
-  planning: ["waiting_approval", "cancelled", "failed"],
   waiting_approval: ["executing", "cancelled", "failed"],
   executing: ["integrating", "needs_input", "cancelled", "failed"],
   integrating: ["testing", "cancelled", "failed"],

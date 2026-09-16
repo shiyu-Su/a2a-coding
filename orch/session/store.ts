@@ -5,16 +5,20 @@
  * - 持久化 `contextId <-> sessionId` 映射（Agent 退出重启后仍可继承上下文）。
  * - 持久化任务态与 artifacts（`working | completed | failed | input-required`）。
  *
- * 数据库文件路径取自环境变量 `SESSION_DB`，默认 `./data/sessions.sqlite`（自动创建父目录）。
+ * 数据库文件路径取自环境变量 `SESSION_DB`，默认锚定 orch 单元根的
+ * `data/sessions.sqlite`（自动创建父目录）。
  */
 import { mkdirSync } from "node:fs";
-import { dirname, resolve } from "node:path";
+import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
+import { appRootFromModule } from "../app-root.js";
+import { conditionalStateUpdate } from "./conditional-update.js";
 import { FEATURE_STATES, isFeatureState } from "../feature/state-machine.js";
 import type {
   AgentKind,
   ArtifactRecord,
   EventRecord,
+  FailureKind,
   FeatureCreateInput,
   FeatureRecord,
   FeatureState,
@@ -24,8 +28,31 @@ import type {
   TaskState,
 } from "../types.js";
 
-/** 默认数据库文件（相对进程 cwd） */
-export const DEFAULT_SESSION_DB = "./data/sessions.sqlite";
+/**
+ * 默认数据库文件：锚定 orch 单元根（`<orch>/data/sessions.sqlite`），**非 cwd 相对**，
+ * 避免宿主 cwd 变化导致换库；环境变量 `SESSION_DB` 优先级更高。
+ */
+export const DEFAULT_SESSION_DB = join(
+  appRootFromModule(import.meta.url),
+  "data",
+  "sessions.sqlite",
+);
+
+/** 写锁冲突时的等待上限（ms，`DatabaseSync` 的 `timeout` 选项）：避免并发写立即 SQLITE_BUSY */
+export const SESSION_BUSY_TIMEOUT_MS = 5000;
+
+/**
+ * 打开存储连接：显式 busy timeout（写锁冲突时等待而非立即失败）+ WAL。
+ * 单列出来便于单测直接断言连接上的 `PRAGMA busy_timeout` / `journal_mode`。
+ */
+export function openStoreDatabase(
+  dbPath: string,
+  busyTimeoutMs: number = SESSION_BUSY_TIMEOUT_MS,
+): DatabaseSync {
+  const db = new DatabaseSync(dbPath, { timeout: busyTimeoutMs });
+  db.exec("PRAGMA journal_mode = WAL;");
+  return db;
+}
 
 /** 从环境变量读取正整数；缺失 / 非法 / 非正时回退 fallback */
 function readPositiveIntEnv(name: string, fallback: number): number {
@@ -64,6 +91,20 @@ const TASK_STATES: readonly TaskState[] = [
 ];
 // Feature 状态清单复用状态机模块（单一事实源），此处仅 re-export 供调用方枚举
 export const FEATURE_STATE_VALUES: readonly FeatureState[] = FEATURE_STATES;
+
+/**
+ * **已退役**的 Feature 态（REQ-v0.4.1-2026-09-16-01 §2.3 主链收敛）：
+ * 前段三态（`discussing` / `analyzing` / `planning`）已从枚举删除，库中遗留值须归一到
+ * `waiting_approval`（否则 `rowToFeature` 读取即抛 ⇒ `recover` 启动即抛 / `tick` 停摆）。
+ *
+ * ⚠️ **未来再退休任何状态时，必须把该态追加进本集合**：constructor 的兜底归一语句以
+ * `FEATURE_STATES ∪ RETIRED_FEATURE_STATES` 为"已知值全集"，否则新退役的**合法**态会被
+ * 当作脏值反复归一（每次启动都执行）。
+ */
+const RETIRED_FEATURE_STATES: readonly string[] = ["discussing", "analyzing", "planning"];
+
+/** 失败分类清单（v0.4.1；含校验用，落库值只能是这两者） */
+const FAILURE_KINDS: readonly FailureKind[] = ["infra", "task"];
 
 /** 事件 kind：任务结算（completed / failed / input-required） */
 export const EVENT_TASK_SETTLED = "task.settled";
@@ -180,6 +221,10 @@ function isTaskState(v: string): v is TaskState {
   return (TASK_STATES as readonly string[]).includes(v);
 }
 
+function isFailureKind(v: string): v is FailureKind {
+  return (FAILURE_KINDS as readonly string[]).includes(v);
+}
+
 function readString(row: Record<string, unknown>, key: string): string {
   const v = row[key];
   if (typeof v !== "string") {
@@ -195,6 +240,30 @@ function readNullableString(row: Record<string, unknown>, key: string): string |
     throw new Error(`[session-store] 列 ${key} 数据损坏：期望 string | null`);
   }
   return v;
+}
+
+/** 读取 INTEGER 列（缺失 / 非整数 = 数据损坏，fail-fast） */
+function readInteger(row: Record<string, unknown>, key: string): number {
+  const v = row[key];
+  if (typeof v !== "number" || !Number.isInteger(v)) {
+    throw new Error(`[session-store] 列 ${key} 数据损坏：期望 integer`);
+  }
+  return v;
+}
+
+/** 解析 0/1 标志列（**非 0 即 true**；v0.4.1 的 `exhausted` 用） */
+function readBooleanFlag(row: Record<string, unknown>, key: string): boolean {
+  return readInteger(row, key) !== 0;
+}
+
+/** 解析 `failure_kind` 列（可空；非法值 = 数据损坏，fail-fast） */
+function readFailureKind(row: Record<string, unknown>): FailureKind | null {
+  const raw = readNullableString(row, "failure_kind");
+  if (raw === null) return null;
+  if (!isFailureKind(raw)) {
+    throw new Error(`[session-store] 列 failure_kind 数据损坏：非法分类 ${raw}`);
+  }
+  return raw;
 }
 
 function rowToSession(row: Record<string, unknown>): SessionRecord {
@@ -215,7 +284,8 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
 /** tasks 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToTask） */
 const TASK_COLUMNS =
   "task_id, project_id, context_id, state, artifacts_json, text, prompt, " +
-  "feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, updated_at";
+  "feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, updated_at, " +
+  "retry_count, failure_kind, exhausted, not_before, last_poll_at";
 
 /** features 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToFeature） */
 const FEATURE_COLUMNS =
@@ -287,6 +357,11 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     inputArtifacts: readInputArtifacts(row),
     remoteTaskId: readNullableString(row, "remote_task_id"),
     dispatchMessage: readNullableString(row, "dispatch_message"),
+    retryCount: readInteger(row, "retry_count"),
+    failureKind: readFailureKind(row),
+    exhausted: readBooleanFlag(row, "exhausted"),
+    notBefore: readNullableString(row, "not_before"),
+    lastPollAt: readNullableString(row, "last_poll_at"),
   };
 }
 
@@ -408,8 +483,7 @@ export class SessionStore {
     if (dbPath !== ":memory:") {
       mkdirSync(dirname(resolve(dbPath)), { recursive: true });
     }
-    this.db = new DatabaseSync(dbPath);
-    this.db.exec("PRAGMA journal_mode = WAL;");
+    this.db = openStoreDatabase(dbPath);
     this.db.exec(SESSIONS_DDL);
     this.db.exec(TASKS_DDL);
     this.db.exec(FEATURES_DDL);
@@ -446,6 +520,21 @@ export class SessionStore {
     } catch {
       // 列已存在
     }
+    // v0.4.1 迁移：tasks 加失败自动化列 —— 重试门槛 / 失败分类 / 中性化标记 / 取证派发门
+    // （`INTEGER NOT NULL DEFAULT 0` 使既有行直接取默认值，无需回填）
+    for (const column of [
+      "retry_count INTEGER NOT NULL DEFAULT 0",
+      "failure_kind TEXT",
+      "exhausted INTEGER NOT NULL DEFAULT 0",
+      "not_before TEXT",
+      "last_poll_at TEXT",
+    ]) {
+      try {
+        this.db.exec(`ALTER TABLE tasks ADD COLUMN ${column}`);
+      } catch {
+        // 列已存在
+      }
+    }
     // v0.4.0 迁移：features 加 Feature Context 列（context_id / plan / decisions / contracts）
     for (const column of ["context_id TEXT", "plan TEXT", "decisions TEXT", "contracts TEXT"]) {
       try {
@@ -453,6 +542,47 @@ export class SessionStore {
       } catch {
         // 列已存在
       }
+    }
+    // v0.4.1 迁移（REQ-v0.4.1-2026-09-16-01 §2.3）：主链收敛 ⇒ 前段三态已从枚举删除。
+    // `features.state` **无 DB 约束**（见 FEATURES_DDL），非法值在**读取时**抛（`rowToFeature`）⇒
+    // `scheduler.recover` 启动即抛（`/health` 永远 503）+ `tick` 停摆（波及所有 Feature）⇒ 必须归一。
+    // **三条纪律**：(a) **不改 `updated_at`**（归一不是活动：避免历史 Feature 顶到列表首位，
+    // 也避免与 `updateFeatureState`「改态即改时间 + 写事件」的语义混淆）；(b) **不写 `feature.state`
+    // 事件**（迁移非运行期状态变更，写事件会灌收件箱、让宿主误判"有新进展"）；(c) **幂等**
+    // （WHERE 命中即改，重复启动零行）。**顺序：先退役集、后兜底** ⇒ 只含三态遗留行的**正常升级
+    // 路径不会触发**下方兜底告警。
+    this.db
+      .prepare(
+        `UPDATE features SET state = 'waiting_approval'
+         WHERE state IN (${RETIRED_FEATURE_STATES.map(() => "?").join(", ")})`,
+      )
+      .run(...RETIRED_FEATURE_STATES);
+
+    // 兜底：既不属当前枚举、也不属退役集的**真脏值**（手工写入 / 历史脚本）同样会让读取抛 ⇒
+    // 先取证（取值 + 行数 `console.error` 留痕），再归一 —— 把"桥起不来"降级为"脏行停在审批门
+    // 等人处理"。全集取 `FEATURE_STATES ∪ RETIRED_FEATURE_STATES`（见 `RETIRED_FEATURE_STATES` 注记）。
+    const knownStates = [...FEATURE_STATES, ...RETIRED_FEATURE_STATES];
+    const knownPlaceholders = knownStates.map(() => "?").join(", ");
+    const dirtyRows = this.db
+      .prepare(
+        `SELECT state, COUNT(*) AS n FROM features
+         WHERE state NOT IN (${knownPlaceholders}) GROUP BY state`,
+      )
+      .all(...knownStates) as Array<Record<string, unknown>>;
+    if (dirtyRows.length > 0) {
+      const detail = dirtyRows
+        .map((row) => `${String(row["state"])}×${String(row["n"])}`)
+        .join(" / ");
+      const total = dirtyRows.reduce((sum, row) => sum + Number(row["n"]), 0);
+      console.error(
+        `[session-store] features.state 脏值归一 → waiting_approval：${detail}（共 ${total} 行）`,
+      );
+      this.db
+        .prepare(
+          `UPDATE features SET state = 'waiting_approval'
+           WHERE state NOT IN (${knownPlaceholders})`,
+        )
+        .run(...knownStates);
     }
     // 按项目 + updated_at 倒序的列表查询索引
     this.db.exec(
@@ -564,10 +694,39 @@ export class SessionStore {
   }
 
   /**
+   * 原子任务态流转（compare-and-swap）：单语句 `UPDATE ... WHERE task_id = ? AND state = ?`，
+   * 仅当当前态等于 `expectedFrom` 时才置为 `to`。返回是否实际写入（`changes > 0`）。
+   * 作为「读-改-写」的原子替代，防止并发下丢失更新；`artifactsJson` / `text` 未提供时保留原值。
+   */
+  compareAndSwapTaskState(
+    taskId: string,
+    expectedFrom: TaskState,
+    to: TaskState,
+    artifactsJson?: string | null,
+    text?: string | null,
+  ): boolean {
+    const changes = conditionalStateUpdate(this.db, {
+      table: "tasks",
+      keyColumn: "task_id",
+      key: taskId,
+      expectedState: expectedFrom,
+      nextState: to,
+      assignments: [
+        "artifacts_json = COALESCE(?, artifacts_json)",
+        "text = COALESCE(?, text)",
+        "updated_at = ?",
+      ],
+      assignmentParams: [artifactsJson ?? null, text ?? null, nowIso()],
+    });
+    return changes > 0;
+  }
+
+  /**
    * 更新任务态；`artifactsJson` / `text` 未提供时保留原值（COALESCE）。
    * 任务不存在时无效果，返回 null。
    * v0.4.0：状态发生**变化**且新态非 `working` 时，自动写事件收件箱
    * （`blocked` → `task.blocked`；`completed`/`failed`/`input-required` → `task.settled`）。
+   * v0.4.1：写入改为 CAS（`WHERE state = <读到的原态>`），并发被抢先时不覆盖、不重复写事件。
    */
   updateTaskState(
     taskId: string,
@@ -576,19 +735,16 @@ export class SessionStore {
     text?: string | null,
   ): TaskRecord | null {
     const previous = this.getTask(taskId);
-    const updatedAt = nowIso();
-    this.db
-      .prepare(
-        `UPDATE tasks
-         SET state = ?,
-             artifacts_json = COALESCE(?, artifacts_json),
-             text = COALESCE(?, text),
-             updated_at = ?
-         WHERE task_id = ?`,
-      )
-      .run(state, artifactsJson ?? null, text ?? null, updatedAt, taskId);
+    if (previous === null) return null;
+    const changed = this.compareAndSwapTaskState(
+      taskId,
+      previous.state,
+      state,
+      artifactsJson,
+      text,
+    );
     const stored = this.getTask(taskId);
-    if (stored !== null && previous !== null && previous.state !== stored.state) {
+    if (changed && stored !== null && previous.state !== stored.state) {
       const kind =
         stored.state === "blocked"
           ? EVENT_TASK_BLOCKED
@@ -639,6 +795,100 @@ export class SessionStore {
     return this.getTask(taskId);
   }
 
+  /**
+   * **条件重试**（v0.4.1 §2.4，N=1）：把**已失败**节点重排为待派发，供调度器以
+   * **同 `contextId`** 续一次（`rearmTask` 不做状态前置校验，故单列此带条件版本）。
+   *
+   * 单语句条件 UPDATE（`WHERE task_id = ? AND state = 'failed'`）：状态不匹配即
+   * **不写入任何行** ⇒ 既不与并发写入互相覆盖（防丢失更新），也拒绝对非 `failed` 节点重排。
+   *
+   * **`retry_count` 在此自增（0 → 1），不在 fail 时** —— 该列是「防死循环」承重件：
+   * 倒置为「先取证 → 条件重试」后若去掉门槛，会 `fail → 取证 → D 非空 → re-arm → fail → …` 死循环。
+   *
+   * **顺带清 `exhausted = 0`（re-arm ⇒ 退出中性化）**：中性化标记的事实前提是"这是一个**已终结**
+   * 的失败节点"；一旦授予重试，该节点**重新成为普通在飞节点**。若不清：
+   * ① `computeReadyNodes` 会把它当"不参与派发"而**永久挡住重试**（静默停滞）；
+   * ② `all_completed` 会把它算作 completed，**重试尚未跑完 Feature 就 `integrating`**。
+   * 清掉后 `exhausted=1` 恒蕴含 `state='failed'`，**不存在"已 re-arm 却仍置位"的窗口**。
+   *
+   * 返回是否命中（`false` = 任务不存在或当前态非 `failed`，**未发生任何写入**；此时
+   * `exhausted` 亦**不得**被清）。
+   */
+  rearmForRetry(taskId: string, dispatchMessage: string): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE tasks
+         SET state = 'working', remote_task_id = NULL, dispatch_message = ?,
+             retry_count = retry_count + 1, exhausted = 0, updated_at = ?
+         WHERE task_id = ? AND state = 'failed'`,
+      )
+      .run(dispatchMessage, nowIso(), taskId);
+    return Number(info.changes) > 0;
+  }
+
+  /**
+   * 设置「取证节点」的**可派时间门**（v0.4.1 §2.3）：`notBefore > now` 期间不被调度器选中
+   * （`computeReadyNodes` 就绪判据加 `not_before IS NULL OR not_before <= now`）。
+   * 传 `null` 清门（立即恢复可派）。任务不存在返回 null（与 `updateTaskState` 语义一致）。
+   *
+   * **刻意不写 `updated_at`**：这是派发门 / 观测元数据，不是任务态变化；`listFeatureTasks`
+   * 以 `updated_at` 升序作「派发次序」，若 5s 轮询也搅动它会使节点在列表中被反复重排。
+   */
+  setTaskNotBefore(taskId: string, notBefore: string | null): TaskRecord | null {
+    this.db
+      .prepare("UPDATE tasks SET not_before = ? WHERE task_id = ?")
+      .run(notBefore, taskId);
+    return this.getTask(taskId);
+  }
+
+  /**
+   * 记录最近一次 `GET /projects` 轮询时间（v0.4.1 §2.3「等回收门」5s 节流用）。
+   * 与 `setTaskNotBefore` 同理，**不写 `updated_at`**。任务不存在返回 null。
+   */
+  setTaskLastPollAt(taskId: string, lastPollAt: string | null): TaskRecord | null {
+    this.db
+      .prepare("UPDATE tasks SET last_poll_at = ? WHERE task_id = ?")
+      .run(lastPollAt, taskId);
+    return this.getTask(taskId);
+  }
+
+  /**
+   * **置中性化标记**（v0.4.1 §2.6）：`exhausted = 1` —— 该失败节点已被「取证流」接管，
+   * 下游判定中**视作 completed**（scheduler 的 6 处判定各认它）。**本方法是中性化的唯一写入点**。
+   *
+   * **刻意只写这一列**：
+   * - **不改写 `state`** —— 节点事实上仍是 `failed`（`exhausted` 是标志位，**非新 TaskState**，不污染事实语义）；
+   * - **不写 `updated_at`** —— 理由同 `setTaskNotBefore`：`listFeatureTasks` 以 `updated_at` 升序作
+   *   「派发次序」，中性化不是任务态变化，不应搅动次序（也不应影响按 `updated_at` 的保留策略）。
+   *
+   * 幂等（`exhausted` 已是 1 时重复调用仍为 1）；返回是否命中（`false` = 任务不存在）。
+   */
+  markTaskExhausted(taskId: string): boolean {
+    const info = this.db
+      .prepare("UPDATE tasks SET exhausted = 1 WHERE task_id = ?")
+      .run(taskId);
+    return Number(info.changes) > 0;
+  }
+
+  /**
+   * **落库失败分类**（v0.4.1 §2.2 / §4.1.13 可观测）：`failure_kind ∈ {infra, task}`。
+   *
+   * 「失败原因落库」的**唯一写入点** —— `a2a_feature_status` 的 `failureKind` 出参据此有真实数据源。
+   * **`task` 与 `infra` 两类都写**（便于事后统计），分类由调度器的 `classifyFailure` 决定。
+   *
+   * **刻意只写这一列、不写 `updated_at`**：分类是**观测元数据**，不是任务态变化；
+   * `listFeatureTasks` 以 `updated_at` 升序作「派发次序」，不应被分类写入搅动
+   * （理由同 `setTaskNotBefore` / `markTaskExhausted`）。
+   *
+   * 返回是否命中（`false` = 任务不存在）。可重复调用（后写覆盖前值）。
+   */
+  markTaskFailureKind(taskId: string, kind: FailureKind): boolean {
+    const info = this.db
+      .prepare("UPDATE tasks SET failure_kind = ? WHERE task_id = ?")
+      .run(kind, taskId);
+    return Number(info.changes) > 0;
+  }
+
   /** 按项目列出任务（updated_at 倒序；可选状态过滤；limit 默认 20，clamp 到 [1,100]） */
   listTasks(opts: ListTasksOptions): TaskRecord[] {
     const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100);
@@ -674,9 +924,12 @@ export class SessionStore {
   // Feature CRUD（v0.3.0）
   // ------------------------------------------------------------------
 
-  /** 创建/覆盖 Feature 记录（state 缺省 `discussing`），返回落库后的记录 */
+  /**
+   * 创建/覆盖 Feature 记录（state 缺省 **`waiting_approval`** = 主链起点 / 审批门停靠点，
+   * REQ-v0.4.1-2026-09-16-01 §2.3），返回落库后的记录。
+   */
   createFeature(rec: FeatureCreateInput): FeatureRecord {
-    const state = rec.state ?? "discussing";
+    const state = rec.state ?? "waiting_approval";
     if (!isFeatureState(state)) {
       throw new Error(`[session-store] createFeature 非法 Feature 态：${String(state)}`);
     }
@@ -718,19 +971,46 @@ export class SessionStore {
   }
 
   /**
+   * 原子 Feature 态流转（compare-and-swap）：单语句 `UPDATE ... WHERE feature_id = ? AND state = ?`，
+   * 仅当当前态等于 `expectedFrom` 时才置为 `to`。返回是否实际写入（`changes > 0`）。
+   * 作为「读-改-写」的原子替代，防止并发下丢失更新。
+   */
+  compareAndSwapFeatureState(
+    featureId: string,
+    expectedFrom: FeatureState,
+    to: FeatureState,
+  ): boolean {
+    if (!isFeatureState(expectedFrom) || !isFeatureState(to)) {
+      throw new Error(
+        `[session-store] compareAndSwapFeatureState 非法 Feature 态：${String(expectedFrom)} → ${String(to)}`,
+      );
+    }
+    const changes = conditionalStateUpdate(this.db, {
+      table: "features",
+      keyColumn: "feature_id",
+      key: featureId,
+      expectedState: expectedFrom,
+      nextState: to,
+      assignments: ["updated_at = ?"],
+      assignmentParams: [nowIso()],
+    });
+    return changes > 0;
+  }
+
+  /**
    * 更新 Feature 态；Feature 不存在时无效果，返回 null。
    * v0.4.0：状态发生变化时自动写 `feature.state` 事件。
+   * v0.4.1：写入改为 CAS（`WHERE state = <读到的原态>`），并发被抢先时不覆盖、不重复写事件。
    */
   updateFeatureState(featureId: string, state: FeatureState): FeatureRecord | null {
     if (!isFeatureState(state)) {
       throw new Error(`[session-store] updateFeatureState 非法 Feature 态：${String(state)}`);
     }
     const previous = this.getFeature(featureId);
-    this.db
-      .prepare("UPDATE features SET state = ?, updated_at = ? WHERE feature_id = ?")
-      .run(state, nowIso(), featureId);
+    if (previous === null) return null;
+    const changed = this.compareAndSwapFeatureState(featureId, previous.state, state);
     const stored = this.getFeature(featureId);
-    if (stored !== null && previous !== null && previous.state !== stored.state) {
+    if (changed && stored !== null && previous.state !== stored.state) {
       this.appendEvent({ featureId, taskId: null, kind: EVENT_FEATURE_STATE, state });
     }
     return stored;
@@ -977,6 +1257,17 @@ export function updateTaskState(
   return getDefaultStore().updateTaskState(taskId, state, artifactsJson, text);
 }
 
+/** 原子任务态流转（默认存储） */
+export function compareAndSwapTaskState(
+  taskId: string,
+  expectedFrom: TaskState,
+  to: TaskState,
+  artifactsJson?: string | null,
+  text?: string | null,
+): boolean {
+  return getDefaultStore().compareAndSwapTaskState(taskId, expectedFrom, to, artifactsJson, text);
+}
+
 /** 查询任务记录（默认存储） */
 export function getTask(taskId: string): TaskRecord | null {
   return getDefaultStore().getTask(taskId);
@@ -1002,6 +1293,31 @@ export function rearmTask(taskId: string, dispatchMessage: string): TaskRecord |
   return getDefaultStore().rearmTask(taskId, dispatchMessage);
 }
 
+/** 条件重试：仅当节点当前为 failed 时重排（默认存储）；返回是否命中 */
+export function rearmForRetry(taskId: string, dispatchMessage: string): boolean {
+  return getDefaultStore().rearmForRetry(taskId, dispatchMessage);
+}
+
+/** 设置取证节点可派时间门（默认存储） */
+export function setTaskNotBefore(taskId: string, notBefore: string | null): TaskRecord | null {
+  return getDefaultStore().setTaskNotBefore(taskId, notBefore);
+}
+
+/** 记录最近一次 /projects 轮询时间（默认存储） */
+export function setTaskLastPollAt(taskId: string, lastPollAt: string | null): TaskRecord | null {
+  return getDefaultStore().setTaskLastPollAt(taskId, lastPollAt);
+}
+
+/** 置中性化标记：exhausted = 1（默认存储）；返回是否命中 */
+export function markTaskExhausted(taskId: string): boolean {
+  return getDefaultStore().markTaskExhausted(taskId);
+}
+
+/** 落库失败分类 failure_kind（默认存储）；返回是否命中 */
+export function markTaskFailureKind(taskId: string, kind: FailureKind): boolean {
+  return getDefaultStore().markTaskFailureKind(taskId, kind);
+}
+
 /** 创建/覆盖 Feature 记录（默认存储） */
 export function createFeature(rec: FeatureCreateInput): FeatureRecord {
   return getDefaultStore().createFeature(rec);
@@ -1015,6 +1331,15 @@ export function getFeature(featureId: string): FeatureRecord | null {
 /** 更新 Feature 态（默认存储） */
 export function updateFeatureState(featureId: string, state: FeatureState): FeatureRecord | null {
   return getDefaultStore().updateFeatureState(featureId, state);
+}
+
+/** 原子 Feature 态流转（默认存储） */
+export function compareAndSwapFeatureState(
+  featureId: string,
+  expectedFrom: FeatureState,
+  to: FeatureState,
+): boolean {
+  return getDefaultStore().compareAndSwapFeatureState(featureId, expectedFrom, to);
 }
 
 /** 更新 Feature Context（默认存储） */

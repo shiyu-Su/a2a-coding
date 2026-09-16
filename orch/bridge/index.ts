@@ -18,9 +18,9 @@
  * 跨 MCP 边界的错误一律结构化返回（`{ ok: false, code, error }`），不抛出。
  */
 import { randomUUID } from "node:crypto";
-import { createServer } from "node:http";
+import { createServer as createHttpServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
 import {
   ClientFactory,
   DefaultAgentCardResolver,
@@ -37,12 +37,11 @@ import type {
   SendMessageResult,
   Task,
 } from "@a2a-js/sdk";
-import { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
-import { StdioServerTransport } from "@modelcontextprotocol/sdk/server/stdio.js";
-import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
-import { z } from "zod";
+import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { appRootFromModule } from "../app-root.js";
 import { loadMachinesConfig } from "../config.js";
+import { BRIDGE_VERSION } from "../version.js";
+import { BridgeRuntime, defaultPidFile, type RuntimeReadiness } from "../runtime/lifecycle.js";
 import {
   PROTOCOL_VERSION,
   SUPPORTED_PEER_PROTOCOL_MAJORS,
@@ -58,11 +57,15 @@ import {
   type TaskListItem,
   type TaskRecord,
   type TaskState as DomainTaskState,
+  type TransportConfig,
+  type TransportMode,
 } from "../types.js";
 import {
   appendEvent,
   createTask,
+  DEFAULT_SESSION_DB,
   getArtifact,
+  getDefaultStore,
   getFeature,
   getTask,
   latestEventId,
@@ -72,11 +75,19 @@ import {
   listTasks,
   markTaskDispatched,
   pruneTasks,
+  setTaskNotBefore,
   truncatePrompt,
   updateTaskState,
   upsertArtifact,
   close as closeSessionStore,
 } from "../session/store.js";
+import { bridgeLog } from "./bridge-log.js";
+import {
+  EVIDENCE_ARTIFACT_NAME,
+  artifactSummaryText,
+  buildEvidenceMessage,
+  parseEvidenceResult,
+} from "./evidence-message.js";
 import {
   isTaskWatched,
   notifyTaskPush,
@@ -84,8 +95,13 @@ import {
   WATCHER_MAX_CONSECUTIVE_FAILURES,
 } from "./task-watcher.js";
 import {
+  EVIDENCE_EVENT_KIND,
+  EVIDENCE_POLL_MS,
   FEATURE_ABANDONED_TEXT,
   FeatureScheduler,
+  isLocalTerminalTask,
+  markEvidenceMessage,
+  type EvidenceResult,
   type FeatureDispatchResult,
 } from "./scheduler.js";
 import {
@@ -94,7 +110,25 @@ import {
   handleFeatureCancel,
   handleFeatureCreate,
   handleFeatureStatus,
+  type FeatureAdvanceArgs,
+  type FeatureApproveArgs,
+  type FeatureCancelArgs,
+  type FeatureCreateArgs,
+  type FeatureCreateSuccess,
+  type FeatureStateChangeSuccess,
+  type FeatureStatusArgs,
+  type FeatureStatusSuccess,
+  type FeatureToolFailure,
 } from "./feature-tools.js";
+import {
+  isLoopbackHostOrAddress,
+  startHttpTransport,
+  type HttpTransportHandle,
+} from "./transports/http.js";
+import { startStdioTransport } from "./transports/stdio.js";
+// 挂载态常量（单一事实源在 register-tools.ts）：index → register-tools 的运行时 import 安全
+// （register-tools 对 index 仅 **type-only** 引用，擦除后无环）
+import { MOUNTABLE_FEATURE_STATES } from "./register-tools.js";
 
 // ---------------------------------------------------------------------------
 // 配置与超时（全部可通过环境变量覆盖；显式超时，避免跨机调用挂死）
@@ -466,7 +500,10 @@ async function locateProject(projectId: string): Promise<LocateResult> {
       const listed = await listMachineProjects(machine);
       if (listed.ok) {
         const project = listed.projects.find((p) => p.projectId === projectId);
-        if (project !== undefined) return { ok: true, machine, project };
+        if (project !== undefined) {
+          rememberProjectStatus(project); // 顺带预热取证快照（免额外 HTTP）
+          return { ok: true, machine, project };
+        }
       }
       projectIndex.delete(projectId);
     } else {
@@ -495,6 +532,7 @@ async function locateProject(projectId: string): Promise<LocateResult> {
     const project = listed.projects.find((p) => p.projectId === projectId);
     if (project !== undefined) {
       projectIndex.set(projectId, machine.machineId);
+      rememberProjectStatus(project); // 顺带预热取证快照（免额外 HTTP）
       return { ok: true, machine, project };
     }
   }
@@ -750,11 +788,12 @@ function taskText(task: Task): string {
  * 本地记录是否已终结（终结态结果由本地存档直接作答，不再查询远端）。
  * `blocked` 为 orch 本地专属终态（v0.4.0 失败传播，不映射 A2A）：被阻塞节点不会再派发，
  * 直接以本地存档作答，避免误查远端。
+ *
+ * v0.4.1：**委托** `scheduler.isLocalTerminalTask(node)`，消除「双份判据」——
+ * 该判定是中性化的第 5 处，须认 `exhausted`（节点级谓词，scheduler 为单一事实源）。
  */
-function isLocalTerminalState(state: DomainTaskState): boolean {
-  return (
-    state === "completed" || state === "failed" || state === "input-required" || state === "blocked"
-  );
+function isLocalTerminalState(node: TaskRecord): boolean {
+  return isLocalTerminalTask(node);
 }
 
 /** 从本地存档的 artifactsJson（ArtifactSummary[]）拼接文本；规则对齐 partsToText/taskText，兼容无 text 的旧记录 */
@@ -951,7 +990,7 @@ function deferWorkingTask(
         JSON.stringify(summarizeArtifacts(task.artifacts)),
         taskText(task),
       );
-      console.log(`[a2a-bridge] 后台看护：任务 ${task.id} 已终态（${state}），结果落库`);
+      bridgeLog.info("a2a-bridge", `后台看护：任务 ${task.id} 已终态（${state}），结果落库`);
     },
     // v0.4.0 §2.6：可选订阅推送（命中即提前对账；无推送时与纯轮询等价）
     subscribePush: true,
@@ -960,7 +999,7 @@ function deferWorkingTask(
     maxConsecutiveFailures: WATCHER_MAX_CONSECUTIVE_FAILURES,
   });
   if (started) {
-    console.log(`[a2a-bridge] 任务 ${settled.id} ${reason}，转后台看护`);
+    bridgeLog.info("a2a-bridge", `任务 ${settled.id} ${reason}，转后台看护`);
   }
   return {
     ok: true,
@@ -1047,12 +1086,23 @@ async function dispatchTask(
   return { ok: true, contextId, kind: "task", task: settled, client, machine: located.machine };
 }
 
+/**
+ * `a2a_call` 的**立即派发路径**（REQ-v0.4.1-2026-09-16-01 §2.5）：**只承载 `inquiry`**。
+ * 执行型派发（`mode="execute"`）必带 `featureId` ⇒ 走 {@link registerFeatureNode}（登记 DAG 节点，
+ * 由调度器派发），永不进入本函数。
+ *
+ * 契约以**类型级**表达：`mode` 只能取字面量 `"inquiry"` —— 传 `"execute"` 即**编译错误**；
+ * `mode` 的必填性 / 对偶校验**不在本层重复实现**（单一事实源：`register-tools.ts` 的
+ * `a2aCallSchema` 与 `validateCallMode`）。缺省值使既有 4 参调用点行为完全等价（A 步零破坏）。
+ */
 async function handleCall(
   projectId: string,
   text: string,
   contextIdInput: string | undefined,
   wait: boolean,
+  mode: "inquiry" = "inquiry",
 ): Promise<CallOutcome> {
+  void mode; // 类型级契约：运行时无需分支（非 inquiry 无法通过编译）
   const contextId =
     contextIdInput !== undefined && contextIdInput.length > 0 ? contextIdInput : randomUUID();
 
@@ -1325,7 +1375,9 @@ function buildNodeDispatchMessage(node: TaskRecord, feature: FeatureRecord | nul
 /**
  * `a2a_call` 带 `featureId` —— 登记一个 Feature DAG 节点（本地 id），
  * 不立即派发；由调度器在依赖满足后按拓扑并行派发（每 Feature 批门闩）。
- * `analyzing`（分析扇出）/ `executing` 的 Feature 均可挂载任务；
+ * 可挂载态 = `MOUNTABLE_FEATURE_STATES`（**常量集合驱动**，现为
+ * `executing` / `waiting_approval`；`analyzing`（分析扇出）已随主链收敛**有意撤销**；
+ * 登记 ≠ 派发 —— `tick` 只看 `executing`。变更该常量即自动更新文案，经 `join` 取用）；
  * `dependencies` 引用同 Feature 内的本地 taskId；`inputs` 声明本节点引用的上游产物。
  */
 function registerFeatureNode(
@@ -1342,11 +1394,11 @@ function registerFeatureNode(
   if (feature === null) {
     return { ok: false, code: "feature_not_found", error: `未知 Feature ${featureId}`, contextId };
   }
-  if (feature.state !== "analyzing" && feature.state !== "executing") {
+  if (!MOUNTABLE_FEATURE_STATES.includes(feature.state)) {
     return {
       ok: false,
       code: "feature_state_invalid",
-      error: `Feature ${featureId} 当前为 ${feature.state}，仅 analyzing / executing 可挂载任务`,
+      error: `Feature ${featureId} 当前为 ${feature.state}，仅 ${MOUNTABLE_FEATURE_STATES.join(" / ")} 可挂载任务`,
       contextId,
     };
   }
@@ -1441,8 +1493,9 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
       const artifacts = summarizeArtifacts(task.artifacts);
       registerArtifacts(featureId, node.taskId, artifacts);
       updateTaskState(node.taskId, st, JSON.stringify(artifacts), taskText(task));
-      console.log(
-        `[a2a-bridge] Feature 节点 ${node.taskId}（远端 ${remoteTaskId}）已终态（${st}）`,
+      bridgeLog.info(
+        "a2a-bridge",
+        `Feature 节点 ${node.taskId}（远端 ${remoteTaskId}）已终态（${st}）`,
       );
     },
     onSettled: (task, outcome) => {
@@ -1464,16 +1517,222 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
     maxConsecutiveFailures: WATCHER_MAX_CONSECUTIVE_FAILURES,
   });
   if (started) {
-    console.log(
-      `[a2a-bridge] Feature 节点 ${node.taskId} 已派发（远端 ${remoteTaskId}），转后台看护`,
+    bridgeLog.info(
+      "a2a-bridge",
+      `Feature 节点 ${node.taskId} 已派发（远端 ${remoteTaskId}），转后台看护`,
     );
   }
   return { ok: true };
 }
 
+// ---------------------------------------------------------------------------
+// v0.4.1 取证流：`/projects` 快照 + 取证结论解析（§2.5 硬路径 / §2.3 ③④）
+// ---------------------------------------------------------------------------
+
+/** `/projects` 快照状态（**非阻塞**：探针只读快照，刷新为 fire-and-forget 惰性触发） */
+interface ProjectsSnapshotState {
+  byProject: Map<string, ProjectStatus>;
+  /** 最近一次刷新完成时刻（成功或失败都记，用于节流） */
+  refreshedAt: number;
+  /** 最近一次刷新失败的原因（仅供 reason 留痕；四种失败一律 `ready=false`） */
+  error: string | null;
+  inFlight: boolean;
+}
+
+const projectsSnapshot: ProjectsSnapshotState = {
+  byProject: new Map<string, ProjectStatus>(),
+  refreshedAt: 0,
+  error: null,
+  inFlight: false,
+};
+
+/**
+ * 把项目状态顺带记进快照。**由 `locateProject` 在命中项目时调用**：
+ * 派发/查询路径本就已经拿到 `ProjectStatus`，顺带落快照 ⇒ 探针免掉一次额外 HTTP，
+ * 也让 `workspace` 在**第一次**登记取证节点时就是真值（而非退化为 cwd 表述）。
+ */
+function rememberProjectStatus(project: ProjectStatus): void {
+  projectsSnapshot.byProject.set(project.projectId, project);
+}
+
+/** 把 `/projects` 失败文本归类为 reason（除 `offline` 外四者一律 `ready=false`，此处只为留痕） */
+function classifyProbeError(error: string): string {
+  if (error.includes("503")) return "503";
+  if (error.toLowerCase().includes("starting")) return "starting";
+  return "unreachable";
+}
+
+/**
+ * **惰性刷新** `/projects` 快照（**fire-and-forget，绝不 `await`**）。
+ *
+ * - 最短刷新间隔 `EVIDENCE_POLL_MS`（与门同频；`inFlight` 防重入）；
+ * - **不新增定时器**：由 tick 侧探针调用触发，不引入第二套生命周期；
+ * - 无论成败都记 `refreshedAt` ⇒ 失败时不会每 tick 重打。
+ */
+function refreshProjectsSnapshotLazily(): void {
+  if (projectsSnapshot.inFlight) return;
+  if (Date.now() - projectsSnapshot.refreshedAt < EVIDENCE_POLL_MS) return;
+  projectsSnapshot.inFlight = true;
+  void (async () => {
+    try {
+      const config = loadMachines();
+      if (!config.ok) {
+        projectsSnapshot.error = "probe_unavailable";
+        return;
+      }
+      const listed = await Promise.all(config.machines.map((m) => listMachineProjects(m)));
+      let firstError: string | null = null;
+      for (const result of listed) {
+        if (result.ok) {
+          for (const p of result.projects) rememberProjectStatus(p);
+        } else if (firstError === null) {
+          firstError = classifyProbeError(result.error);
+        }
+      }
+      projectsSnapshot.error = firstError;
+    } catch (err) {
+      projectsSnapshot.error = "unreachable";
+      bridgeLog.error("a2a-bridge", `取证探针刷新 /projects 失败：${toMessage(err)}`);
+    } finally {
+      projectsSnapshot.refreshedAt = Date.now();
+      projectsSnapshot.inFlight = false;
+    }
+  })();
+}
+
+/**
+ * `probeProjectReady` 实现（注入 `FeatureScheduler`，§2.5 硬路径）。
+ *
+ * `ready = 该 project 的 status !== "online"` —— **线协议字段是 `status`（`online`/`offline`），
+ * 没有 `running` 字段**（见 `PROTOCOL.md` / `parseProjectStatus`）。
+ * `503` / `starting` / 不可达 / 无快照 ⇒ `ready=false`（由 `reason` 区分，仅留痕）。
+ *
+ * **同步返回**：只读快照 + 惰性触发刷新，回调内**不 `await`**（否则 10min 的门会拖住 tick 推进）。
+ */
+function probeProjectReady(projectId: string): { ready: boolean; reason: string } {
+  refreshProjectsSnapshotLazily();
+  const status = projectsSnapshot.byProject.get(projectId);
+  if (status === undefined) {
+    return { ready: false, reason: projectsSnapshot.error ?? "probe_unavailable" };
+  }
+  if (status.status !== "online") return { ready: true, reason: "offline" };
+  return { ready: false, reason: "online" };
+}
+
+/**
+ * `resolveEvidence` 实现（注入 `FeatureScheduler`，§2.5 → §2.3 ④）。
+ *
+ * 取证结论的解析来源（按优先级）：
+ * 1. 该任务**归档产物摘要**里的 `evidence.json`（`tasks.artifacts_json`）——
+ *    **这是唯一真正带内容的地方**：`artifacts` 表只存 `name/mime/uri/size`（无内容列）；
+ * 2. 该任务全部归档产物文本（worker 未按建议命名时）；
+ * 3. `artifacts` 表中名字命中的行（`uri` 恰为内联 JSON 时）。
+ *
+ * 解析成功 ⇒ 写 `parsed` **转折点**事件（只写一次，不是每轮询）；**失败 / 缺失 ⇒ `null`**
+ * ⇒ 调度器按「无证据」交人（fail-safe）。
+ */
+function resolveEvidence(evidenceTaskId: string): EvidenceResult | null {
+  const task = getTask(evidenceTaskId);
+  if (task === null) return null;
+
+  const archived = parseArchivedArtifacts(task.artifactsJson);
+  const named = archived.find((a) => a.name === EVIDENCE_ARTIFACT_NAME);
+  const candidates: string[] = [];
+  if (named !== undefined) candidates.push(artifactSummaryText(named));
+  candidates.push(textFromArchivedArtifacts(task.artifactsJson));
+  for (const rec of listArtifactsByProducer(evidenceTaskId, 50)) {
+    if (rec.name === EVIDENCE_ARTIFACT_NAME && rec.uri !== null) candidates.push(rec.uri);
+  }
+
+  for (const text of candidates) {
+    if (text.length === 0) continue;
+    const evidence = parseEvidenceResult(text);
+    if (evidence === null) continue;
+    appendEvent({
+      featureId: task.featureId,
+      taskId: evidenceTaskId,
+      kind: EVIDENCE_EVENT_KIND,
+      state: null,
+      payload: JSON.stringify({
+        phase: "parsed",
+        projectId: task.projectId,
+        stable: evidence.stable,
+        gatesOk: evidence.gatesOk,
+        dCount: evidence.d.length,
+        rCount: evidence.r.length,
+      }),
+    });
+    return evidence;
+  }
+  bridgeLog.error(
+    "a2a-bridge",
+    `取证结论解析失败（节点 ${evidenceTaskId}）：未取到可解析的 ${EVIDENCE_ARTIFACT_NAME}`,
+  );
+  return null;
+}
+
+/**
+ * 取证节点登记（v0.4.1 §2.3 ② / §2.5）—— 注入 `FeatureScheduler.registerEvidenceNode`。
+ *
+ * 调用时机由调度器保证：`infra` 失败节点**已中性化**（`exhausted=1`）之后才调用，
+ * 故此处只需「建节点 + 打角色标记 + 设初始挡板」。
+ *
+ * 要点：
+ * - **新 `contextId`**（`randomUUID()`）：不继承失败节点的会话 ⇒ 与旧 turn 无共享状态，
+ *   是**客观第三方**；失败节点若仍在通过超时 turn 写盘，也不会污染本次取证；
+ * - **角色标记随消息持久化**（`markEvidenceMessage`）⇒ 桥重启后仍可被 `isEvidenceNode` 识别
+ *   （内存态标记会丢，这正是 §4.1.8 要「消息带角色标记」的原因）；
+ * - **自包含消息**（nonce / project / workspace / In-Scope / 命令 / 软校验口径 / 输出格式），
+ *   模板见 `bridge/evidence-message.ts`；
+ * - **初始持久化挡板** `not_before = now + EVIDENCE_POLL_MS`：即使本轮 tick 立刻跑，
+ *   取证节点也不会在等回收门判定之前被派出去（后续由 O3b 的门续挡 / 放行）；
+ * - **不调用 `scheduler.kick()`**：登记发生在看护回调路径上，下一个 tick（≤1.5s）自然会处理；
+ *   初始挡板已保证不会被抢跑。
+ */
+function registerEvidenceNode(featureId: string, failedTaskId: string): void {
+  const failed = getTask(failedTaskId);
+  if (failed === null) {
+    bridgeLog.error("a2a-bridge", `取证节点登记失败：未知失败节点 ${failedTaskId}`);
+    return;
+  }
+  const feature = getFeature(featureId);
+  const nonce = randomUUID();
+  const message = markEvidenceMessage(
+    buildEvidenceMessage({
+      projectId: failed.projectId,
+      // 真值优先取自快照（`locateProject` 已顺带写入）⇒ 消息带**真实 workspace**；
+      // 尚未预热时（极少）退化为模板的「cwd 即 workspace」表述。
+      workspace: projectsSnapshot.byProject.get(failed.projectId)?.workspace ?? null,
+      featureId,
+      plan: feature?.plan ?? null,
+      nonce,
+      sampleGapSec: Math.max(1, Math.round(EVIDENCE_POLL_MS / 1000)),
+    }),
+  );
+  const localTaskId = randomUUID();
+  createTask({
+    taskId: localTaskId,
+    projectId: failed.projectId,
+    // 新 ctx：取证节点**不继承**失败节点的会话（客观第三方；也避免与旧 turn 共享状态）
+    contextId: randomUUID(),
+    state: "working",
+    prompt: message,
+    featureId,
+    dispatchMessage: message,
+  });
+  setTaskNotBefore(localTaskId, new Date(Date.now() + EVIDENCE_POLL_MS).toISOString());
+  bridgeLog.info(
+    "a2a-bridge",
+    `已登记取证节点 ${localTaskId}（feature=${featureId}，失败节点=${failedTaskId}，project=${failed.projectId}）`,
+  );
+}
+
 /** 进程级调度器（生命周期随桥进程；main() 启动循环 + 恢复） */
 const scheduler = new FeatureScheduler({
   dispatch: (node) => dispatchFeatureNode(node),
+  registerEvidenceNode: (featureId, failedTaskId) => registerEvidenceNode(featureId, failedTaskId),
+  probeProjectReady: (projectId) => probeProjectReady(projectId),
+  resolveEvidence: (evidenceTaskId) => resolveEvidence(evidenceTaskId),
 });
 
 interface TaskStatusSuccess {
@@ -1499,7 +1758,7 @@ async function handleTaskStatus(taskId: string): Promise<TaskStatusOutcome> {
 
   // 本地快路径：终结态结果是最终事实（落库时已 settle），直接以本地存档作答；
   // 不 ensure、不碰远端——远端任务态不持久化（agent 回收后重 ensure 是新进程，只会 Task not found）
-  if (isLocalTerminalState(record.state)) {
+  if (isLocalTerminalState(record)) {
     const artifacts = parseArchivedArtifacts(record.artifactsJson);
     return {
       ok: true,
@@ -1631,10 +1890,6 @@ interface MachinesView {
     projects: ProjectStatus[];
     error?: string;
   }>;
-}
-
-function isFailure(v: MachinesView | Failure): v is Failure {
-  return "ok" in v && v.ok === false;
 }
 
 async function handleProjects(): Promise<MachinesView | Failure> {
@@ -1892,7 +2147,7 @@ function applyPushedTaskState(localTaskId: string, a2aState: string): void {
   const mapped = mapTaskState(stateEnum);
   if (mapped !== "completed" && mapped !== "failed" && mapped !== "input-required") return;
   const current = getTask(localTaskId);
-  if (current === null || isLocalTerminalState(current.state)) return;
+  if (current === null || isLocalTerminalState(current)) return;
   updateTaskState(localTaskId, mapped);
 }
 
@@ -1978,21 +2233,16 @@ async function handleCallbackRequest(
   }
 }
 
-/** 是否 loopback 主机（用于绑定告警：跨机回调鉴权待 v0.7.0） */
-function isLoopbackHost(host: string): boolean {
-  return host === "localhost" || host === "::1" || /^127\./.test(host);
-}
-
 /** 启动 HTTP 事件端点（幂等；`enabled=false` 时不启动） */
 function startCallbackServer(cfg: CallbackConfig): void {
   if (!cfg.enabled || callbackServer !== null) return;
-  if (!isLoopbackHost(cfg.host)) {
+  if (!isLoopbackHostOrAddress(cfg.host)) {
     console.error(
       `[a2a-bridge] 警告：回调端点绑定非 loopback 地址 ${cfg.host}` +
         `（仅同机/受信网络 opt-in；跨机回调鉴权待 v0.7.0）`,
     );
   }
-  const server = createServer((req, res) => {
+  const server = createHttpServer((req, res) => {
     void handleCallbackRequest(req, res, cfg);
   });
   server.on("error", (err) => {
@@ -2019,412 +2269,261 @@ function stopCallbackServer(): void {
 }
 
 // ---------------------------------------------------------------------------
-// MCP Server（stdio；固定工具面，5 个泛型工具）
+// 编排内核（core）与 MCP server 工厂
 // ---------------------------------------------------------------------------
+// 工具注册与 `createServer(core)` 已迁至 `bridge/register-tools.ts`：stateless
+// 「每请求新建 server + transport」可**无副作用复用**（本模块是进程入口，import 即有
+// 副作用，故工厂不放在这里）。
+//
+// §2.2 硬规则：core 对外只暴露领域入口（下列 `BridgeCore`），**不含任何 MCP 类型**；
+// transports 层调用后自行把结果格式化为 `CallToolResult`。
 
-const server = new McpServer({ name: "a2a-coding-bridge", version: "0.2.0" });
+/**
+ * 编排内核对外领域入口（§2.2）。现由 `createCore()` 包住本模块既有领域处理器装配；
+ * N6 接常驻化时改为注入 runtime 生命周期（core 租约 / scheduler 归属）。
+ */
+export interface BridgeCore {
+  projects(): Promise<MachinesView | Failure>;
+  tasks(projectId: string, state?: DomainTaskState, limit?: number): Promise<TasksView | Failure>;
+  call(
+    projectId: string,
+    text: string,
+    contextId: string | undefined,
+    wait: boolean,
+    /**
+     * **立即派发路径只承载 `inquiry`**（类型级约束，见 `handleCall`）；执行型派发
+     * （`mode="execute"`）必带 `featureId`，走 `registerFeatureNode`（登记 DAG，由调度器派发）。
+     */
+    mode?: "inquiry",
+  ): Promise<CallOutcome>;
+  registerFeatureNode(
+    projectId: string,
+    message: string,
+    contextId: string | undefined,
+    featureId: string,
+    dependencies: readonly string[],
+    inputs?: readonly InputArtifactRef[] | undefined,
+  ): CallOutcome;
+  taskStatus(taskId: string): Promise<TaskStatusOutcome>;
+  cancel(taskId: string): Promise<CancelOutcome>;
+  events(since?: number): EventsOutcome;
+  wait(timeoutMs?: number): Promise<WaitOutcome>;
+  featureCreate(args: FeatureCreateArgs): FeatureCreateSuccess | FeatureToolFailure;
+  featureStatus(args: FeatureStatusArgs): FeatureStatusSuccess | FeatureToolFailure;
+  featureAdvance(args: FeatureAdvanceArgs): FeatureStateChangeSuccess | FeatureToolFailure;
+  featureApprove(args: FeatureApproveArgs): FeatureStateChangeSuccess | FeatureToolFailure;
+  featureCancel(args: FeatureCancelArgs): FeatureStateChangeSuccess | FeatureToolFailure;
+  /** 工具返回后统一 kick 调度器（Feature 工具组用） */
+  kickScheduler(): void;
+}
 
-function textResult(payload: unknown): CallToolResult {
+/** 装配内核：既有领域处理器的结构化聚合（N6 常驻化时改为注入 runtime 生命周期）。 */
+export function createCore(): BridgeCore {
   return {
-    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
+    projects: handleProjects,
+    tasks: handleTasks,
+    call: handleCall,
+    registerFeatureNode,
+    taskStatus: handleTaskStatus,
+    cancel: handleCancel,
+    events: handleEvents,
+    wait: handleWait,
+    featureCreate: handleFeatureCreate,
+    featureStatus: handleFeatureStatus,
+    featureAdvance: handleFeatureAdvance,
+    featureApprove: handleFeatureApprove,
+    featureCancel: handleFeatureCancel,
+    kickScheduler: (): void => scheduler.kick(),
   };
 }
 
-function errorResult(payload: unknown): CallToolResult {
-  return {
-    content: [{ type: "text", text: JSON.stringify(payload, null, 2) }],
-    isError: true,
-  };
+/** 当前活动 MCP server（stdio 路径由 `main()` 装配；供 `shutdown()` 关闭） */
+let activeServer: McpServer | null = null;
+/** 常驻 HTTP 接入面句柄（http 模式；停机第一步先停收新请求） */
+let activeHttp: HttpTransportHandle | null = null;
+/** 运行时编排（两接入面共用：core 租约 / 后台循环归属 / pidfile / 排空停机） */
+let activeRuntime: BridgeRuntime | null = null;
+/** 停机重入守卫（信号与 `POST /shutdown` 可能并发到达） */
+let stopping = false;
+
+/**
+ * 桥运行时 data dir：与 store 的 DB 同目录 —— `core.lock` / `bridge.pid` 落 `orch/data`。
+ * DB 路径已由 store 绝对化（N2），此处跟随其目录，保证「租约」与「库」不会分家。
+ */
+const DATA_DIR = dirname(process.env["SESSION_DB"] ?? DEFAULT_SESSION_DB);
+
+// ---------------------------------------------------------------------------
+// 启动（按 `config.transport.mode` 分派：stdio 为默认接入面，http 为常驻接入面）
+// ---------------------------------------------------------------------------
+
+/** transport 配置（懒加载 + 进程内缓存；读取失败回落 stdio 默认，与旧配置行为一致） */
+let cachedTransportConfig: TransportConfig | null = null;
+let transportConfigLoaded = false;
+
+/** 配置缺失 / 非法时的兜底（取值与 `config.ts` 缺省一致） */
+const FALLBACK_TRANSPORT: TransportConfig = {
+  mode: "stdio",
+  http: { host: "127.0.0.1", port: 8787, path: "/mcp" },
+};
+
+function transportConfig(): TransportConfig {
+  if (!transportConfigLoaded) {
+    transportConfigLoaded = true;
+    try {
+      cachedTransportConfig = loadMachinesConfig(MACHINES_CONFIG_PATH).transport;
+    } catch (err) {
+      // 与 `callbackConfig()` 一致：配置缺失 / 非法不阻塞启动，回落 stdio（旧行为）
+      bridgeLog.error("a2a-bridge", `加载 transport 配置失败（回落 stdio）：${toMessage(err)}`);
+      cachedTransportConfig = null;
+    }
+  }
+  return cachedTransportConfig ?? FALLBACK_TRANSPORT;
 }
 
-function internalError(err: unknown): CallToolResult {
-  return errorResult({ ok: false, code: "internal_error", error: toMessage(err) });
+function transportMode(): TransportMode {
+  return transportConfig().mode;
 }
 
-server.registerTool(
-  "a2a_projects",
-  {
-    description:
-      "聚合列出所有已配置机器及其本机项目（含运行态与 A2A 端点）。机器不可达时该项目列表为空并带 error 字段。",
-  },
-  async () => {
-    try {
-      const result = await handleProjects();
-      return isFailure(result) ? errorResult(result) : textResult(result);
-    } catch (err) {
-      return internalError(err);
-    }
-  },
-);
-
-server.registerTool(
-  "a2a_tasks",
-  {
-    description:
-      "按项目列出本地任务记录（默认按 updatedAt 倒序、默认 20 条）。用于句柄丢失后找回任务；prompt 为落库片段。",
-    inputSchema: {
-      project: z.string().min(1).describe("目标项目 ID"),
-      state: z
-        .enum(["working", "completed", "failed", "input-required", "blocked"])
-        .optional()
-        .describe("按任务态过滤；省略返回全部"),
-      limit: z
-        .number()
-        .int()
-        .positive()
-        .max(100)
-        .optional()
-        .describe("返回条数上限，默认 20，最大 100"),
-    },
-  },
-  async (args) => {
-    try {
-      const outcome = await handleTasks(args.project, args.state, args.limit);
-      return "ok" in outcome && outcome.ok === false ? errorResult(outcome) : textResult(outcome);
-    } catch (err) {
-      return internalError(err);
-    }
-  },
-);
-
-server.registerTool(
-  "a2a_call",
-  {
-    description:
-      "向目标项目派发一轮任务：解析项目→机器，按需幂等启动其 Agent（ensure），经 A2A 发送消息并返回文本结果 + artifacts。传入相同 contextId 可续接上下文；返回 contextId 便于继续追问。wait=false 时立即返回句柄（全异步，不进入同步等待）。提供 featureId 时改为登记 Feature DAG 节点（不立即派发），由调度器按 dependencies 串行自动派发。",
-    inputSchema: {
-      project: z.string().min(1).describe("目标项目 ID（静态分布配置中的 projectId）"),
-      message: z.string().min(1).describe("发给执行 Agent 的任务内容"),
-      contextId: z
-        .string()
-        .optional()
-        .describe("会话上下文 ID；续接同一上下文时传入，省略则自动新建并在返回中给出"),
-      wait: z
-        .boolean()
-        .optional()
-        .describe(
-          "true/省略=半异步（同步等待至多 SYNC_BUDGET_MS 再返回）；false=全异步，立即返回 working + taskId + contextId，由后台看护在终态时落库",
-        ),
-      featureId: z
-        .string()
-        .optional()
-        .describe(
-          "挂载到 Feature：提供时任务作为 DAG 节点登记（返回本地 taskId），由调度器在依赖满足后自动串行派发；省略则按现状立即派发。仅 analyzing / executing 的 Feature 可挂载。",
-        ),
-      dependencies: z
-        .array(z.string())
-        .optional()
-        .describe(
-          "前置任务本地 taskId 数组（仅 featureId 提供时生效；前一任务终态后才派发下一个）",
-        ),
-      inputs: z
-        .array(
-          z.object({
-            producerTaskId: z.string().optional().describe("上游节点本地 taskId"),
-            name: z.string().optional().describe("产物名（配 producerTaskId 定位）"),
-            artifactId: z.string().optional().describe("产物主键（优先，支持后缀匹配）"),
-          }),
-        )
-        .optional()
-        .describe(
-          "本节点引用的上游产物（仅 featureId 提供时生效）：{producerTaskId, name} 或 {artifactId}；派发时解析并注入完成的上游产物内容/引用",
-        ),
-    },
-  },
-  async (args) => {
-    try {
-      if (args.featureId !== undefined && args.featureId.length > 0) {
-        const outcome = registerFeatureNode(
-          args.project,
-          args.message,
-          args.contextId,
-          args.featureId,
-          args.dependencies ?? [],
-          args.inputs,
-        );
-        return outcome.ok ? textResult(outcome) : errorResult(outcome);
-      }
-      const outcome = await handleCall(
-        args.project,
-        args.message,
-        args.contextId,
-        args.wait ?? true,
-      );
-      return outcome.ok ? textResult(outcome) : errorResult(outcome);
-    } catch (err) {
-      return internalError(err);
-    }
-  },
-);
-
-server.registerTool(
-  "a2a_task_status",
-  {
-    description: "查询任务态（A2A tasks/get），并回写本地任务存储；返回状态、文本与 artifacts。",
-    inputSchema: {
-      taskId: z.string().min(1).describe("a2a_call 返回的 taskId"),
-    },
-  },
-  async (args) => {
-    try {
-      const outcome = await handleTaskStatus(args.taskId);
-      return outcome.ok ? textResult(outcome) : errorResult(outcome);
-    } catch (err) {
-      return internalError(err);
-    }
-  },
-);
-
-server.registerTool(
-  "a2a_cancel",
-  {
-    description: "取消任务（A2A tasks/cancel），并回写本地任务存储；返回取消后的任务态。",
-    inputSchema: {
-      taskId: z.string().min(1).describe("a2a_call 返回的 taskId"),
-    },
-  },
-  async (args) => {
-    try {
-      const outcome = await handleCancel(args.taskId);
-      return outcome.ok ? textResult(outcome) : errorResult(outcome);
-    } catch (err) {
-      return internalError(err);
-    }
-  },
-);
-
-server.registerTool(
-  "a2a_events",
-  {
-    description:
-      "读取事件收件箱增量（任务结算/阻塞、Feature 流转、worker push）。省略 since 则自进程读游标起；无变化时廉价空返回。",
-    inputSchema: {
-      since: z
-        .number()
-        .int()
-        .nonnegative()
-        .optional()
-        .describe("游标：仅返回 eventId 大于它的新事件；省略则用进程读游标"),
-    },
-  },
-  async (args) => {
-    try {
-      return textResult(handleEvents(args.since));
-    } catch (err) {
-      return internalError(err);
-    }
-  },
-);
-
-server.registerTool(
-  "a2a_wait",
-  {
-    description:
-      "长轮询等待新事件（推送优先唤醒 + 定时对账），最多 timeoutMs（内部上限低于同步预算）；超时无事件则 timedOut=true。",
-    inputSchema: {
-      timeoutMs: z
-        .number()
-        .int()
-        .positive()
-        .optional()
-        .describe("最长等待毫秒；省略用内部上限（cap < SYNC_BUDGET_MS）"),
-    },
-  },
-  async (args) => {
-    try {
-      return textResult(await handleWait(args.timeoutMs));
-    } catch (err) {
-      return internalError(err);
-    }
-  },
-);
-
-// ---------------------------------------------------------------------------
-// MCP Server（Feature 工具组；静态注册，零重连）
-// ---------------------------------------------------------------------------
-
-server.registerTool(
-  "a2a_feature_create",
-  {
-    description:
-      "新建 Feature（一条需求，初始态 discussing）。返回 featureId 供后续 advance/approve/cancel/status 引用。",
-    inputSchema: {
-      title: z.string().min(1).describe("Feature 标题（需求的简短摘要）"),
-      requirement: z.string().optional().describe("需求原文（可选）"),
-      contextId: z
-        .string()
-        .optional()
-        .describe("Feature 级会话上下文（落 features.context_id，跨任务 / 跨 worker 启停复用）"),
-    },
-  },
-  async (args) => {
-    try {
-      const outcome = handleFeatureCreate({
-        title: args.title,
-        requirement: args.requirement,
-        contextId: args.contextId,
-      });
-      return outcome.ok ? textResult(outcome) : errorResult(outcome);
-    } catch (err) {
-      return internalError(err);
-    }
-  },
-);
-
-server.registerTool(
-  "a2a_feature_status",
-  {
-    description:
-      "查询 Feature 详情（state + tasks 摘要 + artifacts）；省略 featureId 时列出全部 Feature（含任务数）。",
-    inputSchema: {
-      featureId: z.string().optional().describe("Feature ID；省略则列出全部"),
-    },
-  },
-  async (args) => {
-    try {
-      const outcome = handleFeatureStatus({ featureId: args.featureId });
-      return outcome.ok ? textResult(outcome) : errorResult(outcome);
-    } catch (err) {
-      return internalError(err);
-    }
-  },
-);
-
-server.registerTool(
-  "a2a_feature_advance",
-  {
-    description:
-      "orch agent 驱动 Feature 主链推进（如 discussing→analyzing→planning→waiting_approval、integrating→testing→reviewing→completed）；状态机校验合法后继，非法流转被拒。needs_input 恢复用 to=executing 并携带 answer。",
-    inputSchema: {
-      featureId: z.string().min(1).describe("Feature ID"),
-      to: z
-        .string()
-        .min(1)
-        .describe(
-          "目标状态：discussing / analyzing / planning / waiting_approval / executing / integrating / testing / reviewing / completed / needs_input / failed / cancelled（非法后继被状态机拒绝）",
-        ),
-      note: z
-        .string()
-        .optional()
-        .describe("统一方案 / 备注：落 Feature Context 的 plan（供审批与派发注入）"),
-      decisions: z
-        .string()
-        .optional()
-        .describe("决策记录（JSON 字符串；落 Feature Context 的 decisions）"),
-      contracts: z
-        .string()
-        .optional()
-        .describe("契约（JSON 字符串；落 Feature Context 的 contracts）"),
-      answer: z
-        .string()
-        .optional()
-        .describe("needs_input→executing 时的人工澄清内容，以同 contextId 续接待澄清任务"),
-    },
-  },
-  async (args) => {
-    try {
-      const outcome = handleFeatureAdvance({
-        featureId: args.featureId,
-        to: args.to,
-        note: args.note,
-        decisions: args.decisions,
-        contracts: args.contracts,
-        answer: args.answer,
-      });
-      if (!outcome.ok) return errorResult(outcome);
-      scheduler.kick();
-      return textResult(outcome);
-    } catch (err) {
-      return internalError(err);
-    }
-  },
-);
-
-server.registerTool(
-  "a2a_feature_approve",
-  {
-    description: "审批门：用户放行 Feature（waiting_approval → executing）；非该态调用被拒。",
-    inputSchema: {
-      featureId: z.string().min(1).describe("Feature ID"),
-    },
-  },
-  async (args) => {
-    try {
-      const outcome = handleFeatureApprove({ featureId: args.featureId });
-      if (!outcome.ok) return errorResult(outcome);
-      scheduler.kick();
-      return textResult(outcome);
-    } catch (err) {
-      return internalError(err);
-    }
-  },
-);
-
-server.registerTool(
-  "a2a_feature_cancel",
-  {
-    description: "取消 Feature（任意非终态 → cancelled）；调度器随之停止该 Feature。",
-    inputSchema: {
-      featureId: z.string().min(1).describe("Feature ID"),
-    },
-  },
-  async (args) => {
-    try {
-      const outcome = handleFeatureCancel({ featureId: args.featureId });
-      return outcome.ok ? textResult(outcome) : errorResult(outcome);
-    } catch (err) {
-      return internalError(err);
-    }
-  },
-);
-
-// ---------------------------------------------------------------------------
-// 启动（stdio）
-// ---------------------------------------------------------------------------
-
-async function main(): Promise<void> {
+/**
+ * 开 store + 启动清理（lifecycle 的 `openStore` 钩子）。
+ * 与既有 stdio 启动同序：先开库（迁移）再 `pruneTasks()`；清理失败只记日志、不阻塞启动。
+ */
+function openStoreAndPrune(): void {
+  getDefaultStore();
   try {
     const pruned = pruneTasks();
-    if (pruned > 0) {
-      console.error(`[a2a-bridge] 启动清理任务记录：删除 ${pruned} 条`);
-    }
+    if (pruned > 0) bridgeLog.info("a2a-bridge", `启动清理任务记录：删除 ${pruned} 条`);
   } catch (err) {
-    console.error(`[a2a-bridge] 启动清理任务记录失败：${toMessage(err)}`);
+    bridgeLog.error("a2a-bridge", `启动清理任务记录失败：${toMessage(err)}`);
   }
-  // 桥重启恢复：扫描非终态 Feature 纯本地收敛（不 ensure、不派发）
-  try {
-    const recovered = scheduler.recover();
-    if (recovered.scanned > 0 || recovered.interruptedTasks > 0) {
-      console.error(
-        `[a2a-bridge] 桥重启恢复：扫描非终态 Feature ${recovered.scanned}，收敛 failed ${recovered.failedFeatures}（interrupted 任务 ${recovered.interruptedTasks}）`,
-      );
-    }
-  } catch (err) {
-    console.error(`[a2a-bridge] 桥重启恢复失败：${toMessage(err)}`);
-  }
-  // 启动串行 Task DAG 调度器（进程内异步循环，不阻塞 stdio）
-  scheduler.start();
-  // 启动 worker 回调端点（v0.4.0 §2.6；`callback.enabled` 默认关，关闭时 startCallbackServer 空操作）
-  startCallbackServer(callbackConfig());
-  const transport = new StdioServerTransport();
-  await server.connect(transport);
-  console.error(
-    "[a2a-bridge] MCP stdio server ready: a2a_projects / a2a_tasks / a2a_call / a2a_task_status / a2a_cancel / a2a_feature_create / a2a_feature_status / a2a_feature_advance / a2a_feature_approve / a2a_feature_cancel",
+}
+
+/**
+ * 装配运行时编排（§2.5）：开 store → 抢 core 租约 → 启动 watcher → 启动 scheduler →
+ * `recover()` → 就绪。`unref` 由 lifecycle 按模式给出（stdio=true / http=false）。
+ *
+ * pidfile **仅常驻模式**写：stdio 桥由宿主作为子进程拉起，若也写 `<dataDir>/bridge.pid`
+ * 会覆盖常驻进程的记录（N7 `bridgectl status/stop` 会认错进程）。
+ */
+function createBridgeRuntime(mode: TransportMode): BridgeRuntime {
+  return new BridgeRuntime({
+    dataDir: DATA_DIR,
+    mode,
+    scheduler,
+    openStore: openStoreAndPrune,
+    pidFile: mode === "http" ? defaultPidFile(DATA_DIR) : null,
+  });
+}
+
+/** 启动恢复摘要（lifecycle 只回摘要不落日志；此处补日志，承接旧 stdio 路径的 recover 日志） */
+function logRecoverySummary(recovery: unknown): void {
+  const r = asRecord(recovery);
+  if (r === null) return;
+  const scanned = typeof r["scanned"] === "number" ? r["scanned"] : 0;
+  const failedFeatures = typeof r["failedFeatures"] === "number" ? r["failedFeatures"] : 0;
+  const interruptedTasks = typeof r["interruptedTasks"] === "number" ? r["interruptedTasks"] : 0;
+  if (scanned === 0 && interruptedTasks === 0) return;
+  bridgeLog.info(
+    "a2a-bridge",
+    `桥重启恢复：扫描非终态 Feature ${scanned}，收敛 failed ${failedFeatures}（interrupted 任务 ${interruptedTasks}）`,
   );
 }
 
+/**
+ * stdio 接入面（默认）：接入面 + 生命周期编排。
+ * 相对旧路径唯一的行为差异是**多一道 core 租约门闩**：owner 照常跑 scheduler/watcher；
+ * follower（他进程已持调度权）只提供工具面（§2.4 / §2.8 单桥约束）。
+ */
+async function startStdioBridge(): Promise<void> {
+  const runtime = createBridgeRuntime("stdio");
+  activeRuntime = runtime;
+  const readiness: RuntimeReadiness = runtime.start();
+  logRecoverySummary(readiness.recovery);
+  // 启动 worker 回调端点（v0.4.0 §2.6；`callback.enabled` 默认关，关闭时 startCallbackServer 空操作）
+  startCallbackServer(callbackConfig());
+  activeServer = await startStdioTransport(createCore());
+  console.error(
+    `[a2a-bridge] MCP stdio server ready（role=${readiness.role}）: a2a_projects / a2a_tasks / a2a_call / a2a_task_status / a2a_cancel / a2a_feature_create / a2a_feature_status / a2a_feature_advance / a2a_feature_approve / a2a_feature_cancel`,
+  );
+}
+
+/**
+ * 常驻接入面（http）：**先 `listen`** —— 端口被占即 fail fast，且此时尚未持锁 / 未写 pidfile
+ * （§2.4 第 4 条「端口绑定即单实例互斥」）；随后走 lifecycle 编排。
+ * `/health` 在 `recover()` 落地前返回 503 + `status="starting"`（就绪信号晚于 `recover()`，§2.5）。
+ */
+async function startHttpBridge(): Promise<void> {
+  const { host, port, path } = transportConfig().http;
+  let ready = false;
+  const runtime = createBridgeRuntime("http");
+  activeRuntime = runtime;
+  const handle = await startHttpTransport({
+    core: createCore(),
+    host,
+    port,
+    path,
+    isReady: () => ready,
+    role: () => runtime.currentRole,
+    version: BRIDGE_VERSION,
+    onShutdown: shutdown,
+  });
+  activeHttp = handle;
+  const readiness: RuntimeReadiness = runtime.start();
+  logRecoverySummary(readiness.recovery);
+  startCallbackServer(callbackConfig());
+  ready = true;
+  bridgeLog.info(
+    "a2a-bridge",
+    `MCP HTTP 接入面就绪：http://${host}:${handle.port}${path}（role=${readiness.role}，pid=${readiness.pid}）`,
+    {
+      health: `http://${host}:${handle.port}/health`,
+      shutdown: `http://${host}:${handle.port}/shutdown`,
+    },
+  );
+}
+
+async function main(): Promise<void> {
+  if (transportMode() === "http") {
+    await startHttpBridge();
+    return;
+  }
+  await startStdioBridge();
+}
+
+/**
+ * 优雅停机（信号 / `POST /shutdown` 共用；§2.5 反序 + 排空）：
+ * 停收新请求（HTTP listener）→ 停 scheduler → 排空在飞任务与看护（等待至宽限上限，
+ * **不取消**远端 A2A 任务）→ 停 watcher → 关 store → 释放租约 → 删 pidfile →
+ * 关 MCP server → 退出。幂等（`stopping` 守卫）。
+ */
 function shutdown(): void {
-  scheduler.stop();
-  stopCallbackServer();
-  closeSessionStore();
-  void server
-    .close()
-    .catch((err: unknown) => {
-      console.error(`[a2a-bridge] close error: ${toMessage(err)}`);
-    })
-    .finally(() => {
+  if (stopping) return;
+  stopping = true;
+  void (async (): Promise<void> => {
+    try {
+      const handle = activeHttp;
+      activeHttp = null;
+      if (handle !== null) await handle.close();
+      stopCallbackServer();
+      const runtime = activeRuntime;
+      activeRuntime = null;
+      if (runtime === null) {
+        // 早到信号（lifecycle 尚未装配）：按旧路径兜底收尾
+        scheduler.stop();
+        closeSessionStore();
+      } else {
+        const summary = await runtime.stop();
+        bridgeLog.info("a2a-bridge", `停机完成：${JSON.stringify(summary)}`);
+      }
+      const server = activeServer;
+      activeServer = null;
+      if (server !== null) await server.close();
+    } catch (err) {
+      bridgeLog.error("a2a-bridge", `停机异常：${toMessage(err)}`);
+    } finally {
       process.exit(0);
-    });
+    }
+  })();
 }
 
 process.on("SIGINT", shutdown);

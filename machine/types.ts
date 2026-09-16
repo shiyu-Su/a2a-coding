@@ -99,6 +99,26 @@ export interface StopResult {
   stopped: boolean;
 }
 
+/**
+ * 子进程账本条目：**Launcher 本地文件**，一进程一文件落
+ * `<machine 根>/.a2a/children/<pid>.json`（与 `.a2a/logs`、`.a2a/launcher.pid` 同族）。
+ *
+ * 用途：启动时对账清理 + `machine/scripts/reaper.mjs` 的孤儿判定数据源。
+ * **非线协议**：不得并入 `ProjectStatus`（不变量：不加协议 `pid`）。
+ */
+export interface ChildLedgerEntry {
+  /** 子进程 pid（账本文件名即 `<pid>.json`） */
+  pid: number;
+  /** 所属项目（机器配置中的 projectId） */
+  projectId: string;
+  /** wrapper = A2A 包装器；serve = opencode 前置 `opencode serve`（两条被分别杀） */
+  kind: "wrapper" | "serve";
+  /** 启动时刻（UTC ISO 8601） */
+  startedAt: string;
+  /** 诊断用启动命令行（可选；不含环境变量） */
+  command?: string;
+}
+
 /** 统一错误外壳（对外 HTTP / 工具返回） */
 export interface ApiError {
   code: string;

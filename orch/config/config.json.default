@@ -1,5 +1,13 @@
 {
-  "_comment": "callback：orch 回调端点（默认关 enabled=false）。开启后桥在 host:port 上监听 POST /callback 接收 worker push 通知；仅同机/受信网络 opt-in（跨机回调鉴权待 v0.7.0）。host 缺省 127.0.0.1、port 缺省 3200（避开 Launcher 3100 与项目 A2A 3010-3012）；可选 token 用于校验推送请求（省略则不校验，字段名 token）。machines[].pushCallback：该机项目是否接收 orch push 回调（缺省 false）；仅当 callback.enabled 与该位同时为 true 时，派发才内联注册回调。",
+  "_comment": "transport：桥 transport（v0.4.1 桥常驻化，可选段）。mode 取值 stdio|http，缺省 stdio（旧配置无此段时零改动可用、行为不变）；mode=http 时桥常驻监听 http.host:http.port+http.path，缺省 host=127.0.0.1、port=8787、path=/mcp（避开 Launcher 3100、项目 A2A 3010-3012、回调 3200）。callback：orch 回调端点（默认关 enabled=false）。开启后桥在 host:port 上监听 POST /callback 接收 worker push 通知；仅同机/受信网络 opt-in（跨机回调鉴权待 v0.7.0）。host 缺省 127.0.0.1、port 缺省 3200（避开 Launcher 3100 与项目 A2A 3010-3012）；可选 token 用于校验推送请求（省略则不校验，字段名 token）。machines[].pushCallback：该机项目是否接收 orch push 回调（缺省 false）；仅当 callback.enabled 与该位同时为 true 时，派发才内联注册回调。",
+  "transport": {
+    "mode": "stdio",
+    "http": {
+      "host": "127.0.0.1",
+      "port": 8787,
+      "path": "/mcp"
+    }
+  },
   "callback": {
     "enabled": false,
     "host": "127.0.0.1",

@@ -1,6 +1,6 @@
 {
   "name": "@a2a-coding/orch",
-  "version": "0.4.0",
+  "version": "0.4.1",
   "private": true,
   "type": "module",
   "engines": {
@@ -10,6 +10,11 @@
     "typecheck": "tsc --noEmit",
     "build": "tsc -p tsconfig.json",
     "bridge": "npm run build && node dist/bridge/index.js",
+    "bridge:start": "node scripts/bridgectl.mjs start",
+    "bridge:stop": "node scripts/bridgectl.mjs stop",
+    "bridge:restart": "node scripts/bridgectl.mjs restart",
+    "bridge:status": "node scripts/bridgectl.mjs status",
+    "bridge:logs": "node scripts/bridgectl.mjs logs",
     "lint": "eslint .",
     "test": "npm run build && node --test \"dist/test/*.test.js\"",
     "format": "prettier --write .",

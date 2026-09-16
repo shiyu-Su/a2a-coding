@@ -18,14 +18,33 @@ import {
   createTask,
   getFeature,
   getTask,
+  listEvents,
+  listFeatureTasks,
+  markTaskExhausted,
+  rearmForRetry,
   updateTaskState,
 } from "../session/store.js";
 import {
+  EVIDENCE_EVENT_KIND,
+  EVIDENCE_POLL_MS,
+  EVIDENCE_READY_STREAK,
+  EVIDENCE_WAIT_MAX_MS,
+  EVENT_TASK_RETRY,
   FeatureScheduler,
+  MAX_RETRY,
+  buildRetryMessage,
+  classifyFailure,
   computeReadyNodes,
+  decideEvidenceOutcome,
   depStateOf,
+  isEvidenceNode,
+  isLocalTerminalTask,
+  isNeutered,
+  isPastNotBefore,
+  markEvidenceMessage,
   propagateBlocked,
   reduceConvergence,
+  type EvidenceResult,
   type FeatureDispatchResult,
 } from "../bridge/scheduler.js";
 import type { TaskRecord, TaskState } from "../types.js";
@@ -33,12 +52,13 @@ import type { TaskRecord, TaskState } from "../types.js";
 // 默认存储固定内存库（getDefaultStore 首次调用时读取）
 process.env["SESSION_DB"] = ":memory:";
 
-/** 构造测试用 TaskRecord（仅提供断言关心的字段） */
+/** 构造测试用 TaskRecord（仅提供断言关心的字段）；`over` 覆盖 v0.4.1 新列等 */
 function task(
   id: string,
   state: TaskState,
   dependencies: string[] | null = null,
   remoteTaskId: string | null = null,
+  over: Partial<TaskRecord> = {},
 ): TaskRecord {
   return {
     taskId: id,
@@ -54,6 +74,13 @@ function task(
     inputArtifacts: null,
     remoteTaskId,
     dispatchMessage: null,
+    // v0.4.1 失败自动化列：默认取中性值（未中性化 / 无重试 / 无门）
+    retryCount: 0,
+    failureKind: null,
+    exhausted: false,
+    notBefore: null,
+    lastPollAt: null,
+    ...over,
   };
 }
 
@@ -145,6 +172,165 @@ test("reduceConvergence：全 completed → all_completed；否则 dispatch", ()
   assert.equal(reduceConvergence([task("A", "completed"), task("B", "completed")]).kind, "all_completed");
   assert.equal(reduceConvergence([task("A", "completed"), task("B", "working")]).kind, "dispatch");
   assert.equal(reduceConvergence([task("A", "working")]).kind, "dispatch");
+});
+
+// ---------------------------------------------------------------------------
+// v0.4.1：失败分类（§2.2）
+// ---------------------------------------------------------------------------
+
+test("classifyFailure：白名单 → infra（含 Prompt timeout after / interrupted / abandoned / 库锁 / 网络）", () => {
+  assert.equal(classifyFailure("Prompt timeout after 600000ms"), "infra", "必须含 wrapper 超时");
+  assert.equal(classifyFailure("PROMPT TIMEOUT AFTER 600s"), "infra", "大小写不敏感");
+  // 桥重启 written text（FEATURE_INTERRUPTED_TEXT）与看护放弃 text（FEATURE_ABANDONED_TEXT）
+  assert.equal(
+    classifyFailure("任务因桥进程重启而中断（interrupted），未产出终态；请重新发起或重试。"),
+    "infra",
+  );
+  assert.equal(
+    classifyFailure("任务后台看护连续失败超限（abandoned），任务状态未知；请重新发起或重试。"),
+    "infra",
+  );
+  assert.equal(classifyFailure("database is locked"), "infra");
+  assert.equal(classifyFailure("fetch failed"), "infra");
+  assert.equal(classifyFailure("ECONNREFUSED 127.0.0.1:3010"), "infra");
+});
+
+test("classifyFailure：未知文本 / 空 / null **安全降级 task**（不重试）", () => {
+  assert.equal(classifyFailure("门禁未通过：3 个断言失败"), "task", "任务级失败不得误判 infra");
+  assert.equal(classifyFailure("预期产物缺失"), "task");
+  assert.equal(classifyFailure(""), "task");
+  assert.equal(classifyFailure(null), "task");
+  assert.equal(classifyFailure(undefined), "task");
+});
+
+// ---------------------------------------------------------------------------
+// v0.4.1：中性化（exhausted ⇒ 视作 completed）
+//   `exhausted` 节点 raw `state` 仍是 `failed`，5 处判定各需认它
+// ---------------------------------------------------------------------------
+
+test("中性化①depStateOf：exhausted 上游视作 completed ⇒ 下游可继续派发", () => {
+  const neutered = [
+    task("A", "failed", null, null, { exhausted: true }),
+    task("B", "working", ["A"]),
+  ];
+  assert.equal(depStateOf(neutered[1]!, byIdOf(neutered)), "completed");
+  // 对照：未中性化的 failed 上游仍是 upstreamFailed
+  const plain = [task("A", "failed"), task("B", "working", ["A"])];
+  assert.equal(depStateOf(plain[1]!, byIdOf(plain)), "upstreamFailed");
+});
+
+test("中性化②reduceConvergence 的 failed/blocked 计数：不计入 exhausted", () => {
+  const nodes = [
+    task("A", "failed", null, null, { exhausted: true }),
+    task("B", "completed"),
+  ];
+  assert.notEqual(reduceConvergence(nodes).kind, "failed", "中性化节点不得把 Feature 判 failed");
+});
+
+test("中性化③all_completed 专门用例：取证成功且工作已做完 ⇒ 可推进 integrating（最致命一处）", () => {
+  // 失败节点已被中性化（raw state 仍 failed）+ 工作节点全部 completed
+  const nodes = [
+    task("A", "failed", null, null, { exhausted: true }),
+    task("B", "completed"),
+  ];
+  const convergence = reduceConvergence(nodes);
+  assert.equal(
+    convergence.kind,
+    "all_completed",
+    "漏认中性化 ⇒ 恒不满足 every(completed) ⇒ Feature 永久卡 executing",
+  );
+});
+
+test("中性化④computeReadyNodes：exhausted 节点不参与派发", () => {
+  const nodes = [
+    task("A", "working", null, null, { exhausted: true }),
+    task("B", "working"),
+  ];
+  assert.deepEqual(
+    computeReadyNodes(nodes).map((n) => n.taskId),
+    ["B"],
+  );
+});
+
+test("中性化⑤isLocalTerminalTask：exhausted 节点视作本地终态（不误查远端）", () => {
+  assert.equal(isLocalTerminalTask(task("A", "failed", null, null, { exhausted: true })), true);
+  // 对照：既有语义不变（completed/failed/input-required/blocked 本就是本地终态）
+  assert.equal(isLocalTerminalTask(task("A", "failed")), true);
+  assert.equal(isLocalTerminalTask(task("A", "blocked")), true);
+  assert.equal(isLocalTerminalTask(task("A", "input-required")), true);
+  assert.equal(isLocalTerminalTask(task("A", "completed")), true);
+  // 非终态
+  assert.equal(isLocalTerminalTask(task("A", "working")), false);
+  // 中性化判定单列（与 state 解耦）
+  assert.equal(isNeutered({ exhausted: true }), true);
+  assert.equal(isNeutered({ exhausted: false }), false);
+});
+
+// ---------------------------------------------------------------------------
+// v0.4.1：持久化派发门 not_before（§2.3）
+// ---------------------------------------------------------------------------
+
+test("computeReadyNodes：not_before 未到不被选中；到点被选中（门=持久化，非内存态）", () => {
+  const nowMs = Date.parse("2026-09-15T10:00:00.000Z");
+  const nodes = [
+    task("A", "working", null, null, { notBefore: "2026-09-15T10:05:00.000Z" }), // 未到
+    task("B", "working", null, null, { notBefore: null }), // 无门
+    task("C", "working", null, null, { notBefore: "2026-09-15T09:59:00.000Z" }), // 已过
+  ];
+  assert.deepEqual(
+    computeReadyNodes(nodes, undefined, nowMs).map((n) => n.taskId),
+    ["B", "C"],
+    "门未到者必须不被派出（否则「登记即就绪」绕过硬路径）",
+  );
+  assert.deepEqual(
+    computeReadyNodes(nodes, undefined, Date.parse("2026-09-15T10:05:00.000Z")).map((n) => n.taskId),
+    ["A", "B", "C"],
+    "到点即恢复可派（<= now 含相等）",
+  );
+});
+
+test("isPastNotBefore：NULL / 已过 ⇒ 可派；损坏时间戳按「无门」处理（不永久卡死）", () => {
+  assert.equal(isPastNotBefore(task("A", "working")), true);
+  assert.equal(
+    isPastNotBefore(task("A", "working", null, null, { notBefore: "2026-09-15T09:59:00.000Z" }),
+      Date.parse("2026-09-15T10:00:00.000Z")),
+    true,
+  );
+  assert.equal(
+    isPastNotBefore(task("A", "working", null, null, { notBefore: "2026-09-15T10:05:00.000Z" }),
+      Date.parse("2026-09-15T10:00:00.000Z")),
+    false,
+  );
+  assert.equal(
+    isPastNotBefore(task("A", "working", null, null, { notBefore: "not-a-timestamp" })),
+    true,
+    "坏值不阻塞派发（避免坏值把 Feature 永久卡在 executing）",
+  );
+});
+
+// ---------------------------------------------------------------------------
+// v0.4.1：常量与单测可注入（避免真等 10min）
+// ---------------------------------------------------------------------------
+
+test("v0.4.1 常量：MAX_RETRY=1 / 等回收门上界 10min / 轮询 5s，且经 options 可注入", () => {
+  assert.equal(MAX_RETRY, 1, "N=1：只同 ctx 续一次（防死循环承重件）");
+  assert.equal(EVIDENCE_WAIT_MAX_MS, 600_000);
+  assert.equal(EVIDENCE_POLL_MS, 5_000);
+
+  const bare = new FeatureScheduler({ dispatch: () => Promise.resolve({ ok: true }) });
+  assert.equal(bare.maxRetry, MAX_RETRY);
+  assert.equal(bare.evidenceWaitMaxMs, EVIDENCE_WAIT_MAX_MS);
+  assert.equal(bare.evidencePollMs, EVIDENCE_POLL_MS);
+
+  const injected = new FeatureScheduler({
+    dispatch: () => Promise.resolve({ ok: true }),
+    maxRetry: 0,
+    evidenceWaitMaxMs: 50,
+    evidencePollMs: 5,
+  });
+  assert.equal(injected.maxRetry, 0);
+  assert.equal(injected.evidenceWaitMaxMs, 50);
+  assert.equal(injected.evidencePollMs, 5);
 });
 
 // ---------------------------------------------------------------------------
@@ -340,4 +526,501 @@ test("recover：无在飞任务的 executing Feature 保持，等待续推", () 
   assert.equal(summary.failedFeatures, 0);
   assert.equal(getFeature("f-idle")?.state, "executing");
   assert.equal(getTask("A")?.state, "working");
+});
+
+// ---------------------------------------------------------------------------
+// v0.4.1：infra 处置判定 + 中性化写入 + 取证决策（§2.2 / §2.3 / §2.4 / §2.5）
+// ---------------------------------------------------------------------------
+
+const INFRA_TEXT = "Prompt timeout after 600000ms";
+
+test("buildRetryMessage：中性固定模板（三段齐全、原文照附、不含决策内容）", () => {
+  const msg = buildRetryMessage("原任务：改 X");
+  assert.ok(msg.includes("【自动重试 · 第 1/1 次 · 同会话续接】"));
+  assert.ok(msg.includes("上一次执行在约 600s 时被客户端超时中断"), "① 发生了什么");
+  assert.ok(msg.includes("先核对当前工作区/会话状态"), "② 怎么继续：核现状");
+  assert.ok(msg.includes("只把尚未完成的部分做完"), "② 怎么继续：不重写");
+  assert.ok(msg.includes("先把改动落盘"), "② 怎么继续：接近上限先落盘");
+  assert.ok(msg.includes("原任务内容如下（未变更）"));
+  assert.ok(msg.includes("原任务：改 X"), "原 dispatch_message 全文照附（追加，不替换）");
+  assert.ok(!msg.includes("只做"), "不得含决策内容（引擎不替宿主拍板 scope）");
+});
+
+test("decideEvidenceOutcome：§2.3 决策矩阵（无证据/不稳定/D 空/R 空门禁绿/可重试/用尽）", () => {
+  const base: EvidenceResult = { stable: true, d: ["src/a.ts"], r: ["src/b.ts"], gatesOk: false };
+  assert.equal(decideEvidenceOutcome(null, 0).kind, "needs_input", "无证据 ⇒ 交人");
+  assert.equal(
+    decideEvidenceOutcome({ ...base, stable: false }, 0).kind,
+    "needs_input",
+    "stable=false ⇒ 不拍板不重试",
+  );
+  assert.equal(decideEvidenceOutcome({ ...base, d: [] }, 0).kind, "needs_input", "D 空 ⇒ 不自动重做");
+  assert.equal(
+    decideEvidenceOutcome({ ...base, r: [], gatesOk: true }, 0).kind,
+    "settle",
+    "R 空且门禁绿 ⇒ 按成功收口",
+  );
+  assert.equal(decideEvidenceOutcome(base, 0).kind, "retry");
+  assert.equal(decideEvidenceOutcome(base, MAX_RETRY).kind, "needs_input", "重试用尽 ⇒ 交人");
+  // 注入 maxRetry 生效（单测可关掉重试）
+  assert.equal(decideEvidenceOutcome(base, 0, 0).kind, "needs_input");
+});
+
+test("isEvidenceNode / markEvidenceMessage：角色标记（role flag）随消息持久化", () => {
+  assert.equal(isEvidenceNode({ dispatchMessage: markEvidenceMessage("x"), prompt: null }), true);
+  assert.equal(isEvidenceNode({ dispatchMessage: null, prompt: markEvidenceMessage("x") }), true);
+  assert.equal(isEvidenceNode({ dispatchMessage: "普通任务", prompt: null }), false);
+  assert.equal(isEvidenceNode({ dispatchMessage: null, prompt: null }), false);
+});
+
+test("infra 失败：先中性化后登记取证节点，不 propagate、不 failFeature、不 rearm", () => {
+  close();
+  createFeature({ featureId: "f-infra", title: "infra", state: "executing" });
+  createTask({ taskId: "A", projectId: "p1", contextId: "c1", state: "working", featureId: "f-infra" });
+  createTask({
+    taskId: "B",
+    projectId: "p1",
+    contextId: "c1",
+    state: "working",
+    featureId: "f-infra",
+    dependencies: ["A"],
+  });
+
+  const registered: Array<[string, string]> = [];
+  let exhaustedAtRegister: boolean | null = null;
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    registerEvidenceNode: (featureId, failedTaskId) => {
+      registered.push([featureId, failedTaskId]);
+      exhaustedAtRegister = getTask(failedTaskId)?.exhausted ?? null;
+    },
+  });
+
+  updateTaskState("A", "failed", null, INFRA_TEXT);
+  scheduler.notifyTaskSettled("f-infra", "A", { state: "failed", text: INFRA_TEXT });
+
+  assert.equal(getTask("A")?.exhausted, true, "必须已中性化（唯一写入点 markTaskExhausted）");
+  assert.equal(getTask("A")?.state, "failed", "中性化不改写 state");
+  assert.equal(getTask("A")?.failureKind, "infra", "失败原因落库（§4.1.13）");
+  assert.deepEqual(registered, [["f-infra", "A"]], "必须请求登记取证节点");
+  assert.equal(
+    exhaustedAtRegister,
+    true,
+    "顺序硬约束：登记时失败节点必须**已**中性化（否则 reduceConvergence 立刻判 Feature failed）",
+  );
+  assert.equal(getFeature("f-infra")?.state, "executing", "取证期间 Feature 必须非终态");
+  assert.equal(getTask("B")?.state, "working", "infra 分支不得 propagate（下游不被 blocked）");
+});
+
+test("task 类失败：维持现状（propagate → 下游 blocked → Feature failed）", () => {
+  close();
+  createFeature({ featureId: "f-taskcls", title: "task", state: "executing" });
+  createTask({ taskId: "A", projectId: "p1", contextId: "c1", state: "working", featureId: "f-taskcls" });
+  createTask({
+    taskId: "B",
+    projectId: "p1",
+    contextId: "c1",
+    state: "working",
+    featureId: "f-taskcls",
+    dependencies: ["A"],
+  });
+
+  const scheduler = new FeatureScheduler({ dispatch: async () => ({ ok: true }) });
+  scheduler.notifyTaskSettled("f-taskcls", "A", { state: "failed", text: "门禁未通过：3 个断言失败" });
+
+  assert.equal(getTask("A")?.exhausted, false, "task 类不得中性化");
+  assert.equal(getTask("A")?.failureKind, "task", "两类失败都落库（§4.1.13）");
+  assert.equal(getTask("B")?.state, "blocked");
+  assert.equal(getFeature("f-taskcls")?.state, "failed");
+});
+
+test("取证节点自身失败：直接 needs_input（不再取证、不 propagate、不 failFeature）", () => {
+  close();
+  createFeature({ featureId: "f-evfail", title: "取证失败", state: "executing" });
+  createTask({ taskId: "A", projectId: "p1", contextId: "c1", state: "failed", featureId: "f-evfail" });
+  markTaskExhausted("A");
+  createTask({
+    taskId: "EV",
+    projectId: "p1",
+    contextId: "c1",
+    state: "working",
+    featureId: "f-evfail",
+    dispatchMessage: markEvidenceMessage("取证：跑 git status / diff / 门禁"),
+  });
+
+  let registered = 0;
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    registerEvidenceNode: () => {
+      registered += 1;
+    },
+  });
+  updateTaskState("EV", "failed", null, INFRA_TEXT);
+  scheduler.notifyTaskSettled("f-evfail", "EV", { state: "failed", text: INFRA_TEXT });
+
+  assert.equal(getFeature("f-evfail")?.state, "needs_input");
+  assert.equal(registered, 0, "取证节点失败**不得**再派第二个取证节点（防「取证套取证」）");
+  assert.equal(getTask("A")?.state, "failed", "不得 propagate / 不得改写其他节点");
+  assert.equal(getTask("EV")?.failureKind, null, "取证节点豁免：不参与 {infra, task} 分类，故不写此列");
+});
+
+test("取证节点派发失败：直接 needs_input（§4.1.8，不 failed、不 propagate）", async () => {
+  seedPendingEvidence("f-evdisp");
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: false, error: "ensure 超时" }),
+    // 先让等回收门达标放行（未派发的取证节点会被门挡 ⇒ 这正是门生效的证据）
+    probeProjectReady: () => ({ ready: true, reason: "offline" }),
+    evidencePollMs: 1,
+  });
+  scheduler.kick(); // 门：streak=1 ⇒ 仍挡
+  await gateSleep(5);
+  assert.equal(getFeature("f-evdisp")?.state, "executing", "门未达标前不派发（故未触发派发失败）");
+  scheduler.kick(); // 门：streak=2 ⇒ 放行 ⇒ 派发 ⇒ 失败
+  await gateSleep(5);
+
+  assert.equal(getFeature("f-evdisp")?.state, "needs_input");
+  assert.equal(getTask("EV")?.state, "working", "不得置 failed（否则 Feature 直接终态）");
+});
+
+test("取证 settle 且 D 非空：条件重试同 ctx 续一次，retry_count 自增，且重试节点可被派发", () => {
+  close();
+  createFeature({ featureId: "f-retry", title: "重试", state: "executing" });
+  createTask({
+    taskId: "A",
+    projectId: "p1",
+    state: "failed",
+    featureId: "f-retry",
+    contextId: "ctx-A",
+    remoteTaskId: "remote-A",
+    dispatchMessage: "原始任务内容",
+  });
+  markTaskExhausted("A");
+  createTask({
+    taskId: "EV",
+    projectId: "p1",
+    contextId: "ctx-ev",
+    state: "completed",
+    featureId: "f-retry",
+    dispatchMessage: markEvidenceMessage("取证"),
+  });
+
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    resolveEvidence: () => ({ stable: true, d: ["src/a.ts"], r: ["src/b.ts"], gatesOk: false }),
+  });
+  scheduler.notifyTaskSettled("f-retry", "EV", { state: "completed", text: "done" });
+
+  const a = getTask("A");
+  assert.equal(a?.state, "working");
+  assert.equal(a?.retryCount, 1, "retry_count 在 re-arm 时自增（不在 fail 时）");
+  assert.equal(a?.remoteTaskId, null, "清远端 id 以便重派");
+  assert.equal(a?.contextId, "ctx-A", "必须**同 ctx** 续接");
+  assert.equal(a?.exhausted, false, "re-arm ⇒ 退出中性化（exhausted 必须已清）");
+  assert.ok(a?.dispatchMessage?.includes("【自动重试 · 第 1/1 次 · 同会话续接】"));
+  assert.ok(a?.dispatchMessage?.includes("原始任务内容"), "原消息全文照附");
+  assert.equal(getFeature("f-retry")?.state, "executing", "重试不打扰 orch、Feature 保持 executing");
+  assert.deepEqual(
+    computeReadyNodes(listFeatureTasks("f-retry", { limit: 100 })).map((n) => n.taskId),
+    ["A"],
+    "exhausted 已被清 ⇒ 重试节点作为普通 working 节点自然可派",
+  );
+
+  // §4.1.13 可观测：恰好一条 task.retry（只在 retry 分支写）
+  const retries = taskRetryEvents();
+  assert.equal(retries.length, 1, "恰好一条 task.retry 事件");
+  assert.equal(retries[0]?.taskId, "A");
+  assert.equal(retries[0]?.payload["retryCount"], 1, "payload 带 re-arm 后的真实新值");
+  assert.equal(retries[0]?.payload["failureKind"], "infra");
+});
+
+test("取证 settle 且重试用尽（retryCount ≥ MAX_RETRY）：交人（needs_input）", () => {
+  close();
+  createFeature({ featureId: "f-exhausted", title: "用尽", state: "executing" });
+  createTask({
+    taskId: "A",
+    projectId: "p1",
+    contextId: "c1",
+    state: "failed",
+    featureId: "f-exhausted",
+    dispatchMessage: "orig",
+  });
+  markTaskExhausted("A");
+  // 模拟「已重试过一次后又失败」：retry_count 0→1（rearmForRetry 的唯一自增点，且**清 exhausted**），
+  // 随后第二次 infra 失败 ⇒ infra 分支会**再次中性化** ⇒ 必须复原 exhausted=1，否则本用例会
+  // 因「定位不到失败节点」而**vacuous 通过**（分支身份由 decideEvidenceOutcome 矩阵单独覆盖）。
+  assert.equal(rearmForRetry("A", "retry msg"), true);
+  updateTaskState("A", "failed", null, INFRA_TEXT);
+  assert.equal(markTaskExhausted("A"), true);
+  assert.equal(getTask("A")?.retryCount, 1);
+  assert.equal(getTask("A")?.exhausted, true);
+  assert.equal(getTask("A")?.state, "failed");
+
+  createTask({
+    taskId: "EV",
+    projectId: "p1",
+    contextId: "ctx-ev",
+    state: "completed",
+    featureId: "f-exhausted",
+    dispatchMessage: markEvidenceMessage("取证"),
+  });
+
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    resolveEvidence: () => ({ stable: true, d: ["src/a.ts"], r: ["src/b.ts"], gatesOk: false }),
+  });
+  scheduler.notifyTaskSettled("f-exhausted", "EV", { state: "completed", text: "done" });
+
+  assert.equal(getFeature("f-exhausted")?.state, "needs_input", "重试用尽 ⇒ 交人（不再自动重派）");
+  assert.equal(getTask("A")?.retryCount, 1, "不得产生第 2 次重试（N=1 门槛承重）");
+  assert.equal(taskRetryEvents().length, 0, "needs_input 分支**不写** task.retry");
+});
+
+test("补缺测①：store 级 all_completed ⇒ Feature 能推进 integrating（取证 settle 收口）", async () => {
+  close();
+  createFeature({ featureId: "f-settle", title: "收口", state: "executing" });
+  createTask({ taskId: "A", projectId: "p1", contextId: "c1", state: "failed", featureId: "f-settle" });
+  markTaskExhausted("A"); // raw state 仍 failed
+  createTask({ taskId: "B", projectId: "p1", contextId: "c1", state: "completed", featureId: "f-settle" });
+  createTask({
+    taskId: "EV",
+    projectId: "p1",
+    contextId: "ctx-ev",
+    state: "completed",
+    featureId: "f-settle",
+    dispatchMessage: markEvidenceMessage("取证"),
+  });
+
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    resolveEvidence: () => ({ stable: true, d: ["src/a.ts"], r: [], gatesOk: true }),
+  });
+  scheduler.notifyTaskSettled("f-settle", "EV", { state: "completed", text: "ok" });
+  await new Promise((r) => setImmediate(r));
+
+  assert.equal(
+    getFeature("f-settle")?.state,
+    "integrating",
+    "漏认 all_completed 的中性化 ⇒ 此处会永久卡在 executing（最致命一处）",
+  );
+  assert.equal(taskRetryEvents().length, 0, "settle 分支**不写** task.retry");
+});
+
+test("补缺测②：中性化第 6 处 —— exhausted 失败节点不触发传播，下游不被 blocked 且可继续派发", () => {
+  close();
+  createFeature({ featureId: "f-sweep", title: "传播扫描", state: "executing" });
+  createTask({
+    taskId: "A",
+    projectId: "p1",
+    contextId: "c1",
+    state: "failed",
+    featureId: "f-sweep",
+    remoteTaskId: "r-A",
+  });
+  markTaskExhausted("A");
+  createTask({
+    taskId: "B",
+    projectId: "p1",
+    contextId: "c1",
+    state: "working",
+    featureId: "f-sweep",
+    dependencies: ["A"],
+  });
+
+  const started: string[] = [];
+  const scheduler = new FeatureScheduler({
+    dispatch: async (node) => {
+      started.push(node.taskId);
+      return { ok: true };
+    },
+  });
+  scheduler.kick();
+
+  assert.equal(getTask("B")?.state, "working", "B 不得被置 blocked（否则中性化被整条击穿）");
+  assert.deepEqual(started, ["B"], "中性化后 A 的下游 B 必须可继续派发");
+  assert.equal(getFeature("f-sweep")?.state, "executing", "Feature 不得被判 failed");
+});
+
+// ---------------------------------------------------------------------------
+// v0.4.1：等回收门（§2.3 ③ / §2.5）—— tick 驱动，探测靠注入 stub
+// ---------------------------------------------------------------------------
+
+const gateSleep = (ms: number): Promise<void> => new Promise((r) => setTimeout(r, ms));
+
+/** 造「executing Feature + 待派发取证节点」场景 */
+function seedPendingEvidence(featureId: string): void {
+  close();
+  createFeature({ featureId, title: "等回收门", state: "executing" });
+  createTask({
+    taskId: "EV",
+    projectId: "p1",
+    contextId: "c1",
+    state: "working",
+    featureId,
+    dispatchMessage: markEvidenceMessage("取证：跑 git status / diff / 门禁"),
+  });
+}
+
+/** 统计 `task.evidence` 转折点事件数（按 phase） */
+function evidencePhases(): string[] {
+  return listEvents({ limit: 1000 })
+    .filter((e) => e.kind === EVIDENCE_EVENT_KIND)
+    .map((e) => String(JSON.parse(e.payload ?? "{}")["phase"]));
+}
+
+/** 取 `task.retry` 事件（§4.1.13：宿主经 `a2a_events` 应能看到重试发生） */
+function taskRetryEvents(): Array<{ taskId: string | null; payload: Record<string, unknown> }> {
+  return listEvents({ limit: 1000 })
+    .filter((e) => e.kind === EVENT_TASK_RETRY)
+    .map((e) => ({
+      taskId: e.taskId,
+      payload: JSON.parse(e.payload ?? "{}") as Record<string, unknown>,
+    }));
+}
+
+test("等回收门①：未达标 ⇒ 取证节点不被派发，not_before 被持久化续挡（且只留 1 条转折点事件）", async () => {
+  seedPendingEvidence("f-gate1");
+  const started: string[] = [];
+  let probes = 0;
+  const scheduler = new FeatureScheduler({
+    dispatch: async (node) => {
+      started.push(node.taskId);
+      return { ok: true };
+    },
+    probeProjectReady: () => {
+      probes += 1;
+      return { ready: false, reason: "online" };
+    },
+    evidencePollMs: 60_000, // 节流：本用例内不会二次探测
+  });
+
+  scheduler.kick();
+  await gateSleep(5);
+  scheduler.kick();
+  await gateSleep(5);
+
+  assert.deepEqual(started, [], "未达标不得派发取证节点");
+  const ev = getTask("EV");
+  assert.equal(ev?.state, "working");
+  assert.ok(ev?.notBefore !== null, "必须写**持久化**挡板（非内存态，否则桥重启即绕过硬路径）");
+  assert.ok(Date.parse(ev.notBefore) > Date.now(), "挡板指向未来");
+  assert.ok(ev?.lastPollAt !== null, "已记录探测时间（供节流）");
+  assert.equal(probes, 1, "60s 节流内只探测一次");
+  assert.deepEqual(evidencePhases(), ["wait_start"], "严禁每次轮询都写事件（只写转折点）");
+});
+
+test("等回收门②：需连续 2 次达标（debounce）才清门放行", async () => {
+  seedPendingEvidence("f-gate2");
+  const started: string[] = [];
+  let probes = 0;
+  const scheduler = new FeatureScheduler({
+    dispatch: async (node) => {
+      started.push(node.taskId);
+      return { ok: true };
+    },
+    probeProjectReady: () => {
+      probes += 1;
+      return { ready: true, reason: "offline" };
+    },
+    evidencePollMs: 1, // 允许快速二次探测
+  });
+
+  scheduler.kick(); // 第 1 次达标 ⇒ streak=1 ⇒ 仍挡
+  await gateSleep(5);
+  assert.deepEqual(started, [], "第 1 次达标不得放行（debounce 覆盖 stop() 优雅期窗口）");
+  assert.ok(getTask("EV")?.notBefore !== null, "仍在门内");
+
+  scheduler.kick(); // 第 2 次达标 ⇒ streak=2 ⇒ 放行
+  await gateSleep(5);
+  assert.equal(probes, EVIDENCE_READY_STREAK, "恰好 2 次探测");
+  assert.equal(getTask("EV")?.notBefore, null, "达标后必须清门");
+  assert.deepEqual(started, ["EV"], "放行后由既有 tick 正常派发");
+  assert.deepEqual(evidencePhases(), ["wait_start", "wait_ready"]);
+});
+
+test("等回收门③：上界到点 ⇒ 放行（转软校验 = 一等路径）", async () => {
+  seedPendingEvidence("f-gate3");
+  const started: string[] = [];
+  let probes = 0;
+  const scheduler = new FeatureScheduler({
+    dispatch: async (node) => {
+      started.push(node.taskId);
+      return { ok: true };
+    },
+    probeProjectReady: () => {
+      probes += 1;
+      return { ready: false, reason: "online" };
+    },
+    evidenceWaitMaxMs: 0, // 上界立即到点
+    evidencePollMs: 60_000,
+  });
+
+  scheduler.kick();
+  await gateSleep(5);
+
+  assert.equal(getTask("EV")?.notBefore, null, "上界到点必须清门放行");
+  assert.deepEqual(started, ["EV"], "放行后派发（软校验由取证节点自采 ①②）");
+  assert.equal(probes, 0, "上界判定先于探测");
+  assert.deepEqual(evidencePhases(), ["wait_timeout"]);
+});
+
+test("等回收门④：503 / starting / 不可达 一律视作未就绪（不放行）", async () => {
+  for (const reason of ["503", "starting", "unreachable"]) {
+    seedPendingEvidence(`f-gate4-${reason}`);
+    const started: string[] = [];
+    const scheduler = new FeatureScheduler({
+      dispatch: async (node) => {
+        started.push(node.taskId);
+        return { ok: true };
+      },
+      probeProjectReady: () => ({ ready: false, reason }),
+      evidencePollMs: 1,
+    });
+
+    for (let i = 0; i < 3; i += 1) {
+      scheduler.kick();
+      await gateSleep(3);
+    }
+
+    assert.deepEqual(started, [], `${reason}：不得放行`);
+    assert.ok(getTask("EV")?.notBefore !== null, `${reason}：仍在门内`);
+  }
+});
+
+test("等回收门⑤：last_poll_at 节流 —— 同一轮询间隔内不重复探测", async () => {
+  seedPendingEvidence("f-gate5");
+  let probes = 0;
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    probeProjectReady: () => {
+      probes += 1;
+      return { ready: false, reason: "online" };
+    },
+    evidencePollMs: 60_000,
+  });
+
+  scheduler.kick();
+  await gateSleep(3);
+  scheduler.kick();
+  await gateSleep(3);
+  scheduler.kick();
+  await gateSleep(3);
+
+  assert.equal(probes, 1, "一次性 3 次 tick 也只探测一次");
+  assert.deepEqual(evidencePhases(), ["wait_start"], "节流期间不产生新事件");
+});
+
+test("等回收门⑥：探测不在 dispatch 内 await ⇒ drain() 不被长门阻塞", async () => {
+  seedPendingEvidence("f-gate6");
+  const scheduler = new FeatureScheduler({
+    dispatch: async () => ({ ok: true }),
+    probeProjectReady: () => ({ ready: false, reason: "online" }),
+    evidencePollMs: 1, // 门会持续续挡，但不得占用在飞标记
+  });
+
+  scheduler.kick();
+  await gateSleep(5);
+
+  const drained = await scheduler.drain(50);
+  assert.equal(drained, true, "门不占 dispatching/inFlightNodes ⇒ 立即可排空（不阻塞停机）");
+  assert.ok(getTask("EV")?.notBefore !== null, "节点仍被挡（drain 不改变门）");
 });

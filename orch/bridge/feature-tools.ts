@@ -4,10 +4,13 @@
  * 纯数据层处理器：只依赖 `session/store.ts` 与 `feature/state-machine.ts`，
  * 不触碰 A2A / 不触发调度（调度 kick 由 `bridge/index.ts` 在工具返回后统一发起）。
  *
- * - `handleFeatureCreate`  新建 Feature（`discussing`；落 `contextId` 到 `features.context_id`）
+ * - `handleFeatureCreate`  新建 Feature（**初态 `waiting_approval`** = 主链起点；落 `contextId` 到
+ *                          `features.context_id`）
  * - `handleFeatureStatus`  查询单个 Feature 详情 / 全部列表（state + tasks 摘要 + artifacts）
  * - `handleFeatureAdvance` orch agent 驱动主链推进（状态机校验合法后继；`note`→plan、
- *                          `decisions`/`contracts` 可选落 Feature Context；`answer` 用于 needs_input 补齐）
+ *                          `decisions`/`contracts` 可选落 Feature Context；`answer` 用于 needs_input 补齐）；
+ *                          **`waiting_approval → executing` 已禁用** —— 唯一准入 = `handleFeatureApprove`，
+ *                          错误码 `feature_approval_required`
  * - `handleFeatureApprove` 审批门：`waiting_approval → executing`
  * - `handleFeatureCancel`  任意非终态 → `cancelled`
  */
@@ -31,6 +34,7 @@ import {
 } from "../feature/state-machine.js";
 import type {
   ArtifactRecord,
+  FailureKind,
   FeatureRecord,
   FeatureState,
   InputArtifactRef,
@@ -55,6 +59,16 @@ export interface FeatureTaskSummary {
   /** 下游声明的上游产物引用（v0.4.0；NULL = 无输入产物） */
   inputArtifacts: InputArtifactRef[] | null;
   updatedAt: string;
+  /**
+   * 失败分类（v0.4.1 §4.1.13 可观测；`null` = 未失败 / 未分类）。
+   * **只增字段**，既有字段语义不变。
+   */
+  failureKind: FailureKind | null;
+  /**
+   * 条件重试已用次数（v0.4.1；`0` = 未重试）。
+   * 供宿主判断「重试是否已用尽」（N=1 门槛）而无需另查库。
+   */
+  retryCount: number;
 }
 
 function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
@@ -67,6 +81,9 @@ function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
     dependencies: rec.dependencies,
     inputArtifacts: rec.inputArtifacts,
     updatedAt: rec.updatedAt,
+    // 缺失 / 未设时给 `null` / `0`：**不得省略字段、不得 `undefined`**（老记录 / 部分对象也要有确定值）
+    failureKind: rec.failureKind ?? null,
+    retryCount: rec.retryCount ?? 0,
   };
 }
 
@@ -103,7 +120,9 @@ export function handleFeatureCreate(
     title,
     requirement: args.requirement ?? null,
     contextId: args.contextId ?? null,
-    state: "discussing",
+    // 主链起点 = 审批门停靠点（REQ-v0.4.1-2026-09-16-01 §2.3）：引擎只做需求实现，
+    // 前段讨论 / 方案（Step 0/1）不走引擎；`waiting_approval → executing` 只能经 `a2a_feature_approve`
+    state: "waiting_approval",
   });
   const success: FeatureCreateSuccess = { ok: true, featureId: rec.featureId, state: rec.state, title: rec.title };
   if (rec.contextId !== null) success.contextId = rec.contextId;
@@ -190,6 +209,21 @@ export function handleFeatureAdvance(
       ok: false,
       code: "feature_transition_invalid",
       error: `非法状态流转：${feature.state} → ${args.to}（合法后继：${allowedTransitions(feature.state).join(" / ") || "无（终态）"}）`,
+    };
+  }
+
+  // 唯一准入门（REQ-v0.4.1-2026-09-16-01 §2.4）：`approve` 是进入 `executing` 的唯一通道。
+  // 位置在 `canTransition` **之后** ⇒ `waiting_approval → analyzing` 之类非法目标仍报
+  // `feature_transition_invalid`（错误区分），只有"合法但须审批"的这一步改为 `feature_approval_required`。
+  // ⚠️ 条件严格限定这两态：**不得**误伤 `needs_input → executing`（人工澄清续推，属设计内）。
+  // 注：状态机层保留 `waiting_approval → executing` 边（转移表 = 单一事实源；approve 自身不经 canTransition）。
+  if (feature.state === "waiting_approval" && args.to === "executing") {
+    return {
+      ok: false,
+      code: "feature_approval_required",
+      error:
+        "非法状态流转：waiting_approval → executing 须经审批门（请用 a2a_feature_approve；" +
+        "该操作 = 记录用户已给的方案确认，一对一映射，不可预领 / 不可补领）",
     };
   }
 

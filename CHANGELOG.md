@@ -2,6 +2,39 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.4.1] - 2026-09-16
+
+> 主题：**需求流程引擎化 + 编排内核常驻化 + 失败自动化 + 执行准入**（本版本含 4 条需求；「一版本一需求」约束**自 v0.4.1 之后的下一个版本起**生效，**本版豁免**）。
+
+### Added
+
+- **需求流程规范包 `flow/`**（REQ-v0.4.1-2026-09-15-01）：`flow/spec/{需求流程,引擎映射,文档模板}.md` 内核 + `hosts/`（opencode 完整可用；Claude Code / Codex / Cursor 给指引）+ `install/{install,uninstall}.mjs`（**旁路引入**：不破坏目标项目既有 `CLAUDE.md` / `AGENTS.md`，幂等、可字节还原）。
+- **常驻编排内核（桥常驻化与多驱动面）**（REQ-v0.4.1-2026-09-15-02）：桥由「宿主 stdio 子进程」升格为**常驻进程** —— 新增 `runtime/{core-lease,lifecycle}.ts`（**core 租约**单调度权 `owner`/`follower` + 启停编排与 drain）、`bridge/register-tools.ts`（`createServer` / `registerTools` 工厂）、`bridge/transports/{stdio,http}.ts`（**stateless Streamable HTTP**：`/mcp` + `/health` + `/shutdown`）、`scripts/bridgectl.mjs`（start/stop/restart/status/logs）、`tools/mcp-http-probe.mjs`、`version.ts`；store 加固（busy timeout / DB 路径绝对化 / CAS）。
+- **超时与失败自动化 + 执行后孤儿回收**（REQ-v0.4.1-2026-09-15-03）：`infra` / `task` 失败分类（文本白名单 + **未知降级 `task`**）；**先取证 → 条件重试**（N=1、同 `contextId`）+ **中性化**（`tasks.exhausted`，**6 处**判定，Feature **不连坐**）；**取证节点**（新 ctx、只读、消息自包含含 nonce、结构化输出 D/R/门禁/`stable`）；**等回收门**（`status !== "online"` + **debounce 2 次** + 5s 节流 + **持久化挡板** + 上界转软校验）；machine 侧**进程账本**（`children/<pid>.json`，write-ahead）+ **启动对账清理**（`launcher/reconcile.ts`）+ **`scripts/reaper.mjs`**（默认只读 / `--clean` / 六档闸门 / **红线：pidfile 存活禁清**）+ POSIX `detached` **进程组杀**。
+- **引擎职责收敛与执行准入**（REQ-v0.4.1-2026-09-16-01）：主链 **9 → 6 态**（移除 `discussing` / `analyzing` / `planning`；**Step 0/1 引擎不参与**）；`a2a_feature_create` **初态即 `waiting_approval`**；**`approve` 成为唯一准入**（`advance(to="executing")` 被拒，`feature_approval_required`）；**`a2a_call.mode` 必填** + **对偶校验**（`feature_required_for_execute` / `feature_not_allowed_for_inquiry`）；`features.state` 迁移 + **脏值兜底**（`RETIRED_FEATURE_STATES` + 归一留痕）。
+
+### Changed
+
+- **MCP 工具面数量不变**（泛型 7 + Feature 工具组 5）；**`a2a_call` 的 `mode` 必填**（`"inquiry"` 不得带 `featureId`；`"execute"` 必带 `featureId`）。
+- **Feature 主链收敛为 6 态**：`waiting_approval → executing → integrating → testing → reviewing → completed`；`waiting_approval → executing` 边保留（供 `approve`），但 `advance` 无法走通。
+- **`registerFeatureNode` 挂载门改常量集合驱动**（`MOUNTABLE_FEATURE_STATES`），放开 `waiting_approval`（登记 ≠ 派发）。
+- **根 `package.json` 版本号升至 `0.4.1`**（**版本源**，`lib/common.getVersion()` 读取它）；⚠️ **orch / machine 两单元的 `package.json` 版本号待补 bump** —— 本会话宿主 MCP 工具表为**旧 schema**（无 `mode` 参数），而桥已启用 `mode` **必填**，派发被拒（`-32602`）⇒ 两单元（`orch/**` / `machine/**`，须经 A2A 委派）的 bump 需**宿主重启后**执行（见 `planlog.md` 待办）。
+- **线协议不变**（`PROTOCOL.md` / `PROTOCOL_VERSION` 保持 `1.0`）；`machine` 本版**仅**账本/对账/reaper/组杀相关改动（无协议改动）。
+- **流程规范**：Step 2 增**硬约束 H1–H3**（建 Feature + 同轮贴 DAG / 实现期禁 `execute` 无 `featureId` / H3 = **行为复核**）；Step 3 增**分水岭**（**实现级增补** ⇒ `needs_input → executing` 续推；**方案级回炉** ⇒ `a2a_feature_cancel` + 回步骤 0 新建）。
+- **有意撤销**：v0.4.0 的「**分析扇出**」（`analyzing` 态可挂载）随主链收敛**撤销**（用户定「Step 0/1 不走引擎」）—— **非回归缺陷**。
+- **已知限制（登记）**：同 project 并发节点时取证不干净（根治 = 每节点独立 worktree，即搁置的 v0.5.0）；硬路径「半写文件」；`stop()` 先删条目后杀进程（故需 debounce）。
+
+### Verified
+
+- 门禁：`orch` `typecheck` 零错 + 单测 **101/101**；`machine` `typecheck` / `lint` 通过；`reaper` **只读模式实跑 exit 0**（红线真实命中「pidfile pid 存活 ⇒ 禁清」）。
+- **全量回归 603/603**（v0.4.0 基线 554 → 603：新增 REQ-03 / REQ-04 用例，并**等价改写** 4 条陈旧断言 —— `isLocalTerminalState` 委托化 2 条、主链 6 态 1 条、挂载门常量 1 条；**未放宽标准**）。
+- **真机**：常驻桥 `bridgectl` 启停/状态全绿（`role=owner`）、`mcp-http-probe` **9/9**（12 工具 / stateless / 无 `Mcp-Session-Id`）；宿主经 `type:"remote"` 连通（REQ-02）；REQ-04 重启后**三段冒烟**：`tools/list` 的 `a2a_call.required` 含 `mode` ✓、缺 `mode` 拒 `-32602` ✓、`mode="inquiry"` **端到端**回执 ✓、`a2a_feature_status` 全量列表不抛 ✓、桥日志零脏值告警 ✓。
+
+### 未覆盖（遗留验证，**不得算通过**）
+
+- **REQ-03 失败自动化真机 E2E 全链路** 与 **REQ-04 新准入首战** —— 均按 `flow/spec/需求流程.md` Step 3 登记，**交「下一个需求」实施验证**（见 `planlog.md`「下一需求必须承接」）。
+- 网页驱动面（v0.8/v0.9）对同一准入的复用未评估；跨机 / 其它库存在退役态或脏值的真实迁移未真机（本机 0 行）；POSIX 组杀路径需 macOS/Linux 真机；硬路径「半写文件」；`reaper --clean` 未实跑。
+
 ## [v0.4.0] - 2026-09-14
 
 ### Added

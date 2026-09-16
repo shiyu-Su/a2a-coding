@@ -25,9 +25,16 @@
  * （**Feature 层不新增 `blocked`**）；任务 `input-required` → Feature `needs_input`。
  */
 import {
+  appendEvent,
   getFeature,
+  getTask,
   listFeatureTasks,
   listFeatures,
+  markTaskExhausted,
+  markTaskFailureKind,
+  rearmForRetry,
+  setTaskLastPollAt,
+  setTaskNotBefore,
   updateFeatureState,
   updateTaskState,
 } from "../session/store.js";
@@ -36,7 +43,8 @@ import {
   canTransition,
   isTerminalFeatureState,
 } from "../feature/state-machine.js";
-import type { FeatureRecord, TaskRecord, TaskState } from "../types.js";
+import type { CoreRole } from "../runtime/core-lease.js";
+import type { FailureKind, FeatureRecord, TaskRecord, TaskState } from "../types.js";
 
 /** 桥重启后对账在飞任务时写入的结果文本（对齐 wrapper `failed(interrupted)` 语义） */
 export const FEATURE_INTERRUPTED_TEXT =
@@ -46,8 +54,137 @@ export const FEATURE_INTERRUPTED_TEXT =
 export const FEATURE_ABANDONED_TEXT =
   "任务后台看护连续失败超限（abandoned），任务状态未知；请重新发起或重试。";
 
+/**
+ * **取证节点角色标记**（v0.4.1 §2.5）：显式写入取证节点消息，供调度器识别该节点并
+ * ① 走「取证 settle → 决策」分支、② 从 `infra`-取证分支**豁免**（防「取证套取证」死循环）。
+ *
+ * 选择「消息标记」而非「store 角色列」的理由：无需改 schema（本节点不得动 `store.ts`），
+ * 且**随消息持久化** ⇒ 桥重启后仍可识别（内存态标记会丢）。
+ */
+export const EVIDENCE_NODE_MARKER = "【取证节点 · 只读】";
+
+/** 给取证节点消息打角色标记（O4 登记取证节点时用） */
+export function markEvidenceMessage(body: string): string {
+  return `${EVIDENCE_NODE_MARKER}\n${body}`;
+}
+
+/**
+ * 取证节点判定（§2.5）：消息（`dispatchMessage`，回退 `prompt`）带角色标记即取证节点。
+ * **只读、纯函数**。
+ */
+export function isEvidenceNode(
+  node: Pick<TaskRecord, "dispatchMessage" | "prompt">,
+): boolean {
+  const text = node.dispatchMessage ?? node.prompt ?? "";
+  return text.includes(EVIDENCE_NODE_MARKER);
+}
+
+/** 取证节点结构化结论（§2.5；O4 从 `artifacts` 表解析后注入） */
+export interface EvidenceResult {
+  /** 软校验 `stable = ① 无在飞 turn（排除自身） AND ② git 静默窗无变化` */
+  stable: boolean;
+  /** 已改集 */
+  d: string[];
+  /** 未改集 */
+  r: string[];
+  /** 门禁是否通过 */
+  gatesOk: boolean;
+}
+
+/** 取证 settle 后的决策（§2.3） */
+export type EvidenceDecision =
+  | { kind: "needs_input"; reason: string }
+  /** 条件重试：同 `contextId` 续一次（`rearmForRetry`，`retry_count` 由 store 自增） */
+  | { kind: "retry" }
+  /** R 空且门禁绿：**不拦**，让既有 `reduceConvergence` 收口（推进 `integrating`） */
+  | { kind: "settle" };
+
+/**
+ * 「取证 settle → 决策」判定（§2.3 决策图，**纯函数**，便于单测）：
+ * 1. 无证据（`resolveEvidence` 返回 null）⇒ 交人；
+ * 2. `stable === false` ⇒ 交人（不拍板、不重试）；
+ * 3. `d` 空 ⇒ 交人（不是"切得太大"，**不自动重做**）；
+ * 4. `r` 空 且 门禁绿 ⇒ `settle`（按成功收口，仍须跑验收/回归）；
+ * 5. `d` 非空 且 `retryCount < MAX_RETRY` ⇒ `retry`；
+ * 6. 否则（重试用尽）⇒ 交人（+ 宿主据 evidence 的 R 挂拆解节点）。
+ */
+export function decideEvidenceOutcome(
+  evidence: EvidenceResult | null,
+  retryCount: number,
+  maxRetry: number = MAX_RETRY,
+): EvidenceDecision {
+  if (evidence === null) {
+    return { kind: "needs_input", reason: "取证无结构化结果" };
+  }
+  if (!evidence.stable) {
+    return { kind: "needs_input", reason: "工作区不稳定（stable=false，可能有写者）" };
+  }
+  if (evidence.d.length === 0) {
+    return { kind: "needs_input", reason: "无已改集（D 空），不自动重做" };
+  }
+  if (evidence.r.length === 0 && evidence.gatesOk) {
+    return { kind: "settle" };
+  }
+  if (retryCount < maxRetry) {
+    return { kind: "retry" };
+  }
+  return { kind: "needs_input", reason: `重试已用尽（retryCount=${retryCount}）` };
+}
+
+/**
+ * 条件重试的「**中性固定模板**」（§2.4，逐字对齐文档）：
+ * 追加在原 `dispatch_message` 之后、**不替换**原内容。
+ * 「中性」= ① 不含决策内容（不写"只做 X 片"）② 不动 scope（原文照附）③ 只约束行为方式。
+ */
+export function buildRetryMessage(base: string): string {
+  return [
+    "【自动重试 · 第 1/1 次 · 同会话续接】",
+    "上一次执行在约 600s 时被客户端超时中断；这并不意味着你的改动已丢失。",
+    "请按以下方式继续（不要重头再来）：",
+    "1. 先核对当前工作区/会话状态（如 git status / 已改文件 / 门禁结果）；",
+    "2. 只把尚未完成的部分做完；已完成的部分不要重写；",
+    "3. 若接近时间上限，先把改动落盘并给出简短报告（已改哪些文件 / 门禁是否通过 / 还差什么）；",
+    "4. 原任务内容如下（未变更）：",
+    "────",
+    base,
+    "────",
+  ].join("\n");
+}
+
 /** 调度循环间隔（可配，默认 1500ms） */
 export const FEATURE_TICK_MS = readPositiveIntEnv("FEATURE_TICK_MS", 1_500);
+
+/**
+ * 条件重试上限（v0.4.1 §2.4，N=1：只同 `contextId` 续一次）。
+ * **无需 env** —— 这是「防死循环」承重件，不允许按环境放大：
+ * 倒置为「先取证 → 条件重试」后，去掉上限会 `fail → 取证 → D 非空 → re-arm → fail → …` 死循环。
+ * 判据：`retryCount < MAX_RETRY` 才允许 `rearmForRetry`。
+ */
+export const MAX_RETRY = 1;
+
+/** 「等回收门」上界（ms，可配，默认 10min）：到点该 project 仍非 offline ⇒ 转软校验兜底 */
+export const EVIDENCE_WAIT_MAX_MS = readPositiveIntEnv("EVIDENCE_WAIT_MAX_MS", 600_000);
+
+/** 「等回收门」轮询 `GET /projects` 的间隔（ms，可配，默认 5s） */
+export const EVIDENCE_POLL_MS = readPositiveIntEnv("EVIDENCE_POLL_MS", 5_000);
+
+/**
+ * 「等回收门」**debounce** 连续达标次数（v10 §2.5）。
+ * 依据：Launcher `stop()` **先删条目、后杀进程** ⇒ `/projects` 报 `offline` **早于**进程真死；
+ * POSIX 优雅期上界 = 5s 优雅期 + 10s 兜底 ⇒ **2 次、间隔 ≥ `EVIDENCE_POLL_MS`（5s）**
+ * 大致覆盖该上界，避免"报告已停、其实仍在写"的窗口。
+ */
+export const EVIDENCE_READY_STREAK = 2;
+
+/** 「等回收门」转折点事件的 kind（**只写转折点**，严禁每次轮询都写） */
+export const EVIDENCE_EVENT_KIND = "task.evidence";
+
+/**
+ * 条件重试**已发生**的事件 kind（v0.4.1 §2.3 / §4.1.13 可观测）。
+ * 宿主经 `a2a_events` 能**直接看到重试**，不必再靠 `retry_count` 从 0→1 查库推断。
+ * **只在 `handleEvidenceSettled` 的 retry 分支写一条**（settle / needs_input / fail 均不写）。
+ */
+export const EVENT_TASK_RETRY = "task.retry";
 
 function readPositiveIntEnv(name: string, fallback: number): number {
   const raw = process.env[name];
@@ -80,7 +217,50 @@ export type FeatureNodeDispatch = (node: TaskRecord) => Promise<FeatureDispatchR
 export interface FeatureSchedulerOptions {
   dispatch: FeatureNodeDispatch;
   pollIntervalMs?: number;
+  /** 条件重试上限（缺省 `MAX_RETRY` = 1）；单测可注入 */
+  maxRetry?: number;
+  /** 「等回收门」上界（ms；缺省 `EVIDENCE_WAIT_MAX_MS` = 10min）；单测可注入以免真等 */
+  evidenceWaitMaxMs?: number;
+  /** 「等回收门」轮询间隔（ms；缺省 `EVIDENCE_POLL_MS` = 5s）；单测可注入 */
+  evidencePollMs?: number;
+  /**
+   * **登记取证节点**（§2.3 ②，IO 由 `index.ts`/O4 注入）：`infra` 失败且失败节点**已中性化**后调用。
+   * 调度器只负责「**先中性化、后登记**」的顺序与调用时机，节点怎么建、消息怎么自包含由注入方决定
+   * （消息须经 `markEvidenceMessage` 打角色标记）。**不提供 = 本版不启用取证流**（退化为旧行为）。
+   */
+  registerEvidenceNode?: (featureId: string, failedTaskId: string) => void;
+  /**
+   * **解析取证结论**（§2.5，IO 由 O4 从 `artifacts` 表实现）：取证节点 settle 后调用。
+   * 返回 `null` = 未取到结构化证据 ⇒ 决策为「交人」。
+   */
+  resolveEvidence?: (evidenceTaskId: string) => EvidenceResult | null;
+  /**
+   * **探测目标 project 是否已空闲回收**（§2.5 硬路径，IO 由 O4 用 `listMachineProjects` 实现）：
+   * `ready = true` 表示该 project **`status !== "online"`**（已 `stop()`）⇒ 结构性无写者。
+   * `reason` 表达 `offline` / `503` / `starting` / 不可达等（**一律按"未就绪"处理**，仅用于留痕）。
+   *
+   * **同步返回**：等回收门由 tick 驱动、**绝不在 `dispatch` 内 `await`**（否则 10min 的门会占满
+   * `dispatching`/`inFlightNodes` ⇒ 阻塞 `drain()` 与同 Feature 其它节点）。
+   * ⇒ O4 须提供**非阻塞快照**实现（HTTP 轮询由 O4 自己的循环维护快照，本回调只读快照）。
+   */
+  probeProjectReady?: (projectId: string) => { ready: boolean; reason: string };
 }
+
+/**
+ * `start()` 选项（REQ-v0.4.1-2026-09-15-02）。
+ * - `unref`：是否对定时器 `unref()`（不持有进程）。**缺省 true** = 与旧行为一致
+ *   （stdio 桥随宿主退出）；常驻模式由 lifecycle 传 `false`（HTTP listener 持有进程）。
+ *   **模式不硬编码进 scheduler**，由调用方按 `mode` 决定。
+ * - `role`：core 租约角色门闩（**第二道防线**）。缺省 / `"owner"` 正常启动；
+ *   `"follower"` 直接拒绝启动并 warn（不跑后台循环），使"接线写错"也无法双调度。
+ */
+export interface FeatureSchedulerStartOptions {
+  unref?: boolean;
+  role?: CoreRole;
+}
+
+/** 停机排空轮询间隔（ms） */
+const DRAIN_POLL_MS = 25;
 
 /** 启动恢复摘要 */
 export interface FeatureRecoverySummary {
@@ -96,12 +276,100 @@ export interface FeatureRecoverySummary {
 // 纯函数（无副作用 / 可单测）
 // ---------------------------------------------------------------------------
 
+/**
+ * `infra` 失败文本白名单（**小写子串**匹配；判据 = 错误码 + 文本，本版只有文本可用）。
+ * 覆盖：wrapper 600s 客户端超时 / 桥重启 interrupted / 看护放弃 abandoned / 库锁 / 网络类。
+ */
+const INFRA_TEXT_PATTERNS: readonly string[] = [
+  "prompt timeout after", // 必须含：wrapper `timeouts.prompt`（600s，外部包 a2a-opencode）
+  "interrupted", // 桥重启：FEATURE_INTERRUPTED_TEXT / wrapper failed(interrupted)
+  "abandoned", // 看护连续失败超限
+  "database is locked", // SQLite 写锁
+  "fetch failed",
+  "failed to fetch",
+  "econnrefused",
+  "econnreset",
+  "etimedout",
+  "enotfound",
+  "eai_again",
+  "socket hang up",
+];
+
+/**
+ * 失败分类（v0.4.1 §2.2）：`infra`（可取证 + 条件重试）/ `task`（照旧传播，不重试）。
+ *
+ * **未知文本一律安全降级为 `task`**（不重试）—— 宁可少自愈，不可对任务级失败做无意义重试。
+ * `FEATURE_ABANDONED_TEXT` 单独整串比对（不依赖其文案里恰好含 "abandoned"）。
+ */
+export function classifyFailure(text: string | null | undefined): FailureKind {
+  if (text === null || text === undefined) return "task";
+  if (text.includes(FEATURE_ABANDONED_TEXT)) return "infra";
+  const lower = text.toLowerCase();
+  for (const pattern of INFRA_TEXT_PATTERNS) {
+    if (lower.includes(pattern)) return "infra";
+  }
+  return "task";
+}
+
+/**
+ * 中性化判定（v0.4.1 §2.6）：`exhausted` 节点已被「取证流」接管 ⇒ **在下游判定中视作 completed**。
+ * 注意 `state` **不被改写**（仍是事实上的 `failed`），故所有「读 `state` 做判断」的位置都要过这一层。
+ */
+export function isNeutered(node: Pick<TaskRecord, "exhausted">): boolean {
+  return node.exhausted;
+}
+
+/**
+ * **判定用**：该节点的失败事实已被中性化 ⇒ 在下游判定中「**视作 completed**」。
+ *
+ * 为何要带 `state === "failed"`：中性化标记**不会**被条件重试清掉（`rearmForRetry` 只写
+ * state / retry_count），故**已 re-arm 的节点仍是 `exhausted` 但处于 `working`**。它此刻是
+ * **活跃节点**（重试在飞/待派），而非"已终结的失败事实" ⇒ 既不可视作 completed（否则
+ * `all_completed` 会在重试尚未跑完时就成立，Feature 直接 `integrating`），也不可参与
+ * "失败已中性化"的过滤。
+ */
+export function isNeuteredSettled(
+  node: Pick<TaskRecord, "exhausted" | "state">,
+): boolean {
+  return node.exhausted && node.state === "failed";
+}
+
+/**
+ * 可派时间门判定（v0.4.1 §2.3）：`notBefore` 为 NULL ⇒ 立即可派；否则需 `notBefore <= now`。
+ * **无法解析的时间戳按「无门」处理**（不阻塞派发）：该值只由本单元写入（UTC ISO 8601），
+ * 出现坏值时宁可派发，也不让一个坏值把 Feature 永久卡在 `executing`。
+ */
+export function isPastNotBefore(node: TaskRecord, nowMs: number = Date.now()): boolean {
+  if (node.notBefore === null) return true;
+  const at = Date.parse(node.notBefore);
+  return Number.isNaN(at) ? true : at <= nowMs;
+}
+
+/**
+ * 本地是否已终结（**中性化第 5 处**）：`exhausted` 节点视作终态 ⇒ `a2a_task_status`
+ * 不误查远端（远端任务已不可达）。
+ *
+ * ⚠️ 落点提示：`index.ts:773` 的同名私有函数 `isLocalTerminalState(state)` **只吃 state 字符串**、
+ * 看不到 `exhausted`；本节点不碰 `index.ts`。当前它**行为上已满足**（`exhausted` 不改写 `state`，
+ * 而 `failed` 本就被判为本地终态）；待拥有 `index.ts` 的节点把它改为委托本函数，以消除双份判据。
+ */
+export function isLocalTerminalTask(node: TaskRecord): boolean {
+  return (
+    isNeutered(node) ||
+    node.state === "completed" ||
+    node.state === "failed" ||
+    node.state === "input-required" ||
+    node.state === "blocked"
+  );
+}
+
 /** 依赖三态：`completed`（可派发）/ `pending`（前序未完成）/ `upstreamFailed`（上游失败或阻塞） */
 export type DepState = "completed" | "pending" | "upstreamFailed";
 
 /**
  * 单节点依赖三态判定。
- * - 任一上游 `failed` / `blocked` → `upstreamFailed`（不带病派发）；
+ * - 任一上游 `failed` / `blocked`（**未被中性化**）→ `upstreamFailed`（不带病派发）；
+ * - **中性化（`exhausted`）上游视作 `completed`** ⇒ 下游可继续派发（v0.4.1 第 1 处）；
  * - 否则存在未完成上游 → `pending`；
  * - 全部 completed（含无依赖）→ `completed`。
  */
@@ -111,7 +379,9 @@ export function depStateOf(
 ): DepState {
   let pending = false;
   for (const dep of node.dependencies ?? []) {
-    const state = byId.get(dep)?.state;
+    const upstream = byId.get(dep);
+    if (upstream !== undefined && isNeuteredSettled(upstream)) continue; // 中性化 ⇒ 视作 completed
+    const state = upstream?.state;
     if (state === "failed" || state === "blocked") return "upstreamFailed";
     if (state !== "completed") pending = true;
   }
@@ -120,18 +390,28 @@ export function depStateOf(
 
 /**
  * 计算**同批可并发派发**的就绪节点集合（同层无依赖节点一并返回）。
- * 就绪 = `working` 且尚未派发（`remoteTaskId === null`）且不在在飞标记内且依赖全部 completed。
+ * 就绪 = `working` 且**未被中性化**且尚未派发（`remoteTaskId === null`）且不在在飞标记内、
+ * **可派时间门已到**（`not_before`）且依赖全部 completed。
+ *
+ * `not_before > now` 的节点（v0.4.1 §2.3「登记取证节点后先不派」的**持久化门**）不入选
+ * ⇒ 「登记即就绪」不再成立，tick 不会抢在等回收门之前把它派出去。
  */
 export function computeReadyNodes(
   nodes: readonly TaskRecord[],
   inFlight?: ReadonlySet<string>,
+  nowMs: number = Date.now(),
 ): TaskRecord[] {
   const byId = new Map(nodes.map((n) => [n.taskId, n]));
   return nodes.filter(
     (n) =>
       n.state === "working" &&
+      // 中性化节点不参与派发。**无需 re-arm 例外**：`rearmForRetry` 已顺带清 `exhausted = 0`
+      // （re-arm ⇒ 退出中性化）⇒ 重试节点是**普通 working 节点**，自然就绪；
+      // `exhausted=1` 恒蕴含 `state='failed'`，不会被本条件选中。
+      !isNeutered(n) &&
       n.remoteTaskId === null &&
       !(inFlight?.has(n.taskId) ?? false) &&
+      isPastNotBefore(n, nowMs) &&
       depStateOf(n, byId) === "completed",
   );
 }
@@ -177,14 +457,18 @@ export type Convergence =
 
 /**
  * 收敛判定（顺序）：
- * 1. 存在 `failed` / `blocked` → `failed`（Feature 收敛失败，不派发）；
- * 2. 存在 `input-required` → `needs_input`；
- * 3. 全部 `completed` → `all_completed`；
+ * 1. 存在 **未被中性化** 的 `failed` / `blocked` → `failed`（Feature 收敛失败，不派发）；
+ * 2. 存在 **未被中性化** 的 `input-required` → `needs_input`；
+ * 3. 全部 `completed`（**中性化节点视作 completed**）→ `all_completed`；
  * 4. 否则 → `dispatch`（派发全部就绪节点）。
+ *
+ * ⚠️ 第 1 处与第 3 处**都必须**认中性化（v0.4.1 §2.6）：只改第 1 处而漏第 3 处时，
+ * 中性化节点 raw `state` 仍是 `failed` ⇒ `every(completed)` 恒为假 ⇒ 既不 `failed` 也不
+ * `integrating`，**Feature 永久卡在 `executing`**（最致命的一处）。
  */
 export function reduceConvergence(nodes: readonly TaskRecord[]): Convergence {
-  const failed = nodes.filter((n) => n.state === "failed").length;
-  const blocked = nodes.filter((n) => n.state === "blocked").length;
+  const failed = nodes.filter((n) => n.state === "failed" && !isNeuteredSettled(n)).length;
+  const blocked = nodes.filter((n) => n.state === "blocked" && !isNeuteredSettled(n)).length;
   if (failed > 0 || blocked > 0) {
     return {
       kind: "failed",
@@ -194,10 +478,10 @@ export function reduceConvergence(nodes: readonly TaskRecord[]): Convergence {
           : `存在被阻塞任务（${blocked}）`,
     };
   }
-  if (nodes.some((n) => n.state === "input-required")) {
+  if (nodes.some((n) => n.state === "input-required" && !isNeutered(n))) {
     return { kind: "needs_input", reason: "存在待澄清任务" };
   }
-  if (nodes.length > 0 && nodes.every((n) => n.state === "completed")) {
+  if (nodes.length > 0 && nodes.every((n) => n.state === "completed" || isNeuteredSettled(n))) {
     return { kind: "all_completed" };
   }
   return { kind: "dispatch" };
@@ -214,20 +498,64 @@ export class FeatureScheduler {
   private readonly tickingFeatures = new Set<string>();
   private timer: NodeJS.Timeout | null = null;
   private ticking = false;
+  /** 条件重试上限（`retryCount < maxRetry` 才允许 re-arm；见 `MAX_RETRY`） */
+  readonly maxRetry: number;
+  /** 「等回收门」上界（ms）；O3 的等回收门循环读此值 */
+  readonly evidenceWaitMaxMs: number;
+  /** 「等回收门」轮询间隔（ms）；O3 的等回收门循环读此值 */
+  readonly evidencePollMs: number;
+  /** 登记取证节点（注入；缺省不启用取证流） */
+  private readonly registerEvidenceNode?: (featureId: string, failedTaskId: string) => void;
+  /** 解析取证结论（注入；缺省视为「无证据」⇒ 交人） */
+  private readonly resolveEvidence?: (evidenceTaskId: string) => EvidenceResult | null;
+  /** 探测目标 project 是否已空闲回收（注入；缺省视为**未就绪** ⇒ 一直等，直到上界放行） */
+  private readonly probeProjectReady?: (projectId: string) => { ready: boolean; reason: string };
+  /**
+   * Feature → **触发取证的失败节点 + 登记时刻**（§2.3 ①）。
+   * 取证节点自身 id 无需在此保存：识别靠**消息角色标记**（`isEvidenceNode`）；重试目标靠本映射。
+   * 进程内态（桥重启后靠 `exhausted` + `state='failed'` 的**单一扫描**兜底，见 `resolveRetryTarget`；
+   * 上界基线回退到失败节点的 `updated_at`，见 `evidenceWaitedMs`）。
+   */
+  private readonly pendingEvidence = new Map<
+    string,
+    { failedTaskId: string; registeredAt: number }
+  >();
+  /**
+   * 取证节点 → **连续"已回收"探测次数**（debounce，v10 §2.5）。
+   * 进程内态：桥重启后计数归零 ⇒ 只会**更保守**（多探一轮），可接受（门本身是持久化的）。
+   */
+  private readonly evidenceReadyStreak = new Map<string, number>();
 
   constructor(options: FeatureSchedulerOptions) {
     this.dispatch = options.dispatch;
     this.pollIntervalMs = options.pollIntervalMs ?? FEATURE_TICK_MS;
+    this.maxRetry = options.maxRetry ?? MAX_RETRY;
+    this.evidenceWaitMaxMs = options.evidenceWaitMaxMs ?? EVIDENCE_WAIT_MAX_MS;
+    this.evidencePollMs = options.evidencePollMs ?? EVIDENCE_POLL_MS;
+    this.registerEvidenceNode = options.registerEvidenceNode;
+    this.resolveEvidence = options.resolveEvidence;
+    this.probeProjectReady = options.probeProjectReady;
   }
 
-  /** 启动后台循环（幂等） */
-  start(): void {
+  /**
+   * 启动后台循环（幂等）。
+   *
+   * `role === "follower"` 时**拒绝启动**（第二道防线：只有 core 租约持有者跑调度）——
+   * 记 warn 并返回，不设定时器、不立即 tick。
+   */
+  start(options: FeatureSchedulerStartOptions = {}): void {
+    if (options.role === "follower") {
+      console.error("[a2a-feature] 非 core 租约持有者（follower）：拒绝启动调度器");
+      return;
+    }
     if (this.timer !== null) return;
     this.timer = setInterval(() => {
       void this.tick();
     }, this.pollIntervalMs);
-    // 不因定时器持有进程：桥退出即终止（生命周期随桥进程）
-    if (typeof this.timer.unref === "function") this.timer.unref();
+    // stdio 模式不因定时器持有进程；常驻模式（unref=false）由 HTTP listener 持有进程
+    if (options.unref !== false && typeof this.timer.unref === "function") {
+      this.timer.unref();
+    }
     void this.tick();
   }
 
@@ -239,6 +567,22 @@ export class FeatureScheduler {
     }
   }
 
+  /**
+   * 停机排空：等待直到**无在飞派发**（Feature 批门闩 + 节点级在飞标记皆空）或达宽限上限。
+   * 返回是否已排空（`false` = 超时仍有在飞）。只等待，**不取消**远端 A2A 任务。
+   */
+  async drain(graceMs: number): Promise<boolean> {
+    const deadline = Date.now() + Math.max(0, graceMs);
+    while (this.dispatching.size > 0 || this.inFlightNodes.size > 0) {
+      const remain = deadline - Date.now();
+      if (remain <= 0) return false;
+      await new Promise<void>((resolve) => {
+        setTimeout(resolve, Math.min(DRAIN_POLL_MS, remain));
+      });
+    }
+    return true;
+  }
+
   /** 触发一次推进（approve / advance / 任务终态后调用；不阻塞调用方） */
   kick(): void {
     void this.tick();
@@ -246,8 +590,15 @@ export class FeatureScheduler {
 
   /**
    * 任务终态通知（由桥的看护 `onSettled` / 同步派发结果调用）。
-   * `failed` → 先传播 blocked 再 Feature failed；`input-required` → Feature needs_input；
-   * `completed` → 交给 tick 判完成（可能触发下一批就绪）。
+   *
+   * v0.4.1 三段（§2.2/§2.3）：
+   * - `failed` + **取证节点** ⇒ **豁免**：直接 `needs_input`（不重试、不再取证、不 propagate，
+   *   否则「取证套取证」无限套娃）；
+   * - `failed` + `task` 类 ⇒ **维持现状**（传播 `blocked` → Feature `failed`）；
+   * - `failed` + `infra` 类 ⇒ ① `markTaskExhausted` **先中性化** → ② 请求登记取证节点 → **return**
+   *   （**不 propagate、不 failFeature、不立即 rearm**；重试与否由取证 settle 后决定）；
+   * - `input-required` ⇒ Feature `needs_input`；
+   * - `completed` + **取证节点** ⇒ 走「取证 settle → 决策」；其余 `completed` ⇒ 交 tick 判完成。
    */
   notifyTaskSettled(
     featureId: string,
@@ -256,7 +607,32 @@ export class FeatureScheduler {
   ): void {
     const feature = getFeature(featureId);
     if (feature === null || isTerminalFeatureState(feature.state)) return;
+    const node = getTask(taskId);
+    const isEvidence = node !== null && isEvidenceNode(node);
+
     if (outcome.state === "failed") {
+      if (isEvidence) {
+        this.needsInputFeature(feature, `取证节点 ${taskId} 失败（按 §2.5 豁免直接交人）`);
+        return;
+      }
+      // 分类输入：显式 text 优先；回退**库中文本**（看护放弃路径传 text=null，文案在库）
+      const failureText = outcome.text ?? node?.text ?? null;
+      const failureKind = classifyFailure(failureText);
+      // §4.1.13 可观测：失败原因落库（`task` 与 `infra` 两类都写，便于事后统计）。
+      // 注：取证节点在上面已豁免返回 ⇒ 不参与分类，故不写此列（其处置不属 {infra, task} 分类语义）。
+      markTaskFailureKind(taskId, failureKind);
+      if (failureKind === "infra") {
+        // ⚠️ 顺序不可换（§2.3）：**先中性化、后登记** —— 失败节点此刻已在库中为 failed，
+        // 若先登记（其 `scheduler.kick()` 会立刻跑 reduceConvergence）Feature 会被判 failed 终态，
+        // 之后 registerFeatureNode / advance / approve 全被拒 ⇒ 取证与拍板**永不可达**。
+        markTaskExhausted(taskId);
+        this.pendingEvidence.set(feature.featureId, {
+          failedTaskId: taskId,
+          registeredAt: Date.now(),
+        });
+        this.registerEvidenceNode?.(feature.featureId, taskId);
+        return;
+      }
       this.propagateFailure(feature, taskId);
       this.failFeature(feature, `任务 ${taskId} 失败`);
       return;
@@ -265,8 +641,204 @@ export class FeatureScheduler {
       this.needsInputFeature(feature, `任务 ${taskId} 需人工澄清`);
       return;
     }
-    // completed：由 tick 判定「全部任务终态 → integrating」
+    // completed
+    if (isEvidence) {
+      this.handleEvidenceSettled(feature, taskId);
+      return;
+    }
+    // 其余 completed：由 tick 判定「全部任务终态 → integrating」
     this.kick();
+  }
+
+  /**
+   * 取证 settle → 决策（§2.3 ④）。判定为纯函数 `decideEvidenceOutcome`，此处只做**存储动作**：
+   * `retry` ⇒ `rearmForRetry`（同 ctx，`retry_count` 由 store 自增）；`needs_input` ⇒ 交人；
+   * `settle` ⇒ 不拦，`kick()` 让既有 `reduceConvergence` 收口（推进 `integrating`）。
+   */
+  private handleEvidenceSettled(feature: FeatureRecord, evidenceTaskId: string): void {
+    const evidence = this.resolveEvidence?.(evidenceTaskId) ?? null;
+    const target = this.resolveRetryTarget(feature.featureId);
+    const decision = decideEvidenceOutcome(evidence, target?.retryCount ?? 0, this.maxRetry);
+
+    if (decision.kind === "needs_input") {
+      this.needsInputFeature(feature, `取证决策：交人（${decision.reason}）`);
+      return;
+    }
+    if (decision.kind === "retry") {
+      if (target === null) {
+        this.needsInputFeature(feature, "取证决策：应重试但未定位到失败节点（交人）");
+        return;
+      }
+      const base = target.dispatchMessage ?? target.prompt ?? "";
+      rearmForRetry(target.taskId, buildRetryMessage(base));
+      // §4.1.13 可观测：**恰好一条** `task.retry`（re-arm 之后写，便于拿到自增后的真实值）。
+      // 仅此处写 —— `settle` / `needs_input` / fail 分支都不写（本条不产生"需要 orch 响应"的信号）。
+      appendEvent({
+        featureId: feature.featureId,
+        taskId: target.taskId,
+        kind: EVENT_TASK_RETRY,
+        state: "working",
+        payload: JSON.stringify({
+          retryCount: getTask(target.taskId)?.retryCount ?? target.retryCount + 1,
+          failureKind: "infra", // 进入本分支的不变量：本次失败已被分类为 infra
+        }),
+      });
+      this.pendingEvidence.delete(feature.featureId);
+      this.kick(); // 重派由 tick 按 `not_before` / 依赖判定
+      return;
+    }
+    // settle：按成功收口（仍须宿主跑验收/回归才算真通过）
+    this.pendingEvidence.delete(feature.featureId);
+    this.kick();
+  }
+
+  /**
+   * 定位本次取证对应的**失败节点**（重试目标）：优先 {@link pendingEvidence}（进程内映射），
+   * 回退「**恰好一个** `exhausted` 且仍 `failed` 的节点」——后者跨桥重启仍有效（标记落库）。
+   * 命中 0 个或多个（无法消歧）⇒ 返回 null ⇒ 决策降级为交人（fail-safe，不赌）。
+   */
+  private resolveRetryTarget(featureId: string): TaskRecord | null {
+    const nodes = listFeatureTasks(featureId, { limit: 1000 });
+    const byId = new Map(nodes.map((n) => [n.taskId, n]));
+    const mapped = this.pendingEvidence.get(featureId);
+    if (mapped !== undefined) {
+      const hit = byId.get(mapped.failedTaskId);
+      if (hit !== undefined && hit.state === "failed") return hit;
+    }
+    const candidates = nodes.filter((n) => isNeutered(n) && n.state === "failed");
+    return candidates.length === 1 ? candidates[0]! : null;
+  }
+
+  // ------------------------------------------------------------------
+  // 内部：等回收门（§2.3 ③ / §2.5）—— tick 驱动，**绝不在 dispatch 内 await**
+  // ------------------------------------------------------------------
+
+  /**
+   * 「等回收门」一次推进（**同步、无 `await`**）：对每个**尚未派发**的取证节点探测目标 project
+   * 是否已空闲回收；未达标则用**持久化** `not_before` 挡板继续挡住派发。
+   *
+   * - **节流**：距 `last_poll_at` 不足 `evidencePollMs` ⇒ 只续挡板、**不发探测**（tick 为 1.5s）；
+   * - **debounce**：需**连续 `EVIDENCE_READY_STREAK` 次**探测 `ready` 才放行（覆盖 `stop()` 的
+   *   "先删条目后杀进程"窗口）；
+   * - **上界**：自登记起超过 `evidenceWaitMaxMs` ⇒ **放行**（转软校验 = **一等路径**，由取证节点
+   *   自采 ①② 并输出 `stable`）；
+   * - `503` / `starting` / 不可达 ⇒ 由注入方返回 `ready:false` ⇒ 视作**未就绪**；
+   * - **持久化门**（不做纯内存态）：否则桥重启后门即丢、tick 会立刻派发 ⇒ **静默绕过硬路径**；
+   * - **可观测**：只写转折点（`wait_start` / `wait_ready` / `wait_timeout`），**严禁每次轮询都写**。
+   *
+   * 返回是否**改写过库**（调用方据此重读节点快照，避免"刚续了挡板却按旧快照放行"）。
+   */
+  private runEvidenceGate(
+    feature: FeatureRecord,
+    nodes: readonly TaskRecord[],
+    nowMs: number,
+  ): boolean {
+    const pendingEvidenceNodes = nodes.filter(
+      (n) => isEvidenceNode(n) && n.state === "working" && n.remoteTaskId === null,
+    );
+    if (pendingEvidenceNodes.length === 0) return false;
+
+    for (const node of pendingEvidenceNodes) {
+      const waitedMs = this.evidenceWaitedMs(feature.featureId, node, nowMs);
+
+      // 上界：到点 ⇒ 放行（转软校验，一等路径）
+      if (waitedMs >= this.evidenceWaitMaxMs) {
+        setTaskNotBefore(node.taskId, null);
+        this.evidenceReadyStreak.delete(node.taskId);
+        this.appendEvidenceEvent(feature.featureId, node.taskId, node.projectId, {
+          phase: "wait_timeout",
+          waitedMs,
+          ready: false,
+          reason: "upper_bound",
+        });
+        continue;
+      }
+
+      // 节流：不足一个轮询间隔 ⇒ 只续挡板，不打探测
+      if (!this.evidencePollDue(node, nowMs)) {
+        setTaskNotBefore(node.taskId, new Date(nowMs + this.evidencePollMs).toISOString());
+        continue;
+      }
+
+      // 首次探测 ⇒ `wait_start` 转折点（以 `last_poll_at === null` 判定"第一次"，无需额外状态）
+      if (node.lastPollAt === null) {
+        this.appendEvidenceEvent(feature.featureId, node.taskId, node.projectId, {
+          phase: "wait_start",
+          waitedMs,
+          ready: false,
+          reason: "waiting",
+        });
+      }
+      setTaskLastPollAt(node.taskId, new Date(nowMs).toISOString());
+
+      const probe = this.probeProjectReady?.(node.projectId) ?? {
+        ready: false,
+        reason: "probe_unavailable",
+      };
+      if (!probe.ready) {
+        // 未就绪（含 503 / starting / 不可达）：作废连续计数、继续挡
+        this.evidenceReadyStreak.delete(node.taskId);
+        setTaskNotBefore(node.taskId, new Date(nowMs + this.evidencePollMs).toISOString());
+        continue;
+      }
+
+      const streak = (this.evidenceReadyStreak.get(node.taskId) ?? 0) + 1;
+      this.evidenceReadyStreak.set(node.taskId, streak);
+      if (streak < EVIDENCE_READY_STREAK) {
+        // debounce 未达 ⇒ 继续挡，下一轮再确认
+        setTaskNotBefore(node.taskId, new Date(nowMs + this.evidencePollMs).toISOString());
+        continue;
+      }
+
+      // 达标 ⇒ 清门放行（随后由既有 tick 正常派发）
+      setTaskNotBefore(node.taskId, null);
+      this.evidenceReadyStreak.delete(node.taskId);
+      this.appendEvidenceEvent(feature.featureId, node.taskId, node.projectId, {
+        phase: "wait_ready",
+        waitedMs,
+        ready: true,
+        reason: probe.reason,
+      });
+    }
+    return true;
+  }
+
+  /** 是否到达下一个探测时点（节流）：无 `last_poll_at`（首次）或已满 `evidencePollMs` */
+  private evidencePollDue(node: TaskRecord, nowMs: number): boolean {
+    if (node.lastPollAt === null) return true;
+    const at = Date.parse(node.lastPollAt);
+    return Number.isNaN(at) ? true : nowMs - at >= this.evidencePollMs;
+  }
+
+  /**
+   * 自登记起已等待时长：优先**进程内**登记时刻，回退**失败节点 `updated_at`**
+   * （后者随失败落库持久化 ⇒ 桥重启后上界仍成立，不会永久卡在门里）。
+   */
+  private evidenceWaitedMs(featureId: string, _node: TaskRecord, nowMs: number): number {
+    const mapped = this.pendingEvidence.get(featureId);
+    if (mapped !== undefined) return Math.max(0, nowMs - mapped.registeredAt);
+    const failed = this.resolveRetryTarget(featureId);
+    if (failed !== null) {
+      const at = Date.parse(failed.updatedAt);
+      if (!Number.isNaN(at)) return Math.max(0, nowMs - at);
+    }
+    return 0;
+  }
+
+  /** 写一条 `task.evidence` 转折点事件（**只在转折点调用**，避免灌满收件箱） */
+  private appendEvidenceEvent(
+    featureId: string,
+    taskId: string,
+    projectId: string,
+    payload: { phase: string; waitedMs: number; ready: boolean; reason: string },
+  ): void {
+    appendEvent({
+      featureId,
+      taskId,
+      kind: EVIDENCE_EVENT_KIND,
+      state: null,
+      payload: JSON.stringify({ ...payload, projectId }),
+    });
   }
 
   /**
@@ -357,8 +929,11 @@ export class FeatureScheduler {
     }
 
     // 失败传播（幂等）：任一 failed → 下游传递闭包置 blocked
+    // v0.4.1 中性化（**第 6 处，v7 §2.6 清单未列但必需**）：已 `exhausted` 的失败节点**不得**
+    // 再触发传播 —— 否则下游被置 `blocked` ⇒ `depStateOf` 就算认了中性化也白费（下游永不可派发），
+    // 且 blocked>0 会让 `reduceConvergence` 把 Feature 判 `failed`，中性化被整条击穿。
     const failedIds = nodes
-      .filter((n) => n.state === "failed")
+      .filter((n) => n.state === "failed" && !isNeutered(n))
       .map((n) => n.taskId);
     if (failedIds.length > 0) {
       let blockedAny = false;
@@ -382,8 +957,16 @@ export class FeatureScheduler {
       return;
     }
 
+    // v0.4.1「等回收门」（§2.3 ③）：**先**对未派发的取证节点探测/续挡板，**再**算就绪集合。
+    // 顺序不可换 —— 否则"登记即就绪"会让 tick 抢在等回收门之前把取证节点派出去。
+    // 门会回写库 ⇒ `nodes` 快照已陈旧（刚续的挡板看不见）⇒ 重读，避免按旧快照放行。
+    const nowMs = Date.now();
+    if (this.runEvidenceGate(feature, nodes, nowMs)) {
+      nodes = listFeatureTasks(feature.featureId, { limit: 1000 });
+    }
+
     // 就绪集合（拓扑并行）：同层无依赖节点整批并发派发
-    const ready = computeReadyNodes(nodes, this.inFlightNodes);
+    const ready = computeReadyNodes(nodes, this.inFlightNodes, nowMs);
     if (ready.length === 0) return; // 队列等待前序依赖中 / 全部在飞
 
     // Feature 级批门闩 + 节点级在飞标记：**同步置位**（await 前完成，保证原子防重入）
@@ -397,6 +980,12 @@ export class FeatureScheduler {
         if (node === undefined || result === undefined) continue;
         if (!result.ok) {
           const reason = result.error ?? `派发任务 ${node.taskId} 失败`;
+          // 取证节点**派发失败**同样豁免（§4.1.8）：本不可达 ⇒ 交人，**不**置 failed / propagate /
+          // failFeature（否则 Feature 直接终态，取证与拍板永不可达）。
+          if (isEvidenceNode(node)) {
+            this.needsInputFeature(feature, `取证节点 ${node.taskId} 派发失败：${reason}`);
+            return;
+          }
           updateTaskState(node.taskId, "failed", null, reason);
           this.propagateFailure(feature, node.taskId);
           this.failFeature(feature, reason);

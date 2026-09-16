@@ -3,10 +3,12 @@
  * 按需幂等启动（ensure）、停止、状态聚合；不做服务发现（静态分布约束）。
  */
 import type { ChildProcess } from "node:child_process";
-import { existsSync } from "node:fs";
+import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { join } from "node:path";
 import { getAdapter } from "../adapters/index.js";
 import type { LaunchSpec } from "../adapters/types.js";
 import type {
+  ChildLedgerEntry,
   EnsureResult,
   MachineConfig,
   ProjectConfig,
@@ -68,6 +70,41 @@ export function agentEndpoint(a2aPort: number): string {
   return `http://127.0.0.1:${a2aPort}`;
 }
 
+/** 子进程账本目录（`<machine 根>/.a2a/children`；每次调用重新解析，构建/源码两种运行方式均可用） */
+export function childLedgerDir(): string {
+  return join(appRootFromModule(import.meta.url), ".a2a", "children");
+}
+
+/** 账本条目路径 `<machine 根>/.a2a/children/<pid>.json` */
+function childLedgerPath(pid: number): string {
+  return join(childLedgerDir(), `${pid}.json`);
+}
+
+/**
+ * write-ahead 写账本（spawn 返回即调用，早于 `waitForPort` / `running.set`）。
+ * **fail-safe**：任何失败只记日志，绝不影响拉起流程（账本不是拉起的必要条件）。
+ */
+export function writeChildLedgerEntry(entry: ChildLedgerEntry): void {
+  try {
+    mkdirSync(childLedgerDir(), { recursive: true });
+    writeFileSync(childLedgerPath(entry.pid), `${JSON.stringify(entry)}\n`, "utf8");
+  } catch (err) {
+    console.error(`[launcher] 写子进程账本失败（不影响运行）：${errorMessage(err)}`);
+  }
+}
+
+/**
+ * 删账本条目（幂等）。**fail-safe**：失败只记日志。
+ * `force: true` 使「shutdown 显式清 → 随后 exit 事件再清」的重复删除无害。
+ */
+export function removeChildLedgerEntry(pid: number): void {
+  try {
+    rmSync(childLedgerPath(pid), { force: true });
+  } catch (err) {
+    console.error(`[launcher] 删子进程账本失败（不影响运行）：${errorMessage(err)}`);
+  }
+}
+
 export class AgentManager {
   private readonly config: MachineConfig;
   private readonly running = new Map<string, RunningAgent>();
@@ -89,14 +126,50 @@ export class AgentManager {
   /**
    * 登记子进程（spawn 返回后**立即**调用，早于 `waitForPort` / `running.set`）。
    * `exit`/`error` 时自动移除，保证「spawn→注册窗口」归零（退出清理不漏）。
+   *
+   * 同时 **write-ahead 落账本** `<machine 根>/.a2a/children/<pid>.json`（一进程一文件），
+   * 供启动对账清理与 `reaper.mjs` 判定孤儿；wrapper 与 `opencode serve` **两条都记**
+   * （它们是被分别终止的两条进程，进程树不互相覆盖）。
    */
-  private trackChild(key: string, child: ChildProcess): void {
+  private trackChild(
+    key: string,
+    child: ChildProcess,
+    meta: { projectId: string; kind: ChildLedgerEntry["kind"]; command?: string },
+  ): void {
     this.allChildren.set(key, child);
+
+    const pid = child.pid;
+    if (pid === undefined) {
+      // 无 pid 无法命名账本文件：只记日志，不阻塞拉起（fail-safe）
+      console.error(`[launcher] 子进程 ${key} 无 pid，跳过账本登记`);
+    } else {
+      writeChildLedgerEntry({
+        pid,
+        projectId: meta.projectId,
+        kind: meta.kind,
+        startedAt: new Date().toISOString(),
+        ...(meta.command !== undefined ? { command: meta.command } : {}),
+      });
+    }
+
     const untrack = (): void => {
       if (this.allChildren.get(key) === child) this.allChildren.delete(key);
+      // 账本删除**不受** `allChildren` 守卫约束：shutdown/killAllSync 已 clear 时仍须清
+      if (pid !== undefined) removeChildLedgerEntry(pid);
     };
     child.once("exit", untrack);
     child.once("error", untrack);
+  }
+
+  /**
+   * 显式清账本（`shutdown()` / `killAllSync()` 专用）：这两条路径先 `allChildren.clear()`，
+   * 之后 `untrack` 的 `allChildren.get(key) === child` 守卫失效、不再触发 ⇒ 必须在此按 pid 主动删。
+   * 只删**本 Launcher 在册**的子进程，不动盘上其它（可能是无主孤儿的）条目。
+   */
+  private clearLedgerEntries(children: readonly ChildProcess[]): void {
+    for (const child of children) {
+      if (child.pid !== undefined) removeChildLedgerEntry(child.pid);
+    }
   }
 
   /** 有效空闲回收时长（ms）：缺省 DEFAULT_IDLE_STOP_MS；`0`/负值表示禁用自动回收 */
@@ -253,7 +326,11 @@ export class AgentManager {
       throw new AgentStartError(project.projectId, errorMessage(err));
     }
     // spawn 返回即注册（先于 waitForPort / running.set），退出清理不再漏
-    this.trackChild(`${project.projectId}:agent`, child);
+    this.trackChild(`${project.projectId}:agent`, child, {
+      projectId: project.projectId,
+      kind: "wrapper",
+      command: [spec.command, ...spec.args].join(" "),
+    });
     const endpoint = agentEndpoint(project.a2aPort);
 
     // 子进程输出不吞：stdout/stderr 逐行转发，便于诊断启动失败
@@ -363,7 +440,11 @@ export class AgentManager {
     };
     const child = spawnAgentProcess(spec, project.workspace);
     // spawn 返回即注册（早于健康等待），退出清理覆盖半启动 serve
-    this.trackChild(`${project.projectId}:serve`, child);
+    this.trackChild(`${project.projectId}:serve`, child, {
+      projectId: project.projectId,
+      kind: "serve",
+      command: [spec.command, ...spec.args].join(" "),
+    });
     pipeChildOutput(child, `[serve:${project.projectId}]`);
 
     const spawnState: { error: Error | null } = { error: null };
@@ -414,22 +495,30 @@ export class AgentManager {
     return { projectId, stopped: true };
   }
 
-  /** 停止所有 Agent 及其前置 serve（进程退出前调用）：遍历唯一注册表 allChildren */
+  /**
+   * 停止所有 Agent 及其前置 serve（进程退出前调用）：遍历唯一注册表 allChildren。
+   * `allChildren.clear()` 之前**显式清账本**（clear 后 untrack 守卫失效，不再自动清）。
+   */
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
     for (const entry of this.running.values()) this.clearIdleTimer(entry);
     this.running.clear();
     const children = [...this.allChildren.values()];
+    this.clearLedgerEntries(children);
     this.allChildren.clear();
     await Promise.all(children.map((child) => terminateChild(child)));
   }
 
-  /** 同步兜底清理（process exit 事件中不可 await）：对 allChildren 逐个树杀 */
+  /**
+   * 同步兜底清理（process exit 事件中不可 await）：对 allChildren 逐个树杀。
+   * 账本清理同为同步（`rmSync`），可在 exit 钩子内完成。
+   */
   killAllSync(): void {
     this.shuttingDown = true;
     for (const entry of this.running.values()) this.clearIdleTimer(entry);
     this.running.clear();
     const children = [...this.allChildren.values()];
+    this.clearLedgerEntries(children);
     this.allChildren.clear();
     for (const child of children) killProcessTreeSync(child);
   }

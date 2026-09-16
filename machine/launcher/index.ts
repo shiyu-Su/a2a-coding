@@ -6,7 +6,9 @@
  * 启动顺序（REQ-v0.2.1-2026-09-14-02「启动与退出健壮性」）：
  *   1. `listen(port[, listenHost])` 先行 —— 端口绑定即单实例互斥锁（OS 级原子 test-and-set）；
  *      `EADDRINUSE` → 打印「已在运行」并 `exit(1)`，**不再进入自检**（根除双实例 a2a 撞车）。
- *   2. `'listening'` 后写 pidfile（`<machine 根>/.a2a/launcher.pid`）→ 清理过期包装器配置 → 启动自检。
+ *   2. `'listening'` 后写 pidfile（`<machine 根>/.a2a/launcher.pid`）→ 清理过期包装器配置
+ *      → **启动对账清理**（清上次硬杀留下的无主孤儿，防其占住 a2aPort 令自检 EADDRINUSE）
+ *      → 启动自检。
  *   3. 就绪门：自检通过前 `GET /health` 报 `status:"starting"`、业务路由 503；通过后 `status:"ok"`。
  *   4. 自检失败 fail-fast：关闭端口 → 回收全部子进程 → 删 pidfile → `exit(1)`。
  *   5. 优雅停止（SIGINT/SIGTERM 或可选 `POST /shutdown`）共享同一幂等 `startShutdown()`。
@@ -19,6 +21,7 @@ import { pruneStaleAgentConfigs } from "./agents-prune.js";
 import { appRootFromModule } from "./app-root.js";
 import { AgentManager, DEFAULT_IDLE_STOP_MS } from "./manager.js";
 import { errorMessage } from "./process.js";
+import { reconcileStartupLedger } from "./reconcile.js";
 import { runStartupSelfCheck } from "./self-check.js";
 import { createLauncherApp } from "./server.js";
 
@@ -169,6 +172,17 @@ async function onListening(): Promise<void> {
     console.log(
       `[launcher] 清理过期包装器配置 ${prune.removed.length} 个：${prune.removed.join(", ")}`,
     );
+  }
+
+  // 启动对账清理（本需求唯一能修「服务起不来」的动作）：清掉上次 Launcher 被硬杀留下的
+  // 无主孤儿（wrapper / `opencode serve`），否则它们占住项目 a2aPort ⇒ 下面自检的 `ensure`
+  // 撞 `EADDRINUSE` ⇒ fail-fast 退出。红线：活 Launcher 在册的项目禁清（此刻本进程持有
+  // 端口 = 唯一实例，在册集合仅自身 ⇒ 其余条目均无主）。
+  // fail-safe：清理异常一律不阻断启动、不 exit（reconcileStartupLedger 自身亦不抛出）。
+  try {
+    await reconcileStartupLedger();
+  } catch (err) {
+    console.error(`[launcher] 启动对账清理异常（不阻断启动）：${errorMessage(err)}`);
   }
 
   // 启动自检（缺省开）：端口已监听（互斥锁已生效），全部项目通过才放行业务路由

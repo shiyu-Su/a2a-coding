@@ -10,6 +10,7 @@
  * - 生命周期随桥进程：桥退出即终止（需求确认单边界）。
  */
 import type { Task } from "@a2a-js/sdk";
+import { bridgeLog } from "./bridge-log.js";
 
 /** 连续 poll 失败上限：达到后放弃看护（防永久性故障导致无限空转） */
 export const WATCHER_MAX_CONSECUTIVE_FAILURES = 30;
@@ -47,6 +48,65 @@ const watching = new Set<string>();
 
 /** 推送唤醒订阅表：看护 taskId → 唤醒器集合（仅 `subscribePush=true` 的看护注册） */
 const pushWakeups = new Map<string, Set<() => void>>();
+
+/**
+ * 看护子系统 owner 门闩（REQ-v0.4.1-2026-09-15-02）。
+ *
+ * **只有 core 租约持有者（owner）应启动/轮询看护**；`follower` 置 false 后，
+ * `startTaskWatcher` 一律拒绝并 warn（返回 false，不建立轮询循环）。
+ * 缺省 `true` = 保持既有行为（未接入 lifecycle 的调用方零改动）。
+ */
+let watcherEnabled = true;
+
+/** 设置 owner 门闩（lifecycle 按 core 租约 role 调用） */
+export function setTaskWatcherEnabled(enabled: boolean): void {
+  watcherEnabled = enabled;
+}
+
+/** 当前门闩状态（供 /health / 单测断言） */
+export function isTaskWatcherEnabled(): boolean {
+  return watcherEnabled;
+}
+
+/** 排空结果 */
+export interface WatcherDrainResult {
+  /** 是否已排空（`false` = 到宽限上限仍有在飞看护） */
+  drained: boolean;
+  /** 剩余在飞看护数 */
+  remaining: number;
+  /** 实际等待毫秒数 */
+  waitedMs: number;
+}
+
+const DRAIN_POLL_MS = 25;
+
+function drainSleep(ms: number): Promise<void> {
+  return new Promise((resolve) => {
+    setTimeout(resolve, ms);
+  });
+}
+
+/**
+ * 停机排空：等待全部在飞看护循环自然结束（各自 poll 到终态 / 放弃）或达宽限上限。
+ * 只等待，**不取消**远端 A2A 任务（对齐 §2.5 停机语义）。
+ */
+export async function drainTaskWatchers(
+  graceMs: number,
+  pollMs: number = DRAIN_POLL_MS,
+): Promise<WatcherDrainResult> {
+  const startedAt = Date.now();
+  for (;;) {
+    if (watching.size === 0) {
+      return { drained: true, remaining: 0, waitedMs: Date.now() - startedAt };
+    }
+    const remain = graceMs - (Date.now() - startedAt);
+    if (remain <= 0) {
+      return { drained: false, remaining: watching.size, waitedMs: Date.now() - startedAt };
+    }
+    await drainSleep(Math.min(pollMs, remain));
+  }
+}
+
 
 /**
  * 推送唤醒（v0.4.0）：通知该 taskId 的看护立即 poll（推送优先）。
@@ -113,6 +173,13 @@ function safeOnSettled(
 
 /** 启动后台看护（fire-and-forget）；同 taskId 已有看护时返回 false（去重） */
 export function startTaskWatcher(options: TaskWatcherOptions): boolean {
+  if (!watcherEnabled) {
+    bridgeLog.warn(
+      "a2a-bridge",
+      `非 core 租约持有者（follower）：拒绝启动后台看护 ${options.taskId}`,
+    );
+    return false;
+  }
   if (watching.has(options.taskId)) return false;
   watching.add(options.taskId);
   void watchLoop(options).finally(() => {
@@ -151,7 +218,7 @@ async function watchLoop(options: TaskWatcherOptions): Promise<void> {
         consecutiveFailures = 0;
         if (options.isSettled(task)) {
           options.persist(task);
-          console.log(`[a2a-bridge] 后台看护 ${taskId}：任务已终态，看护结束`);
+          bridgeLog.info("a2a-bridge", `后台看护 ${taskId}：任务已终态，看护结束`);
           safeOnSettled(options, task, { abandoned: false });
           return;
         }

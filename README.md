@@ -16,6 +16,8 @@
   - [配置](#配置)
   - [运行](#运行)
 - [使用示例](#使用示例)
+- [作为 orch 宿主快速开始](#作为-orch-宿主快速开始)
+- [把流程规范引入你的项目](#把流程规范引入你的项目)
 - [配置说明](#配置说明)
 - [API 文档](#api-文档)
 - [目录结构](#目录结构)
@@ -70,7 +72,7 @@ flowchart TD
 - ✅ **静态分布，无中心注册**：项目到机器的映射来自配置，不做自注册、心跳、TTL 或服务发现。
 - ✅ **每机常驻 Launcher**：管理本机项目 Agent 生命周期，暴露 `health` / `projects` / `ensure` / `stop` 接口。
 - ✅ **按需幂等启动**：派发任务才 `ensure`，已在运行直接复用同一 A2A 端点，不重复拉起。
-- ✅ **泛型 MCP 工具面**：orch 只经 `a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` / `a2a_events` / `a2a_wait` 通信，agent 增减无需重连或刷新工具面。
+- ✅ **泛型 MCP 工具面**：orch 只经 `a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` / `a2a_events` / `a2a_wait` 通信，agent 增减无需重连或刷新工具面。其中 **`a2a_call` 的 `mode` 必填**（`"inquiry"` 只读询问 / `"execute"` 执行型派发，后者必带 `featureId`）—— **保证"执行必走引擎"**。
 - ✅ **Feature 编排**：把一个需求作为 Feature，经状态机 + 拓扑并行 Task DAG 调度器跨项目自动派发，中途可停下审批 / 澄清；上游失败向下游传播 `blocked`，不带病继续。
 - ✅ **会话映射持久化**：`contextId ↔ sessionId` 落 SQLite（`node:sqlite`），两侧进程重启均不丢。
 - ✅ **任务态回传与兜底找回**：任务态与结果落库；丢失 `taskId` 句柄可用 `a2a_tasks` 找回。
@@ -78,6 +80,8 @@ flowchart TD
 - ✅ **跨平台后台启停**：`launcherctl.mjs` 在 Windows / Linux / macOS 统一 start / stop / restart / status / logs。
 - ✅ **线协议版本化握手**：桥首触一台机器先握手校验主版本，不兼容即拒绝派发并给出升级指引。
 - ✅ **启动自检与空闲回收**：Launcher 启动时对全部项目跑真实最小任务自检；项目 Agent 空闲超时自动回收。
+- ✅ **失败自动化（v0.4.1）**：任务遇 `infra` 类失败（典型如 600s 超时）**不再直接判死** —— 引擎先把该节点**中性化**（下游不被连坐），再派**取证节点**（等目标 project 空闲回收后进场，确保无写者）读出「已改集 D / 未改集 R / 门禁 / 稳定位」，据此**同 `contextId` 续一次**或停下要人决策；全程由桥内代码推进，宿主无需轮询。
+- ✅ **孤儿进程回收（v0.4.1）**：Launcher 启动时**对账清理**进程账本里的无主孤儿 —— 这是唯一能修「孤儿占住 `a2aPort` ⇒ 新 Launcher 自检 `EADDRINUSE` ⇒ 服务起不来」的动作；另提供只读兜底 `npm run reap`（默认只列不杀，`--clean` 才清，红线：pidfile 存活一律禁清）。
 
 ## 演示 / 截图
 
@@ -100,7 +104,7 @@ flowchart TD
 ### 环境要求
 
 - Node.js ≥ 22.5（会话 / 任务库用内置 `node:sqlite`）。
-- **orch agent 与 `orch/`（MCP 桥）必须同机**：桥是本地 stdio MCP server，由 orch agent 作为子进程拉起。执行机器（Launcher + 项目 Agent）可在本机或远端。
+- **orch agent 与 `orch/`（MCP 桥）的连接**：缺省为本地 stdio MCP server，由 orch agent 作为子进程拉起（须同机）；亦可让桥以**常驻进程**运行，orch 经 MCP `type: "remote"` 连接（见[常驻部署形态](#常驻部署形态)）。执行机器（Launcher + 项目 Agent）可在本机或远端。
 - 执行机器按项目 `agentKind` 准备对应的 CLI 与认证（Launcher 从自身进程环境继承）：
   - `opencode`：PATH 上有 `opencode` CLI（三端中**唯一**需要预装 CLI 的 kind）；Launcher 会先拉起 `opencode serve` 作为前置后端。
   - `codex`：**无需在 PATH 安装全局 `codex` CLI**，`a2a-codex` 依赖已内置 codex 运行时（`@openai/codex` + 对应平台包，`npm install` 按 OS/arch 自动选择，SDK 自动解析）；仅需认证（`OPENAI_API_KEY`，或 `codex login` 生成的 `~/.codex/auth.json`），无前置后端。自定义网关经 `~/.codex/config.toml` 的 `[model_providers.*]` 配置：`base_url` 须为 OpenAI 兼容地址，注意 codex 会在其后拼接 `/responses`（`wire_api = "responses"`），网关地址需含版本段（如 `https://…/v1`）。如需指定其它 codex 版本 / 二进制，可用 `agentConfig.codex.codexPathOverride`。
@@ -155,9 +159,9 @@ npm run build        # 产出 dist/bridge/index.js
 }
 ```
 
-把 `command` 的路径换成实际部署路径即可。`MACHINES_CONFIG` 与 `SESSION_DB` 缺省时分别回退到 orch 单元根的 `config/config.json` 与 `./data/sessions.sqlite`。若 orch 不是 opencode，按该 agent 的方式登记同一个 stdio MCP server（`command` 与环境变量一致）即可，桥本身不绑定任何宿主。仓库内 `orch/opencode.json` 是一份把 `mcp.a2a` 配进 orch 的样例。
+把 `command` 的路径换成实际部署路径即可。`MACHINES_CONFIG` 与 `SESSION_DB` 缺省时分别回退到 orch 单元根的 `config/config.json` 与 `./data/sessions.sqlite`。若 orch 不是 opencode，按该 agent 的方式登记同一个 stdio MCP server（`command` 与环境变量一致）即可，桥本身不绑定任何宿主。仓库内 `orch/opencode.json.example` 是一份把 `mcp.a2a` 配进 orch 的样例。
 
-> ⚠️ **同机约束**：桥（`orch/` 单元）是本地 stdio MCP server，由 orch agent 作为子进程拉起，因此**必须与 orch agent 部署在同一台机器**（当前不支持把桥放远端用 HTTP 连）。
+> **两种连接形态**：缺省 stdio，桥由 orch agent 作为子进程拉起，须与 orch agent 同机；**常驻**模式下桥以独立进程运行，暴露 stateless Streamable HTTP（默认绑 `127.0.0.1`，路由 `/mcp`），orch 经 MCP `type: "remote"` 连接。常驻部署见[常驻部署形态](#常驻部署形态)。
 
 ### 运行
 
@@ -179,26 +183,70 @@ npm run status       # 查看 pid / host:port / health / startedAt
 
 ```text
 a2a_projects()
-a2a_call(project="machine", message="列出当前目录的顶层文件")
-a2a_call(project="machine", message="把刚才的结果按类型分组", contextId="<上一轮返回的 contextId>")
+a2a_call(project="machine", message="列出当前目录的顶层文件", mode="inquiry")
+a2a_call(project="machine", message="把刚才的结果按类型分组", contextId="<上一轮返回的 contextId>", mode="inquiry")
 ```
 
-`a2a_call` 省略 `contextId` 时自动新建并在返回中给出；续接同一上下文时把它带回来即可。
+`a2a_call` 省略 `contextId` 时自动新建并在返回中给出；续接同一上下文时把它带回来即可。**`mode` 必填**：只读询问用 `"inquiry"`；要真正派发实现任务则用 `"execute"` 并**必须**带 `featureId`（见下）。
 
 Feature 编排（把一个需求作为 Feature 推进）：
 
 ```text
-# 1) orch 建 Feature，组织各项目分析、汇总方案
+# 1) 方案已确认后建 Feature（初态即 waiting_approval，= 改造文档确认门），并同轮登记 DAG 节点
 a2a_feature_create(title="给登录页加记住我", requirement="…")
-# 2) 推进主链到等待审批后停下
-a2a_feature_advance(featureId="<id>", to="waiting_approval")
-# 3) 用户放行，桥内 Task DAG 调度器按 dependencies 拓扑派发（同层并行）
+a2a_call(project="machine", message="…", mode="execute", featureId="<id>")
+# 2) 用户确认方案后放行：approve = 记录已发生的用户确认（一对一，不可预领/不可补领）
 a2a_feature_approve(featureId="<id>")
-# 4) 任务需澄清时 Feature 停 needs_input，补齐答案续推
+#    ⚠️ 不能再用 a2a_feature_advance(to="executing") 绕门 —— 会被拒（feature_approval_required）
+# 3) 桥内 Task DAG 调度器按 dependencies 拓扑派发（同层并行）
+# 4) 任务需澄清时 Feature 停 needs_input，补齐答案续推（局部澄清；整案回炉需 cancel + 新建）
 a2a_feature_advance(featureId="<id>", to="executing", answer="…")
 ```
 
+**主链为 6 态**：`waiting_approval → executing → integrating → testing → reviewing → completed`（Step 0/1 由宿主驱动、**引擎不参与**）。
+
 调度器为**代码组件**，LLM 不参与等待 / 轮询。
+
+## 作为 orch 宿主快速开始
+
+本仓本身就是一套可直接使用的「完整 orch 宿主包」：`orch/` 桥 + `machine/` Launcher + `flow/` 流程规范 + 配置模板。交付 A 的接入步骤：
+
+1. clone 本仓，分别安装并构建两个单元：
+
+   ```bash
+   cd machine && npm install
+   cd ../orch && npm install && npm run build
+   ```
+
+2. 起 Launcher（执行机器，一律经 `machine/scripts/launcherctl.mjs`）：
+
+   ```bash
+   cd machine && npm run start
+   ```
+
+3. 填两份配置：`machine/config/config.json` 的 `projects[]`（本机项目），`orch/config/config.json` 的 `machines[]`（机器 → Launcher 地址）。字段说明见[配置说明](#配置说明)。
+
+4. 启动宿主（如 opencode）：按 [opencode.json.example](opencode.json.example) 建 `opencode.json`，经 `instructions` 加载 `flow/spec/`，并注册 `mcp.a2a`。
+
+5. 验证：在宿主里调用 `a2a_projects()`，能列出项目即接入成功。
+
+完整说明见 [flow/README.md](flow/README.md)。
+
+## 把流程规范引入你的项目
+
+已有自己的宿主配置与项目文档（`CLAUDE.md` / `AGENTS.md`）时，用 `flow/install/install.mjs` 把需求流程规范**旁路**引入既有项目。交付 B 的接入步骤：
+
+```bash
+node flow/install/install.mjs --target <项目根>
+```
+
+引入是旁路、幂等、可还原的：**不改动目标项目既有的 `CLAUDE.md` / `AGENTS.md`**，只在宿主配置里新增 `mcp.a2a` 并追加 `flow/spec/` 的 `instructions`。撤销：
+
+```bash
+node flow/install/uninstall.mjs --target <项目根>
+```
+
+细节见 [flow/README.md](flow/README.md)。
 
 ## 配置说明
 
@@ -343,7 +391,7 @@ Bridge ⇄ Launcher 的线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单�
 #### 泛型工具（7 个）
 
 - `a2a_projects()`：列出所有已配置机器及其本机项目（含运行态与 A2A 端点）。
-- `a2a_call(project, message, contextId?, wait?)`：解析项目到机器，幂等 ensure，经 A2A 派发一轮任务。默认半异步：≤30s 完成直接返回文本结果与 artifacts，更长返回 `working + taskId` 并用 `a2a_task_status` 轮询；`wait=false` 时永远立即返回 `working + taskId + contextId`（不进入同步轮询，后台看护照常落库）。
+- `a2a_call(project, message, mode, contextId?, wait?, featureId?, dependencies?, inputs?)`：解析项目到机器，幂等 ensure。**`mode` 必填**：`"inquiry"` = 只读询问/核实（**不得带 `featureId`**）⇒ 立即派发；`"execute"` = 执行型派发（**必带 `featureId`**）⇒ 登记 Feature 队列节点，由调度器派发。默认半异步：≤30s 完成直接返回文本结果与 artifacts，更长返回 `working + taskId` 并用 `a2a_task_status` 轮询；`wait=false` 时永远立即返回 `working + taskId + contextId`（不进入同步轮询，后台看护照常落库）。
 - `a2a_task_status(taskId)`：查询任务态并回写本地任务存储。已终结任务（completed / failed / input-required）由桥本地存档直接作答（不唤醒远端 Agent）；未终结任务走远端实时查询。
 - `a2a_tasks(project, [state], [limit])`：按项目列出本地任务记录（默认 `updatedAt` 倒序、默认 20 条、最多 100），每条含 `prompt` 片段 / state / text / contextId / updatedAt / stale。用于丢失 `taskId` 句柄后的兜底找回。
 - `a2a_cancel(taskId)`：取消任务，并回写本地任务存储。
@@ -354,13 +402,13 @@ Bridge ⇄ Launcher 的线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单�
 
 把一个需求作为 Feature 编排：`a2a_feature_create` 建 Feature → orch 组织各项目分析、汇总方案 → `a2a_feature_advance` 推进到 `waiting_approval` 停下 → 用户 `a2a_feature_approve` 放行 → 桥内 Task DAG 调度器（**同层拓扑并行** + 失败传播）按 `dependencies` 自动派发各项目任务并推进至完成；任务需澄清时 Feature 停 `needs_input`，`a2a_feature_advance(..., answer=…)` 续推。
 
-- `a2a_feature_create(title, requirement?, contextId?)`：新建 Feature（`discussing`），返回 `featureId`。
-- `a2a_feature_status(featureId?)`：查看 Feature 详情 / 列表（state + tasks 摘要）。
-- `a2a_feature_advance(featureId, to, note?, answer?)`：推进状态机主链（校验合法后继，非法流转被拒）；`answer` 用于 `needs_input` 补齐后续推。
-- `a2a_feature_approve(featureId)`：审批门——`waiting_approval → executing`。
-- `a2a_feature_cancel(featureId)`：任意非终态 → `cancelled`。
+- `a2a_feature_create(title, requirement?, contextId?)`：新建 Feature，**初态即 `waiting_approval`**（= 改造文档确认门停靠点，**引擎只做需求实现**），返回 `featureId`。
+- `a2a_feature_status(featureId?)`：查看 Feature 详情 / 列表（state + tasks 摘要，含 `failureKind` / `retryCount`）。
+- `a2a_feature_advance(featureId, to, note?, answer?)`：推进状态机主链（校验合法后继，非法流转被拒）；**`to="executing"` 在 `waiting_approval` 会被拒**（`feature_approval_required`，请用 `approve`）；`answer` 用于 `needs_input` 补齐后续推。
+- `a2a_feature_approve(featureId)`：**唯一准入**——`waiting_approval → executing`。语义 = **记录已发生的用户确认（一对一映射：不可预领、不可补领）**：宿主在收到用户确认后**立即**调用，**不是新增一次用户决策**；禁止在用户未确认方案前调用。
+- `a2a_feature_cancel(featureId)`：任意非终态 → `cancelled`（**执行中途"方案整体回炉"只能走这条**：主链无回边）。
 
-`a2a_call` 增可选 `featureId` / `dependencies`：带 `featureId` = 登记该 Feature 的队列节点（由调度器按 `dependencies` 拓扑派发，同层并行）；不带则与既有行为一致（立即派发）。
+`a2a_call` 的 `mode` **对偶校验**：`mode="execute"` 必带 `featureId`（否则 `feature_required_for_execute`）；`mode="inquiry"` **不得**带 `featureId`（否则 `feature_not_allowed_for_inquiry`）—— 由桥侧强制，**保证"执行必走引擎"**。
 
 #### 任务态
 
@@ -368,7 +416,7 @@ A2A 任务态统一使用 `working` / `completed` / `failed` / `input-required`�
 
 ## 目录结构
 
-代码按部署单元组织，`orch/` 与 `machine/` 各自完全自包含（各自的 `package.json` / `tsconfig.json` / `node_modules/` / `dist/` / `config/`）。单元之间只通过线协议耦合：线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单一事实源，类型两侧各自声明、由契约测试（`test-protocol-version`）锁定一致；修改协议时先改 PROTOCOL.md 再同步两侧实现。
+代码按部署单元组织，`orch/` 与 `machine/` 各自完全自包含（各自的 `package.json` / `tsconfig.json` / `node_modules/` / `dist/` / `config/`）。`flow/` 是需求流程规范包（项目无关，不参与 `npm` 构建），宿主经 `instructions` 加载其 `spec/` 内核。单元之间只通过线协议耦合：线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单一事实源，类型两侧各自声明、由契约测试（`test-protocol-version`）锁定一致；修改协议时先改 PROTOCOL.md 再同步两侧实现。
 
 ```text
 a2a-coding/
@@ -377,9 +425,14 @@ a2a-coding/
 │  ├─ tsconfig.json
 │  ├─ config/config.json          # 机器清单（实际，git 忽略）
 │  ├─ config/config.json.default  # 机器清单模板（入库）
-│  ├─ opencode.json               # 样例：把 mcp.a2a 配进 orch 的 opencode
+│  ├─ opencode.json.example       # 样例：把 mcp.a2a 配进 orch 的 opencode
 │  ├─ types.ts  config.ts  app-root.ts
 │  ├─ bridge/index.ts             # MCP 薄桥：泛型 7 + Feature 工具组 5；派发主链 dispatchTask
+│  ├─ bridge/register-tools.ts    # 工具注册：createServer(core) 工厂 + registerTools(server, core)
+│  ├─ bridge/transports/{stdio,http}.ts  # 接入面：stdio（缺省）/ stateless Streamable HTTP（/mcp /health /shutdown）
+│  ├─ runtime/{lifecycle,core-lease}.ts  # 启停编排与排空 + core 租约（单调度权，role owner/follower）
+│  ├─ scripts/bridgectl.mjs       # 桥启停脚本（start/stop/restart/status/logs）
+│  ├─ tools/mcp-http-probe.mjs    # 独立 MCP HTTP 探测客户端
 │  ├─ bridge/task-watcher.ts      # 任务后台看护（轮询 + 续约至终态落库；onSettled 供调度器接驳）
 │  ├─ bridge/scheduler.ts         # 拓扑并行 Task DAG 调度器（失败传播 blocked / 启动恢复）
 │  ├─ bridge/feature-tools.ts     # Feature 工具组 handler（create / status / advance / approve / cancel）
@@ -398,6 +451,7 @@ a2a-coding/
 │  ├─ scripts/                    # 验证脚本：verify-session-persist{,-codex,-claude}.mjs、verify-config-precedence.mjs
 │  ├─ agents/                     # 运行态：launcher 生成的包装器配置（git 忽略）
 │  └─ .a2a/                       # 运行态：包装器会话映射 sessions.json（git 忽略）
+├─ flow/                          # 需求流程规范包：spec 内核 / hosts 适配 / install 旁路引入（不参与 npm 构建）
 ├─ package.json                   # 仓级 dev manifest（version / type）
 └─ CHANGELOG.md  README.md
 ```
@@ -427,8 +481,43 @@ a2a-coding/
 
 ### 构建
 
-- orch（MCP 桥）：`cd orch && npm run build`，产出 `dist/bridge/index.js`。桥是 stdio MCP server，无独立常驻进程，由 orch agent 作为子进程拉起。
+- orch（MCP 桥）：`cd orch && npm run build`，产出 `dist/bridge/index.js`。缺省以 stdio MCP server 运行，由 orch agent 作为子进程拉起；亦可经 `npm run bridge:start` 以常驻进程运行（见[常驻部署形态](#常驻部署形态)）。
 - machine（Launcher）：`npm install` 时 `postinstall` 自动执行 `patch-package` 应用会话落盘补丁；`npm run launcher` 先 `tsc` 构建再运行 `dist/launcher/index.js`（前台，仅作调试）。
+
+### 常驻部署形态
+
+桥缺省以 stdio 形态运行，行为不变；亦可改为**常驻进程**独立部署，编排内核不再随 orch 宿主会话结束而停摆。在 `orch/config/config.json` 增 `transport` 段即可切换（`transport` 缺失即 stdio，旧配置零改动可用）：
+
+```json
+{
+  "transport": {
+    "mode": "http",
+    "http": { "host": "127.0.0.1", "port": 8787, "path": "/mcp" }
+  }
+}
+```
+
+常驻形态以 **stateless Streamable HTTP** 暴露 MCP（`sessionIdGenerator: undefined`），路由为 `POST /mcp`（主）、`GET /health`（就绪 / `role`）、`POST /shutdown`（仅接受 loopback，优雅停机）。宿主侧把 `mcp.a2a` 换成 remote 形态：
+
+```json
+"mcp": { "a2a": { "type": "remote", "url": "http://127.0.0.1:8787/mcp", "enabled": true } }
+```
+
+启停一律经 `orch/scripts/bridgectl.mjs`（`npm run bridge:*`），语义与 Launcher 的 `launcherctl.mjs` 一致：
+
+```bash
+cd orch
+npm run bridge:start    # 后台常驻启动，日志重定向；已在运行则提示并退出
+npm run bridge:status   # 查看 pid / host:port / health / role / startedAt
+npm run bridge:stop     # 优先 POST /shutdown 优雅停机，超时兜底强杀
+npm run bridge:restart  # 停止后重新后台拉起
+npm run bridge:logs     # 输出日志全文（支持 --lines N / --follow）
+```
+
+- pidfile：`orch/data/bridge.pid`；日志：`orch/data/logs/bridge.log`。
+- **单实例与单调度权靠 core 租约**（`orch/data/core.lock`）：只有租约持有者运行 scheduler 与 task-watcher；同一 data dir 的第二个实例降级为 `follower`，照常提供 MCP 工具但不跑后台循环。`GET /health` 会报当前 `role`（`owner` / `follower`）。
+- 端口被占则 **fail fast**，且不写 pidfile；pidfile 陈旧无害，只探测不误杀。
+- 默认只绑 `127.0.0.1`；非 loopback 暴露需反向代理 + 鉴权。回滚：宿主配置改回 `type: "local"` 并 `npm run bridge:stop`，行为退回 stdio 现状。
 
 ### 服务启停（`machine/scripts/launcherctl.mjs`）
 
@@ -446,6 +535,22 @@ npm run logs -- --follow      # 持续跟踪（等价 tail -f，Ctrl+C 退出）
 
 端口读配置 `launcher.port`，`MACHINE_CONFIG` 可指定其他配置文件；pidfile 位于 `machine/.a2a/launcher.pid`（由 Launcher 写）。`start` 会轮询 `/health` 至可达；`stop` 优先按配置 `launcher.shutdownEndpoint=true` 走 `POST /shutdown` 优雅停止，端点不可用时回落到发信号。pidfile 缺失 / 陈旧时只做端口探测提示，不误杀。前台命令 `npm run launcher` 的进程同样可被 `status` 发现、被 `stop` 停止。
 
+### 孤儿进程回收（`machine/scripts/reaper.mjs`）
+
+Launcher 被硬杀（`taskkill /F`、崩溃、断电）时，它拉起的项目 Agent 会**逃脱**并继续占住 `a2aPort` ⇒ 下次 Launcher 启动自检撞 `EADDRINUSE`，服务**根本起不来**。v0.4.1 用两道防线处理：
+
+1. **启动对账清理（自动、事前）**：Launcher `listen` 成功之后、启动自检**之前**，读取进程账本 `<machine 根>/.a2a/children/<pid>.json`，把「pid 存活 **且** 不在本次在册集合 **且** 超过宽限期」的条目判为孤儿并**组杀**；`pid` 已死则只删陈旧条目。判定口径：**在册 → 跳过（红线优先）→ 已死 → 只删条目 → 时间不可判 → 跳过 → 宽限期内 → 跳过**（宁漏勿误杀）。
+2. **`reaper.mjs`（手动、事后兜底）**：
+
+   ```bash
+   cd machine
+   npm run reap                  # 默认只读：列出孤儿，不做任何改动
+   npm run reap -- --clean       # 实际清理（组杀 + 删账本条目）
+   npm run reap -- --grace-ms 60000
+   ```
+
+   **红线**：**pidfile 的 pid 存活 ⇒ 一律禁清**（Launcher"假活"时其子进程可能仍在正常服务，误杀不可逆）；只有「`/health` 不可达 **且** pidfile 无存活 pid」才允许清。`/health` 报 `starting` 或 `/projects` 返回 503 时**不清理**；配置不可读时直接退出（不猜）。`REAPER_READONLY=1` 可强制拒绝 `--clean`。
+
 ### 运行须知
 
 - **单实例与启动顺序**：Launcher **先 `listen` 端口再自检**，端口绑定即单实例互斥锁，重复启动的第二实例在 `listen` 阶段即 `EADDRINUSE` 退出，不进入自检，从根上杜绝双实例撞 a2a 端口。`'listening'` 后写 pidfile `<machine 根>/.a2a/launcher.pid`（JSON `{ pid, port, host, startedAt }`，UTC ISO-8601，供启停脚本读取，非锁，陈旧无害），优雅退出 / fail-fast / `process exit` 均删除。
@@ -461,8 +566,8 @@ npm run logs -- --follow      # 持续跟踪（等价 tail -f，Ctrl+C 退出）
 
 ## 常见问题
 
-**Q：为什么 orch agent 必须与 `orch/`（MCP 桥）同机？**
-桥是本地 stdio MCP server，由 orch agent 作为子进程拉起；当前不支持把桥放远端用 HTTP 连。执行机器（Launcher + 项目 Agent）可在本机或远端。
+**Q：orch agent 与 `orch/`（MCP 桥）必须同机吗？**
+不一定。缺省 stdio 形态下桥由 orch agent 作为子进程拉起，须与 orch agent 同机；常驻形态下桥以独立进程运行并暴露 stateless Streamable HTTP，orch 经 MCP `type: "remote"` 连接（见[常驻部署形态](#常驻部署形态)）。执行机器（Launcher + 项目 Agent）可在本机或远端。
 
 **Q：`codex` / `claude` 需要预先安装全局 CLI 吗？**
 不需要。`a2a-codex` 与 `a2a-claude` 依赖已内置对应运行时，`npm install` 按 OS/arch 自动选择；只需准备认证。三端中只有 `opencode` 需要 PATH 上有 `opencode` CLI。
