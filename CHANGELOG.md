@@ -2,6 +2,38 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.6.0] - 2026-09-17
+
+> 主题：**项目组与选择性连接**（「一版本一需求」）。orch 侧新增**静态「项目组」**（成员 = `machineId × projectId`）+ **选择性连接** —— 桥只连「有成员的机器」、只用「列名成员的项目」；未列成员的项目**不 `ensure` / 不派发 / 不展示**，派发到非成员**显式失败**（`project_not_a_member`）。**线协议不变**（`PROTOCOL.md` / `PROTOCOL_VERSION` = `1.0`）；**`machine` 单元本版零源码改动**（仅 `package.json` 版本号）；**架构约束不变**。原路线图 v0.6.0 的「Transport 抽象与 SSH」经 **Step 0 重新评审后整体移出本版**（登记为后续；触发条件 = 出现「只有 SSH 能进」的机器）。
+
+### Added
+
+- **orch 侧静态「项目组」+ 选择性连接**（REQ-v0.6.0-2026-09-16-01）：
+  - **配置**：`orch/config/config.json` 新增可选顶层 **`projectGroup`**（`{ name?, members: [{ machineId, projectId }] }`；**单组**）。**段缺省 = 全量接纳**（`selective:false`，旧配置零改动可用）；`members` **不得为空数组**；`machineId` 必须存在于 `machines[]`（否则**解析期 fail-fast**）；**每请求现读、不缓存** ⇒ 改 members **无需重启桥**。
+  - **桥侧过滤（5 个拦截点，同一判据两种形态）**：`memberKey` 为**唯一 key 构造**（分隔符取 NUL，附对抗用例锁单射性）；`isMemberProject()`（过滤）与 `assertMember()`（断言，`code:"project_not_a_member"`）**同源于它**；`listMachineProjects(machine, group)` **单点过滤**（**4 个调用点**全覆盖）；`locateProject` 三条缓存落点（cache-hit 先判成员、不命中即清 `projectIndex` 条目并回落扫描；scan-hit **只缓存成员**；扫描前先 assert；扫描范围收窄为 `memberMachineIds`）；`handleProjects` **只遍历成员机器 + 只列成员项目**，**无成员的机器整条消失（含其 `error` 条目）**；`refreshProjectsSnapshotLazily` **与 `locateProject` 同时施加**；`probeProjectReady` **未改**（保持「无快照 ⇒ `ready=false`」fail-safe）。
+  - **三条防线**：`dispatchTask` / `registerFeatureNode` **零 I/O 早失败** + **`ensureProject` 首行硬兜底**（早于 `ensureProtocol`）—— 覆盖**全部 6 条「拉起」路径**（`handleCall` / `dispatchFeatureNode` / `handleTaskStatus` / `handleCancel` / 看护 `renew` / `pollTaskUntilSettled` 的 `renew`）⇒ 非成员**绝不 `POST /ensure`、连 `/health` 都不发**（实测出站 = 0）。
+- **`a2a_projects` 出参新增 `group`（恒存在）**：`{ name: string | null, selective: boolean, memberMachines: string[] }`；`memberMachines` = **配置声明的成员机器集合**（**非**运行时在线集合）；`selective:false` 时为空数组。
+- **工具面对应描述句**（`register-tools.ts` 两处**静态文本**，零重连）：`a2a_projects` 补「列出项目组成员 / 无成员的机器整条消失」；`a2a_call` 补「仅项目组成员可派发；非成员 ⇒ `project_not_a_member`」。
+- **`orch/config/config.json.default` 增可见配置样例**：新增**惰性结构化样例键 `_projectGroupExample`**（置于 `machines` 之后；合法 JSON、**不参与解析** ⇒ 缺省仍为全量接纳）+ `_comment` 里 `projectGroup` 段**前移**（原埋在 1687 字符注释末尾、键树里完全不可见）。
+
+### Changed
+
+- **三处 `package.json` 版本号升至 `0.6.0`**（根 / `orch` / `machine`；根为版本源）。
+- **`orch/bridge/index.ts` 顶层新增入口判定 `isEntryModule()` + 条件 `main()`**（为让 `bridge/index.ts` 可被单测 import；三条生产启动路径 `argv[1]` 均指向本文件 ⇒ 行为不变，已真机验证）。
+- **新增回归用例** `.omo/skills/regression-test/tests/test-v0.6.0-project-group.js`（结构锁 / 不变量 I1·I2·I3·I5 / 防回退 / **防 vacuous** / 范围锁）。
+
+### Verified
+
+- 门禁：`orch` `typecheck` **0** / `lint` **0** / `npm test` **168/168**（147 → 168：`orch/test/project-group.test.ts` **8 条**防 vacuous 用例 + `config.test.ts` **13 条**）；`machine` **零源码改动**（`typecheck` 0）。
+- **全量回归 776/776**（v0.5.1 基线 715；报告落 `reports/v0.6.0/`）。⚠ 过程中**修掉本版自写回归用例的 2 处缺陷**：① `ensureProject` 定义体定位失败（原用缩进正则）⇒ 改「**定义体窗口法**」（自符号起取定长窗口 + `loadMachines` 特征）；② 一处 `probeProjectReady` 断言在定位失败时会**假通过（vacuous）** ⇒ 补「窗口可定位」前置断言。
+- **真机（Step 3，宿主独立断言 4/4）**：① `a2a_projects()` 只列成员 + `group={selective:true,…}`；② 非成员派发 ⇒ **`project_not_a_member`** 且**无 `taskId` ⇒ 零出站**；③ 成员内派发 ⇒ **端到端成功**（真 `ensure` → A2A → 回传）；④ 非成员**未被 `ensure`**（Launcher 日志内无该项目 agent 启动 / 端口）。**旁证**：Launcher `/projects` 全量俱在 ⇒ **是过滤、非"项目不存在"**。撤夹具后恢复 **3 项目 + `selective:false`** ⇒ **缺省零回归**；**未重启桥**（配置每请求现读）。
+- **真机（发版）**：`bridge:restart` 后新 pid / `role=owner`；新构建**行为判据** = `a2a_projects()` 出参出现 `group`；网页 `GET /api/projects` **200** 且**不含 `group`/`workspace`/`agentConfig`**（字段白名单生效）、`GET /` **200**。
+
+### 未覆盖（遗留验证，**不得算通过**）
+
+- 成员**热移除**后在飞任务 `renew` 失败（需受控中断）· `idleStopMs=0` 机器移出成员后 agent 驻留 · **坏配置**的**真机**路径（单元级已由 `project-group.test.ts` fail-closed 用例覆盖；真机级因「可能把 `transport.mode=http` 打回 stdio」代价高，**保持登记**）· 跨机同名 `projectId` · **无成员的机器整条消失 + 零 `/projects` 请求（需第二台机器）** · 新增**项目**级自注册零重连（成员增删不需重连已顺带印证）。
+- **引擎级发现（本版不改，归 v0.6.1「编排引擎重新梳理」）**：同 Feature **≥2 个 infra 失败**时**重试仲裁错配**（先失败节点永不重试、其证据被记到后失败节点账上）· 中性化节点**下游照常派发**（与取证「无写者窗口」互扰，本次靠上界降级侥幸）· **判超时 ≠ 写盘停止**（判死后仍写入 7m38s）。详见 `doc/v0.6.0/项目组与选择性连接-改造文档.md` §6-11~15。
+
 ## [v0.5.1] - 2026-09-16
 
 > 主题：**失败自动化收口修复**（补丁版，「一版本一需求」）。修 REQ-03「失败自动化」暴露的两条收口缺陷 —— **D2**（收敛判定 / 失败传播**不认「取证节点」** ⇒ 取证节点失败被当普通失败、Feature **闷声 `failed`**）与 **D1**（`needsInputFeature` 三处静默 `return` + `notifyTaskSettled` 终态早退**零留痕**）；并**同批**处理「修 D2 即死锁」的耦合（`pendingEvidence` 出口未清）+ 兜底扫描。**线协议不变**（`PROTOCOL.md` / `PROTOCOL_VERSION` = `1.0`）；**`machine` 单元本版零源码改动**（仅 `package.json` 版本号）。**D3 已由 v0.5.0 的 D5 闭合 ⇒ 本版移出、不重复改造**。

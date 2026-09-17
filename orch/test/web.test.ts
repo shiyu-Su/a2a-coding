@@ -87,10 +87,19 @@ interface CoreOverrides {
   featureStatus?: WebCore["featureStatus"];
 }
 
+/**
+ * `a2a_projects` 出参 `group` 的缺省视图（v0.6.0 §2.3-I5：`group` **恒存在**）。
+ * 网页接面**不转发** `group`（`sendProjects` 是显式字段映射），但 `WebCore["projects"]`
+ * 的类型（`MachinesView`）要求该字段存在 —— 故此处只补类型形状，不影响 `/api/projects` 出参。
+ */
+function defaultGroupView(): { name: string | null; selective: boolean; memberMachines: string[] } {
+  return { name: null, selective: false, memberMachines: [] };
+}
+
 /** 最小内核桩：只实现网页接面用到的三件事（`BridgeCore` 结构兼容） */
 function fakeCore(overrides: CoreOverrides = {}): WebCore {
   return {
-    projects: overrides.projects ?? (async () => ({ machines: [] })),
+    projects: overrides.projects ?? (async () => ({ machines: [], group: defaultGroupView() })),
     tasks:
       overrides.tasks ??
       (async (projectId: string) => ({ ok: true, projectId, reachable: true, tasks: [] })),
@@ -260,6 +269,7 @@ test("GET /api/projects → 白名单（剔除 workspace / agentConfig / risk）
         { machineId: "m1", projects: [onlineProject()] },
         { machineId: "m2", projects: [], error: "机器不可达（测试）" },
       ],
+      group: defaultGroupView(),
     }),
   });
   const handle = await startWeb(core);

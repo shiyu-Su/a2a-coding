@@ -4,6 +4,8 @@ import type {
   HttpTransportConfig,
   MachineRef,
   MachinesConfig,
+  ProjectGroup,
+  ProjectMember,
   TransportConfig,
   TransportMode,
   WebConfig,
@@ -148,6 +150,83 @@ function parseWeb(v: unknown): WebConfig {
   };
 }
 
+/**
+ * 成员 key 分隔符（v0.6.0）。取 NUL：配置 id 中不可能出现，保证
+ * `memberKey` 对 `(machineId, projectId)` **单射** —— 用 `":"` / `"/"` 拼接会让
+ * `("a", "b:c")` 与 `("a:b", "c")` 碰撞（§2.3-I1 单一判据的前提）。
+ */
+const MEMBER_KEY_SEP = "\u0000";
+
+/**
+ * 成员 key **唯一构造**（v0.6.0 §2.1 总纲 3 / §2.3-I1）。
+ *
+ * 全仓成员判定的**唯一**来源：过滤（`isMemberProject`）与断言（`assertMember`）必须共用它，
+ * **禁止第二套拼接**（v0.5.1 D2 教训：双份判据 ⇒ 缓存 / 扫描路径判据分叉）。
+ * 纯函数，无 I/O、无副作用。
+ */
+export function memberKey(machineId: string, projectId: string): string {
+  return `${machineId}${MEMBER_KEY_SEP}${projectId}`;
+}
+
+/**
+ * `projectGroup` 段缺省态（v0.6.0）= **全量接纳**：`selective: false`、无成员。
+ *
+ * 这是「段缺省」这一唯一情形下的合法结果；**配置异常一律 fail-fast**，绝不复用本默认
+ * （§2.3-I2：任何「未命中 / 配置异常」都不得回退成全量接纳）。
+ */
+export function defaultProjectGroup(): ProjectGroup {
+  return {
+    name: null,
+    members: [],
+    memberKeys: new Set(),
+    memberMachineIds: new Set(),
+    selective: false,
+  };
+}
+
+/**
+ * 解析 `projectGroup` 配置段（v0.6.0 静态项目组；纯函数，可单测）。
+ *
+ * - **段缺失**（`value === undefined`）⇒ `selective: false` 全量接纳（旧 `config.json` 零改动可用，
+ *   **绝不 fail-fast** —— 这是验收项）；
+ * - **段存在** ⇒ 严格校验：必须对象；`name` 缺省/`null` ⇒ `null`，否则须非空字符串；
+ *   `members` 必须为**非空**数组（**空数组 = 配置错误 ⇒ fail**，U1 裁定：要么删段、要么列成员）；
+ *   成员项必须为对象且 `{ machineId, projectId }` 均为非空字符串；
+ *   **`machineId` 必须 ∈ `machines[]`，否则 fail-fast**（拼错机器名的代价 = 桥整体拒绝该段）。
+ * - 派生：`memberKeys` / `memberMachineIds` / `selective: true`（成员判定同源于 `memberKey`）。
+ *
+ * 非法一律走既有 `fail()` 约定（`[config]` 前缀 + 字段路径），不新造第二种错误风格、不静默降级。
+ */
+export function parseProjectGroup(value: unknown, machineIds: ReadonlySet<string>): ProjectGroup {
+  if (value === undefined) return defaultProjectGroup();
+  const g = asRecord(value, "projectGroup");
+  const nameRaw = g["name"];
+  const name =
+    nameRaw === undefined || nameRaw === null ? null : asString(nameRaw, "projectGroup.name");
+  const membersRaw = g["members"];
+  if (!Array.isArray(membersRaw)) fail("projectGroup.members 必须是数组");
+  if (membersRaw.length === 0) {
+    fail("projectGroup.members 必须是非空数组（要么删除本段 = 全量接纳，要么列出成员）");
+  }
+  const members = membersRaw.map((m, i): ProjectMember => {
+    const ctx = `projectGroup.members[${i}]`;
+    const r = asRecord(m, ctx);
+    const machineId = asString(r["machineId"], `${ctx}.machineId`);
+    const projectId = asString(r["projectId"], `${ctx}.projectId`);
+    if (!machineIds.has(machineId)) {
+      fail(`${ctx}.machineId "${machineId}" 不在 machines[] 中（成员必须指向已配置机器）`);
+    }
+    return { machineId, projectId };
+  });
+  return {
+    name,
+    members,
+    memberKeys: new Set(members.map((m) => memberKey(m.machineId, m.projectId))),
+    memberMachineIds: new Set(members.map((m) => m.machineId)),
+    selective: true,
+  };
+}
+
 /** 加载并校验「orch 侧机器清单」（含可选回调端点 / 桥 transport / 网页端只读工作台配置） */
 export function loadMachinesConfig(path: string): MachinesConfig {
   const raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
@@ -160,21 +239,31 @@ export function loadMachinesConfig(path: string): MachinesConfig {
   const transport = transportRaw === undefined ? defaultTransport() : parseTransport(transportRaw);
   const webRaw = o["web"];
   const web = parseWeb(webRaw === undefined ? {} : webRaw);
+  const machineRefs = machines.map((m, i): MachineRef => {
+    const r = asRecord(m, `machines[${i}]`);
+    const pushCallbackRaw = r["pushCallback"];
+    return {
+      machineId: asString(r["machineId"], `machines[${i}].machineId`),
+      launcherUrl: asString(r["launcherUrl"], `machines[${i}].launcherUrl`),
+      pushCallback:
+        pushCallbackRaw === undefined
+          ? undefined
+          : asBool(pushCallbackRaw, `machines[${i}].pushCallback`),
+    };
+  });
+  /**
+   * v0.6.0 项目组：在 `machines[]` 解析之后接入（成员 `machineId ∈ machines[]` 校验依赖其派生集合）。
+   * 段缺失 ⇒ `selective: false`（全量接纳），**恒返回完整对象**（运行时不存在 `undefined`）。
+   */
+  const projectGroup = parseProjectGroup(
+    o["projectGroup"],
+    new Set(machineRefs.map((r) => r.machineId)),
+  );
   return {
-    machines: machines.map((m, i): MachineRef => {
-      const r = asRecord(m, `machines[${i}]`);
-      const pushCallbackRaw = r["pushCallback"];
-      return {
-        machineId: asString(r["machineId"], `machines[${i}].machineId`),
-        launcherUrl: asString(r["launcherUrl"], `machines[${i}].launcherUrl`),
-        pushCallback:
-          pushCallbackRaw === undefined
-            ? undefined
-            : asBool(pushCallbackRaw, `machines[${i}].pushCallback`),
-      };
-    }),
+    machines: machineRefs,
     callback,
     transport,
     web,
+    projectGroup,
   };
 }

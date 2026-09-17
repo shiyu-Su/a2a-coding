@@ -1,5 +1,5 @@
 {
-  "_comment": "transport：桥 transport（v0.4.1 桥常驻化，可选段）。mode 取值 stdio|http，缺省 stdio（旧配置无此段时零改动可用、行为不变）；mode=http 时桥常驻监听 http.host:http.port+http.path，缺省 host=127.0.0.1、port=8787、path=/mcp（避开 Launcher 3100、项目 A2A 3010-3012、回调 3200）。web：网页端只读工作台（v0.5.0，可选段）。缺省 {enabled:true, host:127.0.0.1, port:3300, allowStdio:false}（3300 避开 Launcher 3100 / 项目 A2A 3010-3012 / MCP http 8787 / 回调 3200）。enabled 仅在常驻（transport.mode=http）形态下生效，stdio 形态不读它；allowStdio 是唯一允许 stdio 形态也 bind 的开关（缺省 false），置 true 时必须 server.unref()，否则会持住事件循环、让桥子进程不随宿主退出；实际是否 bind 由运行时判定 (mode===http ? enabled : allowStdio) && role===owner，且 host 非 loopback 一律拒起（本段只承载配置，不实现监听）。callback：orch 回调端点（默认关 enabled=false）。开启后桥在 host:port 上监听 POST /callback 接收 worker push 通知；仅同机/受信网络 opt-in（跨机回调鉴权待 v0.7.0）。host 缺省 127.0.0.1、port 缺省 3200（避开 Launcher 3100 与项目 A2A 3010-3012）；可选 token 用于校验推送请求（省略则不校验，字段名 token）。machines[].pushCallback：该机项目是否接收 orch push 回调（缺省 false）；仅当 callback.enabled 与该位同时为 true 时，派发才内联注册回调。",
+  "_comment": "projectGroup：orch 侧静态「项目组」+ 选择性连接（v0.6.0，可选段、单组）。① 本段缺省 = 全量接纳（与今天行为一致：不写 projectGroup 键 ⇒ selective=false，全部已配置机器/项目照常列出与派发，旧配置零改动可用）。② 本段存在时 members 必须是非空数组 —— 空数组成员列表视为配置错误（要么删掉该段、要么列出成员）。③ 本段 fail-fast：成员 machineId 拼错（不在 machines[] 中）会让桥整体拒绝派发（错误码 machines_config_error），且该配置解析失败可能连带让 transport / web / callback 回落各自默认（如 transport.mode=http 被打回 stdio、callback 静默变 enabled=false）—— 改完配置请先验证（先校验 JSON 合法性，再起桥看日志）。④ 推荐入组机器保持 launcher.idleStopMs > 0（缺省 300000）：把项目移出成员后，靠 Launcher 空闲回收把已拉起的 agent 自动收回；为 0（显式禁用回收）时该 agent 可能长期驻留，需人工 POST {launcherUrl}/projects/{projectId}/stop（注意 launcherctl.mjs 不含单项目 stop）。样例（启用时才把下列内容从注释搬成真实键 projectGroup；不写 = 全量接纳）：{\"name\":\"<组名>\",\"members\":[{\"machineId\":\"<machine-id>\",\"projectId\":\"<project-id>\"}]} transport：桥 transport（v0.4.1 桥常驻化，可选段）。mode 取值 stdio|http，缺省 stdio（旧配置无此段时零改动可用、行为不变）；mode=http 时桥常驻监听 http.host:http.port+http.path，缺省 host=127.0.0.1、port=8787、path=/mcp（避开 Launcher 3100、项目 A2A 3010-3012、回调 3200）。web：网页端只读工作台（v0.5.0，可选段）。缺省 {enabled:true, host:127.0.0.1, port:3300, allowStdio:false}（3300 避开 Launcher 3100 / 项目 A2A 3010-3012 / MCP http 8787 / 回调 3200）。enabled 仅在常驻（transport.mode=http）形态下生效，stdio 形态不读它；allowStdio 是唯一允许 stdio 形态也 bind 的开关（缺省 false），置 true 时必须 server.unref()，否则会持住事件循环、让桥子进程不随宿主退出；实际是否 bind 由运行时判定 (mode===http ? enabled : allowStdio) && role===owner，且 host 非 loopback 一律拒起（本段只承载配置，不实现监听）。callback：orch 回调端点（默认关 enabled=false）。开启后桥在 host:port 上监听 POST /callback 接收 worker push 通知；仅同机/受信网络 opt-in（跨机回调鉴权待 v0.7.0）。host 缺省 127.0.0.1、port 缺省 3200（避开 Launcher 3100 与项目 A2A 3010-3012）；可选 token 用于校验推送请求（省略则不校验，字段名 token）。machines[].pushCallback：该机项目是否接收 orch push 回调（缺省 false）；仅当 callback.enabled 与该位同时为 true 时，派发才内联注册回调。",
   "transport": {
     "mode": "stdio",
     "http": {
@@ -25,5 +25,9 @@
       "launcherUrl": "http://<host>:3100",
       "pushCallback": false
     }
-  ]
+  ],
+  "_projectGroupExample": {
+    "name": "示例：启用时把本键改名为 projectGroup 并填真实值；不启用则保持本键不动（不参与解析）",
+    "members": [ { "machineId": "<machine-id>", "projectId": "<project-id>" } ]
+  }
 }

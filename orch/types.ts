@@ -158,6 +158,37 @@ export interface WebConfig {
   allowStdio: boolean;
 }
 
+/** 项目组成员（v0.6.0：`machineId × projectId` 二元组） */
+export interface ProjectMember {
+  machineId: string;
+  projectId: string;
+}
+
+/**
+ * 静态「项目组」（v0.6.0 §2.1；`orch/config/config.json` 的 `projectGroup` 段，**单组**、
+ * 每请求现读、不缓存）。
+ *
+ * 段**缺省** ⇒ `selective: false`（全量接纳，与旧版行为完全一致，**绝不 fail-fast**）；
+ * 段**存在** ⇒ 严格结构校验、非法即 `fail()`（成员列表空数组 / 成员项非法 /
+ * `machineId ∉ machines[]` 一律 fail-fast，见 §2.3-I2「绝不 fail-open」）。
+ *
+ * `name` / `members` = 配置声明态；`memberKeys` / `memberMachineIds` / `selective` =
+ * 解析期由 `config.ts#parseProjectGroup` 产出的**派生态**（`loadMachinesConfig()` 恒填充）。
+ * 成员判定**必须**同源于 `memberKey(machineId, projectId)`（§2.3-I1 单一判据，禁第二套拼接）。
+ */
+export interface ProjectGroup {
+  /** 组名（缺省 `null`；遵循本仓「不省略字段、无数据返 `null`」） */
+  name: string | null;
+  /** 声明态成员（保持配置内声明顺序；重复项由派生集合去重） */
+  members: ProjectMember[];
+  /** 派生：成员 key 集合（由 `memberKey(machineId, projectId)` 构造） */
+  memberKeys: Set<string>;
+  /** 派生：成员机器 id 集合（「发现」路径的扫描范围收窄依据） */
+  memberMachineIds: Set<string>;
+  /** 派生：是否启用选择性连接（段缺省 ⇒ `false` = 全量接纳） */
+  selective: boolean;
+}
+
 /** orch 侧：机器清单 */
 export interface MachinesConfig {
   machines: MachineRef[];
@@ -167,6 +198,11 @@ export interface MachinesConfig {
   transport: TransportConfig;
   /** 网页端只读工作台（v0.5.0；配置缺省时解析为 `{ true, "127.0.0.1", 3300, false }`） */
   web: WebConfig;
+  /**
+   * 静态项目组（v0.6.0；**段缺省时解析为 `selective: false` 的全量接纳态**，
+   * 由 `loadMachinesConfig()` **恒填充** —— 运行时不会出现 `undefined`，字段可选仅为对齐配置段可选）。
+   */
+  projectGroup?: ProjectGroup;
 }
 
 /** 项目 + 运行态（GET /projects 返回；bridge 消费的 launcher 线协议） */

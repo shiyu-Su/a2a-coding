@@ -165,7 +165,8 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_projects",
     {
       description:
-        "聚合列出所有已配置机器及其本机项目（含运行态与 A2A 端点）。机器不可达时该项目列表为空并带 error 字段。",
+        "聚合列出所有已配置机器及其本机项目（含运行态与 A2A 端点）。机器不可达时该项目列表为空并带 error 字段。" +
+        "**列出项目组成员**：未配置 `projectGroup`（全量接纳）时列出全部；配置后只列成员机器及其成员项目（无成员的机器整条消失）。",
     },
     async () => {
       try {
@@ -212,7 +213,8 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     {
       description:
         "向目标项目派发一轮任务：解析项目→机器，按需幂等启动其 Agent（ensure），经 A2A 发送消息并返回文本结果 + artifacts。传入相同 contextId 可续接上下文；返回 contextId 便于继续追问。wait=false 时立即返回句柄（全异步，不进入同步等待）。" +
-        `**mode 必填（无缺省）**：mode="execute" = 执行型派发，**必带 featureId**，任务作为 Feature DAG 节点登记（不立即派发），由调度器按 dependencies 串行自动派发（可挂载态 = ${MOUNTABLE_FEATURE_STATES.join(" / ")}）；mode="inquiry" = 只读询问 / 核实（Step 0/1 用），**不得带 featureId**，立即派发。`,
+        `**mode 必填（无缺省）**：mode="execute" = 执行型派发，**必带 featureId**，任务作为 Feature DAG 节点登记（不立即派发），由调度器按 dependencies 串行自动派发（可挂载态 = ${MOUNTABLE_FEATURE_STATES.join(" / ")}）；mode="inquiry" = 只读询问 / 核实（Step 0/1 用），**不得带 featureId**，立即派发。` +
+        "**仅项目组成员可派发**：非成员 ⇒ 返回 `project_not_a_member`（零出站请求即失败，绝不 ensure）。",
       inputSchema: a2aCallSchema,
     },
     async (args) => {

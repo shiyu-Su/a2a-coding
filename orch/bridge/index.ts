@@ -20,7 +20,8 @@
 import { randomUUID } from "node:crypto";
 import { createServer as createHttpServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
-import { dirname, join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 import {
   ClientFactory,
   DefaultAgentCardResolver,
@@ -39,7 +40,7 @@ import type {
 } from "@a2a-js/sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { appRootFromModule } from "../app-root.js";
-import { loadMachinesConfig } from "../config.js";
+import { defaultProjectGroup, loadMachinesConfig, memberKey } from "../config.js";
 import { BRIDGE_VERSION } from "../version.js";
 import { BridgeRuntime, defaultPidFile, type RuntimeReadiness } from "../runtime/lifecycle.js";
 import {
@@ -52,6 +53,7 @@ import {
   type FeatureRecord,
   type InputArtifactRef,
   type MachineRef,
+  type ProjectGroup,
   type ProjectStatus,
   type RiskLevel,
   type TaskListItem,
@@ -417,7 +419,7 @@ function parseProjectList(data: unknown): ProjectStatus[] | null {
 type ListResult =
   { ok: true; projects: ProjectStatus[] } | { ok: false; code?: string; error: string };
 
-async function listMachineProjects(machine: MachineRef): Promise<ListResult> {
+async function listMachineProjects(machine: MachineRef, group: ProjectGroup): Promise<ListResult> {
   const protocol = await ensureProtocol(machine);
   if (!protocol.ok) {
     return { ok: false, code: protocol.code, error: protocol.error };
@@ -438,22 +440,124 @@ async function listMachineProjects(machine: MachineRef): Promise<ListResult> {
       error: `GET ${url} 响应格式不合法：期望 ProjectStatus[] 或 { projects: ProjectStatus[] }`,
     };
   }
-  return { ok: true, projects };
+  /**
+   * **单点过滤**（v0.6.0 §2.2）：`GET /projects` 是本桥**唯一**的项目发现入口 ⇒
+   * 在此收口即覆盖全部「发现」路径（`locateProject` cache-hit / scan、`refreshProjectsSnapshotLazily`、
+   * `handleProjects`）。判据经 {@link isMemberProject}（与 `assertMember` 同源，I1）。
+   */
+  return {
+    ok: true,
+    projects: projects.filter((p) => isMemberProject(machine.machineId, p.projectId, group)),
+  };
 }
 
 type LocateResult =
   | { ok: true; machine: MachineRef; project: ProjectStatus }
   | { ok: false; code: string; error: string };
 
-function loadMachines(): { ok: true; machines: MachineRef[] } | { ok: false; error: string } {
+type MachinesLoad =
+  | { ok: true; machines: MachineRef[]; group: ProjectGroup }
+  | { ok: false; error: string };
+
+/**
+ * 机器清单 + 项目组（v0.6.0 §2.1 总纲 2）。
+ *
+ * **不新增进程级缓存**：与 `machines[]` 同生命周期 —— 每次调用现读配置文件，
+ * 配置热改（成员增删 / 段增删）**即时生效**，无需重启桥。`projectGroup` 段缺失 ⇒
+ * `selective: false`（全量接纳，旧 `config.json` 零改动可用）；段存在但非法 ⇒
+ * `loadMachinesConfig` 抛错 ⇒ 此处 `{ ok: false }` ⇒ 调用方一律 `machines_config_error`
+ * （**绝不 fail-open**，I2）。
+ */
+function loadMachines(): MachinesLoad {
   try {
-    return { ok: true, machines: loadMachinesConfig(MACHINES_CONFIG_PATH).machines };
+    const config = loadMachinesConfig(MACHINES_CONFIG_PATH);
+    return {
+      ok: true,
+      machines: config.machines,
+      // `projectGroup` 只由 `loadMachinesConfig` 产出（恒有值）；`??` 仅为可选字段的类型收窄
+      group: config.projectGroup ?? defaultProjectGroup(),
+    };
   } catch (err) {
     return {
       ok: false,
       error: `加载机器清单失败（${MACHINES_CONFIG_PATH}）：${toMessage(err)}`,
     };
   }
+}
+
+// ---------------------------------------------------------------------------
+// 项目组成员判定（v0.6.0 §2.3-I1：**唯一判据** —— 过滤 / 断言必须同源）
+// ---------------------------------------------------------------------------
+
+/**
+ * 过滤用（§2.2）：`(machineId, projectId)` 是否为项目组成员。
+ *
+ * - `selective: false`（无 `projectGroup` 段）⇒ **全量接纳**（旧配置语义）；
+ * - `selective: true` ⇒ 唯一判据 = `memberKeys.has(memberKey(machineId, projectId))`
+ *   （`memberKey` 单一构造来自 `config.ts`，本文件**不另起拼接**）。
+ *
+ * 与 {@link assertMember} **同源**（两者只经 `memberKey`）；禁止各自演化（v0.5.1 D2 教训）。
+ */
+function isMemberProject(machineId: string, projectId: string, group: ProjectGroup): boolean {
+  if (!group.selective) return true;
+  return group.memberKeys.has(memberKey(machineId, projectId));
+}
+
+/** 构造 `project_not_a_member` 结构化失败（`machineId === null` = 未知落点机器的通用表述） */
+function notAMemberFailure(
+  machineId: string | null,
+  projectId: string,
+  group: ProjectGroup,
+): Failure {
+  const where = machineId === null ? `项目 ${projectId}` : `项目 ${projectId}@${machineId}`;
+  const who = group.name === null ? "项目组" : `项目组「${group.name}」`;
+  return {
+    ok: false,
+    code: "project_not_a_member",
+    error:
+      `${where} 不是${who}的成员（选择性连接：未列成员的项目不主动连 / 不 ensure / 不派发）。` +
+      `请在 orch/config/config.json 的 projectGroup.members 中登记 { machineId, projectId } 后重试。`,
+  };
+}
+
+/**
+ * 断言用（§2.2）：返回 `Failure`（非成员）或 `null`（通过）。
+ *
+ * - `machineId` 给定 ⇒ **精确**到 `(machineId, projectId)` 的成员判定
+ *   （`ensureProject` 硬兜底用，落点机器已知）；
+ * - `machineId === null` ⇒ 只要求「**该项目被任一成员机器声明**」—— 派发前置
+ *   （`dispatchTask` / `registerFeatureNode` / `locateProject` 扫描前）尚**不知道落点机器**，
+ *   用本形态可**零 I/O** 判定「未被选中」，避免把「没选它」降级成 `project_not_found`。
+ *
+ * 两种形态**同源**：给定机器走 {@link isMemberProject}；未给定机器遍历
+ * `memberMachineIds` × `memberKey` —— 无第二套拼接 / 第二套判据（I1）。
+ */
+function assertMember(
+  machineId: string | null,
+  projectId: string,
+  group: ProjectGroup,
+): Failure | null {
+  if (!group.selective) return null;
+  if (machineId !== null) {
+    return isMemberProject(machineId, projectId, group)
+      ? null
+      : notAMemberFailure(machineId, projectId, group);
+  }
+  for (const candidate of group.memberMachineIds) {
+    if (group.memberKeys.has(memberKey(candidate, projectId))) return null;
+  }
+  return notAMemberFailure(null, projectId, group);
+}
+
+/**
+ * 参与「发现 / 定位」的机器集合：`selective: false` ⇒ 全部机器；否则 ⇒ 配置声明的成员机器。
+ *
+ * `handleProjects` / `refreshProjectsSnapshotLazily` / `locateProject` **共用同一集合** ——
+ * 否则出现「定位得到、快照没有」的双份判据（§2.2）。
+ */
+function memberMachines(machines: readonly MachineRef[], group: ProjectGroup): MachineRef[] {
+  if (!group.selective) return Array.from(machines);
+  return machines.filter((m) => group.memberMachineIds.has(m.machineId));
 }
 
 // ---------------------------------------------------------------------------
@@ -487,36 +591,62 @@ function pushCallbackFor(machine: MachineRef): { url: string; token: string } | 
   return { url: `http://${cb.host}:${cb.port}/callback`, token: cb.token ?? "" };
 }
 
-/** 解析 project -> machine（命中缓存时仅向该机核对；未命中时全量扫描并写缓存） */
+/**
+ * 解析 project -> machine（v0.6.0 §2.2：**成员机器范围内**定位）。
+ *
+ * 成员过滤的三条落点（R1「缓存不绕过」）：
+ * ① 扫描范围收窄为 `memberMachines(machines, group)`（= `group.memberMachineIds`）；
+ * ② **cache-hit 分支先判成员**：`(cachedMachineId, pid)` 已非成员 ⇒ 清缓存条目；
+ *    若该项目在**另一台**成员机器上仍是成员，则继续走扫描（见下方 `assertMember` 后的扫描）；
+ * ③ **scan-hit 只对成员** `projectIndex.set(...)`（非成员绝不入缓存、绝不作命中）；
+ * ④ 扫描前先 `assertMember(null, …)`：未被任何成员机器声明 ⇒ **零 I/O** 返回
+ *    `project_not_a_member`，**不降级**成 `project_not_found`、**不回落全量扫描**。
+ */
 async function locateProject(projectId: string): Promise<LocateResult> {
   const config = loadMachines();
   if (!config.ok) {
     return { ok: false, code: "machines_config_error", error: config.error };
   }
-  const machines = config.machines;
+  const { group } = config;
+  const machines = memberMachines(config.machines, group);
 
   const cachedMachineId = projectIndex.get(projectId);
   if (cachedMachineId !== undefined) {
-    const machine = machines.find((m) => m.machineId === cachedMachineId);
-    if (machine !== undefined) {
-      const listed = await listMachineProjects(machine);
-      if (listed.ok) {
-        const project = listed.projects.find((p) => p.projectId === projectId);
-        if (project !== undefined) {
-          rememberProjectStatus(project); // 顺带预热取证快照（免额外 HTTP）
-          return { ok: true, machine, project };
-        }
-      }
+    // ② 缓存不绕过：**先判成员**再核对（配置热改移出成员后，缓存不得成为旁路）
+    if (!isMemberProject(cachedMachineId, projectId, group)) {
       projectIndex.delete(projectId);
     } else {
-      projectIndex.delete(projectId);
+      const machine = machines.find((m) => m.machineId === cachedMachineId);
+      if (machine !== undefined) {
+        const listed = await listMachineProjects(machine, group);
+        if (listed.ok) {
+          const project = listed.projects.find((p) => p.projectId === projectId);
+          if (project !== undefined) {
+            rememberProjectStatus(project); // 顺带预热取证快照（免额外 HTTP）
+            return { ok: true, machine, project };
+          }
+        }
+        projectIndex.delete(projectId);
+      } else {
+        projectIndex.delete(projectId);
+      }
     }
+  }
+
+  /**
+   * ④ 扫描前断言：未知落点机器 ⇒ 「任一成员机器声明」即可。
+   * 未声明 ⇒ **零 I/O** 失败（`project_not_a_member`）——既不发 `/health` 也不发 `/projects`；
+   * 陈旧缓存条目已在上面清理 ⇒ 不存在「回落全量扫描」。
+   */
+  const denied = assertMember(null, projectId, group);
+  if (denied !== null) {
+    return { ok: false, code: denied.code, error: denied.error };
   }
 
   const scanned = await Promise.all(
     machines.map(async (machine) => ({
       machine,
-      listed: await listMachineProjects(machine),
+      listed: await listMachineProjects(machine, group),
     })),
   );
   const unreachable: string[] = [];
@@ -532,11 +662,13 @@ async function locateProject(projectId: string): Promise<LocateResult> {
       continue;
     }
     const project = listed.projects.find((p) => p.projectId === projectId);
-    if (project !== undefined) {
-      projectIndex.set(projectId, machine.machineId);
-      rememberProjectStatus(project); // 顺带预热取证快照（免额外 HTTP）
-      return { ok: true, machine, project };
-    }
+    if (project === undefined) continue;
+    // ③ 只对成员入缓存 / 只把成员当命中（`listMachineProjects` 已过滤；此处再判一次 = 显式落点，
+    //    防未来有人绕过该过滤时静默污染缓存与快照）
+    if (!isMemberProject(machine.machineId, projectId, group)) continue;
+    projectIndex.set(projectId, machine.machineId);
+    rememberProjectStatus(project); // 顺带预热取证快照（免额外 HTTP）
+    return { ok: true, machine, project };
   }
   if (protocolRefusals.length > 0) {
     return {
@@ -558,6 +690,23 @@ type EnsureOutcome =
 
 /** `POST {launcher}/projects/{id}/ensure`（幂等启动），返回 A2A 端点 */
 async function ensureProject(machine: MachineRef, projectId: string): Promise<EnsureOutcome> {
+  /**
+   * **硬兜底 · 首行（v0.6.0 §2.2 / §2.3-I3）**：判成员必须**早于任何网络 I/O**（含 `/health` 握手）。
+   * 这是**唯一充分**的解 —— 覆盖全部 6 条「拉起」路径（`handleCall` / `dispatchFeatureNode` /
+   * `handleTaskStatus` / `handleCancel` / 看护 `renew` / `pollTaskUntilSettled` 的 `renew`）：
+   * 非成员**绝不 `POST /ensure`，连 `GET /health` 都不发**。
+   *
+   * 配置**现读**（不缓存）⇒ 成员热移除后，在飞任务的 `renew` 也随之失败（R6 设计内行为，
+   * 非致命：看护仍用已建 client 直连 `tasks/get` 至终态）。配置坏 ⇒ `machines_config_error`（I2）。
+   */
+  const config = loadMachines();
+  if (!config.ok) {
+    return { ok: false, code: "machines_config_error", error: config.error };
+  }
+  const denied = assertMember(machine.machineId, projectId, config.group);
+  if (denied !== null) {
+    return { ok: false, code: denied.code, error: denied.error };
+  }
   const protocol = await ensureProtocol(machine);
   if (!protocol.ok) {
     return { ok: false, code: protocol.code, error: protocol.error };
@@ -1037,6 +1186,19 @@ async function dispatchTask(
   contextId: string,
   wait: boolean,
 ): Promise<DispatchOutcome> {
+  /**
+   * 派发前置断言（v0.6.0 §2.2）：**零 I/O 早失败** —— `inquiry` 路径在未被选中时
+   * 不得先发 `/health` / `/projects` 才发现「项目不属本组」。判据同源于 {@link assertMember}
+   * （`machineId === null`：任一成员机器声明即可；落点机器由随后的 `locateProject` 决定）。
+   */
+  const config = loadMachines();
+  if (!config.ok) {
+    return { ok: false, code: "machines_config_error", error: config.error, contextId };
+  }
+  const denied = assertMember(null, projectId, config.group);
+  if (denied !== null) {
+    return { ok: false, code: denied.code, error: denied.error, contextId };
+  }
   const located = await locateProject(projectId);
   if (!located.ok) {
     return { ok: false, code: located.code, error: located.error, contextId };
@@ -1404,6 +1566,19 @@ function registerFeatureNode(
       contextId,
     };
   }
+  /**
+   * 登记前断言（v0.6.0 §2.2）：防「登记成功、异步才失败」—— 越界必须**即时**失败。
+   * 此处仍在 `createTask` **之前** ⇒ 非成员节点绝不入库、调度器也不会被 kick。
+   * 判据同源 {@link assertMember}（`machineId === null`：任一成员机器声明即可）。
+   */
+  const config = loadMachines();
+  if (!config.ok) {
+    return { ok: false, code: "machines_config_error", error: config.error, contextId };
+  }
+  const denied = assertMember(null, projectId, config.group);
+  if (denied !== null) {
+    return { ok: false, code: denied.code, error: denied.error, contextId };
+  }
   const localTaskId = randomUUID();
   const deps = dependencies.length > 0 ? Array.from(new Set(dependencies)) : null;
   const inputRefs = inputs !== undefined && inputs.length > 0 ? Array.from(inputs) : null;
@@ -1455,7 +1630,12 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
 
   const sent = await dispatchTask(node.projectId, message, node.contextId, true);
   if (!sent.ok) {
-    return { ok: false, error: sent.error };
+    /**
+     * `FeatureDispatchResult` 只有 `error`（无 `code`）—— 守住 `scheduler.ts` **零改动**的前提下，
+     * 把错误码嵌进错误字符串（如 `[project_not_a_member] …`），保证非成员等结构化失败码在
+     * 失败传播 / Feature failed 原因 / 日志里**不丢失**（v0.6.0 §3.1-N2）。
+     */
+    return { ok: false, error: `[${sent.code}] ${sent.error}` };
   }
   if (sent.kind === "message") {
     updateTaskState(node.taskId, "completed", null, sent.text);
@@ -1582,7 +1762,14 @@ function refreshProjectsSnapshotLazily(): void {
         projectsSnapshot.error = "probe_unavailable";
         return;
       }
-      const listed = await Promise.all(config.machines.map((m) => listMachineProjects(m)));
+      /**
+       * 只遍历**成员机器**（v0.6.0 §2.2）：必须与 `locateProject` 同时施加，否则出现
+       * 「定位得到、快照没有」的双份判据（`probeProjectReady` 会因无快照而 `ready=false`）。
+       */
+      const targets = memberMachines(config.machines, config.group);
+      const listed = await Promise.all(
+        targets.map((m) => listMachineProjects(m, config.group)),
+      );
       let firstError: string | null = null;
       for (const result of listed) {
         if (result.ok) {
@@ -1886,12 +2073,39 @@ async function handleCancel(taskId: string): Promise<CancelOutcome> {
   }
 }
 
+/**
+ * `a2a_projects` 出参的 `group` 视图（v0.6.0 §2.3-I5：**恒存在**、不省略字段）。
+ * `selective: false` 可消除「空 `memberMachines` 被误读为零成员」的风险。
+ */
+interface GroupView {
+  /** 项目组名；未配置 / 未命名 ⇒ `null`（**不省略字段**） */
+  name: string | null;
+  /** 是否选择性连接（`false` = 全量接纳 = 旧配置语义） */
+  selective: boolean;
+  /**
+   * **配置声明的**成员机器集合（含当前不可达者 —— **不是**运行时在线集合）；
+   * `selective: false` ⇒ `[]`。顺序 = 配置 `members[]` 首次出现序。
+   */
+  memberMachines: string[];
+}
+
 interface MachinesView {
   machines: Array<{
     machineId: string;
     projects: ProjectStatus[];
     error?: string;
   }>;
+  /** 项目组视图（v0.6.0；**恒存在**） */
+  group: GroupView;
+}
+
+/** 项目组 → 出参视图（`memberMachineIds` 由 `members[]` 派生，Set 去重保序 ⇒ 即声明集合） */
+function groupView(group: ProjectGroup): GroupView {
+  return {
+    name: group.name,
+    selective: group.selective,
+    memberMachines: Array.from(group.memberMachineIds),
+  };
 }
 
 async function handleProjects(): Promise<MachinesView | Failure> {
@@ -1899,16 +2113,22 @@ async function handleProjects(): Promise<MachinesView | Failure> {
   if (!config.ok) {
     return { ok: false, code: "machines_config_error", error: config.error };
   }
+  /**
+   * 只遍历**成员机器**（v0.6.0 §2.2）：**无成员的机器整条消失（含其 `error` 条目）** ——
+   * 既不 `GET /projects`（不主动连），也不在出参里留占位。每机只列成员由
+   * `listMachineProjects(machine, group)` 单点过滤保证。
+   */
+  const targets = memberMachines(config.machines, config.group);
   const entries = await Promise.all(
-    config.machines.map(async (machine) => {
-      const listed = await listMachineProjects(machine);
+    targets.map(async (machine) => {
+      const listed = await listMachineProjects(machine, config.group);
       if (listed.ok) {
         return { machineId: machine.machineId, projects: listed.projects };
       }
       return { machineId: machine.machineId, projects: [], error: listed.error };
     }),
   );
-  return { machines: entries };
+  return { machines: entries, group: groupView(config.group) };
 }
 
 interface TasksView {
@@ -2636,7 +2856,31 @@ function shutdown(): void {
 process.on("SIGINT", shutdown);
 process.on("SIGTERM", shutdown);
 
-main().catch((err: unknown) => {
-  console.error(`[a2a-bridge] fatal: ${toMessage(err)}`);
-  process.exit(1);
-});
+/**
+ * 本模块是否被 node **作为入口脚本直接执行**（v0.6.0 §3.1-N2）。
+ *
+ * 为什么需要：单测要驱动 `createCore()` 的领域入口（成员判据 / 缓存不绕过 / 出站请求计数），
+ * 而本模块顶层 `main()` 会**拉起整座桥**（core 租约 / DB / 传输面）⇒「import 即产生副作用」
+ * 使 `bridge/index.ts` 不可被单测 import（`test/web.test.ts` 已书面记录该限制）。
+ * 判定式只比较 `process.argv[1]` 与 `import.meta.url`：三种真实启动路径
+ * （`orch/opencode.json.example` 的 `node …/dist/bridge/index.js`、`bridgectl.mjs` 的 spawn、
+ * `npm run bridge`）的 `argv[1]` 都指向本文件 ⇒ 判定恒为真，**生产行为零变化**；
+ * 仅「被 import」时不再自动启动。
+ */
+function isEntryModule(): boolean {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  const self = fileURLToPath(import.meta.url);
+  const target = resolve(entry);
+  // Windows 路径大小写不敏感（盘符 / 路径段大小写可能不同）⇒ 折半比较
+  return process.platform === "win32"
+    ? self.toLowerCase() === target.toLowerCase()
+    : self === target;
+}
+
+if (isEntryModule()) {
+  main().catch((err: unknown) => {
+    console.error(`[a2a-bridge] fatal: ${toMessage(err)}`);
+    process.exit(1);
+  });
+}

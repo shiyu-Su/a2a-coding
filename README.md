@@ -73,6 +73,7 @@ flowchart TD
 - ✅ **每机常驻 Launcher**：管理本机项目 Agent 生命周期，暴露 `health` / `projects` / `ensure` / `stop` 接口。
 - ✅ **按需幂等启动**：派发任务才 `ensure`，已在运行直接复用同一 A2A 端点，不重复拉起。
 - ✅ **泛型 MCP 工具面**：orch 只经 `a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` / `a2a_events` / `a2a_wait` 通信，agent 增减无需重连或刷新工具面。其中 **`a2a_call` 的 `mode` 必填**（`"inquiry"` 只读询问 / `"execute"` 执行型派发，后者必带 `featureId`）—— **保证"执行必走引擎"**。
+- ✅ **项目组与选择性连接（v0.6.0）**：orch 侧可声明**静态项目组**（`orch/config/config.json` 的 `projectGroup.members`，成员 = `machineId × projectId`）。声明后 orch **只连「有成员的机器」、只用「列名成员的项目」** —— 未列成员的项目**不 ensure、不派发、不出现在 `a2a_projects`**；派发到非成员会**显式失败**（`project_not_a_member`，与「项目不存在」的 `project_not_found` 分开）。**段缺省时行为与旧版完全一致（全量接纳）**。`a2a_projects` 出参新增 `group` 字段（**恒存在**）。**machine 侧零改动、线协议不动、架构约束不变。**
 - ✅ **Feature 编排**：把一个需求作为 Feature，经状态机 + 拓扑并行 Task DAG 调度器跨项目自动派发，中途可停下审批 / 澄清；上游失败向下游传播 `blocked`，不带病继续。
 - ✅ **会话映射持久化**：`contextId ↔ sessionId` 落 SQLite（`node:sqlite`），两侧进程重启均不丢。
 - ✅ **任务态回传与兜底找回**：任务态与结果落库；丢失 `taskId` 句柄可用 `a2a_tasks` 找回。
@@ -260,7 +261,7 @@ node flow/install/uninstall.mjs --target <项目根>
 |------|------|--------|------|
 | `machineId` | 机器标识，需与 orch 机器清单一致 | - | 是 |
 | `launcher.port` | Launcher 监听端口 | - | 是 |
-| `launcher.idleStopMs` | 空闲回收时长（毫秒），项目 Agent 超过该时长没有 `ensure` 调用就自动 `stop`；`0` 或负值表示禁用 | `300000` | 否 |
+| `launcher.idleStopMs` | 空闲回收时长（毫秒），项目 Agent 超过该时长没有 `ensure` 调用就自动 `stop`；`0` 或负值表示禁用。**（v0.6.0 起）若该机项目被列为 orch 项目组成员，推荐保持 `> 0`**：成员被移出后 orch 不再 `ensure`，靠空闲回收自动收回已拉起的 agent；设为 `0`（禁用回收）时该 agent **可能长期驻留**，需人工 `POST {launcherUrl}/projects/{projectId}/stop`（注意 `launcherctl.mjs` **不含**单项目 stop）。启动日志可直接辨识：`[launcher] idleStopMs=disabled` | `300000` | 否 |
 | `launcher.startupCheck` | 启动自检开关，`false` 跳过自检直接进入服务 | `true` | 否 |
 | `launcher.startupCheckTimeoutMs` | 每个项目自检的总超时（毫秒） | `120000` | 否 |
 | `launcher.startupCheckPrompt` | 自检 prompt | `Reply with exactly: OK` | 否 |
@@ -315,6 +316,7 @@ orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自
 | `machines[].machineId` | 机器标识，需与本机 Launcher 配置一致 | - | 是 |
 | `machines[].launcherUrl` | 该机 Launcher 地址（如 `http://localhost:3100`） | - | 是 |
 | `machines[].pushCallback` | 按机 opt-in：允许该机 worker 向 orch 回调端点推送状态变化（需配合 `callback` 与项目 `agentConfig.agentCard.pushNotifications`） | `false` | 否 |
+| `projectGroup` | **v0.6.0**：静态「项目组」—— `{ name?: string, members: [{ machineId, projectId }] }`。声明后 orch **只连有成员的机器、只用列名成员的项目**（未列成员不 ensure / 不派发 / 不展示）；`members` **不得为空数组**；`machineId` 必须存在于 `machines[]`（否则本段 **fail-fast**，桥整体拒绝派发）。**段缺省 = 全量接纳**（与旧版行为一致） | 不设置（全量接纳） | 否 |
 | `callback.enabled` | 开启 orch HTTP 事件端点（`POST /callback`），接收 worker push；**默认关**，仅同机 / 受信网络 opt-in | `false` | 否 |
 | `callback.host` | 事件端点绑定地址（建议 loopback） | `127.0.0.1` | 否 |
 | `callback.port` | 事件端点监听端口 | - | `callback.enabled=true` 时是 |
@@ -411,7 +413,7 @@ Bridge ⇄ Launcher 的线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单�
 
 #### 泛型工具（7 个）
 
-- `a2a_projects()`：列出所有已配置机器及其本机项目（含运行态与 A2A 端点）。
+- `a2a_projects()`：列出**项目组成员**（未配置 `projectGroup` 时列出全部），含运行态与 A2A 端点。出参含 `group`（**恒存在**）：`{ name: string | null, selective: boolean, memberMachines: string[] }` —— `memberMachines` = **配置声明的成员机器集合**（**非**运行时在线集合）；`selective: false` = 未配置项目组（全量接纳）。**无成员的机器整条不出现（含其 `error` 条目）。**
 - `a2a_call(project, message, mode, contextId?, wait?, featureId?, dependencies?, inputs?)`：解析项目到机器，幂等 ensure。**`mode` 必填**：`"inquiry"` = 只读询问/核实（**不得带 `featureId`**）⇒ 立即派发；`"execute"` = 执行型派发（**必带 `featureId`**）⇒ 登记 Feature 队列节点，由调度器派发。默认半异步：≤30s 完成直接返回文本结果与 artifacts，更长返回 `working + taskId` 并用 `a2a_task_status` 轮询；`wait=false` 时永远立即返回 `working + taskId + contextId`（不进入同步轮询，后台看护照常落库）。
 - `a2a_task_status(taskId)`：查询任务态并回写本地任务存储。已终结任务（completed / failed / input-required）由桥本地存档直接作答（不唤醒远端 Agent）；未终结任务走远端实时查询。
 - `a2a_tasks(project, [state], [limit])`：按项目列出本地任务记录（默认 `updatedAt` 倒序、默认 20 条、最多 100），每条含 `prompt` 片段 / state / text / contextId / updatedAt / stale。用于丢失 `taskId` 句柄后的兜底找回。
