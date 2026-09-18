@@ -77,8 +77,8 @@ import {
   listEvents,
   listTasks,
   markTaskDispatched,
+  markTaskDispatchStarted,
   pruneTasks,
-  setTaskNotBefore,
   truncatePrompt,
   updateTaskState,
   upsertArtifact,
@@ -86,25 +86,20 @@ import {
 } from "../session/store.js";
 import { bridgeLog } from "./bridge-log.js";
 import {
-  EVIDENCE_ARTIFACT_NAME,
-  artifactSummaryText,
-  buildEvidenceMessage,
-  parseEvidenceResult,
-} from "./evidence-message.js";
-import {
   isTaskWatched,
   notifyTaskPush,
   startTaskWatcher,
   WATCHER_MAX_CONSECUTIVE_FAILURES,
 } from "./task-watcher.js";
+/**
+ * 任务 id 双向解析（v0.6.1 REQ-05 §2.5 白捡 / A5-5）——
+ * 从本模块抽出为 `task-lookup.ts`（单一事实源；避免进程入口模块被单测整座拉起）。
+ */
+import { registerRemoteTask, resolveLocalTaskId, resolveTaskLookup } from "./task-lookup.js";
 import {
-  EVIDENCE_EVENT_KIND,
-  EVIDENCE_POLL_MS,
   FEATURE_ABANDONED_TEXT,
   FeatureScheduler,
   isLocalTerminalTask,
-  markEvidenceMessage,
-  type EvidenceResult,
   type FeatureDispatchResult,
 } from "./scheduler.js";
 import {
@@ -114,6 +109,7 @@ import {
   handleFeatureCreate,
   handleFeatureStatus,
   type FeatureAdvanceArgs,
+  type FeatureAdvanceSuccess,
   type FeatureApproveArgs,
   type FeatureCancelArgs,
   type FeatureCreateArgs,
@@ -622,7 +618,6 @@ async function locateProject(projectId: string): Promise<LocateResult> {
         if (listed.ok) {
           const project = listed.projects.find((p) => p.projectId === projectId);
           if (project !== undefined) {
-            rememberProjectStatus(project); // 顺带预热取证快照（免额外 HTTP）
             return { ok: true, machine, project };
           }
         }
@@ -664,10 +659,9 @@ async function locateProject(projectId: string): Promise<LocateResult> {
     const project = listed.projects.find((p) => p.projectId === projectId);
     if (project === undefined) continue;
     // ③ 只对成员入缓存 / 只把成员当命中（`listMachineProjects` 已过滤；此处再判一次 = 显式落点，
-    //    防未来有人绕过该过滤时静默污染缓存与快照）
+    //    防未来有人绕过该过滤时静默污染缓存）
     if (!isMemberProject(machine.machineId, projectId, group)) continue;
     projectIndex.set(projectId, machine.machineId);
-    rememberProjectStatus(project); // 顺带预热取证快照（免额外 HTTP）
     return { ok: true, machine, project };
   }
   if (protocolRefusals.length > 0) {
@@ -935,18 +929,6 @@ function taskText(task: Task): string {
   return artifactChunks.join("\n\n");
 }
 
-/**
- * 本地记录是否已终结（终结态结果由本地存档直接作答，不再查询远端）。
- * `blocked` 为 orch 本地专属终态（v0.4.0 失败传播，不映射 A2A）：被阻塞节点不会再派发，
- * 直接以本地存档作答，避免误查远端。
- *
- * v0.4.1：**委托** `scheduler.isLocalTerminalTask(node)`，消除「双份判据」——
- * 该判定是中性化的第 5 处，须认 `exhausted`（节点级谓词，scheduler 为单一事实源）。
- */
-function isLocalTerminalState(node: TaskRecord): boolean {
-  return isLocalTerminalTask(node);
-}
-
 /** 从本地存档的 artifactsJson（ArtifactSummary[]）拼接文本；规则对齐 partsToText/taskText，兼容无 text 的旧记录 */
 function textFromArchivedArtifacts(artifactsJson: string | null): string {
   if (artifactsJson === null) return "";
@@ -1185,6 +1167,11 @@ async function dispatchTask(
   text: string,
   contextId: string,
   wait: boolean,
+  /**
+   * **C11 先占位后发**（v0.6.1 REQ-05 §2.5 白捡，可选）：在 `message/send` **之前**同步执行。
+   * 仅 Feature 节点派发注入（`markTaskDispatchStarted`）；独立 `inquiry` 路径不传 ⇒ 零行为变化。
+   */
+  onBeforeSend?: () => void,
 ): Promise<DispatchOutcome> {
   /**
    * 派发前置断言（v0.6.0 §2.2）：**零 I/O 早失败** —— `inquiry` 路径在未被选中时
@@ -1221,6 +1208,17 @@ async function dispatchTask(
   }
 
   let result: SendMessageResult;
+  /**
+   * **C11 先占位后发**：占位必须落在 `sendMessage` **紧前** —— 令「占位窗口」恰为 send 本身，
+   * 把「占位已写但从未发出」的误判面压到最小（`locateProject` / `ensureProject` /
+   * `createA2AClient` 的失败都不写占位 ⇒ 那些失败重启后仍可安全重派）。
+   * 占位写入失败**不阻断**发送（降级为旧行为），仅记日志。
+   */
+  try {
+    onBeforeSend?.();
+  } catch (err) {
+    console.error(`[a2a-bridge] 派发占位写入失败（继续发送，崩溃窗口保护降级）：${toMessage(err)}`);
+  }
   try {
     result = await client.sendMessage(
       buildSendRequest(text, contextId, pushCallbackFor(located.machine)),
@@ -1609,11 +1607,10 @@ function registerFeatureNode(
 }
 
 /**
- * 远端 A2A 任务 id → 本地 Feature 节点 id（v0.4.0 §2.6 回调回写用）。
- * 回调只携带远端 id，而 Feature 节点本地 id 与远端不同（独立任务二者相同）；
- * 进程内映射，桥重启后靠轮询对账兜底（推送配置本身亦为 worker 端 in-memory）。
+ * 远端 A2A 任务 id → 本地 Feature 节点 id 的映射与反查已抽到 `./task-lookup.js`
+ * （v0.6.1 REQ-05 §2.5 白捡 / A5-5）：派发回填处调用 {@link registerRemoteTask}，
+ * 推送回写 / 工具反查统一走 `resolveLocalTaskId` / `resolveTaskLookup`。
  */
-const remoteTaskIndex = new Map<string, string>();
 
 /**
  * 调度器注入的节点派发：派发前注入 Feature Context（plan/decisions/contracts）与已完成上游
@@ -1628,7 +1625,12 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
   const feature = getFeature(featureId);
   const message = buildNodeDispatchMessage(node, feature);
 
-  const sent = await dispatchTask(node.projectId, message, node.contextId, true);
+  // v0.6.1 REQ-05 §2.5 白捡（C11）：**先占位后发** —— `message/send` 前写「已发出」占位
+  // （`dispatch_guard`），send 返回后由下方 `markTaskDispatched` 回填真实远端 id。
+  // 崩溃点落在两者之间 ⇒ 重启按「占位已写、远端未知」保守收敛（不自动重派，防双派）。
+  const sent = await dispatchTask(node.projectId, message, node.contextId, true, () =>
+    void markTaskDispatchStarted(node.taskId),
+  );
   if (!sent.ok) {
     /**
      * `FeatureDispatchResult` 只有 `error`（无 `code`）—— 守住 `scheduler.ts` **零改动**的前提下，
@@ -1646,7 +1648,7 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
   const remoteTaskId = task.id;
   const state = mapTaskState(taskStateOf(task));
   // 回调回写映射：远端 id → 本地节点 id（推送只带远端 id）
-  remoteTaskIndex.set(remoteTaskId, node.taskId);
+  registerRemoteTask(remoteTaskId, node.taskId);
 
   // 远端已终态：登记产物 + 直接落库
   if (terminalOrInterrupted(taskStateOf(task))) {
@@ -1707,221 +1709,9 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
   return { ok: true };
 }
 
-// ---------------------------------------------------------------------------
-// v0.4.1 取证流：`/projects` 快照 + 取证结论解析（§2.5 硬路径 / §2.3 ③④）
-// ---------------------------------------------------------------------------
-
-/** `/projects` 快照状态（**非阻塞**：探针只读快照，刷新为 fire-and-forget 惰性触发） */
-interface ProjectsSnapshotState {
-  byProject: Map<string, ProjectStatus>;
-  /** 最近一次刷新完成时刻（成功或失败都记，用于节流） */
-  refreshedAt: number;
-  /** 最近一次刷新失败的原因（仅供 reason 留痕；四种失败一律 `ready=false`） */
-  error: string | null;
-  inFlight: boolean;
-}
-
-const projectsSnapshot: ProjectsSnapshotState = {
-  byProject: new Map<string, ProjectStatus>(),
-  refreshedAt: 0,
-  error: null,
-  inFlight: false,
-};
-
-/**
- * 把项目状态顺带记进快照。**由 `locateProject` 在命中项目时调用**：
- * 派发/查询路径本就已经拿到 `ProjectStatus`，顺带落快照 ⇒ 探针免掉一次额外 HTTP，
- * 也让 `workspace` 在**第一次**登记取证节点时就是真值（而非退化为 cwd 表述）。
- */
-function rememberProjectStatus(project: ProjectStatus): void {
-  projectsSnapshot.byProject.set(project.projectId, project);
-}
-
-/** 把 `/projects` 失败文本归类为 reason（除 `offline` 外四者一律 `ready=false`，此处只为留痕） */
-function classifyProbeError(error: string): string {
-  if (error.includes("503")) return "503";
-  if (error.toLowerCase().includes("starting")) return "starting";
-  return "unreachable";
-}
-
-/**
- * **惰性刷新** `/projects` 快照（**fire-and-forget，绝不 `await`**）。
- *
- * - 最短刷新间隔 `EVIDENCE_POLL_MS`（与门同频；`inFlight` 防重入）；
- * - **不新增定时器**：由 tick 侧探针调用触发，不引入第二套生命周期；
- * - 无论成败都记 `refreshedAt` ⇒ 失败时不会每 tick 重打。
- */
-function refreshProjectsSnapshotLazily(): void {
-  if (projectsSnapshot.inFlight) return;
-  if (Date.now() - projectsSnapshot.refreshedAt < EVIDENCE_POLL_MS) return;
-  projectsSnapshot.inFlight = true;
-  void (async () => {
-    try {
-      const config = loadMachines();
-      if (!config.ok) {
-        projectsSnapshot.error = "probe_unavailable";
-        return;
-      }
-      /**
-       * 只遍历**成员机器**（v0.6.0 §2.2）：必须与 `locateProject` 同时施加，否则出现
-       * 「定位得到、快照没有」的双份判据（`probeProjectReady` 会因无快照而 `ready=false`）。
-       */
-      const targets = memberMachines(config.machines, config.group);
-      const listed = await Promise.all(
-        targets.map((m) => listMachineProjects(m, config.group)),
-      );
-      let firstError: string | null = null;
-      for (const result of listed) {
-        if (result.ok) {
-          for (const p of result.projects) rememberProjectStatus(p);
-        } else if (firstError === null) {
-          firstError = classifyProbeError(result.error);
-        }
-      }
-      projectsSnapshot.error = firstError;
-    } catch (err) {
-      projectsSnapshot.error = "unreachable";
-      bridgeLog.error("a2a-bridge", `取证探针刷新 /projects 失败：${toMessage(err)}`);
-    } finally {
-      projectsSnapshot.refreshedAt = Date.now();
-      projectsSnapshot.inFlight = false;
-    }
-  })();
-}
-
-/**
- * `probeProjectReady` 实现（注入 `FeatureScheduler`，§2.5 硬路径）。
- *
- * `ready = 该 project 的 status !== "online"` —— **线协议字段是 `status`（`online`/`offline`），
- * 没有 `running` 字段**（见 `PROTOCOL.md` / `parseProjectStatus`）。
- * `503` / `starting` / 不可达 / 无快照 ⇒ `ready=false`（由 `reason` 区分，仅留痕）。
- *
- * **同步返回**：只读快照 + 惰性触发刷新，回调内**不 `await`**（否则 10min 的门会拖住 tick 推进）。
- */
-function probeProjectReady(projectId: string): { ready: boolean; reason: string } {
-  refreshProjectsSnapshotLazily();
-  const status = projectsSnapshot.byProject.get(projectId);
-  if (status === undefined) {
-    return { ready: false, reason: projectsSnapshot.error ?? "probe_unavailable" };
-  }
-  if (status.status !== "online") return { ready: true, reason: "offline" };
-  return { ready: false, reason: "online" };
-}
-
-/**
- * `resolveEvidence` 实现（注入 `FeatureScheduler`，§2.5 → §2.3 ④）。
- *
- * 取证结论的解析来源（按优先级）：
- * 1. 该任务**归档产物摘要**里的 `evidence.json`（`tasks.artifacts_json`）——
- *    **这是唯一真正带内容的地方**：`artifacts` 表只存 `name/mime/uri/size`（无内容列）；
- * 2. 该任务全部归档产物文本（worker 未按建议命名时）；
- * 3. `artifacts` 表中名字命中的行（`uri` 恰为内联 JSON 时）。
- *
- * 解析成功 ⇒ 写 `parsed` **转折点**事件（只写一次，不是每轮询）；**失败 / 缺失 ⇒ `null`**
- * ⇒ 调度器按「无证据」交人（fail-safe）。
- */
-function resolveEvidence(evidenceTaskId: string): EvidenceResult | null {
-  const task = getTask(evidenceTaskId);
-  if (task === null) return null;
-
-  const archived = parseArchivedArtifacts(task.artifactsJson);
-  const named = archived.find((a) => a.name === EVIDENCE_ARTIFACT_NAME);
-  const candidates: string[] = [];
-  if (named !== undefined) candidates.push(artifactSummaryText(named));
-  candidates.push(textFromArchivedArtifacts(task.artifactsJson));
-  for (const rec of listArtifactsByProducer(evidenceTaskId, 50)) {
-    if (rec.name === EVIDENCE_ARTIFACT_NAME && rec.uri !== null) candidates.push(rec.uri);
-  }
-
-  for (const text of candidates) {
-    if (text.length === 0) continue;
-    const evidence = parseEvidenceResult(text);
-    if (evidence === null) continue;
-    appendEvent({
-      featureId: task.featureId,
-      taskId: evidenceTaskId,
-      kind: EVIDENCE_EVENT_KIND,
-      state: null,
-      payload: JSON.stringify({
-        phase: "parsed",
-        projectId: task.projectId,
-        stable: evidence.stable,
-        gatesOk: evidence.gatesOk,
-        dCount: evidence.d.length,
-        rCount: evidence.r.length,
-      }),
-    });
-    return evidence;
-  }
-  bridgeLog.error(
-    "a2a-bridge",
-    `取证结论解析失败（节点 ${evidenceTaskId}）：未取到可解析的 ${EVIDENCE_ARTIFACT_NAME}`,
-  );
-  return null;
-}
-
-/**
- * 取证节点登记（v0.4.1 §2.3 ② / §2.5）—— 注入 `FeatureScheduler.registerEvidenceNode`。
- *
- * 调用时机由调度器保证：`infra` 失败节点**已中性化**（`exhausted=1`）之后才调用，
- * 故此处只需「建节点 + 打角色标记 + 设初始挡板」。
- *
- * 要点：
- * - **新 `contextId`**（`randomUUID()`）：不继承失败节点的会话 ⇒ 与旧 turn 无共享状态，
- *   是**客观第三方**；失败节点若仍在通过超时 turn 写盘，也不会污染本次取证；
- * - **角色标记随消息持久化**（`markEvidenceMessage`）⇒ 桥重启后仍可被 `isEvidenceNode` 识别
- *   （内存态标记会丢，这正是 §4.1.8 要「消息带角色标记」的原因）；
- * - **自包含消息**（nonce / project / workspace / In-Scope / 命令 / 软校验口径 / 输出格式），
- *   模板见 `bridge/evidence-message.ts`；
- * - **初始持久化挡板** `not_before = now + EVIDENCE_POLL_MS`：即使本轮 tick 立刻跑，
- *   取证节点也不会在等回收门判定之前被派出去（后续由 O3b 的门续挡 / 放行）；
- * - **不调用 `scheduler.kick()`**：登记发生在看护回调路径上，下一个 tick（≤1.5s）自然会处理；
- *   初始挡板已保证不会被抢跑。
- */
-function registerEvidenceNode(featureId: string, failedTaskId: string): void {
-  const failed = getTask(failedTaskId);
-  if (failed === null) {
-    bridgeLog.error("a2a-bridge", `取证节点登记失败：未知失败节点 ${failedTaskId}`);
-    return;
-  }
-  const feature = getFeature(featureId);
-  const nonce = randomUUID();
-  const message = markEvidenceMessage(
-    buildEvidenceMessage({
-      projectId: failed.projectId,
-      // 真值优先取自快照（`locateProject` 已顺带写入）⇒ 消息带**真实 workspace**；
-      // 尚未预热时（极少）退化为模板的「cwd 即 workspace」表述。
-      workspace: projectsSnapshot.byProject.get(failed.projectId)?.workspace ?? null,
-      featureId,
-      plan: feature?.plan ?? null,
-      nonce,
-      sampleGapSec: Math.max(1, Math.round(EVIDENCE_POLL_MS / 1000)),
-    }),
-  );
-  const localTaskId = randomUUID();
-  createTask({
-    taskId: localTaskId,
-    projectId: failed.projectId,
-    // 新 ctx：取证节点**不继承**失败节点的会话（客观第三方；也避免与旧 turn 共享状态）
-    contextId: randomUUID(),
-    state: "working",
-    prompt: message,
-    featureId,
-    dispatchMessage: message,
-  });
-  setTaskNotBefore(localTaskId, new Date(Date.now() + EVIDENCE_POLL_MS).toISOString());
-  bridgeLog.info(
-    "a2a-bridge",
-    `已登记取证节点 ${localTaskId}（feature=${featureId}，失败节点=${failedTaskId}，project=${failed.projectId}）`,
-  );
-}
-
 /** 进程级调度器（生命周期随桥进程；main() 启动循环 + 恢复） */
 const scheduler = new FeatureScheduler({
   dispatch: (node) => dispatchFeatureNode(node),
-  registerEvidenceNode: (featureId, failedTaskId) => registerEvidenceNode(featureId, failedTaskId),
-  probeProjectReady: (projectId) => probeProjectReady(projectId),
-  resolveEvidence: (evidenceTaskId) => resolveEvidence(evidenceTaskId),
 });
 
 interface TaskStatusSuccess {
@@ -1936,22 +1726,29 @@ interface TaskStatusSuccess {
 type TaskStatusOutcome = TaskStatusSuccess | (Failure & { task?: TaskRecord });
 
 async function handleTaskStatus(taskId: string): Promise<TaskStatusOutcome> {
-  const record = getTask(taskId);
-  if (record === null) {
+  /**
+   * **A5-5 反查**（v0.6.1 REQ-05 §2.5 白捡）：解析（本地 id 优先，MISS 时经远端映射反查）
+   * ⇒ 拿到 `record`（本地记录）与 `remoteId`（**远端调用必须用的 id**）。
+   * Feature 节点本地 id ≠ 远端 id，旧实现直接拿入参查远端 ⇒ 恒 404。
+   */
+  const lookup = resolveTaskLookup(taskId);
+  if (lookup === null) {
     return {
       ok: false,
       code: "task_not_found",
       error: `未知任务 ${taskId}（本地任务存储无记录）`,
     };
   }
+  const { record, remoteId } = lookup;
+  const localTaskId = record.taskId;
 
   // 本地快路径：终结态结果是最终事实（落库时已 settle），直接以本地存档作答；
   // 不 ensure、不碰远端——远端任务态不持久化（agent 回收后重 ensure 是新进程，只会 Task not found）
-  if (isLocalTerminalState(record)) {
+  if (isLocalTerminalTask(record)) {
     const artifacts = parseArchivedArtifacts(record.artifactsJson);
     return {
       ok: true,
-      taskId,
+      taskId: localTaskId,
       status: record.state,
       text: record.text ?? textFromArchivedArtifacts(record.artifactsJson),
       artifacts,
@@ -1982,15 +1779,16 @@ async function handleTaskStatus(taskId: string): Promise<TaskStatusOutcome> {
 
   try {
     const task = await client.getTask(
-      { tenant: "", id: taskId, historyLength: undefined },
+      { tenant: "", id: remoteId, historyLength: undefined },
       { signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS) },
     );
     const status = mapTaskState(taskStateOf(task));
     const artifacts = summarizeArtifacts(task.artifacts);
-    updateTaskState(taskId, status, JSON.stringify(artifacts), taskText(task));
+    // 回写**本地**记录（远端 id 不是本地主键）
+    updateTaskState(localTaskId, status, JSON.stringify(artifacts), taskText(task));
     return {
       ok: true,
-      taskId,
+      taskId: localTaskId,
       status,
       text: taskText(task),
       artifacts,
@@ -2018,14 +1816,17 @@ type CancelOutcome =
   | (Failure & { task?: TaskRecord });
 
 async function handleCancel(taskId: string): Promise<CancelOutcome> {
-  const record = getTask(taskId);
-  if (record === null) {
+  // A5-5 反查（同 handleTaskStatus）：本地 id 优先，MISS 时经远端映射；远端调用用 remoteId
+  const lookup = resolveTaskLookup(taskId);
+  if (lookup === null) {
     return {
       ok: false,
       code: "task_not_found",
       error: `未知任务 ${taskId}（本地任务存储无记录）`,
     };
   }
+  const { record, remoteId } = lookup;
+  const localTaskId = record.taskId;
   const located = await locateProject(record.projectId);
   if (!located.ok) {
     return { ok: false, code: located.code, error: located.error, task: record };
@@ -2049,15 +1850,15 @@ async function handleCancel(taskId: string): Promise<CancelOutcome> {
 
   try {
     const task = await client.cancelTask(
-      { tenant: "", id: taskId, metadata: undefined },
+      { tenant: "", id: remoteId, metadata: undefined },
       { signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS) },
     );
     const status = mapTaskState(taskStateOf(task));
     const artifacts = summarizeArtifacts(task.artifacts);
-    updateTaskState(taskId, status, JSON.stringify(artifacts), taskText(task));
+    updateTaskState(localTaskId, status, JSON.stringify(artifacts), taskText(task));
     return {
       ok: true,
-      taskId,
+      taskId: localTaskId,
       status,
       text: taskText(task),
       artifacts,
@@ -2349,12 +2150,6 @@ function parsePushInfo(parsed: unknown): PushInfo {
   return { remoteTaskId: null, state: null };
 }
 
-/** 由远端 id 定位本地任务（独立任务 `taskId` 即远端 id；Feature 节点查进程内映射） */
-function resolveLocalTaskId(remoteOrLocalId: string): string | null {
-  if (getTask(remoteOrLocalId) !== null) return remoteOrLocalId;
-  return remoteTaskIndex.get(remoteOrLocalId) ?? null;
-}
-
 /**
  * 命中本地任务时回写任务态（推送仅作「提前感知」，完整 artifacts/text 由轮询对账补齐）。
  * 只采纳 `completed` / `input-required`（`working` 不提前改写；`blocked` 为本地专属）。
@@ -2377,7 +2172,7 @@ function applyPushedTaskState(localTaskId: string, a2aState: string): void {
   const mapped = mapTaskState(stateEnum);
   if (mapped !== "completed" && mapped !== "input-required") return;
   const current = getTask(localTaskId);
-  if (current === null || isLocalTerminalState(current)) return;
+  if (current === null || isLocalTerminalTask(current)) return;
   updateTaskState(localTaskId, mapped);
 }
 
@@ -2541,7 +2336,7 @@ export interface BridgeCore {
   wait(timeoutMs?: number): Promise<WaitOutcome>;
   featureCreate(args: FeatureCreateArgs): FeatureCreateSuccess | FeatureToolFailure;
   featureStatus(args: FeatureStatusArgs): FeatureStatusSuccess | FeatureToolFailure;
-  featureAdvance(args: FeatureAdvanceArgs): FeatureStateChangeSuccess | FeatureToolFailure;
+  featureAdvance(args: FeatureAdvanceArgs): FeatureAdvanceSuccess | FeatureToolFailure;
   featureApprove(args: FeatureApproveArgs): FeatureStateChangeSuccess | FeatureToolFailure;
   featureCancel(args: FeatureCancelArgs): FeatureStateChangeSuccess | FeatureToolFailure;
   /** 工具返回后统一 kick 调度器（Feature 工具组用） */

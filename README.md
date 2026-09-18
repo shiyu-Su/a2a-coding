@@ -74,14 +74,14 @@ flowchart TD
 - ✅ **按需幂等启动**：派发任务才 `ensure`，已在运行直接复用同一 A2A 端点，不重复拉起。
 - ✅ **泛型 MCP 工具面**：orch 只经 `a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` / `a2a_events` / `a2a_wait` 通信，agent 增减无需重连或刷新工具面。其中 **`a2a_call` 的 `mode` 必填**（`"inquiry"` 只读询问 / `"execute"` 执行型派发，后者必带 `featureId`）—— **保证"执行必走引擎"**。
 - ✅ **项目组与选择性连接（v0.6.0）**：orch 侧可声明**静态项目组**（`orch/config/config.json` 的 `projectGroup.members`，成员 = `machineId × projectId`）。声明后 orch **只连「有成员的机器」、只用「列名成员的项目」** —— 未列成员的项目**不 ensure、不派发、不出现在 `a2a_projects`**；派发到非成员会**显式失败**（`project_not_a_member`，与「项目不存在」的 `project_not_found` 分开）。**段缺省时行为与旧版完全一致（全量接纳）**。`a2a_projects` 出参新增 `group` 字段（**恒存在**）。**machine 侧零改动、线协议不动、架构约束不变。**
-- ✅ **Feature 编排**：把一个需求作为 Feature，经状态机 + 拓扑并行 Task DAG 调度器跨项目自动派发，中途可停下审批 / 澄清；上游失败向下游传播 `blocked`，不带病继续。
+- ✅ **Feature 编排**：把一个需求作为 Feature，经状态机 + Task DAG 调度器跨项目自动派发，中途可停下审批 / 澄清；**同 project 粒度串行**（同一时刻最多一个任务在写同一工作区）、跨 project 并行；**失败只冻结依赖闭包**（未派发的下游），不带病继续也不连坐其它 project。
 - ✅ **会话映射持久化**：`contextId ↔ sessionId` 落 SQLite（`node:sqlite`），两侧进程重启均不丢。
 - ✅ **任务态回传与兜底找回**：任务态与结果落库；丢失 `taskId` 句柄可用 `a2a_tasks` 找回。
 - ✅ **最小权限**：项目 `risk` 档位（`read` / `write` / `full`）映射到各端权限 / 沙箱参数。
 - ✅ **跨平台后台启停**：`launcherctl.mjs` 在 Windows / Linux / macOS 统一 start / stop / restart / status / logs。
 - ✅ **线协议版本化握手**：桥首触一台机器先握手校验主版本，不兼容即拒绝派发并给出升级指引。
 - ✅ **启动自检与空闲回收**：Launcher 启动时对全部项目跑真实最小任务自检；项目 Agent 空闲超时自动回收。
-- ✅ **失败自动化（v0.4.1）**：任务遇 `infra` 类失败（典型如 600s 超时）**不再直接判死** —— 引擎先把该节点**中性化**（下游不被连坐），再派**取证节点**（等目标 project 空闲回收后进场，确保无写者）读出「已改集 D / 未改集 R / 门禁 / 稳定位」，据此**同 `contextId` 续一次**或停下要人决策；全程由桥内代码推进，宿主无需轮询。
+- ✅ **失败上收与重派（v0.6.1）**：任务失败**不判死整单、不自动重试** —— 引擎只冻结其依赖闭包下游（`blocked`），把还能干的干完；收敛（无可派发 && 无在飞）且有失败 ⇒ Feature 保持 `executing` 自然**静止**，发一条 **`feature.failure_report`** 事件（账单 = 失败节点 `text`/`taskId`/`contextId` + 冻结集），宿主经 **`a2a_feature_advance(..., retryTaskIds?)`** 裁量重派（重派失败节点 + 自动解冻其下游）。**配套同 project 串行 + 静止期禁 `ensure`**（不顶掉空闲回收窗口）。
 - ✅ **孤儿进程回收（v0.4.1）**：Launcher 启动时**对账清理**进程账本里的无主孤儿 —— 这是唯一能修「孤儿占住 `a2aPort` ⇒ 新 Launcher 自检 `EADDRINUSE` ⇒ 服务起不来」的动作；另提供只读兜底 `npm run reap`（默认只列不杀，`--clean` 才清，红线：pidfile 存活一律禁清）。
 
 - ✅ **只读工作台（网页端）**：orch 侧常驻桥可另起一个**只读 HTTP 服务**（默认仅常驻形态、仅 `owner`、绑 `127.0.0.1`、端口 **3300**），以「当前宿主下的项目成员（含在线态）」+「任务引擎内的任务情况（Feature / Task 状态）」两面板呈现实时进度；数据只读自桥的 SQLite 与 Launcher `GET /projects`，**不改线协议、不做第二编排入口**。
@@ -201,9 +201,12 @@ a2a_call(project="machine", message="…", mode="execute", featureId="<id>")
 # 2) 用户确认方案后放行：approve = 记录已发生的用户确认（一对一，不可预领/不可补领）
 a2a_feature_approve(featureId="<id>")
 #    ⚠️ 不能再用 a2a_feature_advance(to="executing") 绕门 —— 会被拒（feature_approval_required）
-# 3) 桥内 Task DAG 调度器按 dependencies 拓扑派发（同层并行）
+# 3) 桥内 Task DAG 调度器按 dependencies 拓扑派发（同 project 串行、跨 project 并行）
 # 4) 任务需澄清时 Feature 停 needs_input，补齐答案续推（局部澄清；整案回炉需 cancel + 新建）
 a2a_feature_advance(featureId="<id>", to="executing", answer="…")
+# 5) 任务失败时 Feature 停在 executing 静止（a2a_events 收 feature.failure_report 账单一次），
+#    宿主裁量后重派失败节点（同时自动解冻其被冻下游；同 contextId 续接）
+a2a_feature_advance(featureId="<id>", retryTaskIds=["<失败节点 taskId>"])
 ```
 
 **主链为 6 态**：`waiting_approval → executing → integrating → testing → reviewing → completed`（Step 0/1 由宿主驱动、**引擎不参与**）。
@@ -423,11 +426,11 @@ Bridge ⇄ Launcher 的线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单�
 
 #### Feature 工具组（5 个）
 
-把一个需求作为 Feature 编排：`a2a_feature_create` 建 Feature → orch 组织各项目分析、汇总方案 → `a2a_feature_advance` 推进到 `waiting_approval` 停下 → 用户 `a2a_feature_approve` 放行 → 桥内 Task DAG 调度器（**同层拓扑并行** + 失败传播）按 `dependencies` 自动派发各项目任务并推进至完成；任务需澄清时 Feature 停 `needs_input`，`a2a_feature_advance(..., answer=…)` 续推。
+把一个需求作为 Feature 编排：`a2a_feature_create` 建 Feature → orch 组织各项目分析、汇总方案 → `a2a_feature_advance` 推进到 `waiting_approval` 停下 → 用户 `a2a_feature_approve` 放行 → 桥内 Task DAG 调度器（**同 project 串行、跨 project 并行**）按 `dependencies` 自动派发各项目任务并推进至完成；任务需澄清时 Feature 停 `needs_input`，`a2a_feature_advance(..., answer=…)` 续推；**任务失败时** Feature 保持 `executing` 静止（`a2a_events` 发一次 `feature.failure_report` 账单），宿主 `a2a_feature_advance(..., retryTaskIds=[…])` 重派并解冻。
 
 - `a2a_feature_create(title, requirement?, contextId?)`：新建 Feature，**初态即 `waiting_approval`**（= 改造文档确认门停靠点，**引擎只做需求实现**），返回 `featureId`。
 - `a2a_feature_status(featureId?)`：查看 Feature 详情 / 列表（state + tasks 摘要，含 `failureKind` / `retryCount`）。
-- `a2a_feature_advance(featureId, to, note?, answer?)`：推进状态机主链（校验合法后继，非法流转被拒）；**`to="executing"` 在 `waiting_approval` 会被拒**（`feature_approval_required`，请用 `approve`）；`answer` 用于 `needs_input` 补齐后续推。
+- `a2a_feature_advance(featureId, to, note?, answer?, retryTaskIds?)`：推进状态机主链（校验合法后继，非法流转被拒）；**`to="executing"` 在 `waiting_approval` 会被拒**（`feature_approval_required`，请用 `approve`）；`answer` 用于 `needs_input` 补齐后续推；**`retryTaskIds`（v0.6.1）用于失败重派**（仅静止失败场景：重派指定未处置 `failed` 节点并自动解冻其被冻下游；不传/非法/与 `answer` 同传 ⇒ 结构化错误拒绝且 Feature 态不变）。
 - `a2a_feature_approve(featureId)`：**唯一准入**——`waiting_approval → executing`。语义 = **记录已发生的用户确认（一对一映射：不可预领、不可补领）**：宿主在收到用户确认后**立即**调用，**不是新增一次用户决策**；禁止在用户未确认方案前调用。
 - `a2a_feature_cancel(featureId)`：任意非终态 → `cancelled`（**执行中途"方案整体回炉"只能走这条**：主链无回边）。
 

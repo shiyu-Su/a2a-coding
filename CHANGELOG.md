@@ -2,6 +2,44 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+# Changelog
+
+本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+
+## [v0.6.1] - 2026-09-18
+
+> 主题：**编排引擎失败上收与项目串行**（REQ-v0.6.1-2026-09-17-05）。**删除失败自动化五层自愈机制**（失败分类 / 中性化 / 取证流 / 自动重试 / D5 硬闸），改为**失败隔离 + 静止收敛 + 账单交宿主**：失败只冻结依赖闭包下游（在飞不动），Feature 不再因业务失败判死（`failed` 退化为 DAG 结构非法 fail-fast 专用）；失败收敛 = **`executing` 自然静止** + **新事件 `feature.failure_report`**（账单含 failed 列表 / 错误文本 / contextId / blockedSet），重派 = **`a2a_feature_advance(..., retryTaskIds?)`**（重派指定 failed 节点 + 解冻其被冻下游；不加状态机自环、与 `answer` 互斥、已派发被冻节点解冻不清 `remoteTaskId` 防双派）。**同 project 粒度串行**（同 project 同一时刻最多 1 个任务在写；跨 project 保持并行）+ **静止期禁 ensure**（不再把空闲回收窗口顶掉）。`needs_input` 保持单一来源（任务停下问问题）。**线协议不变**（PROTOCOL 1.0）；**machine 单元零源码改动**（仅 package.json 版本号）；工具面 12 个数量与既有签名不变（`advance` 加可选 `retryTaskIds` additive 入参）。**派发消息自包含规范**入 `flow/spec`（H4，异机 worker 无宿主文件系统）。详见 `doc/v0.6.1/失败上收与项目串行-改造文档.md`（v4(final)，47 条问题清单承接自 v0.6.1 现状梳理 ①②）。
+
+### Added
+
+- **失败隔离（依赖闭包级）**：任一节点失败 → 仅冻结其依赖下游中**未派发**节点（`blocked`）；**在飞节点不动**；其余节点（含其它 project）照常派发、结果有效。`needs_input` 保持单一来源（任务 `input-required` 停下问人）。
+- **静止收敛 + `feature.failure_report` 事件**：收敛（无可派发 && 无在飞）且存在失败 ⇒ Feature **保持 `executing` 自然静止**（零动作、不进任何异常态），发一条 failure_report（进程内 signature 去重，一次/静止期；重派使集合变化即重新武装）；全 completed 照旧自动进 `integrating`。`a2a_feature_status` 节点摘要增可选 `text` / `contextId`（账单字段，additive）。
+- **`a2a_feature_advance` 增可选 `retryTaskIds?: string[]`**（v0.6.1 REQ-05 新语义）：重派指定未处置 `failed` 节点 + 解冻其被冻下游；`handleFeatureAdvance` 显式特例（`TRANSITIONS` **不加自环**），`to` 必须 `"executing"`；与 `answer` 互斥（同传 `feature_conflicting_args`）；不传/非法集合 ⇒ `feature_nothing_to_resume` 结构化拒绝（防抖振）；重派复用 `rearmForRetry` CAS + 显式 `kick()`；事件 `task.rearmed` 留痕。
+- **project 粒度串行**：`session/store.ts` 新增 `listBusyProjectIds()`（存在 `working ∧ remote_task_id != NULL` 的项目集，独立 SQL，不受 `listTasks` clamp 限制）；就绪判定按 projectId 过滤 + 项目预留与 `inFlightNodes` 同步段落位（跨 Feature 并发正确性）；**静止期禁 ensure 不变量**（executing 双义子态判据，防误续命顶掉 `idleStopMs` 回收窗口）。
+- **回归用例 v0.6.1**：`test-v0.6.1-failure-semantics.js`（32 条：新符号存在性 / **五层符号零命中** / kind 六值清单 / 冻结-静止-重派-解冻断言）；`.omo` 旧失败自动化用例四文件退役（v0.4.1-timeout-failure-automation / v0.5.0-evidence-parse / v0.5.0-retry-timing / v0.5.1-failure-closure —— 其题材整体随五层删除）；`task-result-guarantee` 与 `v0.6.0-project-group` 两文件的 3 处判据对齐 v6.1 语义（isLocalTerminalState 合一 / probeProjectReady 退役）。
+
+### Changed
+
+- **三处 `package.json` 版本号升至 `0.6.1`**（根 / `orch` / `machine`；根为版本源）。
+- **`recover()` 不再整单判死**：重启时在飞节点按 `interrupted` 置 `failed` 但 **Feature 不 `failFeature`**（交给静止收敛交宿主裁量）；`reduceConvergence` 删除 `failed` 臂、`blocked` 升为良性终态。
+- `orch/bridge/index.ts`：“先占位后发”派发顺序（`dispatch_guard` 列迁移，ctor try-ALTER）修 **C11 派发崩溃窗口重复派发**；`a2a_task_status` / `a2a_cancel` 的**远端 id 反查落库**（`bridge/task-lookup.ts` 新增）修 **A5-5 本地 id 查远端**；`limit 1000` 截断告警修 **C12**；`isLocalTerminalState` 同义双份合一。
+- `bridge/task-watcher.ts`：`persist` 异常与 `poll` 异常分离分类（修 **A5-2**，看护不再把落库失败误判成轮询放弃）。
+- **三列休眠**：`exhausted` / `not_before` / `last_poll_at` / `failure_kind` 保留列自 REQ-05 起**停止读写**（schema 不 DROP；`retryCount`/`failureKind` 出参字段保留、语义休眠恒 0/null——登记为出参不变、语义休眠）。`needs_input` 彻底单源：ogets 三处取证交人出口（兜底扫描 / settle / evidenceSettled）随取证流整块删除。
+- `flow/spec/` SDK：`引擎映射.md`（失败非异常态 / 静止语义落 §2/§4 二分判据 / `retryTaskIds` 一句 / `拓扑派发（并行/串行资源约束由运行底座决定）`）+ `需求流程.md` **H4 派发消息自包含**（异机 worker 无法读宿主侧 doc ⇒ 每条任务消息必须内嵌改造要点全文）+ `文档模板.md` 派发消息模板。
+
+### Verified
+
+- 门禁：`orch` `typecheck` **0** / `lint` **0** / `npm test` **147/147**（含新增 C11 锁定用例）；regression new 用例 **32/32**。**machine 零源码改动**（`typecheck` 0）。
+- **全量回归 666/666**（套件 808 → 666：4 文件共 174 条五层题材断言退役 + 32 条新用例；报告落 `reports/v0.6.1/`）。
+- **真机（Step 3 宿主自测 = §4.3 真机 E2E，Feature `6b8e2cfe` completed）**：双 project（scratch-c 18s 受控失败 + flow/machine 对照）—— V2 失败隔离（`blockedSet` 仅闭包两节点，E-a/E-b 照常完成）· V3 failure_report 恰 1 条 & Feature 保持 `executing` **零动作** · V4 `retryTaskIds` 重派×2（返回 `rearmed/unfrozen` 正确、`retryCount` 记账、同 ctx 续接自判成功）· **无自环**（无参数 advance ⇒ `feature_transition_invalid`）· V9 全程 `task.evidence`/`task.retry` 事件**零出现** · 全 completed 自动进 `integrating`。**收口 Feature `25040882`**（N-r1：门禁三绿 147/147 + 僵尸取证结算 + 回归新用例 32/32）completed；发版收尾清理（测试项目 scratch-b/scratch-c 移除 + Launcher 重启）Feature `78c8c45a` completed。
+- **真机（发版）**：`bridge:restart` 新构建生效（`a2a_feature_advance` 出现 `retryTaskIds` 参数；事件 kind 六值 = task.settled / task.blocked / feature.state / push.received / feature.transition_skipped / **feature.failure_report**；退役 kind 零命中）。
+
+### 未覆盖（遗留验证，**不得算通过**）
+
+- **`feature.failure_report` 二次重派失败不重发**（signature 未纳入 retryCount ⇒ 同一静止期第二次失败只有状态侧可见、事件面不可见）——登记为下一小需求承接。
+- 写者**终止类** (D1 终止写者 / D3 任务级终止 API / D5-D6 孤儿与双写者) 本版**移出**（靠「引擎排队 + 有界 idleStopMs」绕开；D5-D6 由运维 `reap` 承接）。
+- 发版回归套件中 **174 条 v0.4.x/v0.5.x 失败自动化与取证流旧断言**（4 用例文件整批退役）随五层题材删除（题材消失、非红灯；新用例 32 项对应承接）。
+
 ## [v0.6.0] - 2026-09-17
 
 > 主题：**项目组与选择性连接**（「一版本一需求」）。orch 侧新增**静态「项目组」**（成员 = `machineId × projectId`）+ **选择性连接** —— 桥只连「有成员的机器」、只用「列名成员的项目」；未列成员的项目**不 `ensure` / 不派发 / 不展示**，派发到非成员**显式失败**（`project_not_a_member`）。**线协议不变**（`PROTOCOL.md` / `PROTOCOL_VERSION` = `1.0`）；**`machine` 单元本版零源码改动**（仅 `package.json` 版本号）；**架构约束不变**。原路线图 v0.6.0 的「Transport 抽象与 SSH」经 **Step 0 重新评审后整体移出本版**（登记为后续；触发条件 = 出现「只有 SSH 能进」的机器）。

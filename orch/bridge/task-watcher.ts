@@ -7,6 +7,8 @@
  *
  * - 进程内按 taskId 去重：同一任务的看护只启动一次；
  * - 单次 poll / renew 失败仅记日志并继续；连续 poll 失败达上限后放弃（防永久故障空转）；
+ * - v0.6.1 REQ-05 §2.5（A5-2）：`persist`（终态落库）异常与 `poll` 异常**分离分类** ——
+ *   `persist` 抛错**不计入**连续失败、不走 abandoned，且终态仍**必调** `onSettled`；
  * - 生命周期随桥进程：桥退出即终止（需求确认单边界）。
  */
 import type { Task } from "@a2a-js/sdk";
@@ -217,12 +219,29 @@ async function watchLoop(options: TaskWatcherOptions): Promise<void> {
         const task = await options.poll();
         consecutiveFailures = 0;
         if (options.isSettled(task)) {
-          options.persist(task);
+          /**
+           * v0.6.1 REQ-05 §2.5（A5-2 / N3）：**`persist` 异常与 `poll` 异常分离分类**。
+           *
+           * 旧实现把 `persist` 放在 `poll` 的 `try` 内 ⇒ `persist` 抛错被计入
+           * `consecutiveFailures`，连续抛错即走 **abandoned 判放弃**（把「已定终态但落库失败」
+           * 误判为「远端永久故障」）。正确语义：
+           * - `persist` 失败**不得**走 abandoned、**不得**打断收尾（`终态已确定` 是既成事实）；
+           * - **已完成终态必须 `persist`（成功或失败）后仍 `safeOnSettled`** ——
+           *   DAG 续推的驱动信号不能因落库异常而丢失。
+           */
+          try {
+            options.persist(task);
+          } catch (err) {
+            console.error(
+              `[a2a-bridge] 后台看护 ${taskId} 终态落库失败（不影响收尾，仍将回调 onSettled）：${toMessage(err)}`,
+            );
+          }
           bridgeLog.info("a2a-bridge", `后台看护 ${taskId}：任务已终态，看护结束`);
           safeOnSettled(options, task, { abandoned: false });
           return;
         }
       } catch (err) {
+        // 仅 **poll** 失败计入连续失败（`persist` 已在各自的 try 内消化）
         consecutiveFailures += 1;
         console.error(
           `[a2a-bridge] 后台看护 ${taskId} 轮询失败（${consecutiveFailures}/${options.maxConsecutiveFailures}）：${toMessage(err)}`,

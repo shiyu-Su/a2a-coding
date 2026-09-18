@@ -112,6 +112,13 @@ export const EVENT_TASK_SETTLED = "task.settled";
 export const EVENT_TASK_BLOCKED = "task.blocked";
 /** 事件 kind：Feature 状态流转 */
 export const EVENT_FEATURE_STATE = "feature.state";
+/**
+ * 事件 kind：列表查询**触顶截断**告警（v0.6.1 REQ-05 §2.5 白捡 / C12）。
+ *
+ * `listFeatures` / `listFeatureTasks` 返回行数触顶（`=== limit`）时记**事件 + 日志各一条**，
+ * 令「`limit:1000` 静默截断」变为可观测信号。去重：每 (list, scope, limit) **每实例至多一次**。
+ */
+export const EVENT_LIST_TRUNCATED = "store.list_truncated";
 
 /** `upsertSession` 入参：时间戳缺省时由存储层补齐（UTC ISO 8601） */
 export interface SessionUpsertInput {
@@ -256,11 +263,6 @@ function readInteger(row: Record<string, unknown>, key: string): number {
   return v;
 }
 
-/** 解析 0/1 标志列（**非 0 即 true**；v0.4.1 的 `exhausted` 用） */
-function readBooleanFlag(row: Record<string, unknown>, key: string): boolean {
-  return readInteger(row, key) !== 0;
-}
-
 /** 解析 `failure_kind` 列（可空；非法值 = 数据损坏，fail-fast） */
 function readFailureKind(row: Record<string, unknown>): FailureKind | null {
   const raw = readNullableString(row, "failure_kind");
@@ -286,11 +288,17 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
   };
 }
 
-/** tasks 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToTask） */
+/**
+ * tasks 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToTask）。
+ *
+ * v0.6.1 REQ-05：`exhausted` / `not_before` / `last_poll_at` **三列自本期起为休眠列** ——
+ * 列仍在库中（`schema 不挖`），但**不再出现在 SELECT**；`rowToTask` 以固定中性值（`false` / `null`）
+ * 填充对应字段，故这三条历史值不会被任何代码读到。
+ */
 const TASK_COLUMNS =
   "task_id, project_id, context_id, state, artifacts_json, text, prompt, " +
-  "feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, updated_at, " +
-  "retry_count, failure_kind, exhausted, not_before, last_poll_at, " +
+  "feature_id, dependencies, input_artifacts, remote_task_id, dispatch_guard, dispatch_message, updated_at, " +
+  "retry_count, failure_kind, " +
   "created_at, started_at, finished_at";
 
 /** features 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToFeature） */
@@ -367,12 +375,15 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     dependencies: readDependencies(row),
     inputArtifacts: readInputArtifacts(row),
     remoteTaskId: readNullableString(row, "remote_task_id"),
+    // C11 派发占位（非 NULL = 已发出）：老记录 / 独立单任务为 NULL
+    dispatchGuard: readNullableString(row, "dispatch_guard"),
     dispatchMessage: readNullableString(row, "dispatch_message"),
     retryCount: readInteger(row, "retry_count"),
     failureKind: readFailureKind(row),
-    exhausted: readBooleanFlag(row, "exhausted"),
-    notBefore: readNullableString(row, "not_before"),
-    lastPollAt: readNullableString(row, "last_poll_at"),
+    // v0.6.1 REQ-05：三列休眠 —— 不进 SELECT，恒取中性值（字段保留以维持 TaskRecord 形状）
+    exhausted: false,
+    notBefore: null,
+    lastPollAt: null,
   };
 }
 
@@ -501,6 +512,14 @@ CREATE TABLE IF NOT EXISTS events (
 export class SessionStore {
   private readonly db: DatabaseSync;
   private closed = false;
+  /**
+   * C12 触顶告警去重（每实例、每 key 至多一次）。
+   *
+   * 理由：`listFeatures` / `listFeatureTasks` 位于调度 **tick 热路径**（每 tick 多次），
+   * 触顶是**持续性**事实而非事件 ⇒ 若不去的，会每 tick 往事件收件箱刷同一条告警。
+   * 随实例销毁（`close()` ⇒ 下次 `getDefaultStore()` 全新集合），测试隔离友好。
+   */
+  private readonly truncationWarned = new Set<string>();
 
   constructor(dbPath: string = process.env["SESSION_DB"] ?? DEFAULT_SESSION_DB) {
     if (dbPath !== ":memory:") {
@@ -544,7 +563,12 @@ export class SessionStore {
       // 列已存在
     }
     // v0.4.1 迁移：tasks 加失败自动化列 —— 重试门槛 / 失败分类 / 中性化标记 / 取证派发门
-    // （`INTEGER NOT NULL DEFAULT 0` 使既有行直接取默认值，无需回填）
+    // （`INTEGER NOT NULL DEFAULT 0` 使既有行直接取默认值，无需回填）。
+    //
+    // ⚠️ v0.6.1 REQ-05：**列保留（schema 不挖），但 `exhausted` / `not_before` / `last_poll_at`
+    // 三列自本期起为休眠列**（停止读写：不进 `TASK_COLUMNS`、无任何 UPDATE 写口）；`failure_kind`
+    // 亦**停止写入**（读侧保留，出参恒 `null`）。保留 ALTER 的目的是**不挖 schema** ⇒ 老库升级
+    // 路径不变、未来若要复用在库数据不丢。
     for (const column of [
       "retry_count INTEGER NOT NULL DEFAULT 0",
       "failure_kind TEXT",
@@ -567,6 +591,15 @@ export class SessionStore {
       } catch {
         // 列已存在
       }
+    }
+    // v0.6.1 REQ-05 §2.5 白捡（C11）：派发占位列 —— 本版**唯一**新增列（任务级幂等键）。
+    // 语义见 `types.ts` 的 `TaskRecord.dispatchGuard`：A2A send **前**写占位、send 后回填
+    // `remote_task_id`；崩溃恢复据此区分「占位未发 vs 已发」⇒ 既不双派也不永久不派。
+    // 纪律：只加列、必可空、不复用既有列、读侧 `readNullableString`、**只在 ctor try-ALTER**。
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN dispatch_guard TEXT");
+    } catch {
+      // 列已存在
     }
     // v0.4.0 迁移：features 加 Feature Context 列（context_id / plan / decisions / contracts）
     for (const column of ["context_id TEXT", "plan TEXT", "decisions TEXT", "contracts TEXT"]) {
@@ -832,11 +865,40 @@ export class SessionStore {
   }
 
   /**
+   * **C11 派发占位（先占位后发）**：在 A2A `message/send` **之前**写入「已发出」事实。
+   * 任务不存在时无效果，返回 null。
+   *
+   * - `dispatch_guard` = 占位时刻（非 NULL = 已发起派发）；`remote_task_id` **保持 NULL**，
+   *   由 {@link markTaskDispatched} 在 send 返回后回填；
+   * - `started_at` 与占位同批写（`COALESCE`：仅首次填）—— 占位时刻即「首次开工」；
+   * - **幂等**：`COALESCE(dispatch_guard, ?)` ⇒ 重复调用**不刷新**占位时刻（不产生新事实）。
+   *
+   * **事务粒度 / 锁**：单条 `UPDATE` 即原子（SQLite 单进程写，`DatabaseSync` 同步执行）；
+   * 占位与回填是**两个独立语句**，**不得**跨 `await`（`sendMessage` 是长 I/O）持有事务 ——
+   * 崩溃窗口改由「占位」显式表达（`recover` 据三态判定），而非靠长事务掩盖。
+   */
+  markTaskDispatchStarted(taskId: string): TaskRecord | null {
+    const now = nowIso();
+    this.db
+      .prepare(
+        `UPDATE tasks
+         SET dispatch_guard = COALESCE(dispatch_guard, ?), started_at = COALESCE(started_at, ?),
+             updated_at = ?
+         WHERE task_id = ?`,
+      )
+      .run(now, now, now, taskId);
+    return this.getTask(taskId);
+  }
+
+  /**
    * Feature 节点派发落库：回填远端 id，保持 state（working）以便看护接管。
    * 任务不存在时无效果，返回 null。
    *
    * v0.5.0：**`started_at` 写口（仅当 IS NULL 才填）** —— `COALESCE(started_at, ?)` 使
    * 「首次派发」补时刻、而重派 / 重试**不重置起点**（幂等；与 `createTask` 的 `COALESCE` 同一纪律）。
+   *
+   * v0.6.1 REQ-05 §2.5 白捡（C11）：本方法 = **占位后的回填**（真实远端 id）——
+   * **不清 `dispatch_guard`**（「已发出」是既成事实，清空点只在 `rearmTask` / `rearmForRetry`）。
    */
   markTaskDispatched(taskId: string, remoteTaskId: string): TaskRecord | null {
     const now = nowIso();
@@ -857,13 +919,16 @@ export class SessionStore {
    * v0.5.0：**同时清 `finished_at`** —— 该节点重新成为"在飞未完成"，
    * 否则破坏不变量「有 `finished_at` ⇔ 已完成」（网页端会把它显示成已完成）。
    * `started_at` **保留**（首次开工时刻，续推不改写耗时起点）。
+   *
+   * v0.6.1 REQ-05 §2.5 白捡（C11）：**同时清 `dispatch_guard`** —— 回到「待派发」后，
+   * 旧占位不再代表「已发出」（否则重启恢复会把重排后的节点误判为派发窗口中断 ⇒ 永久不派）。
    */
   rearmTask(taskId: string, dispatchMessage: string): TaskRecord | null {
     this.db
       .prepare(
         `UPDATE tasks
-         SET state = 'working', remote_task_id = NULL, dispatch_message = ?, updated_at = ?,
-             finished_at = NULL
+         SET state = 'working', remote_task_id = NULL, dispatch_guard = NULL, dispatch_message = ?,
+             updated_at = ?, finished_at = NULL
          WHERE task_id = ?`,
       )
       .run(dispatchMessage, nowIso(), taskId);
@@ -892,79 +957,20 @@ export class SessionStore {
    * v0.5.0：**同时清 `finished_at`** —— `failed` 是终态口径之一（有 `finished_at`），
    * 授予重试后节点重新成为在飞未完成 ⇒ 必须清空以维持不变量「有 `finished_at` ⇔ 已完成」。
    * `started_at` **保留**（首次开工时刻，重试不改写耗时起点）。
+   *
+   * v0.6.1 REQ-05 §2.5 白捡（C11）：**同时清 `dispatch_guard`** —— 重派是新的派发动作，
+   * 旧占位必须作废，否则 `computeReadyNodes` 的「占位 ⇒ 不重派」判据会**永久挡住重派**
+   * （重派节点 `remote_task_id = NULL` 且占位仍在 ⇒ 永不就绪）。
    */
   rearmForRetry(taskId: string, dispatchMessage: string): boolean {
     const info = this.db
       .prepare(
         `UPDATE tasks
-         SET state = 'working', remote_task_id = NULL, dispatch_message = ?,
+         SET state = 'working', remote_task_id = NULL, dispatch_guard = NULL, dispatch_message = ?,
              retry_count = retry_count + 1, exhausted = 0, updated_at = ?, finished_at = NULL
          WHERE task_id = ? AND state = 'failed'`,
       )
       .run(dispatchMessage, nowIso(), taskId);
-    return Number(info.changes) > 0;
-  }
-
-  /**
-   * 设置「取证节点」的**可派时间门**（v0.4.1 §2.3）：`notBefore > now` 期间不被调度器选中
-   * （`computeReadyNodes` 就绪判据加 `not_before IS NULL OR not_before <= now`）。
-   * 传 `null` 清门（立即恢复可派）。任务不存在返回 null（与 `updateTaskState` 语义一致）。
-   *
-   * **刻意不写 `updated_at`**：这是派发门 / 观测元数据，不是任务态变化；`listFeatureTasks`
-   * 以 `updated_at` 升序作「派发次序」，若 5s 轮询也搅动它会使节点在列表中被反复重排。
-   */
-  setTaskNotBefore(taskId: string, notBefore: string | null): TaskRecord | null {
-    this.db
-      .prepare("UPDATE tasks SET not_before = ? WHERE task_id = ?")
-      .run(notBefore, taskId);
-    return this.getTask(taskId);
-  }
-
-  /**
-   * 记录最近一次 `GET /projects` 轮询时间（v0.4.1 §2.3「等回收门」5s 节流用）。
-   * 与 `setTaskNotBefore` 同理，**不写 `updated_at`**。任务不存在返回 null。
-   */
-  setTaskLastPollAt(taskId: string, lastPollAt: string | null): TaskRecord | null {
-    this.db
-      .prepare("UPDATE tasks SET last_poll_at = ? WHERE task_id = ?")
-      .run(lastPollAt, taskId);
-    return this.getTask(taskId);
-  }
-
-  /**
-   * **置中性化标记**（v0.4.1 §2.6）：`exhausted = 1` —— 该失败节点已被「取证流」接管，
-   * 下游判定中**视作 completed**（scheduler 的 6 处判定各认它）。**本方法是中性化的唯一写入点**。
-   *
-   * **刻意只写这一列**：
-   * - **不改写 `state`** —— 节点事实上仍是 `failed`（`exhausted` 是标志位，**非新 TaskState**，不污染事实语义）；
-   * - **不写 `updated_at`** —— 理由同 `setTaskNotBefore`：`listFeatureTasks` 以 `updated_at` 升序作
-   *   「派发次序」，中性化不是任务态变化，不应搅动次序（也不应影响按 `updated_at` 的保留策略）。
-   *
-   * 幂等（`exhausted` 已是 1 时重复调用仍为 1）；返回是否命中（`false` = 任务不存在）。
-   */
-  markTaskExhausted(taskId: string): boolean {
-    const info = this.db
-      .prepare("UPDATE tasks SET exhausted = 1 WHERE task_id = ?")
-      .run(taskId);
-    return Number(info.changes) > 0;
-  }
-
-  /**
-   * **落库失败分类**（v0.4.1 §2.2 / §4.1.13 可观测）：`failure_kind ∈ {infra, task}`。
-   *
-   * 「失败原因落库」的**唯一写入点** —— `a2a_feature_status` 的 `failureKind` 出参据此有真实数据源。
-   * **`task` 与 `infra` 两类都写**（便于事后统计），分类由调度器的 `classifyFailure` 决定。
-   *
-   * **刻意只写这一列、不写 `updated_at`**：分类是**观测元数据**，不是任务态变化；
-   * `listFeatureTasks` 以 `updated_at` 升序作「派发次序」，不应被分类写入搅动
-   * （理由同 `setTaskNotBefore` / `markTaskExhausted`）。
-   *
-   * 返回是否命中（`false` = 任务不存在）。可重复调用（后写覆盖前值）。
-   */
-  markTaskFailureKind(taskId: string, kind: FailureKind): boolean {
-    const info = this.db
-      .prepare("UPDATE tasks SET failure_kind = ? WHERE task_id = ?")
-      .run(kind, taskId);
     return Number(info.changes) > 0;
   }
 
@@ -987,6 +993,50 @@ export class SessionStore {
     return rows.map(rowToTask);
   }
 
+  /**
+   * **C12 触顶截断告警**（v0.6.1 REQ-05 §2.5 白捡）：`limit` 触顶（`returned === limit`）时
+   * 记**事件 + 日志各一条**（{@link EVENT_LIST_TRUNCATED}），令「`limit:1000` 静默截断」可观测。
+   *
+   * - 触发判据 = 「返回行数 `=== limit`」（`limit` 调用方已 clamp 到 [1,1000]）⇒ **仅触顶才**
+   *   做一次 `COUNT(*)` 得 `total`（校验「恰好等于 limit」vs「真被截断」），**未触顶零额外开销**；
+   * - 去重：`key`（= list + scope + limit）不变 ⇒ 本实例内只告警一次；key 变（换 list / 换 limit /
+   *   换 Feature）⇒ 重新告警（不同截断面 = 不同事实）；
+   * - 纯观测：**不改**查询结果、不抛错（告警失败不得影响读取）。
+   */
+  private warnIfListTruncated(
+    key: string,
+    list: string,
+    featureId: string | null,
+    returned: number,
+    limit: number,
+    countTotal: () => number,
+  ): void {
+    if (returned < limit) return;
+    if (this.truncationWarned.has(key)) return;
+    this.truncationWarned.add(key);
+    let total: number;
+    try {
+      total = countTotal();
+      console.error(
+        `[session-store] ${list} 触顶截断：limit=${limit}，返回 ${returned}，total=${total}（后续同 key 静默）`,
+      );
+    } catch (err) {
+      console.error(`[session-store] ${list} 触顶统计失败：${String(err)}`);
+      total = returned;
+    }
+    try {
+      this.appendEvent({
+        featureId,
+        taskId: null,
+        kind: EVENT_LIST_TRUNCATED,
+        state: null,
+        payload: JSON.stringify({ list, limit, returned, total }),
+      });
+    } catch (err) {
+      console.error(`[session-store] ${list} 触顶告警事件写入失败：${String(err)}`);
+    }
+  }
+
   /** 按 Feature 列出任务节点（updated_at 升序 = 派发次序；limit 默认 100，clamp 到 [1,1000]） */
   listFeatureTasks(featureId: string, opts: ListFeatureTasksOptions = {}): TaskRecord[] {
     const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
@@ -996,7 +1046,49 @@ export class SessionStore {
          ORDER BY updated_at ASC LIMIT ?`,
       )
       .all(featureId, limit) as Array<Record<string, unknown>>;
+    // v0.6.1 REQ-05 §2.5 白捡（C12）：触顶 ⇒ 事件 + 日志各一条（total 校验）
+    this.warnIfListTruncated(
+      `listFeatureTasks:${featureId}:${limit}`,
+      "listFeatureTasks",
+      featureId,
+      rows.length,
+      limit,
+      () => {
+        const row = this.db
+          .prepare("SELECT COUNT(*) AS n FROM tasks WHERE feature_id = ?")
+          .get(featureId) as Record<string, unknown> | undefined;
+        return Number(row?.["n"] ?? 0);
+      },
+    );
     return rows.map(rowToTask);
+  }
+
+  /**
+   * **项目忙**集合（v0.6.1 REQ-05 §2.5 / N5）：当前存在**在飞节点**的 `project_id` 集合。
+   *
+   * 判据 = `EXISTS(state = 'working' AND remote_task_id IS NOT NULL)`（`DISTINCT project_id`）。
+   *
+   * ⚠️ **不得复用 `listTasks`**：后者 `limit` clamp 到 `[1,100]` 且按 `updated_at DESC` 截断
+   * ⇒ 任务多于 100 条时**静默漏**忙碌项目（串行虚设）。本查询是**集合投影**（无 limit、无排序），
+   * 返回基数天然有界于项目数，不存在截断。
+   *
+   * 「在飞」口径 = **派发在恋 ∨ 看护存活**（受 `A2A_REQUEST_TIMEOUT_MS` / 看护 `renew` +
+   * `maxConsecutiveFailures → abandoned` 约束）—— **事件性上界，非墙钟上界**（改造文档 §2.5
+   * 硬约束 2）；`working ∧ 丢看护` 的**悬挂态**兜底 = 桥重启 `recover()` 对账，不在本查询内。
+   *
+   * 本查询只覆盖**已落库**的在飞；「派发已发起但 `remote_task_id` 尚未回填」的窗口由调度器
+   * **进程内项目预留**补（`FeatureScheduler.reservedProjects`）——二者相并方为完整忙集。
+   */
+  listBusyProjectIds(): Set<string> {
+    const rows = this.db
+      .prepare(
+        `SELECT DISTINCT project_id FROM tasks
+          WHERE state = 'working' AND remote_task_id IS NOT NULL`,
+      )
+      .all() as Array<Record<string, unknown>>;
+    const ids = new Set<string>();
+    for (const row of rows) ids.add(readString(row, "project_id"));
+    return ids;
   }
 
   // ------------------------------------------------------------------
@@ -1143,6 +1235,23 @@ export class SessionStore {
          FROM features ${where}ORDER BY updated_at DESC LIMIT ?`,
       )
       .all(...params) as Array<Record<string, unknown>>;
+    // v0.6.1 REQ-05 §2.5 白捡（C12）：触顶 ⇒ 事件 + 日志各一条（total 校验）
+    const stateFilter = opts.state;
+    this.warnIfListTruncated(
+      `listFeatures:${stateFilter ?? "*"}:${limit}`,
+      "listFeatures",
+      null,
+      rows.length,
+      limit,
+      () => {
+        const row = (
+          stateFilter !== undefined
+            ? this.db.prepare("SELECT COUNT(*) AS n FROM features WHERE state = ?").get(stateFilter)
+            : this.db.prepare("SELECT COUNT(*) AS n FROM features").get()
+        ) as Record<string, unknown> | undefined;
+        return Number(row?.["n"] ?? 0);
+      },
+    );
     return rows.map(rowToFeature);
   }
 
@@ -1362,6 +1471,16 @@ export function listFeatureTasks(featureId: string, opts?: ListFeatureTasksOptio
   return getDefaultStore().listFeatureTasks(featureId, opts);
 }
 
+/** 项目忙集合：存在在飞节点（`working ∧ remote_task_id IS NOT NULL`）的 projectId（默认存储） */
+export function listBusyProjectIds(): Set<string> {
+  return getDefaultStore().listBusyProjectIds();
+}
+
+/** C11 派发占位：A2A send 前写入「已发出」事实（默认存储） */
+export function markTaskDispatchStarted(taskId: string): TaskRecord | null {
+  return getDefaultStore().markTaskDispatchStarted(taskId);
+}
+
 /** Feature 节点派发落库：回填远端 id（默认存储） */
 export function markTaskDispatched(taskId: string, remoteTaskId: string): TaskRecord | null {
   return getDefaultStore().markTaskDispatched(taskId, remoteTaskId);
@@ -1375,26 +1494,6 @@ export function rearmTask(taskId: string, dispatchMessage: string): TaskRecord |
 /** 条件重试：仅当节点当前为 failed 时重排（默认存储）；返回是否命中 */
 export function rearmForRetry(taskId: string, dispatchMessage: string): boolean {
   return getDefaultStore().rearmForRetry(taskId, dispatchMessage);
-}
-
-/** 设置取证节点可派时间门（默认存储） */
-export function setTaskNotBefore(taskId: string, notBefore: string | null): TaskRecord | null {
-  return getDefaultStore().setTaskNotBefore(taskId, notBefore);
-}
-
-/** 记录最近一次 /projects 轮询时间（默认存储） */
-export function setTaskLastPollAt(taskId: string, lastPollAt: string | null): TaskRecord | null {
-  return getDefaultStore().setTaskLastPollAt(taskId, lastPollAt);
-}
-
-/** 置中性化标记：exhausted = 1（默认存储）；返回是否命中 */
-export function markTaskExhausted(taskId: string): boolean {
-  return getDefaultStore().markTaskExhausted(taskId);
-}
-
-/** 落库失败分类 failure_kind（默认存储）；返回是否命中 */
-export function markTaskFailureKind(taskId: string, kind: FailureKind): boolean {
-  return getDefaultStore().markTaskFailureKind(taskId, kind);
 }
 
 /** 创建/覆盖 Feature 记录（默认存储） */

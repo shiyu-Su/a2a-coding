@@ -399,6 +399,7 @@ test("v0.4.1 迁移：旧库补列幂等、老行取默认值、新列可回读�
       const legacyRow = store.getTask("legacy-1");
       assert.equal(legacyRow?.retryCount, 0);
       assert.equal(legacyRow?.failureKind, null);
+      // v0.6.1 REQ-05：三个休眠列自本期起**不进 SELECT**，读侧恒中性值
       assert.equal(legacyRow?.exhausted, false);
       assert.equal(legacyRow?.notBefore, null);
       assert.equal(legacyRow?.lastPollAt, null);
@@ -406,16 +407,18 @@ test("v0.4.1 迁移：旧库补列幂等、老行取默认值、新列可回读�
       store.close();
     }
 
-    // ③ 新列可写回并读回（后续节点由 scheduler 写 exhausted / failure_kind；此处直连库模拟）
+    // ③ 列仍在库中（schema 不挖）；`failure_kind` 仍可读写，**休眠三列不再被读出**
     const raw = openStoreDatabase(dbPath);
-    raw.exec("UPDATE tasks SET exhausted = 1, failure_kind = 'infra' WHERE task_id = 'legacy-1'");
+    raw.exec("UPDATE tasks SET exhausted = 1, not_before = '2030-01-01T00:00:00.000Z', failure_kind = 'infra' WHERE task_id = 'legacy-1'");
     raw.close();
     const store2 = new SessionStore(dbPath);
     try {
       const row = store2.getTask("legacy-1");
-      assert.equal(row?.exhausted, true);
-      assert.equal(row?.failureKind, "infra");
-      assert.equal(row?.state, "completed", "中性化标记不得改写 state（非新 TaskState）");
+      // 休眠列即便在库中被置位也不被读回（读侧恒中性值 ⇒ 「停止读写」可机械核验）
+      assert.equal(row?.exhausted, false, "exhausted 休眠列：读侧恒 false（旧值不再可读）");
+      assert.equal(row?.notBefore, null, "not_before 休眠列：读侧恒 null");
+      assert.equal(row?.failureKind, "infra", "failure_kind 仍可读（只停写，不停读）");
+      assert.equal(row?.state, "completed", "列搬动不得改写 state");
     } finally {
       store2.close();
     }
@@ -504,10 +507,10 @@ test("N2b 迁移：退役三态归一 + 脏值兜底 + 三条纪律（不改 upd
   }
 });
 
-test("rearmForRetry：仅 failed 命中；命中后 retry_count +1、清 remote_task_id 并清 exhausted；非 failed 零变化", () => {
+test("rearmForRetry：仅 failed 命中；命中后 retry_count +1、清 remote_task_id / finished_at；非 failed 零变化", () => {
   const store = newStore();
   try {
-    // 非 failed（working）→ 不命中，且字段零变化（含**不得清 `exhausted`**）
+    // 非 failed（working）→ 不命中，且字段零变化
     store.createTask({
       taskId: "t-working",
       projectId: "p1",
@@ -516,16 +519,14 @@ test("rearmForRetry：仅 failed 命中；命中后 retry_count +1、清 remote_
       remoteTaskId: "remote-1",
       dispatchMessage: "orig",
     });
-    assert.equal(store.markTaskExhausted("t-working"), true);
     assert.equal(store.rearmForRetry("t-working", "retry note"), false);
     const working = store.getTask("t-working");
     assert.equal(working?.state, "working");
     assert.equal(working?.retryCount, 0, "未命中不得自增 retry_count");
     assert.equal(working?.remoteTaskId, "remote-1", "未命中不得清 remote_task_id");
     assert.equal(working?.dispatchMessage, "orig");
-    assert.equal(working?.exhausted, true, "未命中不得清 exhausted（中性化不被旁路绕过）");
 
-    // failed → 命中：state / remote_task_id / dispatch_message / retry_count / exhausted 一次写全
+    // failed → 命中：state / remote_task_id / dispatch_message / retry_count / finished_at 一次写全
     store.createTask({
       taskId: "t-failed",
       projectId: "p1",
@@ -534,26 +535,20 @@ test("rearmForRetry：仅 failed 命中；命中后 retry_count +1、清 remote_
       remoteTaskId: "remote-2",
       dispatchMessage: "orig",
     });
-    assert.equal(store.markTaskExhausted("t-failed"), true);
-    assert.equal(store.getTask("t-failed")?.exhausted, true);
+    assert.ok(store.getTask("t-failed")?.finishedAt !== null, "failed 是终态口径之一 ⇒ 有 finished_at");
 
-    assert.equal(store.rearmForRetry("t-failed", "orig\n\n【自动重试】"), true);
+    assert.equal(store.rearmForRetry("t-failed", "orig\n\n【重派】"), true);
     const retried = store.getTask("t-failed");
     assert.equal(retried?.state, "working");
     assert.equal(retried?.remoteTaskId, null);
-    assert.equal(retried?.dispatchMessage, "orig\n\n【自动重试】");
-    assert.equal(retried?.retryCount, 1);
-    assert.equal(retried?.contextId, "c1", "重试同 contextId 续接（不得换 ctx）");
-    assert.equal(
-      retried?.exhausted,
-      false,
-      "re-arm ⇒ 退出中性化（否则计算就绪时被永久挡住 / all_completed 提前成立）",
-    );
+    assert.equal(retried?.dispatchMessage, "orig\n\n【重派】");
+    assert.equal(retried?.retryCount, 1, "本列自 REQ-05 起语义休眠（仅供重派记账），原语行为保留");
+    assert.equal(retried?.contextId, "c1", "重派同 contextId 续接（不得换 ctx）");
+    assert.equal(retried?.finishedAt, null, "回到未完成 ⇒ 必须清 finished_at（不变量：有 finished_at ⇔ 已完成）");
 
-    // 第二次：已非 failed → 不命中、不再自增、exhausted 保持已清（N=1 防死循环门槛）
+    // 第二次：已非 failed → 不命中、不再自增
     assert.equal(store.rearmForRetry("t-failed", "again"), false);
     assert.equal(store.getTask("t-failed")?.retryCount, 1);
-    assert.equal(store.getTask("t-failed")?.exhausted, false);
 
     // 任务不存在 → 不命中
     assert.equal(store.rearmForRetry("missing", "x"), false);
@@ -562,97 +557,27 @@ test("rearmForRetry：仅 failed 命中；命中后 retry_count +1、清 remote_
   }
 });
 
-test("取证派发门原语：setTaskNotBefore / setTaskLastPollAt 往返与清空，且不动 updated_at", () => {
-  const store = newStore();
-  try {
-    store.createTask({
-      taskId: "t-gate",
-      projectId: "p1",
-      contextId: "c1",
-      state: "working",
-    });
-    const before = store.getTask("t-gate")?.updatedAt;
-    const gateAt = "2026-09-15T10:00:00.000Z";
-
-    assert.equal(store.setTaskNotBefore("t-gate", gateAt)?.notBefore, gateAt);
-    assert.equal(store.setTaskLastPollAt("t-gate", gateAt)?.lastPollAt, gateAt);
-    // 清门 → 立即可派
-    assert.equal(store.setTaskNotBefore("t-gate", null)?.notBefore, null);
-    // 门列是派发门 / 观测元数据，不是任务态变化 ⇒ 不搅动 updated_at（保 listFeatureTasks 的派发次序）
-    assert.equal(store.getTask("t-gate")?.updatedAt, before);
-
-    // 任务不存在 → null（与 updateTaskState 语义一致）
-    assert.equal(store.setTaskNotBefore("missing", gateAt), null);
-    assert.equal(store.setTaskLastPollAt("missing", gateAt), null);
-  } finally {
-    store.close();
+test("N2：失败自动化五层的 store 写口整块移除（markTaskExhausted / markTaskFailureKind / setTaskNotBefore / setTaskLastPollAt）", () => {
+  const store = newStore() as unknown as Record<string, unknown>;
+  for (const gone of [
+    "markTaskExhausted",
+    "markTaskFailureKind",
+    "setTaskNotBefore",
+    "setTaskLastPollAt",
+  ]) {
+    assert.equal(store[gone], undefined, `${gone} 必须整块删除（休眠列停止读写）`);
   }
-});
-
-test("markTaskExhausted：置位后 state 仍 failed、updated_at/retry_count 不变、幂等、不存在不命中", () => {
-  const store = newStore();
+  const store2 = newStore();
   try {
-    store.createTask({
-      taskId: "t-ex",
-      projectId: "p1",
-      contextId: "c1",
-      state: "failed",
-      remoteTaskId: "remote-9",
-      dispatchMessage: "orig",
-    });
-    const before = store.getTask("t-ex");
-    assert.equal(before?.exhausted, false, "初始未中性化");
-
-    assert.equal(store.markTaskExhausted("t-ex"), true);
-    const after = store.getTask("t-ex");
-    assert.equal(after?.exhausted, true);
-    assert.equal(after?.state, "failed", "中性化不得改写 state（非新 TaskState，事实仍是 failed）");
-    assert.equal(after?.updatedAt, before?.updatedAt, "不得搅动 updated_at（派发次序）");
-    assert.equal(after?.retryCount, 0, "中性化不占 N=1 重试额度");
-    assert.equal(after?.remoteTaskId, "remote-9");
-    assert.equal(after?.failureKind, null, "不越权写 failure_kind（分类归 scheduler）");
-
-    // 幂等：重复置位仍为 1
-    assert.equal(store.markTaskExhausted("t-ex"), true);
-    assert.equal(store.getTask("t-ex")?.exhausted, true);
-    assert.equal(store.getTask("t-ex")?.state, "failed");
-
-    // 不存在的 taskId → 不命中
-    assert.equal(store.markTaskExhausted("missing"), false);
+    // 仅重派原语保留（供 N4 复用），其余失败自动化写口不存在 ⇒ 建任务后故障列恒中性值
+    store2.createTask({ taskId: "t-n2", projectId: "p1", contextId: "c1", state: "failed" });
+    const rec = store2.getTask("t-n2");
+    assert.equal(rec?.exhausted, false);
+    assert.equal(rec?.failureKind, null);
+    assert.equal(rec?.notBefore, null);
+    assert.equal(rec?.lastPollAt, null);
   } finally {
-    store.close();
-  }
-});
-
-test("markTaskFailureKind：落库 failure_kind、updated_at 不变、不存在不命中", () => {
-  const store = newStore();
-  try {
-    store.createTask({
-      taskId: "t-kind",
-      projectId: "p1",
-      contextId: "c1",
-      state: "failed",
-      remoteTaskId: "remote-k",
-    });
-    const before = store.getTask("t-kind");
-    assert.equal(before?.failureKind, null, "初始未分类");
-
-    assert.equal(store.markTaskFailureKind("t-kind", "infra"), true);
-    const after = store.getTask("t-kind");
-    assert.equal(after?.failureKind, "infra");
-    assert.equal(after?.updatedAt, before?.updatedAt, "不写 updated_at（不搅动派发次序）");
-    assert.equal(after?.state, "failed", "不改写 state");
-    assert.equal(after?.retryCount, 0, "不越权改 retry_count");
-    assert.equal(after?.exhausted, false, "不越权改 exhausted（中性化归 markTaskExhausted）");
-
-    // 后写覆盖：task 类同样可落库（两类都写）
-    assert.equal(store.markTaskFailureKind("t-kind", "task"), true);
-    assert.equal(store.getTask("t-kind")?.failureKind, "task");
-
-    // 不存在的 taskId → 不命中
-    assert.equal(store.markTaskFailureKind("missing", "infra"), false);
-  } finally {
-    store.close();
+    store2.close();
   }
 });
 

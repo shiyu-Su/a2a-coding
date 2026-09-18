@@ -6,8 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { close, createFeature, createTask, rearmForRetry, updateTaskState } from "../session/store.js";
-import { FeatureScheduler } from "../bridge/scheduler.js";
+import { close, createFeature, createTask, rearmForRetry } from "../session/store.js";
 import { handleFeatureStatus, type FeatureStatusSuccess } from "../bridge/feature-tools.js";
 
 // 默认存储固定内存库（与 scheduler.test.ts 同口径）
@@ -57,35 +56,6 @@ test("a2a_feature_status 出参：任务摘要含 failureKind / retryCount（只
   const after = second.tasks?.find((t) => t.taskId === "T1");
   assert.equal(after?.retryCount, 1, "重试后 N=1 门槛对宿主可见（无需另查库）");
   assert.equal(after?.state, "working", "re-arm 后回到待派发");
-
-  close();
-});
-
-test("O1.7 × O5 闭环：scheduler 落库 failure_kind ⇒ a2a_feature_status 的 failureKind 不再恒 null", () => {
-  close();
-  createFeature({ featureId: "f-kind", title: "分类可见", state: "executing" });
-  createTask({
-    taskId: "K1",
-    projectId: "p1",
-    contextId: "c1",
-    state: "working",
-    featureId: "f-kind",
-  });
-
-  const scheduler = new FeatureScheduler({ dispatch: async () => ({ ok: true }) });
-  // 真实序列：`persist`/看护**先**把节点落 `failed`，随后才 `notifyTaskSettled`
-  updateTaskState("K1", "failed", null, "Prompt timeout after 600000ms");
-  // infra 类（超时文本）⇒ markTaskFailureKind("infra") + 中性化；不 propagate、不 failFeature
-  scheduler.notifyTaskSettled("f-kind", "K1", {
-    state: "failed",
-    text: "Prompt timeout after 600000ms",
-  });
-
-  const view = mustSucceed(handleFeatureStatus({ featureId: "f-kind" }));
-  const k1 = view.tasks?.find((t) => t.taskId === "K1");
-  assert.equal(k1?.failureKind, "infra", "出参现在有真实数据源");
-  assert.equal(k1?.retryCount, 0, "未重试");
-  assert.equal(k1?.state, "failed", "中性化不改写 state（出参与库一致）");
 
   close();
 });

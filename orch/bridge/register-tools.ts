@@ -391,7 +391,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_feature_advance",
     {
       description:
-        "orch agent 驱动 Feature 主链推进（如 integrating→testing→reviewing→completed）；状态机校验合法后继，非法流转被拒。**waiting_approval→executing 已禁用**（唯一准入 = a2a_feature_approve，错误码 feature_approval_required）。needs_input 恢复用 to=executing 并携带 answer。",
+        "orch agent 驱动 Feature 主链推进（如 integrating→testing→reviewing→completed）；状态机校验合法后继，非法流转被拒。**waiting_approval→executing 已禁用**（唯一准入 = a2a_feature_approve，错误码 feature_approval_required）。needs_input 恢复用 to=executing 并携带 answer。**重派失败节点**用 retryTaskIds（须显式 to=executing，与 answer 互斥；重派 + 解冻闭包外 blocked 下游，不改 Feature 态）。",
       inputSchema: {
         featureId: z.string().min(1).describe("Feature ID"),
         to: z
@@ -416,6 +416,14 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           .string()
           .optional()
           .describe("needs_input→executing 时的人工澄清内容，以同 contextId 续接待澄清任务"),
+        retryTaskIds: z
+          .array(z.string().min(1))
+          .optional()
+          .describe(
+            "重派与解冻（失败上收 §2.3）：给一组**本 Feature 内当前 `failed`** 的节点 id ⇒ 重派（复用 rearmForRetry，同 contextId 续接）+ 解冻其依赖闭包**外**的 `blocked` 下游。" +
+              "须显式 `to=\"executing\"`（本参数是派发语义操作，不是状态流转）；与 `answer` **互斥**（同传 ⇒ feature_conflicting_args）；" +
+              "空数组 / 任一 id 非法 ⇒ feature_nothing_to_resume（**整单拒绝，不做部分重派**，Feature 态不变）。",
+          ),
       },
     },
     async (args) => {
@@ -427,6 +435,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           decisions: args.decisions,
           contracts: args.contracts,
           answer: args.answer,
+          retryTaskIds: args.retryTaskIds,
         });
         if (!outcome.ok) return errorResult(outcome);
         core.kickScheduler();

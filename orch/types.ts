@@ -31,10 +31,12 @@ export type AgentKind = "opencode" | "codex" | "claude";
 export type TaskState = "working" | "completed" | "failed" | "input-required" | "blocked";
 
 /**
- * 任务失败分类（v0.4.1 超时与失败自动化）。
- * - `infra`：基础设施类失败（超时 / 中断 / 看护放弃 / 库锁 / 网络）⇒ 走「取证 → 条件重试」；
- * - `task`：任务本身失败 ⇒ 照旧传播 `blocked` → Feature `failed`（不重试）。
- * 判据为错误码 + 文本白名单，**未知文本一律安全降级为 `task`**。
+ * 任务失败分类（v0.4.1 超时与失败自动化；**v0.6.1 REQ-05 起语义休眠**）。
+ * - `infra`：基础设施类失败（超时 / 中断 / 看护放弃 / 库锁 / 网络）⇒ 曾走「取证 → 条件重试」；
+ * - `task`：任务本身失败 ⇒ 曾照旧传播 `blocked` → Feature `failed`（不重试）。
+ *
+ * ⚠️ 五层删除（分类器 `classifyFailure` + 写口 `markTaskFailureKind` 均删）后**不再产生新分类**；
+ * 类型与 `tasks.failure_kind` 列一并保留（读侧兼容历史行、出参字段形状不变），但实际恒 `null`。
  */
 export type FailureKind = "infra" | "task";
 
@@ -298,28 +300,57 @@ export interface TaskRecord {
   inputArtifacts: InputArtifactRef[] | null;
   /** Feature 节点派发后远端 A2A 任务 id；独立任务为 NULL（taskId 即远端 id） */
   remoteTaskId: string | null;
+  /**
+   * **派发占位（C11 幂等键，v0.6.1 REQ-05 §2.5 白捡；非 NULL = 「已发出」）**。
+   *
+   * 写入点 = A2A `message/send` **之前**（`markTaskDispatchStarted`），值 = 占位时刻（UTC ISO 8601）；
+   * `remoteTaskId` 由 send 返回后回填。二者合起来表达「**已发出即有占位**」：
+   * - `dispatchGuard === null` ⇒ **必未发出**（崩溃点在此 ⇒ 重启可安全重派，无双派）；
+   * - `dispatchGuard !== null` 且 `remoteTaskId === null` ⇒ **可能已发出、远端 id 未知**
+   *   （崩溃点在此 ⇒ 重启保守判「已发出」，**不自动重派**，按 interrupted 收敛并交静止账单）；
+   * - 二者皆非 NULL ⇒ 已发出且已知远端 id（既有在飞恢复路径）。
+   *
+   * 清空点 = `rearmTask` / `rearmForRetry`（回到待派发 ⇒ 可重派，避免「永久不派」）；
+   * 回填**不清**（「已发出」是既成事实）。老记录 / 独立单任务为 NULL。
+   */
+  dispatchGuard: string | null;
   /** Feature 排队节点的待派发消息全文；派发后保留（作为可重派依据） */
   dispatchMessage: string | null;
   /**
-   * 条件重试已用次数（v0.4.1）。`retryCount < 1` 是「**防死循环**」承重门槛：
-   * 倒置为「先取证 → 条件重试」后，去掉门槛会 `fail → 取证 → D 非空 → re-arm → fail → …` 死循环。
-   * **自增点在 re-arm 时**（`rearmForRetry`），**不在 fail 时**。
+   * 重派记账次数（v0.4.1 的「条件重试已用次数」；**v0.6.1 REQ-05 起门禁语义删除、降级为记账**）。
+   *
+   * ⚠️ 自 REQ-05（删五层：失败分类 / 中性化 / 取证流 / 等回收门 / 条件重试）起，本列**唯一写口**
+   * = `rearmForRetry`（保留给「重派」复用）：`a2a_feature_advance(retryTaskIds)` 每成功重派一次 **+1**
+   * ⇒ `a2a_feature_status` 出参 `retryCount` **在重派后 > 0**（**不再恒 `0`**）。
+   * **门禁语义已消失**：不得据此判断「重试是否用尽 / 是否已重试过」（N=1 门槛随条件重试一并删除）。
    */
   retryCount: number;
-  /** 失败分类（v0.4.1；未失败 / 未分类为 null） */
+  /**
+   * 失败分类（v0.4.1；**v0.6.1 REQ-05 起语义休眠**）。
+   *
+   * ⚠️ 分类器（`classifyFailure`）与写口（`markTaskFailureKind`）随五层删除 ⇒ 该列不再被写入
+   * （读侧保留以兼容历史行）⇒ `a2a_feature_status` 出参 `failureKind` 恒 `null`（字段保留、语义休眠）。
+   */
   failureKind: FailureKind | null;
   /**
-   * 中性化标记（v0.4.1）：该失败节点已被「取证流」接管。下游判定中**视作 completed**、
-   * 不计入 failed/blocked、不参与派发、`a2a_task_status` 视作终态（共 5 处判定）。
-   * **非新 TaskState**（不污染 `state` 的事实语义）。`exhausted` 与 `notBefore` 语义独立，不得混用。
+   * **休眠列（自 REQ-05 起）** —— 中性化标记（v0.4.1 的「失败节点已被取证流接管」）。
+   *
+   * 列保留（`schema 不挖`）但**引擎不读不写**：`store` 已把它移出 `TASK_COLUMNS`（恒读作 `false`）、
+   * 写口 `markTaskExhausted` 已删除。字段保留仅为维持记录形状与老库兼容。
    */
   exhausted: boolean;
   /**
-   * 可派时间门（v0.4.1，UTC ISO 8601；NULL = 无门 = 立即可派）。
-   * 「登记取证节点后**先不派**」的**持久化**门：内存态会在桥重启后丢门 ⇒ 静默绕过硬路径。
+   * **休眠列（自 REQ-05 起）** —— 可派时间门（v0.4.1「登记取证节点后先不派」的持久化挡板）。
+   *
+   * 列保留但**引擎不读不写**：判据 `isPastNotBefore` 与写口 `setTaskNotBefore` 已删除，
+   * `computeReadyNodes` 不再有任何时间门条件。
    */
   notBefore: string | null;
-  /** 最近一次 `GET /projects` 轮询时间（v0.4.1，UTC ISO 8601；NULL = 未轮询），供「等回收门」5s 节流 */
+  /**
+   * **休眠列（自 REQ-05 起）** —— 最近一次 `GET /projects` 轮询时间（v0.4.1 等回收门 5s 节流用）。
+   *
+   * 列保留但**引擎不读不写**：写口 `setTaskLastPollAt` 与等回收门整块已删除。
+   */
   lastPollAt: string | null;
 }
 
