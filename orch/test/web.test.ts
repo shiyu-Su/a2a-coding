@@ -129,7 +129,6 @@ function baseOptions(
     version: overrides.version ?? "0.5.0-test",
   };
   if (overrides.refreshMs !== undefined) options.refreshMs = overrides.refreshMs;
-  if (overrides.unref !== undefined) options.unref = overrides.unref;
   return options;
 }
 

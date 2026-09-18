@@ -40,9 +40,16 @@ function asPort(v: unknown, ctx: string): number {
   return v;
 }
 
+/**
+ * 解析 `transport.mode`（v0.7.1 stdio 退役）：**仅接受 `"http"`**。
+ * 显式 `"stdio"` = 已退役的死形态 ⇒ **结构化 fail-fast**（不得静默降级为 http）。
+ */
 function asTransportMode(v: unknown, ctx: string): TransportMode {
-  if (v !== "stdio" && v !== "http") fail(`${ctx} 必须是 "stdio" 或 "http"`);
-  return v;
+  if (v === "http") return "http";
+  if (v === "stdio") {
+    fail(`${ctx} "stdio" 已退役（stdio transport 不再支持）：仅接受 "http"`);
+  }
+  fail(`${ctx} 必须是 "http"`);
 }
 
 function asHttpPath(v: unknown, ctx: string): string {
@@ -68,10 +75,10 @@ function parseCallback(v: unknown): CallbackConfig {
 }
 
 /**
- * 桥 transport 缺省（v0.4.1）：`mode` 缺省 `stdio` = 与旧配置行为一致；
+ * 桥 transport 缺省（v0.7.1）：stdio 已退役 ⇒ `mode` **缺省 `http`**（桥恒常驻）；
  * http 绑定 loopback，端口避开 Launcher 3100、项目 A2A 3010-3012 与回调 3200。
  */
-const DEFAULT_TRANSPORT_MODE: TransportMode = "stdio";
+const DEFAULT_TRANSPORT_MODE: TransportMode = "http";
 const DEFAULT_HTTP_HOST = "127.0.0.1";
 const DEFAULT_HTTP_PORT = 8787;
 const DEFAULT_HTTP_PATH = "/mcp";
@@ -81,7 +88,7 @@ function defaultHttpTransport(): HttpTransportConfig {
   return { host: DEFAULT_HTTP_HOST, port: DEFAULT_HTTP_PORT, path: DEFAULT_HTTP_PATH };
 }
 
-/** 无 `transport` 段时的解析结果（旧 `config.json` 零改动可用） */
+/** 无 `transport` 段时的解析结果（旧 `config.json` 零改动可用：`mode` 缺省 `http`） */
 function defaultTransport(): TransportConfig {
   return { mode: DEFAULT_TRANSPORT_MODE, http: defaultHttpTransport() };
 }
@@ -100,7 +107,7 @@ function parseHttpTransport(v: unknown): HttpTransportConfig {
 }
 
 /**
- * 解析 `transport` 配置（段可选；`mode` 缺省 `stdio`）。
+ * 解析 `transport` 配置（段可选；`mode` 缺省 `http`，显式 `"stdio"` ⇒ fail-fast）。
  * 非法 mode / 端口 / 路径一律结构化报错（复用 `fail`），不静默降级。
  */
 function parseTransport(v: unknown): TransportConfig {
@@ -120,34 +127,30 @@ function parseTransport(v: unknown): TransportConfig {
 const DEFAULT_WEB_ENABLED = true;
 const DEFAULT_WEB_HOST = "127.0.0.1";
 const DEFAULT_WEB_PORT = 3300;
-const DEFAULT_WEB_ALLOW_STDIO = false;
 
 /**
  * 解析 `web` 配置段（v0.5.0 网页端只读工作台；段可选，缺省字段补默认值）。
  *
  * 语义（本节点只解析与暴露配置，**不实现 bind**）：
- * - `enabled`（缺省 `true`）**只在常驻（`transport.mode === "http"`）形态下生效**；
- *   stdio 形态**不读它**（避免「`enabled = true` 但无效果」的歧义）。
- * - `allowStdio`（缺省 `false`）= **唯一**允许 stdio 形态也 bind 的显式开关
- *   （运行时开启时必须 `server.unref()`）。
- * - 运行时 bind 判定式：`(mode === "http" ? web.enabled : web.allowStdio) && role === "owner"`。
+ * - `enabled`（缺省 `true`）：是否允许常驻桥另起只读 HTTP 工作台；
+ * - 运行时 bind 判定式：`web.enabled && role === "owner"`；
  * - `host` 只校验**非空字符串**；**非 loopback 不在此拒绝**（loopback 拒起属运行时）。
  * - `port` 非法（非整数 / 越界 / 类型错）一律结构化报错（复用 `fail`），不静默降级。
+ * - `allowStdio`（v0.7.1 起随 stdio 退役成**死配置**）：显式出现仅 **warn + 忽略**，
+ *   **不 fail-fast**（避免旧部署因残留键直接起不来）；解析产物不再含该字段。
  */
 function parseWeb(v: unknown): WebConfig {
   const w = asRecord(v, "web");
   const enabledRaw = w["enabled"];
   const hostRaw = w["host"];
   const portRaw = w["port"];
-  const allowStdioRaw = w["allowStdio"];
+  if (w["allowStdio"] !== undefined) {
+    console.warn("[config] web.allowStdio 已退役（stdio transport 退役）：按死配置 warn + 忽略。");
+  }
   return {
     enabled: enabledRaw === undefined ? DEFAULT_WEB_ENABLED : asBool(enabledRaw, "web.enabled"),
     host: hostRaw === undefined ? DEFAULT_WEB_HOST : asString(hostRaw, "web.host"),
     port: portRaw === undefined ? DEFAULT_WEB_PORT : asPort(portRaw, "web.port"),
-    allowStdio:
-      allowStdioRaw === undefined
-        ? DEFAULT_WEB_ALLOW_STDIO
-        : asBool(allowStdioRaw, "web.allowStdio"),
   };
 }
 

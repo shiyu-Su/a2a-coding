@@ -8,7 +8,7 @@
 | 目录 | 作用 |
 |---|---|
 | `flow/spec/` | 内核（单一事实源）：`需求流程.md`（Step 0-3 骨架 / 判据 / 产出物 / planlog 与发版纪律）、`引擎映射.md`（步骤 ↔ Feature 状态 ↔ 驱动方）、`文档模板.md`（需求确认单 / 改造文档 / 派发消息模板）。 |
-| `flow/hosts/` | 适配层：各宿主如何注册本地 stdio MCP、如何旁路加载规范文本。 |
+| `flow/hosts/` | 适配层：各宿主如何注册 MCP、如何旁路加载规范文本。 |
 | `flow/install/` | 引入通道：`install.mjs` / `uninstall.mjs`，把规范旁路引入既有项目。 |
 
 规则：**流程正文只落在 `flow/spec/`**。宿主相关差异写进 `flow/hosts/`，机械变换写进 `flow/install/`。
@@ -35,7 +35,7 @@
 node flow/install/install.mjs --host opencode --orch <orch 单元路径>
 ```
 
-它做两件事：向宿主配置**新增** `mcp.a2a`（stdio MCP）；在宿主 `instructions` 追加 `flow/spec/` 两份规范文件。`--dry-run` 只打印将发生的改动。撤销：
+它做两件事：向宿主配置**新增** `mcp.a2a`（remote MCP）；在宿主 `instructions` 追加 `flow/spec/` 两份规范文件。`--dry-run` 只打印将发生的改动。撤销：
 
 ```bash
 node flow/install/uninstall.mjs --target <项目根>
@@ -55,14 +55,14 @@ node flow/install/uninstall.mjs --target <项目根>
 
 | 宿主 | 状态 | 说明 |
 |---|---|---|
-| opencode | 完整可用 | 注册 stdio MCP + `instructions` 旁路，`install.mjs` 自动完成。见 [hosts/opencode.md](./hosts/opencode.md)。 |
+| opencode | 完整可用 | 注册 remote MCP + `instructions` 旁路，`install.mjs` 自动完成。见 [hosts/opencode.md](./hosts/opencode.md)。 |
 | Claude Code | 指引 | 注册 `.mcp.json`；规范靠 `CLAUDE.md` 的 `@` 导入，需你手加一行引用。见 [hosts/claude-code.md](./hosts/claude-code.md)。 |
 | Codex | 指引 | 注册 `~/.codex/config.toml`；规范靠 `AGENTS.md`。见 [hosts/codex.md](./hosts/codex.md)。 |
 | Cursor | 指引 | 注册 `.cursor/mcp.json`；规范靠 `.cursor/rules/` 或 `AGENTS.md`。见 [hosts/cursor.md](./hosts/cursor.md)。 |
 
 v0.4.1 只把 opencode 路径做到完整可用，其余宿主给接入指引，自动注册留后续版本。
 
-> ⚠️ **两种形态不能共用同一份 orch config**（桥按自己读的 `config.json` 分派 stdio/http），细节见各 `hosts/*.md`。
+> ⚠️ 桥的运行形态由**桥自己读的 `config.json`** 决定，细节见各 `hosts/*.md`。
 
 ## 边界
 

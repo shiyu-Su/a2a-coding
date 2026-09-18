@@ -13,8 +13,8 @@
  * - `POST /shutdown`：**仅 loopback 来源**（Windows 无可靠 SIGTERM，优雅停机走此端点，§2.5）；
  *   先回 200 再触发停机，非 loopback → 403。
  * - `/runner/*`（v0.7.0 A3）：**委托** `options.runner`（`bridge/runner.ts`）处理，本层不做
- *   任何鉴权 / 形态判断 —— 该处理器的 `handle()` 自行完成「stdio 不注册 / 非 owner 503」门闩
- *   与路由匹配；未接 runner（stdio 形态 / 旧调用方）时 `/runner/*` 自然落 404（零回归）。
+ *   任何鉴权 / 判断 —— 该处理器的 `handle()` 自行完成「非 owner 503」门闩与路由匹配；
+ *   未接 runner 时 `/runner/*` 自然落 404（兜底）。
  *
  * 实现边界：HTTP 层用 `node:http`（SDK 的 express 助手依赖 express，而 orch 未声明该依赖，
  * 「不得新增第三方依赖」故不用）；绑定默认 loopback，非 loopback 地址打 warn（跨机鉴权待 v0.7.0）。
@@ -61,8 +61,8 @@ export interface HttpTransportOptions {
   onShutdown: () => void;
   /**
    * Runner 入站端点处理器（v0.7.0 A3；可选）。
-   * 由 `bridge/index.ts` 在 `transport.mode === "http"` 时经 `createRunnerEndpoints` 注入；
-   * 缺省（未注入）时 `/runner/*` 走 404 —— 即「stdio 形态不注册路由」在 HTTP 层的兜底。
+   * 由 `bridge/index.ts` 常驻 http 启动时经 `createRunnerEndpoints` 注入；
+   * 缺省（未注入）时 `/runner/*` 走 404（兜底）。
    */
   runner?: RunnerEndpointHandle;
 }

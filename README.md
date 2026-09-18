@@ -38,7 +38,7 @@ a2a-coding 让开发协作时 orch 只管派发任务；目标项目的执行 Ag
 ```mermaid
 flowchart TD
     USER([用户]) -->|需求讨论 / 任务派发| ORCH["orch Agent<br/>任意 MCP host（示例 opencode）"]
-    ORCH -->|"MCP stdio<br/>泛型工具 7 + Feature 工具组 5"| BRIDGE["MCP 薄桥 · orch/<br/>项目 → 机器解析 · 启动编排 · A2A Client · 任务态落库"]
+    ORCH -->|"MCP remote（Streamable HTTP）<br/>泛型工具 7 + Feature 工具组 5"| BRIDGE["MCP 薄桥 · orch/<br/>项目 → 机器解析 · 启动编排 · A2A Client · 任务态落库"]
     BRIDGE -->|"HTTP 长轮询（Runner ⇄ 桥）<br/>POST /runner/register · /runner/connect · /runner/result"| LAUNCHER["每机 Launcher→Runner · machine/<br/>本机项目自持 · Agent 生命周期 · 心跳/拉取"]
     LAUNCHER -->|拉起包装器（按 agentKind）| WRAP["A2A 包装器<br/>a2a-opencode / a2a-codex / a2a-claude"]
     WRAP -->|" CLI<br/>opencode run / codex exec / claude -p"| WS["目标 workspace 执行"]
@@ -72,6 +72,7 @@ flowchart TD
 - ✅ **静态分布，无中心注册**：项目到机器的映射来自配置，不做自注册、心跳、TTL 或服务发现。
 - ✅ **Runner 反向注册（v0.7.0 pull）**：Launcher 升格 Runner——出站注册（携带 machineId + projects + capabilities + selfCheck + protocolVersion）→ 长轮询拉取任务/指令 → 本地 ensure 执行 → 结果回传（outbox + ack，可重放）；入站 `/projects`·`/ensure`·`/{id}/stop` 退役（404）。
 - ✅ **按需幂等（pull 语义保持）**：命令族 dispatch/stop/cancel-task 均携 commandId；claim 用 CAS 幂等，控制面离线不清在飞任务（心跳失败只降注册态、不触发 stop）。
+- ✅ **常驻桥接入（v0.7.1）**：桥以**常驻进程**运行（`orch/scripts/bridgectl.mjs` 启停），orch 经 MCP `type: "remote"`（stateless Streamable HTTP，默认 `http://127.0.0.1:8787/mcp`）连接；**stdio 形态已退役**（不再由 orch agent 作为子进程拉起）。
 - ✅ **泛型 MCP 工具面**：orch 只经 `a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` / `a2a_events` / `a2a_wait` 通信，agent 增减无需重连或刷新工具面。其中 **`a2a_call` 的 `mode` 必填**（`"inquiry"` 只读询问 / `"execute"` 执行型派发，后者必带 `featureId`）—— **保证"执行必走引擎"**。
 - ✅ **项目组与选择性连接（v0.6.0）**：orch 侧可声明**静态项目组**（`orch/config/config.json` 的 `projectGroup.members`，成员 = `machineId × projectId`）。声明后 orch **只连「有成员的机器」、只用「列名成员的项目」** —— 未列成员的项目**不 ensure、不派发、不出现在 `a2a_projects`**；派发到非成员会**显式失败**（`project_not_a_member`，与「项目不存在」的 `project_not_found` 分开）。**段缺省时行为与旧版完全一致（全量接纳）**。`a2a_projects` 出参新增 `group` 字段（**恒存在**）。**machine 侧零改动、线协议不动、架构约束不变。**
 - ✅ **Feature 编排**：把一个需求作为 Feature，经状态机 + Task DAG 调度器跨项目自动派发，中途可停下审批 / 澄清；**同 project 粒度串行**（同一时刻最多一个任务在写同一工作区）、跨 project 并行；**失败只冻结依赖闭包**（未派发的下游），不带病继续也不连坐其它 project。
@@ -107,13 +108,13 @@ flowchart TD
 ### 环境要求
 
 - Node.js ≥ 22.5（会话 / 任务库用内置 `node:sqlite`）。
-- **orch agent 与 `orch/`（MCP 桥）的连接**：缺省为本地 stdio MCP server，由 orch agent 作为子进程拉起（须同机）；亦可让桥以**常驻进程**运行，orch 经 MCP `type: "remote"` 连接（见[常驻部署形态](#常驻部署形态)）。执行机器（Launcher + 项目 Agent）可在本机或远端。
+- **orch agent 与 `orch/`（MCP 桥）的连接**：**唯一形态 = 常驻桥 + MCP `type: "remote"`（stateless Streamable HTTP，默认 `http://127.0.0.1:8787/mcp`）**；stdio 形态已随 v0.7.1 退役，桥不再由 orch agent 作为子进程拉起。桥须经 `orch/scripts/bridgectl.mjs` 常驻启动（`cd orch && npm run bridge:start -- --no-wait`，再 `npm run bridge:status` 确认就绪，见[常驻部署形态](#常驻部署形态)）。连接不再要求桥与 orch agent 同机：桥可运行在任意可达主机（默认只绑 `127.0.0.1`，非 loopback 暴露须反代 + 鉴权）。执行机器（Launcher + 项目 Agent）可在本机或远端。
 - 执行机器按项目 `agentKind` 准备对应的 CLI 与认证（Launcher 从自身进程环境继承）：
   - `opencode`：PATH 上有 `opencode` CLI（三端中**唯一**需要预装 CLI 的 kind）；Launcher 会先拉起 `opencode serve` 作为前置后端。
   - `codex`：**无需在 PATH 安装全局 `codex` CLI**，`a2a-codex` 依赖已内置 codex 运行时（`@openai/codex` + 对应平台包，`npm install` 按 OS/arch 自动选择，SDK 自动解析）；仅需认证（`OPENAI_API_KEY`，或 `codex login` 生成的 `~/.codex/auth.json`），无前置后端。自定义网关经 `~/.codex/config.toml` 的 `[model_providers.*]` 配置：`base_url` 须为 OpenAI 兼容地址，注意 codex 会在其后拼接 `/responses`（`wire_api = "responses"`），网关地址需含版本段（如 `https://…/v1`）。如需指定其它 codex 版本 / 二进制，可用 `agentConfig.codex.codexPathOverride`。
   - `claude`：**无需在 PATH 安装全局 `claude` CLI**，`a2a-claude` 依赖已内置 Claude Code 运行时（`@anthropic-ai/claude-agent-sdk` + 对应平台包，`npm install` 按 OS/arch 自动选择）。默认**加载用户级配置**（`settingSources: ["user"]`，读取 `~/.claude/settings.json` 的模型 / 网关 / 认证 `env`），交互式 Claude Code 已配好的用户开箱即用。项目可显式覆盖：`agentConfig.claude.settingSources: []` 恢复完全隔离（此时需把 `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` 注入 **Launcher 进程环境**）；模型可写在该项目 `agentConfig.claude.model`（优先于用户配置）。如需指定其它 Claude Code 版本 / 二进制，可用 `agentConfig.claude.executablePathOverride`。
 - codex 项目的 `workspace` 默认只需指向一个目录，不必是 Git 仓库（Launcher 默认注入 `codex.skipGitRepoCheck: true`）；若要强制 Git 校验，可在该项目的 `agentConfig.codex` 里覆盖为 `false`。
-- orch（**任意支持本地 stdio MCP 的 agent**，如 opencode / Claude Code / Codex / Cursor）与执行机器的 CLI 都已配好模型 provider，否则无法调用模型。
+- orch（**任意支持 MCP `type: "remote"`（Streamable HTTP）的 agent**，如 opencode / Claude Code / Codex / Cursor）与执行机器的 CLI 都已配好模型 provider，否则无法调用模型。
 - Windows / macOS 均可，单元内的 CLI 参数已做跨平台处理。
 
 ### 安装
@@ -143,28 +144,32 @@ npm run build        # 产出 dist/bridge/index.js
 
 字段说明见 [配置说明](#配置说明) 与各单元 `config/config.json.default`。
 
-把 MCP 桥配进 orch agent。把下面这段加入 orch 宿主的 MCP 配置后重启 orch；下例为 opencode 的 `opencode.json`，**任何支持本地 stdio MCP 的 agent**（Claude Code、Codex、Cursor 等）同理，仅配置位置与格式不同：
+桥须先以常驻进程启动（v0.7.1 起 stdio 形态已退役，此为该桥唯一接入形态；桥进程的环境变量见[桥的环境变量](#桥的环境变量)）：
+
+```bash
+cd orch
+npm run bridge:start -- --no-wait   # 发起即返（exit 0 = 已发起，≠ 就绪）
+npm run bridge:status               # 确认就绪（pid / host:port / health / role / startedAt）
+```
+
+再把 `mcp.a2a` 配进 orch agent。把下面这段加入 orch 宿主的 MCP 配置后重启 orch；下例为 opencode 的 `opencode.json`，**任何支持 MCP `type: "remote"`（Streamable HTTP）的 agent**（Claude Code、Codex、Cursor 等）同理，仅配置位置与格式不同：
 
 ```json
 {
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "a2a": {
-      "type": "local",
-      "command": ["node", "G:/code/a2a-coding/orch/dist/bridge/index.js"],
-      "environment": {
-        "MACHINES_CONFIG": "G:/code/a2a-coding/orch/config/config.json",
-        "SESSION_DB": "G:/code/a2a-coding/orch/data/sessions.sqlite"
-      },
+      "type": "remote",
+      "url": "http://127.0.0.1:8787/mcp",
       "enabled": true
     }
   }
 }
 ```
 
-把 `command` 的路径换成实际部署路径即可。`MACHINES_CONFIG` 与 `SESSION_DB` 缺省时分别回退到 orch 单元根的 `config/config.json` 与 `./data/sessions.sqlite`。若 orch 不是 opencode，按该 agent 的方式登记同一个 stdio MCP server（`command` 与环境变量一致）即可，桥本身不绑定任何宿主。仓库内 `orch/opencode.json.example` 是一份把 `mcp.a2a` 配进 orch 的样例。
+`url` 默认即 `http://127.0.0.1:8787/mcp`（= `transport.http` 的 `host:port/path`，见下）；桥可运行在任意可达主机，改 `url` 指向实际地址即可（默认只绑 loopback，跨机暴露须反向代理 + 鉴权）。若 orch 不是 opencode，按该 agent 登记 remote MCP server / Streamable HTTP 端点的方式配置同一 URL 即可，桥本身不绑定任何宿主。仓库内 `orch/opencode.json.example` 与根 `opencode.json.example` 都是把 `mcp.a2a` 配进 orch 的样例。
 
-> **两种连接形态**：缺省 stdio，桥由 orch agent 作为子进程拉起，须与 orch agent 同机；**常驻**模式下桥以独立进程运行，暴露 stateless Streamable HTTP（默认绑 `127.0.0.1`，路由 `/mcp`），orch 经 MCP `type: "remote"` 连接。常驻部署见[常驻部署形态](#常驻部署形态)。
+> **唯一接入形态（v0.7.1）**：**常驻桥 + MCP `type: "remote"`**（stateless Streamable HTTP，默认绑 `127.0.0.1`、端口 `8787`、路由 `/mcp`）。stdio 形态已退役：桥不再作为 orch agent 的子进程拉起，`transport.mode = "stdio"` 会被拒绝（fail-fast）。常驻部署见[常驻部署形态](#常驻部署形态)。
 
 ### 运行
 
@@ -234,7 +239,7 @@ a2a_feature_advance(featureId="<id>", retryTaskIds=["<失败节点 taskId>"])
 
 3. 填两份配置：`machine/config/config.json` 的 `projects[]`（本机项目），`orch/config/config.json` 的 `machines[]`（机器 → Launcher 地址）。字段说明见[配置说明](#配置说明)。
 
-4. 启动宿主（如 opencode）：按 [opencode.json.example](opencode.json.example) 建 `opencode.json`，经 `instructions` 加载 `flow/spec/`，并注册 `mcp.a2a`。
+4. 启动桥与宿主：先 `cd orch && npm run bridge:start -- --no-wait` 并 `npm run bridge:status` 确认就绪（桥为常驻进程，stdio 形态已退役）；宿主（如 opencode）按 [opencode.json.example](opencode.json.example) 建 `opencode.json`，经 `instructions` 加载 `flow/spec/`，并以 remote 形态注册 `mcp.a2a`（默认 `http://127.0.0.1:8787/mcp`）。
 
 5. 验证：在宿主里调用 `a2a_projects()`，能列出项目即接入成功。
 
@@ -314,7 +319,7 @@ node flow/install/uninstall.mjs --target <项目根>
 
 ### orch：`orch/config/config.json`
 
-orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自持（实际配置 `config/config.json` 不入库，首次部署从 `config/config.json.default` 复制并填入真实机器地址）。字段为 `machines[]`（每项含 `machineId` + `launcherUrl`）与可选的 `callback`。
+orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自持（实际配置 `config/config.json` 不入库，首次部署从 `config/config.json.default` 复制并填入真实机器地址）。字段为 `machines[]`（每项含 `machineId` + `launcherUrl`）与可选的 `transport`（桥接入面，见[常驻部署形态](#常驻部署形态)）、`callback`、`web`。
 
 | 字段 | 说明 | 默认值 | 必填 |
 |------|------|--------|------|
@@ -326,10 +331,13 @@ orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自
 | `callback.host` | 事件端点绑定地址（建议 loopback） | `127.0.0.1` | 否 |
 | `callback.port` | 事件端点监听端口 | - | `callback.enabled=true` 时是 |
 | `callback.token` | 事件端点校验令牌（worker 推送时携带）；不填则不校验 | 不校验 | 否 |
+| `transport` | 桥接入面配置（**可选**）；v0.7.1 起桥只有常驻 HTTP 形态 | 不设置（按 http 缺省启动） | 否 |
+| `transport.mode` | 只允许 `"http"`；显式 `"stdio"` 会被拒绝（fail-fast，stdio 形态已退役） | `"http"` | 否 |
+| `transport.http` | 常驻 HTTP 监听配置 `{ host, port, path }` | `{ "host": "127.0.0.1", "port": 8787, "path": "/mcp" }` | 否 |
 | `web.enabled` | 只读工作台开关（页面 + `/api/*`）；**仅常驻（http）形态 + 仅 `owner` 实例**真正 bind | `true` | 否 |
 | `web.host` | 只读工作台绑定地址（建议 loopback） | `127.0.0.1` | 否 |
 | `web.port` | 只读工作台监听端口 | `3300` | 否 |
-| `web.allowStdio` | stdio 形态下是否也开工作台；缺省 `false`（stdio 下桥是宿主 agent 的子进程，开页面会形成「页面依赖 agent」的循环） | `false` | 否 |
+| `web.allowStdio` | 旧字段：stdio 形态（v0.7.1 已退役）下是否也开工作台；现无实际作用，保留仅为旧配置兼容 | `false` | 否 |
 
 ```json
 {
@@ -343,7 +351,7 @@ orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自
 
 > `callback` 默认关闭：跨机回调受鉴权边界约束（跨机鉴权待后续），当前仅同机 / 受信网络可 opt-in。关闭或端点不可达时，任务终态仍由 `task-watcher` 轮询对账兜底落库。
 
-> `web`（只读工作台）：缺省**仅常驻（`transport.mode=http`）形态 + 仅 `owner` 实例**提供页面（`allowStdio: false` —— stdio 形态下桥是宿主 agent 的子进程，开页面会形成「页面依赖 agent」的循环）；端口被占 ⇒ **warn 降级、不伤 MCP**；只读、仅 loopback、**无鉴权** ⇒ 暴露到本机之外须先有 v0.7.0 的跨机鉴权。`/api/events` **直连 `listEvents`**，不会推移宿主收件箱的读游标。
+> `web`（只读工作台）：缺省**仅常驻（`transport.mode=http`）形态 + 仅 `owner` 实例**提供页面（`allowStdio` 为旧字段，随 stdio 形态退役、现无实际作用）；端口被占 ⇒ **warn 降级、不伤 MCP**；只读、仅 loopback、**无鉴权** ⇒ 暴露到本机之外须先有 v0.7.0 的跨机鉴权。`/api/events` **直连 `listEvents`**，不会推移宿主收件箱的读游标。
 
 环境变量 `MACHINES_CONFIG` 可指定其他清单文件；缺省为 `config/config.json`（模板 `config/config.json.default`）。
 
@@ -457,7 +465,7 @@ a2a-coding/
 │  ├─ types.ts  config.ts  app-root.ts
 │  ├─ bridge/index.ts             # MCP 薄桥：泛型 7 + Feature 工具组 5；派发主链 dispatchTask
 │  ├─ bridge/register-tools.ts    # 工具注册：createServer(core) 工厂 + registerTools(server, core)
-│  ├─ bridge/transports/{stdio,http,web}.ts  # 接入面：stdio（缺省）/ stateless Streamable HTTP（/mcp /health /shutdown）/ 只读工作台 HTTP（/ · /api/*）
+│  ├─ bridge/transports/{http,web}.ts  # 接入面：stateless Streamable HTTP（/mcp /health /shutdown）/ 只读工作台 HTTP（/ · /api/*）（stdio 已于 v0.7.1 退役）
 │  ├─ bridge/web/html.ts          # 只读工作台单页（两面板，纯函数渲染）
 │  ├─ runtime/{lifecycle,core-lease}.ts  # 启停编排与排空 + core 租约（单调度权，role owner/follower）
 │  ├─ scripts/bridgectl.mjs       # 桥启停脚本（start/stop/restart/status/logs）
@@ -480,6 +488,8 @@ a2a-coding/
 │  ├─ scripts/                    # 验证脚本：verify-session-persist{,-codex,-claude}.mjs、verify-config-precedence.mjs
 │  ├─ agents/                     # 运行态：launcher 生成的包装器配置（git 忽略）
 │  └─ .a2a/                       # 运行态：包装器会话映射 sessions.json（git 忽略）
+├─ scripts/                       # 宿主侧编排辅助脚本（**非部署单元**；宿主直接维护/执行，在单元 deny 面之外）
+│  └─ watch-feature.mjs           # 只读监视一个 Feature 至「需宿主动作」时点（完成/失败收敛静止/needs_input/终态），经 orch 只读 web API
 ├─ flow/                          # 需求流程规范包：spec 内核 / hosts 适配 / install 旁路引入（不参与 npm 构建）
 ├─ package.json                   # 仓级 dev manifest（version / type）
 └─ CHANGELOG.md  README.md
@@ -510,12 +520,12 @@ a2a-coding/
 
 ### 构建
 
-- orch（MCP 桥）：`cd orch && npm run build`，产出 `dist/bridge/index.js`。缺省以 stdio MCP server 运行，由 orch agent 作为子进程拉起；亦可经 `npm run bridge:start` 以常驻进程运行（见[常驻部署形态](#常驻部署形态)）。
+- orch（MCP 桥）：`cd orch && npm run build`，产出 `dist/bridge/index.js`。桥以**常驻进程**运行（v0.7.1 起 stdio 形态已退役，此为该桥唯一形态），经 `npm run bridge:start` 启动（见[常驻部署形态](#常驻部署形态)）。
 - machine（Launcher）：`npm install` 时 `postinstall` 自动执行 `patch-package` 应用会话落盘补丁；`npm run launcher` 先 `tsc` 构建再运行 `dist/launcher/index.js`（前台，仅作调试）。
 
 ### 常驻部署形态
 
-桥缺省以 stdio 形态运行，行为不变；亦可改为**常驻进程**独立部署，编排内核不再随 orch 宿主会话结束而停摆。在 `orch/config/config.json` 增 `transport` 段即可切换（`transport` 缺失即 stdio，旧配置零改动可用）：
+v0.7.1 起 stdio 形态已退役：**常驻进程**是桥的唯一运行形态，编排内核不随 orch 宿主会话结束而停摆。`orch/config/config.json` 的 `transport` 段为**可选**配置 —— 缺省即按 http 形态启动；`mode` 只允许 `"http"`，显式 `"stdio"` 会被拒绝（fail-fast）。配置形如：
 
 ```json
 {
@@ -526,7 +536,7 @@ a2a-coding/
 }
 ```
 
-常驻形态以 **stateless Streamable HTTP** 暴露 MCP（`sessionIdGenerator: undefined`），路由为 `POST /mcp`（主）、`GET /health`（就绪 / `role`）、`POST /shutdown`（仅接受 loopback，优雅停机）。宿主侧把 `mcp.a2a` 换成 remote 形态：
+常驻形态以 **stateless Streamable HTTP** 暴露 MCP（`sessionIdGenerator: undefined`），路由为 `POST /mcp`（主）、`GET /health`（就绪 / `role`）、`POST /shutdown`（仅接受 loopback，优雅停机）。宿主侧 `mcp.a2a` 唯一形态即 remote：
 
 ```json
 "mcp": { "a2a": { "type": "remote", "url": "http://127.0.0.1:8787/mcp", "enabled": true } }
@@ -548,7 +558,7 @@ npm run bridge:logs                 # 输出日志全文（支持 --lines N / --
 - pidfile：`orch/data/bridge.pid`；日志：`orch/data/logs/bridge.log`。
 - **单实例与单调度权靠 core 租约**（`orch/data/core.lock`）：只有租约持有者运行 scheduler 与 task-watcher；同一 data dir 的第二个实例降级为 `follower`，照常提供 MCP 工具但不跑后台循环。`GET /health` 会报当前 `role`（`owner` / `follower`）。
 - 端口被占则 **fail fast**，且不写 pidfile；pidfile 陈旧无害，只探测不误杀。
-- 默认只绑 `127.0.0.1`；非 loopback 暴露需反向代理 + 鉴权。回滚：宿主配置改回 `type: "local"` 并 `npm run bridge:stop`，行为退回 stdio 现状。
+- 默认只绑 `127.0.0.1`；非 loopback 暴露需反向代理 + 鉴权。停止：`npm run bridge:stop`（stdio 形态已退役，无 `type: "local"` 回退路径）。
 
 ### 服务启停（`machine/scripts/launcherctl.mjs`）
 
@@ -599,7 +609,7 @@ Launcher 被硬杀（`taskkill /F`、崩溃、断电）时，它拉起的项目 
 ## 常见问题
 
 **Q：orch agent 与 `orch/`（MCP 桥）必须同机吗？**
-不一定。缺省 stdio 形态下桥由 orch agent 作为子进程拉起，须与 orch agent 同机；常驻形态下桥以独立进程运行并暴露 stateless Streamable HTTP，orch 经 MCP `type: "remote"` 连接（见[常驻部署形态](#常驻部署形态)）。执行机器（Launcher + 项目 Agent）可在本机或远端。
+不必须。桥以**常驻进程**运行并暴露 stateless Streamable HTTP（v0.7.1 起 stdio 形态已退役，此为唯一接入形态），orch 经 MCP `type: "remote"` 连接（见[常驻部署形态](#常驻部署形态)）。默认只绑 `127.0.0.1`，故同机是最简部署；桥放在可达的其它主机（改 `url` + 反代鉴权）亦可。执行机器（Launcher + 项目 Agent）可在本机或远端。
 
 **Q：`codex` / `claude` 需要预先安装全局 CLI 吗？**
 不需要。`a2a-codex` 与 `a2a-claude` 依赖已内置对应运行时，`npm install` 按 OS/arch 自动选择；只需准备认证。三端中只有 `opencode` 需要 PATH 上有 `opencode` CLI。

@@ -1,15 +1,14 @@
 /**
  * 桥内统一日志（REQ-v0.4.1-2026-09-15-02，日志收口）。
  *
- * 为什么存在：桥以 **stdio** 承载 MCP JSON-RPC，`stdout` 就是协议通道——
- * 任何 `console.log` 都会污染协议流、破坏宿主解析。本模块是桥内观测日志的
- * 统一出口：**只写 stderr（或被显式重定向的文件），绝不写 stdout**。
+ * 为什么存在：桥内观测日志必须与 MCP 响应通道隔离 —— 本模块是统一出口：
+ * **只写 stderr（或被显式重定向的文件），绝不写 stdout**（避免污染宿主对进程输出的解析）。
  *
  * 形态：结构化 JSON 行（一行一条），字段固定为
  * `{ ts, level, scope, msg, data? }`（`ts` 为 UTC ISO 8601）。
  *
  * 重定向：环境变量 `BRIDGE_LOG_FILE` 指向文件时改写该文件（追加，父目录自动创建）；
- * 未设置时写 stderr（stdio 模式下的安全默认）。可选 `BRIDGE_LOG_LEVEL` 过滤，
+ * 未设置时写 stderr（桥的安全默认）。可选 `BRIDGE_LOG_LEVEL` 过滤，
  * 默认 `debug`（全量），因此不改变既有日志的输出时机与语义。
  *
  * 约束：不引入新依赖（仅 Node 内置）；日志写失败一律吞掉，绝不影响业务。
@@ -106,7 +105,7 @@ function log(level: LogLevel, scope: string, msg: string, data?: Record<string, 
   emit(serialize(record));
 }
 
-/** 桥内统一日志出口（stdio 安全：只写 stderr / 重定向文件，绝不写 stdout）。 */
+/** 桥内统一日志出口（只写 stderr / 重定向文件，绝不写 stdout）。 */
 export const bridgeLog = {
   debug: (scope: string, msg: string, data?: Record<string, unknown>): void =>
     log("debug", scope, msg, data),

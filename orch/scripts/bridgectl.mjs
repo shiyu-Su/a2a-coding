@@ -122,7 +122,7 @@ function findBridgeRoot(startDir) {
   }
 }
 
-/** 读取配置里脚本关心的字段（transport 模式 / host / port / path；`transport` 缺失 = stdio 旧行为） */
+/** 读取配置里脚本关心的字段（transport 模式 / host / port / path；`transport` 缺失 = 常驻 http 缺省） */
 function loadConfig() {
   let raw;
   try {
@@ -131,7 +131,8 @@ function loadConfig() {
     fail(`无法读取配置 ${CONFIG_PATH}：${err instanceof Error ? err.message : String(err)}`);
   }
   const transport = raw?.transport;
-  const mode = transport?.mode === "http" ? "http" : "stdio";
+  // stdio 已退役：仅显式 "stdio" 才判 stdio（随后 cmdStart fail-fast），其余（含缺省）= http
+  const mode = transport?.mode === "stdio" ? "stdio" : "http";
   const http = transport?.http;
   const host =
     typeof http?.host === "string" && http.host.length > 0 ? http.host : DEFAULT_HTTP_HOST;
@@ -678,8 +679,8 @@ async function cmdStart(flags) {
   const config = loadConfig();
   if (config.mode !== "http") {
     fail(
-      `配置 ${config.path} 的 transport.mode=${config.mode}（非 http）：桥为 stdio 接入面、无常驻端口，bridgectl 无法后台化。` +
-        `请将该段设为 "transport": { "mode": "http", "http": { "host": "127.0.0.1", "port": <非默认端口> } } 后重试。`,
+      `配置 ${config.path} 的 transport.mode=${config.mode}：stdio transport 已退役（桥会解析期 fail-fast），bridgectl 无法后台化。` +
+        `请删除 "transport.mode"（缺省即 http）或将其改为 "http" 后重试。`,
     );
   }
 

@@ -3,14 +3,14 @@
  *
  * 职责：把「开 store → 抢 core 租约 → 起后台循环 → 就绪」与
  * 「停调度 → 排空在飞 → 关 store → 释放租约 → 清 pidfile」的**顺序**固化成一处，
- * 供 stdio / http 两个接入面共用（接线由后续节点负责，本模块不改 `bridge/index.ts`）。
+ * 供 HTTP 接入面复用（接线由后续节点负责，本模块不改 `bridge/index.ts`）。
  *
  * 两条硬规则：
  * 1. **只有 core 租约持有者（owner）启动 scheduler + task-watcher**；`follower` 不跑任何
  *    后台循环（记 warn + `role=follower`），只提供 MCP 工具面 —— 这是对付"多桥同抢一批节点"
  *    的第二道防线（第一道是 core 租约本身的原子建锁）。
- * 2. **`unref` 按模式**：stdio 维持现状（定时器 `unref`，不持有进程，桥随宿主退出）；
- *    常驻（http）**不得 `unref`**（否则进程会自行退出）。模式不硬编码进 scheduler/watcher。
+ * 2. **定时器不 `unref`**：桥恒常驻 http（stdio 已退役），由 HTTP listener 持住进程；
+ *    `unref` 会让「无其它句柄」时进程自行退出。模式不硬编码进 scheduler/watcher。
  *
  * 排空调度（停机）：`scheduler.stop()` → 等待 scheduler 在飞派发 + task-watcher 在飞看护
  * 至宽限上限（`drainGraceMs`）→ 停 watcher → 关 store → 释放租约 → 删 pidfile。
@@ -32,14 +32,6 @@ import {
   type CoreLeaseInfo,
   type CoreRole,
 } from "./core-lease.js";
-
-/**
- * stdio 模式是否对后台定时器 `unref()`：
- * **是**（不持有进程，桥随宿主退出）；常驻 http 模式 **否**（由连接持有进程）。
- */
-export function unrefTimerForMode(mode: TransportMode): boolean {
-  return mode === "stdio";
-}
 
 /** 停机排空宽限上限（ms，可配 `BRIDGE_DRAIN_GRACE_MS`，默认 30s） */
 export function readDrainGraceMs(
@@ -82,7 +74,7 @@ export function createDefaultWatcher(): LifecycleWatcher {
 export interface BridgeRuntimeOptions {
   /** `orch/data`（core.lock 落点；须为**绝对路径**，常驻化不得 cwd 相对） */
   dataDir: string;
-  /** 桥 transport 模式（决定 unref 与日志形态） */
+  /** 桥 transport 模式（恒 `http`；仅用于 pidfile / 锁诊断与日志形态） */
   mode: TransportMode;
   /** 调度器句柄（由 bridge 装配后注入） */
   scheduler: LifecycleScheduler;
@@ -176,8 +168,8 @@ export class BridgeRuntime {
     if (lease.role === "owner") {
       // 3) 启动 watcher（owner 门闩打开，后续 startTaskWatcher 才受理）
       this.watcher.setEnabled(true);
-      // 4) 启动 scheduler（unref 按模式；role 双保险门闩）
-      scheduler.start({ unref: unrefTimerForMode(mode), role: "owner" });
+      // 4) 启动 scheduler（桥恒常驻 http：不 unref；role 双保险门闩）
+      scheduler.start({ unref: false, role: "owner" });
       // 5) 重启恢复（写库收敛在飞节点；必须在就绪信号之前）
       recovery = scheduler.recover();
       this.writePidFile();

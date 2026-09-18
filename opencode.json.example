@@ -2,18 +2,9 @@
   "$schema": "https://opencode.ai/config.json",
   "mcp": {
     "a2a": {
-      "type": "local",
-      "command": ["node", "<orch>/dist/bridge/index.js"],
-      "environment": {
-        "MACHINES_CONFIG": "<orch>/config/config.json",
-        "SESSION_DB": "<orch>/data/sessions.sqlite"
-      },
-      "enabled": true
-    },
-    "a2a-remote": {
       "type": "remote",
       "url": "http://127.0.0.1:8787/mcp",
-      "enabled": false
+      "enabled": true
     }
   },
   "instructions": [

@@ -22,7 +22,6 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { TaskState as A2aTaskState, taskStateFromJSON } from "@a2a-js/sdk";
-import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { appRootFromModule } from "../app-root.js";
 import { defaultProjectGroup, loadMachinesConfig, memberKey } from "../config.js";
 import { BRIDGE_VERSION } from "../version.js";
@@ -110,7 +109,6 @@ import {
   startHttpTransport,
   type HttpTransportHandle,
 } from "./transports/http.js";
-import { startStdioTransport } from "./transports/stdio.js";
 import { startWebTransport, type WebTransportOutcome } from "./transports/web.js";
 // 挂载态常量（单一事实源在 register-tools.ts）：index → register-tools 的运行时 import 安全
 // （register-tools 对 index 仅 **type-only** 引用，擦除后无环）
@@ -582,8 +580,8 @@ type CallOutcome = CallSuccess | Failure;
  * 进程级 Runner 入站端点处理器（v0.7.0 A4）。
  *
  * 仅 `transport.mode === "http"` 时在 `startHttpBridge` 创建并注入 `startHttpTransport`
- * （`/runner/*` 路由 + `wake` 立即下发共用同一实例）；stdio 形态保持 `null`
- * ⇒ 既不注册 `/runner/*`，`wake` 亦为 no-op（零回归）。
+ * （`/runner/*` 路由 + `wake` 立即下发共用同一实例）；未接线时保持 `null`
+ * ⇒ 既不注册 `/runner/*`，`wake` 亦为 no-op（单测 / 早退路径零回归）。
  */
 let runnerEndpoints: RunnerEndpointHandle | null = null;
 
@@ -1276,7 +1274,7 @@ type CancelOutcome =
  *
  * 桥侧**不再** `tasks/cancel`（A2A 出站退役）。命令为**异步投递**：本函数返回「已下发」，
  * 任务态仍以本地回传落库为准（宿主按 `a2a_task_status` 观察）。
- * 非成员 ⇒ `project_not_a_member`（零 I/O）；stdio 形态无 Runner 端点 ⇒ `cancel_unavailable`。
+ * 非成员 ⇒ `project_not_a_member`（零 I/O）；无 Runner 端点（未接线 / 非 owner）⇒ `cancel_unavailable`。
  */
 async function handleCancel(taskId: string): Promise<CancelOutcome> {
   const lookup = resolveTaskLookup(taskId);
@@ -1874,9 +1872,7 @@ export function createCore(): BridgeCore {
   };
 }
 
-/** 当前活动 MCP server（stdio 路径由 `main()` 装配；供 `shutdown()` 关闭） */
-let activeServer: McpServer | null = null;
-/** 常驻 HTTP 接入面句柄（http 模式；停机第一步先停收新请求） */
+/** 常驻 HTTP 接入面句柄（停机第一步先停收新请求） */
 let activeHttp: HttpTransportHandle | null = null;
 /**
  * 只读网页接面句柄（v0.5.0 §2.5；**仅在形态门 + `owner` 同时成立时**才有值）。
@@ -1895,43 +1891,36 @@ let stopping = false;
 const DATA_DIR = dirname(process.env["SESSION_DB"] ?? DEFAULT_SESSION_DB);
 
 // ---------------------------------------------------------------------------
-// 启动（按 `config.transport.mode` 分派：stdio 为默认接入面，http 为常驻接入面）
+// 启动（stdio 退役后**恒常驻 http**；不再有按 mode 的分派）
 // ---------------------------------------------------------------------------
 
-/** transport 配置（懒加载 + 进程内缓存；读取失败回落 stdio 默认，与旧配置行为一致） */
+/** transport 配置（懒加载 + 进程内缓存） */
 let cachedTransportConfig: TransportConfig | null = null;
 let transportConfigLoaded = false;
 
-/** 配置缺失 / 非法时的兜底（取值与 `config.ts` 缺省一致） */
-const FALLBACK_TRANSPORT: TransportConfig = {
-  mode: "stdio",
-  http: { host: "127.0.0.1", port: 8787, path: "/mcp" },
-};
-
+/**
+ * 读取桥 transport 配置。**fail-fast（不 bind）**：读配置失败**绝不回落默认** ——
+ * 否则坏配置会静默 bind 默认 8787、掩盖问题。stdio 退役后唯一合法 `mode` = `"http"`
+ * （显式 `"stdio"` 由 `config.ts` 解析期拒绝）。抛出由入口 `main().catch` 收敛为 exit 1。
+ */
 function transportConfig(): TransportConfig {
   if (!transportConfigLoaded) {
     transportConfigLoaded = true;
-    try {
-      cachedTransportConfig = loadMachinesConfig(MACHINES_CONFIG_PATH).transport;
-    } catch (err) {
-      // 与 `callbackConfig()` 一致：配置缺失 / 非法不阻塞启动，回落 stdio（旧行为）
-      bridgeLog.error("a2a-bridge", `加载 transport 配置失败（回落 stdio）：${toMessage(err)}`);
-      cachedTransportConfig = null;
-    }
+    cachedTransportConfig = loadMachinesConfig(MACHINES_CONFIG_PATH).transport;
   }
-  return cachedTransportConfig ?? FALLBACK_TRANSPORT;
+  if (cachedTransportConfig === null) {
+    throw new Error(
+      "[a2a-bridge] transport 配置不可用（加载失败）：拒绝回落默认端口，请修复配置后重启",
+    );
+  }
+  return cachedTransportConfig;
 }
 
-function transportMode(): TransportMode {
-  return transportConfig().mode;
-}
-
-/** web 配置缺失 / 非法时的兜底（取值与 `config.ts` 缺省一致：常驻启用、stdio 不启用、127.0.0.1:3300） */
+/** web 配置缺失 / 非法时的兜底（取值与 `config.ts` 缺省一致：常驻启用、127.0.0.1:3300） */
 const FALLBACK_WEB: WebConfig = {
   enabled: true,
   host: "127.0.0.1",
   port: 3300,
-  allowStdio: false,
 };
 
 /** 网页只读工作台配置（懒加载 + 进程内缓存；读取失败回落默认，与 transport 同策略） */
@@ -1946,7 +1935,7 @@ function webConfig(): WebConfig {
     } catch (err) {
       bridgeLog.error(
         "a2a-bridge",
-        `加载 web 配置失败（回落默认：常驻启用 / stdio 不启用）：${toMessage(err)}`,
+        `加载 web 配置失败（回落默认：常驻启用 127.0.0.1:3300）：${toMessage(err)}`,
       );
       cachedWebConfig = null;
     }
@@ -1956,7 +1945,7 @@ function webConfig(): WebConfig {
 
 /**
  * 开 store + 启动清理（lifecycle 的 `openStore` 钩子）。
- * 与既有 stdio 启动同序：先开库（迁移）再 `pruneTasks()`；清理失败只记日志、不阻塞启动。
+ * 与既有启动同序：先开库（迁移）再 `pruneTasks()`；清理失败只记日志、不阻塞启动。
  */
 function openStoreAndPrune(): void {
   getDefaultStore();
@@ -1970,10 +1959,10 @@ function openStoreAndPrune(): void {
 
 /**
  * 装配运行时编排（§2.5）：开 store → 抢 core 租约 → 启动 watcher → 启动 scheduler →
- * `recover()` → 就绪。`unref` 由 lifecycle 按模式给出（stdio=true / http=false）。
+ * `recover()` → 就绪。`unref` 恒 `false`（桥恒常驻 http，由 HTTP listener 持住进程）。
  *
- * pidfile **仅常驻模式**写：stdio 桥由宿主作为子进程拉起，若也写 `<dataDir>/bridge.pid`
- * 会覆盖常驻进程的记录（N7 `bridgectl status/stop` 会认错进程）。
+ * pidfile **恒写**：stdio 桥（由宿主作为子进程拉起、会覆盖常驻进程记录）已退役，
+ * 不再存在「两形态共用 dataDir 而 pidfile 打架」的场景。
  */
 function createBridgeRuntime(mode: TransportMode): BridgeRuntime {
   return new BridgeRuntime({
@@ -1981,11 +1970,11 @@ function createBridgeRuntime(mode: TransportMode): BridgeRuntime {
     mode,
     scheduler,
     openStore: openStoreAndPrune,
-    pidFile: mode === "http" ? defaultPidFile(DATA_DIR) : null,
+    pidFile: defaultPidFile(DATA_DIR),
   });
 }
 
-/** 启动恢复摘要（lifecycle 只回摘要不落日志；此处补日志，承接旧 stdio 路径的 recover 日志） */
+/** 启动恢复摘要（lifecycle 只回摘要不落日志；此处补日志） */
 function logRecoverySummary(recovery: unknown): void {
   const r = asRecord(recovery);
   if (r === null) return;
@@ -2002,19 +1991,17 @@ function logRecoverySummary(recovery: unknown): void {
 /**
  * 网页只读接面接线（v0.5.0 §2.5）：**必须在 `runtime.start()` 之后**调用（否则拿不到 `role`）。
  *
- * 判定式（单一表达式，与 `config.ts` / `types.ts` 注释同源）：
- * `(mode === "http" ? web.enabled : web.allowStdio) && role === "owner"`。
- * - follower **一律不 bind**（同机多桥互抢端口随之消失）；http 形态不读 `allowStdio`，
- *   stdio 形态不读 `enabled`（见 `config.ts` 语义收窄）；
- * - stdio 缺省不 bind：桥是 orch agent 的子进程，由它提供页面会与「网页启动 agent」构成死循环；
+ * 判定式（单一表达式，与 `config.ts` / `types.ts` 注释同源）：`web.enabled && role === "owner"`
+ * （v0.7.1 stdio 退役后形态门只剩「常驻启用」这一维）。
+ * - follower **一律不 bind**（同机多桥互抢端口随之消失）；
  * - **不 throw**：非 loopback / 端口被占 / 未启用 ⇒ 不 bind 且不报错（`startWebTransport` 自吞，
  *   返回未启用句柄）；「无页面」是合法状态，**MCP 工具面不受影响**；
- * - stdio 形态 bind 时 `unref`（否则 listener 持住事件循环 ⇒ 桥不随宿主退出 ⇒ 子进程泄漏）。
+ * - listener 不 `unref`：桥恒常驻 http（由 HTTP listener 持住进程），`shutdown()` 会显式关闭。
  */
 async function startWebIfEnabled(mode: TransportMode, readiness: RuntimeReadiness): Promise<void> {
   const web = webConfig();
   // 顺序反转（§2.5 (a)）：此处已过 `runtime.start()` ⇒ `readiness.role` 是权威角色
-  const shapeEnabled = mode === "http" ? web.enabled : web.allowStdio;
+  const shapeEnabled = web.enabled;
   if (!shapeEnabled || readiness.role !== "owner") {
     bridgeLog.info(
       "a2a-bridge",
@@ -2037,7 +2024,6 @@ async function startWebIfEnabled(mode: TransportMode, readiness: RuntimeReadines
         startedAt: readiness.startedAt,
       }),
       version: BRIDGE_VERSION,
-      unref: mode === "stdio",
     });
   } catch (err) {
     // 兜底：网页接面**绝不允许**拖垮 MCP 工具面（契约上 `startWebTransport` 不 throw）
@@ -2046,27 +2032,6 @@ async function startWebIfEnabled(mode: TransportMode, readiness: RuntimeReadines
       `网页接面接线异常（已忽略，MCP 工具面不受影响）：${toMessage(err)}`,
     );
   }
-}
-
-/**
- * stdio 接入面（默认）：接入面 + 生命周期编排。
- * 相对旧路径唯一的行为差异是**多一道 core 租约门闩**：owner 照常跑 scheduler/watcher；
- * follower（他进程已持调度权）只提供工具面（§2.4 / §2.8 单桥约束）。
- */
-async function startStdioBridge(): Promise<void> {
-  const runtime = createBridgeRuntime("stdio");
-  activeRuntime = runtime;
-  const readiness: RuntimeReadiness = runtime.start();
-  logRecoverySummary(readiness.recovery);
-  // 启动 worker 回调端点（v0.4.0 §2.6；`callback.enabled` 默认关，关闭时 startCallbackServer 空操作）
-  startCallbackServer(callbackConfig());
-  const core = createCore();
-  activeServer = await startStdioTransport(core);
-  console.error(
-    `[a2a-bridge] MCP stdio server ready（role=${readiness.role}）: a2a_projects / a2a_tasks / a2a_call / a2a_task_status / a2a_cancel / a2a_feature_create / a2a_feature_status / a2a_feature_advance / a2a_feature_approve / a2a_feature_cancel`,
-  );
-  // 网页接面在接入面就绪**之后**接线（缺省不 bind；`allowStdio=true` 时经 unref 了才不持进程）
-  await startWebIfEnabled("stdio", readiness);
 }
 
 /**
@@ -2089,7 +2054,6 @@ async function startHttpBridge(): Promise<void> {
    * `config` 现读 ⇒ token / projectGroup / `runner.holdMs` 热改即时生效（与桥其余路径一致）。
    */
   runnerEndpoints = createRunnerEndpoints({
-    mode: transportMode,
     role: () => runtime.currentRole,
     config: () => loadMachinesConfig(MACHINES_CONFIG_PATH),
     // A7 接线：Runner 事件（registered/online/offline/claimed/stale）落库后立即唤醒 a2a_wait 订阅者
@@ -2123,12 +2087,9 @@ async function startHttpBridge(): Promise<void> {
   await startWebIfEnabled("http", readiness);
 }
 
+/** 桥入口：stdio 退役后**恒常驻 http**（`startHttpBridge` 先 `listen` ⇒ 端口被占即 fail-fast）。 */
 async function main(): Promise<void> {
-  if (transportMode() === "http") {
-    await startHttpBridge();
-    return;
-  }
-  await startStdioBridge();
+  await startHttpBridge();
 }
 
 /**
@@ -2161,9 +2122,6 @@ function shutdown(): void {
         const summary = await runtime.stop();
         bridgeLog.info("a2a-bridge", `停机完成：${JSON.stringify(summary)}`);
       }
-      const server = activeServer;
-      activeServer = null;
-      if (server !== null) await server.close();
     } catch (err) {
       bridgeLog.error("a2a-bridge", `停机异常：${toMessage(err)}`);
     } finally {

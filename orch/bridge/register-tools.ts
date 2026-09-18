@@ -4,7 +4,7 @@
  * 为什么单独成模块：stateless Streamable HTTP 惯例是**每请求新建 server + transport**，
  * 故 server 不能再是 `bridge/index.ts` 里的模块作用域单例。本模块**只做「注册 + 建 server」**：
  * 不持有任何领域状态、不 import core 的运行时实现（`BridgeCore` 仅**类型**引用），
- * 因此 stdio / http 两个接入面都可安全复用，且 import 本模块无副作用
+ * 因此 HTTP 接入面可安全复用，且 import 本模块无副作用
  * （唯一外部读取是 `../version.ts` 读 `package.json` 的版本，纯读、无副作用）。
  *
  * 分层边界（§2.2）：transports 层只做「参数 → 调 core → 结果格式化」，

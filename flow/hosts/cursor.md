@@ -2,7 +2,7 @@
 
 > 本文件是 `flow/` 规范包在 Cursor 宿主上的接入指引。v0.4.1 给指引，自动注册留后续版本。
 
-## ① 注册本地 stdio MCP
+## ① 注册 remote MCP
 
 Cursor 的 MCP server 写在 `.cursor/mcp.json`（项目级）或 `~/.cursor/mcp.json`（用户级）：
 
@@ -10,18 +10,13 @@ Cursor 的 MCP server 写在 `.cursor/mcp.json`（项目级）或 `~/.cursor/mcp
 {
   "mcpServers": {
     "a2a": {
-      "command": "node",
-      "args": ["<orch>/dist/bridge/index.js"],
-      "env": {
-        "MACHINES_CONFIG": "<orch>/config/config.json",
-        "SESSION_DB": "<orch>/data/sessions.sqlite"
-      }
+      "url": "http://127.0.0.1:8787/mcp"
     }
   }
 }
 ```
 
-把 `<orch>` 换成桥单元的实际绝对路径。桥与 Cursor **必须同机**。
+`url` 指向桥的 MCP HTTP 端点；Cursor 的 remote 字段语法**待真机核实**。
 
 ## ② 加载额外指令文件
 

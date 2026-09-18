@@ -4,7 +4,7 @@
 
 ## 整体形态
 
-- **接入面**：缺省 stdio（桥由 orch 宿主 agent 作为子进程拉起，须与宿主同机）；亦可常驻，以 **stateless Streamable HTTP** 暴露 MCP（路由 `POST /mcp`、`GET /health`、`POST /shutdown`），宿主经 MCP `type: "remote"` 连接。
+- **接入面**：**常驻 stateless Streamable HTTP**（唯一形态；**stdio 已于 v0.7.1 退役**），桥经 `bridgectl` 常驻，以 **stateless Streamable HTTP** 暴露 MCP（路由 `POST /mcp`、`GET /health`、`POST /shutdown`），宿主经 MCP `type: "remote"` 连接。
 - **工具面**：泛型工具 7（`a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` / `a2a_events` / `a2a_wait`）+ Feature 工具组 5（`a2a_feature_create` / `a2a_feature_status` / `a2a_feature_advance` / `a2a_feature_approve` / `a2a_feature_cancel`），静态注册、零重连。
 - **单实例与单调度权**：靠 core 租约（`core.lock`）—— 只有租约持有者运行 scheduler 与 task-watcher；同一 data dir 的第二个实例降级为 `follower`，照常提供 MCP 工具但不跑后台循环。`GET /health` 报当前 `role`（`owner` / `follower`）。
 - **只读工作台**：常驻形态下可另起只读 HTTP 服务（默认仅 `owner`、绑 loopback），只读自桥的 SQLite（含 Runner 注册投影 `runners` / `runner_projects`），不做第二编排入口。
@@ -23,7 +23,7 @@ Runner（machine，出站）                        Bridge（orch，http transpo
   │  POST /runner/result    ─────────────────▶  claimToken 校验 → 按 (machineId, taskId) 幂等落库 → ack
 ```
 
-- **端点**：`/runner/register`（注册 / 刷新投影）、`/runner/connect`（长轮询；新任务 / 事件 `wake` 立即唤醒；空超时 204 心跳）、`/runner/result`（结果回传 + ack）。挂载于常驻 HTTP transport（复用 MCP 端口，不引第二接入面）；stdio 形态**不注册**路由（404）。
+- **端点**：`/runner/register`（注册 / 刷新投影）、`/runner/connect`（长轮询；新任务 / 事件 `wake` 立即唤醒；空超时 204 心跳）、`/runner/result`（结果回传 + ack）。挂载于常驻 HTTP transport（复用 MCP 端口，不引第二接入面）。
 - **门闩**：仅 core 租约 `owner` 提供端点；follower 一律 503 `runner_not_owner`（不抢调度权，也不给 Runner 下发命令）。
 - **鉴权**：per-machine 静态 Bearer token（machine 侧 `launcher.bridge.token` ↔ orch 侧 `machines[].token`）；该机未配置 token 一律拒绝（绝不 fail-open）。
 - **版本准入**：注册载荷必携 `protocolVersion`，主版本须 ∈ `SUPPORTED_PEER_PROTOCOL_MAJORS`（2.0 硬切，当前 `[2]`）；不符 ⇒ 403 `protocol_version_mismatch`（含升级指引）。
@@ -42,7 +42,7 @@ npm run bridge:restart   # 停止后重新后台拉起
 npm run bridge:logs      # 输出日志全文（支持 --lines N / --follow）
 ```
 
-- `start` / `restart` 支持 `--no-wait`（语义见下）。缺省形态为 stdio 时桥无常驻端口，脚本只提示需先切换 `transport.mode=http`。
+- `start` / `restart` 支持 `--no-wait`（语义见下）。桥恒常驻 http（stdio 已退役；显式 `transport.mode="stdio"` 会在解析期 fail-fast）。
 - 端口读配置 `transport.http`；`MACHINES_CONFIG` 可指定其他配置文件，`SESSION_DB` 可指定会话库路径。
 - pidfile：`data/bridge.pid`（**由桥自己写**，JSON `{ pid, mode, role, startedAt }`，非锁，陈旧无害）；日志：`data/logs/bridge.log`。
 - 前台入口 `npm run bridge` 仅作调试，不作为启停手段。

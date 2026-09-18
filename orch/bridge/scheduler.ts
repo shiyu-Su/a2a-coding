@@ -160,9 +160,8 @@ export interface FeatureSchedulerOptions {
 
 /**
  * `start()` 选项（REQ-v0.4.1-2026-09-15-02）。
- * - `unref`：是否对定时器 `unref()`（不持有进程）。**缺省 true** = 与旧行为一致
- *   （stdio 桥随宿主退出）；常驻模式由 lifecycle 传 `false`（HTTP listener 持有进程）。
- *   **模式不硬编码进 scheduler**，由调用方按 `mode` 决定。
+ * - `unref`：是否对定时器 `unref()`（不持有进程）。**缺省 true**；桥恒常驻 http，
+ *   由 lifecycle 显式传 `false`（HTTP listener 持有进程）。**模式不硬编码进 scheduler**。
  * - `role`：core 租约角色门闩（**第二道防线**）。缺省 / `"owner"` 正常启动；
  *   `"follower"` 直接拒绝启动并 warn（不跑后台循环），使"接线写错"也无法双调度。
  */
@@ -548,7 +547,7 @@ export class FeatureScheduler {
     this.timer = setInterval(() => {
       void this.tick();
     }, this.pollIntervalMs);
-    // stdio 模式不因定时器持有进程；常驻模式（unref=false）由 HTTP listener 持有进程
+    // 桥恒常驻（http listener 持有进程）：lifecycle 传 unref=false ⇒ 不 unref 定时器
     if (options.unref !== false && typeof this.timer.unref === "function") {
       this.timer.unref();
     }

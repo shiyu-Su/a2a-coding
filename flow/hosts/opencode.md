@@ -6,9 +6,9 @@
 
 - Node.js ≥ 22.5。
 - 桥已构建：`orch` 下 `npm run build` 产出 `orch/dist/bridge/index.js`。
-- **stdio 形态**要求桥与 opencode **必须同机**：桥是本地 stdio MCP server，由 opencode 作为子进程拉起；**常驻（remote）形态**则桥以独立进程运行，opencode 经 `type:"remote"` 连接（见 `README.md` 的「常驻部署形态」与 `orch/config/config.json` 的 `transport.mode = "http"`）。
+- 桥以 **HTTP 形态**运行（独立于宿主进程），opencode 经 `type:"remote"` 连接其 MCP 端点（见 `orch/config/config.json` 的 `transport.mode = "http"`）。
 
-## ① 注册 stdio MCP
+## ① 注册 remote MCP
 
 在 opencode 配置 `opencode.json` 里新增（不改动其它键）：
 
@@ -16,21 +16,17 @@
 {
   "mcp": {
     "a2a": {
-      "type": "local",
-      "command": ["node", "<orch>/dist/bridge/index.js"],
-      "environment": {
-        "MACHINES_CONFIG": "<orch>/config/config.json",
-        "SESSION_DB": "<orch>/data/sessions.sqlite"
-      },
+      "type": "remote",
+      "url": "http://127.0.0.1:8787/mcp",
       "enabled": true
     }
   }
 }
 ```
 
-把 `<orch>` 换成桥单元的实际绝对路径。`MACHINES_CONFIG` / `SESSION_DB` 缺省时分别回退到 orch 单元根的 `config/config.json` 与 `./data/sessions.sqlite`。**仓库根 [`opencode.json.example`](../../opencode.json.example) 是 canonical 宿主样例**（含 stdio 与 remote 两形态 + `instructions`）；`orch/opencode.json.example` 则是 **orch 单元自身**的历史配置样例（v0.4.1 由 `orch/opencode.json` 改名而来，用于避免 worker 侧再拉起第二座桥），**不是宿主接入样例**。
+`url` 指向桥的 MCP HTTP 端点。**仓库根 [`opencode.json.example`](../../opencode.json.example) 是 canonical 宿主样例**；`orch/opencode.json.example` 则是 **orch 单元自身**的历史配置样例（v0.4.1 由 `orch/opencode.json` 改名而来，用于避免 worker 侧再拉起第二座桥），**不是宿主接入样例**。
 
-> ⚠️ **两种形态不能共用同一份 orch config**：桥的接入面由**桥自己读的 `<orch>/config/config.json`** 决定 —— 无 `transport` 段（或 `mode="stdio"`）⇒ stdio；`transport.mode="http"` ⇒ 常驻 HTTP。若 config 是 http 而宿主仍按 stdio 拉起该条目，子进程会去 `listen 8787`（与常驻桥冲突或变成没人再说 JSON-RPC 的进程）。**要并存需两份 config**，分别经 `MACHINES_CONFIG` 指向。另：remote 形态的宿主条目**不需要 env**（env 属于启动桥的 shell）；**stdio 桥不写 pidfile、不归 `bridgectl` 管**。
+> ⚠️ 桥的接入面由**桥自己读的 `<orch>/config/config.json`** 决定；remote 形态的宿主条目**不需要 `env`**（env 属于启动桥的 shell）。
 
 ## ② 旁路加载流程规范
 

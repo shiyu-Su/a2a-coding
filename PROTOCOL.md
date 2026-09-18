@@ -14,7 +14,7 @@
 
 ## 端点
 
-`/runner/*` 仅由 `transport.mode === "http"` **且** core 租约 `owner` 的桥实例提供（follower ⇒ 503 `runner_not_owner`；stdio ⇒ 不注册路由，404）。全部 **POST + JSON**，统一外壳 `{ result, data, error }`；请求头 `Authorization: Bearer <token>`（per-machine 静态 Bearer：machine 侧 `launcher.bridge.token` ↔ orch 侧 `machines[].token`；常量时间比较）。
+`/runner/*` 仅由 core 租约 `owner` 的桥实例提供（follower ⇒ 503 `runner_not_owner`）；桥接入面为**常驻 HTTP**（现唯一形态，`transport.mode` 恒为 `"http"`，stdio 已退役）。全部 **POST + JSON**，统一外壳 `{ result, data, error }`；请求头 `Authorization: Bearer <token>`（per-machine 静态 Bearer：machine 侧 `launcher.bridge.token` ↔ orch 侧 `machines[].token`；常量时间比较）。
 
 ### POST /runner/register
 

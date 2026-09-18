@@ -4,7 +4,7 @@
  * 覆盖（对齐验收 §4.1 第 5 / 11 条）：
  * ① **第二个 core 抢不到租约 → `role=follower` 且不启动 scheduler / watcher**；
  * ② **owner 退出（陈旧锁）后新进程可接管**（`role=owner`，正常启动后台循环）；
- * ③ **`unref` 按模式**：stdio ⇒ true（不持有进程），http ⇒ false（常驻持有进程）；
+ * ③ **`unref` 恒 false**：桥恒常驻 http（stdio 已退役），定时器不 unref（由 HTTP listener 持住进程）；
  * ④ 启停顺序：owner 停机走「停调度 → 排空 → 停 watcher → 关 store → 释放租约 → 删 pidfile」；
  * ⑤ `task-watcher` owner 门闩：follower 下 `startTaskWatcher` 一律拒绝。
  *
@@ -30,7 +30,6 @@ import {
 } from "../runtime/core-lease.js";
 import {
   BridgeRuntime,
-  unrefTimerForMode,
   type LifecycleScheduler,
   type LifecycleWatcher,
 } from "../runtime/lifecycle.js";
@@ -117,18 +116,13 @@ function writeLockFromExitedProcess(lockPath: string): number {
   return result.pid;
 }
 
-test("unref 按模式：stdio 不持有进程，常驻 http 持有进程", () => {
-  assert.equal(unrefTimerForMode("stdio"), true);
-  assert.equal(unrefTimerForMode("http"), false);
-});
-
 test("① 第二个 core（活锁存在）→ role=follower，且不启动 scheduler / watcher", async () => {
   const dir = tempDir("follower");
   const calls = newCalls();
   const watcherCalls = newWatcherCalls();
   try {
     // 第一把锁（模拟已在运行的 core，pid 为本进程 → 判活）
-    assert.equal(acquireCoreLease(dir, "stdio").role, "owner");
+    assert.equal(acquireCoreLease(dir, "http").role, "owner");
 
     const runtime = new BridgeRuntime({
       dataDir: dir,
@@ -240,7 +234,7 @@ test("③ 启停顺序：owner 停机 = 停调度 → 排空 → 停 watcher →
     };
     const runtime = new BridgeRuntime({
       dataDir: dir,
-      mode: "stdio",
+      mode: "http",
       scheduler,
       watcher,
       openStore: () => {
@@ -253,7 +247,7 @@ test("③ 启停顺序：owner 停机 = 停调度 → 排空 → 停 watcher →
     });
     const readiness = runtime.start();
     assert.equal(readiness.role, "owner");
-    assert.equal(lastUnref, true, "stdio 模式应 unref（不持有进程）");
+    assert.equal(lastUnref, false, "桥恒常驻：定时器不 unref");
     await runtime.stop();
     assert.deepEqual(events, [
       "store.open",

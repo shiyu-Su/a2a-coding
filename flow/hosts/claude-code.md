@@ -6,14 +6,14 @@
 
 - Node.js ≥ 22.5；桥已构建：`orch` 下 `npm run build` 产出 `orch/dist/bridge/index.js`（**入口在 `dist/`，未 build 起不来**）。
 - `orch/config/config.json` 已存在且含 `machines[]`（模板 `config.json.default`）。
-- stdio 形态要求 **Claude Code 与桥同机**（stdio 是子进程管道，不支持跨机）。
+- 桥以 **HTTP 形态**运行，Claude Code 经 `.mcp.json` 的 `{ "type": "http", "url": … }` 连接其 MCP 端点。
 
-## ① 注册本地 stdio MCP
+## ① 注册 remote MCP
 
 Claude Code 的 MCP server 写在 `mcpServers` 对象里，位置二选一：
 
 - **项目级**：项目根的 `.mcp.json`（随仓库走，建议入库）；
-- **用户级**：`~/.claude.json`；或用命令 `claude mcp add a2a -- node <orch>/dist/bridge/index.js` 登记。
+- **用户级**：`~/.claude.json`；或用命令 `claude mcp add --transport http a2a http://127.0.0.1:8787/mcp` 登记。
 
 格式（**严格 JSON，无注释** —— 说明见本文与范例文件名）：
 
@@ -21,31 +21,21 @@ Claude Code 的 MCP server 写在 `mcpServers` 对象里，位置二选一：
 {
   "mcpServers": {
     "a2a": {
-      "command": "node",
-      "args": ["<orch>/dist/bridge/index.js"],
-      "env": {
-        "MACHINES_CONFIG": "<orch>/config/config.json",
-        "SESSION_DB": "<orch>/data/sessions.sqlite"
-      }
+      "type": "http",
+      "url": "http://127.0.0.1:8787/mcp"
     }
   }
 }
 ```
 
-- 把 `<orch>` 换成桥单元的**绝对路径**；两个 env 可省略（桥按单元根回退），但**建议显式写出**。
+- `url` 指向桥的 MCP HTTP 端点。
 
-## ② ⚠️ 两种形态不能共用同一份 orch config
+## ② 桥以 HTTP 形态运行
 
-桥的接入面由**桥自己读的 `<orch>/config/config.json`** 决定，与宿主"怎么写条目"无关：
+桥的接入面由**桥自己读的 `<orch>/config/config.json`** 决定：`transport.mode = "http"` 时桥以 HTTP 形态运行，与宿主"怎么写条目"无关。
 
-| `config.json` | 桥的运行形态 |
-|---|---|
-| **无 `transport` 段**（或 `mode = "stdio"`） | stdio（由宿主作为子进程拉起） |
-| `transport.mode = "http"` | 常驻 HTTP（在 orch 单元根用 `npm run bridge:start -- --no-wait` 发起 → `npm run bridge:status` 确认就绪；**退出码 0 = 已发起，≠ 已就绪**） |
-
-⇒ 要两种形态并存，需**两份 config 文件**，分别经 `MACHINES_CONFIG` 指向。
-另两条易错点：**remote 形态的宿主条目不需要 `env`**（env 属于启动桥的 shell）；**stdio 桥不写 pidfile、不归 `bridgectl` 管**。
-⚠️ **remote（HTTP）形态在 Claude Code 上的字段语法尚未真机核实** ⇒ 本仓库**不提供** Claude Code 的 remote 样例，需以官方文档为准（本仓只在 opencode 上验证过 `{ "type": "remote", "url": … }`）。
+- 宿主条目**不需要 `env`**（env 属于启动桥的 shell）。
+- ⚠️ **HTTP 形态在 Claude Code 上的字段语法尚未真机核实** ⇒ 以官方文档为准（本仓目前只在 opencode 上验证过 `{ "type": "remote", "url": … }`）。
 
 ## ③ 加载额外指令文件（**已在官方文档级核实**）
 
@@ -71,5 +61,5 @@ Claude Code **没有**「列出额外指令文件路径」的配置字段 ——
 ## 待真机核实（**文档级已核实，真机仍未验**）
 
 - ✅ **已核实（官方文档级）**：无"额外指令文件列表"字段；对等接缝 = `.claude/rules/*.md`；`--append-system-prompt-file` 可注入；
-- ✅ **已核实（官方文档级）**：`.mcp.json` 的 remote 写法 `{"type":"http","url":…}`（`streamable-http` 为别名；**有 `url` 无 `type` 会报错**）；stdio `{"type":"stdio","command","args","env"}`；支持 `${VAR}` / `${VAR:-default}` 展开；**同名 `claude mcp add` 报错不覆盖**；优先级 **local > project > user > plugin > connectors**；
+- ✅ **已核实（官方文档级）**：`.mcp.json` 的 remote 写法 `{"type":"http","url":…}`（`streamable-http` 为别名；**有 `url` 无 `type` 会报错**）；支持 `${VAR}` / `${VAR:-default}` 展开；**同名 `claude mcp add` 报错不覆盖**；优先级 **local > project > user > plugin > connectors**；
 - ⏳ **仍待真机**：上述字段在你的 Claude Code 版本上实际生效（配置读入 / 加载顺序 / `.claude/rules/` 是否如期常驻）。

@@ -11,10 +11,10 @@
  * | `POST /runner/connect` | 长轮询（poll 即心跳） | 同上鉴权；claim 前置 = `(machineId,projectId) ∈ memberKeys` **且**任务归属该机器（= 本机注册过的项目）；命中 claim CAS 即下发 `dispatch`，另可下发 `stop` / `cancel-task`；空超时 = 心跳（204） |
  * | `POST /runner/result` | 结果回传（ack） | 同上鉴权 + **claim_token 校验**（比对落库领取令牌）→ `upsertTaskResult`（幂等键 `(machineId, taskId)`）→ 200 ack |
  *
- * 门闩与形态（节点验收项）：
- * - **owner 门闩**：仅 `transport.mode === "http"` 且 core 租约 `owner` 的实例提供端点；
+ * 门闩与接入面（节点验收项）：
+ * - **owner 门闩**：仅 core 租约 `owner` 的实例提供端点；
  *   follower 一律 `503 runner_not_owner`（不抢调度权，也不给 Runner 下发命令）。
- * - **stdio 形态不注册路由**：`handle()` 首检 `mode`，非 `http` 直接返回 `false`（http.ts 落 404）。
+ * - **接入面恒 http**：stdio 已退役；未注入本处理器时 `/runner/*` 落 404（`http.ts` 兜底）。
  * - **宽容解析**：`capabilities` 与未知字段一律忽略（不落库、不因未知字段 400）。
  *
  * 唤醒语义：`/connect` 的挂起可被 `wake(machineId)` 立即唤醒（新任务入队时由派发侧调用；
@@ -80,7 +80,6 @@ import type {
   MachinesConfig,
   RiskLevel,
   TaskState,
-  TransportMode,
 } from "../types.js";
 import { SUPPORTED_PEER_PROTOCOL_MAJORS } from "../types.js";
 import { bridgeLog } from "./bridge-log.js";
@@ -254,8 +253,6 @@ const DEFAULT_SWEEP_INTERVAL_MS = 15_000;
 // ---------------------------------------------------------------------------
 
 export interface RunnerEndpointOptions {
-  /** transport 模式（`stdio` ⇒ 不注册路由） */
-  mode: () => TransportMode;
   /** core 租约角色（`follower` ⇒ 503 `runner_not_owner`） */
   role: () => CoreRole;
   /** 机器清单（`machines[].token` 鉴权 / `projectGroup` 成员判定 / `runner.holdMs` 阈值） */
@@ -331,7 +328,7 @@ type HoldOutcome = { ok: true; holdMs: number } | { ok: false; message: string }
 
 /**
  * 组装 Runner 端点处理器（纯工厂，无副作用、不 bind）。
- * 由 `bridge/index.ts` 在 `transport.mode === "http"` 时创建并传入 `startHttpTransport`。
+ * 由 `bridge/index.ts` 常驻 http 启动时创建并传入 `startHttpTransport`。
  */
 export function createRunnerEndpoints(options: RunnerEndpointOptions): RunnerEndpointHandle {
   return new RunnerEndpoints(options);
@@ -366,8 +363,6 @@ class RunnerEndpoints implements RunnerEndpointHandle {
   }
 
   async handle(req: IncomingMessage, res: ServerResponse, path: string): Promise<boolean> {
-    // 形态门：stdio 不注册路由（调用方落 404）
-    if (this.options.mode() !== "http") return false;
     if (
       path !== RUNNER_REGISTER_PATH &&
       path !== RUNNER_CONNECT_PATH &&
@@ -486,11 +481,10 @@ class RunnerEndpoints implements RunnerEndpointHandle {
    * 判据：注册态 `online` 且 `now - lastHeartbeatAt >= runner.heartbeatTimeoutMs`，则
    * ① `requeueStaleTask`（B2：名下 `claimed`/`running` → `queued` + 清 claim 三字段）+ `task.stale`；
    * ② `markRunnerOffline` + `runner.offline`（D8：只降态、不 stop）。
-   * 门闩：非 `http` / 非 `owner` ⇒ 空结果（不读库、不抢清算权）。
+   * 门闩：非 `owner` ⇒ 空结果（不读库、不抢清算权）。
    */
   sweepStale(): RunnerSweepResult {
     const result: RunnerSweepResult = { offlineRunners: [], requeuedTasks: [] };
-    if (this.options.mode() !== "http") return result;
     if (this.options.role() !== "owner") return result;
     let timeoutMs: number;
     try {

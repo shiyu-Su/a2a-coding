@@ -1,6 +1,6 @@
 #!/usr/bin/env node
 // a2a-coding 需求流程规范「旁路引入」安装器（零依赖 ESM）
-// 用法：node flow/install/install.mjs --target <项目根> [--host opencode] [--orch <orch路径>] [--dry-run] [--force]
+// 用法：node flow/install/install.mjs --target <项目根> [--host opencode] [--bridge-url <url>] [--dry-run] [--force]
 //
 // 硬约束：只增不改。绝不触碰目标项目既有的 CLAUDE.md / AGENTS.md；
 // 宿主配置仅按下述确定性条目追加，且可被 uninstall.mjs 精确还原。
@@ -12,9 +12,11 @@ import path from 'node:path';
 // _shared：常量与工具
 // ---------------------------------------------------------------------------
 const PACK_ROOT = path.resolve(import.meta.dirname, '..'); // .../flow（本包根）
-const REPO_ROOT = path.resolve(PACK_ROOT, '..'); // 交付 A 仓库根
 const CONFIG_FILE = 'opencode.json';
 const SCHEMA_URL = 'https://opencode.ai/config.json';
+
+/** remote 桥的默认 MCP 端点（可用 --bridge-url 覆盖）。 */
+const DEFAULT_BRIDGE_URL = 'http://127.0.0.1:8787/mcp';
 
 /** 旁路加载的 instructions 条目（目标项目根相对路径；opencode 相对配置文件目录解析）。 */
 const INSTRUCTION_ENTRIES = ['flow/spec/需求流程.md', 'flow/spec/引擎映射.md'];
@@ -50,15 +52,10 @@ function readJson(file) {
 }
 
 /** install 会写入的 mcp.a2a 确定性取值（uninstall 以此为还原判据）。 */
-function mcpEntry(orch) {
-  const root = toPosix(path.resolve(orch));
+function mcpEntry(bridgeUrl) {
   return {
-    type: 'local',
-    command: ['node', `${root}/dist/bridge/index.js`],
-    environment: {
-      MACHINES_CONFIG: `${root}/config/config.json`,
-      SESSION_DB: `${root}/data/sessions.sqlite`,
-    },
+    type: 'remote',
+    url: bridgeUrl,
     enabled: true,
   };
 }
@@ -67,15 +64,16 @@ function mcpEntry(orch) {
 // 参数与规划
 // ---------------------------------------------------------------------------
 function parseArgs(argv) {
-  const out = { target: process.cwd(), host: 'opencode', orch: '', dryRun: false, force: false };
+  const out = { target: process.cwd(), host: 'opencode', bridgeUrl: DEFAULT_BRIDGE_URL, orchIgnored: false, dryRun: false, force: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--target') out.target = argv[++i] ?? fail('--target 需要一个路径参数');
     else if (arg === '--host') out.host = argv[++i] ?? fail('--host 需要一个值');
-    else if (arg === '--orch') out.orch = argv[++i] ?? fail('--orch 需要一个路径参数');
+    else if (arg === '--bridge-url') out.bridgeUrl = argv[++i] ?? fail('--bridge-url 需要一个 URL 参数');
+    else if (arg === '--orch') { argv[++i] ?? fail('--orch 需要一个路径参数'); out.orchIgnored = true; }
     else if (arg === '--dry-run') out.dryRun = true;
     else if (arg === '--force') out.force = true;
-    else if (arg === '--help' || arg === '-h') { console.log('用法：node flow/install/install.mjs --target <项目根> [--host opencode] [--orch <orch路径>] [--dry-run] [--force]'); process.exit(0); }
+    else if (arg === '--help' || arg === '-h') { console.log('用法：node flow/install/install.mjs --target <项目根> [--host opencode] [--bridge-url <url>] [--dry-run] [--force]\n  --orch 已弃用（接受并忽略，仅为兼容既有调用）。'); process.exit(0); }
     else fail(`未知参数：${arg}（用 --help 查看用法）`);
   }
   return out;
@@ -111,7 +109,7 @@ function planCopies(target, force) {
 }
 
 /** 规划宿主配置改动：只追加缺失项，绝不删改既有条目。 */
-function planConfig(target, orch) {
+function planConfig(target, bridgeUrl) {
   const file = path.join(target, CONFIG_FILE);
   let data;
   let created = false;
@@ -139,11 +137,11 @@ function planConfig(target, orch) {
   if (data.mcp !== undefined && (typeof data.mcp !== 'object' || data.mcp === null || Array.isArray(data.mcp))) {
     fail(`${file} 的 mcp 不是对象，已中止（不覆盖既有配置）`);
   }
-  const desired = mcpEntry(orch);
+  const desired = mcpEntry(bridgeUrl);
   if (data.mcp?.a2a === undefined) {
     data.mcp = data.mcp ?? {};
     data.mcp.a2a = desired;
-    changes.push(`mcp.a2a = 新增 stdio 桥（orch=${toPosix(path.resolve(orch))}）`);
+    changes.push(`mcp.a2a = 新增 remote 桥（url=${bridgeUrl}）`);
   } else if (!deepEqual(data.mcp.a2a, desired)) {
     fail(`mcp.a2a 已存在且与预期不一致，已中止（不覆盖既有配置）。\n  如确需更新，请手动修改 ${toPosix(file)} 或先移除该项后重试。`);
   }
@@ -160,18 +158,17 @@ function main() {
   }
   const target = path.resolve(args.target);
   if (!existsSync(target) || !statSync(target).isDirectory()) fail(`目标目录不存在或不是目录：${target}`);
-  const orch = path.resolve(args.orch || path.join(REPO_ROOT, 'orch'));
-  if (!existsSync(orch)) fail(`未找到 orch 单元：${toPosix(orch)}\n  请用 --orch <orch路径> 指定。`);
+  if (args.orchIgnored) console.warn('[警告] --orch 已弃用（remote 形态不再需要 orch 路径），本次已忽略。');
 
   const adds = planCopies(target, args.force);
-  const cfg = planConfig(target, orch);
+  const cfg = planConfig(target, args.bridgeUrl);
 
   if (args.dryRun) {
     console.log('[dry-run] 以下为计划改动，未写入任何文件：');
     for (const a of adds) console.log(`  新增文件  ${toPosix(path.relative(target, a.to))}`);
     for (const c of cfg.changes) console.log(`  配置改动  ${CONFIG_FILE}：${c}`);
     if (adds.length === 0 && cfg.changes.length === 0) console.log('  无变化');
-    console.log(`\n[dry-run] 目标：${toPosix(target)}；宿主：${args.host}；orch：${toPosix(orch)}`);
+    console.log(`\n[dry-run] 目标：${toPosix(target)}；宿主：${args.host}；bridge-url：${args.bridgeUrl}`);
     return;
   }
 

@@ -6,6 +6,42 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.7.1] - 2026-09-18
+
+> 主题：**编排等待与提醒 + stdio transport 退役**（两条需求 · `REQ-v0.7.1-2026-09-18-01` / `REQ-v0.7.1-2026-09-18-02`）。两者**均不改状态机语义、不新增 Feature 态**。
+
+### Added
+
+- **宿主侧 Feature 等待脚本**（①）：`scripts/watch-feature.mjs` 重写 —— **只读**、经 orch 只读 web API（`GET /api/features/:id`，base URL 可经 `--base`/`WATCH_BASE_URL` 注入）**快照驱动**监视 Feature 至「需宿主动作」时点；退出码七类：`0` 完成 · `10` 失败收敛静止 · `11` needs_input · `12` cancelled · `13` failed(DAG) · `20` 超时仍在 executing · `1` 参数/连接错误。HTTP 用 **`node:http`（`agent:false`）** + **`process.exitCode` 自然退出**（消除 Windows libuv 退出竞态致**退出码损坏**）。
+- **流程语义条款**（①）：`flow/spec/引擎映射.md` §7 新增「可观测语义」—— 宿主在**需动作三时点**（完成 / 失败收敛静止 / 需澄清）经**运行底座给出的可观测信号**被感知；**等待由运行底座（代码组件）承担、不靠人工提醒**；明文保留「LLM 不执行等待与轮询」；终态与 timeout 排除。§5 补一句 `a2a_events`/`a2a_wait` 的状态语义。
+- **宿主指令**（①）：`CLAUDE.md`「宿主侧辅助面（仓根 `scripts/`）」含「**用法（必须）**」—— 派发 Feature 后宿主**必须**用 `watch-feature.mjs` **同步阻塞**等待并按退出码分流；**禁止** `Start-Sleep` + `a2a_feature_status` 手工轮询。
+
+### Changed
+
+- **stdio transport 退役**（②，力度 (b)）：桥**移除 stdio 运行分支** —— 删 `orch/bridge/transports/stdio.ts`、`main()` 的 stdio 分派、`unref` 双轨、`web.allowStdio` 死配置；`transport.mode` **只接受 `"http"`**，显式 `"stdio"` ⇒ **结构化 fail-fast**（不静默降级）；`FALLBACK_TRANSPORT` 改 **fail-fast（读配置失败不 bind）**；**缺省 = http**；**保留 `main()` / `isEntryModule()`**。
+- **接入面统一常驻 http**：`flow/hosts/{opencode,claude-code,codex,cursor}.md`（去两形态）· `flow/README.md` · **`flow/install/{install,uninstall}.mjs`（产出 `type:"remote"` 条目、**无 `env`**）** · 仓根 `README.md` / `opencode.json.example`（remote 单条目）· `CLAUDE.md` · `orch/README.md` / `orch/opencode.json.example`。
+- **`PROTOCOL.md:17`**：去 stdio 限定（→「桥接入面为**常驻 HTTP**（现唯一形态）」），**`/runner/*` 契约不变**；**machine 只读审阅接受**。
+- **`flow/spec/引擎映射.md:10`**：仅去「stdio」限定词、**保留拉模型论证**（论证内核逐字保留）；§8 Transport 行**示例单元格对齐**（原则句与收尾句 `:125` 逐字冻结）。
+- 三处 `package.json` 版本 → **0.7.1**（根 / `orch` / `machine`）。
+- **`machine` 零源码改动**（7 项冻结 + 线协议零改）。
+
+### Verified
+
+- 门禁：`orch` `typecheck` **0** / `lint` **0** / `test` **195/195** / `build` **0**；`machine` `typecheck` **0**。
+- 真机：桥以**唯一 http 形态**常驻运行 —— 8787 + 3300 监听、`/health` `role=owner`、`a2a_projects()` 3 项目 online、**Runner 自动重连**（machine 未重启）；`mode="stdio"` ⇒ **fail-fast 且不 bind**；坏配置 ⇒ fail-fast 不 bind。
+- ① 脚本真机：`scripts/watch-feature.mjs <featureId>` 阻塞等待 → `判定=completed` → **`exit 0`**；mock 六态+1 **7/7**；真机 timeout 路径 **12/12** `exit 20`；错误路径 **5/5** `exit 1`。
+- ② 宿主自测：端到端派发（inquiry → `S2-SELFTEST-OK`、`protocolVersion=2.0`）· installer 真机（临时目标：产出 remote 条目 + `uninstall` 字节还原 `opencode.json`）。
+- Step 3 验收：① 用户「算通过」· ② 用户「以自测为准」。
+
+### 未覆盖（遗留验证，**不得默认算通过**）
+
+- ① **`failure-at-rest` 的真机**（mock 覆盖 + 完成侧真机命中；失败收敛静止未在真机复现）。
+- ② **旧 stdio 配置的真机 fail-fast**（单元真机证据已给，宿主未复跑）；**codex / claude-code / cursor** 三端接入面真机。
+- `bridge:restart` **就绪窗口 >30s ⇒ 假阴性**（与 v0.6.2 同族）；发版时 `bridge:start --no-wait` 后立即 `status` 可能报「未运行」，需等待/重试。
+- **`config warn spam` 淹没启动日志**（v0.7.0 已登记遗留；本次导致诊断失明）。
+- `machine/config/config.json.default:2` 注释 stale（machine 单元）。
+- 回归用例（本版于 `§8.1e` 补 `test-v0.7.1-*`）。
+
 ## [v0.7.0] - 2026-09-18
 
 > 主题：**Runner 反向注册（pull 连接模型整体反转）**（REQ-v0.7.0-2026-09-18-01，方案级变更；架构约束「无中心注册/静态分布/每机 Launcher 入站」随之修订）。**发版纪律变更：自本版起不上传 GitHub 仓库（用户指示；commit/tag 仅本地）。**

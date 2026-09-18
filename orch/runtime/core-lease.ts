@@ -102,12 +102,12 @@ function readLockFile(lockPath: string): CoreLeaseInfo | null {
     if (typeof parsed !== "object" || parsed === null) return null;
     const rec = parsed as Record<string, unknown>;
     const pid = rec["pid"];
-    const mode = rec["mode"];
     const startedAt = rec["startedAt"];
     if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return null;
     return {
       pid,
-      mode: mode === "stdio" || mode === "http" ? mode : "stdio",
+      // stdio 已退役（恒常驻 http）：mode 仅诊断用，历史锁文件中的其它值一律归一为 "http"
+      mode: "http",
       startedAt: typeof startedAt === "string" ? startedAt : "",
     };
   } catch {

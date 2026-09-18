@@ -113,11 +113,6 @@ export interface WebTransportOptions {
   version: string;
   /** 自动刷新间隔（ms；< 15000 一律抬到 15000） */
   refreshMs?: number;
-  /**
-   * stdio 形态显式允许 bind 时置 true ⇒ `server.unref()`。
-   * 否则 listener 会持住事件循环、破坏「桥随宿主退出」不变量（子进程泄漏）。
-   */
-  unref?: boolean;
 }
 
 export type WebDisabledReason = "non_loopback_host" | "listen_failed";
@@ -217,7 +212,6 @@ export async function startWebTransport(
   server.on("error", (err) => {
     bridgeLog.error("a2a-bridge", `网页接面错误：${toMessage(err)}`);
   });
-  if (options.unref === true) server.unref();
   bridgeLog.info("a2a-bridge", `只读网页接面已监听 http://${host}:${boundPort}/`, {
     api: "/api/projects, /api/features, /api/tasks, /api/events",
     refreshMs: resolveRefreshMs(options.refreshMs),

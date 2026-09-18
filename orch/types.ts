@@ -140,9 +140,9 @@ export interface CallbackConfig {
 }
 
 /**
- * 桥 transport 模式（v0.4.1 桥常驻化）。
- * - `stdio`（缺省）：桥随宿主进程内嵌，行为与旧配置完全一致；
- * - `http`：桥常驻监听 `transport.http`，由宿主经 HTTP 连接。
+ * 桥 transport 模式（v0.4.1 桥常驻化；v0.7.1 **stdio 退役**）。
+ * - `"http"`（缺省，现唯一合法值）：桥常驻监听 `transport.http`，由宿主经 HTTP 连接；
+ * - `"stdio"`：**已退役**（保留类型仅为承载显式配置的结构化拒绝 —— 配置解析期 fail-fast）。
  */
 export type TransportMode = "stdio" | "http";
 
@@ -156,7 +156,7 @@ export interface HttpTransportConfig {
 /**
  * 桥 transport 配置（v0.4.1）。
  * 配置文件内**可选**（旧 `config.json` 无 `transport` 键时零改动可用），
- * 解析后恒补齐为完整对象：缺省 `mode = "stdio"`、`http = { 127.0.0.1, 8787, "/mcp" }`。
+ * 解析后恒补齐为完整对象：缺省 `mode = "http"`、`http = { 127.0.0.1, 8787, "/mcp" }`。
  */
 export interface TransportConfig {
   mode: TransportMode;
@@ -164,22 +164,19 @@ export interface TransportConfig {
 }
 
 /**
- * orch 网页端只读工作台配置（v0.5.0 §2.2）。
+ * orch 网页端只读工作台配置（v0.5.0 §2.2；v0.7.1 stdio 退役后 `allowStdio` 移除）。
  *
  * 配置文件内**可选**，解析后恒补齐为完整对象（缺省见 `config.ts`）。
  * 语义（本段只承载「解析后的配置」，是否 bind 由运行时决定）：
- * - `enabled`（缺省 `true`）**只在常驻（`transport.mode === "http"`）形态下生效**；
- *   stdio 形态**不读它**（避免「`enabled = true` 但无效果」的歧义）。
- * - `allowStdio`（缺省 `false`）= **唯一**允许 stdio 形态也 bind 的显式开关；
- *   开启时运行时**必须 `server.unref()`**（否则持住事件循环 ⇒ 破「桥随宿主退出」不变量 ⇒ 子进程泄漏）。
- * - 运行时 bind 判定式为 `(mode === "http" ? web.enabled : web.allowStdio) && role === "owner"`。
+ * - `enabled`（缺省 `true`）：是否允许常驻桥另起只读 HTTP 工作台；
+ * - 运行时 bind 判定式为 `enabled && role === "owner"`；
  * - `host` 非 loopback 由**运行时**拒起，**不在解析层拒绝**（loopback 校验属运行时）。
+ * - `allowStdio`（v0.7.1 起随 stdio 退役成死配置）：配置显式出现仅 warn + 忽略，**不在本结构**。
  */
 export interface WebConfig {
   enabled: boolean;
   host: string;
   port: number;
-  allowStdio: boolean;
 }
 
 /** 项目组成员（v0.6.0：`machineId × projectId` 二元组） */
@@ -232,9 +229,9 @@ export interface MachinesConfig {
   machines: MachineRef[];
   /** orch 回调端点（v0.4.0；缺省 = 关闭） */
   callback?: CallbackConfig;
-  /** 桥 transport（v0.4.1；配置缺省时解析为 `mode = "stdio"` 旧行为） */
+  /** 桥 transport（v0.4.1；配置缺省时解析为 `mode = "http"`，stdio 已退役） */
   transport: TransportConfig;
-  /** 网页端只读工作台（v0.5.0；配置缺省时解析为 `{ true, "127.0.0.1", 3300, false }`） */
+  /** 网页端只读工作台（v0.5.0；配置缺省时解析为 `{ true, "127.0.0.1", 3300 }`） */
   web: WebConfig;
   /** Runner 反向注册阈值（v0.7.0；配置缺省时解析为 `{ holdMs: 25000, heartbeatTimeoutMs: 60000 }`） */
   runner: RunnerConfig;

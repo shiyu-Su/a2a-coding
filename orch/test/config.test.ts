@@ -1,10 +1,10 @@
 /**
  * `orch/config.ts` 配置解析单元测试（v0.4.1 transport 段 / v0.5.0 web 段 / v0.7.0 runner 段；`node:test`，无新依赖）。
  *
- * 覆盖：无 `transport` 段（缺省 stdio，旧配置零改动可用）、显式 stdio、
+ * 覆盖：无 `transport` 段（缺省 http，旧配置零改动可用）、显式 stdio（⇒ 退役 fail-fast）、
  * 显式 http（含 `http` 段部分缺省）、空段、非法 mode、非法 http 端口 / 路径。
  * 覆盖（v0.5.0 web）：无 `web` 段 / 空段缺省、部分缺省、显式覆盖、非法端口（含 1/65535 边界）、
- * 非法 host / enabled / allowStdio、段非对象，以及「非 loopback host 不在解析层拒绝」的边界锁定。
+ * 非法 host / enabled、段非对象、`allowStdio` 死配置 warn + 忽略，以及「非 loopback host 不在解析层拒绝」的边界锁定。
  * 覆盖（v0.6.0 projectGroup）：段缺省 ⇒ selective=false 全量接纳（**不得 fail-fast**）、
  * 正常解析 + 派生集合（memberKeys / memberMachineIds / selective）、`name` 缺省 null、
  * 空数组 ⇒ fail、成员项缺字段 / 非对象 / 非字符串 ⇒ fail、未知 `machineId` ⇒ fail、
@@ -46,19 +46,20 @@ function minimalConfig(extra: Record<string, unknown> = {}): unknown {
 
 const HTTP_DEFAULTS = { host: "127.0.0.1", port: 8787, path: "/mcp" };
 
-/** v0.5.0 `web` 段缺省（enabled 只在常驻形态生效；stdio 形态不读它） */
-const WEB_DEFAULTS = { enabled: true, host: "127.0.0.1", port: 3300, allowStdio: false };
+/** v0.5.0 `web` 段缺省（v0.7.1 起 `allowStdio` 已随 stdio 退役移除） */
+const WEB_DEFAULTS = { enabled: true, host: "127.0.0.1", port: 3300 };
 
-test("缺省：无 transport 段 → mode=stdio 且 http 取默认值（旧配置行为不变）", () => {
+test("缺省：无 transport 段 → mode=http 且 http 取默认值（v0.7.1 缺省反转，旧配置零改动可用）", () => {
   const cfg = withConfig(minimalConfig(), loadMachinesConfig);
-  assert.equal(cfg.transport.mode, "stdio");
+  assert.equal(cfg.transport.mode, "http");
   assert.deepEqual(cfg.transport.http, HTTP_DEFAULTS);
 });
 
-test("显式 stdio：mode=stdio 被接受，http 段仍补齐默认值", () => {
-  const cfg = withConfig(minimalConfig({ transport: { mode: "stdio" } }), loadMachinesConfig);
-  assert.equal(cfg.transport.mode, "stdio");
-  assert.deepEqual(cfg.transport.http, HTTP_DEFAULTS);
+test("显式 stdio：已退役 ⇒ 结构化 fail-fast（不得静默降级为 http）", () => {
+  assert.throws(
+    () => withConfig(minimalConfig({ transport: { mode: "stdio" } }), loadMachinesConfig),
+    /\[config\] transport\.mode "stdio" 已退役/,
+  );
 });
 
 test("显式 http：按声明覆盖 http 段，未声明字段回退默认", () => {
@@ -79,9 +80,9 @@ test("显式 http：按声明覆盖 http 段，未声明字段回退默认", () 
   assert.deepEqual(partial.transport.http, { host: "127.0.0.1", port: 9100, path: "/mcp" });
 });
 
-test("空 transport 段：{} 视同缺省（stdio + http 默认）", () => {
+test("空 transport 段：{} 视同缺省（http + http 默认）", () => {
   const cfg = withConfig(minimalConfig({ transport: {} }), loadMachinesConfig);
-  assert.equal(cfg.transport.mode, "stdio");
+  assert.equal(cfg.transport.mode, "http");
   assert.deepEqual(cfg.transport.http, HTTP_DEFAULTS);
 });
 
@@ -90,7 +91,7 @@ test("非法 mode → 结构化报错（[config] 前缀 + 字段路径），不�
   for (const mode of bad) {
     assert.throws(
       () => withConfig(minimalConfig({ transport: { mode } }), loadMachinesConfig),
-      /\[config\] transport\.mode 必须是 "stdio" 或 "http"/,
+      /\[config\] transport\.mode 必须是 "http"/,
     );
   }
 });
@@ -125,7 +126,7 @@ test("非法 http 路径 → 结构化报错（非空字符串且以 / 开头）
 
 // ── v0.5.0 `web` 段（网页端只读工作台）────────────────────────────────────────
 
-test("web 缺省：无 web 段 → enabled=true / host=127.0.0.1 / port=3300 / allowStdio=false", () => {
+test("web 缺省：无 web 段 → enabled=true / host=127.0.0.1 / port=3300", () => {
   const cfg = withConfig(minimalConfig(), loadMachinesConfig);
   assert.deepEqual(cfg.web, WEB_DEFAULTS);
 });
@@ -137,32 +138,33 @@ test("web 空段：{} 视同缺省（旧配置零改动可用）", () => {
 
 test("web 部分缺省：仅声明 port → 其余字段回退缺省（host 回退 127.0.0.1）", () => {
   const cfg = withConfig(minimalConfig({ web: { port: 3400 } }), loadMachinesConfig);
-  assert.deepEqual(cfg.web, { enabled: true, host: "127.0.0.1", port: 3400, allowStdio: false });
+  assert.deepEqual(cfg.web, { enabled: true, host: "127.0.0.1", port: 3400 });
 });
 
-test("web 显式覆盖：四个字段均按声明取值", () => {
+test("web 显式覆盖：三个字段均按声明取值（allowStdio 已退役不参与）", () => {
   const cfg = withConfig(
-    minimalConfig({ web: { enabled: false, host: "localhost", port: 3301, allowStdio: true } }),
+    minimalConfig({ web: { enabled: false, host: "localhost", port: 3301 } }),
     loadMachinesConfig,
   );
-  assert.deepEqual(cfg.web, { enabled: false, host: "localhost", port: 3301, allowStdio: true });
+  assert.deepEqual(cfg.web, { enabled: false, host: "localhost", port: 3301 });
 });
 
-test("web.enabled：显式 false 被接受（语义 = 仅常驻形态下不启用）", () => {
+test("web.enabled：显式 false 被接受（语义 = 不另起只读工作台）", () => {
   const cfg = withConfig(minimalConfig({ web: { enabled: false } }), loadMachinesConfig);
   assert.equal(cfg.web.enabled, false);
   assert.equal(cfg.web.host, WEB_DEFAULTS.host);
   assert.equal(cfg.web.port, WEB_DEFAULTS.port);
-  assert.equal(cfg.web.allowStdio, false);
 });
 
-test("web.allowStdio：缺省 false；显式 true 被接受（stdio 形态 bind 的唯一开关）", () => {
-  const def = withConfig(minimalConfig({ web: {} }), loadMachinesConfig);
-  assert.equal(def.web.allowStdio, false);
-
-  const on = withConfig(minimalConfig({ web: { allowStdio: true } }), loadMachinesConfig);
-  assert.equal(on.web.allowStdio, true);
-  assert.equal(on.web.enabled, true);
+test("web.allowStdio：已退役（死配置）⇒ 显式出现仅 warn + 忽略，不 fail-fast", () => {
+  const { value: cfg, warnings } = captureWarn(() =>
+    withConfig(minimalConfig({ web: { allowStdio: true } }), loadMachinesConfig),
+  );
+  assert.deepEqual(cfg.web, WEB_DEFAULTS);
+  assert.ok(
+    warnings.some((w) => w.includes("web.allowStdio")),
+    `期望 allowStdio 退役告警，实际：${JSON.stringify(warnings)}`,
+  );
 });
 
 test("非法 web.port → 结构化报错（非整数 / 越界 / 类型错），不静默降级", () => {
@@ -199,15 +201,18 @@ test("web.host 非 loopback：解析层**接受**（loopback 拒起属运行时�
   }
 });
 
-test("非法 web.enabled / web.allowStdio → 结构化报错（必须布尔值）", () => {
+test("非法 web.enabled → 结构化报错（必须布尔值）；web.allowStdio 已退役 ⇒ warn + 忽略", () => {
   for (const bad of ["true", 1, null]) {
     assert.throws(
       () => withConfig(minimalConfig({ web: { enabled: bad } }), loadMachinesConfig),
       /\[config\] web\.enabled 必须是布尔值/,
     );
-    assert.throws(
-      () => withConfig(minimalConfig({ web: { allowStdio: bad } }), loadMachinesConfig),
-      /\[config\] web\.allowStdio 必须是布尔值/,
+    const { warnings } = captureWarn(() =>
+      withConfig(minimalConfig({ web: { allowStdio: bad } }), loadMachinesConfig),
+    );
+    assert.ok(
+      warnings.some((w) => w.includes("web.allowStdio")),
+      `期望 allowStdio 退役告警，实际：${JSON.stringify(warnings)}`,
     );
   }
 });

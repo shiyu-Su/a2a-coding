@@ -88,7 +88,7 @@ function makeConfig(machines: MachineRef[], heartbeatTimeoutMs: number): Machine
   return {
     machines,
     transport: { mode: "http", http: { host: "127.0.0.1", port: 0, path: "/mcp" } },
-    web: { enabled: false, host: "127.0.0.1", port: 0, allowStdio: false },
+    web: { enabled: false, host: "127.0.0.1", port: 0 },
     runner: { holdMs: 50, heartbeatTimeoutMs },
   };
 }
@@ -121,7 +121,6 @@ async function startHarness(
   overrides: Partial<RunnerEndpointOptions> = {},
 ): Promise<Harness> {
   const handle = createRunnerEndpoints({
-    mode: () => "http",
     role: () => "owner",
     config: () => cfg,
     sweepIntervalMs: 3_600_000, // 关闭自动循环：由用例显式调用 sweepStale() 确定性驱动
@@ -207,7 +206,6 @@ test("sweepStale：心跳超期 → requeue + runner.offline + task.stale（事�
   const cfg = makeConfig([machine("m-sweep")], 1_000);
   let signals = 0;
   const handle = createRunnerEndpoints({
-    mode: () => "http",
     role: () => "owner",
     config: () => cfg,
     now: () => Date.parse("2026-09-18T00:01:00.000Z"),
@@ -338,7 +336,6 @@ test("离线→requeue→回线：注册→领取→超期回收→/connect 照�
 test("门闩：follower ⇒ sweepStale 空结果且零写库（不抢清算权）", () => {
   const cfg = makeConfig([machine("m-fol")], 1_000);
   const handle = createRunnerEndpoints({
-    mode: () => "http",
     role: () => "follower",
     config: () => cfg,
     now: () => Date.parse("2026-09-18T00:01:00.000Z"),

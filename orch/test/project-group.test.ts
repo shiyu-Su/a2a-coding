@@ -377,7 +377,7 @@ test("⑥ 本地任务态：taskStatus 读本地落库（不碰远端）", async
   assert.equal(outboundCount, 0, "taskStatus 不得有任何出站");
 });
 
-test("③ cancel：本地成员任务无 Runner 端点（stdio/测试形态）⇒ cancel_unavailable", async () => {
+test("③ cancel：本地成员任务无 Runner 端点（测试形态）⇒ cancel_unavailable", async () => {
   outboundCount = 0;
   writeConfig({ name: "g1", members: [{ machineId: "m1", projectId: "alpha" }] });
   registerRunner("m1", [{ projectId: "alpha" }]);

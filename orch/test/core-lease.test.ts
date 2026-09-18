@@ -39,7 +39,7 @@ function writeLockFromExitedProcess(lockPath: string): number {
     "const path=require('node:path');",
     "const p=process.argv[1];",
     "fs.mkdirSync(path.dirname(p),{recursive:true});",
-    "fs.writeFileSync(p, JSON.stringify({pid:process.pid,mode:'stdio',startedAt:new Date().toISOString()}));",
+    "fs.writeFileSync(p, JSON.stringify({pid:process.pid,mode:'http',startedAt:new Date().toISOString()}));",
   ].join("");
   const result = spawnSync(process.execPath, ["-e", script, lockPath], { stdio: "ignore" });
   if (result.pid === undefined || result.pid <= 0) {
@@ -70,9 +70,9 @@ test("首次抢锁 → owner，锁内容含 pid / mode / startedAt", () => {
 test("活锁存在 → 第二个 core 得 follower（不覆盖锁）", () => {
   const dir = tempDir("follower");
   try {
-    const first = acquireCoreLease(dir, "stdio");
+    const first = acquireCoreLease(dir, "http");
     assert.equal(first.role, "owner");
-    const second = acquireCoreLease(dir, "stdio");
+    const second = acquireCoreLease(dir, "http");
     assert.equal(second.role, "follower");
     assert.equal(second.role === "follower" ? second.holder?.pid : null, process.pid);
     // 锁仍属第一持有者
@@ -108,11 +108,11 @@ test("损坏 / 空锁文件 → 判为陈旧并接管", () => {
     const lockPath = coreLockPath(dir);
     writeFileSync(lockPath, "not-json", "utf8");
     assert.equal(readCoreLease(dir), null);
-    assert.equal(acquireCoreLease(dir, "stdio").role, "owner");
+    assert.equal(acquireCoreLease(dir, "http").role, "owner");
 
     writeFileSync(lockPath, "", "utf8");
     releaseCoreLease(dir);
-    assert.equal(acquireCoreLease(dir, "stdio").role, "owner");
+    assert.equal(acquireCoreLease(dir, "http").role, "owner");
     assert.equal(releaseCoreLease(dir), true);
   } finally {
     rmSync(dir, { recursive: true, force: true });
@@ -129,7 +129,7 @@ test("releaseCoreLease：幂等，且不删他进程的活锁", () => {
     const lockPath = coreLockPath(dir);
     writeFileSync(
       lockPath,
-      JSON.stringify({ pid: process.pid + 1, mode: "stdio", startedAt: "2026-01-01T00:00:00Z" }),
+      JSON.stringify({ pid: process.pid + 1, mode: "http", startedAt: "2026-01-01T00:00:00Z" }),
       "utf8",
     );
     assert.equal(releaseCoreLease(dir), false, "他进程的锁不得被删");
@@ -137,7 +137,7 @@ test("releaseCoreLease：幂等，且不删他进程的活锁", () => {
     rmSync(lockPath, { force: true }); // 清掉测试夹具，验证"自己的锁"路径
 
     // 自己的锁 → 删除且幂等
-    const result = acquireCoreLease(dir, "stdio");
+    const result = acquireCoreLease(dir, "http");
     assert.equal(result.role, "owner");
     assert.equal(releaseCoreLease(dir), true);
     assert.equal(releaseCoreLease(dir), false);
@@ -152,7 +152,7 @@ test("dataDir 不存在时自动创建后再建锁", () => {
   const dir = join(base, "nested", "data");
   try {
     assert.equal(existsSync(dirname(coreLockPath(dir))), false);
-    const result = acquireCoreLease(dir, "stdio");
+    const result = acquireCoreLease(dir, "http");
     assert.equal(result.role, "owner");
     assert.ok(existsSync(dir), "dataDir 应被创建");
     assert.equal(releaseCoreLease(dir), true);

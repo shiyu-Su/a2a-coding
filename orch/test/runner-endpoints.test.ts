@@ -9,7 +9,7 @@
  * - **CAS claim 唯一**：同一入队任务被两个并发 `/connect` 争抢 ⇒ 恰一个 `dispatch`、另一个心跳；
  * - **wake 唤醒**：挂起的 `/connect` 被 `wake(machineId)` 立即唤醒并领取新入队任务（远早于 hold）；
  * - **hold 超时**：无命令时到点返回 204（心跳）；
- * - **owner 门闩 / stdio 不注册**：follower ⇒ 503 `runner_not_owner`；stdio ⇒ `/runner/*` 404；
+ * - **owner 门闩**：follower ⇒ 503 `runner_not_owner`（stdio 已退役，接入面恒 http）；
  * - **register 落库 / 事件 / 宽容解析**：投影全量替换 + `runner.registered` 事件 + 未知字段忽略；
  * - **result claim_token 校验**：错令牌 ⇒ 409，正确 ⇒ 200 ack 且幂等。
  *
@@ -101,7 +101,7 @@ function makeConfig(opts: {
   return {
     machines: opts.machines,
     transport: { mode: "http", http: { host: "127.0.0.1", port: 0, path: "/mcp" } },
-    web: { enabled: false, host: "127.0.0.1", port: 0, allowStdio: false },
+    web: { enabled: false, host: "127.0.0.1", port: 0 },
     runner: { holdMs: opts.holdMs ?? 100, heartbeatTimeoutMs: 60_000 },
     ...(projectGroup === undefined ? {} : { projectGroup }),
   };
@@ -117,7 +117,6 @@ async function startHarness(
   overrides: Partial<RunnerEndpointOptions> = {},
 ): Promise<Harness> {
   const handle = createRunnerEndpoints({
-    mode: () => "http",
     role: () => "owner",
     config: () => cfg,
     ...overrides,
@@ -463,10 +462,10 @@ test("hold 超时：无命令时到点返回 204 心跳（且不超过请求/配
 });
 
 // ---------------------------------------------------------------------------
-// owner 门闩 / stdio 不注册
+// owner 门闩（stdio 已退役，接入面恒 http）
 // ---------------------------------------------------------------------------
 
-test("owner 门闩：follower ⇒ 503 runner_not_owner；stdio 形态 ⇒ /runner/* 404（不注册路由）", async () => {
+test("owner 门闩：follower ⇒ 503 runner_not_owner", async () => {
   const cfg = makeConfig({ machines: [machine("m-gate", "tok-gate")], holdMs: 60 });
   const follower = await startHarness(cfg, { role: () => "follower" });
   const denied = await post(
@@ -477,15 +476,6 @@ test("owner 门闩：follower ⇒ 503 runner_not_owner；stdio 形态 ⇒ /runne
   );
   assert.equal(denied.status, 503);
   assert.equal(errorCodeOf(denied), "runner_not_owner");
-
-  const stdio = await startHarness(cfg, { mode: () => "stdio" });
-  const notFound = await post(
-    stdio.port,
-    RUNNER_REGISTER_PATH,
-    { machineId: "m-gate", protocolVersion: "2.0", projects: [] },
-    "tok-gate",
-  );
-  assert.equal(notFound.status, 404);
 });
 
 // ---------------------------------------------------------------------------

@@ -6,33 +6,24 @@
 
 - Node.js ≥ 22.5；桥已构建：`orch` 下 `npm run build` 产出 `orch/dist/bridge/index.js`（**入口在 `dist/`，未 build 起不来**）。
 - `orch/config/config.json` 已存在且含 `machines[]`（模板 `config.json.default`）。
-- stdio 形态要求 **Codex 与桥同机**（stdio 是子进程管道，不支持跨机；跨机执行由桥→Launcher 的 HTTP 承担，与这里无关）。
+- 桥以 **HTTP 形态**运行，Codex 经 `~/.codex/config.toml` 的 `url` 连接其 MCP 端点。
 
-## ① 注册本地 stdio MCP
+## ① 注册 remote MCP
 
-Codex 的 MCP server 写在**用户级** `~/.codex/config.toml`，用 `[mcp_servers.<name>]` 表（把 `<orch>` 换成**绝对路径**）：
+Codex 的 MCP server 写在**用户级** `~/.codex/config.toml`，用 `[mcp_servers.<name>]` 表：
 
 ```toml
 [mcp_servers.a2a]
-command = "node"
-args = ["<orch>/dist/bridge/index.js"]
-env = { MACHINES_CONFIG = "<orch>/config/config.json", SESSION_DB = "<orch>/data/sessions.sqlite" }
+url = "http://127.0.0.1:8787/mcp"
 ```
 
-- 两个 env 可省略（桥按单元根回退），但**建议显式写出**（避免多份桥副本「库与配置分家」）。
-- Windows 路径反斜杠在 TOML 里需转义（`\\`）或用正斜杠。
+- 按 `url` 识别，**无 `type` 键**。
 
-## ② ⚠️ 两种形态不能共用同一份 orch config
+## ② 桥以 HTTP 形态运行
 
-桥的接入面由**桥自己读的 `<orch>/config/config.json`** 决定，与宿主"怎么写条目"无关：
+桥的接入面由**桥自己读的 `<orch>/config/config.json`** 决定：`transport.mode = "http"` 时桥以 HTTP 形态运行，与宿主"怎么写条目"无关。
 
-| `config.json` | 桥的运行形态 |
-|---|---|
-| **无 `transport` 段**（或 `mode = "stdio"`） | stdio（由宿主作为子进程拉起） |
-| `transport.mode = "http"` | 常驻 HTTP（在 orch 单元根用 `npm run bridge:start -- --no-wait` 发起 → `npm run bridge:status` 确认就绪；**退出码 0 = 已发起，≠ 已就绪**） |
-
-⇒ 要两种形态并存，需**两份 config 文件**，分别经 `MACHINES_CONFIG` 指向。
-另两条易错点：**remote 形态的宿主条目不需要 `env`**（env 属于启动桥的 shell）；**stdio 桥不写 pidfile、不归 `bridgectl` 管**（`bridgectl status` 会报"未运行"）。
+- 宿主条目**不需要 `env`**（env 属于启动桥的 shell）。
 
 ## ③ 加载额外指令文件（**已在官方文档级核实**）
 
@@ -67,5 +58,5 @@ Codex **没有**「列出额外指令文件路径」的配置键：
 ## 待真机核实（**文档级已核实，真机仍未验**）
 
 - ✅ **已核实（官方文档级）**：无"额外指令文件列表"键；`instructions` 保留未启用；`model_instructions_file` 是**替换**且不鼓励；`AGENTS.md` 链与 32 KiB 上限；
-- ✅ **已核实（官方文档级）**：MCP **stdio** 键 = `command` / `args` / `env` / `env_vars` / `cwd`；**HTTP** 键 = `url` / `bearer_token_env_var` / `http_headers` / `env_http_headers`（**无 `type` 键**，按有 `command` 还是有 `url` 推断；HTTP 原生支持、**无需 feature flag**）；项目级 `.codex/config.toml` **仅在受信项目**读取；
-- ⏳ **仍待真机**：上述键名在你的 Codex 版本上实际生效（含 remote 形态；本仓的 `codex.config.toml.example` 里该段仍标"未真机"）。
+- ✅ **已核实（官方文档级）**：MCP **HTTP** 键 = `url` / `bearer_token_env_var` / `http_headers` / `env_http_headers`（**无 `type` 键**，按有 `url` 推断；HTTP 原生支持、**无需 feature flag**）；项目级 `.codex/config.toml` **仅在受信项目**读取；
+- ⏳ **仍待真机**：上述键名在你的 Codex 版本上实际生效（本仓的 `codex.config.toml.example` 里该段仍标"未真机"）。
