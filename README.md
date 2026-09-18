@@ -172,9 +172,11 @@ npm run build        # 产出 dist/bridge/index.js
 
 ```bash
 cd machine
-npm run start        # 后台启动（已在运行则提示并退出 0）
-npm run status       # 查看 pid / host:port / health / startedAt
+npm run start -- --no-wait   # 后台启动：发起即返（exit 0 = 已发起，≠ 业务就绪）
+npm run status               # 查看 pid / host:port / health / startedAt（确认就绪）
 ```
+
+> **就绪语义与全部选项以 [machine/README.md](machine/README.md) 为唯一锚点**：缺省 `start` 只等「服务可答」，**`exit 0` ≠ 业务就绪**；需要业务就绪用 `npm run start -- --wait-ready`。⚠ npm 会吞掉裸 `--no-*`，透传必须写 `--`。
 
 启动后，Launcher 会按配置监听端口并暴露本机项目；orch 侧即可通过 MCP 工具派发任务。首次落地时 Launcher 默认对全部项目跑一遍启动自检，自检通过才放行业务路由（详见 [构建与部署](#构建与部署)）。
 
@@ -530,16 +532,18 @@ a2a-coding/
 "mcp": { "a2a": { "type": "remote", "url": "http://127.0.0.1:8787/mcp", "enabled": true } }
 ```
 
-启停一律经 `orch/scripts/bridgectl.mjs`（`npm run bridge:*`），语义与 Launcher 的 `launcherctl.mjs` 一致：
+启停一律经 `orch/scripts/bridgectl.mjs`（`npm run bridge:*`），与 Launcher 的 `launcherctl.mjs` **同契约**：
 
 ```bash
 cd orch
-npm run bridge:start    # 后台常驻启动，日志重定向；已在运行则提示并退出
-npm run bridge:status   # 查看 pid / host:port / health / role / startedAt
-npm run bridge:stop     # 优先 POST /shutdown 优雅停机，超时兜底强杀
-npm run bridge:restart  # 停止后重新后台拉起
-npm run bridge:logs     # 输出日志全文（支持 --lines N / --follow）
+npm run bridge:start -- --no-wait   # 发起即返（exit 0 = 已发起，≠ 就绪）
+npm run bridge:status               # 确认就绪（pid / host:port / health / role / startedAt）
+npm run bridge:stop                 # 优先 POST /shutdown 优雅停机，超时兜底强杀
+npm run bridge:restart -- --no-wait # 仅 start 段即返；stop 段仍阻塞（极端 ≤35s）
+npm run bridge:logs                 # 输出日志全文（支持 --lines N / --follow）
 ```
+
+> **就绪语义与全部选项以 [orch/README.md](orch/README.md) 为唯一锚点**；⚠ npm 会吞掉裸 `--no-*`，透传必须写 `--`。
 
 - pidfile：`orch/data/bridge.pid`；日志：`orch/data/logs/bridge.log`。
 - **单实例与单调度权靠 core 租约**（`orch/data/core.lock`）：只有租约持有者运行 scheduler 与 task-watcher；同一 data dir 的第二个实例降级为 `follower`，照常提供 MCP 工具但不跑后台循环。`GET /health` 会报当前 `role`（`owner` / `follower`）。
@@ -551,16 +555,17 @@ npm run bridge:logs     # 输出日志全文（支持 --lines N / --follow）
 Launcher 的启停一律经 `machine/scripts/launcherctl.mjs`（纯 Node ESM，零第三方依赖、无需构建），同一条命令在 Windows / Linux / macOS 均可后台常驻，日志写入 `machine/.a2a/logs/launcher.log`：
 
 ```bash
-npm run start                 # 后台启动（已在运行则提示并退出 0）
+npm run start -- --no-wait    # 后台启动：发起即返（exit 0 = 已发起，≠ 业务就绪）
+npm run start -- --wait-ready # 需要业务就绪（等 health status=ok）时使用
 npm run status                # 查看 pid / host:port / health / startedAt
 npm run stop                  # 停止（POSIX 发 SIGTERM 优雅退出；Windows taskkill /T /F 强制树杀）
-npm run restart               # 停止后重新后台拉起
+npm run restart -- --no-wait  # 停止后重新拉起（--no-wait 仅 start 段即返；stop 段仍阻塞 ≈≤20s）
 npm run logs                  # 输出日志全文
 npm run logs -- --lines 50    # 仅看尾部 50 行
 npm run logs -- --follow      # 持续跟踪（等价 tail -f，Ctrl+C 退出）
 ```
 
-端口读配置 `launcher.port`，`MACHINE_CONFIG` 可指定其他配置文件；pidfile 位于 `machine/.a2a/launcher.pid`（由 Launcher 写）。`start` 会轮询 `/health` 至可达；`stop` 优先按配置 `launcher.shutdownEndpoint=true` 走 `POST /shutdown` 优雅停止，端点不可用时回落到发信号。pidfile 缺失 / 陈旧时只做端口探测提示，不误杀。前台命令 `npm run launcher` 的进程同样可被 `status` 发现、被 `stop` 停止。
+端口读配置 `launcher.port`，`MACHINE_CONFIG` 可指定其他配置文件；pidfile 位于 `machine/.a2a/launcher.pid`（由 Launcher 写）。`start` 缺省只等「服务可答（HTTP 200）」，**`exit 0` ≠ 业务就绪**（需要业务就绪用 `npm run start -- --wait-ready`；**就绪语义与全部选项以 [machine/README.md](machine/README.md) 为唯一锚点**）；`stop` 优先按配置 `launcher.shutdownEndpoint=true` 走 `POST /shutdown` 优雅停止，端点不可用时回落到发信号。pidfile 缺失 / 陈旧时只做端口探测提示，不误杀。前台命令 `npm run launcher` 的进程同样可被 `status` 发现、被 `stop` 停止。
 
 ### 孤儿进程回收（`machine/scripts/reaper.mjs`）
 

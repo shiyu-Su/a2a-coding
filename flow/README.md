@@ -20,7 +20,7 @@
 本仓（`orch/` 桥 + `machine/` Launcher + `flow/` 规范 + 配置模板）本身就是一套可直接使用的 orch 宿主。使用步骤：
 
 1. clone 本仓，分别 `npm install` `orch/` 与 `machine/`，并构建桥（`orch` 下 `npm run build`）。
-2. 起 Launcher（执行机器，一律经 `machine/scripts/launcherctl.mjs`）。
+2. 起 Launcher（执行机器，一律经 `machine/scripts/launcherctl.mjs`；在 machine 单元根用 `npm run start -- --no-wait` 发起 → `npm run status` 确认就绪）。
 3. 填两份配置：`machine/config/config.json` 的 `projects[]`，`orch/config/config.json` 的 `machines[]`。
 4. 启动宿主（如 opencode），经 `opencode.json` 的 `instructions` 加载 `flow/spec/*.md`，并注册 `mcp.a2a`。
 5. 验证：`a2a_projects()` 能列出项目即接入成功。

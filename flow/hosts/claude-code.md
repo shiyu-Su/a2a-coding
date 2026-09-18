@@ -41,7 +41,7 @@ Claude Code 的 MCP server 写在 `mcpServers` 对象里，位置二选一：
 | `config.json` | 桥的运行形态 |
 |---|---|
 | **无 `transport` 段**（或 `mode = "stdio"`） | stdio（由宿主作为子进程拉起） |
-| `transport.mode = "http"` | 常驻 HTTP（须 `npm run bridge:start`，**非阻塞发起**） |
+| `transport.mode = "http"` | 常驻 HTTP（在 orch 单元根用 `npm run bridge:start -- --no-wait` 发起 → `npm run bridge:status` 确认就绪；**退出码 0 = 已发起，≠ 已就绪**） |
 
 ⇒ 要两种形态并存，需**两份 config 文件**，分别经 `MACHINES_CONFIG` 指向。
 另两条易错点：**remote 形态的宿主条目不需要 `env`**（env 属于启动桥的 shell）；**stdio 桥不写 pidfile、不归 `bridgectl` 管**。

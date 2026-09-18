@@ -67,4 +67,4 @@ node flow/install/install.mjs --host opencode --orch <orch 单元路径>
 a2a_projects()
 ```
 
-能列出已配置机器及其本机项目，即接入成功。若返回空或报错，依次检查：Launcher 是否已 `npm run start` 且 `/health` 为 `ok`；`orch/config/config.json` 的 `machines[]` 是否指向正确的 `launcherUrl`。
+能列出已配置机器及其本机项目，即接入成功。若返回空或报错，依次检查：Launcher 是否已在 machine 单元根发起（`npm run start -- --no-wait`）并经 `npm run status` 确认就绪（见 machine 单元 README）；`orch/config/config.json` 的 `machines[]` 是否指向正确的 `launcherUrl`。

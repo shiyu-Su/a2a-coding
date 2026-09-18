@@ -922,6 +922,9 @@ export class SessionStore {
    *
    * v0.6.1 REQ-05 §2.5 白捡（C11）：**同时清 `dispatch_guard`** —— 回到「待派发」后，
    * 旧占位不再代表「已发出」（否则重启恢复会把重排后的节点误判为派发窗口中断 ⇒ 永久不派）。
+   *
+   * ⚠️ **Feature `failed` 节点重派禁止走此口**：本方法不做状态前置校验、亦不自增 `retry_count`，
+   * 唯一入口 = `rearmForRetry`（单语句条件 UPDATE + `retry_count+1`，参与失败账单 episode 去重）。
    */
   rearmTask(taskId: string, dispatchMessage: string): TaskRecord | null {
     this.db

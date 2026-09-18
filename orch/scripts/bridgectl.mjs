@@ -16,9 +16,28 @@
  * start 只做「先探测再起」的快速判定；stop 优先 `POST /shutdown`（仅 loopback）优雅停机、
  * 超时兜底强杀；status/logs 依赖 pidfile + 端口探测，**pidfile 缺失/陈旧只探测提示、不误杀**。
  *
- * 运行判定（**不以「端口可连」为准**）：只有 `GET /health` 返回 **HTTP 200 且 body 可解析出
- * `status:"ok"`**（并读出 `role`）才算「桥在运行」；仅端口可连而 `/health` 不健康 → 视为
- * **端口被非本桥进程占用**，`start` fail fast（非零退出 + 不写 pidfile）。
+ * Windows 脱壳拉起（REQ-v0.6.2-2026-09-18-02 增补#2 节点 E-N1；与 machine 侧**同契约、异实现**）：
+ *   常驻桥经 WMI `Win32_Process.Create` 脱壳（挂 WmiPrvSE，**不在**调用方作业 / 进程树内），
+ *   由隐藏窗口的壳进程 `Start-Process` 拉起 —— 否则调用方（宿主工具）「等自己的作业 / 进程树清空」而卡住。
+ *   脱壳不可用（无 WMI / 权限不足 / 判定失败）⇒ **显式**降级 `spawn(detached)` 并在 stdout 警告（不静默）。
+ *   POSIX 保持 `spawn(detached:true)` + `unref()`（setsid 天然脱离）。
+ *   注：`Start-Process` **不允许** stdout / stderr 指向同一文件（InvalidOperationException），故壳内经
+ *   `cmd /c "… >> log 2>&1"` 合并两条流（保持与原 `openSync(log,"a")` 一致的追加语义）；脱壳后脚本
+ *   **无子进程句柄** ⇒ pid 归属校验退化为「以 pidfile 为准；缺失判『不确定』」（并发竞态与 machine 侧同口径）。
+ *
+ * 运行判定（**不以「端口可连」为准**，键 = `/health` 的 `status`）：`GET /health` 返回
+ * **HTTP 200 且 `status:"ok"`**（并读出 `role`）才算「桥在运行」；`status:"starting"`
+ * （HTTP 503）表示**本服务启动中**。start 入口探测按 `status` 三分类：
+ *   - `/health` 不可达 / 不可解析 ⇒ **真占用**（exit 1，不写 pidfile、不 spawn）
+ *   - `status:"ok"` ⇒ 已在运行 / 已就绪（exit 0）
+ *   - `status:"starting"` ⇒ 本服务启动中 ⇒ **缺省与 `--no-wait` 均即返 0**
+ *   - `status` 缺失 / 非白名单（`ok|starting` 之外）⇒ 占用（exit 1）
+ *
+ * 等待语义（C1/C2）：`start` **缺省**等待服务可答（`/health` 200 且 `status:"ok"`）后返回
+ * （≤ `READY_TIMEOUT_MS`）；`--no-wait` 发起即返（exit 0 = 已发起，**≠ 就绪**；仅 spawn
+ * 同步失败才 exit 1）。**缺省 0 ≠ 业务就绪**。`restart --no-wait` **仅 start 段**生效，
+ * stop 段仍阻塞（最长约 35s = shutdown 5s + 强杀等待 15s×2），**非瞬时返回**。
+ * 退出码恒 `{0,1}`（C5）。
  *
  * status 退出码约定（与 `cmdStatus` 实现一致）：桥在运行 → 0；未运行 → 0；
  * 探测/配置异常（端口被非本桥占用、`/health` 不健康、配置不可读）→ 非零。
@@ -79,6 +98,11 @@ function fail(message) {
 
 function info(message) {
   console.log(`[bridgectl] ${message}`);
+}
+
+/** 降级告警（stdout，必须可见）：如脱壳不可用时提示「调用方可能被拖住」 */
+function warn(message) {
+  console.log(`[bridgectl] 警告：${message}`);
 }
 
 function delay(ms) {
@@ -183,13 +207,28 @@ async function httpHealth(host, port, timeoutMs = 2_000) {
   }
 }
 
-/** 轮询 `/health` 至 `status=ok`（就绪信号晚于 `recover()`）；超时返回 null */
-async function waitForReady(host, port, timeoutMs) {
+/**
+ * 轮询 `/health` 至就绪；就绪判定**收紧**为 `HTTP 200 && status === "ok"`（与入口探测
+ * `doStart` 一致，防御 200 + 非 ok 的中间态）。循环内 `null`（不可达）与 `starting`
+ * 一律**继续轮询至超时**（行为不变）；超时返回 `{ health: null, sawStarting }`。
+ * `onStatus` 仅在观测到的 `status` 变化时回调（供上层明示 `starting`）。
+ */
+async function waitForReady(host, port, timeoutMs, onStatus) {
   const deadline = Date.now() + timeoutMs;
+  let reported;
+  let sawStarting = false;
   for (;;) {
     const health = await httpHealth(host, port);
-    if (health !== null && health.httpStatus === 200) return health;
-    if (Date.now() >= deadline) return null;
+    if (health !== null && health.httpStatus === 200 && health.status === "ok") {
+      return { health, sawStarting };
+    }
+    const status = health?.status;
+    if (status !== undefined && status !== reported) {
+      reported = status;
+      if (status === "starting") sawStarting = true;
+      onStatus?.(health);
+    }
+    if (Date.now() >= deadline) return { health: null, sawStarting };
     await delay(PROBE_INTERVAL_MS);
   }
 }
@@ -231,43 +270,84 @@ function ensureBuilt() {
   fail(`未找到 ${BRIDGE_ENTRY}：请先在 ${BRIDGE_ROOT} 运行 npm run build`);
 }
 
+/** PowerShell 单引号字面量（内部单引号翻倍）：把任意字符串安全嵌入 PS 源码 */
+function psQuote(value) {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/** PowerShell `-EncodedCommand` 载荷（UTF-16LE + Base64）：规避多层命令行的引号 / 转义问题 */
+function encodePowerShell(script) {
+  return Buffer.from(script, "utf16le").toString("base64");
+}
+
 /**
- * 后台启动（幂等，但**判定以 `/health` 为准**：仅端口可连不算「已在运行」）。
- * 不退出，返回结果供调用方决定输出 / 退出码：
- *   - { ok:true, already:true }  端口在监听且 `/health` HTTP 200 + `status:"ok"` → 已在运行
- *   - { ok:false, occupied:true } 端口在监听但 `/health` 不健康 → 端口被非本桥占用（不构建、不 spawn、不写 pidfile）
- *   - { ok:true, already:false } 本次后台拉起成功并已就绪
- *   - { ok:false, occupied:false } 已拉起但就绪超时
+ * 脱壳壳脚本（Windows）：隐藏窗口拉起常驻桥，stdout / stderr **追加合并**落 bridge.log。
+ * 说明：`Start-Process` 不允许 stdout / stderr 指向同一文件（InvalidOperationException），
+ * 故经 `cmd /c … >> log 2>&1` 合并两条流，并保持与原 `openSync(log, "a")` 一致的**追加**语义。
+ * `MACHINES_CONFIG` / `SESSION_DB` 在壳内设置：Start-Process 的子进程继承壳进程环境
+ * （WmiPrvSE 的环境不含调用方变量，故这两个决定落盘的变量必须显式带入）。
  */
-async function doStart(config) {
-  const host = resolveProbeHost(config);
-
-  if (await probePort(config.port, host)) {
-    const health = await httpHealth(host, config.port);
-    if (health !== null && health.httpStatus === 200 && health.status === "ok") {
-      return { ok: true, already: true, host, port: config.port, health, pid: undefined };
-    }
-    // 仅端口可连、/health 不健康：判定为「端口被非本桥进程占用」，交调用方 fail fast
-    // （非零退出 + 不写 pidfile）。不得据此误报「已在运行」并 exit 0。
-    return {
-      ok: false,
-      already: false,
-      occupied: true,
-      host,
-      port: config.port,
-      health,
-      pid: undefined,
-    };
+function buildDetachShellScript(config) {
+  const inner = `/c ""${process.execPath}" "${BRIDGE_ENTRY}" >> "${LOG_PATH}" 2>&1"`;
+  const lines = [
+    "$shell = if ($env:ComSpec) { $env:ComSpec } else { 'cmd.exe' }",
+    `$env:MACHINES_CONFIG = ${psQuote(config.path)}`,
+  ];
+  if (process.env["SESSION_DB"] !== undefined) {
+    lines.push(`$env:SESSION_DB = ${psQuote(process.env["SESSION_DB"])}`);
   }
+  lines.push(
+    `Start-Process -FilePath $shell -ArgumentList ${psQuote(inner)} -WorkingDirectory ${psQuote(
+      BRIDGE_ROOT,
+    )} -WindowStyle Hidden`,
+  );
+  return lines.join("\n");
+}
 
-  ensureBuilt();
-  mkdirSync(LOG_DIR, { recursive: true });
+/**
+ * Windows 脱壳拉起：WMI `Win32_Process.Create` 建**隐藏的 powershell 壳**（挂 WmiPrvSE，不在调用方树内），
+ * 壳内 `Start-Process -WindowStyle Hidden` 拉起常驻桥。同步等**壳进程**退出（毫秒级），常驻桥已脱壳。
+ * 返回 `{ kind: "detached" }` 或 `{ kind: "failed", reason }`（后者由调用方显式降级，不得静默）。
+ */
+function launchDetachedWindows(config) {
+  const shellCmd = `powershell -NoProfile -WindowStyle Hidden -EncodedCommand ${encodePowerShell(
+    buildDetachShellScript(config),
+  )}`;
+  const outerScript =
+    `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ${psQuote(shellCmd)} }; ` +
+    "if ($null -eq $r) { exit 2 }; exit [int]$r.ReturnValue";
+  let result;
+  try {
+    result = spawnSync("powershell", ["-NoProfile", "-Command", outerScript], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 30_000,
+    });
+  } catch (err) {
+    return { kind: "failed", reason: err instanceof Error ? err.message : String(err) };
+  }
+  if (result.error !== undefined) return { kind: "failed", reason: result.error.message };
+  if (result.status !== 0) {
+    const lines = String(result.stderr ?? "")
+      .trim()
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== "");
+    const detail = lines.length > 0 ? `：${lines[lines.length - 1]}` : "";
+    return { kind: "failed", reason: `WMI Create 退出码 ${result.status}${detail}` };
+  }
+  return { kind: "detached" };
+}
 
+/**
+ * 兜底拉起：`spawn(detached: true)` + `unref()`（POSIX 天然脱离；Windows 兜底，**可能拖住调用方**）。
+ * stdio 显式绑定到日志 fd：子进程**不继承**调用方的 stdout/stderr，调用方可正常拿到 EOF
+ * （否则管道被桥长期持有、调用方读不到 EOF 而挂住）。fd 已被 spawn 复制，随后即可 close。
+ * 返回 `{ kind: "spawn", child }` 或 `{ kind: "spawn-failed", error }`。
+ */
+function spawnBridgeDetached(config) {
   const logFd = openSync(LOG_PATH, "a");
   let child;
   try {
-    // stdio 显式绑定到日志 fd：子进程**不继承**调用方的 stdout/stderr，调用方可正常拿到 EOF
-    // （否则管道被桥长期持有、调用方读不到 EOF 而挂住）。fd 已被 spawn 复制，随后即可 close。
     child = spawn(process.execPath, [BRIDGE_ENTRY], {
       detached: true,
       stdio: ["ignore", logFd, logFd],
@@ -275,22 +355,110 @@ async function doStart(config) {
       cwd: BRIDGE_ROOT,
       env: { ...process.env, MACHINES_CONFIG: config.path },
     });
-  } finally {
+  } catch (err) {
     closeSync(logFd);
+    // spawn **同步**失败（参数非法 / 资源不可用等）：按契约 exit 1，不得当作「已发起」
+    return { kind: "spawn-failed", error: err };
   }
-
+  closeSync(logFd);
   child.once("error", (err) => {
     console.error(
       `[bridgectl] 子进程启动失败：${err instanceof Error ? err.message : String(err)}`,
     );
   });
   child.unref();
+  return { kind: "spawn", child };
+}
 
-  const health = await waitForReady(host, config.port, READY_TIMEOUT_MS);
-  if (health === null) {
-    return { ok: false, already: false, host, port: config.port, health: null, pid: child.pid };
+/**
+ * 拉起初次实例（入口判定为「端口未监听」后调用）：
+ *   - Windows：先试 WMI 脱壳（脱离调用方作业 / 进程树）；不可用则**显式**降级 `spawn(detached)` 并 stdout 警告。
+ *   - 其它平台：`spawn(detached:true)` + `unref()`。
+ */
+function launchBridge(config) {
+  if (process.platform !== "win32") return spawnBridgeDetached(config);
+
+  const detached = launchDetachedWindows(config);
+  if (detached.kind === "detached") return { kind: "detached" };
+
+  warn(
+    `Windows 脱壳拉起不可用（${detached.reason}）⇒ 降级为 spawn(detached)；**调用方（宿主工具）可能被拖住**（常驻桥仍在其作业 / 进程树内）。`,
+  );
+  return spawnBridgeDetached(config);
+}
+
+/**
+ * 后台启动（幂等，但**判定以 `/health` 为准**：仅端口可连不算「已在运行」）。
+ * 入口探测（端口已监听）按 `/health` 的 `status` 三分类（键 = `status`，见文件头）：
+ *   - `httpHealth === null`（可连但 /health 不可达 / 非 JSON）⇒ **真占用**（`occupied`，exit 1）
+ *   - `status === "ok"` ⇒ 已就绪 / 已在运行（`already`，exit 0）
+ *   - `status === "starting"` ⇒ 本服务启动中 ⇒ **缺省与 `--no-wait` 均即返 0**（`starting`）
+ *   - `status` 缺失 / 非白名单 ⇒ 占用（`occupied`，exit 1）
+ * 端口未监听则拉起：`--no-wait` 发起即返（`spawned`）；缺省轮询至 `200 && status === "ok"`
+ * （`started`），超时 `timeout`（exit 1）。spawn **同步**抛错 ⇒ `spawn-failed`（exit 1）。
+ * 不退出，返回 `{ kind, host, port, health, pid, sawStarting?, error? }` 供调用方决定输出 / 退出码。
+ */
+async function doStart(config, options = {}) {
+  const noWait = options.noWait === true;
+  const host = resolveProbeHost(config);
+  const port = config.port;
+
+  if (await probePort(port, host)) {
+    const health = await httpHealth(host, port);
+    if (health === null) {
+      // ① 可连但 /health 不可达 / 不可解析 ⇒ 真占用（不构建、不 spawn、不写 pidfile）
+      return { kind: "occupied", host, port, health: null, pid: undefined };
+    }
+    if (health.status === "ok") {
+      // ② 已就绪 / 已在运行
+      return { kind: "already", host, port, health, pid: undefined };
+    }
+    if (health.status === "starting") {
+      // ③ 本服务启动中：入口探测遇 starting ⇒ 缺省 / --no-wait 均即返 0
+      return { kind: "starting", host, port, health, pid: undefined };
+    }
+    // ④ status 缺失 / 非白名单 / 不可解析 ⇒ 端口被非本桥进程占用
+    return { kind: "occupied", host, port, health, pid: undefined };
   }
-  return { ok: true, already: false, host, port: config.port, health, pid: child.pid };
+
+  ensureBuilt();
+  mkdirSync(LOG_DIR, { recursive: true });
+
+  // 拉起方式：Windows 走 WMI 脱壳（脱离调用方作业 / 进程树），其余走 spawn(detached) + unref
+  const launched = launchBridge(config);
+  if (launched.kind === "spawn-failed") {
+    // spawn **同步**失败（参数非法 / 资源不可用等）：按契约 exit 1，不得当作「已发起」
+    return { kind: "spawn-failed", host, port, health: null, pid: undefined, error: launched.error };
+  }
+
+  // 脱壳路径**无本地子进程句柄**（child=undefined）⇒ pid 以 pidfile 为准；缺失即 undefined（判「不确定」）
+  const child = launched.kind === "spawn" ? launched.child : undefined;
+  const launchPid = child !== undefined ? child.pid : readPidfile()?.pid;
+
+  if (noWait) {
+    // 发起即返：exit 0 = 已发起 ≠ 就绪；异步 spawn error 不改变结论（C8：pid 仅供参考）
+    return { kind: "spawned", host, port, health: null, pid: launchPid };
+  }
+
+  const ready = await waitForReady(host, port, READY_TIMEOUT_MS, options.onStatus);
+  if (ready.health === null) {
+    return {
+      kind: "timeout",
+      host,
+      port,
+      health: null,
+      pid: launchPid,
+      sawStarting: ready.sawStarting,
+    };
+  }
+  return {
+    kind: "started",
+    host,
+    port,
+    health: ready.health,
+    pid: launchPid,
+    sawStarting: ready.sawStarting,
+  };
 }
 
 /** 优雅停机端点（`POST /shutdown`，仅 loopback）；成功返回 true */
@@ -440,11 +608,13 @@ function parsePositiveInt(value, name) {
 }
 
 function parseArgs(argv) {
-  const flags = { lines: undefined, follow: false, help: false };
+  const flags = { lines: undefined, follow: false, help: false, noWait: false };
   const positionals = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
-    if (arg === "--follow" || arg === "-f") {
+    if (arg === "--no-wait") {
+      flags.noWait = true;
+    } else if (arg === "--follow" || arg === "-f") {
       flags.follow = true;
     } else if (arg === "--lines" || arg === "-n") {
       i += 1;
@@ -469,12 +639,23 @@ function printUsage() {
   node scripts/bridgectl.mjs <command> [options]
 
 命令：
-  start     后台启动常驻桥（detached + stdio 指向日志 fd + 轮询 /health 至就绪；已在运行则提示并退出 0；
-            端口被非本桥占用则非零退出且不写 pidfile）
+  start     后台启动常驻桥（Windows 经 WMI 脱壳、POSIX 走 detached + stdio 指向日志 fd；缺省轮询 /health 至 ok；
+            已在运行则提示并退出 0；端口被非本桥占用则 exit 1 且不写 pidfile；--no-wait 则发起即返）
   stop      停止桥（优先 POST /shutdown 优雅停机，超时兜底强杀；清 pidfile）
-  restart   停止后重新后台拉起
+  restart   停止后重新后台拉起（--no-wait 仅 start 段生效：stop 段仍阻塞，非瞬时）
   status    查看运行态（pid / host:port / health / role / startedAt）；退出码：运行 0 / 未运行 0 / 探测异常非零
   logs      输出日志文件（--lines N 取尾部；--follow 跟踪）
+
+选项（start / restart）：
+  --no-wait         发起即返；exit 0 = 已发起（≠ 就绪），仅 spawn 同步失败才 exit 1。
+                    缺省 = 等待服务可答（GET /health 200 且 status:"ok"）后返回。
+                    缺省 0 ≠ 业务就绪（退出码 0 仅表示 /health 就绪，业务就绪需另行验证）。
+                    ! npm 会吞掉裸 --no-*（C7）：必须用 -- 透传，例如
+                        npm run bridge:start -- --no-wait
+                        npm run bridge:restart -- --no-wait
+                    ! restart 的 --no-wait 仅作用于 start 段：stop 段仍阻塞
+                      （最长约 35s = shutdown 5s + 强杀等待 15s×2），该次返回非瞬时。
+                    ! --no-wait 报出的 pid 仅供参考，须另起 status 确认（C8）。
 
 选项（logs）：
   -n, --lines <N>   仅输出尾部 N 行
@@ -492,7 +673,8 @@ function printUsage() {
   log              ${LOG_PATH}`);
 }
 
-async function cmdStart() {
+async function cmdStart(flags) {
+  const noWait = flags.noWait === true;
   const config = loadConfig();
   if (config.mode !== "http") {
     fail(
@@ -501,37 +683,95 @@ async function cmdStart() {
     );
   }
 
-  const result = await doStart(config);
-  if (!result.ok) {
-    if (result.occupied === true) {
+  const result = await doStart(config, {
+    noWait,
+    onStatus: (health) => {
+      if (health !== null && health.status === "starting") {
+        info("state: starting（服务已可答，尚未就绪；继续等待至 ok …）");
+      }
+    },
+  });
+
+  switch (result.kind) {
+    case "occupied": {
       const detail =
         result.health === null
-          ? "/health 不可达（非本桥 HTTP 服务）"
-          : `/health 不健康（httpStatus=${result.health.httpStatus}，status=${result.health.status ?? "无"}）`;
+          ? "/health 不可达 / 不可解析（非本桥 HTTP 服务）"
+          : `status 非白名单（httpStatus=${result.health.httpStatus}，status=${result.health.status ?? "无"}）`;
       console.error(
         `[bridgectl] 端口 ${result.port} 已被占用（非本桥）：${formatHost(result.host)}:${result.port} ${detail}；` +
-          `已中止 start（非零退出、未写 pidfile、未启动桥）。请先释放该端口，或改用其它 transport.http.port。`,
+          `已中止 start（exit 1、未写 pidfile、未启动桥）。请先释放该端口，或改用其它 transport.http.port。`,
       );
       process.exit(1);
+      return;
     }
-    console.error(
-      `[bridgectl] 启动超时（${READY_TIMEOUT_MS}ms）：${formatHost(result.host)}:${result.port} /health 不可达（pid=${result.pid}）`,
-    );
-    printLogTail(30);
-    process.exit(1);
+    case "spawn-failed": {
+      console.error(
+        `[bridgectl] 子进程启动失败（spawn 同步异常）：${
+          result.error instanceof Error ? result.error.message : String(result.error)
+        }；exit 1（未发起）。`,
+      );
+      process.exit(1);
+      return;
+    }
+    case "timeout": {
+      console.error(
+        `[bridgectl] state: ${result.sawStarting === true ? "starting" : "unreachable"}；启动失败（超时 ${READY_TIMEOUT_MS}ms）：` +
+          `${formatHost(result.host)}:${result.port} /health 未达 200+status=ok（pid=${result.pid}）`,
+      );
+      printLogTail(30);
+      process.exit(1);
+      return;
+    }
+    case "already": {
+      info(
+        `state: ok（已在运行：${formatHost(result.host)}:${result.port}${config.mcpPath}，` +
+          `health=${result.health?.status ?? "ok"}，role=${result.health?.role ?? "未报"}）`,
+      );
+      info("提示：缺省 0 ≠ 业务就绪（退出码 0 仅表示 /health 就绪，业务就绪需另行验证）。");
+      process.exit(0);
+      return;
+    }
+    case "starting": {
+      // 入口探测遇 starting：本服务启动中 ⇒ 缺省 / --no-wait 均即返 0（不接管、不重启）
+      info(
+        `state: starting（${formatHost(result.host)}:${result.port} 上的本服务正在启动中；未接管、未重启）`,
+      );
+      info("提示：缺省 0 ≠ 业务就绪；本分支不等待 ok，如需确认请另起 `bridgectl status`。");
+      process.exit(0);
+      return;
+    }
+    case "spawned": {
+      info(
+        `state: starting（--no-wait 发起即返：已拉起，未等待就绪）pid=${result.pid}（仅供参考），` +
+          `endpoint=${formatHost(result.host)}:${result.port}${config.mcpPath}，日志：${LOG_PATH}`,
+      );
+      info(
+        "提示：--no-wait 退出码 0 仅表示「已发起」，≠ 就绪；pid 仅供参考，请另起 `bridgectl status`" +
+          "（npm run bridge:status）确认。",
+      );
+      process.exit(0);
+      return;
+    }
+    case "started": {
+      if (result.sawStarting === true) {
+        info("state: starting（启动过程中服务已可答，尚未就绪）");
+      }
+      info(
+        `state: ok（已后台启动 pid=${result.pid}，health=${result.health?.status ?? "ok"}，` +
+          `role=${result.health?.role ?? "未报"}，endpoint=${formatHost(result.host)}:${result.port}${config.mcpPath}，` +
+          `日志：${LOG_PATH}）`,
+      );
+      info("提示：缺省 0 ≠ 业务就绪（退出码 0 仅表示 /health 就绪，业务就绪需另行验证）。");
+      process.exit(0);
+      return;
+    }
+    default: {
+      console.error(`[bridgectl] 未知启动结果：${String(result.kind)}`);
+      process.exit(1);
+      return;
+    }
   }
-  const role = result.health?.role ?? "未报";
-  if (result.already) {
-    info(
-      `已在运行：${formatHost(result.host)}:${result.port}${config.mcpPath}（health=${result.health?.status ?? "ok"}，role=${role}）`,
-    );
-    process.exit(0);
-  }
-  info(
-    `已后台启动 pid=${result.pid}，health=${result.health?.status ?? "ok"}，role=${role}，` +
-      `endpoint=${formatHost(result.host)}:${result.port}${config.mcpPath}，日志：${LOG_PATH}`,
-  );
-  process.exit(0);
 }
 
 async function cmdStop() {
@@ -546,15 +786,24 @@ async function cmdStop() {
   process.exit(1);
 }
 
-async function cmdRestart() {
+async function cmdRestart(flags) {
+  const noWait = flags.noWait === true;
   const config = loadConfig();
+  if (noWait) {
+    // C6：--no-wait 仅作用 start 段；stop 段（shutdown + 兜底强杀等待）仍阻塞 ⇒ 显式提示非瞬时
+    info(
+      `restart --no-wait：仅 **start 段** 发起即返；**stop 段仍阻塞**（最长约 ${
+        (SHUTDOWN_TIMEOUT_MS + STOP_TIMEOUT_MS * 2) / 1000
+      }s = shutdown ${SHUTDOWN_TIMEOUT_MS / 1000}s + 强杀等待 ${STOP_TIMEOUT_MS / 1000}s×2），本次调用**非瞬时返回**。`,
+    );
+  }
   const result = await doStop(config);
   if (!result.ok) {
     console.error(`[bridgectl] restart 中止（停止失败）：${result.message}`);
     process.exit(1);
   }
   info(result.message);
-  await cmdStart();
+  await cmdStart(flags);
 }
 
 /**
@@ -634,13 +883,13 @@ async function main() {
   }
   switch (command) {
     case "start":
-      await cmdStart();
+      await cmdStart(flags);
       break;
     case "stop":
       await cmdStop();
       break;
     case "restart":
-      await cmdRestart();
+      await cmdRestart(flags);
       break;
     case "status":
       await cmdStatus();

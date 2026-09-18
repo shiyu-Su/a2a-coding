@@ -13,6 +13,22 @@
  *
  * 单实例互斥由 Launcher 内部承担（先 listen，端口即锁）；本脚本只做「先探测再起」的快速判定，
  * stop/status 依赖 pidfile + 端口探测，pidfile 缺失/陈旧时不误杀。
+ *
+ * Windows 脱壳拉起（REQ-v0.6.2-2026-09-18-02 增补轨 D-N1）：
+ *   常驻 Launcher 经 WMI `Win32_Process.Create` 脱壳（挂 WmiPrvSE，**不在**调用方作业 / 进程树内），
+ *   由隐藏窗口的壳进程 `Start-Process` 拉起 —— 否则宿主工具会「等自己的作业清空」而卡住。
+ *   脱壳不可用（无 WMI / 权限不足 / 判定失败）⇒ **显式**降级 `spawn(detached)` 并在 stdout 警告（不静默）。
+ *   POSIX 保持 `spawn(detached:true)` + `unref()`（setsid 天然脱离）。
+ *
+ * 就绪语义（REQ-v0.6.2-2026-09-18-02，C1–C8）：
+ *   - 判据键一律取 `/health` 的 `status`（launcher 自检期 = 200 + starting；不得依赖 HTTP 码）。
+ *   - 缺省 start：等 L1（/health 可答 = HTTP 200）即返回；exit 0 ≠ 业务就绪（starting 时业务路由 503）。
+ *   - `--no-wait`：发起即返（exit 0 = 已发起，≠ 就绪）；spawn 同步失败才 exit 1；pid 仅供参考。
+ *   - `--wait-ready`：等待 status=ok 才 exit 0；超时/失败 exit 1（按 `自检失败`/`[self-check]` 过滤行输出）。
+ *   - 三分类占用（键 = status）：不可答 / status 非 `ok`|`starting` ⇒ 真占用 exit 1；
+ *     `ok` ⇒ 已在运行 exit 0；`starting` ⇒ 本服务启动中（缺省/--no-wait 即返 0，--wait-ready 续等）。
+ *   - 竞态归属：以 pidfile 与本次 spawn 的 child 交叉校验（输家提示「另一实例已接管」并 exit 0），不引入脚本级锁。
+ *   - 退出码恒 {0,1}（C5）。
  */
 import { spawn, spawnSync } from "node:child_process";
 import {
@@ -29,7 +45,7 @@ import { createConnection } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** start 等待 /health 可达的超时（端口在自检前即监听，通常毫秒级） */
+/** start 等待 L1（/health 可答 = HTTP 200）的超时（端口在自检前即监听，通常毫秒级） */
 const READY_TIMEOUT_MS = 30_000;
 /** stop 等待端口释放的超时 */
 const STOP_TIMEOUT_MS = 15_000;
@@ -38,6 +54,19 @@ const PROBE_TIMEOUT_MS = 1_000;
 const PROBE_INTERVAL_MS = 200;
 /** logs --follow 轮询间隔 */
 const FOLLOW_INTERVAL_MS = 300;
+/**
+ * 单项目启动自检缺省总超时。与 launcher/self-check.ts 的 DEFAULT_STARTUP_CHECK_TIMEOUT_MS 同值
+ * （脚本不 import TS 产物，故此处常量须与它保持一致）。
+ */
+const DEFAULT_STARTUP_CHECK_TIMEOUT_MS = 120_000;
+/**
+ * `--wait-ready` 缺省整段硬上限 = max(下限, N × startupCheckTimeoutMs + 余量)：
+ * 自检按项目顺序串行，N 个项目最坏 N × 单项目超时；再留一个自检超时作余量。
+ */
+const READY_WAIT_FLOOR_MS = 60_000;
+const READY_WAIT_MARGIN_MS = 60_000;
+/** 竞态归属判定时等待子进程收尾（输家因 EADDRINUSE 会立即退出）的上限 */
+const CHILD_SETTLE_TIMEOUT_MS = 2_000;
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
 const MACHINE_ROOT = findMachineRoot(SCRIPT_DIR);
@@ -54,6 +83,11 @@ function fail(message) {
 
 function info(message) {
   console.log(`[launcherctl] ${message}`);
+}
+
+/** 降级告警（stdout，必须可见）：如脱壳不可用时提示「调用方可能被拖住」 */
+function warn(message) {
+  console.log(`[launcherctl] 警告：${message}`);
 }
 
 function delay(ms) {
@@ -73,7 +107,10 @@ function findMachineRoot(startDir) {
   }
 }
 
-/** 读取机器配置里脚本关心的字段（端口 / 绑定地址 / 可选优雅停止端点） */
+/**
+ * 读取机器配置里脚本关心的字段（端口 / 绑定地址 / 可选优雅停止端点 / 启动自检参数）。
+ * `startupCheck` / `startupCheckTimeoutMs` / projects 数用于推导 `--wait-ready` 的缺省硬上限。
+ */
 function loadConfig() {
   let raw;
   try {
@@ -85,12 +122,22 @@ function loadConfig() {
   if (launcher === null || typeof launcher !== "object" || typeof launcher.port !== "number") {
     fail(`配置缺少 launcher.port：${CONFIG_PATH}`);
   }
+  const projects = Array.isArray(raw?.projects) ? raw.projects : [];
   return {
     path: CONFIG_PATH,
     port: launcher.port,
     listenHost: typeof launcher.listenHost === "string" ? launcher.listenHost : undefined,
     shutdownEndpoint: launcher.shutdownEndpoint === true,
     shutdownToken: typeof launcher.shutdownToken === "string" ? launcher.shutdownToken : undefined,
+    /** 启动自检开关（与 launcher/index.ts 的 `?? true` 同口径） */
+    startupCheck: launcher.startupCheck !== false,
+    /** 单项目自检超时（缺省与 launcher/self-check.ts 同值） */
+    startupCheckTimeoutMs:
+      typeof launcher.startupCheckTimeoutMs === "number" && launcher.startupCheckTimeoutMs > 0
+        ? launcher.startupCheckTimeoutMs
+        : DEFAULT_STARTUP_CHECK_TIMEOUT_MS,
+    /** projects 数（`--wait-ready` 缺省硬上限 = N × startupCheckTimeoutMs + 余量） */
+    projectCount: projects.length,
   };
 }
 
@@ -157,13 +204,32 @@ async function httpHealth(host, port, timeoutMs = 2_000) {
   }
 }
 
-/** 轮询 /health 至可达或超时 */
-async function waitForHealth(host, port, timeoutMs) {
+/** L1 谓词：/health 已可答（HTTP 200，status 任意） */
+function healthAnswerable(health) {
+  return health !== null;
+}
+
+/** 业务就绪谓词：/health `status === "ok"`（`starting` = 自检未过，不算就绪） */
+function healthReady(health) {
+  return health !== null && health.status === "ok";
+}
+
+/**
+ * 轮询 /health 至满足谓词或超时（每次调用独立超时）。
+ * 等待循环内 `null` = 尚未起 ⇒ **继续轮询**（不判占用）；超时返回 `matched: null`。
+ * 返回 `{ matched, last }`：`matched` = 命中的 health；`last` = 超时前最后一次可答的 health（诊断用）。
+ * 双谓词：L1 用 `healthAnswerable`；业务就绪用 `healthReady`。
+ */
+async function waitForHealth(host, port, timeoutMs, predicate) {
   const deadline = Date.now() + timeoutMs;
+  let last = null;
   for (;;) {
     const health = await httpHealth(host, port);
-    if (health !== null) return health;
-    if (Date.now() >= deadline) return null;
+    if (health !== null) {
+      last = health;
+      if (predicate(health)) return { matched: health, last: health };
+    }
+    if (Date.now() >= deadline) return { matched: null, last };
     await delay(PROBE_INTERVAL_MS);
   }
 }
@@ -209,18 +275,140 @@ function ensureBuilt() {
   }
 }
 
-/** 后台启动（幂等：端口已监听即视为已在运行）。不退出，返回结果供调用方决定输出 / 退出码。 */
-async function doStart(config) {
-  const host = resolveProbeHost(config, readPidfile());
+/** /health 状态标签（诊断输出用；null = 不可答） */
+function healthStatusLabel(health) {
+  if (health === null) return "不可答";
+  return health.status === undefined ? "(缺失)" : health.status;
+}
 
-  if (await probePort(config.port, host)) {
-    const health = await httpHealth(host, config.port);
-    return { ok: true, already: true, host, port: config.port, health, pid: undefined };
+/**
+ * 入口占用判定三分类（键 = `/health` 的 `status`，不依赖 HTTP 码）：
+ *   free     ：端口未监听 ⇒ 可拉起。
+ *   occupied ：端口在监听但 /health 不可答（非 200 / 网络错误 / 超时），或 status 缺失/非白名单
+ *              ⇒ **真占用**（非本服务）⇒ 调用方 exit 1。
+ *   ready    ：status === "ok" ⇒ 已在运行且已就绪 ⇒ exit 0。
+ *   starting ：status === "starting" ⇒ 本服务启动中（自检未过）。
+ * 适用范围：`null ⇒ occupied` **仅入口探测**；等待循环内 `null` = 尚未起，继续轮询（见 waitForHealth）。
+ */
+async function classifyOccupancy(config) {
+  const pidfile = readPidfile();
+  const host = resolveProbeHost(config, pidfile);
+  const port = config.port;
+
+  if (!(await probePort(port, host))) return { kind: "free", host, port, pidfile };
+
+  const health = await httpHealth(host, port);
+  if (health === null) {
+    return {
+      kind: "occupied",
+      host,
+      port,
+      pidfile,
+      reason: "端口在监听但 /health 不可答（非 200 / 网络错误 / 超时）",
+    };
   }
+  if (health.status === "ok") return { kind: "ready", host, port, pidfile, health };
+  if (health.status === "starting") return { kind: "starting", host, port, pidfile, health };
+  return {
+    kind: "occupied",
+    host,
+    port,
+    pidfile,
+    reason: `端口在监听但 /health status=${health.status === undefined ? "(缺失)" : `"${health.status}"`} 不在白名单（ok / starting）`,
+  };
+}
 
-  ensureBuilt();
-  mkdirSync(LOG_DIR, { recursive: true });
+/** 有界等待子进程收尾；返回是否已退出（exitCode / signalCode 任一落定） */
+async function settleChildExit(child, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  while (child.exitCode === null && child.signalCode === null && Date.now() < deadline) {
+    await delay(50);
+  }
+  return child.exitCode !== null || child.signalCode !== null;
+}
 
+/**
+ * 竞态归属交叉校验（**不引入脚本级锁**）：以 pidfile 归属判定本次 spawn 的子进程是赢家还是输家。
+ *   winner   ：pidfile.pid === child.pid ⇒ 本实例真身。
+ *   loser    ：pidfile 存在、pid 与 child.pid 不同、且 child 已退出 ⇒ 端口被另一实例接管（EADDRINUSE），
+ *              本实例子进程已死 ⇒ 调用方输出「另一实例已接管 pid=…」并 exit 0。
+ *   uncertain：**pidfile 缺失**，或 pid 不同但子进程仍未退出 ⇒ 无法归属，只报告、不冒充。
+ */
+async function resolveOwnership(child) {
+  const pidfile = readPidfile();
+  if (pidfile === null) return { kind: "uncertain", pid: undefined };
+  if (child.pid !== undefined && pidfile.pid === child.pid) {
+    return { kind: "winner", pid: pidfile.pid };
+  }
+  const exited = await settleChildExit(child, CHILD_SETTLE_TIMEOUT_MS);
+  if (exited) return { kind: "loser", pid: pidfile.pid };
+  return { kind: "uncertain", pid: pidfile.pid };
+}
+
+/** PowerShell 单引号字面量（内部单引号翻倍）：把任意字符串安全嵌入 PS 源码 */
+function psQuote(value) {
+  return `'${value.replace(/'/g, "''")}'`;
+}
+
+/** PowerShell `-EncodedCommand` 载荷（UTF-16LE + Base64）：规避多层命令行的引号 / 转义问题 */
+function encodePowerShell(script) {
+  return Buffer.from(script, "utf16le").toString("base64");
+}
+
+/**
+ * 脱壳壳脚本（Windows）：隐藏窗口拉起常驻 Launcher，stdout / stderr **追加合并**落 launcher.log。
+ * 说明：`Start-Process` 不允许 stdout / stderr 指向同一文件（InvalidOperationException），
+ * 故经 `cmd /c … >> log 2>&1` 合并两条流，并保持与原 `openSync(log, "a")` 一致的**追加**语义。
+ * `MACHINE_CONFIG` 在壳内设置：Start-Process 的子进程继承壳进程环境（WinPS 5.1 无 `-Environment`）。
+ */
+function buildDetachShellScript(config) {
+  const inner = `/c ""${process.execPath}" "${LAUNCHER_ENTRY}" >> "${LOG_PATH}" 2>&1"`;
+  return [
+    "$shell = if ($env:ComSpec) { $env:ComSpec } else { 'cmd.exe' }",
+    `$env:MACHINE_CONFIG = ${psQuote(config.path)}`,
+    `Start-Process -FilePath $shell -ArgumentList ${psQuote(inner)} -WorkingDirectory ${psQuote(MACHINE_ROOT)} -WindowStyle Hidden`,
+  ].join("\n");
+}
+
+/**
+ * Windows 脱壳拉起：WMI `Win32_Process.Create` 建**隐藏的 powershell 壳**（挂 WmiPrvSE，不在调用方树内），
+ * 壳内 `Start-Process -WindowStyle Hidden` 拉起 Launcher。同步等**壳进程**退出（毫秒级），常驻进程已脱壳。
+ * 返回 `{ kind: "detached" }` 或 `{ kind: "failed", reason }`（后者由调用方显式降级，不得静默）。
+ */
+function launchDetachedWindows(config) {
+  const shellCmd = `powershell -NoProfile -WindowStyle Hidden -EncodedCommand ${encodePowerShell(
+    buildDetachShellScript(config),
+  )}`;
+  const outerScript =
+    `$r = Invoke-CimMethod -ClassName Win32_Process -MethodName Create -Arguments @{ CommandLine = ${psQuote(shellCmd)} }; ` +
+    "if ($null -eq $r) { exit 2 }; exit [int]$r.ReturnValue";
+  let result;
+  try {
+    result = spawnSync("powershell", ["-NoProfile", "-Command", outerScript], {
+      encoding: "utf8",
+      windowsHide: true,
+      timeout: 30_000,
+    });
+  } catch (err) {
+    return { kind: "failed", reason: err instanceof Error ? err.message : String(err) };
+  }
+  if (result.error !== undefined) return { kind: "failed", reason: result.error.message };
+  if (result.status !== 0) {
+    const lines = String(result.stderr ?? "")
+      .trim()
+      .split(/\r?\n/)
+      .filter((line) => line.trim() !== "");
+    const detail = lines.length > 0 ? `：${lines[lines.length - 1]}` : "";
+    return { kind: "failed", reason: `WMI Create 退出码 ${result.status}${detail}` };
+  }
+  return { kind: "detached" };
+}
+
+/**
+ * 现有实现：`spawn(detached: true)` + `unref()`（POSIX 天然脱离；Windows 兜底，**可能拖住调用方**）。
+ * 返回 `{ kind: "spawn", child }` 或 `{ kind: "spawn-failed", reason }`。
+ */
+function spawnLauncherDetached(config) {
   const logFd = openSync(LOG_PATH, "a");
   let child;
   try {
@@ -231,22 +419,193 @@ async function doStart(config) {
       cwd: MACHINE_ROOT,
       env: { ...process.env, MACHINE_CONFIG: config.path },
     });
-  } finally {
+  } catch (err) {
     closeSync(logFd);
+    return { kind: "spawn-failed", reason: err instanceof Error ? err.message : String(err) };
   }
-
+  closeSync(logFd);
+  if (child.pid === undefined) {
+    return { kind: "spawn-failed", reason: "子进程未获得 pid（spawn 同步失败）" };
+  }
   child.once("error", (err) => {
     console.error(
       `[launcherctl] 子进程启动失败：${err instanceof Error ? err.message : String(err)}`,
     );
   });
   child.unref();
+  return { kind: "spawn", child };
+}
 
-  const health = await waitForHealth(host, config.port, READY_TIMEOUT_MS);
-  if (health === null) {
-    return { ok: false, already: false, host, port: config.port, health: null, pid: child.pid };
+/**
+ * 拉起初次实例（入口判定为 `free` 后调用）：
+ *   - Windows：先试 WMI 脱壳；不可用则**显式**降级 `spawn(detached)` 并在 stdout 警告。
+ *   - 其它平台：`spawn(detached:true)` + `unref()`。
+ */
+function launchLauncher(config) {
+  if (process.platform !== "win32") return spawnLauncherDetached(config);
+
+  const detached = launchDetachedWindows(config);
+  if (detached.kind === "detached") return { kind: "detached" };
+
+  warn(
+    `Windows 脱壳拉起不可用（${detached.reason}）⇒ 降级为 spawn(detached)；**调用方（宿主工具）可能被拖住**（常驻 Launcher 仍在其作业 / 进程树内）。`,
+  );
+  return spawnLauncherDetached(config);
+}
+
+/**
+ * 归属判定统一入口：
+ *   - spawn 路径（有本地子进程句柄）⇒ `resolveOwnership`（pidfile × child.pid 交叉校验）。
+ *   - 脱壳路径（无子进程句柄）⇒ 以 pidfile 为准：存在即「运行中的本服务」，缺失判「不确定」
+ *     （脱壳后 Launcher 挂 WmiPrvSE，脚本无句柄可交叉校验；并发竞态退化为「服务可用」语义）。
+ */
+async function resolveLaunchedOwnership(child) {
+  if (child !== undefined) return resolveOwnership(child);
+  const pidfile = readPidfile();
+  if (pidfile === null) return { kind: "uncertain", pid: undefined };
+  return { kind: "winner", pid: pidfile.pid };
+}
+
+/** `--wait-ready` 整段硬上限：显式 `--ready-timeout` 优先；缺省 max(60_000, N × startupCheckTimeoutMs + 60_000) */
+function resolveReadyTimeoutMs(config, flags) {
+  if (flags.readyTimeout !== undefined) return flags.readyTimeout;
+  return Math.max(
+    READY_WAIT_FLOOR_MS,
+    config.projectCount * config.startupCheckTimeoutMs + READY_WAIT_MARGIN_MS,
+  );
+}
+
+/**
+ * 后台启动（幂等）。不退出，返回结构化结果供调用方输出 / 决定退出码。
+ * 结果 `kind` ∈ { occupied, already-ready, already-starting, started, no-wait, ready,
+ *                 ready-timeout, start-timeout, spawn-failed, race-loser, race-uncertain }；
+ * 所有结果均带 `occupied` 布尔（真占用时 true）。
+ */
+async function doStart(config, flags) {
+  const entry = await classifyOccupancy(config);
+  const base = { occupied: entry.kind === "occupied", host: entry.host, port: entry.port };
+
+  if (entry.kind === "occupied") {
+    return { ...base, kind: "occupied", reason: entry.reason, spawned: false, already: false, health: null, pid: undefined };
   }
-  return { ok: true, already: false, host, port: config.port, health, pid: child.pid };
+
+  if (entry.kind === "ready") {
+    return {
+      ...base,
+      kind: "already-ready",
+      spawned: false,
+      already: true,
+      health: entry.health,
+      pid: entry.pidfile?.pid,
+    };
+  }
+
+  if (entry.kind === "starting") {
+    if (flags.waitReady) {
+      const readyTimeoutMs = resolveReadyTimeoutMs(config, flags);
+      const waited = await waitForHealth(entry.host, entry.port, readyTimeoutMs, healthReady);
+      if (waited.matched !== null) {
+        return {
+          ...base,
+          kind: "ready",
+          spawned: false,
+          already: true,
+          health: waited.matched,
+          pid: entry.pidfile?.pid,
+          readyTimeoutMs,
+        };
+      }
+      return {
+        ...base,
+        kind: "ready-timeout",
+        spawned: false,
+        already: true,
+        health: waited.last,
+        pid: entry.pidfile?.pid,
+        readyTimeoutMs,
+      };
+    }
+    return {
+      ...base,
+      kind: "already-starting",
+      spawned: false,
+      already: true,
+      health: entry.health,
+      pid: entry.pidfile?.pid,
+    };
+  }
+
+  // entry.kind === "free"：拉起本实例
+  ensureBuilt();
+  mkdirSync(LOG_DIR, { recursive: true });
+
+  // 拉起方式：Windows 走 WMI 脱壳（脱离调用方作业 / 进程树），其余走 spawn(detached) + unref
+  const launched = launchLauncher(config);
+
+  if (launched.kind === "spawn-failed") {
+    return {
+      ...base,
+      kind: "spawn-failed",
+      reason: launched.reason,
+      spawned: false,
+      already: false,
+      health: null,
+      pid: undefined,
+    };
+  }
+
+  // 脱壳路径无本地子进程句柄 ⇒ child 为 undefined；pid 取 pidfile（脱壳后此刻可能尚未写入）
+  const child = launched.kind === "spawn" ? launched.child : undefined;
+  const launchPid = child !== undefined ? child.pid : readPidfile()?.pid;
+
+  // C1/C8：发起即返（exit 0 = 已发起，≠ 就绪）；pid 仅供参考（可能被另一实例接管而退出）
+  if (flags.noWait) {
+    return { ...base, kind: "no-wait", spawned: true, already: false, health: null, pid: launchPid };
+  }
+
+  // C3：等待业务就绪（status=ok）；exit 0 仅在 ok，超时/失败归调用方 exit 1
+  if (flags.waitReady) {
+    const readyTimeoutMs = resolveReadyTimeoutMs(config, flags);
+    const waited = await waitForHealth(entry.host, entry.port, readyTimeoutMs, healthReady);
+    if (waited.matched !== null) {
+      const ownership = await resolveLaunchedOwnership(child);
+      return {
+        ...base,
+        kind: "ready",
+        spawned: true,
+        already: false,
+        health: waited.matched,
+        pid: ownership.kind === "winner" ? ownership.pid : launchPid,
+        ownership: ownership.kind,
+        readyTimeoutMs,
+      };
+    }
+    return {
+      ...base,
+      kind: "ready-timeout",
+      spawned: true,
+      already: false,
+      health: waited.last,
+      pid: launchPid,
+      readyTimeoutMs,
+    };
+  }
+
+  // C2：缺省等待 L1（/health 可答 = HTTP 200）；返回后由调用方显式标注 starting / ok 且 0 ≠ 业务就绪
+  const waited = await waitForHealth(entry.host, entry.port, READY_TIMEOUT_MS, healthAnswerable);
+  if (waited.matched === null) {
+    return { ...base, kind: "start-timeout", spawned: true, already: false, health: null, pid: launchPid };
+  }
+
+  // 竞态归属交叉校验：本次 spawn 可能输给并发实例（EADDRINUSE），须避免把死 pid 当成本实例
+  const ownership = await resolveLaunchedOwnership(child);
+  if (ownership.kind === "loser") {
+    return { ...base, kind: "race-loser", spawned: true, already: false, health: waited.matched, pid: ownership.pid };
+  }
+  if (ownership.kind === "uncertain") {
+    return { ...base, kind: "race-uncertain", spawned: true, already: false, health: waited.matched, pid: launchPid };
+  }
+  return { ...base, kind: "started", spawned: true, already: false, health: waited.matched, pid: ownership.pid };
 }
 
 /** 可选 HTTP 优雅停止（POST /shutdown）；成功返回 true，非 200 / 连接失败返回 false */
@@ -361,6 +720,27 @@ function printLogTail(count) {
   console.error(lastLines(content, count));
 }
 
+/**
+ * 按模式输出**过滤行**（非 tail N）：用于 `--wait-ready` 失败诊断，只打印自检相关行，
+ * 避免关键失败被淹没在大段日志尾部。无命中时明示「未匹配」。
+ */
+function printFilteredLog(patterns) {
+  if (!existsSync(LOG_PATH)) {
+    console.error(`[launcherctl] 日志不存在：${LOG_PATH}`);
+    return;
+  }
+  const content = readFileSync(LOG_PATH, "utf8");
+  const lines = content.split(/\r?\n/).filter((line) => patterns.some((p) => line.includes(p)));
+  if (lines.length === 0) {
+    console.error(
+      `[launcherctl] 日志中未匹配到 ${patterns.join(" / ")} 行（${LOG_PATH}）`,
+    );
+    return;
+  }
+  console.error(`[launcherctl] 自检相关日志行（过滤 ${patterns.join(" / ")}，${LOG_PATH}）：`);
+  console.error(lines.join("\n"));
+}
+
 /** tail -f 等价：轮询文件增长并输出新增字节（处理截断） */
 async function followLog() {
   let size = statSync(LOG_PATH).size;
@@ -394,7 +774,14 @@ function parsePositiveInt(value, name) {
 }
 
 function parseArgs(argv) {
-  const flags = { lines: undefined, follow: false, help: false };
+  const flags = {
+    lines: undefined,
+    follow: false,
+    help: false,
+    noWait: false,
+    waitReady: false,
+    readyTimeout: undefined,
+  };
   const positionals = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
@@ -405,6 +792,15 @@ function parseArgs(argv) {
       flags.lines = parsePositiveInt(argv[i], "--lines");
     } else if (arg.startsWith("--lines=")) {
       flags.lines = parsePositiveInt(arg.slice("--lines=".length), "--lines");
+    } else if (arg === "--no-wait") {
+      flags.noWait = true;
+    } else if (arg === "--wait-ready") {
+      flags.waitReady = true;
+    } else if (arg === "--ready-timeout") {
+      i += 1;
+      flags.readyTimeout = parsePositiveInt(argv[i], "--ready-timeout");
+    } else if (arg.startsWith("--ready-timeout=")) {
+      flags.readyTimeout = parsePositiveInt(arg.slice("--ready-timeout=".length), "--ready-timeout");
     } else if (arg === "--help" || arg === "-h") {
       flags.help = true;
     } else if (arg.startsWith("-")) {
@@ -413,6 +809,16 @@ function parseArgs(argv) {
       positionals.push(arg);
     }
   }
+
+  // C3：--no-wait（发起即返）与 --wait-ready（等待业务就绪）语义互斥 ⇒ 显式报错
+  if (flags.noWait && flags.waitReady) {
+    fail("--no-wait 与 --wait-ready 不能同时使用（前者发起即返，后者等待业务就绪）");
+  }
+  // --ready-timeout 仅承载 --wait-ready 的整段硬上限，脱离 --wait-ready 无意义 ⇒ 显式报错
+  if (flags.readyTimeout !== undefined && !flags.waitReady) {
+    fail("--ready-timeout 仅在 --wait-ready 下有效");
+  }
+
   return { command: positionals[0], flags };
 }
 
@@ -425,14 +831,30 @@ function printUsage() {
 命令：
   start     后台启动 Launcher（已在运行则提示并退出 0）
   stop      停止 Launcher（POSIX 发 SIGTERM；Windows taskkill /T /F 强制树杀）
-  restart   停止后重新后台拉起
+  restart   停止后重新后台拉起（stop 段阻塞，非瞬时）
   status    查看运行态（pid / host:port / health / startedAt）
   logs      输出日志文件（--lines N 取尾部；--follow 跟踪）
+
+选项（start / restart）：
+  --no-wait              发起即返；exit 0 = 已发起（≠ 就绪）；spawn 同步失败才 exit 1
+                         pid 仅供参考，须另起 status 确认；与 --wait-ready 互斥
+  --wait-ready           等待业务就绪（/health status=ok）后才 exit 0；超时/失败 exit 1
+  --ready-timeout <ms>   --wait-ready 的整段硬上限
+                         （缺省 max(60000, N × startupCheckTimeoutMs + 60000)，N = projects 数）
 
 选项（logs）：
   -n, --lines <N>   仅输出尾部 N 行
   -f, --follow      持续跟踪新增日志（默认关闭）
   -h, --help        显示帮助
+
+就绪语义：
+  缺省 start 只等 L1（/health 可答 = HTTP 200）即返回 0 —— **缺省 exit 0 ≠ 业务就绪**
+  （health.status=starting 时业务路由仍 503）；需业务就绪请加 --wait-ready。
+
+调用拼写（重要，C7）：
+  npm 会吞掉裸 --no-* 选项，透传给脚本必须加 -- 分隔：
+    npm run start -- --no-wait
+    npm run restart -- --wait-ready --ready-timeout 420000
 
 配置：
   MACHINE_CONFIG  机器配置文件路径（缺省 ${join(MACHINE_ROOT, "config", "config.json")}）
@@ -440,26 +862,97 @@ function printUsage() {
   log             ${LOG_PATH}`);
 }
 
-async function cmdStart() {
+async function cmdStart(flags) {
   const config = loadConfig();
-  const result = await doStart(config);
+  const result = await doStart(config, flags);
+  const endpoint = `${formatHost(result.host)}:${result.port}`;
 
-  if (!result.ok) {
-    console.error(
-      `[launcherctl] 启动超时（${READY_TIMEOUT_MS}ms）：${formatHost(result.host)}:${result.port} /health 不可达（pid=${result.pid}）`,
-    );
-    printLogTail(30);
-    process.exit(1);
+  switch (result.kind) {
+    case "occupied": {
+      console.error(`[launcherctl] 端口 ${endpoint} 被真占用（非本服务）：${result.reason}`);
+      console.error(
+        "[launcherctl] 未执行启动。如确需强制接管，请先 `npm run stop` 或手动清理占用进程。",
+      );
+      process.exit(1);
+      break;
+    }
+    case "already-ready": {
+      info(`已在运行：${endpoint}（health=ok，自检已通过）；exit 0`);
+      break;
+    }
+    case "already-starting": {
+      info(`已在运行：${endpoint}（health=starting，自检进行中）；exit 0`);
+      info(
+        "注意：缺省 exit 0 ≠ 业务就绪（starting 时 /health 可答为 200，但业务路由仍 503）；如需等待自检通过请用 --wait-ready。",
+      );
+      break;
+    }
+    case "started": {
+      const status = result.health?.status ?? "ok";
+      info(`已后台启动 pid=${result.pid}，health=${status}，日志：${LOG_PATH}`);
+      info(
+        `缺省等待 L1（/health 可答 = HTTP 200）后返回；**exit 0 ≠ 业务就绪**（当前 status=${status}，starting=自检进行中 / ok=自检已通过）；如需业务就绪请用 --wait-ready。`,
+      );
+      break;
+    }
+    case "ready": {
+      const via =
+        result.ownership === "loser"
+          ? `（另一实例已接管 pid=${result.pid}）`
+          : result.spawned
+            ? `（本次发起 pid=${result.pid}）`
+            : "";
+      info(`已就绪：${endpoint}（health=ok）${via}；exit 0`);
+      break;
+    }
+    case "no-wait": {
+      const pidLabel = result.pid === undefined ? "（脱壳拉起，暂不可知）" : String(result.pid);
+      info(`已发起启动 pid=${pidLabel}（--no-wait：发起即返；exit 0 = 已发起，≠ 就绪）`);
+      info(
+        "pid 仅供参考：子进程可能因另一实例接管（EADDRINUSE）而退出；请另起 `npm run status` 确认运行态。",
+      );
+      info(
+        "调用拼写：`npm run <script> -- --no-wait`（npm 会吞掉裸 --no-* 选项，必须加 `--` 分隔）。",
+      );
+      break;
+    }
+    case "race-loser": {
+      info(`另一实例已接管 pid=${result.pid}（本实例子进程已退出）；服务可用，exit 0。`);
+      break;
+    }
+    case "race-uncertain": {
+      info(
+        `服务已可答：${endpoint}（health=${healthStatusLabel(result.health)}），但 pidfile 缺失/无法归属，归属不确定。`,
+      );
+      info(`本次 pid=${result.pid} 仅供参考；请另起 \`npm run status\` 确认运行态。`);
+      break;
+    }
+    case "ready-timeout": {
+      console.error(
+        `[launcherctl] --wait-ready 超时（${result.readyTimeoutMs}ms）：/health 未达 status=ok（last=${healthStatusLabel(result.health)}）；判为「启动未就绪」。`,
+      );
+      printFilteredLog(["自检失败", "[self-check]"]);
+      process.exit(1);
+      break;
+    }
+    case "start-timeout": {
+      console.error(
+        `[launcherctl] 启动超时（${READY_TIMEOUT_MS}ms）：${endpoint} /health 不可达（pid=${result.pid}）；判为「启动失败」（非被占用）。`,
+      );
+      printLogTail(30);
+      process.exit(1);
+      break;
+    }
+    case "spawn-failed": {
+      console.error(`[launcherctl] 子进程同步启动失败：${result.reason}`);
+      process.exit(1);
+      break;
+    }
+    default: {
+      console.error(`[launcherctl] 未知启动结果：${String(result.kind)}`);
+      process.exit(1);
+    }
   }
-  if (result.already) {
-    const suffix = result.health?.status ? `（health=${result.health.status}）` : "";
-    info(`已在运行：${formatHost(result.host)}:${result.port}${suffix}`);
-    process.exit(0);
-  }
-  const note = result.health?.status === "starting" ? "（自检进行中，业务路由暂 503）" : "";
-  info(
-    `已后台启动 pid=${result.pid}，health=${result.health?.status ?? "ok"}${note}，日志：${LOG_PATH}`,
-  );
   process.exit(0);
 }
 
@@ -475,15 +968,24 @@ async function cmdStop() {
   process.exit(1);
 }
 
-async function cmdRestart() {
+async function cmdRestart(flags) {
   const config = loadConfig();
+  const stopHint =
+    "restart 先执行 stop（阻塞，**非瞬时**：POST /shutdown ≤5s + 等待端口释放 ≤15s，machine ≈ ≤20s）…";
+  if (flags.noWait) {
+    info(
+      `restart --no-wait：**仅 start 段为发起即返**，整体重启仍非瞬时 —— ${stopHint}`,
+    );
+  } else {
+    info(stopHint);
+  }
   const result = await doStop(config);
   if (!result.ok) {
     console.error(`[launcherctl] restart 中止（停止失败）：${result.message}`);
     process.exit(1);
   }
   info(result.message);
-  await cmdStart();
+  await cmdStart(flags);
 }
 
 async function cmdStatus() {
@@ -543,15 +1045,21 @@ async function main() {
     printUsage();
     process.exit(command === undefined ? 1 : 0);
   }
+  const startOnlyFlagUsed = flags.noWait || flags.waitReady || flags.readyTimeout !== undefined;
+  if (startOnlyFlagUsed && command !== "start" && command !== "restart") {
+    fail(
+      `--no-wait / --wait-ready / --ready-timeout 仅适用于 start / restart（当前命令：${command}）`,
+    );
+  }
   switch (command) {
     case "start":
-      await cmdStart();
+      await cmdStart(flags);
       break;
     case "stop":
       await cmdStop();
       break;
     case "restart":
-      await cmdRestart();
+      await cmdRestart(flags);
       break;
     case "status":
       await cmdStatus();

@@ -974,7 +974,11 @@ export class FeatureScheduler {
       .map((n) => n.taskId)
       .sort();
     const failedIds = failed.map((n) => n.taskId).sort();
-    const signature = `${failedIds.join(",")}|${blockedIds.join(",")}`;
+    const failedKey = failed
+      .map((n) => `${n.taskId}:${n.retryCount}`)
+      .sort()
+      .join(",");
+    const signature = `${failedKey}|${blockedIds.join(",")}`;
     if (this.failureReportSignatures.get(feature.featureId) === signature) return;
     this.failureReportSignatures.set(feature.featureId, signature);
     appendEvent({

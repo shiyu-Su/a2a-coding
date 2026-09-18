@@ -6,6 +6,39 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.6.2] - 2026-09-18
+
+> 主题：**编排可观测性修复 + 启停脚本非阻塞收口**（两条需求 + 一条流程纪律沉淀）。**A** `REQ-v0.6.2-2026-09-18-01`：`feature.failure_report` 的去重单位由「失败节点集合」改为「**失败 episode**」—— signature 的 failed 项改为 `${taskId}:${retryCount}`（`orch/bridge/scheduler.ts`），使**同一节点重派后再次失败也发第二条账单**；同一静止期仍幂等。**B** `REQ-v0.6.2-2026-09-18-02`：`launcherctl` / `bridgectl` 增 **`--no-wait`**（显式开关，缺省不变）+ machine opt-in **`--wait-ready`**；就绪判据键统一为 `/health` 的 `status`；占用判定三分类（`status` 缺失 ⇒ occupied）；`restart --no-wait` **仅作用 start 段**；**调用方维度**修复 —— Windows 改用 **WMI 脱壳拉起**常驻进程（否则宿主工具会被调用方的作业/进程树拖住）。**流程纪律**：`flow/spec` 写入「同一版本内多需求必须串行」。详见 `doc/v0.6.2/`。
+
+### Added
+
+- **失败账单 episode 去重**（A）：`orch/bridge/scheduler.ts` signature 的 failed 项由 taskId 集合改为 `${taskId}:${retryCount}`（`rearmForRetry` 自增的失败代次）；`orch/types.ts` 的 `retryCount` 注释由「语义休眠」改为「重派代次、参与 episode 去重」；`orch/session/store.ts` 的 `rearmTask` 加不变量注释（Feature `failed` 重派唯一入口 = `rearmForRetry`）。
+- **启停脚本 `--no-wait` / `--wait-ready`**（B）：`machine/scripts/launcherctl.mjs` · `orch/scripts/bridgectl.mjs`；统一契约 C1–C8（发起即返 · 缺省等待目标分层 · 三分类键 = `/health` 的 `status` · 退出码恒 `{0,1}` · 调用拼写 `npm run <script> -- --no-wait` · `--no-wait` 的 pid 仅供参考）。
+- **Windows 脱壳拉起**（B 增补轨）：常驻进程经 **WMI `Win32_Process.Create`** + 隐藏窗口拉起，脱离调用方作业/进程树（实测：宿主工具调用**即时返回**、无弹窗）；脱壳不可用时**显式降级 + 警告**（不得静默）；POSIX 保持 `detached + unref`。
+- **单元 README 锚点段**：`orch/README.md` · `machine/README.md`（**版本中立**；就绪语义 / 退出码 / 调用拼写的**唯一锚点**）。
+- **流程纪律**：`flow/spec/引擎映射.md` §4.1（+ `需求流程.md`）写入「**同一版本内多需求必须串行**」—— 第 2 个及以后的 Feature 须停在 `waiting_approval`，**前一条 `completed` 后才 `approve`**；引擎只提供同 project 串行，**不提供需求间串行**。
+- **回归用例**：`.omo/skills/regression-test/tests/test-v0.6.2-observability.js`（A/B/纪律/版本一致性检测项）。
+
+### Changed
+
+- **三处 `package.json` 版本号升至 `0.6.2`**（根 / `orch` / `machine`；根为版本源）。
+- `README.md`：启停段改用 `npm run <script> -- --no-wait` + `status` 确认，并指向**单元 README 为唯一锚点**（不复述判据）。
+- `CLAUDE.md`：更正启停「非阻塞发起」的**误归因** —— `Start-Process + 切 stdin` **不能让宿主工具退出**；真因是**调用方作业 / 进程树归属**，修复 = **WMI 脱壳拉起**。
+- `flow/hosts/{codex,claude-code}.md` · `flow/README.md` · `flow/hosts/opencode.md`：改用 `--no-wait` → `status` 直接用法 + 内联执行目录 + 指向单元 README。
+
+### Verified
+
+- **门禁**：`orch` `typecheck` 0 / `lint` 0 / **`npm test` 152 pass**（含 5 组新测）；`machine` `typecheck` 0；两脚本 `node --check` 0；宿主只读收口复核（A/B/增补轨）逐条通过。
+- **真机 E2E（A，scratch-e2e `timeouts.prompt=18000` 受控超时）**：首轮失败收敛 = **恰 1 条** `feature.failure_report`（event `30298`，`text="Error: Prompt timeout after 18000ms"`、`blockedSet=[]`）；`advance(retryTaskIds=[S-N2])` 重派（`rearmed=[S-N2]` / `unfrozen=[]` / `retryCount 0→1`）→ 再次失败 ⇒ **第二条账单**（event `30301`，failed 集合与 #1 **完全相同**）= **修复目标达成**；其后静止期 **40s 零新事件**（不刷屏）；全程 `task.evidence` / `task.retry` **零出现**。
+- **真机（B）**：`restart --no-wait` 脱壳路径 **1263–1314ms 返回**；**进程归属取证** —— 常驻进程的 `cmd` 祖先**已断**（不在调用方作业/进程树内）；`--wait-ready` / 互斥报错 / 已运行幂等 / 未知选项拒绝（orch 侧无 `--wait-ready`）均验。
+
+### 未覆盖（遗留验证，**不得算通过**）
+
+- **V4**：桥重启后「至多补发一条」账单（已知有界假阳性）未真机验证。
+- **A 的 W1 语义缺口**：episode 结束原因**非重派**时集合可能复原 ⇒ 账单仍可能被静默吞（建议后续改用独立 episode 计数）。
+- B：`--wait-ready` **穿透 `starting`** 未真机（只验到「已 ok」路径）；就绪窗口内并发 `start` 误诊未真机；`restart --no-wait` 的 stop 段上界未实测。
+- 增补轨 #1 `dc78e2c5` 因节点自测**自毁**（停掉承载自身的 Launcher ⇒ 连带另一个节点失败、Launcher 宕机）被 `cancel`；已沉淀纪律：**worker 自测禁止启停承载自身或其它单元的服务**（启停与「调用方维度」验收归宿主）。
+
 ## [v0.6.1] - 2026-09-18
 
 > 主题：**编排引擎失败上收与项目串行**（REQ-v0.6.1-2026-09-17-05）。**删除失败自动化五层自愈机制**（失败分类 / 中性化 / 取证流 / 自动重试 / D5 硬闸），改为**失败隔离 + 静止收敛 + 账单交宿主**：失败只冻结依赖闭包下游（在飞不动），Feature 不再因业务失败判死（`failed` 退化为 DAG 结构非法 fail-fast 专用）；失败收敛 = **`executing` 自然静止** + **新事件 `feature.failure_report`**（账单含 failed 列表 / 错误文本 / contextId / blockedSet），重派 = **`a2a_feature_advance(..., retryTaskIds?)`**（重派指定 failed 节点 + 解冻其被冻下游；不加状态机自环、与 `answer` 互斥、已派发被冻节点解冻不清 `remoteTaskId` 防双派）。**同 project 粒度串行**（同 project 同一时刻最多 1 个任务在写；跨 project 保持并行）+ **静止期禁 ensure**（不再把空闲回收窗口顶掉）。`needs_input` 保持单一来源（任务停下问问题）。**线协议不变**（PROTOCOL 1.0）；**machine 单元零源码改动**（仅 package.json 版本号）；工具面 12 个数量与既有签名不变（`advance` 加可选 `retryTaskIds` additive 入参）。**派发消息自包含规范**入 `flow/spec`（H4，异机 worker 无宿主文件系统）。详见 `doc/v0.6.1/失败上收与项目串行-改造文档.md`（v4(final)，47 条问题清单承接自 v0.6.1 现状梳理 ①②）。

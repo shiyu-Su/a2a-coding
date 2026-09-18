@@ -317,12 +317,14 @@ export interface TaskRecord {
   /** Feature 排队节点的待派发消息全文；派发后保留（作为可重派依据） */
   dispatchMessage: string | null;
   /**
-   * 重派记账次数（v0.4.1 的「条件重试已用次数」；**v0.6.1 REQ-05 起门禁语义删除、降级为记账**）。
+   * **重派代次**（v0.4.1 的「条件重试已用次数」；**v0.6.1 REQ-05 起门禁语义删除、降级为记账**）。
    *
-   * ⚠️ 自 REQ-05（删五层：失败分类 / 中性化 / 取证流 / 等回收门 / 条件重试）起，本列**唯一写口**
-   * = `rearmForRetry`（保留给「重派」复用）：`a2a_feature_advance(retryTaskIds)` 每成功重派一次 **+1**
+   * ⚠️ 本列**唯一写口** = `rearmForRetry`（自增）：`a2a_feature_advance(retryTaskIds)` 每成功重派一次 **+1**
    * ⇒ `a2a_feature_status` 出参 `retryCount` **在重派后 > 0**（**不再恒 `0`**）。
-   * **门禁语义已消失**：不得据此判断「重试是否用尽 / 是否已重试过」（N=1 门槛随条件重试一并删除）。
+   *
+   * **参与失败账单 episode 去重**（v0.6.2 REQ-01）：`reportFailureAtRest` 的签名以
+   * `${taskId}:${retryCount}` 记账失败项 ⇒ 同一节点被重派后再次失败，会产出**新的 episode**
+   * （失败账单可再次发出），而非被旧签名静默吞掉。
    */
   retryCount: number;
   /**
