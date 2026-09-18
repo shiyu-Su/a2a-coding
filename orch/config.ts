@@ -6,6 +6,7 @@ import type {
   MachinesConfig,
   ProjectGroup,
   ProjectMember,
+  RunnerConfig,
   TransportConfig,
   TransportMode,
   WebConfig,
@@ -151,6 +152,55 @@ function parseWeb(v: unknown): WebConfig {
 }
 
 /**
+ * 正整数毫秒（v0.7.0 `runner` 段）：非 number / 非整数 / <1 一律结构化报错。
+ * 上限不设（阈值语义由消费方裁决），但拒绝 NaN / 小数 / 负数 / 0 / 字符串布尔等弱类型。
+ */
+function asPositiveMs(v: unknown, ctx: string): number {
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 1) {
+    fail(`${ctx} 必须是正整数（毫秒，>=1）`);
+  }
+  return v;
+}
+
+/**
+ * `runner` 段缺省（v0.7.0 D2）：hold ~25s（poll 即心跳）、心跳判死 60s。
+ * 与 `PROTOCOL.md` 2.0 的常量约定一致；缺省段零改动可用（旧 `config.json` 无本段）。
+ */
+const DEFAULT_RUNNER_HOLD_MS = 25000;
+const DEFAULT_RUNNER_HEARTBEAT_TIMEOUT_MS = 60000;
+
+/** `runner` 段缺省构造（段缺失 / 空段时使用） */
+export function defaultRunner(): RunnerConfig {
+  return {
+    holdMs: DEFAULT_RUNNER_HOLD_MS,
+    heartbeatTimeoutMs: DEFAULT_RUNNER_HEARTBEAT_TIMEOUT_MS,
+  };
+}
+
+/**
+ * 解析顶层 `runner` 段（v0.7.0 D2；段可选，缺省字段补默认值）。
+ *
+ * - **段缺失 / 空段** ⇒ 全缺省（`{ 25000, 60000 }`），旧 `config.json` 零改动可用；
+ * - **段存在** ⇒ 结构校验：必须对象；`holdMs` / `heartbeatTimeoutMs` 若声明必须为
+ *   正整数毫秒，非法**一律 fail-fast**（复用 `fail`，不静默降级）。
+ */
+export function parseRunner(v: unknown): RunnerConfig {
+  const r = asRecord(v, "runner");
+  const holdRaw = r["holdMs"];
+  const heartbeatRaw = r["heartbeatTimeoutMs"];
+  return {
+    holdMs:
+      holdRaw === undefined
+        ? DEFAULT_RUNNER_HOLD_MS
+        : asPositiveMs(holdRaw, "runner.holdMs"),
+    heartbeatTimeoutMs:
+      heartbeatRaw === undefined
+        ? DEFAULT_RUNNER_HEARTBEAT_TIMEOUT_MS
+        : asPositiveMs(heartbeatRaw, "runner.heartbeatTimeoutMs"),
+  };
+}
+
+/**
  * 成员 key 分隔符（v0.6.0）。取 NUL：配置 id 中不可能出现，保证
  * `memberKey` 对 `(machineId, projectId)` **单射** —— 用 `":"` / `"/"` 拼接会让
  * `("a", "b:c")` 与 `("a:b", "c")` 碰撞（§2.3-I1 单一判据的前提）。
@@ -227,7 +277,31 @@ export function parseProjectGroup(value: unknown, machineIds: ReadonlySet<string
   };
 }
 
-/** 加载并校验「orch 侧机器清单」（含可选回调端点 / 桥 transport / 网页端只读工作台配置） */
+/**
+ * 解析 `machines[].launcherUrl`（v0.7.0：必填 → **可选 / 已作废**）。
+ *
+ * 语义（**解析宽容；不 fail-fast、不回退全量接纳**）：
+ * - **缺省** ⇒ 告警 + 归一为 `""`（pull 模型下该字段无消费方；入站通道退役）；
+ * - **存在且为非空字符串** ⇒ 原样保留（旧配置零改动，出站路径退役前仍可用）；
+ * - **存在但非法**（空串 / 非字符串）⇒ 告警 + 忽略（归一为 `""`），不抛错。
+ *
+ * ⚠ 类型侧 `MachineRef.launcherUrl` 暂保持必填（`bridge/index.ts` 出站路径仍直接解引用，
+ * 改成可选会连带 typecheck 变红），故此处恒返回字符串；待出站路径退役节点（A6）后转可选。
+ */
+function parseLauncherUrl(v: unknown, index: number): string {
+  const ctx = `machines[${index}].launcherUrl`;
+  if (v === undefined) {
+    console.warn(
+      `[config] ${ctx} 缺省：v0.7.0 起入站指挥通道退役（Runner 反向注册替代），该字段可选、不再 fail-fast。`,
+    );
+    return "";
+  }
+  if (typeof v === "string" && v.length > 0) return v;
+  console.warn(`[config] ${ctx} 非法（须为非空字符串）：按解析宽容忽略。`);
+  return "";
+}
+
+/** 加载并校验「orch 侧机器清单」（含可选回调端点 / 桥 transport / 网页端只读工作台 / runner 阈值配置） */
 export function loadMachinesConfig(path: string): MachinesConfig {
   const raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
   const o = asRecord(raw, "machines config");
@@ -239,12 +313,16 @@ export function loadMachinesConfig(path: string): MachinesConfig {
   const transport = transportRaw === undefined ? defaultTransport() : parseTransport(transportRaw);
   const webRaw = o["web"];
   const web = parseWeb(webRaw === undefined ? {} : webRaw);
+  const runnerRaw = o["runner"];
+  const runner = runnerRaw === undefined ? defaultRunner() : parseRunner(runnerRaw);
   const machineRefs = machines.map((m, i): MachineRef => {
     const r = asRecord(m, `machines[${i}]`);
     const pushCallbackRaw = r["pushCallback"];
+    const tokenRaw = r["token"];
     return {
       machineId: asString(r["machineId"], `machines[${i}].machineId`),
-      launcherUrl: asString(r["launcherUrl"], `machines[${i}].launcherUrl`),
+      launcherUrl: parseLauncherUrl(r["launcherUrl"], i),
+      token: tokenRaw === undefined ? undefined : asString(tokenRaw, `machines[${i}].token`),
       pushCallback:
         pushCallbackRaw === undefined
           ? undefined
@@ -264,6 +342,7 @@ export function loadMachinesConfig(path: string): MachinesConfig {
     callback,
     transport,
     web,
+    runner,
     projectGroup,
   };
 }

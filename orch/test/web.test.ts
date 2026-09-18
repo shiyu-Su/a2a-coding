@@ -99,7 +99,9 @@ function defaultGroupView(): { name: string | null; selective: boolean; memberMa
 /** 最小内核桩：只实现网页接面用到的三件事（`BridgeCore` 结构兼容） */
 function fakeCore(overrides: CoreOverrides = {}): WebCore {
   return {
-    projects: overrides.projects ?? (async () => ({ machines: [], group: defaultGroupView() })),
+    projects:
+      overrides.projects ??
+      (async () => ({ machines: [], runners: [], group: defaultGroupView() })),
     tasks:
       overrides.tasks ??
       (async (projectId: string) => ({ ok: true, projectId, reachable: true, tasks: [] })),
@@ -173,6 +175,8 @@ interface ProjectsBody {
   note: string;
   observedAt: string;
   machines: Array<{ machineId: string; error?: string; projects: Array<Record<string, unknown>> }>;
+  /** Runner 注册视图（v0.7.0 A6）：白名单字段 */
+  runners?: Array<Record<string, unknown>>;
 }
 
 interface FeaturesBody {
@@ -262,22 +266,33 @@ test("GET / → 层级视图「需求 → 任务」（§8 增补 #2）：无手�
   }
 });
 
-test("GET /api/projects → 白名单（剔除 workspace / agentConfig / risk）+ 快照语义标注", async () => {
+test("GET /api/projects → 白名单（剔除 workspace / agentConfig / risk / Runner 内部字段）+ 桥注册表快照语义", async () => {
+  /** 故意夹带 Runner 内部字段：网页白名单必须剔除（防 vacuous：全文断言不含这些值） */
+  const runnerWithInternals = {
+    machineId: "m1",
+    online: true,
+    lastHeartbeatAt: "2026-09-18T00:00:00Z",
+    runnerId: "runner-internal-id",
+    token: "do-not-leak-token",
+    protocolVersion: "2.0",
+  };
   const core = fakeCore({
-    projects: async () => ({
-      machines: [
-        { machineId: "m1", projects: [onlineProject()] },
-        { machineId: "m2", projects: [], error: "机器不可达（测试）" },
-      ],
-      group: defaultGroupView(),
-    }),
+    projects: async () =>
+      ({
+        machines: [
+          { machineId: "m1", projects: [onlineProject()] },
+          { machineId: "m2", projects: [], error: "机器不可达（测试）" },
+        ],
+        runners: [runnerWithInternals],
+        group: defaultGroupView(),
+      }) as unknown as Awaited<ReturnType<WebCore["projects"]>>,
   });
   const handle = await startWeb(core);
   const res = await get(handle.port, "/api/projects");
   assert.equal(res.status, 200);
   const body = json<ProjectsBody>(res);
   assert.equal(body.ok, true);
-  assert.equal(body.source, "GET /projects（Launcher 只读快照）");
+  assert.equal(body.source, "桥注册表（Runner 上报快照）");
   assert.match(body.note, /快照语义/);
   assert.match(body.observedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/, "须给出观测时间");
   assert.equal(body.machines.length, 2);
@@ -296,9 +311,19 @@ test("GET /api/projects → 白名单（剔除 workspace / agentConfig / risk）
   assert.equal("workspace" in project, false, "workspace 绝对路径不得出口");
   assert.equal("agentConfig" in project, false, "agentConfig 不得出口");
   assert.equal("risk" in project, false, "白名单外字段不得出口");
+
+  // Runner 注册视图：字段白名单 = machineId / online / lastHeartbeatAt（无 runnerId / token / protocolVersion）
+  const runner = at(body.runners ?? [], 0);
+  assert.deepEqual(runner, {
+    machineId: "m1",
+    online: true,
+    lastHeartbeatAt: "2026-09-18T00:00:00Z",
+  });
   const raw = JSON.stringify(body);
   assert.ok(!raw.includes("secret-workspace"), "响应全文不得含 workspace 绝对路径");
   assert.ok(!raw.includes("do-not-leak"), "响应全文不得含 agentConfig 内容");
+  assert.ok(!raw.includes("runner-internal-id"), "响应全文不得含 runnerId");
+  assert.ok(!raw.includes("do-not-leak-token"), "响应全文不得含 Runner token");
 });
 
 test("路由形状：未知路径 404；已注册路径非 GET → 405", async () => {

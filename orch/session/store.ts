@@ -8,6 +8,7 @@
  * 数据库文件路径取自环境变量 `SESSION_DB`，默认锚定 orch 单元根的
  * `data/sessions.sqlite`（自动创建父目录）。
  */
+import { randomUUID } from "node:crypto";
 import { mkdirSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { DatabaseSync } from "node:sqlite";
@@ -23,6 +24,7 @@ import type {
   FeatureRecord,
   FeatureState,
   InputArtifactRef,
+  RiskLevel,
   SessionRecord,
   TaskRecord,
   TaskState,
@@ -119,6 +121,150 @@ export const EVENT_FEATURE_STATE = "feature.state";
  * 令「`limit:1000` 静默截断」变为可观测信号。去重：每 (list, scope, limit) **每实例至多一次**。
  */
 export const EVENT_LIST_TRUNCATED = "store.list_truncated";
+
+// ---------------------------------------------------------------------------
+// v0.7.0 A2：Runner 注册表 + 任务队列地基（pull 连接模型的存储面）
+//
+// 本段只新增「运行态投影」所需的最小面，不改动既有列语义（`state` / `dispatch_guard`
+// 等既有列按各自既有口径继续工作）：
+// - `runners` / `runner_projects` 两张**投影表**（可删可重建，**启动不清空**）；
+// - `tasks` 五条队列列（`queue_state` / `claimed_by` / `claim_token` / `claimed_at` / `queued_at`）；
+// - 类型与读写口集中在 `orch/session/store.ts`（types.ts 的 `TaskRecord` 形状不变）。
+// ---------------------------------------------------------------------------
+
+/**
+ * 任务队列态（`tasks.queue_state`）。
+ * - `queued`：已入队待领取；
+ * - `claimed`：已被某 Runner 领取（in-flight，claim CAS 的唯一准入态）；
+ * - `running`：Runner 已在本机开工（领取与开工之间的细分态，供 Runner 侧上报）；
+ * - `settled`：已结算（终态落库 / 结果已回传）。
+ *
+ * ⚠️ **NULL 兼容**：v0.7.0 之前的老行该列为 NULL ⇒ 读侧一律视为 `settled`（老数据不在
+ * 队列中）。迁移**不回填**（不写历史行），`claimTask` 的 CAS 只认显式 `queue_state = 'queued'`。
+ */
+export type QueueState = "queued" | "claimed" | "running" | "settled";
+
+const QUEUE_STATES: readonly QueueState[] = ["queued", "claimed", "running", "settled"];
+
+/** Runner 注册态（心跳超期只降为 `offline`，**不得触发 stop** —— 决策 D8） */
+export type RunnerState = "online" | "offline";
+
+/** Runner 上报的项目运行态（`runner_projects.status`，与 Launcher `/projects` 同口径） */
+export type RunnerProjectStatus = "online" | "offline";
+
+const RISK_LEVELS: readonly RiskLevel[] = ["read", "write", "full"];
+
+/** `tasks` 队列列 + 既有列的组合投影（**不改 `TaskRecord` 形状**，避免波及 types.ts） */
+export interface TaskQueueColumns {
+  /** 队列态（NULL 老数据已归一为 `settled`） */
+  queueState: QueueState;
+  /** 领取者标识（落 `tasks.claimed_by`；未领取 / 已清算为 null） */
+  claimedBy: string | null;
+  /** 本次领取的唯一令牌（`requeueStaleTask` 清算时清空） */
+  claimToken: string | null;
+  /** 领取时刻（UTC ISO 8601） */
+  claimedAt: string | null;
+  /** 入队时刻（UTC ISO 8601；FIFO 领取序） */
+  queuedAt: string | null;
+}
+
+/** 队列视角的任务记录：既有 `TaskRecord` ∪ 队列五列 */
+export type QueuedTaskRecord = TaskRecord & TaskQueueColumns;
+
+/** `upsertRunner` 入参：`registeredAt` / `lastHeartbeatAt` 缺省时由存储层补齐 */
+export interface RunnerUpsertInput {
+  /** 注册实例 id（主键；同一台机器重复注册应沿用同一 id ⇒ `machine_id` UNIQUE 不冲突） */
+  runnerId: string;
+  /** 机器 id（UNIQUE；「一台机器同时只有一个 Runner 注册行」） */
+  machineId: string;
+  /** Runner 自携协议版本（如 `"2.0"`） */
+  protocolVersion: string;
+  /** Runner 软件版本（可空） */
+  version?: string | null;
+  /** 注册态（缺省 `online`；心跳超期由调用方显式降为 `offline`） */
+  state?: RunnerState;
+  /** 首次注册时刻（冲突时**保留首次**，不随重注册刷新） */
+  registeredAt?: string;
+  /** 最近心跳时刻（每次注册 / 心跳刷新） */
+  lastHeartbeatAt?: string;
+}
+
+/** Runner 注册记录（落 SQLite `runners` 表；运行态投影，重启不清空） */
+export interface RunnerRecord {
+  runnerId: string;
+  machineId: string;
+  protocolVersion: string;
+  version: string | null;
+  state: RunnerState;
+  registeredAt: string;
+  lastHeartbeatAt: string;
+}
+
+/** `runnerProjectsReplace` 单条项目入参（全量替换语义） */
+export interface RunnerProjectInput {
+  projectId: string;
+  /** 工作区绝对路径（可空） */
+  workspace?: string | null;
+  agentKind: AgentKind;
+  a2aPort: number;
+  /** 项目风险级别（可空 = 未声明） */
+  risk?: RiskLevel | null;
+  status: RunnerProjectStatus;
+  /** 本地 A2A 端点（可空 = 未就绪） */
+  endpoint?: string | null;
+  /** 项目 Agent 启动时刻（可空） */
+  startedAt?: string | null;
+}
+
+/** Runner 项目记录（落 `runner_projects`；`updated_at` 由每次全量替换统一盖章） */
+export interface RunnerProjectRecord {
+  runnerId: string;
+  projectId: string;
+  workspace: string | null;
+  agentKind: AgentKind;
+  a2aPort: number;
+  risk: RiskLevel | null;
+  status: RunnerProjectStatus;
+  endpoint: string | null;
+  startedAt: string | null;
+  updatedAt: string;
+}
+
+/** `claimTask` 入参 */
+export interface ClaimTaskOptions {
+  /** 领取者标识（落 `tasks.claimed_by`；本版约定 = 领取的 Runner 所属 `machineId`） */
+  claimedBy: string;
+  /** 唯一 claim token；缺省由存储层生成（`randomUUID`） */
+  claimToken?: string;
+  /** 仅在这些项目内领取（缺省 = 不限；**空数组 = 无可领取**） */
+  projectIds?: readonly string[];
+  /** 领取时刻（缺省 now） */
+  claimedAt?: string;
+}
+
+/**
+ * `upsertTaskResult` 入参：**幂等键 = `(machineId, taskId)`**。
+ *
+ * 逻辑键中的 `taskId` = 派发时下发给 Runner 的任务 id（`tasks.task_id` 主键 ⇒ 二次到达
+ * 命中同一行）；`machineId` = 上报机器（pull 回传与 callback 两条路径同源，取同一键去重）。
+ * 该方法**只写终态 + artifacts**，不改既有列语义。
+ */
+export interface TaskResultUpsertInput {
+  /** 上报机器（幂等键组成部分；亦是「非本机回传」的审计线索） */
+  machineId: string;
+  /** 任务本地 id（= 派发时下发给 Runner 的 id） */
+  taskId: string;
+  projectId: string;
+  contextId: string;
+  /** 上报任务态（`completed` / `failed` / `input-required` 为主） */
+  state: TaskState;
+  artifactsJson?: string | null;
+  text?: string | null;
+  featureId?: string | null;
+  remoteTaskId?: string | null;
+  /** 上报 / 结算时刻（缺省 now；重复上报时**不覆盖**已结算行） */
+  updatedAt?: string;
+}
 
 /** `upsertSession` 入参：时间戳缺省时由存储层补齐（UTC ISO 8601） */
 export interface SessionUpsertInput {
@@ -235,6 +381,22 @@ function isFinishedState(state: TaskState): boolean {
 
 function isFailureKind(v: string): v is FailureKind {
   return (FAILURE_KINDS as readonly string[]).includes(v);
+}
+
+function isQueueState(v: string): v is QueueState {
+  return (QUEUE_STATES as readonly string[]).includes(v);
+}
+
+function isRunnerState(v: string): v is RunnerState {
+  return v === "online" || v === "offline";
+}
+
+function isRunnerProjectStatus(v: string): v is RunnerProjectStatus {
+  return v === "online" || v === "offline";
+}
+
+function isRiskLevel(v: string): v is RiskLevel {
+  return (RISK_LEVELS as readonly string[]).includes(v);
 }
 
 function readString(row: Record<string, unknown>, key: string): string {
@@ -434,6 +596,76 @@ function rowToEvent(row: Record<string, unknown>): EventRecord {
   };
 }
 
+/**
+ * 解析 `queue_state` 列：**NULL 归一为 `settled`**（v0.7.0 之前的老行不在队列中）；
+ * 非 NULL 但非法值 = 数据损坏（fail-fast，与其余列同纪律）。
+ */
+function readQueueState(row: Record<string, unknown>): QueueState {
+  const raw = readNullableString(row, "queue_state");
+  if (raw === null) return "settled";
+  if (!isQueueState(raw)) {
+    throw new Error(`[session-store] 列 queue_state 数据损坏：非法值 ${raw}`);
+  }
+  return raw;
+}
+
+/** `tasks` 队列视角全列清单（SELECT 单一事实源；含队列五列） */
+const QUEUE_TASK_COLUMNS = `${TASK_COLUMNS}, queue_state, claimed_by, claim_token, claimed_at, queued_at`;
+
+function rowToQueuedTask(row: Record<string, unknown>): QueuedTaskRecord {
+  return {
+    ...rowToTask(row),
+    queueState: readQueueState(row),
+    claimedBy: readNullableString(row, "claimed_by"),
+    claimToken: readNullableString(row, "claim_token"),
+    claimedAt: readNullableString(row, "claimed_at"),
+    queuedAt: readNullableString(row, "queued_at"),
+  };
+}
+
+function rowToRunner(row: Record<string, unknown>): RunnerRecord {
+  const state = readString(row, "state");
+  if (!isRunnerState(state)) {
+    throw new Error(`[session-store] 列 state 数据损坏：非法 Runner 注册态 ${state}`);
+  }
+  return {
+    runnerId: readString(row, "runner_id"),
+    machineId: readString(row, "machine_id"),
+    protocolVersion: readString(row, "protocol_version"),
+    version: readNullableString(row, "version"),
+    state,
+    registeredAt: readString(row, "registered_at"),
+    lastHeartbeatAt: readString(row, "last_heartbeat_at"),
+  };
+}
+
+function rowToRunnerProject(row: Record<string, unknown>): RunnerProjectRecord {
+  const agentKind = readString(row, "agent_kind");
+  if (!isAgentKind(agentKind)) {
+    throw new Error(`[session-store] 列 agent_kind 数据损坏：非法值 ${agentKind}`);
+  }
+  const status = readString(row, "status");
+  if (!isRunnerProjectStatus(status)) {
+    throw new Error(`[session-store] 列 status 数据损坏：非法项目态 ${status}`);
+  }
+  const risk = readNullableString(row, "risk");
+  if (risk !== null && !isRiskLevel(risk)) {
+    throw new Error(`[session-store] 列 risk 数据损坏：非法风险级别 ${risk}`);
+  }
+  return {
+    runnerId: readString(row, "runner_id"),
+    projectId: readString(row, "project_id"),
+    workspace: readNullableString(row, "workspace"),
+    agentKind,
+    a2aPort: readInteger(row, "a2a_port"),
+    risk,
+    status,
+    endpoint: readNullableString(row, "endpoint"),
+    startedAt: readNullableString(row, "started_at"),
+    updatedAt: readString(row, "updated_at"),
+  };
+}
+
 const SESSIONS_DDL = `
 CREATE TABLE IF NOT EXISTS sessions (
   project_id   TEXT NOT NULL,
@@ -503,6 +735,40 @@ CREATE TABLE IF NOT EXISTS events (
   state      TEXT,
   payload    TEXT,
   created_at TEXT NOT NULL
+)`;
+
+/**
+ * Runner 注册表（v0.7.0 A2）。**运行态投影**：可删可重建，**启动不清空**。
+ * `machine_id` UNIQUE = 「一台机器同时只有一个 Runner 注册行」。
+ */
+const RUNNERS_DDL = `
+CREATE TABLE IF NOT EXISTS runners (
+  runner_id         TEXT PRIMARY KEY,
+  machine_id        TEXT NOT NULL UNIQUE,
+  protocol_version  TEXT NOT NULL,
+  version           TEXT,
+  state             TEXT NOT NULL,
+  registered_at     TEXT NOT NULL,
+  last_heartbeat_at TEXT NOT NULL
+)`;
+
+/**
+ * Runner 项目投影表（v0.7.0 A2）。写入语义 = `runnerProjectsReplace` **全量替换**
+ * （一次注册 / 心跳上报覆盖该 Runner 的项目视图）；机器仍自持项目配置，桥不下发。
+ */
+const RUNNER_PROJECTS_DDL = `
+CREATE TABLE IF NOT EXISTS runner_projects (
+  runner_id   TEXT NOT NULL,
+  project_id  TEXT NOT NULL,
+  workspace   TEXT,
+  agent_kind  TEXT NOT NULL,
+  a2a_port    INTEGER NOT NULL,
+  risk        TEXT,
+  status      TEXT NOT NULL,
+  endpoint    TEXT,
+  started_at  TEXT,
+  updated_at  TEXT NOT NULL,
+  PRIMARY KEY (runner_id, project_id)
 )`;
 
 /**
@@ -650,6 +916,36 @@ export class SessionStore {
         )
         .run(...knownStates);
     }
+    // ── v0.7.0 A2：四段前向幂等迁移（Runner 注册表 + 任务队列地基）──────────────
+    // 纪律：**前向、逐段、各段自幂等**（`CREATE ... IF NOT EXISTS` / try-ALTER）⇒ 重复启动
+    // 零副作用（连续两跑库状态一致）；**注册表不启动清空**（不清 `runners` / `runner_projects`，
+    // 重启后投影仍在）。段落划分（顺序固定）：
+    //   段 1：`tasks` 队列五列；段 2：`runners` 表；段 3：`runner_projects` 表；段 4：队列 / 注册表索引。
+    // 段 1：`tasks` 队列列。老行一律留 NULL（`queue_state` NULL ⇒ 读侧视为 `settled`，**不回填**）。
+    for (const column of [
+      "queue_state TEXT",
+      "claimed_by TEXT",
+      "claim_token TEXT",
+      "claimed_at TEXT",
+      "queued_at TEXT",
+    ]) {
+      try {
+        this.db.exec(`ALTER TABLE tasks ADD COLUMN ${column}`);
+      } catch {
+        // 列已存在（幂等）
+      }
+    }
+    // 段 2 / 段 3：注册表两张（运行态投影；IF NOT EXISTS = 幂等）
+    this.db.exec(RUNNERS_DDL);
+    this.db.exec(RUNNER_PROJECTS_DDL);
+    // 段 4：索引 —— 队列候选（claim 热路径）/ claim_token 唯一 / 项目投影按 Runner
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_state, queued_at)");
+    // claim_token 唯一：SQLite 唯一索引允许多个 NULL ⇒ 未领取行不受限，领取行令牌唯一。
+    this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_claim_token ON tasks(claim_token)");
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_runner_projects_runner ON runner_projects(runner_id)",
+    );
+
     // 按项目 + updated_at 倒序的列表查询索引
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS idx_tasks_project_updated ON tasks(project_id, updated_at DESC)",
@@ -1095,6 +1391,396 @@ export class SessionStore {
   }
 
   // ------------------------------------------------------------------
+  // v0.7.0 A2：Runner 注册表（运行态投影，启动不清空）
+  // ------------------------------------------------------------------
+
+  /**
+   * 写入 / 刷新 Runner 注册行（**按 `machine_id` 幂等 upsert**；运行态投影，重启不清空）。
+   *
+   * - 身份 = `machine_id`：同一台机器重复注册命中同一行（不产生重复注册行）；`runner_id`（PK）
+   *   随之更新为本次注册实例 id。**契约**：同一 `runner_id` 只能属于同一台机器 —— 违反会触发
+   *   PK 冲突（契约错误，不做静默兼容）。
+   * - `registered_at` **保留首次**（重注册不刷新）；`last_heartbeat_at` 每次刷新。
+   * - `state` 缺省 `online`；心跳超期降级由调用方显式传 `offline`（决策 D8：只降态、**不 stop**）。
+   */
+  upsertRunner(rec: RunnerUpsertInput): RunnerRecord {
+    const state = rec.state ?? "online";
+    if (rec.runnerId.length === 0 || rec.machineId.length === 0) {
+      throw new Error("[session-store] upsertRunner 要求 runnerId / machineId 非空");
+    }
+    if (!isRunnerState(state)) {
+      throw new Error(`[session-store] upsertRunner 非法注册态：${String(rec.state)}`);
+    }
+    const registeredAt = rec.registeredAt ?? nowIso();
+    const lastHeartbeatAt = rec.lastHeartbeatAt ?? registeredAt;
+    this.db
+      .prepare(
+        `INSERT INTO runners
+           (runner_id, machine_id, protocol_version, version, state, registered_at, last_heartbeat_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)
+         ON CONFLICT(machine_id) DO UPDATE SET
+           runner_id = excluded.runner_id,
+           protocol_version = excluded.protocol_version,
+           version = excluded.version,
+           state = excluded.state,
+           registered_at = COALESCE(registered_at, excluded.registered_at),
+           last_heartbeat_at = excluded.last_heartbeat_at`,
+      )
+      .run(
+        rec.runnerId,
+        rec.machineId,
+        rec.protocolVersion,
+        rec.version ?? null,
+        state,
+        registeredAt,
+        lastHeartbeatAt,
+      );
+    const row = this.db.prepare("SELECT * FROM runners WHERE machine_id = ?").get(rec.machineId);
+    if (row === undefined) {
+      throw new Error(`[session-store] upsertRunner 后未能读回记录：${rec.machineId}`);
+    }
+    return rowToRunner(row);
+  }
+
+  /**
+   * 刷新心跳：写 `last_heartbeat_at` 并置回 `online`。返回落库记录；Runner 不存在返回 null。
+   * `at` 缺省 now（便于测试注入确定性时刻）。
+   */
+  touchRunnerHeartbeat(runnerId: string, at?: string): RunnerRecord | null {
+    const now = at ?? nowIso();
+    const info = this.db
+      .prepare("UPDATE runners SET last_heartbeat_at = ?, state = 'online' WHERE runner_id = ?")
+      .run(now, runnerId);
+    if (Number(info.changes) === 0) return null;
+    const row = this.db.prepare("SELECT * FROM runners WHERE runner_id = ?").get(runnerId);
+    return row === undefined ? null : rowToRunner(row);
+  }
+
+  /**
+   * **全量替换**某 Runner 的项目投影（先删后插，单事务）。返回替换后的记录（按 `projectId` 升序）。
+   *
+   * - 语义：一次注册 / 心跳 = 该 Runner 的**完整项目视图**（非增量）⇒ 本次不再上报的旧项目被移除；
+   *   空数组 = 清空（Runner 在线但无项目）。
+   * - **先校验后落库**（非法入参 fail-fast，不产生半替换）；删除 + 插入包在 `BEGIN IMMEDIATE`
+   *   事务内 ⇒ 读取方不会看到「空窗」。
+   * - 不校验 `runnerId` 是否存在（投影可先于 / 独立于注册行写入；注册行由 `upsertRunner` 维护）。
+   */
+  runnerProjectsReplace(
+    runnerId: string,
+    projects: readonly RunnerProjectInput[],
+  ): RunnerProjectRecord[] {
+    if (runnerId.length === 0) {
+      throw new Error("[session-store] runnerProjectsReplace 要求 runnerId 非空");
+    }
+    for (const p of projects) {
+      if (p.projectId.length === 0) {
+        throw new Error("[session-store] runnerProjectsReplace 要求 projectId 非空");
+      }
+      if (!isAgentKind(p.agentKind)) {
+        throw new Error(
+          `[session-store] runnerProjectsReplace 非法 agentKind：${String(p.agentKind)}`,
+        );
+      }
+      if (!Number.isInteger(p.a2aPort)) {
+        throw new Error(`[session-store] runnerProjectsReplace 非法 a2aPort：${String(p.a2aPort)}`);
+      }
+      if (!isRunnerProjectStatus(p.status)) {
+        throw new Error(`[session-store] runnerProjectsReplace 非法 status：${String(p.status)}`);
+      }
+      if (p.risk !== undefined && p.risk !== null && !isRiskLevel(p.risk)) {
+        throw new Error(`[session-store] runnerProjectsReplace 非法 risk：${String(p.risk)}`);
+      }
+    }
+    const now = nowIso();
+    const insert = this.db.prepare(
+      `INSERT INTO runner_projects
+         (runner_id, project_id, workspace, agent_kind, a2a_port, risk, status, endpoint, started_at, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+    );
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      this.db.prepare("DELETE FROM runner_projects WHERE runner_id = ?").run(runnerId);
+      for (const p of projects) {
+        insert.run(
+          runnerId,
+          p.projectId,
+          p.workspace ?? null,
+          p.agentKind,
+          p.a2aPort,
+          p.risk ?? null,
+          p.status,
+          p.endpoint ?? null,
+          p.startedAt ?? null,
+          now,
+        );
+      }
+      this.db.exec("COMMIT");
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // 事务已不在活动态：保留原始错误，不掩盖
+      }
+      throw err;
+    }
+    const rows = this.db
+      .prepare("SELECT * FROM runner_projects WHERE runner_id = ? ORDER BY project_id ASC")
+      .all(runnerId) as Array<Record<string, unknown>>;
+    return rows.map(rowToRunnerProject);
+  }
+
+  /**
+   * 查询某 Runner 的项目投影（**只读**）。
+   *
+   * v0.7.0 A3 消费点：`/runner/connect` 在 claim 前读本口，得出「本机可领取的项目集合」
+   * （= 本机注册过的项目 ∩ 成员集合），据此判定「任务归属该机器」（静态分布下桥不把
+   * 项目下发机器，机器自持项目视图）。缺省按 `projectId` 升序；无记录 / 空 `runnerId` 返回空数组。
+   */
+  listRunnerProjects(runnerId: string): RunnerProjectRecord[] {
+    if (runnerId.length === 0) return [];
+    const rows = this.db
+      .prepare("SELECT * FROM runner_projects WHERE runner_id = ? ORDER BY project_id ASC")
+      .all(runnerId) as Array<Record<string, unknown>>;
+    return rows.map(rowToRunnerProject);
+  }
+
+  // ------------------------------------------------------------------
+  // v0.7.0 A7：心跳超期清算读口（只读 + 单个降态写口）
+  //
+  // 为什么必须读库：清算循环（`bridge/runner.ts`）要在**桥重启后**仍能判定「哪些 Runner 超期、
+  // 其名下还有哪些在飞任务」——进程内记忆重启即丢，会使 `queue_state='claimed'` 的行永久悬挂
+  // ⇒ 与 A3 增补 `listRunnerProjects` / `getQueuedTask` 同一纪律（只读口，不改既有列语义）。
+  // ------------------------------------------------------------------
+
+  /**
+   * 列出全部 Runner 注册行（**只读**；A7 心跳超期扫描的唯一入口）。
+   * 缺省按 `registered_at` 升序（稳定序，便于测试断言）。
+   */
+  listRunners(): RunnerRecord[] {
+    const rows = this.db
+      .prepare("SELECT * FROM runners ORDER BY registered_at ASC, runner_id ASC")
+      .all() as Array<Record<string, unknown>>;
+    return rows.map(rowToRunner);
+  }
+
+  /**
+   * 按 `machine_id` 读单个 Runner 注册行（**只读**；A7 判「离线→回线」的**先前态**读口）。
+   * 必须在 `touchRunnerHeartbeat` / `upsertRunner`（二者恒置回 online）**之前**读取，否则
+   * `offline` 事实已被覆盖。Runner 不存在 / 空 id 返回 null。
+   */
+  getRunner(machineId: string): RunnerRecord | null {
+    if (machineId.length === 0) return null;
+    const row = this.db.prepare("SELECT * FROM runners WHERE machine_id = ?").get(machineId);
+    return row === undefined ? null : rowToRunner(row);
+  }
+
+  /**
+   * 列出某领取者名下的**在飞**队列任务（`queue_state ∈ {claimed, running}`；**只读**）。
+   *
+   * A7 消费点：心跳超期清算据此遍历待回收任务（随后逐个 `requeueStaleTask`）。
+   * 空 `claimedBy` → 空数组（不查库）。缺省按 `queued_at` 升序（FIFO，与 claim 同序）。
+   */
+  listClaimedTasks(claimedBy: string): QueuedTaskRecord[] {
+    if (claimedBy.length === 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT ${QUEUE_TASK_COLUMNS} FROM tasks
+          WHERE claimed_by = ? AND queue_state IN ('claimed', 'running')
+          ORDER BY queued_at ASC, updated_at ASC`,
+      )
+      .all(claimedBy) as Array<Record<string, unknown>>;
+    return rows.map(rowToQueuedTask);
+  }
+
+  /**
+   * 标记 Runner 为 `offline`（**只写 `state` 单列**；A7 心跳超期降级写口）。
+   *
+   * 决策 D8：心跳超期**只降注册态、不触发 stop**（本方法不碰任何任务；任务回收由清算循环
+   * 单独走 `requeueStaleTask`）。幂等（重复调用零副作用）。Runner 不存在返回 null。
+   */
+  markRunnerOffline(runnerId: string): RunnerRecord | null {
+    if (runnerId.length === 0) return null;
+    const info = this.db.prepare("UPDATE runners SET state = 'offline' WHERE runner_id = ?").run(
+      runnerId,
+    );
+    if (Number(info.changes) === 0) return null;
+    const row = this.db.prepare("SELECT * FROM runners WHERE runner_id = ?").get(runnerId);
+    return row === undefined ? null : rowToRunner(row);
+  }
+
+  // ------------------------------------------------------------------
+  // v0.7.0 A2：任务队列（claim CAS / 入队 / 清算 / 结果回传）
+  // ------------------------------------------------------------------
+
+  /**
+   * **入队**（`queue_state = 'queued'`）：`dispatch_guard` **降级为入队幂等键**（不新增同义列）。
+   *
+   * - 单语句条件 UPDATE（`WHERE task_id = ? AND dispatch_guard IS NULL`）⇒ **幂等**：重复入队
+   *   零写入（不刷新 `queued_at` ⇒ 不改变 FIFO 位次，也不覆盖已 `claimed` 的领取状态）。
+   * - 任务不存在返回 null；已入队（或老数据已派发）返回**当前记录**（幂等 no-op，非 null）。
+   * - 只写 `queue_state` / `queued_at` / `dispatch_guard` / `updated_at`，**不动 `state` 等既有列**。
+   */
+  enqueueTask(taskId: string): QueuedTaskRecord | null {
+    const now = nowIso();
+    this.db
+      .prepare(
+        `UPDATE tasks
+         SET queue_state = 'queued', queued_at = ?, dispatch_guard = COALESCE(dispatch_guard, ?),
+             updated_at = ?
+         WHERE task_id = ? AND dispatch_guard IS NULL`,
+      )
+      .run(now, now, now, taskId);
+    const row = this.db
+      .prepare(`SELECT ${QUEUE_TASK_COLUMNS} FROM tasks WHERE task_id = ?`)
+      .get(taskId);
+    return row === undefined ? null : rowToQueuedTask(row);
+  }
+
+  /**
+   * **领取任务**（CAS：`WHERE queue_state = 'queued'`）。
+   *
+   * 先从队列按 `queued_at` 升序（FIFO）取候选，再对候选逐条执行条件 UPDATE —— 当前态仍为
+   * `queued` 才置 `claimed`（写 `claimed_by` / 唯一 `claim_token` / `claimed_at`）⇒ 并发下
+   * **同一任务至多被一个领取者拿到**（CAS 落空者自动试下一候选，绝不覆盖）。
+   *
+   * - `projectIds` 缺省 = 不限项目；显式空数组 = 无可领取（返回 null，零 I/O）。
+   * - `claimToken` 缺省由存储层生成（`randomUUID`；`idx_tasks_claim_token` 唯一索引兜底）。
+   * - 无候选 / 全部被抢占 / 候选行消失 ⇒ 返回 null。
+   */
+  claimTask(opts: ClaimTaskOptions): QueuedTaskRecord | null {
+    if (opts.claimedBy.length === 0) {
+      throw new Error("[session-store] claimTask 要求 claimedBy 非空");
+    }
+    const projectIds = opts.projectIds;
+    if (projectIds !== undefined && projectIds.length === 0) return null;
+    const projectClause =
+      projectIds === undefined
+        ? ""
+        : ` AND project_id IN (${projectIds.map(() => "?").join(", ")})`;
+    const candidates = this.db
+      .prepare(
+        `SELECT task_id FROM tasks WHERE queue_state = 'queued'${projectClause}
+         ORDER BY queued_at ASC, updated_at ASC LIMIT 50`,
+      )
+      .all(...(projectIds === undefined ? [] : [...projectIds])) as Array<Record<string, unknown>>;
+    if (candidates.length === 0) return null;
+    const claimedAt = opts.claimedAt ?? nowIso();
+    const update = this.db.prepare(
+      `UPDATE tasks
+       SET queue_state = 'claimed', claimed_by = ?, claim_token = ?, claimed_at = ?, updated_at = ?
+       WHERE task_id = ? AND queue_state = 'queued'`,
+    );
+    for (const candidate of candidates) {
+      const taskId = readString(candidate, "task_id");
+      const claimToken = opts.claimToken ?? randomUUID();
+      const info = update.run(opts.claimedBy, claimToken, claimedAt, claimedAt, taskId);
+      if (Number(info.changes) === 0) continue; // CAS 落空（已被抢占）⇒ 试下一候选
+      const row = this.db
+        .prepare(`SELECT ${QUEUE_TASK_COLUMNS} FROM tasks WHERE task_id = ?`)
+        .get(taskId);
+      return row === undefined ? null : rowToQueuedTask(row);
+    }
+    return null;
+  }
+
+  /**
+   * 查询**队列视角**任务记录（**只读**）：既有 `TaskRecord` ∪ 队列五列；任务不存在返回 `null`。
+   *
+   * v0.7.0 A3 消费点：`/runner/result` 的 **claim_token 校验唯一读口** —— 端点据此比对
+   * 上报令牌与当前领取令牌（令牌落库 ⇒ 桥重启 / 断桥重连后仍可校验，不依赖进程内记忆）。
+   */
+  getQueuedTask(taskId: string): QueuedTaskRecord | null {
+    const row = this.db
+      .prepare(`SELECT ${QUEUE_TASK_COLUMNS} FROM tasks WHERE task_id = ?`)
+      .get(taskId);
+    return row === undefined ? null : rowToQueuedTask(row);
+  }
+
+  /**
+   * **清算悬挂领取**（B2）：`claimed` / `running` → `queued`，并清空 claim 三字段
+   * （`claimed_by` / `claim_token` / `claimed_at`）。用于 Runner 心跳超期 / 归零后回收其名下任务。
+   *
+   * - 条件 UPDATE：仅 `queue_state ∈ {claimed, running}` 命中（`settled` / `queued` / NULL 老行零写入）。
+   * - `expectedClaimedBy` 给定 ⇒ 仅清算该领取者名下的任务（防误清他人）。
+   * - `queued_at` 保留原值（缺省回填 now）⇒ 重领取沿用原 FIFO 位次。
+   * - 返回是否发生迁移（false = 未命中，零写入）。
+   */
+  requeueStaleTask(taskId: string, expectedClaimedBy?: string): boolean {
+    const now = nowIso();
+    const claimedClause = expectedClaimedBy === undefined ? "" : " AND claimed_by = ?";
+    const params: string[] = [now, now, taskId];
+    if (expectedClaimedBy !== undefined) params.push(expectedClaimedBy);
+    const info = this.db
+      .prepare(
+        `UPDATE tasks
+         SET queue_state = 'queued', claimed_by = NULL, claim_token = NULL, claimed_at = NULL,
+             queued_at = COALESCE(queued_at, ?), updated_at = ?
+         WHERE task_id = ? AND queue_state IN ('claimed', 'running')${claimedClause}`,
+      )
+      .run(...params);
+    return Number(info.changes) > 0;
+  }
+
+  /**
+   * **结果回传落库**（幂等键 = `(machineId, taskId)`）：写终态 + artifacts，并把队列态置 `settled`。
+   *
+   * 同一逻辑键（pull 回传 / callback 双路径）重复到达 ⇒ **幂等**：已终态行不再被覆盖
+   * （`WHERE state NOT IN ('completed','failed','blocked')` 保证「首个终态胜出」，防迟到重复上报
+   * 造成状态回退），返回既有行。返回值 = 落库后的**队列视角**记录。
+   *
+   * - 任务不存在 ⇒ 直接 INSERT 一行（`queue_state = 'settled'`，`created_at = 上报时刻`）。
+   * - 只写 `state` / artifacts / text / remote_task_id 与 `finished_at`（首次）/ `updated_at`；
+   *   **不动** `dependencies` / `dispatch_message` / `retry_count` 等既有编排列。
+   */
+  upsertTaskResult(rec: TaskResultUpsertInput): QueuedTaskRecord {
+    if (rec.machineId.length === 0 || rec.taskId.length === 0) {
+      throw new Error("[session-store] upsertTaskResult 要求 machineId / taskId 非空");
+    }
+    if (!isTaskState(rec.state)) {
+      throw new Error(`[session-store] upsertTaskResult 非法任务态：${String(rec.state)}`);
+    }
+    const now = rec.updatedAt ?? nowIso();
+    const finishedAt = isFinishedState(rec.state) ? now : null;
+    this.db
+      .prepare(
+        `INSERT INTO tasks
+           (task_id, project_id, context_id, state, artifacts_json, text, feature_id, remote_task_id,
+            updated_at, created_at, started_at, finished_at, queue_state)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'settled')
+         ON CONFLICT(task_id) DO UPDATE SET
+           state = excluded.state,
+           artifacts_json = COALESCE(excluded.artifacts_json, artifacts_json),
+           text = COALESCE(excluded.text, text),
+           remote_task_id = COALESCE(excluded.remote_task_id, remote_task_id),
+           queue_state = 'settled',
+           updated_at = excluded.updated_at,
+           finished_at = COALESCE(finished_at, excluded.finished_at)
+         WHERE state NOT IN ('completed', 'failed', 'blocked')`,
+      )
+      .run(
+        rec.taskId,
+        rec.projectId,
+        rec.contextId,
+        rec.state,
+        rec.artifactsJson ?? null,
+        rec.text ?? null,
+        rec.featureId ?? null,
+        rec.remoteTaskId ?? null,
+        now,
+        now,
+        rec.state === "working" ? now : null,
+        finishedAt,
+      );
+    const row = this.db
+      .prepare(`SELECT ${QUEUE_TASK_COLUMNS} FROM tasks WHERE task_id = ?`)
+      .get(rec.taskId);
+    if (row === undefined) {
+      throw new Error(`[session-store] upsertTaskResult 后未能读回记录：${rec.taskId}`);
+    }
+    return rowToQueuedTask(row);
+  }
+
+  // ------------------------------------------------------------------
   // Feature CRUD（v0.3.0）
   // ------------------------------------------------------------------
 
@@ -1497,6 +2183,74 @@ export function rearmTask(taskId: string, dispatchMessage: string): TaskRecord |
 /** 条件重试：仅当节点当前为 failed 时重排（默认存储）；返回是否命中 */
 export function rearmForRetry(taskId: string, dispatchMessage: string): boolean {
   return getDefaultStore().rearmForRetry(taskId, dispatchMessage);
+}
+
+/** 写入 / 刷新 Runner 注册行（默认存储） */
+export function upsertRunner(rec: RunnerUpsertInput): RunnerRecord {
+  return getDefaultStore().upsertRunner(rec);
+}
+
+/** 刷新 Runner 心跳（默认存储） */
+export function touchRunnerHeartbeat(runnerId: string, at?: string): RunnerRecord | null {
+  return getDefaultStore().touchRunnerHeartbeat(runnerId, at);
+}
+
+/** 全量替换 Runner 项目投影（默认存储） */
+export function runnerProjectsReplace(
+  runnerId: string,
+  projects: readonly RunnerProjectInput[],
+): RunnerProjectRecord[] {
+  return getDefaultStore().runnerProjectsReplace(runnerId, projects);
+}
+
+/** 查询 Runner 项目投影（默认存储；v0.7.0 A3 claim 前「任务归属该机器」判据读口） */
+export function listRunnerProjects(runnerId: string): RunnerProjectRecord[] {
+  return getDefaultStore().listRunnerProjects(runnerId);
+}
+
+/** 列出全部 Runner 注册行（默认存储；v0.7.0 A7 心跳超期扫描读口） */
+export function listRunners(): RunnerRecord[] {
+  return getDefaultStore().listRunners();
+}
+
+/** 按 machineId 读 Runner 注册行（默认存储；v0.7.0 A7 离线→回线先前态读口） */
+export function getRunner(machineId: string): RunnerRecord | null {
+  return getDefaultStore().getRunner(machineId);
+}
+
+/** 列出某领取者名下在飞队列任务（默认存储；v0.7.0 A7 清算遍历读口） */
+export function listClaimedTasks(claimedBy: string): QueuedTaskRecord[] {
+  return getDefaultStore().listClaimedTasks(claimedBy);
+}
+
+/** 标记 Runner 离线（默认存储；v0.7.0 A7 心跳超期降级口） */
+export function markRunnerOffline(runnerId: string): RunnerRecord | null {
+  return getDefaultStore().markRunnerOffline(runnerId);
+}
+
+/** 任务入队（默认存储） */
+export function enqueueTask(taskId: string): QueuedTaskRecord | null {
+  return getDefaultStore().enqueueTask(taskId);
+}
+
+/** 领取任务（claim CAS；默认存储） */
+export function claimTask(opts: ClaimTaskOptions): QueuedTaskRecord | null {
+  return getDefaultStore().claimTask(opts);
+}
+
+/** 查询队列视角任务记录（默认存储；v0.7.0 A3 `/runner/result` claim_token 校验读口） */
+export function getQueuedTask(taskId: string): QueuedTaskRecord | null {
+  return getDefaultStore().getQueuedTask(taskId);
+}
+
+/** 清算悬挂领取：claimed/running → queued（默认存储）；返回是否命中 */
+export function requeueStaleTask(taskId: string, expectedClaimedBy?: string): boolean {
+  return getDefaultStore().requeueStaleTask(taskId, expectedClaimedBy);
+}
+
+/** 结果回传幂等落库（默认存储） */
+export function upsertTaskResult(rec: TaskResultUpsertInput): QueuedTaskRecord {
+  return getDefaultStore().upsertTaskResult(rec);
 }
 
 /** 创建/覆盖 Feature 记录（默认存储） */

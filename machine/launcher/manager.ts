@@ -48,6 +48,39 @@ export class AgentStartError extends Error {
   }
 }
 
+/**
+ * 本机在飞任务台账的**最小读写面**（结构上由 `runner.ts` 的 `InFlightLedger` 满足）。
+ * 定义此结构类型而**不 import** 具体类，避免 `manager ↔ runner` 的运行时循环依赖。
+ * M5·MC1 起它同时是 idleStop 判据的数据源（`size`）与自检任务的登记口（`add` / `remove`）。
+ */
+export interface InFlightLedgerLike {
+  readonly size: number;
+  add(entry: {
+    taskId: string;
+    projectId: string;
+    startedAt: string;
+    a2aTaskId?: string | null;
+  }): void;
+  remove(taskId: string): boolean;
+  has(taskId: string): boolean;
+}
+
+/** 未注入台账时的空实现（恒无在飞 ⇒ 到点即回收，等价旧行为；生产由入口注入共享实例） */
+const EMPTY_IN_FLIGHT: InFlightLedgerLike = {
+  size: 0,
+  add: (): void => {},
+  remove: (): boolean => false,
+  has: (): boolean => false,
+};
+
+export interface AgentManagerDeps {
+  /**
+   * 本机在飞任务台账（v0.7.0 M5·MC1：idleStop 判据数据源）。
+   * 生产由 `launcher/index.ts` 创建**单一实例**并同时注入本管理器与 Runner（共享）。
+   */
+  inFlight?: InFlightLedgerLike;
+}
+
 /** opencode 项目的前置 `opencode serve` 进程及其后端基址 */
 interface OpencodeBackend {
   child: ChildProcess;
@@ -61,8 +94,6 @@ interface RunningAgent {
   serveChild: ChildProcess | null;
   endpoint: string;
   startedAt: string;
-  /** 空闲回收定时器（用完退出）：null=未调度/已清除；已 unref，不阻塞进程退出 */
-  idleTimer: NodeJS.Timeout | null;
 }
 
 /** A2A 端点约定：本机回环 + 项目 a2aPort */
@@ -105,8 +136,125 @@ export function removeChildLedgerEntry(pid: number): void {
   }
 }
 
+/**
+ * 空闲回收判据（纯函数，v0.7.0 · M5·MC1 新口径）：
+ * `inflight == 0 && (now - lastActivity) >= idleStopMs` ⇒ 可本地 stop。
+ *
+ * **忽略 bridge 可达性**：桥心跳失败只降 Runner 注册态字段（`registered` / `lastError`），
+ * 不进入本判据（本函数甚至不接收该输入）⇒ 心跳失败**绝不**触发 stop。
+ * `idleStopMs <= 0` = 禁用空闲回收；`inFlightCount > 0` = 有在飞任务 ⇒ 恒 false。
+ */
+export function isIdleStopDue(opts: {
+  inFlightCount: number;
+  lastActivityMs: number;
+  nowMs: number;
+  idleStopMs: number;
+}): boolean {
+  if (opts.idleStopMs <= 0) return false;
+  if (opts.inFlightCount > 0) return false;
+  return opts.nowMs - opts.lastActivityMs >= opts.idleStopMs;
+}
+
+/** 空闲计时句柄（单测注入假实现，避免真实等待） */
+export interface IdleTimerHandle {
+  cancel(): void;
+}
+
+export interface IdleReaperOptions {
+  /** 有效空闲回收时长（ms）；`<=0` = 禁用（不排任何计时） */
+  idleStopMs: number;
+  /** 本机当前在飞任务数（数据源 = `InFlightLedger.size`） */
+  inFlightCount: () => number;
+  /** 判据成立时的本地回收动作（由调用方执行 `stop`） */
+  onIdle: (projectId: string) => void;
+  /** 时钟（ms epoch；缺省 `Date.now`；单测注入假时钟） */
+  now?: () => number;
+  /** 定时器（缺省 `setTimeout`；单测注入假实现） */
+  setTimer?: (callback: () => void, ms: number) => IdleTimerHandle;
+  /** 日志（缺省 `console.log`） */
+  log?: (message: string) => void;
+}
+
+interface IdleEntry {
+  lastActivityMs: number;
+  handle: IdleTimerHandle | null;
+}
+
+function defaultIdleSetTimer(callback: () => void, ms: number): IdleTimerHandle {
+  const timer = setTimeout(callback, ms);
+  timer.unref();
+  return { cancel: () => clearTimeout(timer) };
+}
+
+/**
+ * 每项目空闲回收计时（M5·MC1）：`noteActivity` 复位静默基准并重新计时；到点按
+ * {@link isIdleStopDue} 判定 —— **有在飞任务或未满静默则不停**（按同一时长重查，
+ * 且**不复位**静默基准），否则回调 `onIdle`（本地 stop）。
+ *
+ * 本类**不接收任何 bridge / 网络输入**，故 bridge 可达性与回收决策天然解耦。
+ */
+export class IdleReaper {
+  private readonly entries = new Map<string, IdleEntry>();
+
+  constructor(private readonly options: IdleReaperOptions) {}
+
+  /** 记一次活动（启动成功 / ensure 复用）：复位静默基准并按 `idleStopMs` 重新计时 */
+  noteActivity(projectId: string): void {
+    this.entries.get(projectId)?.handle?.cancel();
+    const entry: IdleEntry = { lastActivityMs: this.now(), handle: null };
+    this.entries.set(projectId, entry);
+    if (this.options.idleStopMs <= 0) return;
+    this.arm(projectId, entry, this.options.idleStopMs);
+  }
+
+  /** 清除某项目的空闲计时（停止 / 退出 / 回收路径）；幂等 */
+  clear(projectId: string): void {
+    const entry = this.entries.get(projectId);
+    if (entry === undefined) return;
+    entry.handle?.cancel();
+    this.entries.delete(projectId);
+  }
+
+  /** 清除全部空闲计时（进程退出路径） */
+  clearAll(): void {
+    for (const projectId of [...this.entries.keys()]) this.clear(projectId);
+  }
+
+  private arm(projectId: string, entry: IdleEntry, idleMs: number): void {
+    const setTimer = this.options.setTimer ?? defaultIdleSetTimer;
+    entry.handle = setTimer(() => {
+      // 条目已被 clear / 替换 ⇒ 跳过（正常路径已 cancel，此处为双保险）
+      if (this.entries.get(projectId) !== entry) return;
+      entry.handle = null;
+      const due = isIdleStopDue({
+        inFlightCount: this.options.inFlightCount(),
+        lastActivityMs: entry.lastActivityMs,
+        nowMs: this.now(),
+        idleStopMs: idleMs,
+      });
+      if (!due) {
+        // 有在飞任务 / 未满静默：不停，按同一判据重查（不复位静默基准）
+        this.arm(projectId, entry, idleMs);
+        return;
+      }
+      (this.options.log ?? ((message: string) => console.log(message)))(
+        `[launcher] agent ${projectId} 空闲超时（${idleMs}ms 无调用且无在飞任务），自动回收（用完退出）`,
+      );
+      this.options.onIdle(projectId);
+    }, idleMs);
+  }
+
+  private now(): number {
+    return this.options.now?.() ?? Date.now();
+  }
+}
+
 export class AgentManager {
   private readonly config: MachineConfig;
+  /** 本机在飞任务台账（M5·MC1：与 Runner 共享同一实例；自检经此登记） */
+  readonly inFlight: InFlightLedgerLike;
+  /** 空闲回收计时（M5·MC1：判据 = inflight==0 且静默 ≥ idleStopMs） */
+  private readonly idle: IdleReaper;
   private readonly running = new Map<string, RunningAgent>();
   /** 进行中的 ensure（防并发重复拉起同一项目） */
   private readonly pending = new Map<string, Promise<EnsureResult>>();
@@ -119,8 +267,18 @@ export class AgentManager {
   /** 退出中标志：置位后 `start()` 拒绝拉起，`running.set` 前二次校验，防止僵死注册 */
   private shuttingDown = false;
 
-  constructor(config: MachineConfig) {
+  constructor(config: MachineConfig, deps: AgentManagerDeps = {}) {
     this.config = config;
+    this.inFlight = deps.inFlight ?? EMPTY_IN_FLIGHT;
+    this.idle = new IdleReaper({
+      idleStopMs: this.effectiveIdleStopMs(),
+      inFlightCount: () => this.inFlight.size,
+      onIdle: (projectId) => {
+        void this.stop(projectId).catch((err: unknown) => {
+          console.error(`[launcher] agent ${projectId} 空闲回收失败：${errorMessage(err)}`);
+        });
+      },
+    });
   }
 
   /**
@@ -177,41 +335,6 @@ export class AgentManager {
     return this.config.launcher.idleStopMs ?? DEFAULT_IDLE_STOP_MS;
   }
 
-  /** 清除条目的空闲计时（停止/退出/回收等条目移除路径） */
-  private clearIdleTimer(entry: RunningAgent): void {
-    if (entry.idleTimer !== null) {
-      clearTimeout(entry.idleTimer);
-      entry.idleTimer = null;
-    }
-  }
-
-  /**
-   * 重置项目空闲计时（用完退出）：
-   * 在 start 成功与 ensure 复用命中时调用；超时无再次调用即自动 stop。
-   * 有效值为 `0`/负值时禁用，空操作。
-   */
-  private resetIdleTimer(projectId: string): void {
-    const idleMs = this.effectiveIdleStopMs();
-    if (idleMs <= 0) return;
-    const entry = this.running.get(projectId);
-    if (entry === undefined) return;
-    this.clearIdleTimer(entry);
-
-    const timer = setTimeout(() => {
-      // 条目已被替换或移除则跳过（正常路径已 clearTimeout，此处为双保险）
-      if (this.running.get(projectId) !== entry) return;
-      entry.idleTimer = null;
-      console.log(
-        `[launcher] agent ${projectId} 空闲超时（${idleMs}ms 无调用），自动回收（用完退出）`,
-      );
-      void this.stop(projectId).catch((err: unknown) => {
-        console.error(`[launcher] agent ${projectId} 空闲回收失败：${errorMessage(err)}`);
-      });
-    }, idleMs);
-    timer.unref();
-    entry.idleTimer = timer;
-  }
-
   /** 本机配置中的项目定义；不存在则抛 ProjectNotFoundError */
   getProject(projectId: string): ProjectConfig {
     const project = this.config.projects.find((p) => p.projectId === projectId);
@@ -219,7 +342,7 @@ export class AgentManager {
     return project;
   }
 
-  /** 配置 + 运行态拼接（GET /projects） */
+  /** 配置 + 运行态拼接（内部聚合；入站 `GET /projects` 已于 v0.7.0 M5·MC1 退役） */
   listProjects(): ProjectStatus[] {
     return this.config.projects.map((project) => {
       const entry = this.running.get(project.projectId);
@@ -232,7 +355,7 @@ export class AgentManager {
         };
       }
       if (entry !== undefined) {
-        this.clearIdleTimer(entry);
+        this.idle.clear(project.projectId);
         this.running.delete(project.projectId);
       }
       return {
@@ -254,11 +377,11 @@ export class AgentManager {
     const current = this.running.get(projectId);
     if (current !== undefined && !hasExited(current.child)) {
       // 复用命中：视为一次调用，续期空闲计时
-      this.resetIdleTimer(projectId);
+      this.idle.noteActivity(projectId);
       return { projectId, endpoint: current.endpoint, started: false };
     }
     if (current !== undefined) {
-      this.clearIdleTimer(current);
+      this.idle.clear(projectId);
       this.running.delete(projectId);
     }
 
@@ -352,7 +475,7 @@ export class AgentManager {
       spawnState.error = err;
       const entry = this.running.get(project.projectId);
       if (entry !== undefined && entry.child === child) {
-        this.clearIdleTimer(entry);
+        this.idle.clear(project.projectId);
         this.running.delete(project.projectId);
       }
       console.error(`[launcher] agent ${project.projectId} 进程错误：${errorMessage(err)}`);
@@ -362,7 +485,7 @@ export class AgentManager {
     child.once("exit", (code, signal) => {
       const entry = this.running.get(project.projectId);
       if (entry !== undefined && entry.child === child) {
-        this.clearIdleTimer(entry);
+        this.idle.clear(project.projectId);
         this.running.delete(project.projectId);
       }
       if (backend !== null) {
@@ -408,10 +531,9 @@ export class AgentManager {
       serveChild: backend !== null ? backend.child : null,
       endpoint,
       startedAt: new Date().toISOString(),
-      idleTimer: null,
     });
-    // 启动成功即开始空闲计时（用完退出）
-    this.resetIdleTimer(project.projectId);
+    // 启动成功即开始空闲计时（用完退出；判据 = inflight==0 且静默 ≥ idleStopMs）
+    this.idle.noteActivity(project.projectId);
     console.log(`[launcher] agent ${project.projectId} 已上线：${endpoint}`);
     return { projectId: project.projectId, endpoint, started: true };
   }
@@ -474,10 +596,10 @@ export class AgentManager {
   /** 停止项目 Agent 及其前置 serve；未运行时返回 stopped=false */
   async stop(projectId: string): Promise<StopResult> {
     this.getProject(projectId);
+    this.idle.clear(projectId);
 
     const entry = this.running.get(projectId);
     if (entry === undefined || hasExited(entry.child)) {
-      if (entry !== undefined) this.clearIdleTimer(entry);
       this.running.delete(projectId);
       if (entry !== undefined && entry.serveChild !== null) {
         await terminateChild(entry.serveChild);
@@ -485,7 +607,6 @@ export class AgentManager {
       return { projectId, stopped: false };
     }
 
-    this.clearIdleTimer(entry);
     this.running.delete(projectId);
     await terminateChild(entry.child);
     if (entry.serveChild !== null) {
@@ -501,7 +622,7 @@ export class AgentManager {
    */
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
-    for (const entry of this.running.values()) this.clearIdleTimer(entry);
+    this.idle.clearAll();
     this.running.clear();
     const children = [...this.allChildren.values()];
     this.clearLedgerEntries(children);
@@ -515,7 +636,7 @@ export class AgentManager {
    */
   killAllSync(): void {
     this.shuttingDown = true;
-    for (const entry of this.running.values()) this.clearIdleTimer(entry);
+    this.idle.clearAll();
     this.running.clear();
     const children = [...this.allChildren.values()];
     this.clearLedgerEntries(children);

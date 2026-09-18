@@ -1,5 +1,5 @@
 /**
- * `orch/config.ts` 配置解析单元测试（v0.4.1 transport 段 / v0.5.0 web 段；`node:test`，无新依赖）。
+ * `orch/config.ts` 配置解析单元测试（v0.4.1 transport 段 / v0.5.0 web 段 / v0.7.0 runner 段；`node:test`，无新依赖）。
  *
  * 覆盖：无 `transport` 段（缺省 stdio，旧配置零改动可用）、显式 stdio、
  * 显式 http（含 `http` 段部分缺省）、空段、非法 mode、非法 http 端口 / 路径。
@@ -9,6 +9,10 @@
  * 正常解析 + 派生集合（memberKeys / memberMachineIds / selective）、`name` 缺省 null、
  * 空数组 ⇒ fail、成员项缺字段 / 非对象 / 非字符串 ⇒ fail、未知 `machineId` ⇒ fail、
  * `memberKey` 单射性与集合去重、`defaultProjectGroup` 唯一默认构造。
+ * 覆盖（v0.7.0 A1）：`launcherUrl` 必填→可选（缺省解析成功 + warn；存在非法 ⇒ warn + 忽略；
+ * 存在合法 ⇒ 原样保留且不告警）、`machines[].token` 可选解析（存在须非空字符串）、
+ * 顶层可选 `runner` 段（缺省 / 空段 / 部分缺省 ⇒ 25000 / 60000；非法结构 ⇒ fail-fast）、
+ * 协议常量 `PROTOCOL_VERSION === "2.0"` 与 `SUPPORTED_PEER_PROTOCOL_MAJORS === [2]`。
  *
  * 运行：`npm test`（先 `tsc` 构建，再 `node --test dist/test/`）。
  */
@@ -17,7 +21,8 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultProjectGroup, loadMachinesConfig, memberKey } from "../config.js";
+import { defaultProjectGroup, defaultRunner, loadMachinesConfig, memberKey } from "../config.js";
+import { PROTOCOL_VERSION, SUPPORTED_PEER_PROTOCOL_MAJORS } from "../types.js";
 
 /** 在临时目录落一份配置文件并交给回调解析（用例结束即清理） */
 function withConfig<T>(raw: unknown, fn: (path: string) => T): T {
@@ -438,4 +443,134 @@ test("defaultProjectGroup：唯一「全量接纳」默认构造（段缺省态�
   assert.equal(def.memberKeys.size, 0);
   assert.equal(def.memberMachineIds.size, 0);
   assert.deepEqual(cfg.projectGroup, def);
+});
+
+// ── v0.7.0 A1：协议常量 + launcherUrl/token + runner 段 ─────────────────────────
+
+/** 捕获解析期 `console.warn`（断言「缺省/非法告警」与「合法不告警」） */
+function captureWarn<T>(fn: () => T): { value: T; warnings: string[] } {
+  const original = console.warn;
+  const warnings: string[] = [];
+  console.warn = (...args: unknown[]) => {
+    warnings.push(args.map((a) => String(a)).join(" "));
+  };
+  try {
+    return { value: fn(), warnings };
+  } finally {
+    console.warn = original;
+  }
+}
+
+/** 单机配置（可精确控制该机器对象字段，便于 launcherUrl / token 用例） */
+function machineConfig(machine: Record<string, unknown>, extra: Record<string, unknown> = {}): unknown {
+  return { machines: [machine], ...extra };
+}
+
+const RUNNER_DEFAULTS = { holdMs: 25000, heartbeatTimeoutMs: 60000 };
+
+test("协议常量（v0.7.0 硬切 2.0）：PROTOCOL_VERSION=2.0 / SUPPORTED_PEER_PROTOCOL_MAJORS=[2]", () => {
+  assert.equal(PROTOCOL_VERSION, "2.0");
+  assert.deepEqual([...SUPPORTED_PEER_PROTOCOL_MAJORS], [2]);
+});
+
+test("launcherUrl 缺省（可选）：解析成功 + warn，不 fail-fast、不回退全量接纳", () => {
+  const { value: cfg, warnings } = captureWarn(() =>
+    withConfig(machineConfig({ machineId: "m1" }), loadMachinesConfig),
+  );
+  assert.equal(cfg.machines[0]?.machineId, "m1");
+  assert.equal(cfg.machines[0]?.launcherUrl, "");
+  assert.equal(cfg.projectGroup?.selective, false);
+  assert.ok(
+    warnings.some((w) => w.includes("machines[0].launcherUrl 缺省")),
+    `期望 launcherUrl 缺省告警，实际：${JSON.stringify(warnings)}`,
+  );
+});
+
+test("launcherUrl 存在且合法：原样保留，且不产生告警（旧配置零改动）", () => {
+  const { value: cfg, warnings } = captureWarn(() => withConfig(minimalConfig(), loadMachinesConfig));
+  assert.equal(cfg.machines[0]?.launcherUrl, "http://127.0.0.1:3100");
+  assert.deepEqual(warnings, []);
+});
+
+test("launcherUrl 存在但非法（空串 / 非字符串）：warn + 忽略（归一为 \"\"），不抛错", () => {
+  for (const launcherUrl of ["", 3100, null, true]) {
+    const { value: cfg, warnings } = captureWarn(() =>
+      withConfig(machineConfig({ machineId: "m1", launcherUrl }), loadMachinesConfig),
+    );
+    assert.equal(cfg.machines[0]?.launcherUrl, "");
+    assert.ok(
+      warnings.some((w) => w.includes("machines[0].launcherUrl 非法")),
+      `期望 launcherUrl 非法告警，实际：${JSON.stringify(warnings)}`,
+    );
+  }
+});
+
+test("machines[].token：缺省 ⇒ undefined；显式非空字符串 ⇒ 原样保留", () => {
+  const absent = withConfig(machineConfig({ machineId: "m1" }), loadMachinesConfig);
+  assert.equal(absent.machines[0]?.token, undefined);
+
+  const present = withConfig(
+    machineConfig({ machineId: "m1", token: "runner-tok-1" }),
+    loadMachinesConfig,
+  );
+  assert.equal(present.machines[0]?.token, "runner-tok-1");
+});
+
+test("machines[].token 非法（空串 / 非字符串 / null）→ 结构化报错", () => {
+  for (const token of ["", 123, null, true]) {
+    assert.throws(
+      () => withConfig(machineConfig({ machineId: "m1", token }), loadMachinesConfig),
+      /\[config\] machines\[0\]\.token 必须是非空字符串/,
+    );
+  }
+});
+
+test("runner 缺省：无 runner 段 → { holdMs: 25000, heartbeatTimeoutMs: 60000 }", () => {
+  const cfg = withConfig(minimalConfig(), loadMachinesConfig);
+  assert.deepEqual(cfg.runner, RUNNER_DEFAULTS);
+});
+
+test("runner 空段：{} 视同缺省（旧配置零改动可用）", () => {
+  const cfg = withConfig(minimalConfig({ runner: {} }), loadMachinesConfig);
+  assert.deepEqual(cfg.runner, RUNNER_DEFAULTS);
+});
+
+test("runner 部分缺省：仅声明 holdMs ⇒ heartbeatTimeoutMs 回退缺省；两者均声明 ⇒ 按声明取值", () => {
+  const partial = withConfig(minimalConfig({ runner: { holdMs: 30000 } }), loadMachinesConfig);
+  assert.deepEqual(partial.runner, { holdMs: 30000, heartbeatTimeoutMs: 60000 });
+
+  const full = withConfig(
+    minimalConfig({ runner: { holdMs: 10000, heartbeatTimeoutMs: 45000 } }),
+    loadMachinesConfig,
+  );
+  assert.deepEqual(full.runner, { holdMs: 10000, heartbeatTimeoutMs: 45000 });
+});
+
+test("runner 段非对象（字符串 / 数字 / 数组 / null）→ 结构化报错", () => {
+  for (const runner of ["on", 1, [], null]) {
+    assert.throws(
+      () => withConfig(minimalConfig({ runner }), loadMachinesConfig),
+      /\[config\] runner 必须是对象/,
+    );
+  }
+});
+
+test("runner 阈值非法（0 / 负 / 小数 / 类型错）→ 结构化报错，不静默降级", () => {
+  const bad: unknown[] = [0, -1, 1.5, "25000", null, true];
+  for (const holdMs of bad) {
+    assert.throws(
+      () => withConfig(minimalConfig({ runner: { holdMs } }), loadMachinesConfig),
+      /\[config\] runner\.holdMs 必须是正整数（毫秒，>=1）/,
+    );
+  }
+  for (const heartbeatTimeoutMs of bad) {
+    assert.throws(
+      () => withConfig(minimalConfig({ runner: { heartbeatTimeoutMs } }), loadMachinesConfig),
+      /\[config\] runner\.heartbeatTimeoutMs 必须是正整数（毫秒，>=1）/,
+    );
+  }
+});
+
+test("defaultRunner：唯一缺省构造（段缺省态与缺省解析结果一致）", () => {
+  assert.deepEqual(defaultRunner(), RUNNER_DEFAULTS);
 });

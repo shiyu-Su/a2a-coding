@@ -6,12 +6,15 @@
  * 才回带）。故本接入面：`sessionIdGenerator: undefined`（不发放会话号）+ `enableJsonResponse: true`
  * （JSON 应答，不起 SSE 流），且**每请求新建 server + transport**（无跨请求内存态）。
  *
- * 路由（仅这三条）：
+ * 路由（仅这三条 + Runner 入站分支）：
  * - `POST {path}`（默认 `/mcp`）：MCP JSON-RPC（stateless）；未就绪时 503，非 POST 时 405。
  * - `GET /health`：`{ status, role, version }`；`role` 取自 core 租约（`owner` / `follower`）。
  *   就绪信号**晚于** lifecycle 的 `recover()`：未就绪返回 503 + `status="starting"`。
  * - `POST /shutdown`：**仅 loopback 来源**（Windows 无可靠 SIGTERM，优雅停机走此端点，§2.5）；
  *   先回 200 再触发停机，非 loopback → 403。
+ * - `/runner/*`（v0.7.0 A3）：**委托** `options.runner`（`bridge/runner.ts`）处理，本层不做
+ *   任何鉴权 / 形态判断 —— 该处理器的 `handle()` 自行完成「stdio 不注册 / 非 owner 503」门闩
+ *   与路由匹配；未接 runner（stdio 形态 / 旧调用方）时 `/runner/*` 自然落 404（零回归）。
  *
  * 实现边界：HTTP 层用 `node:http`（SDK 的 express 助手依赖 express，而 orch 未声明该依赖，
  * 「不得新增第三方依赖」故不用）；绑定默认 loopback，非 loopback 地址打 warn（跨机鉴权待 v0.7.0）。
@@ -24,6 +27,7 @@ import type { CoreRole } from "../../runtime/core-lease.js";
 import { bridgeLog } from "../bridge-log.js";
 import type { BridgeCore } from "../index.js";
 import { createServer } from "../register-tools.js";
+import type { RunnerEndpointHandle } from "../runner.js";
 
 /** 非 loopback 绑定的告警对象（host 名或 IP、IPv4-mapped IPv6） */
 export function isLoopbackHostOrAddress(value: string): boolean {
@@ -55,6 +59,12 @@ export interface HttpTransportOptions {
   version: string;
   /** 触发优雅停机（`POST /shutdown` 命中 loopback 时；响应已发出后调用） */
   onShutdown: () => void;
+  /**
+   * Runner 入站端点处理器（v0.7.0 A3；可选）。
+   * 由 `bridge/index.ts` 在 `transport.mode === "http"` 时经 `createRunnerEndpoints` 注入；
+   * 缺省（未注入）时 `/runner/*` 走 404 —— 即「stdio 形态不注册路由」在 HTTP 层的兜底。
+   */
+  runner?: RunnerEndpointHandle;
 }
 
 export interface HttpTransportHandle {
@@ -142,7 +152,7 @@ async function handleRequest(
   res: ServerResponse,
   options: HttpTransportOptions,
 ): Promise<void> {
-  const path = (req.url ?? "").split("?")[0];
+  const path = (req.url ?? "").split("?")[0] ?? "";
   if (path === options.path) {
     await handleMcpRequest(req, res, options);
     return;
@@ -167,6 +177,10 @@ async function handleRequest(
     }
     handleShutdownRequest(req, res, options);
     return;
+  }
+  // Runner 入站分支（v0.7.0 A3）：仅在注入处理器时生效；`handle()` 自检形态 / owner 门闩 / 路由匹配
+  if (options.runner !== undefined) {
+    if (await options.runner.handle(req, res, path)) return;
   }
   respondJson(res, 404, { ok: false, error: "not_found" });
 }

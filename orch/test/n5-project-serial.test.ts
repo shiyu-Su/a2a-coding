@@ -5,9 +5,9 @@
  * - **V1 同 project 串行不变式**：跨 Feature，同 project 同一时刻 `state='working' ∧
  *   remote_task_id IS NOT NULL` 计数 **≤ 1**；**跨 project 同 tick 可并发**；同 project 排队者
  *   在在飞节点终态（项目释放）后于下一 tick 被放行；
- * - **V-ensure / V6 静止期禁 ensure**：静止（失败静止）与 `needs_input` 期**零派发**（⇒ 不走
- *   `dispatchTask` ⇒ 不触 `ensure`）；且静止 ⇒ 无 `working` 在飞 ⇒ **无看护 ⇒ 无 `renew`**
- *   （第二条 ensure 通道）——「对 watcher 与调度通道各一条断言」；
+ * - **V6 静止期禁派发**：静止（失败静止）与 `needs_input` 期**零派发**（⇒ 不走 `dispatchTask`
+ *   ⇒ 零 ensure / 零入队）；v0.7.0 A5 起 `renew` 退役、`isTaskWatched` 改判**本地队列态**
+ *   （`queued/claimed/running`），故「通道②」断言 = 静止期任务不在队；
  * - **`listBusyProjectIds`（项目忙来源）**：口径 = `working ∧ remote_task_id IS NOT NULL`；
  *   终态占位 / 未派发不算忙；**不受 `listTasks` 的 limit clamp 截断**（120 条在飞仍不静默漏）；
  * - **`computeReadyNodes` 第三参**：`projectId ∈ busy ⇒ 不 ready` + **同批顺序认领**（同批同
@@ -22,11 +22,11 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { Task } from "@a2a-js/sdk";
 import {
   close,
   createFeature,
   createTask,
+  enqueueTask,
   getTask,
   listBusyProjectIds,
   listFeatureTasks,
@@ -35,7 +35,7 @@ import {
 } from "../session/store.js";
 import type { FeatureDispatchResult } from "../bridge/scheduler.js";
 import { FeatureScheduler, computeReadyNodes } from "../bridge/scheduler.js";
-import { drainTaskWatchers, isTaskWatched, startTaskWatcher } from "../bridge/task-watcher.js";
+import { isTaskWatched } from "../bridge/task-watcher.js";
 import type { TaskRecord, TaskState } from "../types.js";
 
 process.env["SESSION_DB"] = ":memory:";
@@ -266,9 +266,9 @@ test("N5 · V-ensure/V6：静止期与 needs_input 期零 ensure —— 调度�
   assert.equal(getTask("A")?.state, "failed");
   assert.equal(getTask("B")?.state, "blocked", "未派发下游被冻结");
 
-  // 通道②：看护 renew（= ensureProject）：静止 ⇒ 无 working 节点 ⇒ 无在飞 ⇒ 无看护
+  // 通道②：看护对账（v0.7.0 A5：`renew` 已退役，判据 = 本地队列态）：静止 ⇒ 无在队任务
   assert.equal(inFlightCount("p1", ["f-rest"]), 0, "静止期零在飞（working ∧ remote≠null）");
-  assert.equal(isTaskWatched("A"), false, "无看护 ⇒ 无 renew ⇒ 第二条 ensure 通道亦不发动");
+  assert.equal(isTaskWatched("A"), false, "静止期任务不在队（queue_state=settled）⇒ 无对账");
   assert.equal(isTaskWatched("B"), false);
 
   // needs_input 期（tick 只扫 executing ⇒ 更外层拦截）：同样零派发 / 零看护
@@ -287,22 +287,13 @@ test("N5 · V-ensure/V6：静止期与 needs_input 期零 ensure —— 调度�
   assert.equal(isTaskWatched("T"), false);
 
   /**
-   * **非空洞性对照**：看护确在时 `isTaskWatched` 必为 `true` —— 证明上面两条 `false` 不是
-   * 「探针恒假」造成的假绿（`renew` 只存在于 `watchLoop` 内，故「无看护」严格蕴含「无 renew」）。
+   * **非空洞性对照**（v0.7.0 A5 判据重定义）：`isTaskWatched` 现由**本地队列态**判定
+   * （`queue_state ∈ queued/claimed/running`），与「进程内是否有看护循环」解耦 ——
+   * `renew` 退役后旧「无看护 ⇒ 无 renew」的对照不再适用。故此处改用入队/未入队对照，
+   * 证明上面两条 `false` 不是「探针恒假」。
    */
-  const fakeTask = { id: "w-probe" } as unknown as Task;
-  const startedWatcher = startTaskWatcher({
-    taskId: "w-probe",
-    poll: async () => fakeTask,
-    renew: async () => undefined,
-    isSettled: () => true,
-    persist: () => undefined,
-    pollIntervalMs: 1,
-    renewIntervalMs: 1_000_000,
-    maxConsecutiveFailures: 1,
-  });
-  assert.equal(startedWatcher, true);
-  assert.equal(isTaskWatched("w-probe"), true, "对照：在看护 ⇒ 探针为 true（上面的 false 非空洞）");
-  await drainTaskWatchers(2_000);
-  assert.equal(isTaskWatched("w-probe"), false);
+  createTask({ taskId: "w-probe", projectId: "p1", contextId: "ct", state: "working" });
+  assert.equal(isTaskWatched("w-probe"), false, "未入队（queue_state=NULL=settled）⇒ 非在队");
+  enqueueTask("w-probe");
+  assert.equal(isTaskWatched("w-probe"), true, "对照：入队（queued）⇒ 在队（上面的 false 非空洞）");
 });

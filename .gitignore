@@ -28,5 +28,8 @@ orch/config/config.json
 # ZCode 工作区配置（本机：编排宿主路径守卫 hook）
 /.zcode/
 
+# Qoder 本作用域配置（仅本机生效，不入库）
+/.qoder/settings.local.json
+
 # 本地规划文档（不入库）
 /未来发展方向0912-gpt.md

@@ -35,15 +35,15 @@
  * ## `/api/tasks` 的已知副作用（**复用 `handleTasks` 的代价；不为此新增服务端缓存**）
  *
  * `handleTasks` 不是纯读：① 先 `pruneTasks()` 跑一次保留策略清理；② 若结果中存在
- * `working` 任务，会经 `locateProject` 做一次**跨机 `GET /projects`**（15s 超时）以判定可达性；
- * ③ 顺带把 `/projects` 快照写入**内存**（`projectsSnapshot`）并刷新 `last_poll_at`（落库）。
- * 即：网页刷新会**顺带**参与「等回收门」的节流观测。本模块**刻意不加**服务端缓存来规避 ——
+ * `working` 任务，会经 `locateProject` 读**桥注册表**（v0.7.0 A6：零出站）判定可达性。
+ * 即：网页刷新会**顺带**参与保留策略清理与注册表读取。本模块**刻意不加**服务端缓存来规避 ——
  * 缓存会掩盖真实观测时刻，与「快照 + 观测时间」语义冲突。
  *
  * ## 快照语义（§2.2）
  *
  * `/api/projects` 的 `observedAt` 在**每次请求的内存态**中计算（`new Date()`），
- * **不落库**；响应与页面均标注「由 `GET /projects` 派生 + 观测时间」，**不得呈现为实时在线**。
+ * **不落库**；响应与页面均标注「由桥注册表（Runner 上报快照）派生 + 观测时间」，
+ * **不得呈现为实时在线**。
  *
  * ## 监听 / 降级（§2.5：网页接面**不得拖垮 MCP 工具面**）
  *
@@ -93,8 +93,9 @@ const TASK_STATES: readonly TaskState[] = [
   "blocked",
 ];
 
-const PROJECTS_SOURCE = "GET /projects（Launcher 只读快照）";
-const PROJECTS_NOTE = "快照语义：由 GET /projects 派生 + 观测时间；非实时在线";
+const PROJECTS_SOURCE = "桥注册表（Runner 上报快照）";
+const PROJECTS_NOTE =
+  "快照语义：由桥注册表（Runner 上报投影 runners / runner_projects）派生 + 观测时间；非实时在线";
 const EVENTS_NOTE = "游标由前端传参（since）；本接面不读写宿主 a2a_events 收件箱游标";
 
 /** 网页端最小内核依赖（`Pick<BridgeCore, …>`：N4 直接传完整 core，结构性兼容） */
@@ -428,10 +429,29 @@ async function sendProjects(res: ServerResponse, options: WebTransportOptions): 
       error: machine.error,
       projects: machine.projects.map(toProjectView),
     })),
+    // Runner 注册视图（v0.7.0 A6 / B4）：只列 memberMachines 中已注册者；字段白名单同上
+    runners: outcome.runners.map((runner) => ({
+      machineId: runner.machineId,
+      online: runner.online,
+      lastHeartbeatAt: runner.lastHeartbeatAt,
+    })),
   });
 }
 
-function toProjectView(project: ProjectStatus): ProjectView {
+/**
+ * 项目 → 渲染层视图（**逐字段显式取值**，白名单之外一律不出口）。
+ *
+ * 入参形状 = `handleProjects` 的 `ProjectSummary`（不含 `workspace`）；这里再收窄一次是
+ * **防御性**的（即便上游未来放宽，网页出口也不会带出敏感字段）。
+ */
+function toProjectView(project: {
+  projectId: string;
+  agentKind: ProjectStatus["agentKind"];
+  a2aPort: number;
+  status: ProjectStatus["status"];
+  endpoint: string | null;
+  startedAt: string | null;
+}): ProjectView {
   // 显式逐字段取值（**不用展开**）：白名单之外的字段一律不出口
   return {
     projectId: project.projectId,

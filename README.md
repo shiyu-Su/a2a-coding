@@ -38,15 +38,15 @@ a2a-coding 让开发协作时 orch 只管派发任务；目标项目的执行 Ag
 ```mermaid
 flowchart TD
     USER([用户]) -->|需求讨论 / 任务派发| ORCH["orch Agent<br/>任意 MCP host（示例 opencode）"]
-    ORCH -->|"MCP stdio<br/>泛型工具 7 + Feature 工具组 5"| BRIDGE["MCP 薄桥 · orch/<br/>项目 → 机器解析 · 幂等 ensure · A2A Client · 任务态落库"]
-    BRIDGE -->|"HTTP JSON<br/>GET /projects · POST ensure/stop · GET /health"| LAUNCHER["每机 Launcher · machine/<br/>本机项目配置 · Agent 生命周期 · 空闲回收"]
+    ORCH -->|"MCP stdio<br/>泛型工具 7 + Feature 工具组 5"| BRIDGE["MCP 薄桥 · orch/<br/>项目 → 机器解析 · 启动编排 · A2A Client · 任务态落库"]
+    BRIDGE -->|"HTTP 长轮询（Runner ⇄ 桥）<br/>POST /runner/register · /runner/connect · /runner/result"| LAUNCHER["每机 Launcher→Runner · machine/<br/>本机项目自持 · Agent 生命周期 · 心跳/拉取"]
     LAUNCHER -->|拉起包装器（按 agentKind）| WRAP["A2A 包装器<br/>a2a-opencode / a2a-codex / a2a-claude"]
     WRAP -->|" CLI<br/>opencode run / codex exec / claude -p"| WS["目标 workspace 执行"]
     WS -.->|结果经 A2A 回传| BRIDGE
 ```
 
-- 静态分布：项目到机器的映射来自配置，没有自注册、心跳、TTL 或服务发现。
-- 按需幂等：派发任务才 `ensure`，已在运行直接复用端点。
+- **配置管授权、DB 管在线态（v0.7.0）**：项目→机器映射来自每机静态配置；桥侧建轻量注册视图（runners/runner_projects 运行态投影），机器经 Runner 出站注册+心跳维持在线态。
+- **按需幂等（pull 反转）**：orch 入站调度不变；执行面由 Runner 长轮询领取任务后本地 `ensure`，幂等收据经 claim CAS 去重。
 - 用完退出：项目 Agent 空闲超时自动回收，会话靠 `contextId` 续接。
 
 ### 部署形态
@@ -70,8 +70,8 @@ flowchart TD
 
 - ✅ **三端执行 Agent**：包装器按 `agentKind` 分派 `opencode` / `codex` / `claude`，驱动底层 CLI（`opencode run` / `codex exec` / `claude -p`）。
 - ✅ **静态分布，无中心注册**：项目到机器的映射来自配置，不做自注册、心跳、TTL 或服务发现。
-- ✅ **每机常驻 Launcher**：管理本机项目 Agent 生命周期，暴露 `health` / `projects` / `ensure` / `stop` 接口。
-- ✅ **按需幂等启动**：派发任务才 `ensure`，已在运行直接复用同一 A2A 端点，不重复拉起。
+- ✅ **Runner 反向注册（v0.7.0 pull）**：Launcher 升格 Runner——出站注册（携带 machineId + projects + capabilities + selfCheck + protocolVersion）→ 长轮询拉取任务/指令 → 本地 ensure 执行 → 结果回传（outbox + ack，可重放）；入站 `/projects`·`/ensure`·`/{id}/stop` 退役（404）。
+- ✅ **按需幂等（pull 语义保持）**：命令族 dispatch/stop/cancel-task 均携 commandId；claim 用 CAS 幂等，控制面离线不清在飞任务（心跳失败只降注册态、不触发 stop）。
 - ✅ **泛型 MCP 工具面**：orch 只经 `a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` / `a2a_events` / `a2a_wait` 通信，agent 增减无需重连或刷新工具面。其中 **`a2a_call` 的 `mode` 必填**（`"inquiry"` 只读询问 / `"execute"` 执行型派发，后者必带 `featureId`）—— **保证"执行必走引擎"**。
 - ✅ **项目组与选择性连接（v0.6.0）**：orch 侧可声明**静态项目组**（`orch/config/config.json` 的 `projectGroup.members`，成员 = `machineId × projectId`）。声明后 orch **只连「有成员的机器」、只用「列名成员的项目」** —— 未列成员的项目**不 ensure、不派发、不出现在 `a2a_projects`**；派发到非成员会**显式失败**（`project_not_a_member`，与「项目不存在」的 `project_not_found` 分开）。**段缺省时行为与旧版完全一致（全量接纳）**。`a2a_projects` 出参新增 `group` 字段（**恒存在**）。**machine 侧零改动、线协议不动、架构约束不变。**
 - ✅ **Feature 编排**：把一个需求作为 Feature，经状态机 + Task DAG 调度器跨项目自动派发，中途可停下审批 / 澄清；**同 project 粒度串行**（同一时刻最多一个任务在写同一工作区）、跨 project 并行；**失败只冻结依赖闭包**（未派发的下游），不带病继续也不连坐其它 project。

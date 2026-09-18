@@ -22,7 +22,10 @@ import { appRootFromModule } from "./app-root.js";
 import { AgentManager, DEFAULT_IDLE_STOP_MS } from "./manager.js";
 import { errorMessage } from "./process.js";
 import { reconcileStartupLedger } from "./reconcile.js";
-import { runStartupSelfCheck } from "./self-check.js";
+import { InFlightLedger, createRunner, type Runner } from "./runner.js";
+import { createFileOutbox, outboxDirOf } from "./runner-outbox.js";
+import { RUNNER_STATE_FILENAME } from "./runner-state.js";
+import { runStartupSelfCheck, type SelfCheckResult } from "./self-check.js";
 import { createLauncherApp } from "./server.js";
 
 /** 缺省机器配置：源码运行与构建运行均以 machine 单元根（含 package.json）为基准解析 */
@@ -30,7 +33,13 @@ const DEFAULT_MACHINE_CONFIG = join(appRootFromModule(import.meta.url), "config"
 
 const configPath = process.env["MACHINE_CONFIG"] ?? DEFAULT_MACHINE_CONFIG;
 const machine = loadMachineConfig(configPath);
-const manager = new AgentManager(machine);
+/**
+ * 本机在飞任务台账（v0.7.0 M5·MC1）：**单一实例**，同时注入 AgentManager（idleStop 判据
+ * 数据源 + 自检登记口）与 Runner（命令族 dispatch 登记）。自检早于 Runner 启动，故台账须在
+ * manager 之前创建。
+ */
+const inFlight = new InFlightLedger();
+const manager = new AgentManager(machine, { inFlight });
 
 const appRoot = appRootFromModule(import.meta.url);
 /** 实例元数据（非锁）：供 REQ-01 status/stop 读取 pid */
@@ -44,11 +53,17 @@ let server: Server | null = null;
 let shuttingDown = false;
 /** 就绪门状态：自检通过前 false（业务路由 503） */
 let ready = false;
+/** Runner 出站循环（v0.7.0 Phase A；仅当 launcher.bridge 配置齐全时非 null） */
+let runner: Runner | null = null;
 /** 本实例是否成功写入 pidfile（避免误删其它实例的文件） */
 let pidfileWritten = false;
 
-const app = createLauncherApp(manager, {
+const app = createLauncherApp({
   isReady: () => ready,
+  // `/health` 的 bridge 段读点（M2·MA2）：runner 仅在自检通过且配置了 launcher.bridge
+  // 时才存在；为 null（未启用 / 尚未启动）即视为恒未注册。
+  getBridgeStatus: () =>
+    runner?.healthSnapshot() ?? { registered: false, lastHeartbeatAt: null, lastError: null },
   shutdownEndpoint: machine.launcher.shutdownEndpoint === true,
   ...(machine.launcher.shutdownToken !== undefined
     ? { shutdownToken: machine.launcher.shutdownToken }
@@ -132,6 +147,9 @@ async function startShutdown(signal: string): Promise<void> {
   if (shuttingDown) return;
   shuttingDown = true;
   ready = false;
+  // 先停 Runner 出站循环（中止在飞长轮询与退避等待），再收网络与子进程
+  runner?.stop();
+  runner = null;
   console.log(`[launcher] 收到 ${signal}，正在停止所有 Agent…`);
   await closeServer();
   await manager.shutdown();
@@ -149,6 +167,7 @@ process.on("SIGTERM", () => {
 
 // 兜底：进程退出时同步树杀仍在运行的 child，并清理 pidfile
 process.on("exit", () => {
+  runner?.stop();
   manager.killAllSync();
   removePidfile();
 });
@@ -186,8 +205,11 @@ async function onListening(): Promise<void> {
   }
 
   // 启动自检（缺省开）：端口已监听（互斥锁已生效），全部项目通过才放行业务路由
+  const selfCheck: SelfCheckResult = { ok: true, failures: [] };
   if (machine.launcher.startupCheck ?? true) {
     const result = await runStartupSelfCheck(manager, machine);
+    selfCheck.ok = result.ok;
+    selfCheck.failures = result.failures;
     if (!result.ok) {
       for (const failure of result.failures) {
         console.error(
@@ -210,6 +232,27 @@ async function onListening(): Promise<void> {
 
   ready = true;
   console.log(`[launcher] 就绪（status=ok）`);
+
+  // Runner 出站（v0.7.0 Phase A 影子注册 · 节点 MA1）：仅在自检通过后启动，
+  // 保证注册载荷携带真实自检结论。`launcher.bridge` 缺省 = 不启动（零出站，现状行为）。
+  if (machine.launcher.bridge !== undefined) {
+    const bridge = machine.launcher.bridge;
+    // M3·MB1：注入本机 AgentManager 作为命令执行宿主（ensure/stop/getProject），
+    // 命令族三类（dispatch/stop/cancel-task）由 Runner 出站循环落地。
+    // M4·MB2：注入文件 outbox（`.a2a/outbox/<taskId>.json` → POST /runner/result → ack 删）。
+    // M6·MC2：注入 runner-state 落盘路径（reaper 判活 Runner 的数据源）。
+    runner = createRunner(machine, selfCheck, {
+      manager,
+      // M5·MC1：与 manager 共享同一在飞台账（idleStop 判据可见 dispatch 的在飞任务）
+      ledger: inFlight,
+      runnerStatePath: join(appRoot, ".a2a", RUNNER_STATE_FILENAME),
+      outbox: createFileOutbox({ dir: outboxDirOf(appRoot), bridge }),
+    });
+    if (runner !== null) {
+      console.log(`[launcher] Runner 出站已启动：url=${bridge.url}`);
+      runner.start();
+    }
+  }
 }
 
 async function boot(): Promise<void> {

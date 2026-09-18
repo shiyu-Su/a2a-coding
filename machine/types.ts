@@ -10,8 +10,9 @@
  * Bridge ⇄ Launcher 线协议版本（单一事实源：仓库根 PROTOCOL.md；orch 侧同名常量见
  * orch/types.ts，修改需两侧同步并由契约测试锁定）。
  * 规则：加可选字段 minor+1；删字段 / 改语义 / 加必填请求体 major+1。
+ * v0.7.0：major 由 1.0 升到 2.0（删字段 / 改语义 / 加必填请求体的破坏性变更）。
  */
-export const PROTOCOL_VERSION = "1.0";
+export const PROTOCOL_VERSION = "2.0";
 
 /** 执行层 Agent 类型（决定 A2A 包装器与 CLI 参数） */
 export type AgentKind = "opencode" | "codex" | "claude";
@@ -37,6 +38,20 @@ export interface ProjectConfig {
    * 与其内置默认值深合并；未提供时仅写入默认覆盖项（关闭 events）。
    */
   agentConfig?: Record<string, unknown>;
+}
+
+/**
+ * Runner 出站桥配置（v0.7.0 Phase A 影子注册）。
+ *
+ * `url` 与 `token` **同时给出**才启用 Runner 出站循环；`launcher.bridge` 整段缺省
+ * = 不启动 Runner 出站 = 现状行为（零出站）。占位符写入 `config.json.default`
+ * 由 machine 阶段 C 文档节点负责，本节点仅解析。
+ */
+export interface BridgeConfig {
+  /** 桥的基址（如 `http://127.0.0.1:3200`）；Runner 在其上拼 `/runner/register`、`/runner/connect` */
+  url: string;
+  /** per-machine 静态 Bearer token（与 orch 侧 `machines[].token` 对应） */
+  token: string;
 }
 
 /** 每台机器的本地配置（每机自维护，Q2） */
@@ -71,6 +86,11 @@ export interface MachineConfig {
     shutdownEndpoint?: boolean;
     /** `POST /shutdown` 可选 Bearer 令牌；缺省不校验（配合 loopback 收窄使用） */
     shutdownToken?: string;
+    /**
+     * Runner 出站桥（v0.7.0 Phase A 影子注册）。缺省不写 = **不启动 Runner 出站**
+     * （现状行为、零出站）；同时给出 `url` 与 `token` 才启用。
+     */
+    bridge?: BridgeConfig;
   };
   projects: ProjectConfig[];
 }

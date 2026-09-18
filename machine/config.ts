@@ -1,5 +1,5 @@
 import { readFileSync } from "node:fs";
-import type { AgentKind, MachineConfig, ProjectConfig, RiskLevel } from "./types.js";
+import type { AgentKind, BridgeConfig, MachineConfig, ProjectConfig, RiskLevel } from "./types.js";
 
 const AGENT_KINDS: readonly AgentKind[] = ["opencode", "codex", "claude"];
 
@@ -50,6 +50,15 @@ function asRiskLevel(v: unknown, ctx: string): RiskLevel {
     fail(`${ctx} 必须是 read / write / full`);
   }
   return v;
+}
+
+/** 解析 `launcher.bridge`：整段可选，但一旦存在则 `url` / `token` 均为必填非空串 */
+function asBridge(v: unknown, ctx: string): BridgeConfig {
+  const o = asRecord(v, ctx);
+  return {
+    url: asString(o["url"], `${ctx}.url`),
+    token: asString(o["token"], `${ctx}.token`),
+  };
 }
 
 function parseProject(v: unknown, idx: number): ProjectConfig {
@@ -124,6 +133,11 @@ export function loadMachineConfig(path: string): MachineConfig {
   const shutdownToken = launcher["shutdownToken"];
   if (shutdownToken !== undefined) {
     launcherConfig.shutdownToken = asString(shutdownToken, "launcher.shutdownToken");
+  }
+  const bridge = launcher["bridge"];
+  if (bridge !== undefined) {
+    // 缺省整段不写 = 不启用 Runner 出站（现状行为）；写了就必须 url + token 齐全
+    launcherConfig.bridge = asBridge(bridge, "launcher.bridge");
   }
   return {
     machineId: asString(o["machineId"], "machineId"),

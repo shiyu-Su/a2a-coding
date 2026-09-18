@@ -1,6 +1,6 @@
 {
   "name": "@a2a-coding/machine",
-  "version": "0.6.2",
+  "version": "0.7.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -9,6 +9,7 @@
   "scripts": {
     "typecheck": "tsc --noEmit",
     "lint": "eslint .",
+    "test": "npm run build && node --test \"dist/test/*.test.js\"",
     "format": "prettier --write .",
     "format:check": "prettier --check .",
     "build": "tsc -p tsconfig.json",

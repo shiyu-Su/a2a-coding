@@ -7,18 +7,23 @@
  */
 
 /**
- * Bridge ⇄ Launcher 线协议版本（单一事实源：仓库根 PROTOCOL.md；machine 侧同名常量见
+ * Bridge ⇄ Runner 线协议版本（单一事实源：仓库根 PROTOCOL.md；machine 侧同名常量见
  * machine/types.ts，修改需两侧同步并由契约测试锁定）。
  * 规则：加可选字段 minor+1；删字段 / 改语义 / 加必填请求体 major+1。
+ *
+ * v0.7.0：连接模型整体反转为 pull（Launcher 升格 Runner），握手方向/语义为**破坏性变更**
+ * ⇒ major bump `1.0 → 2.0`，**发版即硬切**（v1 通道退役，见 `SUPPORTED_PEER_PROTOCOL_MAJORS`）。
  */
-export const PROTOCOL_VERSION = "1.0";
+export const PROTOCOL_VERSION = "2.0";
 
 /**
- * 桥可支持的对端（Launcher）主版本清单。主版本升级时按 PROTOCOL.md 维护流程
+ * 桥可支持的对端（Runner）主版本清单。主版本升级时按 PROTOCOL.md 维护流程
  * 显式决策：保留旧主版本支持则留清单并维护对应行为分支（按握手缓存的机器
  * 完整版本号分支）；放弃支持则移出（旧机被拒绝并获升级指引）。
+ *
+ * v0.7.0：pull 模型硬切 ⇒ **只留 `[2]`**（v1 入站通道退役，旧 Runner 被拒绝并获升级指引）。
  */
-export const SUPPORTED_PEER_PROTOCOL_MAJORS: readonly number[] = [1];
+export const SUPPORTED_PEER_PROTOCOL_MAJORS: readonly number[] = [2];
 
 /** 执行层 Agent 类型（决定 A2A 包装器与 CLI 参数） */
 export type AgentKind = "opencode" | "codex" | "claude";
@@ -96,7 +101,24 @@ export type RiskLevel = "read" | "write" | "full";
 /** orch 侧：机器清单中的一条 */
 export interface MachineRef {
   machineId: string;
-  launcherUrl: string;
+  /**
+   * **已作废（deprecated，v0.7.0）**：桥 → Launcher 的入站指挥通道随 Runner 反向注册退役，
+   * pull 模型下本字段**无消费方**（出站路径已在 A6 整体退役：`/health` 握手 / `GET /projects` /
+   * `POST …/ensure` 与 A2A 出站均已删除）。
+   *
+   * 配置解析宽松（解析宽容）：**缺省** ⇒ 告警并归空；**存在但非法**（空串/非字符串）
+   * ⇒ 告警并忽略；**存在且合法** ⇒ 原样保留。三路皆**不 fail-fast、不回退全量接纳**。
+   *
+   * v0.7.0 A6 起类型转**可选**：出站解引用点全数消除后，本字段仅为旧配置的兼容占位。
+   */
+  launcherUrl?: string;
+  /**
+   * per-machine Runner 鉴权 token（v0.7.0 D4；**可选**）。
+   * 桥按 `machineId` 校验 Runner 注册 / 领任务 / 回传所携带的静态 Bearer token
+   * （对应机器侧 `launcher.bridge.token`；常量时间比较）。解析层仅保证「存在时为非空字符串」，
+   * 是否配置 / 准入裁决属注册端点（A3）。
+   */
+  token?: string;
   /**
    * 该机项目是否接收 orch push 回调（v0.4.0 §2.6；缺省 false）。
    * 仅当 orch `callback.enabled` 与该位**同时**为真时，派发才内联注册回调（路径 1）。
@@ -191,6 +213,20 @@ export interface ProjectGroup {
   selective: boolean;
 }
 
+/**
+ * 顶层 `runner` 段（v0.7.0 D2；**配置可选**，解析后恒补齐为完整对象）。
+ *
+ * Runner 反向注册的时序阈值（均为**正整数毫秒**，非整数 / <1 / 类型错一律解析期 fail-fast）：
+ * - `holdMs`：桥端 `/runner/connect` 长轮询单次挂起上限（缺省 `25000`）；
+ *   空超时即视为**心跳**（poll 即心跳，不引 WS/SSE）。
+ * - `heartbeatTimeoutMs`：注册心跳判死阈值（缺省 `60000`）；超期只降注册态，
+ *   **不得触发 stop**（D8；清算 = requeue，见 B2）。
+ */
+export interface RunnerConfig {
+  holdMs: number;
+  heartbeatTimeoutMs: number;
+}
+
 /** orch 侧：机器清单 */
 export interface MachinesConfig {
   machines: MachineRef[];
@@ -200,6 +236,8 @@ export interface MachinesConfig {
   transport: TransportConfig;
   /** 网页端只读工作台（v0.5.0；配置缺省时解析为 `{ true, "127.0.0.1", 3300, false }`） */
   web: WebConfig;
+  /** Runner 反向注册阈值（v0.7.0；配置缺省时解析为 `{ holdMs: 25000, heartbeatTimeoutMs: 60000 }`） */
+  runner: RunnerConfig;
   /**
    * 静态项目组（v0.6.0；**段缺省时解析为 `selective: false` 的全量接纳态**，
    * 由 `loadMachinesConfig()` **恒填充** —— 运行时不会出现 `undefined`，字段可选仅为对齐配置段可选）。

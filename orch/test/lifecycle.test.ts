@@ -281,11 +281,9 @@ test("④ task-watcher owner 门闩：follower 下拒绝启动看护", async () 
       poll: () => {
         throw new Error("follower 不得轮询");
       },
-      renew: async () => undefined,
       isSettled: () => true,
       persist: () => undefined,
       pollIntervalMs: 1,
-      renewIntervalMs: 1,
       maxConsecutiveFailures: 1,
     });
     assert.equal(started, false, "follower 必须被拒绝");

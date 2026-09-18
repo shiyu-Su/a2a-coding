@@ -750,3 +750,342 @@ test("v0.5.0 迁移：旧库补三时刻列幂等、老行留 NULL（不回填�
     rmSync(`${dbPath}-shm`, { force: true });
   }
 });
+
+// ---------------------------------------------------------------------------
+// v0.7.0 A2：Runner 注册表 + 任务队列地基
+// ---------------------------------------------------------------------------
+
+/** 临时库路径（文件库；跨连接 / 跨实例断言需要，`:memory:` 做不到） */
+function tempDbPath(tag: string): string {
+  return join(tmpdir(), `a2a-${tag}-${process.pid}-${Date.now()}.sqlite`);
+}
+
+function cleanupDb(dbPath: string): void {
+  rmSync(dbPath, { force: true });
+  rmSync(`${dbPath}-wal`, { force: true });
+  rmSync(`${dbPath}-shm`, { force: true });
+}
+
+test("A2 Runner 注册表：按 machine_id 幂等 upsert、registered_at 首次为准、心跳刷新、项目全量替换", () => {
+  const store = newStore();
+  try {
+    const first = store.upsertRunner({
+      runnerId: "r1",
+      machineId: "m1",
+      protocolVersion: "2.0",
+      version: "0.7.0",
+      registeredAt: "2026-09-18T00:00:00.000Z",
+      lastHeartbeatAt: "2026-09-18T00:00:00.000Z",
+    });
+    assert.equal(first.runnerId, "r1");
+    assert.equal(first.machineId, "m1");
+    assert.equal(first.state, "online");
+    assert.equal(first.registeredAt, "2026-09-18T00:00:00.000Z");
+
+    // 同机重注册（新实例 id）：命中同一行；registered_at 保留首次，其余刷新
+    const again = store.upsertRunner({
+      runnerId: "r2",
+      machineId: "m1",
+      protocolVersion: "2.0",
+      version: "0.7.1",
+      registeredAt: "2026-09-18T01:00:00.000Z",
+      lastHeartbeatAt: "2026-09-18T01:00:00.000Z",
+    });
+    assert.equal(again.runnerId, "r2");
+    assert.equal(again.registeredAt, "2026-09-18T00:00:00.000Z", "registered_at 首次为准");
+    assert.equal(again.version, "0.7.1");
+    assert.equal(again.lastHeartbeatAt, "2026-09-18T01:00:00.000Z");
+
+    // 心跳：按 runner_id 刷新 + 置回 online；不存在返回 null
+    store.upsertRunner({
+      runnerId: "r2",
+      machineId: "m1",
+      protocolVersion: "2.0",
+      state: "offline",
+    });
+    const beat = store.touchRunnerHeartbeat("r2", "2026-09-18T02:00:00.000Z");
+    assert.equal(beat?.lastHeartbeatAt, "2026-09-18T02:00:00.000Z");
+    assert.equal(beat?.state, "online");
+    assert.equal(store.touchRunnerHeartbeat("missing"), null);
+
+    // 项目全量替换
+    const two = store.runnerProjectsReplace("r2", [
+      {
+        projectId: "p1",
+        agentKind: "opencode",
+        a2aPort: 4101,
+        status: "online",
+        workspace: "G:/p1",
+        risk: "write",
+        startedAt: "2026-09-18T00:00:03.000Z",
+      },
+      { projectId: "p2", agentKind: "codex", a2aPort: 4102, status: "offline" },
+    ]);
+    assert.equal(two.length, 2);
+    assert.equal(two[0]?.projectId, "p1");
+    assert.equal(two[0]?.risk, "write");
+    assert.equal(two[0]?.workspace, "G:/p1");
+    assert.equal(two[1]?.workspace, null);
+    assert.equal(typeof two[0]?.updatedAt, "string");
+
+    // 全量替换 ⇒ 本次未上报的 p2 被移除；重复替换幂等；空数组 = 清空
+    const one = store.runnerProjectsReplace("r2", [
+      { projectId: "p1", agentKind: "opencode", a2aPort: 4101, status: "online" },
+    ]);
+    assert.deepEqual(
+      one.map((p) => p.projectId),
+      ["p1"],
+    );
+    assert.deepEqual(
+      store
+        .runnerProjectsReplace("r2", [
+          { projectId: "p1", agentKind: "opencode", a2aPort: 4101, status: "online" },
+        ])
+        .map((p) => p.projectId),
+      ["p1"],
+    );
+    assert.deepEqual(store.runnerProjectsReplace("r2", []), []);
+  } finally {
+    store.close();
+  }
+});
+
+test("A2 队列 claim CAS：同一任务并发至多一个领取者（两实例同库竞争唯一）", () => {
+  const dbPath = tempDbPath("a2-claim");
+  const storeA = new SessionStore(dbPath);
+  const storeB = new SessionStore(dbPath);
+  try {
+    storeA.createTask({ taskId: "q1", projectId: "p1", contextId: "c1", state: "working" });
+    const enq = storeA.enqueueTask("q1");
+    assert.equal(enq?.queueState, "queued");
+    assert.ok(enq?.queuedAt);
+    assert.ok(enq?.dispatchGuard, "dispatch_guard 降级为入队幂等键");
+
+    // 入队幂等：重复入队不刷新 queued_at / guard（FIFO 位次与幂等键均不变）
+    const enq2 = storeA.enqueueTask("q1");
+    assert.equal(enq2?.queuedAt, enq?.queuedAt);
+    assert.equal(enq2?.dispatchGuard, enq?.dispatchGuard);
+
+    // 两实例同时领取：CAS 保证只有一行成功（另一实例候选为空 / CAS 落空）
+    const a = storeA.claimTask({ claimedBy: "m1" });
+    const b = storeB.claimTask({ claimedBy: "m2" });
+    const winners = [a, b].filter((r) => r !== null);
+    assert.equal(winners.length, 1, "同一 queued 任务并发领取至多一个成功");
+    const won = winners[0];
+    assert.equal(won?.taskId, "q1");
+    assert.equal(won?.queueState, "claimed");
+    assert.ok(won?.claimToken);
+    assert.ok(won?.claimedAt);
+
+    // 二次领取（任一实例）均失败：已被 claim，CAS 只认 queue_state='queued'
+    assert.equal(storeA.claimTask({ claimedBy: "m1" }), null);
+    assert.equal(storeB.claimTask({ claimedBy: "m2" }), null);
+  } finally {
+    storeA.close();
+    storeB.close();
+    cleanupDb(dbPath);
+  }
+});
+
+test("A2 队列：未入队不可领；projectIds 过滤；空集零 I/O；入队不存在任务返回 null", () => {
+  const store = newStore();
+  try {
+    assert.equal(store.enqueueTask("missing"), null, "任务不存在 ⇒ 入队返回 null");
+
+    store.createTask({ taskId: "q1", projectId: "p1", contextId: "c1", state: "working" });
+    store.createTask({ taskId: "q2", projectId: "p2", contextId: "c2", state: "working" });
+    // 未入队（queue_state 为 NULL = 视为 settled）⇒ 不可领
+    assert.equal(store.claimTask({ claimedBy: "m1" }), null);
+
+    store.enqueueTask("q1");
+    store.enqueueTask("q2");
+    // 显式空数组 = 无可领取（零 I/O）
+    assert.equal(store.claimTask({ claimedBy: "m1", projectIds: [] }), null);
+    // projectIds 过滤：只在 p2 内领取
+    const claimed = store.claimTask({ claimedBy: "m1", projectIds: ["p2"] });
+    assert.equal(claimed?.taskId, "q2");
+    assert.equal(claimed?.projectId, "p2");
+    // 领取后其项目内的 q1 仍可被领（过滤只约束当次）
+    assert.equal(store.claimTask({ claimedBy: "m1" })?.taskId, "q1");
+  } finally {
+    store.close();
+  }
+});
+
+test("A2 requeueStaleTask：claimed→queued + 清 claim 三字段；按领取者过滤；非领取零写入", () => {
+  const dbPath = tempDbPath("a2-requeue");
+  const store = new SessionStore(dbPath);
+  try {
+    store.createTask({ taskId: "q1", projectId: "p1", contextId: "c1", state: "working" });
+    store.enqueueTask("q1");
+    const claimed = store.claimTask({ claimedBy: "m1", claimedAt: "2026-09-18T00:00:01.000Z" });
+    assert.equal(claimed?.queueState, "claimed");
+    const queuedAt = claimed?.queuedAt;
+
+    // 领取者不匹配 ⇒ 不清算（防误清他人）
+    assert.equal(store.requeueStaleTask("q1", "other"), false);
+    // 正确领取者 ⇒ claimed→queued，清 claim 三字段
+    assert.equal(store.requeueStaleTask("q1", "m1"), true);
+
+    const raw = openStoreDatabase(dbPath);
+    try {
+      const row = raw
+        .prepare(
+          "SELECT queue_state, claimed_by, claim_token, claimed_at, queued_at FROM tasks WHERE task_id = 'q1'",
+        )
+        .get() as Record<string, unknown>;
+      assert.equal(row["queue_state"], "queued");
+      assert.equal(row["claimed_by"], null, "claim 三字段之一：claimed_by 清空");
+      assert.equal(row["claim_token"], null, "claim 三字段之二：claim_token 清空");
+      assert.equal(row["claimed_at"], null, "claim 三字段之三：claimed_at 清空");
+      assert.equal(row["queued_at"], queuedAt, "清算保留原 queued_at（FIFO 位次不变）");
+    } finally {
+      raw.close();
+    }
+
+    // 已非领取态 / 任务不存在 ⇒ 零写入
+    assert.equal(store.requeueStaleTask("q1"), false);
+    assert.equal(store.requeueStaleTask("missing"), false);
+
+    // 清算后可被重新领取（新 token / 新领取者）
+    const reclaimed = store.claimTask({ claimedBy: "m2" });
+    assert.equal(reclaimed?.queueState, "claimed");
+    assert.equal(reclaimed?.claimedBy, "m2");
+    assert.notEqual(reclaimed?.claimToken, claimed?.claimToken);
+  } finally {
+    store.close();
+    cleanupDb(dbPath);
+  }
+});
+
+test("A2 upsertTaskResult：按 (machineId,taskId) 幂等、首个终态胜出、缺行可建、队列态 settled", () => {
+  const store = newStore();
+  try {
+    store.createTask({
+      taskId: "t1",
+      projectId: "p1",
+      contextId: "c1",
+      state: "working",
+      featureId: "f1",
+    });
+    const first = store.upsertTaskResult({
+      machineId: "m1",
+      taskId: "t1",
+      projectId: "p1",
+      contextId: "c1",
+      state: "completed",
+      artifactsJson: '{"a":1}',
+      text: "ok",
+      remoteTaskId: "remote-1",
+    });
+    assert.equal(first.state, "completed");
+    assert.equal(first.queueState, "settled");
+    assert.equal(first.artifactsJson, '{"a":1}');
+    assert.equal(first.text, "ok");
+    assert.equal(first.remoteTaskId, "remote-1");
+    assert.equal(typeof first.finishedAt, "string");
+    assert.equal(first.featureId, "f1", "落库不得动既有编排列");
+
+    // 双路径同键同载荷重复到达：零变化（updated_at / finished_at 不刷新）⇒ 严格幂等
+    const second = store.upsertTaskResult({
+      machineId: "m1",
+      taskId: "t1",
+      projectId: "p1",
+      contextId: "c1",
+      state: "completed",
+      artifactsJson: '{"a":1}',
+      text: "ok",
+      remoteTaskId: "remote-1",
+    });
+    assert.equal(second.updatedAt, first.updatedAt, "重复回传不得刷新 updated_at");
+    assert.equal(second.finishedAt, first.finishedAt);
+
+    // 首个终态胜出：迟到且状态 / 载荷不同的上报不得回退、不得覆盖 artifacts
+    const late = store.upsertTaskResult({
+      machineId: "m1",
+      taskId: "t1",
+      projectId: "p1",
+      contextId: "c1",
+      state: "failed",
+      artifactsJson: '{"a":2}',
+      text: "late",
+    });
+    assert.equal(late.state, "completed");
+    assert.equal(late.artifactsJson, '{"a":1}');
+    assert.equal(late.text, "ok");
+
+    // 缺行（任务未落库）⇒ 直接建行并 settled；input-required 非终态 ⇒ 无 finished_at
+    const created = store.upsertTaskResult({
+      machineId: "m1",
+      taskId: "t-missing",
+      projectId: "p9",
+      contextId: "c9",
+      state: "input-required",
+      text: "need info",
+    });
+    assert.equal(created.state, "input-required");
+    assert.equal(created.queueState, "settled");
+    assert.equal(created.finishedAt, null);
+  } finally {
+    store.close();
+  }
+});
+
+test("A2 迁移：四段前向幂等（连续三跑库状态一致）+ 注册表不启动清空", () => {
+  const dbPath = tempDbPath("a2-migrate");
+  try {
+    // 第一跑：建库（四段迁移）+ 落注册表 / 队列数据
+    const s1 = new SessionStore(dbPath);
+    s1.upsertRunner({
+      runnerId: "r1",
+      machineId: "m1",
+      protocolVersion: "2.0",
+      version: "0.7.0",
+      registeredAt: "2026-09-18T00:00:00.000Z",
+      lastHeartbeatAt: "2026-09-18T00:00:00.000Z",
+    });
+    s1.runnerProjectsReplace("r1", [
+      { projectId: "p1", agentKind: "opencode", a2aPort: 4101, status: "online" },
+    ]);
+    s1.createTask({ taskId: "q1", projectId: "p1", contextId: "c1", state: "working" });
+    s1.enqueueTask("q1");
+    s1.claimTask({ claimedBy: "m1", claimToken: "tok-1", claimedAt: "2026-09-18T00:00:02.000Z" });
+    s1.close();
+
+    /** 直连快照：任务 / 注册表 / 项目投影 / tasks 列清单（迁移幂等的机械核验面） */
+    const snapshot = (): Record<string, unknown> => {
+      const raw = openStoreDatabase(dbPath);
+      try {
+        const tasks = raw
+          .prepare(
+            "SELECT task_id, project_id, state, queue_state, claimed_by, claim_token, claimed_at, queued_at " +
+              "FROM tasks ORDER BY task_id",
+          )
+          .all();
+        const runners = raw.prepare("SELECT * FROM runners ORDER BY runner_id").all();
+        const projects = raw
+          .prepare("SELECT * FROM runner_projects ORDER BY runner_id, project_id")
+          .all();
+        const taskColumns = raw
+          .prepare("PRAGMA table_info(tasks)")
+          .all()
+          .map((c) => String((c as Record<string, unknown>)["name"]));
+        return { tasks, runners, projects, taskColumns };
+      } finally {
+        raw.close();
+      }
+    };
+
+    const after1 = snapshot();
+    assert.equal((after1["runners"] as unknown[]).length, 1);
+    // 第二 / 第三跑：仅打开 = 四段迁移重复执行 ⇒ 库状态逐字节一致（无清空、无重复行）
+    new SessionStore(dbPath).close();
+    const after2 = snapshot();
+    assert.deepEqual(after2, after1, "连续两跑后库状态须一致（迁移幂等）");
+    new SessionStore(dbPath).close();
+    assert.deepEqual(snapshot(), after1, "第三跑仍一致（前向迁移可反复执行）");
+    assert.equal((after2["runners"] as unknown[]).length, 1, "注册表不启动清空（重启后仍在）");
+  } finally {
+    cleanupDb(dbPath);
+  }
+});

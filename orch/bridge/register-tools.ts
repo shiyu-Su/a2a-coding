@@ -212,9 +212,10 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_call",
     {
       description:
-        "向目标项目派发一轮任务：解析项目→机器，按需幂等启动其 Agent（ensure），经 A2A 发送消息并返回文本结果 + artifacts。传入相同 contextId 可续接上下文；返回 contextId 便于继续追问。wait=false 时立即返回句柄（全异步，不进入同步等待）。" +
-        `**mode 必填（无缺省）**：mode="execute" = 执行型派发，**必带 featureId**，任务作为 Feature DAG 节点登记（不立即派发），由调度器按 dependencies 串行自动派发（可挂载态 = ${MOUNTABLE_FEATURE_STATES.join(" / ")}）；mode="inquiry" = 只读询问 / 核实（Step 0/1 用），**不得带 featureId**，立即派发。` +
-        "**仅项目组成员可派发**：非成员 ⇒ 返回 `project_not_a_member`（零出站请求即失败，绝不 ensure）。",
+        "向目标项目派发一轮任务：解析项目→机器，**任务入队**（Runner 反向注册后经 `/runner/connect` 领取并在目标机本地执行），返回文本结果 + artifacts。传入相同 contextId 可续接上下文；返回 contextId 便于继续追问。wait=false 时立即返回句柄（全异步，不进入同步等待）。" +
+        `**mode 必填（无缺省）**：mode="execute" = 执行型派发，**必带 featureId**，任务作为 Feature DAG 节点登记（不立即派发），由调度器按 dependencies 串行自动派发（可挂载态 = ${MOUNTABLE_FEATURE_STATES.join(" / ")}）；mode="inquiry" = 只读询问 / 核实（Step 0/1 用），**不得带 featureId**，经队列立即下发。` +
+        "**即时性说明**：任务入队后桥经 `/runner/connect` 的 wake 信号**尽力立即下发**；目标机 Runner 未连接时，照常入队（**不拒绝**），最长等其下一轮轮询周期（约 `runner.holdMs`，默认 25s）被领取。" +
+        "**仅项目组成员可派发**：非成员 ⇒ 返回 `project_not_a_member`（零出站请求即失败）。",
       inputSchema: a2aCallSchema,
     },
     async (args) => {

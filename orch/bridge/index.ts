@@ -1,19 +1,18 @@
 /**
- * MCP 泛型桥（orch 工具面）。
+ * MCP 泛型桥（orch 工具面）· **v0.7.0 pull 连接模型**。
  *
- * 只暴露固定 5 个泛型工具，不按 skill 生成工具、不做动态注册（不发 `tools/list_changed`）：
- * - `a2a_projects()`                     聚合各机 `GET /projects`
- * - `a2a_tasks(project, state?, limit?)` 按项目列出本地任务记录（纯本地 + 只读探测，不 ensure）
- * - `a2a_call(project, message, contextId?)`  解析项目→机器 → 幂等 ensure → A2A message/send
- * - `a2a_task_status(taskId)`            查询任务态（远端 A2A `tasks/get`，回写本地存储）
- * - `a2a_cancel(taskId)`                 取消任务（远端 A2A `tasks/cancel`，回写本地存储）
+ * 只暴露固定工具面，不按 skill 生成工具、不做动态注册（不发 `tools/list_changed`）：
+ * - `a2a_projects()`                    读**桥注册表投影**（`runners` / `runner_projects`）+ `runners[]`
+ * - `a2a_tasks(project, state?, limit?)` 按项目列出本地任务记录（纯本地 + 只读探测）
+ * - `a2a_call(project, message, contextId?)`  解析项目→机器（注册视图）→ 入队；由 Runner 领取执行
+ * - `a2a_task_status(taskId)`           读**本地回传落库**（远端 `tasks/get` 已退役）
+ * - `a2a_cancel(taskId)`                下发 `cancel-task` 命令（经 `/runner/connect`，非 A2A 出站）
  *
- * 首触一台机器先经 `GET /health` 握手校验线协议版本（PROTOCOL.md）；主版本不受
- * 支持即拒绝派发（fail-fast），杜绝新请求体被旧 Launcher 静默忽略。
+ * **桥不再出站直连 machine**（A6 出站整体退役）：协议版本由 Runner **入站**注册
+ * （`/runner/register`）时校验；项目发现 / 定位改读注册表投影；任务结果由 Runner
+ * `/runner/result` 回传落库。
  *
- * 依赖：
- * - `@a2a-js/sdk`（A2A Client；v1.1.0：`ClientFactory` + `JsonRpcTransportFactory`/`RestTransportFactory`）
- * - `../session/store.js`（任务态持久化；CLI 会话由包装器按 A2A `contextId` 持有）
+ * 依赖：`../session/store.js`（任务态 / 注册表持久化）。
  *
  * 跨 MCP 边界的错误一律结构化返回（`{ ok: false, code, error }`），不抛出。
  */
@@ -22,30 +21,13 @@ import { createServer as createHttpServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import {
-  ClientFactory,
-  DefaultAgentCardResolver,
-  JsonRpcTransportFactory,
-  RestTransportFactory,
-} from "@a2a-js/sdk/client";
-import type { Client } from "@a2a-js/sdk/client";
-import { Role, TaskState as A2aTaskState, taskStateFromJSON } from "@a2a-js/sdk";
-import type {
-  Artifact,
-  Message,
-  Part,
-  SendMessageRequest,
-  SendMessageResult,
-  Task,
-} from "@a2a-js/sdk";
+import { TaskState as A2aTaskState, taskStateFromJSON } from "@a2a-js/sdk";
 import type { McpServer } from "@modelcontextprotocol/sdk/server/mcp.js";
 import { appRootFromModule } from "../app-root.js";
 import { defaultProjectGroup, loadMachinesConfig, memberKey } from "../config.js";
 import { BRIDGE_VERSION } from "../version.js";
 import { BridgeRuntime, defaultPidFile, type RuntimeReadiness } from "../runtime/lifecycle.js";
 import {
-  PROTOCOL_VERSION,
-  SUPPORTED_PEER_PROTOCOL_MAJORS,
   type AgentKind,
   type ArtifactRecord,
   type CallbackConfig,
@@ -55,7 +37,6 @@ import {
   type MachineRef,
   type ProjectGroup,
   type ProjectStatus,
-  type RiskLevel,
   type TaskListItem,
   type TaskRecord,
   type TaskState as DomainTaskState,
@@ -67,22 +48,26 @@ import {
   appendEvent,
   createTask,
   DEFAULT_SESSION_DB,
+  enqueueTask,
   getArtifact,
   getDefaultStore,
   getFeature,
+  getQueuedTask,
+  getRunner,
   getTask,
   latestEventId,
   listArtifactsByFeature,
   listArtifactsByProducer,
   listEvents,
+  listRunnerProjects,
+  listRunners,
   listTasks,
-  markTaskDispatched,
-  markTaskDispatchStarted,
   pruneTasks,
   truncatePrompt,
   updateTaskState,
-  upsertArtifact,
   close as closeSessionStore,
+  type RunnerProjectRecord,
+  type RunnerRecord,
 } from "../session/store.js";
 import { bridgeLog } from "./bridge-log.js";
 import {
@@ -90,14 +75,15 @@ import {
   notifyTaskPush,
   startTaskWatcher,
   WATCHER_MAX_CONSECUTIVE_FAILURES,
+  type WatchedTaskView,
 } from "./task-watcher.js";
 /**
  * 任务 id 双向解析（v0.6.1 REQ-05 §2.5 白捡 / A5-5）——
  * 从本模块抽出为 `task-lookup.ts`（单一事实源；避免进程入口模块被单测整座拉起）。
  */
-import { registerRemoteTask, resolveLocalTaskId, resolveTaskLookup } from "./task-lookup.js";
+import { resolveLocalTaskId, resolveTaskLookup } from "./task-lookup.js";
+import { createRunnerEndpoints, type RunnerEndpointHandle } from "./runner.js";
 import {
-  FEATURE_ABANDONED_TEXT,
   FeatureScheduler,
   isLocalTerminalTask,
   type FeatureDispatchResult,
@@ -147,20 +133,19 @@ const MACHINES_CONFIG_PATH =
   process.env["MACHINES_CONFIG"] ??
   join(appRootFromModule(import.meta.url), "config", "config.json");
 
-/** Launcher `GET /projects` / `POST .../ensure` 超时 */
-const LAUNCHER_TIMEOUT_MS = readPositiveIntEnv("LAUNCHER_TIMEOUT_MS", 15_000);
-/** Launcher `ensure`（可能触发 Agent 启动）超时 */
-const LAUNCHER_ENSURE_TIMEOUT_MS = readPositiveIntEnv("LAUNCHER_ENSURE_TIMEOUT_MS", 60_000);
-/** 单次 A2A 请求超时 */
-const A2A_REQUEST_TIMEOUT_MS = readPositiveIntEnv("A2A_REQUEST_TIMEOUT_MS", 30_000);
-/** A2A Agent Card 拉取超时 */
-const A2A_CARD_TIMEOUT_MS = readPositiveIntEnv("A2A_CARD_TIMEOUT_MS", 15_000);
+/**
+ * v0.7.0 A6：`LAUNCHER_TIMEOUT_MS` / `LAUNCHER_ENSURE_TIMEOUT_MS` / `A2A_REQUEST_TIMEOUT_MS` /
+ * `A2A_CARD_TIMEOUT_MS` 已随出站路径退役（桥不再直连 Launcher / A2A；任务经 Runner 队列往返）。
+ */
 /** `a2a_call` 同步等待预算；到点仍未终态则返回 working + taskId 供轮询（半异步；须小于 host MCP client 请求超时） */
 const SYNC_BUDGET_MS = readPositiveIntEnv("SYNC_BUDGET_MS", 30_000);
 /** 任务轮询间隔 */
 const POLL_INTERVAL_MS = readPositiveIntEnv("POLL_INTERVAL_MS", 1_000);
-/** 任务轮询期间的租约续期间隔（周期性重呼 launcher `ensure`，防止空闲自动停止误杀运行中任务） */
-const LEASE_RENEW_INTERVAL_MS = readPositiveIntEnv("LEASE_RENEW_INTERVAL_MS", 5_000);
+/**
+ * 后台看护对账间隔（v0.7.0 A5）：pull 模型下 `poll` 读**本地行**（SQLite 单查），开销低；
+ * 2s 足以在 Runner 回传落库后及时 `persist` + 续推 DAG（同步预算内已终态者不走看护）。
+ */
+const TASK_WATCHER_POLL_INTERVAL_MS = readPositiveIntEnv("TASK_WATCHER_POLL_INTERVAL_MS", 2_000);
 /** 派发注入上游产物时的内联字符上限；超出仅保留头部 + 截断说明（完整内容按 uri 引用） */
 const ARTIFACT_INLINE_MAX_CHARS = readPositiveIntEnv("ARTIFACT_INLINE_MAX_CHARS", 4_000);
 
@@ -178,10 +163,11 @@ const EVENT_WAIT_POLL_MS = readPositiveIntEnv("EVENT_WAIT_POLL_MS", 500);
 const EVENT_WAIT_MAX_MS = Math.max(1_000, SYNC_BUDGET_MS - 5_000);
 /** 事件 kind：收到 worker push 回调（v0.4.0 §2.6） */
 const EVENT_PUSH_RECEIVED = "push.received";
-
-const AGENT_KINDS: readonly AgentKind[] = ["opencode", "codex", "claude"];
-
-const RISK_LEVELS: readonly RiskLevel[] = ["read", "write", "full"];
+/**
+ * 事件 kind：`queued` 无人领取的一次性提示（v0.7.0 A5 / B3）。
+ * **不表示失败**（不判 `failed`、不计连续失败）；处置走 `retryTaskIds` / `cancel`。
+ */
+const EVENT_TASK_UNCLAIMED = "task.unclaimed";
 
 // ---------------------------------------------------------------------------
 // 通用小工具（unknown 收窄，避免 any）
@@ -206,14 +192,6 @@ function asNonEmptyString(v: unknown): string | null {
   return typeof v === "string" && v.length > 0 ? v : null;
 }
 
-function isAgentKind(v: string): v is AgentKind {
-  return (AGENT_KINDS as readonly string[]).includes(v);
-}
-
-function isRiskLevel(v: unknown): v is RiskLevel {
-  return typeof v === "string" && (RISK_LEVELS as readonly string[]).includes(v);
-}
-
 function nowIso(): string {
   return new Date().toISOString();
 }
@@ -222,10 +200,6 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
     setTimeout(resolve, ms);
   });
-}
-
-function trimTrailingSlash(url: string): string {
-  return url.endsWith("/") ? url.slice(0, -1) : url;
 }
 
 function stringifyUnknown(v: unknown): string {
@@ -238,217 +212,46 @@ function stringifyUnknown(v: unknown): string {
 }
 
 // ---------------------------------------------------------------------------
-// Launcher HTTP（显式超时；失败返回结构化结果，不抛出）
+// 线协议握手 / Launcher HTTP 出站 —— **v0.7.0 A6 已整体退役**
 // ---------------------------------------------------------------------------
-
-type HttpResult =
-  { ok: true; status: number; data: unknown } | { ok: false; status: number; error: string };
-
-function extractErrorMessage(data: unknown): string | null {
-  const o = asRecord(data);
-  if (o === null) return null;
-  const err = o["error"];
-  if (typeof err === "string" && err.length > 0) return err;
-  const errObj = asRecord(err);
-  if (errObj !== null) {
-    const msg = asNonEmptyString(errObj["message"]);
-    if (msg !== null) return msg;
-  }
-  return asNonEmptyString(o["message"]);
-}
-
-async function fetchJson(url: string, init: RequestInit, timeoutMs: number): Promise<HttpResult> {
-  try {
-    const res = await fetch(url, {
-      ...init,
-      signal: init.signal ?? AbortSignal.timeout(timeoutMs),
-    });
-    const text = await res.text();
-    let data: unknown = null;
-    if (text.length > 0) {
-      try {
-        data = JSON.parse(text);
-      } catch {
-        data = text;
-      }
-    }
-    if (!res.ok) {
-      return {
-        ok: false,
-        status: res.status,
-        error: extractErrorMessage(data) ?? `HTTP ${res.status}`,
-      };
-    }
-    return { ok: true, status: res.status, data };
-  } catch (err) {
-    return { ok: false, status: 0, error: toMessage(err) };
-  }
-}
+// pull 模型下桥不再出站直连 Launcher（`GET /health` 握手 / `GET /projects` / `POST .../ensure`）：
+// 协议版本校验改由 Runner 注册端点（`/runner/register`，O3）承载；项目发现改读注册表投影。
+// 原 `performHandshake` / `ensureProtocol` / 握手缓存 / `fetchJson` 已删除（「桥→machine 出站」
+// 在 index.ts 内不再存在）。
 
 // ---------------------------------------------------------------------------
-// 线协议握手（PROTOCOL.md：桥首触机器时 GET /health 校验 protocolVersion）
+// 项目投影（v0.7.0 A6：数据源 = 注册表 `runner_projects`，出站扫描已退役）
 // ---------------------------------------------------------------------------
-
-type ProtocolCheck = { ok: true; version: string } | { ok: false; code: string; error: string };
-
-/** 已通过握手校验的机器：machineId → 该机自报完整版本号（供按机器版本的行为分支查用） */
-const protocolVerified = new Map<string, string>();
-/** in-flight 握手去重：并发首触同一机器只发一次 /health */
-const protocolHandshakes = new Map<string, Promise<ProtocolCheck>>();
-
-function parseProtocolMajor(version: string): number | null {
-  const m = /^(\d+)\./.exec(version.trim());
-  return m === null ? null : Number(m[1]);
-}
 
 /**
- * 首触握手（幂等）：每机器成功校验一次后本进程内不再重复；
- * 失败不缓存负项——机器升级后下一次调用自动重新握手，无需重启桥。
+ * `a2a_projects` 出参的项目投影（v0.7.0 A6 **字段白名单**）。
+ *
+ * 数据源 = Runner 上报的运行态投影（`runner_projects`）。**不含** `workspace`（绝对路径）/
+ * `agentConfig` / `risk` / 任何 Runner 内部字段（`runnerId` / `protocolVersion` / token）。
  */
-async function ensureProtocol(machine: MachineRef): Promise<ProtocolCheck> {
-  const verified = protocolVerified.get(machine.machineId);
-  if (verified !== undefined) return { ok: true, version: verified };
-
-  const inflight = protocolHandshakes.get(machine.machineId);
-  if (inflight !== undefined) return inflight;
-
-  const check = performHandshake(machine).finally(() => {
-    protocolHandshakes.delete(machine.machineId);
-  });
-  protocolHandshakes.set(machine.machineId, check);
-  return check;
+interface ProjectSummary {
+  projectId: string;
+  agentKind: AgentKind;
+  a2aPort: number;
+  status: ProjectStatus["status"];
+  endpoint: string | null;
+  startedAt: string | null;
 }
 
-async function performHandshake(machine: MachineRef): Promise<ProtocolCheck> {
-  const url = `${trimTrailingSlash(machine.launcherUrl)}/health`;
-  const res = await fetchJson(
-    url,
-    { method: "GET", headers: { accept: "application/json" } },
-    LAUNCHER_TIMEOUT_MS,
-  );
-  if (!res.ok) {
-    console.error(
-      `[a2a-bridge] protocol handshake: ${machine.machineId} 失败（${res.status}）：${res.error}`,
-    );
-    return {
-      ok: false,
-      code: "launcher_unreachable",
-      error: `机器 ${machine.machineId} 线协议握手失败：GET ${url}（${res.status}）：${res.error}`,
-    };
-  }
-  const o = asRecord(res.data);
-  const raw = o === null ? null : asNonEmptyString(o["protocolVersion"]);
-  // 缺失 / 非法 = 未版本化的旧版 Launcher（v0.1.1 及更早），主版本视为 0
-  const actual = raw ?? "0.0";
-  const major = parseProtocolMajor(actual);
-  if (major === null || !SUPPORTED_PEER_PROTOCOL_MAJORS.includes(major)) {
-    const actualDesc = raw === null ? "未版本化的旧版 Launcher（无 protocolVersion）" : actual;
-    console.error(
-      `[a2a-bridge] protocol handshake: ${machine.machineId} v=${actualDesc} 不受支持（本桥 v${PROTOCOL_VERSION}，可支持主版本：${SUPPORTED_PEER_PROTOCOL_MAJORS.join(", ")}）`,
-    );
-    return {
-      ok: false,
-      code: "protocol_version_mismatch",
-      error:
-        `机器 ${machine.machineId}（${machine.launcherUrl}）线协议版本 ${actualDesc} 不受支持` +
-        `（本桥线协议版本 ${PROTOCOL_VERSION}，可支持主版本：${SUPPORTED_PEER_PROTOCOL_MAJORS.join(", ")}）。` +
-        `请升级该机器 machine 单元（Launcher）后重试；升级后无需重启桥，下一次调用自动重新握手。`,
-    };
-  }
-  protocolVerified.set(machine.machineId, actual);
-  // 桥内观测日志统一走 stderr，避免混入 MCP stdio 协议通道
-  console.error(
-    `[a2a-bridge] protocol handshake: ${machine.machineId} v=${actual} 通过（本桥 v${PROTOCOL_VERSION}）`,
-  );
-  return { ok: true, version: actual };
-}
-
-// ---------------------------------------------------------------------------
-// 项目定位（project -> machine；懒加载缓存，无中心注册）
-// ---------------------------------------------------------------------------
-
-const projectIndex = new Map<string, string>();
-
-function parseProjectStatus(v: unknown): ProjectStatus | null {
-  const o = asRecord(v);
-  if (o === null) return null;
-  const projectId = asNonEmptyString(o["projectId"]);
-  if (projectId === null) return null;
-  const workspace = typeof o["workspace"] === "string" ? o["workspace"] : "";
-  const agentKindRaw = o["agentKind"];
-  const agentKind: AgentKind =
-    typeof agentKindRaw === "string" && isAgentKind(agentKindRaw) ? agentKindRaw : "opencode";
-  const a2aPortRaw = o["a2aPort"];
-  const a2aPort = typeof a2aPortRaw === "number" && Number.isInteger(a2aPortRaw) ? a2aPortRaw : 0;
-  const riskRaw = o["risk"];
-  const parsed: ProjectStatus = {
-    projectId,
-    workspace,
-    agentKind,
-    a2aPort,
-    status: o["status"] === "online" ? "online" : "offline",
-    endpoint: asNonEmptyString(o["endpoint"]),
-    startedAt: asNonEmptyString(o["startedAt"]),
-  };
-  if (isRiskLevel(riskRaw)) parsed.risk = riskRaw;
-  return parsed;
-}
-
-function parseProjectList(data: unknown): ProjectStatus[] | null {
-  const raw = Array.isArray(data)
-    ? data
-    : (() => {
-        const o = asRecord(data);
-        if (o === null) return null;
-        const projects = o["projects"];
-        return Array.isArray(projects) ? projects : null;
-      })();
-  if (raw === null) return null;
-  const parsed: ProjectStatus[] = [];
-  for (const item of raw) {
-    const p = parseProjectStatus(item);
-    if (p !== null) parsed.push(p);
-  }
-  return parsed;
-}
-
-type ListResult =
-  { ok: true; projects: ProjectStatus[] } | { ok: false; code?: string; error: string };
-
-async function listMachineProjects(machine: MachineRef, group: ProjectGroup): Promise<ListResult> {
-  const protocol = await ensureProtocol(machine);
-  if (!protocol.ok) {
-    return { ok: false, code: protocol.code, error: protocol.error };
-  }
-  const url = `${trimTrailingSlash(machine.launcherUrl)}/projects`;
-  const res = await fetchJson(
-    url,
-    { method: "GET", headers: { accept: "application/json" } },
-    LAUNCHER_TIMEOUT_MS,
-  );
-  if (!res.ok) {
-    return { ok: false, error: `GET ${url} 失败（${res.status}）：${res.error}` };
-  }
-  const projects = parseProjectList(res.data);
-  if (projects === null) {
-    return {
-      ok: false,
-      error: `GET ${url} 响应格式不合法：期望 ProjectStatus[] 或 { projects: ProjectStatus[] }`,
-    };
-  }
-  /**
-   * **单点过滤**（v0.6.0 §2.2）：`GET /projects` 是本桥**唯一**的项目发现入口 ⇒
-   * 在此收口即覆盖全部「发现」路径（`locateProject` cache-hit / scan、`refreshProjectsSnapshotLazily`、
-   * `handleProjects`）。判据经 {@link isMemberProject}（与 `assertMember` 同源，I1）。
-   */
+/** 注册表项目行 → 出参投影（逐字段显式取值；白名单之外一律不出口） */
+function toProjectSummary(rec: RunnerProjectRecord): ProjectSummary {
   return {
-    ok: true,
-    projects: projects.filter((p) => isMemberProject(machine.machineId, p.projectId, group)),
+    projectId: rec.projectId,
+    agentKind: rec.agentKind,
+    a2aPort: rec.a2aPort,
+    status: rec.status,
+    endpoint: rec.endpoint,
+    startedAt: rec.startedAt,
   };
 }
 
 type LocateResult =
-  | { ok: true; machine: MachineRef; project: ProjectStatus }
+  | { ok: true; machine: MachineRef; project: ProjectSummary }
   | { ok: false; code: string; error: string };
 
 type MachinesLoad =
@@ -520,9 +323,9 @@ function notAMemberFailure(
  * 断言用（§2.2）：返回 `Failure`（非成员）或 `null`（通过）。
  *
  * - `machineId` 给定 ⇒ **精确**到 `(machineId, projectId)` 的成员判定
- *   （`ensureProject` 硬兜底用，落点机器已知）；
- * - `machineId === null` ⇒ 只要求「**该项目被任一成员机器声明**」—— 派发前置
- *   （`dispatchTask` / `registerFeatureNode` / `locateProject` 扫描前）尚**不知道落点机器**，
+ *   （`dispatchTask` 落点已知后的**精确成员复核**用）；
+ * - `machineId === null` ⇒ 只要求「**该项目被任一成员机器声明**」—— 派发 / 登记前置
+ *   （`dispatchTask` / `registerFeatureNode` / `locateProject`）尚**不知道落点机器**，
  *   用本形态可**零 I/O** 判定「未被选中」，避免把「没选它」降级成 `project_not_found`。
  *
  * 两种形态**同源**：给定机器走 {@link isMemberProject}；未给定机器遍历
@@ -548,8 +351,8 @@ function assertMember(
 /**
  * 参与「发现 / 定位」的机器集合：`selective: false` ⇒ 全部机器；否则 ⇒ 配置声明的成员机器。
  *
- * `handleProjects` / `refreshProjectsSnapshotLazily` / `locateProject` **共用同一集合** ——
- * 否则出现「定位得到、快照没有」的双份判据（§2.2）。
+ * `handleProjects` / `locateProject` **共用同一集合** ——
+ * 否则出现「定位得到、展示没有」的双份判据（§2.2）。
  */
 function memberMachines(machines: readonly MachineRef[], group: ProjectGroup): MachineRef[] {
   if (!group.selective) return Array.from(machines);
@@ -578,25 +381,18 @@ function callbackConfig(): CallbackConfig {
 }
 
 /**
- * 该机器本次派发是否内联注册 push 回调（路径 1，v0.4.0 §2.6）：
- * 需 orch `callback.enabled` 与该机 `pushCallback` **同时**为真；返回回调 `url`/`token`。
- */
-function pushCallbackFor(machine: MachineRef): { url: string; token: string } | null {
-  const cb = callbackConfig();
-  if (!cb.enabled || machine.pushCallback !== true) return null;
-  return { url: `http://${cb.host}:${cb.port}/callback`, token: cb.token ?? "" };
-}
-
-/**
- * 解析 project -> machine（v0.6.0 §2.2：**成员机器范围内**定位）。
+ * 解析 `project -> machine`（v0.7.0 A6：**注册视图**为唯一事实源，出站扫描退役）。
  *
- * 成员过滤的三条落点（R1「缓存不绕过」）：
- * ① 扫描范围收窄为 `memberMachines(machines, group)`（= `group.memberMachineIds`）；
- * ② **cache-hit 分支先判成员**：`(cachedMachineId, pid)` 已非成员 ⇒ 清缓存条目；
- *    若该项目在**另一台**成员机器上仍是成员，则继续走扫描（见下方 `assertMember` 后的扫描）；
- * ③ **scan-hit 只对成员** `projectIndex.set(...)`（非成员绝不入缓存、绝不作命中）；
- * ④ 扫描前先 `assertMember(null, …)`：未被任何成员机器声明 ⇒ **零 I/O** 返回
- *    `project_not_a_member`，**不降级**成 `project_not_found`、**不回落全量扫描**。
+ * pull 模型下桥不再出站扫描各机 `GET /projects`：`runner_projects` 是各机 Runner 主动上报的
+ * 运行态投影（D3），本函数只读该投影 + 静态配置成员集合（`projectGroup`），**全程零出站**。
+ *
+ * 判据顺序：
+ * ① `assertMember(null, …)`：未被任一成员机器声明 ⇒ `project_not_a_member`（**不降级**成
+ *    `project_not_found`、**不回落**全量扫描）；
+ * ② 成员机器范围内查注册表：命中 `(machineId, projectId)` 且**精确成员** ⇒ 返回；
+ * ③ 未命中：全部成员机器都「Runner 未注册 / 心跳超时」⇒ `launcher_unreachable`（语义改判：
+ *    原「握手失败」现指「Runner 未注册 / 心跳超时」，仅状态报告用途）；
+ *    否则 ⇒ `project_not_found`。
  */
 async function locateProject(projectId: string): Promise<LocateResult> {
   const config = loadMachines();
@@ -604,177 +400,78 @@ async function locateProject(projectId: string): Promise<LocateResult> {
     return { ok: false, code: "machines_config_error", error: config.error };
   }
   const { group } = config;
-  const machines = memberMachines(config.machines, group);
+  const targets = memberMachines(config.machines, group);
 
-  const cachedMachineId = projectIndex.get(projectId);
-  if (cachedMachineId !== undefined) {
-    // ② 缓存不绕过：**先判成员**再核对（配置热改移出成员后，缓存不得成为旁路）
-    if (!isMemberProject(cachedMachineId, projectId, group)) {
-      projectIndex.delete(projectId);
-    } else {
-      const machine = machines.find((m) => m.machineId === cachedMachineId);
-      if (machine !== undefined) {
-        const listed = await listMachineProjects(machine, group);
-        if (listed.ok) {
-          const project = listed.projects.find((p) => p.projectId === projectId);
-          if (project !== undefined) {
-            return { ok: true, machine, project };
-          }
-        }
-        projectIndex.delete(projectId);
-      } else {
-        projectIndex.delete(projectId);
-      }
-    }
-  }
-
-  /**
-   * ④ 扫描前断言：未知落点机器 ⇒ 「任一成员机器声明」即可。
-   * 未声明 ⇒ **零 I/O** 失败（`project_not_a_member`）——既不发 `/health` 也不发 `/projects`；
-   * 陈旧缓存条目已在上面清理 ⇒ 不存在「回落全量扫描」。
-   */
   const denied = assertMember(null, projectId, group);
   if (denied !== null) {
     return { ok: false, code: denied.code, error: denied.error };
   }
 
-  const scanned = await Promise.all(
-    machines.map(async (machine) => ({
-      machine,
-      listed: await listMachineProjects(machine, group),
-    })),
-  );
-  const unreachable: string[] = [];
-  const protocolRefusals: string[] = [];
-  for (const { machine, listed } of scanned) {
-    if (!listed.ok) {
-      // 协议拒绝与普通不可达分开归集：项目无法定位时优先给出可操作的升级指引
-      if (listed.code === "protocol_version_mismatch") {
-        protocolRefusals.push(listed.error);
-      } else {
-        unreachable.push(`${machine.machineId}: ${listed.error}`);
-      }
-      continue;
-    }
-    const project = listed.projects.find((p) => p.projectId === projectId);
-    if (project === undefined) continue;
-    // ③ 只对成员入缓存 / 只把成员当命中（`listMachineProjects` 已过滤；此处再判一次 = 显式落点，
-    //    防未来有人绕过该过滤时静默污染缓存）
-    if (!isMemberProject(machine.machineId, projectId, group)) continue;
-    projectIndex.set(projectId, machine.machineId);
-    return { ok: true, machine, project };
-  }
-  if (protocolRefusals.length > 0) {
+  let runners: RunnerRecord[];
+  try {
+    runners = listRunners();
+  } catch (err) {
     return {
       ok: false,
-      code: "protocol_version_mismatch",
-      error: `未能定位项目 ${projectId}（机器线协议版本不受支持）：${protocolRefusals.join("; ")}`,
+      code: "runner_registry_error",
+      error: `读取 Runner 注册表失败：${toMessage(err)}`,
+    };
+  }
+  const byMachine = new Map(runners.map((r) => [r.machineId, r]));
+  const unreachable: string[] = [];
+  for (const machine of targets) {
+    const runner = byMachine.get(machine.machineId);
+    if (runner === undefined) {
+      unreachable.push(`${machine.machineId}: Runner 未注册`);
+      continue;
+    }
+    if (runner.state !== "online") {
+      unreachable.push(
+        `${machine.machineId}: Runner 心跳超时（lastHeartbeatAt=${runner.lastHeartbeatAt}）`,
+      );
+    }
+    let project: RunnerProjectRecord | undefined;
+    try {
+      project = listRunnerProjects(runner.runnerId).find((p) => p.projectId === projectId);
+    } catch (err) {
+      return {
+        ok: false,
+        code: "runner_registry_error",
+        error: `读取 Runner 项目投影失败（machineId=${machine.machineId}）：${toMessage(err)}`,
+      };
+    }
+    if (project === undefined) continue;
+    // 精确成员落点（投影已按注册上报，此处再判一次 = 防配置热改后被当作成员命中）
+    if (!isMemberProject(machine.machineId, projectId, group)) continue;
+    return { ok: true, machine, project: toProjectSummary(project) };
+  }
+  if (targets.length > 0 && unreachable.length === targets.length) {
+    return {
+      ok: false,
+      code: "launcher_unreachable",
+      error:
+        `无法定位项目 ${projectId}：Runner 未注册 / 心跳超时（${unreachable.join("; ")}）。` +
+        `等待该机 Runner 出站注册后重试。`,
     };
   }
   const suffix = unreachable.length > 0 ? `（部分机器不可达：${unreachable.join("; ")}）` : "";
   return {
     ok: false,
     code: "project_not_found",
-    error: `未在已配置机器上找到项目 ${projectId}${suffix}`,
+    error: `未在 Runner 注册表找到项目 ${projectId}${suffix}`,
   };
 }
 
-type EnsureOutcome =
-  { ok: true; endpoint: string; started: boolean } | { ok: false; code: string; error: string };
-
-/** `POST {launcher}/projects/{id}/ensure`（幂等启动），返回 A2A 端点 */
-async function ensureProject(machine: MachineRef, projectId: string): Promise<EnsureOutcome> {
-  /**
-   * **硬兜底 · 首行（v0.6.0 §2.2 / §2.3-I3）**：判成员必须**早于任何网络 I/O**（含 `/health` 握手）。
-   * 这是**唯一充分**的解 —— 覆盖全部 6 条「拉起」路径（`handleCall` / `dispatchFeatureNode` /
-   * `handleTaskStatus` / `handleCancel` / 看护 `renew` / `pollTaskUntilSettled` 的 `renew`）：
-   * 非成员**绝不 `POST /ensure`，连 `GET /health` 都不发**。
-   *
-   * 配置**现读**（不缓存）⇒ 成员热移除后，在飞任务的 `renew` 也随之失败（R6 设计内行为，
-   * 非致命：看护仍用已建 client 直连 `tasks/get` 至终态）。配置坏 ⇒ `machines_config_error`（I2）。
-   */
-  const config = loadMachines();
-  if (!config.ok) {
-    return { ok: false, code: "machines_config_error", error: config.error };
-  }
-  const denied = assertMember(machine.machineId, projectId, config.group);
-  if (denied !== null) {
-    return { ok: false, code: denied.code, error: denied.error };
-  }
-  const protocol = await ensureProtocol(machine);
-  if (!protocol.ok) {
-    return { ok: false, code: protocol.code, error: protocol.error };
-  }
-  const url = `${trimTrailingSlash(machine.launcherUrl)}/projects/${encodeURIComponent(projectId)}/ensure`;
-  const res = await fetchJson(
-    url,
-    {
-      method: "POST",
-      headers: { "content-type": "application/json", accept: "application/json" },
-      body: JSON.stringify({}),
-    },
-    LAUNCHER_ENSURE_TIMEOUT_MS,
-  );
-  if (!res.ok) {
-    return {
-      ok: false,
-      code: "ensure_failed",
-      error: `ensure ${projectId}@${machine.machineId} 失败（${res.status}）：${res.error}`,
-    };
-  }
-  const o = asRecord(res.data);
-  const endpoint = o === null ? null : asNonEmptyString(o["endpoint"]);
-  if (endpoint === null) {
-    return {
-      ok: false,
-      code: "ensure_bad_response",
-      error: `ensure ${projectId}@${machine.machineId} 响应缺少 endpoint`,
-    };
-  }
-  const started = o !== null && o["started"] === true;
-  return { ok: true, endpoint, started };
-}
+// ---------------------------------------------------------------------------
+// A2A Client / 结果处理 —— **出站已退役（v0.7.0 A6）**
+// ---------------------------------------------------------------------------
+// 桥不再建 A2A client、不再 `tasks/get` / `tasks/cancel` / `message/send`：任务下发与结果回传
+// 全走 Runner 队列（`/runner/connect` 领取 → 本地执行 → `/runner/result` 回传落库）。
+// `ensureProject` / `createA2AClient` / `pollTaskUntilSettled` / `deferWorkingTask` 已删除；
+// 本地结果读取复用 `textFromArchivedArtifacts` / `parseArchivedArtifacts`。
 
 // ---------------------------------------------------------------------------
-// A2A Client（@a2a-js/sdk v1.1.0）
-// ---------------------------------------------------------------------------
-
-type FetchFn = (input: string | URL | Request, init?: RequestInit) => Promise<Response>;
-
-function fetchWithDefaultTimeout(timeoutMs: number): FetchFn {
-  return (input, init) =>
-    fetch(input, {
-      ...init,
-      signal: init?.signal ?? AbortSignal.timeout(timeoutMs),
-    });
-}
-
-async function createA2AClient(endpoint: string): Promise<Client> {
-  const factory = new ClientFactory({
-    transports: [
-      new JsonRpcTransportFactory({
-        fetchImpl: fetchWithDefaultTimeout(A2A_REQUEST_TIMEOUT_MS),
-        legacyCompat: { enabled: true },
-      }),
-      new RestTransportFactory({
-        fetchImpl: fetchWithDefaultTimeout(A2A_REQUEST_TIMEOUT_MS),
-        legacyCompat: { enabled: true },
-      }),
-    ],
-    clientConfig: {
-      polling: true,
-      acceptedOutputModes: ["text/plain", "application/json"],
-    },
-    cardResolver: new DefaultAgentCardResolver({
-      fetchImpl: fetchWithDefaultTimeout(A2A_CARD_TIMEOUT_MS),
-      legacyCompat: { enabled: true },
-    }),
-  });
-  return factory.createFromUrl(endpoint);
-}
-
-// ---------------------------------------------------------------------------
-// A2A 结果处理
+// 本地结果处理
 // ---------------------------------------------------------------------------
 
 type ArtifactPartSummary =
@@ -788,98 +485,6 @@ interface ArtifactSummary {
   name: string;
   description: string;
   parts: ArtifactPartSummary[];
-}
-
-function summarizeArtifactPart(part: Part): ArtifactPartSummary | null {
-  const content = part.content;
-  if (content === undefined) return null;
-  switch (content.$case) {
-    case "text":
-      return { kind: "text", text: content.value, mediaType: part.mediaType };
-    case "data": {
-      const data: unknown = content.value;
-      return { kind: "data", data, mediaType: part.mediaType };
-    }
-    case "url":
-      return {
-        kind: "url",
-        url: content.value,
-        filename: part.filename,
-        mediaType: part.mediaType,
-      };
-    case "raw":
-      return {
-        kind: "raw",
-        bytes: content.value.length,
-        filename: part.filename,
-        mediaType: part.mediaType,
-      };
-    default:
-      return null;
-  }
-}
-
-/**
- * wrapper（`@a2a-wrapper/core`）的旁路观测产物，如 `trace.mcp` / `trace.thought` / `trace.delegation`。
- * 这些属于 telemetry，不面向 LLM，不过桥（`summarizeArtifacts` / `taskText` 一律跳过）。
- */
-function isTraceArtifact(a: Artifact): boolean {
-  return (
-    a.name.toLowerCase().startsWith("trace.") || a.artifactId.toLowerCase().startsWith("trace.")
-  );
-}
-
-function summarizeArtifacts(artifacts: readonly Artifact[]): ArtifactSummary[] {
-  const summaries: ArtifactSummary[] = [];
-  for (const artifact of artifacts) {
-    if (isTraceArtifact(artifact)) continue;
-    const parts: ArtifactPartSummary[] = [];
-    for (const part of artifact.parts) {
-      const summary = summarizeArtifactPart(part);
-      if (summary !== null) parts.push(summary);
-    }
-    summaries.push({
-      artifactId: artifact.artifactId,
-      name: artifact.name,
-      description: artifact.description,
-      parts,
-    });
-  }
-  return summaries;
-}
-
-function partsToText(parts: readonly Part[]): string {
-  const chunks: string[] = [];
-  for (const part of parts) {
-    const content = part.content;
-    if (content === undefined) continue;
-    switch (content.$case) {
-      case "text":
-        chunks.push(content.value);
-        break;
-      case "data": {
-        const data: unknown = content.value;
-        chunks.push(stringifyUnknown(data));
-        break;
-      }
-      case "url":
-        chunks.push(content.value);
-        break;
-      case "raw":
-        break;
-      default:
-        break;
-    }
-  }
-  return chunks.join("\n");
-}
-
-function isTaskResult(result: SendMessageResult): result is Task {
-  return "id" in result;
-}
-
-function taskStateOf(task: Task): A2aTaskState {
-  return task.status?.state ?? A2aTaskState.TASK_STATE_WORKING;
 }
 
 function mapTaskState(state: A2aTaskState): DomainTaskState {
@@ -902,34 +507,7 @@ function mapTaskState(state: A2aTaskState): DomainTaskState {
   }
 }
 
-function terminalOrInterrupted(state: A2aTaskState): boolean {
-  switch (state) {
-    case A2aTaskState.TASK_STATE_COMPLETED:
-    case A2aTaskState.TASK_STATE_FAILED:
-    case A2aTaskState.TASK_STATE_CANCELED:
-    case A2aTaskState.TASK_STATE_REJECTED:
-    case A2aTaskState.TASK_STATE_INPUT_REQUIRED:
-    case A2aTaskState.TASK_STATE_AUTH_REQUIRED:
-      return true;
-    default:
-      return false;
-  }
-}
-
-function taskText(task: Task): string {
-  const statusText =
-    task.status?.message === undefined ? "" : partsToText(task.status.message.parts);
-  if (statusText.length > 0) return statusText;
-  const artifactChunks: string[] = [];
-  for (const artifact of task.artifacts) {
-    if (isTraceArtifact(artifact)) continue;
-    const text = partsToText(artifact.parts);
-    if (text.length > 0) artifactChunks.push(text);
-  }
-  return artifactChunks.join("\n\n");
-}
-
-/** 从本地存档的 artifactsJson（ArtifactSummary[]）拼接文本；规则对齐 partsToText/taskText，兼容无 text 的旧记录 */
+/** 从本地存档的 artifactsJson（ArtifactSummary[]）拼接文本；兼容无 text 的旧记录 */
 function textFromArchivedArtifacts(artifactsJson: string | null): string {
   if (artifactsJson === null) return "";
   let parsed: unknown;
@@ -977,87 +555,6 @@ function workingGuidanceText(taskId: string, contextId: string): string {
   return `任务仍在执行中。请用 a2a_task_status(taskId="${taskId}") 轮询结果；不要重复 a2a_call（同一任务会重复执行）。若任务因 agent 回收而中断，可携带同 contextId（${contextId}）调用 a2a_call 续接会话继续。`;
 }
 
-function buildSendRequest(
-  text: string,
-  contextId: string,
-  push: { url: string; token: string } | null,
-): SendMessageRequest {
-  const message: Message = {
-    messageId: randomUUID(),
-    contextId,
-    taskId: "",
-    role: Role.ROLE_USER,
-    parts: [
-      {
-        content: { $case: "text", value: text },
-        metadata: undefined,
-        filename: "",
-        mediaType: "text/plain",
-      },
-    ],
-    // 会话由包装器按 contextId 持有，桥不携带 sessionId 元数据
-    metadata: undefined,
-    extensions: [],
-    referenceTaskIds: [],
-  };
-  return {
-    tenant: "",
-    message,
-    configuration: {
-      acceptedOutputModes: ["text/plain", "application/json"],
-      // v0.4.0 §2.6：按 opt-in 内联注册回调（内联注册时 taskId 必须为空，A2A 规范）
-      taskPushNotificationConfig:
-        push === null
-          ? undefined
-          : {
-              tenant: "",
-              id: randomUUID(),
-              taskId: "",
-              url: push.url,
-              token: push.token,
-              authentication: undefined,
-            },
-      returnImmediately: true,
-    },
-    metadata: undefined,
-  };
-}
-
-/** 在同步预算内轮询 `tasks/get` 直至终止/中断态；超时返回最后已知状态 */
-async function pollTaskUntilSettled(
-  client: Client,
-  initial: Task,
-  deadline: number,
-  renew?: () => Promise<void>,
-): Promise<Task> {
-  let current = initial;
-  let lastRenewedAt = Date.now();
-  while (Date.now() < deadline) {
-    await sleep(Math.min(POLL_INTERVAL_MS, Math.max(1, deadline - Date.now())));
-    const remaining = deadline - Date.now();
-    if (remaining <= 0) break;
-    if (renew !== undefined && Date.now() - lastRenewedAt >= LEASE_RENEW_INTERVAL_MS) {
-      try {
-        await renew();
-      } catch (err) {
-        // 续期失败不打断轮询：保留最后已知状态，launcher 侧空闲计时最多按原策略回收
-        console.error(`[a2a-bridge] lease renew failed: ${toMessage(err)}`);
-      }
-      lastRenewedAt = Date.now();
-    }
-    try {
-      current = await client.getTask(
-        { tenant: "", id: initial.id, historyLength: undefined },
-        { signal: AbortSignal.timeout(Math.min(A2A_REQUEST_TIMEOUT_MS, remaining)) },
-      );
-    } catch {
-      break; // 保留最后已知状态，返回 taskId 供后续轮询
-    }
-    if (terminalOrInterrupted(taskStateOf(current))) break;
-  }
-  return current;
-}
-
 // ---------------------------------------------------------------------------
 // 工具实现
 // ---------------------------------------------------------------------------
@@ -1082,102 +579,199 @@ interface Failure {
 type CallOutcome = CallSuccess | Failure;
 
 /**
- * 落库 working + 启动后台看护（轮询 + 续约至终态并落库）+ 返回 working 指引。
- * 半异步（wait=true 且同步预算耗尽）与全异步（wait=false 且未终态）共用。
- * `promptText` 为派发时的原始 prompt（落库截断，REQ-02 联动）；`reason` 仅用于日志。
+ * 进程级 Runner 入站端点处理器（v0.7.0 A4）。
+ *
+ * 仅 `transport.mode === "http"` 时在 `startHttpBridge` 创建并注入 `startHttpTransport`
+ * （`/runner/*` 路由 + `wake` 立即下发共用同一实例）；stdio 形态保持 `null`
+ * ⇒ 既不注册 `/runner/*`，`wake` 亦为 no-op（零回归）。
  */
-function deferWorkingTask(
-  client: Client,
-  machine: MachineRef,
-  projectId: string,
-  promptText: string,
-  settled: Task,
-  contextId: string,
-  reason: string,
-): CallSuccess {
-  createTask({
-    taskId: settled.id,
-    projectId,
-    contextId,
-    state: "working",
-    artifactsJson: JSON.stringify(summarizeArtifacts(settled.artifacts)),
-    text: null,
-    prompt: truncatePrompt(promptText),
-  });
-  const started = startTaskWatcher({
-    taskId: settled.id,
-    poll: () =>
-      client.getTask(
-        { tenant: "", id: settled.id, historyLength: undefined },
-        { signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS) },
-      ),
-    renew: async () => {
-      await ensureProject(machine, projectId);
-    },
-    isSettled: (task) => terminalOrInterrupted(taskStateOf(task)),
-    persist: (task) => {
-      const state = mapTaskState(taskStateOf(task));
-      updateTaskState(
-        task.id,
-        state,
-        JSON.stringify(summarizeArtifacts(task.artifacts)),
-        taskText(task),
-      );
-      bridgeLog.info("a2a-bridge", `后台看护：任务 ${task.id} 已终态（${state}），结果落库`);
-    },
-    // v0.4.0 §2.6：可选订阅推送（命中即提前对账；无推送时与纯轮询等价）
-    subscribePush: true,
-    pollIntervalMs: POLL_INTERVAL_MS,
-    renewIntervalMs: LEASE_RENEW_INTERVAL_MS,
-    maxConsecutiveFailures: WATCHER_MAX_CONSECUTIVE_FAILURES,
-  });
-  if (started) {
-    bridgeLog.info("a2a-bridge", `任务 ${settled.id} ${reason}，转后台看护`);
+let runnerEndpoints: RunnerEndpointHandle | null = null;
+
+/**
+ * 唤醒挂起的 `/runner/connect`（**最佳努力**）：新任务入队后立即下发，避免等满一个 hold
+ * 周期。Runner 未连接（无挂起长轮询）时静默 no-op —— 任务仍在队列中，Runner 下轮轮询照常领取。
+ * 失败绝不阻断派发（`wake` 只是时延优化，不是投递保证）。
+ */
+function wakeRunner(machineId: string): void {
+  const handle = runnerEndpoints;
+  if (handle === null) return;
+  try {
+    handle.wake(machineId);
+  } catch (err) {
+    bridgeLog.warn("a2a-runner", `唤醒 Runner 长轮询失败（最佳努力，忽略）：${toMessage(err)}`);
   }
-  return {
-    ok: true,
-    text: workingGuidanceText(settled.id, contextId),
-    artifacts: [],
-    taskId: settled.id,
-    status: "working",
-    contextId,
-  };
 }
 
 /**
- * 可复用派发：解析项目→机器 → 幂等 ensure → 建 A2A client → `message/send`；
- * `wait=true` 时在同步预算内轮询至终态/中断态。**不落库、不启动看护**——
- * 由调用方决定持久化方式（独立任务用远端 taskId；Feature 节点用本地 id + 调度器看护）。
- * 供 `a2a_call`（MCP 工具）与 Feature 调度器（`dispatchFeatureNode`）共用。
+ * 派发（v0.7.0 A4，pull 连接模型）：**入队**取代「直连 A2A」。
+ *
+ * 新主链（对外契约不变：仍可能同步拿到终态，超预算返回 `working` + `taskId` 句柄）：
+ * ① 成员前置**同步零 I/O fail-fast**（`assertMember(null, …)`；非成员绝不发一个请求）；
+ * ② `projectId → machineId` 解析（v0.7.0 A6：**读 Runner 注册表投影**，零出站）；
+ *    落点已知后再现读配置做**精确成员断言**（零 I/O 硬兜底，
+ *    防「定位成功与入队之间被移出成员」）；
+ * ③ `enqueueTask`（`queue_state=queued` + `dispatch_guard` 幂等键；重复入队零写入、不刷新 FIFO）；
+ * ④ `wake(machineId)` 立即下发（最佳努力）；**无 Runner 在线照常入队、不拒绝**；
+ * ⑤ `wait=true` ⇒ 同步等待至终态 ≤ `SYNC_BUDGET`；超预算返回 `working` + `taskId`。
+ *
+ * 桥侧**不再** `ensureProject` / A2A `message/send` —— 执行由目标机 Runner 经 `/runner/connect`
+ * 领取后本地完成，结果经 `/runner/result` 回传落库（`upsertTaskResult`）。A2A 出站函数与
+ * 「桥→machine 出站」已在 A6 **整体删除**（本文件内零 `fetch`）。
  */
-type DispatchOutcome =
+export type DispatchOutcome =
   | { ok: false; code: string; error: string; contextId: string }
-  | { ok: true; contextId: string; kind: "message"; text: string }
   | {
       ok: true;
       contextId: string;
-      kind: "task";
-      task: Task;
-      client: Client;
-      machine: MachineRef;
+      /** 本地任务 id（= 入队键；pull 模型下独立任务不再以 A2A 远端 id 为主键） */
+      taskId: string;
+      /** 同步预算内是否已落终态（`false` = 仍在飞 / 尚未被领取，交宿主持句柄轮询） */
+      settled: boolean;
+      state: DomainTaskState;
+      text: string | null;
+      artifacts: ArtifactSummary[];
     };
 
-async function dispatchTask(
-  projectId: string,
-  text: string,
-  contextId: string,
-  wait: boolean,
+/** `dispatchTask` 入参（A4 测试接缝：enqueue 幂等 / 成员错零网络 / 超预算 working 句柄） */
+export interface DispatchTaskInput {
+  taskId: string;
+  projectId: string;
+  contextId: string;
+  /** `false` = 全异步：入队后立即返回 `working` 句柄，不等待领取 / 终态 */
+  wait: boolean;
   /**
-   * **C11 先占位后发**（v0.6.1 REQ-05 §2.5 白捡，可选）：在 `message/send` **之前**同步执行。
-   * 仅 Feature 节点派发注入（`markTaskDispatchStarted`）；独立 `inquiry` 路径不传 ⇒ 零行为变化。
+   * 独立任务（inquiry）建行参数：**全部前置断言通过后**才落库 ⇒ 成员错 / 定位失败**不留脏行**。
+   * Feature 节点行已存在（`registerFeatureNode` 已建）⇒ 传 `null`，不重复落库。
    */
-  onBeforeSend?: () => void,
-): Promise<DispatchOutcome> {
-  /**
-   * 派发前置断言（v0.6.0 §2.2）：**零 I/O 早失败** —— `inquiry` 路径在未被选中时
-   * 不得先发 `/health` / `/projects` 才发现「项目不属本组」。判据同源于 {@link assertMember}
-   * （`machineId === null`：任一成员机器声明即可；落点机器由随后的 `locateProject` 决定）。
-   */
+  newTask: { prompt: string; dispatchMessage: string } | null;
+}
+
+/** 未终态（超预算 / 全异步）的派发返回：`working` + 本地 `taskId` 句柄 */
+function workingDispatchOutcome(taskId: string, contextId: string): DispatchOutcome {
+  return {
+    ok: true,
+    contextId,
+    taskId,
+    settled: false,
+    state: "working",
+    text: null,
+    artifacts: [],
+  };
+}
+
+/** 本地任务行 → 看护视图（缺行 ⇒ null） */
+function watchedTaskView(taskId: string): WatchedTaskView | null {
+  const rec = getQueuedTask(taskId);
+  if (rec === null) return null;
+  return {
+    taskId: rec.taskId,
+    state: rec.state,
+    queueState: rec.queueState,
+    claimedBy: rec.claimedBy,
+    artifactsJson: rec.artifactsJson,
+    text: rec.text,
+    featureId: rec.featureId,
+  };
+}
+
+/** 本地回传态是否终态（与 `isLocalTerminalTask` 同口径） */
+function isSettledView(task: WatchedTaskView): boolean {
+  return (
+    task.state === "completed" ||
+    task.state === "failed" ||
+    task.state === "input-required" ||
+    task.state === "blocked"
+  );
+}
+
+/**
+ * 领取是否已超期（B2 判据）：`claimedBy` 对应 Runner 注册行的 `last_heartbeat_at` 静默
+ * ≥ `runner.heartbeatTimeoutMs` ⇒ 超期（O7 清算应回收）。
+ * 无注册行 / 配置不可读 / 时间戳非法 ⇒ **保守判「未超期」**（不主动回收，交 O7 周期清算兜底）。
+ */
+function isClaimHeartbeatStale(task: WatchedTaskView): boolean {
+  if (task.claimedBy === null) return false;
+  try {
+    const runner = getRunner(task.claimedBy);
+    if (runner === null) return false;
+    const heartbeat = Date.parse(runner.lastHeartbeatAt);
+    if (!Number.isFinite(heartbeat)) return false;
+    const timeoutMs = loadMachinesConfig(MACHINES_CONFIG_PATH).runner.heartbeatTimeoutMs;
+    return Date.now() - heartbeat >= timeoutMs;
+  } catch (err) {
+    bridgeLog.warn("a2a-bridge", `领取超期判据读取失败（task=${task.taskId}）：${toMessage(err)}`);
+    return false;
+  }
+}
+
+/**
+ * 启动本地看护（**v0.7.0 A5 接缝**；`dispatchTask` 在「未在同步预算内终态」返回前调用一次）。
+ *
+ * pull 模型下任务终态由 Runner 回传落库（`/runner/result` → `upsertTaskResult`），桥侧**无远端
+ * 轮询**。本接缝把「入队后如何等到终态并续推」收敛为：看护周期读**本地行**，命中终态即
+ * `persist`（`updateTaskState` 路径）+ `onSettled`（Feature 节点据此 `notifyTaskSettled` 续推 DAG）。
+ *
+ * 兜底（改造文档 §1.3 B2/B3）：
+ * - 领取者心跳超期 ⇒ 调 O7 `sweepStale()`（requeue + `task.stale`；**stale ≠ failed**、不 `stop`）；
+ * - `queued` 无人领取 ⇒ 仅发 `task.unclaimed` 事件提示（不判 `failed`、不计连续失败）。
+ *
+ * 同 taskId 已有看护时由 `startTaskWatcher` 去重（返回 false 即静默，幂等）。
+ */
+function startLocalTaskWatcher(taskId: string): void {
+  const record = getTask(taskId);
+  const featureId = record?.featureId ?? null;
+  startTaskWatcher({
+    taskId,
+    poll: () => watchedTaskView(taskId),
+    isSettled: isSettledView,
+    persist: (task) => {
+      // 复用 updateTaskState 路径（CAS；已终态行不覆盖、不重复写 `task.settled` 事件）
+      updateTaskState(task.taskId, task.state, task.artifactsJson, task.text);
+    },
+    isClaimStale: isClaimHeartbeatStale,
+    reclaimStale: () => {
+      const handle = runnerEndpoints;
+      if (handle === null) return;
+      handle.sweepStale();
+    },
+    onUnclaimed: (task) => {
+      appendEvent({
+        featureId: task.featureId ?? featureId,
+        taskId,
+        kind: EVENT_TASK_UNCLAIMED,
+        state: "queued",
+        payload: JSON.stringify({
+          projectId: record?.projectId ?? null,
+          contextId: record?.contextId ?? null,
+          note: "queued 无人领取：不自动失败、不计连续失败（B3）；处置走 retryTaskIds / cancel",
+        }),
+      });
+      signalEvents();
+    },
+    onSettled: (task, outcome) => {
+      if (task === null || outcome.abandoned) {
+        bridgeLog.warn(
+          "a2a-bridge",
+          `任务 ${taskId} 看护放弃（本地行连续读取失败）：不判 failed、不 stop，交宿主核实（retryTaskIds / cancel）`,
+        );
+        return;
+      }
+      // 终态已由 persist 落库；Feature 节点据此续推 DAG（无 Feature 归属 = 独立 inquiry，零动作）
+      if (featureId !== null) {
+        scheduler.notifyTaskSettled(featureId, taskId, { state: task.state, text: task.text });
+      }
+    },
+    // pushCallback 通道保留（本节点不改其语义）：推送仅提前唤醒看护，对账口径仍以本地行为准
+    subscribePush: true,
+    pollIntervalMs: TASK_WATCHER_POLL_INTERVAL_MS,
+    maxConsecutiveFailures: WATCHER_MAX_CONSECUTIVE_FAILURES,
+  });
+}
+
+export async function dispatchTask(input: DispatchTaskInput): Promise<DispatchOutcome> {
+  const { taskId, projectId, contextId, wait } = input;
+
+  // ① 成员前置：同步零 I/O fail-fast（判据同源 assertMember；非成员不产生任何副作用）
   const config = loadMachines();
   if (!config.ok) {
     return { ok: false, code: "machines_config_error", error: config.error, contextId };
@@ -1186,66 +780,68 @@ async function dispatchTask(
   if (denied !== null) {
     return { ok: false, code: denied.code, error: denied.error, contextId };
   }
+
+  // ② 落点解析（projectId → machineId）。过渡期 = locateProject；A6 切 Runner 注册表。
   const located = await locateProject(projectId);
   if (!located.ok) {
     return { ok: false, code: located.code, error: located.error, contextId };
   }
-  const ensured = await ensureProject(located.machine, projectId);
-  if (!ensured.ok) {
-    return { ok: false, code: ensured.code, error: ensured.error, contextId };
+  // 硬兜底：现读配置 + 精确到 (machineId, projectId) 的成员断言（零 I/O）
+  const recheck = loadMachines();
+  if (!recheck.ok) {
+    return { ok: false, code: "machines_config_error", error: recheck.error, contextId };
+  }
+  const deniedAtTarget = assertMember(located.machine.machineId, projectId, recheck.group);
+  if (deniedAtTarget !== null) {
+    return { ok: false, code: deniedAtTarget.code, error: deniedAtTarget.error, contextId };
   }
 
-  let client: Client;
-  try {
-    client = await createA2AClient(ensured.endpoint);
-  } catch (err) {
-    return {
-      ok: false,
-      code: "a2a_client_init_failed",
-      error: `连接 A2A 端点 ${ensured.endpoint} 失败：${toMessage(err)}`,
+  // ③ 独立任务建行（前置全部通过之后 ⇒ 失败路径零副作用、零脏行）
+  if (input.newTask !== null && getTask(taskId) === null) {
+    createTask({
+      taskId,
+      projectId,
       contextId,
-    };
-  }
-
-  let result: SendMessageResult;
-  /**
-   * **C11 先占位后发**：占位必须落在 `sendMessage` **紧前** —— 令「占位窗口」恰为 send 本身，
-   * 把「占位已写但从未发出」的误判面压到最小（`locateProject` / `ensureProject` /
-   * `createA2AClient` 的失败都不写占位 ⇒ 那些失败重启后仍可安全重派）。
-   * 占位写入失败**不阻断**发送（降级为旧行为），仅记日志。
-   */
-  try {
-    onBeforeSend?.();
-  } catch (err) {
-    console.error(`[a2a-bridge] 派发占位写入失败（继续发送，崩溃窗口保护降级）：${toMessage(err)}`);
-  }
-  try {
-    result = await client.sendMessage(
-      buildSendRequest(text, contextId, pushCallbackFor(located.machine)),
-      {
-        signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS),
-      },
-    );
-  } catch (err) {
-    return {
-      ok: false,
-      code: "a2a_send_failed",
-      error: `A2A message/send 失败：${toMessage(err)}`,
-      contextId,
-    };
-  }
-
-  if (!isTaskResult(result)) {
-    return { ok: true, contextId, kind: "message", text: partsToText(result.parts) };
-  }
-
-  let settled = result;
-  if (wait && !terminalOrInterrupted(taskStateOf(result))) {
-    settled = await pollTaskUntilSettled(client, result, Date.now() + SYNC_BUDGET_MS, async () => {
-      await ensureProject(located.machine, projectId);
+      state: "working",
+      prompt: truncatePrompt(input.newTask.prompt),
+      dispatchMessage: input.newTask.dispatchMessage,
     });
   }
-  return { ok: true, contextId, kind: "task", task: settled, client, machine: located.machine };
+
+  // ④ 入队（幂等）+ 立即下发（最佳努力）；无 Runner 在线照常入队、不拒绝
+  const queued = enqueueTask(taskId);
+  if (queued === null) {
+    return { ok: false, code: "task_not_found", error: `任务 ${taskId} 不存在，无法入队`, contextId };
+  }
+  wakeRunner(located.machine.machineId);
+
+  // ⑤ 同步预算内等待终态（终态由 Runner 回传经 `upsertTaskResult` 落库产出）
+  if (!wait) {
+    // 全异步：交后台看护按本地队列态对账（终态落库 + Feature 续推 / B2/B3 兜底）
+    startLocalTaskWatcher(taskId);
+    return workingDispatchOutcome(taskId, contextId);
+  }
+  const deadline = Date.now() + SYNC_BUDGET_MS;
+  for (;;) {
+    const current = getQueuedTask(taskId);
+    if (current !== null && isLocalTerminalTask(current)) {
+      return {
+        ok: true,
+        contextId,
+        taskId,
+        settled: true,
+        state: current.state,
+        text: current.text,
+        artifacts: parseArchivedArtifacts(current.artifactsJson),
+      };
+    }
+    const remaining = deadline - Date.now();
+    if (remaining <= 0) break;
+    await sleep(Math.min(POLL_INTERVAL_MS, remaining));
+  }
+  // 超预算（含「已入队但无人领取」）：启动本地看护，终态到达后 persist + 续推 DAG
+  startLocalTaskWatcher(taskId);
+  return workingDispatchOutcome(taskId, contextId);
 }
 
 /**
@@ -1256,6 +852,9 @@ async function dispatchTask(
  * 契约以**类型级**表达：`mode` 只能取字面量 `"inquiry"` —— 传 `"execute"` 即**编译错误**；
  * `mode` 的必填性 / 对偶校验**不在本层重复实现**（单一事实源：`register-tools.ts` 的
  * `a2aCallSchema` 与 `validateCallMode`）。缺省值使既有 4 参调用点行为完全等价（A 步零破坏）。
+ *
+ * v0.7.0 A4：经队列派发 —— 前置通过后落独立任务行 → 入队 + wake → 同步预算内等终态；
+ * 拿到终态回真实结果，否则回 `working` + `taskId`（**对外契约不变**）。
  */
 async function handleCall(
   projectId: string,
@@ -1268,47 +867,33 @@ async function handleCall(
   const contextId =
     contextIdInput !== undefined && contextIdInput.length > 0 ? contextIdInput : randomUUID();
 
-  const sent = await dispatchTask(projectId, text, contextId, wait);
+  const sent = await dispatchTask({
+    taskId: randomUUID(),
+    projectId,
+    contextId,
+    wait,
+    newTask: { prompt: text, dispatchMessage: text },
+  });
   if (!sent.ok) {
     return { ok: false, code: sent.code, error: sent.error, contextId };
   }
-  if (sent.kind === "message") {
-    // 对端直接返回 Message（非 Task）：视为一次完成的交互
-    return { ok: true, text: sent.text, artifacts: [], status: "completed", contextId };
-  }
-
-  const { task, client, machine } = sent;
-  // 未终态 —— 落库 working、启动后台看护、立即返回句柄
-  if (!terminalOrInterrupted(taskStateOf(task))) {
-    return deferWorkingTask(
-      client,
-      machine,
-      projectId,
-      text,
-      task,
+  if (sent.settled) {
+    return {
+      ok: true,
+      text: sent.text ?? "",
+      artifacts: sent.artifacts,
+      taskId: sent.taskId,
+      status: sent.state,
       contextId,
-      wait ? `超出同步预算（${SYNC_BUDGET_MS}ms）` : "全异步（wait=false）",
-    );
+    };
   }
-
-  // 终态：如实落库并返回真实终态
-  const status = mapTaskState(taskStateOf(task));
-  const artifacts = summarizeArtifacts(task.artifacts);
-  createTask({
-    taskId: task.id,
-    projectId,
-    contextId,
-    state: status,
-    artifactsJson: JSON.stringify(artifacts),
-    text: taskText(task),
-    prompt: truncatePrompt(text),
-  });
+  // 未终态：结果由 Runner 回传落库（`/runner/result` → `upsertTaskResult`），宿主用句柄轮询
   return {
     ok: true,
-    text: taskText(task),
-    artifacts,
-    taskId: task.id,
-    status,
+    text: workingGuidanceText(sent.taskId, contextId),
+    artifacts: [],
+    taskId: sent.taskId,
+    status: "working",
     contextId,
   };
 }
@@ -1316,59 +901,6 @@ async function handleCall(
 // ---------------------------------------------------------------------------
 // Feature 编排接线（v0.3.0 登记 + 调度器派发；v0.4.0 Context / 上游产物注入）
 // ---------------------------------------------------------------------------
-
-/** 产物摘要各 part 中首个非空 mediaType（无则 null） */
-function firstPartMime(parts: readonly ArtifactPartSummary[]): string | null {
-  for (const part of parts) {
-    if (typeof part.mediaType === "string" && part.mediaType.length > 0) return part.mediaType;
-  }
-  return null;
-}
-
-/** 产物摘要各 part 中首个 url（内容引用；无则 null） */
-function artifactUriOf(parts: readonly ArtifactPartSummary[]): string | null {
-  for (const part of parts) {
-    if (part.kind === "url" && part.url.length > 0) return part.url;
-  }
-  return null;
-}
-
-/** 产物摘要各 part 中首个 raw 字节数（其余 kind 无字节语义；无则 null） */
-function artifactSizeOf(parts: readonly ArtifactPartSummary[]): number | null {
-  for (const part of parts) {
-    if (part.kind === "raw") return part.bytes;
-  }
-  return null;
-}
-
-/**
- * 把一次 settle 的产物摘要登记为 `artifacts` 行（v0.4.0 §2.3）。
- * 主键 `${producerTaskId}:${remoteArtifactId}` 避免跨任务 id 冲突；登记 best-effort，
- * 单条失败只记日志、不阻断任务落库。
- */
-function registerArtifacts(
-  featureId: string,
-  producerTaskId: string,
-  artifacts: readonly ArtifactSummary[],
-): void {
-  for (const artifact of artifacts) {
-    const artifactId = `${producerTaskId}:${artifact.artifactId}`;
-    try {
-      upsertArtifact({
-        artifactId,
-        featureId,
-        producerTaskId,
-        name: artifact.name.length > 0 ? artifact.name : artifact.artifactId,
-        mime: firstPartMime(artifact.parts),
-        uri: artifactUriOf(artifact.parts),
-        size: artifactSizeOf(artifact.parts),
-        contentHash: null,
-      });
-    } catch (err) {
-      console.error(`[a2a-bridge] 产物登记失败（${artifactId}）：${toMessage(err)}`);
-    }
-  }
-}
 
 /** 内联内容按上限截断（大产物仅保留头部 + 截断说明，完整内容按 uri 引用） */
 function truncateInline(text: string): string {
@@ -1613,9 +1145,18 @@ function registerFeatureNode(
  */
 
 /**
- * 调度器注入的节点派发：派发前注入 Feature Context（plan/decisions/contracts）与已完成上游
- * 产物（`inputArtifacts`），复用 `dispatchTask` 派发节点消息，落库远端 id，未终态转后台看护
- * （`onSettled` 回调调度器续推 DAG）；settle 时把 `summarizeArtifacts` 登记为 `artifacts` 行。
+ * 调度器注入的节点派发（v0.7.0 A4：**经队列派发**）。
+ *
+ * 派发前注入 Feature Context（plan/decisions/contracts）与已完成上游产物（`inputArtifacts`）；
+ * 注入后的全文**先落库**（Runner 领取消息取自 `dispatch_message`，故必须刷新），再复用
+ * `dispatchTask` **入队**（`queue_state=queued` + `dispatch_guard` 幂等占位，取代旧 C11
+ * `markTaskDispatchStarted` 先占位后发）。
+ *
+ * 结果链：Runner 领取 → 本地执行 → `/runner/result` 回传 → `upsertTaskResult` 落终态；
+ * **节点终态续推 DAG** 由 A5 本地看护接管（`dispatchTask` 未在同步预算内终态时启动；
+ * 看护读到本地终态 ⇒ `persist` + `notifyTaskSettled`；`scheduler.ts`
+ * 引擎语义零改动：`{ok:true}` 无 `settled` ⇒ 节点留待 `notifyTaskSettled`，且 `dispatch_guard`
+ * 非 NULL ⇒ 不被重复派发）。
  */
 async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchResult> {
   const featureId = node.featureId;
@@ -1624,13 +1165,29 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
   }
   const feature = getFeature(featureId);
   const message = buildNodeDispatchMessage(node, feature);
+  // 刷新节点待派发全文（注入 Feature Context / 上游产物；Runner 领取即用此文本）
+  createTask({
+    taskId: node.taskId,
+    projectId: node.projectId,
+    contextId: node.contextId,
+    state: node.state,
+    artifactsJson: node.artifactsJson,
+    text: node.text,
+    prompt: node.prompt,
+    featureId: node.featureId,
+    dependencies: node.dependencies,
+    inputArtifacts: node.inputArtifacts,
+    remoteTaskId: node.remoteTaskId,
+    dispatchMessage: message,
+  });
 
-  // v0.6.1 REQ-05 §2.5 白捡（C11）：**先占位后发** —— `message/send` 前写「已发出」占位
-  // （`dispatch_guard`），send 返回后由下方 `markTaskDispatched` 回填真实远端 id。
-  // 崩溃点落在两者之间 ⇒ 重启按「占位已写、远端未知」保守收敛（不自动重派，防双派）。
-  const sent = await dispatchTask(node.projectId, message, node.contextId, true, () =>
-    void markTaskDispatchStarted(node.taskId),
-  );
+  const sent = await dispatchTask({
+    taskId: node.taskId,
+    projectId: node.projectId,
+    contextId: node.contextId,
+    wait: true,
+    newTask: null,
+  });
   if (!sent.ok) {
     /**
      * `FeatureDispatchResult` 只有 `error`（无 `code`）—— 守住 `scheduler.ts` **零改动**的前提下，
@@ -1639,73 +1196,15 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
      */
     return { ok: false, error: `[${sent.code}] ${sent.error}` };
   }
-  if (sent.kind === "message") {
-    updateTaskState(node.taskId, "completed", null, sent.text);
-    return { ok: true, settled: { state: "completed", text: sent.text } };
+  if (sent.settled) {
+    // 入队即已终态（如 Runner 在预算内已完成回传）：直接交调度器续推
+    return { ok: true, settled: { state: sent.state, text: sent.text } };
   }
-
-  const { task, client, machine } = sent;
-  const remoteTaskId = task.id;
-  const state = mapTaskState(taskStateOf(task));
-  // 回调回写映射：远端 id → 本地节点 id（推送只带远端 id）
-  registerRemoteTask(remoteTaskId, node.taskId);
-
-  // 远端已终态：登记产物 + 直接落库
-  if (terminalOrInterrupted(taskStateOf(task))) {
-    const artifacts = summarizeArtifacts(task.artifacts);
-    registerArtifacts(featureId, node.taskId, artifacts);
-    updateTaskState(node.taskId, state, JSON.stringify(artifacts), taskText(task));
-    markTaskDispatched(node.taskId, remoteTaskId);
-    return { ok: true, settled: { state, text: taskText(task) } };
-  }
-
-  // 未终态：回填远端 id + 转后台看护（看护终态/放弃均经 onSettled 续推 DAG）
-  markTaskDispatched(node.taskId, remoteTaskId);
-  const started = startTaskWatcher({
-    taskId: node.taskId,
-    poll: () =>
-      client.getTask(
-        { tenant: "", id: remoteTaskId, historyLength: undefined },
-        { signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS) },
-      ),
-    renew: async () => {
-      await ensureProject(machine, node.projectId);
-    },
-    isSettled: (task) => terminalOrInterrupted(taskStateOf(task)),
-    persist: (task) => {
-      const st = mapTaskState(taskStateOf(task));
-      const artifacts = summarizeArtifacts(task.artifacts);
-      registerArtifacts(featureId, node.taskId, artifacts);
-      updateTaskState(node.taskId, st, JSON.stringify(artifacts), taskText(task));
-      bridgeLog.info(
-        "a2a-bridge",
-        `Feature 节点 ${node.taskId}（远端 ${remoteTaskId}）已终态（${st}）`,
-      );
-    },
-    onSettled: (task, outcome) => {
-      // 看护放弃路径：本地置 failed 并令 Feature failed
-      if (outcome.abandoned || task === null) {
-        updateTaskState(node.taskId, "failed", null, FEATURE_ABANDONED_TEXT);
-        scheduler.notifyTaskSettled(featureId, node.taskId, { state: "failed", text: null });
-        return;
-      }
-      scheduler.notifyTaskSettled(featureId, node.taskId, {
-        state: mapTaskState(taskStateOf(task)),
-        text: taskText(task),
-      });
-    },
-    // v0.4.0 §2.6：可选订阅推送（命中即提前对账；无推送时与纯轮询等价）
-    subscribePush: true,
-    pollIntervalMs: POLL_INTERVAL_MS,
-    renewIntervalMs: LEASE_RENEW_INTERVAL_MS,
-    maxConsecutiveFailures: WATCHER_MAX_CONSECUTIVE_FAILURES,
-  });
-  if (started) {
-    bridgeLog.info(
-      "a2a-bridge",
-      `Feature 节点 ${node.taskId} 已派发（远端 ${remoteTaskId}），转后台看护`,
-    );
-  }
+  // 未终态：节点已入队（`dispatch_guard` 非 NULL ⇒ 不被重复派发），等 Runner 回传后续推
+  bridgeLog.info(
+    "a2a-bridge",
+    `Feature 节点 ${node.taskId} 已入队（project=${node.projectId}），等待 Runner 领取`,
+  );
   return { ok: true };
 }
 
@@ -1725,12 +1224,14 @@ interface TaskStatusSuccess {
 
 type TaskStatusOutcome = TaskStatusSuccess | (Failure & { task?: TaskRecord });
 
+/**
+ * `a2a_task_status`（v0.7.0 A6 / B1）：**只读本地回传落库**（远端 `tasks/get` 退役）。
+ *
+ * pull 模型下任务态由 Runner `/runner/result` 回传经 `upsertTaskResult` 落库，桥侧无远端可查；
+ * 任务尚未回传时返回其**当前本地态**（通常 `working`），由宿主按句柄轮询至终态。
+ * 仍保留成员前置（非成员任务 ⇒ `project_not_a_member`，零 I/O）。
+ */
 async function handleTaskStatus(taskId: string): Promise<TaskStatusOutcome> {
-  /**
-   * **A5-5 反查**（v0.6.1 REQ-05 §2.5 白捡）：解析（本地 id 优先，MISS 时经远端映射反查）
-   * ⇒ 拿到 `record`（本地记录）与 `remoteId`（**远端调用必须用的 id**）。
-   * Feature 节点本地 id ≠ 远端 id，旧实现直接拿入参查远端 ⇒ 恒 404。
-   */
   const lookup = resolveTaskLookup(taskId);
   if (lookup === null) {
     return {
@@ -1739,69 +1240,23 @@ async function handleTaskStatus(taskId: string): Promise<TaskStatusOutcome> {
       error: `未知任务 ${taskId}（本地任务存储无记录）`,
     };
   }
-  const { record, remoteId } = lookup;
-  const localTaskId = record.taskId;
-
-  // 本地快路径：终结态结果是最终事实（落库时已 settle），直接以本地存档作答；
-  // 不 ensure、不碰远端——远端任务态不持久化（agent 回收后重 ensure 是新进程，只会 Task not found）
-  if (isLocalTerminalTask(record)) {
-    const artifacts = parseArchivedArtifacts(record.artifactsJson);
-    return {
-      ok: true,
-      taskId: localTaskId,
-      status: record.state,
-      text: record.text ?? textFromArchivedArtifacts(record.artifactsJson),
-      artifacts,
-      updatedAt: record.updatedAt,
-    };
+  const { record } = lookup;
+  const config = loadMachines();
+  if (!config.ok) {
+    return { ok: false, code: "machines_config_error", error: config.error, task: record };
   }
-
-  const located = await locateProject(record.projectId);
-  if (!located.ok) {
-    return { ok: false, code: located.code, error: located.error, task: record };
+  const denied = assertMember(null, record.projectId, config.group);
+  if (denied !== null) {
+    return { ok: false, code: denied.code, error: denied.error, task: record };
   }
-  const ensured = await ensureProject(located.machine, record.projectId);
-  if (!ensured.ok) {
-    return { ok: false, code: ensured.code, error: ensured.error, task: record };
-  }
-
-  let client: Client;
-  try {
-    client = await createA2AClient(ensured.endpoint);
-  } catch (err) {
-    return {
-      ok: false,
-      code: "a2a_client_init_failed",
-      error: `连接 A2A 端点 ${ensured.endpoint} 失败：${toMessage(err)}`,
-      task: record,
-    };
-  }
-
-  try {
-    const task = await client.getTask(
-      { tenant: "", id: remoteId, historyLength: undefined },
-      { signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS) },
-    );
-    const status = mapTaskState(taskStateOf(task));
-    const artifacts = summarizeArtifacts(task.artifacts);
-    // 回写**本地**记录（远端 id 不是本地主键）
-    updateTaskState(localTaskId, status, JSON.stringify(artifacts), taskText(task));
-    return {
-      ok: true,
-      taskId: localTaskId,
-      status,
-      text: taskText(task),
-      artifacts,
-      updatedAt: nowIso(),
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      code: "a2a_get_task_failed",
-      error: `A2A tasks/get 失败：${toMessage(err)}。任务可能已随 agent 回收而中断；可携带同 contextId（${record.contextId}）调用 a2a_call 续接会话继续。`,
-      task: record,
-    };
-  }
+  return {
+    ok: true,
+    taskId: record.taskId,
+    status: record.state,
+    text: record.text ?? textFromArchivedArtifacts(record.artifactsJson),
+    artifacts: parseArchivedArtifacts(record.artifactsJson),
+    updatedAt: record.updatedAt,
+  };
 }
 
 type CancelOutcome =
@@ -1815,8 +1270,15 @@ type CancelOutcome =
     }
   | (Failure & { task?: TaskRecord });
 
+/**
+ * `a2a_cancel`（v0.7.0 A6 / B1）：**命令族第三类 `cancel-task`** —— 经 `/runner/connect`
+ * 下一轮轮询下发给目标 Runner，由其对本地 wrapper 执行取消；终态经 `/runner/result` 回传落库。
+ *
+ * 桥侧**不再** `tasks/cancel`（A2A 出站退役）。命令为**异步投递**：本函数返回「已下发」，
+ * 任务态仍以本地回传落库为准（宿主按 `a2a_task_status` 观察）。
+ * 非成员 ⇒ `project_not_a_member`（零 I/O）；stdio 形态无 Runner 端点 ⇒ `cancel_unavailable`。
+ */
 async function handleCancel(taskId: string): Promise<CancelOutcome> {
-  // A5-5 反查（同 handleTaskStatus）：本地 id 优先，MISS 时经远端映射；远端调用用 remoteId
   const lookup = resolveTaskLookup(taskId);
   if (lookup === null) {
     return {
@@ -1825,53 +1287,49 @@ async function handleCancel(taskId: string): Promise<CancelOutcome> {
       error: `未知任务 ${taskId}（本地任务存储无记录）`,
     };
   }
-  const { record, remoteId } = lookup;
-  const localTaskId = record.taskId;
+  const { record } = lookup;
+  const config = loadMachines();
+  if (!config.ok) {
+    return { ok: false, code: "machines_config_error", error: config.error, task: record };
+  }
+  const denied = assertMember(null, record.projectId, config.group);
+  if (denied !== null) {
+    return { ok: false, code: denied.code, error: denied.error, task: record };
+  }
+  if (isLocalTerminalTask(record)) {
+    return {
+      ok: false,
+      code: "task_already_settled",
+      error: `任务 ${record.taskId} 已终态（${record.state}），无需取消`,
+      task: record,
+    };
+  }
   const located = await locateProject(record.projectId);
   if (!located.ok) {
     return { ok: false, code: located.code, error: located.error, task: record };
   }
-  const ensured = await ensureProject(located.machine, record.projectId);
-  if (!ensured.ok) {
-    return { ok: false, code: ensured.code, error: ensured.error, task: record };
-  }
-
-  let client: Client;
-  try {
-    client = await createA2AClient(ensured.endpoint);
-  } catch (err) {
+  const endpoint = runnerEndpoints;
+  if (endpoint === null) {
     return {
       ok: false,
-      code: "a2a_client_init_failed",
-      error: `连接 A2A 端点 ${ensured.endpoint} 失败：${toMessage(err)}`,
+      code: "cancel_unavailable",
+      error:
+        "当前接入面未提供 Runner 端点（仅常驻 http owner 提供）：无法下发 cancel-task 命令；" +
+        "请确认桥以 `transport.mode=http` 且持 core 租约运行。",
       task: record,
     };
   }
-
-  try {
-    const task = await client.cancelTask(
-      { tenant: "", id: remoteId, metadata: undefined },
-      { signal: AbortSignal.timeout(A2A_REQUEST_TIMEOUT_MS) },
-    );
-    const status = mapTaskState(taskStateOf(task));
-    const artifacts = summarizeArtifacts(task.artifacts);
-    updateTaskState(localTaskId, status, JSON.stringify(artifacts), taskText(task));
-    return {
-      ok: true,
-      taskId: localTaskId,
-      status,
-      text: taskText(task),
-      artifacts,
-      updatedAt: nowIso(),
-    };
-  } catch (err) {
-    return {
-      ok: false,
-      code: "a2a_cancel_failed",
-      error: `A2A tasks/cancel 失败：${toMessage(err)}`,
-      task: record,
-    };
-  }
+  endpoint.enqueueCancelTask(located.machine.machineId, record.taskId);
+  // 最佳努力：立即唤醒挂起的长轮询（Runner 未连接则静默，下轮轮询照常领取）
+  wakeRunner(located.machine.machineId);
+  return {
+    ok: true,
+    taskId: record.taskId,
+    status: record.state,
+    text: `已向 Runner（machineId=${located.machine.machineId}）下发 cancel-task 命令；任务态以 Runner 回传落库为准。`,
+    artifacts: parseArchivedArtifacts(record.artifactsJson),
+    updatedAt: nowIso(),
+  };
 }
 
 /**
@@ -1893,9 +1351,15 @@ interface GroupView {
 interface MachinesView {
   machines: Array<{
     machineId: string;
-    projects: ProjectStatus[];
+    projects: ProjectSummary[];
     error?: string;
   }>;
+  /**
+   * Runner 注册视图（v0.7.0 A6 / B4）：**只列 memberMachines** 中**已注册**的 Runner。
+   * 字段白名单 = `machineId` / `online` / `lastHeartbeatAt`；
+   * **不含** token / `runnerId` / `protocolVersion` 等协议内部字段，也不含任何 workspace。
+   */
+  runners: Array<{ machineId: string; online: boolean; lastHeartbeatAt: string }>;
   /** 项目组视图（v0.6.0；**恒存在**） */
   group: GroupView;
 }
@@ -1909,27 +1373,72 @@ function groupView(group: ProjectGroup): GroupView {
   };
 }
 
+/**
+ * `a2a_projects`（v0.7.0 A6）：**数据源 = 桥注册表投影**（`runners` / `runner_projects`），
+ * 不再出站 `GET /projects`。
+ *
+ * - 只遍历**成员机器**（v0.6.0 §2.2）：**无成员的机器整条消失（含其 error 条目）**；
+ * - 每机：注册行存在 ⇒ 列其注册项目（按成员过滤）；未注册 / 心跳超时 ⇒ 保留条目 + `error`
+ *   （`launcher_unreachable` 语义：Runner 未注册 / 心跳超时）；
+ * - 出参补 `runners[]`：**只列 memberMachines** 中已注册者（B4），字段白名单见 {@link MachinesView}。
+ */
 async function handleProjects(): Promise<MachinesView | Failure> {
   const config = loadMachines();
   if (!config.ok) {
     return { ok: false, code: "machines_config_error", error: config.error };
   }
-  /**
-   * 只遍历**成员机器**（v0.6.0 §2.2）：**无成员的机器整条消失（含其 `error` 条目）** ——
-   * 既不 `GET /projects`（不主动连），也不在出参里留占位。每机只列成员由
-   * `listMachineProjects(machine, group)` 单点过滤保证。
-   */
-  const targets = memberMachines(config.machines, config.group);
-  const entries = await Promise.all(
-    targets.map(async (machine) => {
-      const listed = await listMachineProjects(machine, config.group);
-      if (listed.ok) {
-        return { machineId: machine.machineId, projects: listed.projects };
+  const { group } = config;
+  const targets = memberMachines(config.machines, group);
+  let runners: RunnerRecord[];
+  try {
+    runners = listRunners();
+  } catch (err) {
+    return {
+      ok: false,
+      code: "runner_registry_error",
+      error: `读取 Runner 注册表失败：${toMessage(err)}`,
+    };
+  }
+  const byMachine = new Map(runners.map((r) => [r.machineId, r]));
+  const machines: MachinesView["machines"] = [];
+  const runnerViews: MachinesView["runners"] = [];
+  try {
+    for (const machine of targets) {
+      const runner = byMachine.get(machine.machineId);
+      if (runner === undefined) {
+        machines.push({
+          machineId: machine.machineId,
+          projects: [],
+          error: `Runner 未注册（机器 ${machine.machineId} 尚未出站注册；等待其上报后自动可见）`,
+        });
+        continue;
       }
-      return { machineId: machine.machineId, projects: [], error: listed.error };
-    }),
-  );
-  return { machines: entries, group: groupView(config.group) };
+      const projects = listRunnerProjects(runner.runnerId)
+        .filter((p) => isMemberProject(machine.machineId, p.projectId, group))
+        .map(toProjectSummary);
+      runnerViews.push({
+        machineId: runner.machineId,
+        online: runner.state === "online",
+        lastHeartbeatAt: runner.lastHeartbeatAt,
+      });
+      if (runner.state === "online") {
+        machines.push({ machineId: machine.machineId, projects });
+      } else {
+        machines.push({
+          machineId: machine.machineId,
+          projects,
+          error: `Runner 心跳超时（lastHeartbeatAt=${runner.lastHeartbeatAt}）；注册态已降为 offline`,
+        });
+      }
+    }
+  } catch (err) {
+    return {
+      ok: false,
+      code: "runner_registry_error",
+      error: `读取 Runner 项目投影失败：${toMessage(err)}`,
+    };
+  }
+  return { machines, runners: runnerViews, group: groupView(group) };
 }
 
 interface TasksView {
@@ -1941,9 +1450,11 @@ interface TasksView {
 }
 
 /**
- * 按项目列出本地任务记录（纯本地 + 只读探测）。
- * 绝不 `ensureProject`（避免「列个表就把 Agent 拉起」）；`stale` 判定仅用本地看护信号 +
- * 一次只读可达性探测（`locateProject`：`/health` + `/projects`），不做逐任务远端查询。
+ * 按项目列出本地任务记录（纯本地 + 只读注册表探测）。
+ * 绝不拉起 Agent 执行；`stale` 判定 = **本地队列态**
+ * （`isTaskWatched`：`queue_state ∈ queued/claimed/running` ⇒ 在队、不算 stale）+
+ * 一次只读可达性探测（`locateProject`：v0.7.0 A6 起读**桥注册表投影**，零出站），
+ * 不做逐任务远端查询。
  */
 async function handleTasks(
   projectId: string,
@@ -2572,6 +2083,18 @@ async function startHttpBridge(): Promise<void> {
   const runtime = createBridgeRuntime("http");
   activeRuntime = runtime;
   const core = createCore();
+  /**
+   * Runner 入站端点（v0.7.0 A3 模块 + A4 接线）：仅常驻 http 形态创建。
+   * `mode` / `role` 用惰性闭包（`runtime.start()` 在本行之后，角色此刻尚未确定）；
+   * `config` 现读 ⇒ token / projectGroup / `runner.holdMs` 热改即时生效（与桥其余路径一致）。
+   */
+  runnerEndpoints = createRunnerEndpoints({
+    mode: transportMode,
+    role: () => runtime.currentRole,
+    config: () => loadMachinesConfig(MACHINES_CONFIG_PATH),
+    // A7 接线：Runner 事件（registered/online/offline/claimed/stale）落库后立即唤醒 a2a_wait 订阅者
+    signalEvents,
+  });
   const handle = await startHttpTransport({
     core,
     host,
@@ -2581,6 +2104,7 @@ async function startHttpBridge(): Promise<void> {
     role: () => runtime.currentRole,
     version: BRIDGE_VERSION,
     onShutdown: shutdown,
+    runner: runnerEndpoints,
   });
   activeHttp = handle;
   const readiness: RuntimeReadiness = runtime.start();

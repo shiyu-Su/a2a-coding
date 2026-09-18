@@ -23,7 +23,6 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import type { Task } from "@a2a-js/sdk";
 import {
   close,
   createFeature,
@@ -35,7 +34,12 @@ import {
 } from "../session/store.js";
 import { EVENT_FAILURE_REPORT, FeatureScheduler, propagateBlocked } from "../bridge/scheduler.js";
 import { handleFeatureAdvance } from "../bridge/feature-tools.js";
-import { drainTaskWatchers, isTaskWatched, startTaskWatcher } from "../bridge/task-watcher.js";
+import {
+  drainTaskWatchers,
+  isTaskWatched,
+  startTaskWatcher,
+  type WatchedTaskView,
+} from "../bridge/task-watcher.js";
 import type { EventRecord, TaskRecord, TaskState } from "../types.js";
 
 process.env["SESSION_DB"] = ":memory:";
@@ -312,13 +316,19 @@ test("N3 · V8 recover：在飞节点 interrupted、Feature 不 failFeature、�
 // ---------------------------------------------------------------------------
 
 test("N3 · A5-2：persist 抛错不走 abandoned，终态仍回调 onSettled", async () => {
-  const settledTasks: (Task | null)[] = [];
+  const settledTasks: (WatchedTaskView | null)[] = [];
   const abandonedFlags: boolean[] = [];
-  const fakeTask = { id: "w-1" } as unknown as Task;
   const started = startTaskWatcher({
     taskId: "w-persist-fail",
-    poll: async () => fakeTask,
-    renew: async () => undefined,
+    poll: () => ({
+      taskId: "w-1",
+      state: "completed",
+      queueState: "settled",
+      claimedBy: null,
+      artifactsJson: null,
+      text: null,
+      featureId: null,
+    }),
     isSettled: () => true,
     persist: () => {
       throw new Error("database is locked");
@@ -328,7 +338,6 @@ test("N3 · A5-2：persist 抛错不走 abandoned，终态仍回调 onSettled", 
       abandonedFlags.push(outcome.abandoned);
     },
     pollIntervalMs: 1,
-    renewIntervalMs: 1_000_000,
     maxConsecutiveFailures: 1,
   });
   assert.equal(started, true);
@@ -337,7 +346,7 @@ test("N3 · A5-2：persist 抛错不走 abandoned，终态仍回调 onSettled", 
 
   assert.equal(isTaskWatched("w-persist-fail"), false, "看护应正常收尾，不得空转");
   assert.deepEqual(abandonedFlags, [false], "persist 异常不得判 abandoned");
-  assert.equal(settledTasks[0]?.id, "w-1", "终态仍须回调 onSettled（DAG 续推信号不丢）");
+  assert.equal(settledTasks[0]?.taskId, "w-1", "终态仍须回调 onSettled（DAG 续推信号不丢）");
 });
 
 test("N3 · A5-2：poll 连续失败仍按上限走 abandoned（分类未被放宽）", async () => {
@@ -345,18 +354,16 @@ test("N3 · A5-2：poll 连续失败仍按上限走 abandoned（分类未被放�
   let polls = 0;
   startTaskWatcher({
     taskId: "w-poll-fail",
-    poll: async () => {
+    poll: () => {
       polls += 1;
       throw new Error("unreachable");
     },
-    renew: async () => undefined,
     isSettled: () => true,
     persist: () => undefined,
     onSettled: (_task, outcome) => {
       abandonedFlags.push(outcome.abandoned);
     },
     pollIntervalMs: 1,
-    renewIntervalMs: 1_000_000,
     maxConsecutiveFailures: 3,
   });
 

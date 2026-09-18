@@ -6,6 +6,22 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.7.0] - 2026-09-18
+
+> 主题：**Runner 反向注册（pull 连接模型整体反转）**（REQ-v0.7.0-2026-09-18-01，方案级变更；架构约束「无中心注册/静态分布/每机 Launcher 入站」随之修订）。**发版纪律变更：自本版起不上传 GitHub 仓库（用户指示；commit/tag 仅本地）。**
+
+> - **连接模型反转（D1）**：Launcher 升格 **Runner**——出站注册（machineId + projects + capabilities + selfCheck + protocolVersion + version）→ HTTP 长轮询 /runner/connect（hold 25s 可配 + wake signal，poll 即心跳）→ 领取命令（命令族 dispatch / stop / cancel-task，均携 commandId）→ 本地 manager.ensure + 本地 A2A 执行（**三端 wrapper/adapters/会话映射零改**）→ /runner/result 回传。
+> - **outbox 与幂等**：结果按 (machineId, taskId) 幂等 upsert（覆盖 callback + pull 双到达路径）；.a2a/outbox 暂存 ack 后清空，断线重连结果重放不丢。
+> - **轻量注册视图（D3/D4）**：桥侧 runners / runner_projects 运行态投影表（不启动清空）；machines[].token ↔ launcher.bridge.token per-machine Bearer（常量时间比较）；注册准入 = machineId 在 machines[] 白名单内；projectGroup 仅控项目级读/claim。
+> - **调度与回收语义**（半异步对外契约不变）：dispatchTask 改入队（成员前置同步零 I/O fail-fast，无 Runner 在线照常入队）；task-watcher poll/persist 换本地队列态、renew 退役；心跳超期清算 = **requeue**（claimed→queued + task.stale；不判 failed、不 stop）——根治「控制面离线 5 分钟误杀在飞任务」；idle 判据 = 本机无在飞任务。
+> - **事件族**：runner.registered / online / offline · task.claimed / task.stale（+signalEvents）。
+> - **协议 1.0 → 2.0（D5，发版即硬切）**：PROTOCOL.md 原地重写为「Runner ⇤ Bridge 线协议契约（2.0）」（machine 本地 /health 声明为非契约面；capabilities 可扩展对象 + 未知字段忽略）；契约测试全量重写（注册载荷准入断言）。
+> - **端点退役（D6）**：machine 侧 /projects、/{id}/ensure、/{id}/stop 退役（404）；保留 loopback 只读 /health（additive bridge 字段）与 /shutdown；/runner/* 仅常驻 http 形态注册（stdio 启动 warn）。
+> - **SSH/Transport 方向废弃（D9）**（planlog v0.6.0 缩减登记改判「被反向注册取代」）。
+> - **真机 E2E 全 PASS**：E1 注册 · E2 inquiry 全链 · E3 Feature execute×pull · E4 断桥重连+在飞保护+outbox 重放 · E5 超期清算+复领 · E7 鉴权/成员拒绝 · E8 idle 旁证；E6 cancel-task 链路贯通、终态 failed≠canceled（语义缺陷登记待修）。增补轨 N1（命令载荷补 commandId/projectId，orch 196/196）、N2（register version 字段，machine 66/66）。
+> - **过程遗留（登记待修/候收口批）**：bridge:stop wedge ×2（shutdown 打印完整但进程不退 + 租约滞留阻塞重启，绕过 = taskkill + 删 core.lock）；advance(note) 不注入 retryTaskIds 重派消息；config warn spam；DAG 登记缺依赖存在性校验。
+
+
 ## [v0.6.2] - 2026-09-18
 
 > 主题：**编排可观测性修复 + 启停脚本非阻塞收口**（两条需求 + 一条流程纪律沉淀）。**A** `REQ-v0.6.2-2026-09-18-01`：`feature.failure_report` 的去重单位由「失败节点集合」改为「**失败 episode**」—— signature 的 failed 项改为 `${taskId}:${retryCount}`（`orch/bridge/scheduler.ts`），使**同一节点重派后再次失败也发第二条账单**；同一静止期仍幂等。**B** `REQ-v0.6.2-2026-09-18-02`：`launcherctl` / `bridgectl` 增 **`--no-wait`**（显式开关，缺省不变）+ machine opt-in **`--wait-ready`**；就绪判据键统一为 `/health` 的 `status`；占用判定三分类（`status` 缺失 ⇒ occupied）；`restart --no-wait` **仅作用 start 段**；**调用方维度**修复 —— Windows 改用 **WMI 脱壳拉起**常驻进程（否则宿主工具会被调用方的作业/进程树拖住）。**流程纪律**：`flow/spec` 写入「同一版本内多需求必须串行」。详见 `doc/v0.6.2/`。
