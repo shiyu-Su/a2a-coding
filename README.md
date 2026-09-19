@@ -548,8 +548,9 @@ v0.7.1 起 stdio 形态已退役：**常驻进程**是桥的唯一运行形态�
 cd orch
 npm run bridge:start -- --no-wait   # 发起即返（exit 0 = 已发起，≠ 就绪）
 npm run bridge:status               # 确认就绪（pid / host:port / health / role / startedAt）
-npm run bridge:stop                 # 优先 POST /shutdown 优雅停机，超时兜底强杀
-npm run bridge:restart -- --no-wait # 仅 start 段即返；stop 段仍阻塞（极端 ≤35s）
+npm run bridge:stop                 # POST /shutdown 优雅停机；成功判据 = 端口释放 ∧ 进程退出，pid 未退 ⇒ 强杀兜底（killForce）
+npm run bridge:restart -- --no-wait # 仅 start 段即返；stop 段仍阻塞（极端 ≤50s：优雅 45s 预算 + 强杀）
+npm run bridge:start -- --wait-ready # 需要业务就绪时用：exit 0 仅在 /health status=ok（与 --no-wait 互斥）
 npm run bridge:logs                 # 输出日志全文（支持 --lines N / --follow）
 ```
 

@@ -25,7 +25,18 @@ import { TaskState as A2aTaskState, taskStateFromJSON } from "@a2a-js/sdk";
 import { appRootFromModule } from "../app-root.js";
 import { defaultProjectGroup, loadMachinesConfig, memberKey } from "../config.js";
 import { BRIDGE_VERSION } from "../version.js";
-import { BridgeRuntime, defaultPidFile, type RuntimeReadiness } from "../runtime/lifecycle.js";
+import {
+  BridgeRuntime,
+  defaultPidFile,
+  readBridgePidFile,
+  type RuntimeReadiness,
+} from "../runtime/lifecycle.js";
+import {
+  LEASE_PROBE_TIMEOUT_MS,
+  probeHttpHealth,
+  reclaimWedgeCoreLease,
+  type HealthEndpoint,
+} from "../runtime/core-lease.js";
 import {
   type AgentKind,
   type ArtifactRecord,
@@ -1964,13 +1975,15 @@ function openStoreAndPrune(): void {
  * pidfile **恒写**：stdio 桥（由宿主作为子进程拉起、会覆盖常驻进程记录）已退役，
  * 不再存在「两形态共用 dataDir 而 pidfile 打架」的场景。
  */
-function createBridgeRuntime(mode: TransportMode): BridgeRuntime {
+function createBridgeRuntime(mode: TransportMode, endpoint: HealthEndpoint): BridgeRuntime {
   return new BridgeRuntime({
     dataDir: DATA_DIR,
     mode,
     scheduler,
     openStore: openStoreAndPrune,
     pidFile: defaultPidFile(DATA_DIR),
+    // K3：owner 把自身 `/health` 端点写进 pidfile，供下一个实例的前置探针定位 holder
+    endpoint,
   });
 }
 
@@ -2045,7 +2058,28 @@ async function startWebIfEnabled(mode: TransportMode, readiness: RuntimeReadines
 async function startHttpBridge(): Promise<void> {
   const { host, port, path } = transportConfig().http;
   let ready = false;
-  const runtime = createBridgeRuntime("http");
+  /**
+   * K3 前置探针（v0.7.2 REQ-01 ③）：**必须在 `startHttpTransport()` 绑定端口之前**执行 ——
+   * 本进程一旦绑定，配置端点上的 `/health` 响应者就是**自身**，探针将自证而失去意义。
+   * 此时观察到的 `/health` 才是 holder 的真实状态：`ECONNREFUSED`（端口已释放）= 文档化 wedge 特征
+   * ⇒ 回收僵死锁，使本次启动可竞争 owner；探针失败 / 超时 / 端点不明 ⇒ 保守不动（宁可阻塞）。
+   */
+  const pidRecord = readBridgePidFile(defaultPidFile(DATA_DIR));
+  const reclaimed = await reclaimWedgeCoreLease(DATA_DIR, (holder) => {
+    if (pidRecord === null || pidRecord.pid !== holder.pid) return "unknown";
+    if (pidRecord.host === undefined || pidRecord.port === undefined) return "unknown";
+    return probeHttpHealth(
+      { host: pidRecord.host, port: pidRecord.port },
+      LEASE_PROBE_TIMEOUT_MS,
+    );
+  });
+  if (reclaimed) {
+    bridgeLog.warn(
+      "a2a-bridge",
+      "检测到僵死 core 租约（holder pid 存活但 /health 不在服务）→ 已回收，本次启动竞争 owner",
+    );
+  }
+  const runtime = createBridgeRuntime("http", { host, port });
   activeRuntime = runtime;
   const core = createCore();
   /**

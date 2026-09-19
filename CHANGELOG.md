@@ -6,6 +6,40 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.7.2] - 2026-09-19
+
+> 主题：**bridge 停机 wedge 修复**（单一需求 · `REQ-v0.7.2-2026-09-18-01` + Step 3 实测增补轨）。**三端硬性要求**（Linux / macOS / Windows；POSIX = Linux + macOS 同分支）。改造文档：`doc/v0.7.2/bridge停机wedge修复-改造文档.md`（final）。
+
+### Fixed
+
+- **shutdown 不退（主嫌）**：`orch/bridge/transports/http.ts` 的 `close()` 由裸 `server.close(cb)`（无界 await —— keep-alive / Runner 长轮询连接滞留 ⇒ 停机链不 settle、进程不退、`core.lock` 不释放）改为 **`closeIdleConnections()` + 有界兜底 timer → `closeAllConnections()` 强断并 resolve**（幂等守卫；长轮询是活动连接，仅关空闲无效 ⇒ 强断兜底不可省）。
+- **`bridgectl stop` 判据 = 端口而非进程**：成功判据改 **「端口释放 ∧ 进程退出」**（pidfile pid + `isPidAlive` 后置校验）；pid 超时未退 ⇒ **`killForce` 兜底首次可达**；**清 pidfile 仅在确证进程退出之后**；未达标 ⇒ `ok:false` 且保留 pidfile（不再假报「已停止」）。
+- **`killForce` POSIX 名实不符**：原发 SIGTERM（优雅信号，对 wedge 进程无强杀能力，与桥自身 SIGTERM handler 重复）⇒ 改 **`kill(-pid, "SIGKILL")` 组杀 + `ESRCH` 回落单 pid**；Windows 维持 `taskkill /T /F`。`killForce` 与 `bridgectl-probe` 的 `killTree` **收敛为同一进程工具模块 `orch/scripts/lib/proc.mjs`**。
+- **租约 liveness 探针（免人工删 `core.lock`）**：`orch/runtime/core-lease.ts` 新增 `reclaimWedgeCoreLease`，由 `startHttpBridge` 在绑端口前调用 —— holder pid 存活时探其自广播端点（pidfile 新增 `host`/`port` 广播，锁文件格式未动）；**四态保守判据**：pid 死 ⇒ 既有清锁路径；确认不在服务（ECONNREFUSED ⇒ not-serving）⇒ 删锁接管；探针失败/超时/抛错 ⇒ 保守视为活不接管；判定期间锁易主 ⇒ 不删不接管。独立短超时 300ms。
+- **drain/stop 预算对齐**：`bridgectl` stop 等待 15s → **45s**（= drain 30s + 15s 余量，两侧交叉注释锚定），消除「正常慢停机被提前宣告已停止」。
+- **config warn spam**：`orch/config.ts` 两写点（`web.allowStdio` 死配置 · `machines[i].launcherUrl` 缺省/非法——Runner 端点每请求现读 config 导致 ~25s 刷屏）改 **warnOnce（同文案 per-process 仅一次）**；不缓存 config、热改语义不变。
+- **`bridgectl` 退出卫生（Step 3 增补轨）**：**18 处强制 `process.exit()` 清零**（`CliExit` + `process.exitCode` 收口）—— 消除 `restart` 成功路径的 **libuv 断言崩溃 + 退出码污染 `-1073740791`(0xC0000409)**；HTTP 轮询 `fetch` → `node:http`（`agent:false` + `connection:close`）；退出码契约 `{0,1}` 不变。
+- **`start` 输出 `pid=undefined`（Step 3 增补轨）**：改读 `data/bridge.pid` 权威 pid（读不到如实报「未知（pidfile 未就位）」）。
+
+### Added
+
+- **`bridgectl start/restart` 新增 `--wait-ready` / `--ready-timeout`**（opt-in，与 `--no-wait` 互斥）：`exit 0` 仅在 `/health` 的 `status === "ok"`（对齐 machine `--wait-ready` 与 v0.6.2 契约 C4 判据键）。
+- **`machine/scripts/launcherctl.mjs` 同构修复**：两分支停止判据同口径「端口释放 ∧ 进程退出」；**POSIX 补可达强杀兜底**（SIGTERM → 有界等待 → SIGKILL，原缺失）；Windows `taskkill /T /F` 检查 `result.error`/`result.status`（原丢弃）；未达标 `ok:false` 且不删 pidfile。
+- 回归测试 `test-v0.7.2-wedge-fix.js`；orch 新增测试：`test/proc.test.mjs`（killForce / isPidAlive 注入式三端断言 + entry guard）、`test/bridgectl.test.mjs`（无强制退出 + 退出码契约 + 无 libuv 断言）、`test/http-transport-close.test.ts`（close 有界三态）、core-lease 四态用例、config warn-once 用例。
+
+### Verified
+
+- 门禁：orch `typecheck` **0** / `lint` **0** / `npm test` **228 tests / 227 pass / 0 fail / 1 skip（POSIX 集成 win32 跳过）/ 6.2s 自然退出**；machine `typecheck` 0 + `node --check`。
+- 真机（宿主 + 用户分工）：**V1** 旧桥 wedge 现场复现 ⇒ 新判据等满 45s ⇒ killForce 强杀 ⇒ **零人工恢复**；**V2** 新桥 3/3 stop 优雅退出（不再 taskkill/删锁）；**C** 假锁（活 pid + pidfile 广播死端口）⇒ 探针 ECONNREFUSED ⇒ **删锁接管 owner**（缺广播时保守不接管——意外实证）；**E** warn 节流**行号级实证**（每进程恰 1 条、存活期 0 重复）；**复验** restart **exit 0 无断言 + pid 权威输出**；每次换桥后 MCP / Runner 自动重连。
+- Step 3：用户「通过 + 发版」。
+
+### 未覆盖（遗留验证，**不得默认算通过**）
+
+- **POSIX 真机**（Linux/macOS 无真机）：SIGKILL 投递与 POSIX stop 路径仅结构级断言（注入式）+ 源码审查；launcher 孙进程孤儿残余（launcher 自身 SIGTERM handler 兜住）未真机。
+- **doStop「端口释放但 pid 活」边界无自动化用例**（doStop 未导出；真机 V1 已实测该分支）—— 发版回归补受控断言。
+- **bridgectl start/restart 退出路径无自动化断言**（隔离手工 E2E 覆盖）—— 发版回归补受控用例。
+- K3 探针仅对新格式 pidfile（含 host/port）生效；旧格式 ⇒ 保守不接管（安全方向）。PID 复用误杀理论面（路径窄，本版不改）。
+
 ## [v0.7.1] - 2026-09-18
 
 > 主题：**编排等待与提醒 + stdio transport 退役**（两条需求 · `REQ-v0.7.1-2026-09-18-01` / `REQ-v0.7.1-2026-09-18-02`）。两者**均不改状态机语义、不新增 Feature 态**。

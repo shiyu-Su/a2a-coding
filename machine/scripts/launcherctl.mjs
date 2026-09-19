@@ -49,6 +49,12 @@ import { fileURLToPath } from "node:url";
 const READY_TIMEOUT_MS = 30_000;
 /** stop 等待端口释放的超时 */
 const STOP_TIMEOUT_MS = 15_000;
+/**
+ * POSIX stop 的 SIGTERM→SIGKILL 宽限（K7 强杀兜底）：与 launcher/process.ts 的 KILL_GRACE_MS 同值、
+ * **各单元独立实现、零共享代码**。宽限内 pid 仍在 ⇒ 单 pid SIGKILL 强杀（K7 冻结为单 pid 方案，
+ * 孙进程残余见改造文档 §6-8）。
+ */
+const STOP_TERM_GRACE_MS = 5_000;
 /** 单次 TCP 探测超时 / 轮询间隔 */
 const PROBE_TIMEOUT_MS = 1_000;
 const PROBE_INTERVAL_MS = 200;
@@ -234,11 +240,28 @@ async function waitForHealth(host, port, timeoutMs, predicate) {
   }
 }
 
-/** 轮询端口释放；释放返回 true，超时返回 false */
-async function waitPortRelease(port, host, timeoutMs) {
+/**
+ * 轮询**停止收口判据**：`端口已释放 ∧ 进程已退出`（K7 三端统一口径）。
+ * `probePort` 只是单次 TCP connect（对端套接字一关即 false），不能单独作准 ⇒ 追加 `isPidAlive`
+ * 后置校验；pid 未知（pidfile 缺失）时退化为仅看端口，`exited` 置 null 表示无法校验。
+ * 返回 `{ released, exited }`：`exited` = true（已退出）/ false（仍存活）/ null（无法校验）。
+ */
+async function waitStopConverged(port, host, pid, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    if (!(await probePort(port, host))) return true;
+    const released = !(await probePort(port, host));
+    const exited = pid === undefined ? null : !isPidAlive(pid);
+    if (released && exited !== false) return { released, exited };
+    if (Date.now() >= deadline) return { released, exited };
+    await delay(PROBE_INTERVAL_MS);
+  }
+}
+
+/** 轮询进程退出（pid 消失 ⇒ true）；有界超时仍存活 ⇒ false */
+async function waitPidExit(pid, timeoutMs) {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (!isPidAlive(pid)) return true;
     if (Date.now() >= deadline) return false;
     await delay(PROBE_INTERVAL_MS);
   }
@@ -644,12 +667,23 @@ async function doStop(config) {
   if (listening && config.shutdownEndpoint) {
     const endpointOk = await tryShutdownEndpoint(config, host, port);
     if (endpointOk) {
-      const released = await waitPortRelease(port, host, STOP_TIMEOUT_MS);
-      if (released) {
+      const targetPid = pidfile?.pid;
+      // 收口判据 = 端口释放 ∧ 进程退出（pidfile 缺失时退化为仅看端口）
+      const converged = await waitStopConverged(port, host, targetPid, STOP_TIMEOUT_MS);
+      if (converged.released && converged.exited !== false) {
         removePidfileIfPresent();
-        return { ok: true, message: `已停止（端口 ${port} 已释放，POST /shutdown）` };
+        const pidNote =
+          converged.exited === true
+            ? `，pid=${targetPid} 已退出`
+            : "（pidfile 缺失，进程退出未校验）";
+        return { ok: true, message: `已停止（端口 ${port} 已释放，POST /shutdown${pidNote}）` };
       }
-      return { ok: false, message: `停止超时：端口 ${port} 仍被占用` };
+      return {
+        ok: false,
+        message: `停止未达标（POST /shutdown）：端口 ${port} ${
+          converged.released ? "已释放" : "仍被占用"
+        }${converged.exited === false ? `，pid=${targetPid} 仍存活` : ""}`,
+      };
     }
   }
 
@@ -675,12 +709,26 @@ async function doStop(config) {
   }
 
   const pid = pidfile.pid;
+  const deadline = Date.now() + STOP_TIMEOUT_MS;
   if (process.platform === "win32") {
     info(`强制停止（Windows taskkill /PID ${pid} /T /F）…`);
-    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
+    const result = spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
       stdio: ["ignore", "pipe", "pipe"],
       windowsHide: true,
     });
+    // taskkill 失败不得静默：error（未执行 / 命令缺失）与 status（非 0）都必须显式拦下
+    if (result.error !== undefined) {
+      return {
+        ok: false,
+        message: `taskkill 执行失败：${result.error instanceof Error ? result.error.message : String(result.error)}`,
+      };
+    }
+    if (result.status !== 0) {
+      return {
+        ok: false,
+        message: `taskkill 失败（退出码 ${result.status}）：/PID ${pid} /T /F 未确认杀除`,
+      };
+    }
   } else {
     info(`发送 SIGTERM（优雅停止）pid=${pid} …`);
     try {
@@ -693,14 +741,36 @@ async function doStop(config) {
         };
       }
     }
+    // 有界等待进程退出；宽限内仍在 ⇒ 单 pid SIGKILL 强杀兜底（孙进程残余见改造文档 §6-8）
+    const graceDeadline = Math.min(Date.now() + STOP_TERM_GRACE_MS, deadline);
+    if (!(await waitPidExit(pid, graceDeadline - Date.now()))) {
+      info(`SIGTERM 宽限 ${STOP_TERM_GRACE_MS}ms 内 pid=${pid} 未退出，发送 SIGKILL 强杀 …`);
+      try {
+        process.kill(pid, "SIGKILL");
+      } catch (err) {
+        if (err?.code !== "ESRCH") {
+          return {
+            ok: false,
+            message: `发送 SIGKILL 失败：${err instanceof Error ? err.message : String(err)}`,
+          };
+        }
+      }
+    }
   }
 
-  const released = await waitPortRelease(port, host, STOP_TIMEOUT_MS);
-  if (released) {
+  // 收口判据 = 端口释放 ∧ 进程退出（K7 三端统一口径）
+  const converged = await waitStopConverged(port, host, pid, deadline - Date.now());
+  if (converged.released && converged.exited !== false) {
     removePidfileIfPresent();
-    return { ok: true, message: `已停止（端口 ${port} 已释放）` };
+    return { ok: true, message: `已停止（端口 ${port} 已释放，pid=${pid} 已退出）` };
   }
-  return { ok: false, message: `停止超时：端口 ${port} 仍被占用（pid=${pid}）` };
+  // 未达标：ok:false 且**不删 pidfile**（保留现场供排查）
+  return {
+    ok: false,
+    message: `停止超时：端口 ${port} ${
+      converged.released ? "已释放" : "仍被占用"
+    }，pid=${pid} ${converged.exited === false ? "仍存活" : "状态未知"}（pidfile 已保留）`,
+  };
 }
 
 /** 取文本尾部 count 行（忽略结尾空行） */

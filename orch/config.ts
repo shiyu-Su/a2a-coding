@@ -16,6 +16,39 @@ function fail(msg: string): never {
   throw new Error(`[config] ${msg}`);
 }
 
+/**
+ * 进程内**已发 warn 文案**集合（v0.7.2 K6：文案级 once-per-process 去重）。
+ *
+ * 动机：`loadMachinesConfig` 被多条 **per-request** 路径现读 ——
+ * - Runner 端点：`bridge/index.ts` 把 `config: () => loadMachinesConfig(...)` 包成惰性闭包注入，
+ *   `/runner/register` 每请求读、`/runner/connect` 长轮询约 25s/轮读；
+ * - MCP 工具处理器：`loadMachines()` ⇒ `locateProject` / `dispatchTask` / `registerFeatureNode` /
+ *   `handleTaskStatus` / `handleCancel` / `handleProjects`，每次工具调用读。
+ *
+ * 坏配置（`web.allowStdio` 残留、`machines[].launcherUrl` 缺省/非法）会按
+ * 「每台机器 × 每请求」重复打印，淹没启动日志。本去重**只作用于告警文案**：
+ * - **不缓存 config** —— 解析仍每次现读 ⇒ 配置热改（成员的增删 / 段增删 / `launcherUrl` 增删）
+ *   即时生效，语义与去重前完全一致；
+ * - **不改 schema**、**不 fail-fast**；
+ * - **同文案仅 warn 一次**；**不同文案各自独立**（`machines[0]` 与 `machines[1]` 文案因下标不同 ⇒ 各一条）。
+ */
+const warnedTexts = new Set<string>();
+
+/** 同文案在进程内仅 `console.warn` 一次，其余静默（不同文案互不影响） */
+function warnOnce(msg: string): void {
+  if (warnedTexts.has(msg)) return;
+  warnedTexts.add(msg);
+  console.warn(msg);
+}
+
+/**
+ * 测试专用：清空「已发 warn 文案」集合，使同一文案在后续用例中可再次观测到告警。
+ * **生产路径不得调用**（会破坏 once-per-process 语义）。
+ */
+export function resetWarnOnceCache(): void {
+  warnedTexts.clear();
+}
+
 function asRecord(v: unknown, ctx: string): Record<string, unknown> {
   if (typeof v !== "object" || v === null || Array.isArray(v)) {
     fail(`${ctx} 必须是对象`);
@@ -138,6 +171,7 @@ const DEFAULT_WEB_PORT = 3300;
  * - `port` 非法（非整数 / 越界 / 类型错）一律结构化报错（复用 `fail`），不静默降级。
  * - `allowStdio`（v0.7.1 起随 stdio 退役成**死配置**）：显式出现仅 **warn + 忽略**，
  *   **不 fail-fast**（避免旧部署因残留键直接起不来）；解析产物不再含该字段。
+ *   v0.7.2 K6：该告警**文案级 once-per-process 去重**（同文案进程内仅 warn 一次）。
  */
 function parseWeb(v: unknown): WebConfig {
   const w = asRecord(v, "web");
@@ -145,7 +179,7 @@ function parseWeb(v: unknown): WebConfig {
   const hostRaw = w["host"];
   const portRaw = w["port"];
   if (w["allowStdio"] !== undefined) {
-    console.warn("[config] web.allowStdio 已退役（stdio transport 退役）：按死配置 warn + 忽略。");
+    warnOnce("[config] web.allowStdio 已退役（stdio transport 退役）：按死配置 warn + 忽略。");
   }
   return {
     enabled: enabledRaw === undefined ? DEFAULT_WEB_ENABLED : asBool(enabledRaw, "web.enabled"),
@@ -288,19 +322,23 @@ export function parseProjectGroup(value: unknown, machineIds: ReadonlySet<string
  * - **存在且为非空字符串** ⇒ 原样保留（旧配置零改动，出站路径退役前仍可用）；
  * - **存在但非法**（空串 / 非字符串）⇒ 告警 + 忽略（归一为 `""`），不抛错。
  *
+ * v0.7.2 K6：上述告警**文案级 once-per-process 去重**。文案内嵌 `machines[i]` 下标 ⇒
+ * **每台机器各一条**（不同下标 = 不同文案），但同一台机器**不再按每请求重复刷屏**。
+ * 去重只作用于告警，**不影响解析结果**（`launcherUrl` 仍每次现读，热改即时生效）。
+ *
  * ⚠ 类型侧 `MachineRef.launcherUrl` 暂保持必填（`bridge/index.ts` 出站路径仍直接解引用，
  * 改成可选会连带 typecheck 变红），故此处恒返回字符串；待出站路径退役节点（A6）后转可选。
  */
 function parseLauncherUrl(v: unknown, index: number): string {
   const ctx = `machines[${index}].launcherUrl`;
   if (v === undefined) {
-    console.warn(
+    warnOnce(
       `[config] ${ctx} 缺省：v0.7.0 起入站指挥通道退役（Runner 反向注册替代），该字段可选、不再 fail-fast。`,
     );
     return "";
   }
   if (typeof v === "string" && v.length > 0) return v;
-  console.warn(`[config] ${ctx} 非法（须为非空字符串）：按解析宽容忽略。`);
+  warnOnce(`[config] ${ctx} 非法（须为非空字符串）：按解析宽容忽略。`);
   return "";
 }
 

@@ -1,6 +1,6 @@
 {
   "name": "@a2a-coding/orch",
-  "version": "0.7.1",
+  "version": "0.7.2",
   "private": true,
   "type": "module",
   "engines": {
@@ -16,7 +16,8 @@
     "bridge:status": "node scripts/bridgectl.mjs status",
     "bridge:logs": "node scripts/bridgectl.mjs logs",
     "lint": "eslint .",
-    "test": "npm run build && node --test \"dist/test/*.test.js\"",
+    "test": "npm run build && node --test \"dist/test/*.test.js\" \"test/*.test.mjs\"",
+    "test:proc": "node --test test/proc.test.mjs",
     "format": "prettier --write .",
     "format:check": "prettier --check ."
   },

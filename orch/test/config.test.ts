@@ -13,16 +13,31 @@
  * 存在合法 ⇒ 原样保留且不告警）、`machines[].token` 可选解析（存在须非空字符串）、
  * 顶层可选 `runner` 段（缺省 / 空段 / 部分缺省 ⇒ 25000 / 60000；非法结构 ⇒ fail-fast）、
  * 协议常量 `PROTOCOL_VERSION === "2.0"` 与 `SUPPORTED_PEER_PROTOCOL_MAJORS === [2]`。
+ * 覆盖（v0.7.2 K6）：warn **文案级 once-per-process 去重** —— 同一坏配置重复解析 ⇒ 同文案仅
+ * warn 一次（次数 = 1）、不同文案（缺省 / 非法 / 不同机器下标 / allowStdio）互不去重、
+ * 去重不改解析语义（结果一致、合法配置仍零告警）；`resetWarnOnceCache` 提供用例级隔离。
  *
  * 运行：`npm test`（先 `tsc` 构建，再 `node --test dist/test/`）。
  */
-import { test } from "node:test";
+import { beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { defaultProjectGroup, defaultRunner, loadMachinesConfig, memberKey } from "../config.js";
+import {
+  defaultProjectGroup,
+  defaultRunner,
+  loadMachinesConfig,
+  memberKey,
+  resetWarnOnceCache,
+} from "../config.js";
 import { PROTOCOL_VERSION, SUPPORTED_PEER_PROTOCOL_MAJORS } from "../types.js";
+
+// v0.7.2 K6：warn 文案级 once-per-process 去重 —— 每个用例前重置去重态，
+// 保证「同一文案在本用例内的首次告警」可观测（仅测试隔离，不改生产语义）。
+beforeEach(() => {
+  resetWarnOnceCache();
+});
 
 /** 在临时目录落一份配置文件并交给回调解析（用例结束即清理） */
 function withConfig<T>(raw: unknown, fn: (path: string) => T): T {
@@ -207,6 +222,8 @@ test("非法 web.enabled → 结构化报错（必须布尔值）；web.allowStd
       () => withConfig(minimalConfig({ web: { enabled: bad } }), loadMachinesConfig),
       /\[config\] web\.enabled 必须是布尔值/,
     );
+    // K6：逐次重置去重态 —— 每个 bad 值都应观测到「本窗口内的首次」allowStdio 告警
+    resetWarnOnceCache();
     const { warnings } = captureWarn(() =>
       withConfig(minimalConfig({ web: { allowStdio: bad } }), loadMachinesConfig),
     );
@@ -499,6 +516,8 @@ test("launcherUrl 存在且合法：原样保留，且不产生告警（旧配�
 
 test("launcherUrl 存在但非法（空串 / 非字符串）：warn + 忽略（归一为 \"\"），不抛错", () => {
   for (const launcherUrl of ["", 3100, null, true]) {
+    // K6：同文案逐次重置去重态，观测每个取值的「本窗口首次」告警
+    resetWarnOnceCache();
     const { value: cfg, warnings } = captureWarn(() =>
       withConfig(machineConfig({ machineId: "m1", launcherUrl }), loadMachinesConfig),
     );
@@ -578,4 +597,66 @@ test("runner 阈值非法（0 / 负 / 小数 / 类型错）→ 结构化报错�
 
 test("defaultRunner：唯一缺省构造（段缺省态与缺省解析结果一致）", () => {
   assert.deepEqual(defaultRunner(), RUNNER_DEFAULTS);
+});
+
+// ── v0.7.2 K6：warn 文案级 once-per-process 去重（防 per-request 现读刷屏）──────
+
+test("K6 去重：同一坏配置重复解析 ⇒ 同文案仅 warn 一次（次数 = 1）", () => {
+  const { warnings } = captureWarn(() => {
+    for (let i = 0; i < 3; i += 1) {
+      withConfig(machineConfig({ machineId: "m1" }), loadMachinesConfig);
+    }
+  });
+  const hits = warnings.filter((w) => w.includes("machines[0].launcherUrl 缺省"));
+  assert.equal(hits.length, 1, `期望同文案恰 1 次，实际：${JSON.stringify(warnings)}`);
+  assert.equal(warnings.length, 1, `期望整轮仅 1 条告警，实际：${JSON.stringify(warnings)}`);
+});
+
+test("K6 去重：不同文案互不去重（缺省 vs 非法、不同机器下标各自一条）", () => {
+  const badConfig = {
+    machines: [{ machineId: "m1" }, { machineId: "m2", launcherUrl: 3100 }],
+  };
+  const { warnings } = captureWarn(() => {
+    withConfig(badConfig, loadMachinesConfig);
+    withConfig(badConfig, loadMachinesConfig);
+  });
+  const missing = warnings.filter((w) => w.includes("machines[0].launcherUrl 缺省"));
+  const illegal = warnings.filter((w) => w.includes("machines[1].launcherUrl 非法"));
+  assert.equal(missing.length, 1, `缺省文案应恰 1 次：${JSON.stringify(warnings)}`);
+  assert.equal(illegal.length, 1, `非法文案应恰 1 次：${JSON.stringify(warnings)}`);
+  assert.equal(warnings.length, 2, `两次解析同配置应恰 2 条告警：${JSON.stringify(warnings)}`);
+});
+
+test("K6 去重：allowStdio 与 launcherUrl 文案相互独立（各自仅一次）", () => {
+  const badConfig = { machines: [{ machineId: "m1" }], web: { allowStdio: true } };
+  const { warnings } = captureWarn(() => {
+    withConfig(badConfig, loadMachinesConfig);
+    withConfig(badConfig, loadMachinesConfig);
+  });
+  assert.equal(
+    warnings.filter((w) => w.includes("web.allowStdio")).length,
+    1,
+    JSON.stringify(warnings),
+  );
+  assert.equal(
+    warnings.filter((w) => w.includes("machines[0].launcherUrl 缺省")).length,
+    1,
+    JSON.stringify(warnings),
+  );
+  assert.equal(warnings.length, 2, JSON.stringify(warnings));
+});
+
+test("K6：去重不改变解析语义（解析结果逐字段一致；合法配置仍零告警）", () => {
+  const { value: parsed, warnings } = captureWarn(() => {
+    const first = withConfig(machineConfig({ machineId: "m1" }), loadMachinesConfig);
+    const second = withConfig(machineConfig({ machineId: "m1" }), loadMachinesConfig);
+    return { first, second };
+  });
+  assert.equal(parsed.first.machines[0]?.launcherUrl, "");
+  assert.equal(parsed.second.machines[0]?.launcherUrl, "");
+  assert.deepEqual(parsed.first.machines, parsed.second.machines);
+  assert.equal(warnings.length, 1, JSON.stringify(warnings));
+
+  const legal = captureWarn(() => withConfig(minimalConfig(), loadMachinesConfig));
+  assert.deepEqual(legal.warnings, []);
 });

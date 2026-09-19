@@ -29,6 +29,24 @@ import type { BridgeCore } from "../index.js";
 import { createServer } from "../register-tools.js";
 import type { RunnerEndpointHandle } from "../runner.js";
 
+/**
+ * HTTP 接入面关闭兜底预算（ms）：`server.close()` 等待在飞请求自然收尾的上限；
+ * 到点仍有连接未收尾 ⇒ `closeAllConnections()` 强行断开全部连接并 resolve。
+ *
+ * **为什么不可裸用 `server.close()`**：keep-alive 连接会让 `server.close()` 的回调**永不触发**
+ * ⇒ 停机链不 settle、`process.exit(0)` 不可达、进程不退、`core.lock` 不释放
+ * （v0.7.2 K1 主嫌；同仓 `web.ts#closeServer` 已正确处理该陷阱，本文件此前漏改）。
+ *
+ * **为何 `closeAllConnections()` 兜底不可省**：Runner 长轮询（`runner.ts#handleConnect`，
+ * hold 至 `holdMs` 缺省 25s）是**活动连接**，`closeIdleConnections()` 对其无效 —— 只能强断；
+ * 而 `/shutdown` 的响应在 close 前已 `res.end()`（`handleShutdownRequest`）⇒ 强断不截断响应。
+ *
+ * **与停机预算自洽（v0.7.2 K4 对齐，O1 落常量）**：本预算 **5s** + 排空上限
+ * （`runtime/lifecycle.ts#readDrainGraceMs()` 缺省 **30s**）= 35s ≤ `scripts/bridgectl.mjs`
+ * 的 `STOP_TIMEOUT_MS`（**45s**），留 10s 余量；改本值须同步复核那两处交叉注释。
+ */
+export const HTTP_CLOSE_GRACE_MS = 5_000;
+
 /** 非 loopback 绑定的告警对象（host 名或 IP、IPv4-mapped IPv6） */
 export function isLoopbackHostOrAddress(value: string): boolean {
   const v = value.toLowerCase();
@@ -70,7 +88,11 @@ export interface HttpTransportOptions {
 export interface HttpTransportHandle {
   /** 实际监听端口（`port=0` 时为系统分配值） */
   readonly port: number;
-  /** 停止接受新请求并等待在飞请求收尾（停机第一步，§2.5） */
+  /**
+   * 停止接受新请求，并在**有界预算**（`HTTP_CLOSE_GRACE_MS`）内等待在飞请求收尾
+   * （停机第一步，§2.5）；预算内未收尾 ⇒ `closeAllConnections()` 强断全部连接后 resolve。
+   * **幂等**：重复调用返回同一 Promise（不新起兜底 timer、不抛不挂）。
+   */
   close(): Promise<void>;
 }
 
@@ -117,16 +139,43 @@ export async function startHttpTransport(
     health: "/health",
     shutdown: "/shutdown",
   });
+  // 幂等收口：重复 close 复用同一 Promise（不重入 closeServer、不新起兜底 timer）
+  let closePromise: Promise<void> | null = null;
   return {
     port: boundPort,
-    close: async (): Promise<void> => {
-      await new Promise<void>((resolve) => {
-        server.close(() => {
-          resolve();
-        });
-      });
+    close: (): Promise<void> => {
+      closePromise ??= closeServer(server);
+      return closePromise;
     },
   };
+}
+
+/**
+ * 关闭 listener（停机第一步）：**必须**先 `closeIdleConnections()`（否则 keep-alive 空闲连接
+ * 会让 `server.close()` 的回调永不触发），并以 **`HTTP_CLOSE_GRACE_MS` 兜底 `closeAllConnections()`**
+ * 强制收尾（Runner 长轮询等活动连接只能强断）。幂等（`settled` 守卫）；未监听时 `server.close`
+ * 直接回调（无 error 事件）。与 `web.ts#closeServer` 同构，仅预算值不同（见常量 JSDoc）。
+ */
+function closeServer(server: Server): Promise<void> {
+  return new Promise<void>((resolve) => {
+    let settled = false;
+    function finish(): void {
+      if (settled) return;
+      settled = true;
+      clearTimeout(grace);
+      resolve();
+    }
+    const grace = setTimeout(() => {
+      bridgeLog.warn(
+        "a2a-bridge",
+        `MCP 接入面关闭兜底：${HTTP_CLOSE_GRACE_MS}ms 内仍有连接未收尾，强制断开全部连接`,
+      );
+      server.closeAllConnections();
+      finish();
+    }, HTTP_CLOSE_GRACE_MS);
+    server.close(() => finish());
+    server.closeIdleConnections();
+  });
 }
 
 function listen(server: Server, port: number, host: string): Promise<void> {

@@ -66,10 +66,10 @@ npm run bridge:logs      # 输出日志全文（支持 --lines N / --follow）
 - **缺省 `start` 的等待目标 = 服务可答**；桥侧即 `GET /health` 返回 **HTTP 200 且 `status:"ok"`**（≤ `READY_TIMEOUT_MS` 30s；启动自检 `recover()` 为本地同步，30s 为宽裕上界）。超时 ⇒ `exit 1`。
 - **`--no-wait` 后须另起 `npm run bridge:status` 确认就绪**；`--no-wait` 输出的 **pid 仅供参考**（并发竞态下可能指向被接管的败者子进程）。
 - **调用拼写**：`npm run bridge:start -- --no-wait`（npm 会吞掉 script 名后的**裸** `--no-*`，必须用 `--` 分隔）。`restart` 同理：`npm run bridge:restart -- --no-wait`。
-- **`restart --no-wait` 仅作用 start 段**；stop 段仍阻塞（`POST /shutdown` ≤5s + 等待端口释放 ≤15s×2，极端 ≤35s），整体重启**非瞬时返回**。
+- **`restart --no-wait` 仅作用 start 段**；stop 段仍阻塞（`POST /shutdown` ≤5s + 等待端口释放 ≤45s×2，极端 ≤95s），整体重启**非瞬时返回**。
 - **占用判定以 `/health` 的 `status` 为键**（不依赖 HTTP 状态码）：
   - 端口在监听但 `/health` 不可答 / 不可解析，或 `status` 缺失 / 非白名单（`ok` / `starting`）⇒ **端口被非本桥进程占用** ⇒ `exit 1`；
   - `status === "ok"` ⇒ **已在运行且已就绪** ⇒ `exit 0`；
   - `status === "starting"` ⇒ **本服务启动中（已在运行但未就绪）** —— 缺省 / `--no-wait` 均即返 `0`。
 - **退出码恒 `{0,1}`**：`0` = 已发起 / 已就绪 / 已在运行；`1` = 超时 / 被非本桥占用 / spawn 失败。
-- **桥不提供 `--wait-ready`**：orch 缺省 `start` 的等待目标已等价于「业务就绪」（`status:"ok"`），故无需该开关；这是与 machine 侧分层判据（缺省 L1 + opt-in L2）的**有意差异**。
+- **`--wait-ready`（opt-in）**：显式等待就绪（`GET /health` 的 `status === "ok"`）后才 `exit 0`，超时 `exit 1`；可配 `--ready-timeout <ms>` 放宽就绪预算（缺省 30s，治就绪窗口假阴性）。入口探测为 `starting` 时缺省 / `--no-wait` 即返 0，而 `--wait-ready` **续等至 ok**。与 `--no-wait` 互斥（同传即报错），仅 `start` / `restart` 接受。orch 缺省 `start` 的等待目标本就等价于业务就绪（`status:"ok"`），故该开关主要用于「显式确认 / 放宽预算 / 等待 `starting` 收敛」。

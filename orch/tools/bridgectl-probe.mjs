@@ -27,12 +27,13 @@
  *
  * 退出码：0 = 6 条断言全过；1 = 任一失败（含超时 / 意外异常）。
  */
-import { spawn, spawnSync } from "node:child_process";
+import { spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isPidAlive, killForce } from "../scripts/lib/proc.mjs";
 
 // ── 路径 ─────────────────────────────────────────────────────────────────────
 const TOOLS_DIR = dirname(fileURLToPath(import.meta.url));
@@ -137,31 +138,13 @@ function prepareWorkspace() {
 }
 
 // ── 进程 / 端口 / HTTP 基础工具（全部有界） ──────────────────────────────────
+/**
+ * 强杀进程树（best-effort 清理；REQ-v0.7.2 K9：与 `scripts/bridgectl.mjs` 的 `killForce`
+ * 收敛为**同一实现** `scripts/lib/proc.mjs`，此处只忽略返回结果 —— 探针语义为「尽力清理、
+ * 不因强杀失败中断断言」；进程存活判定 `isPidAlive` 亦同样取自该模块）。
+ */
 function killTree(pid) {
-  if (typeof pid !== "number" || pid <= 0) return;
-  if (process.platform === "win32") {
-    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
-      stdio: "ignore",
-      windowsHide: true,
-    });
-    return;
-  }
-  try {
-    process.kill(pid, "SIGKILL");
-  } catch {
-    // 进程已退出：忽略
-  }
-}
-
-/** ESRCH=不存在；EPERM=存在但无权限（视为存活）；其余错误一律视为不存在 */
-function isPidAlive(pid) {
-  if (typeof pid !== "number" || pid <= 0) return false;
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err?.code === "EPERM";
-  }
+  killForce(pid);
 }
 
 /**

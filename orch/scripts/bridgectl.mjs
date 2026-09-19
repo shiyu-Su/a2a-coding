@@ -15,6 +15,9 @@
  * 单实例互斥由桥内部承担（端口绑定即互斥 + core 租约），本脚本**不实现任何锁**：
  * start 只做「先探测再起」的快速判定；stop 优先 `POST /shutdown`（仅 loopback）优雅停机、
  * 超时兜底强杀；status/logs 依赖 pidfile + 端口探测，**pidfile 缺失/陈旧只探测提示、不误杀**。
+ * **停止成功判据 = 端口释放 ∧ 进程退出**（K5a）：`/shutdown` 的 200 仅代表「受理」，端口释放
+ * （`server.close()` 同步停监听）不代表进程已退 ⇒ 须 `readPidfile()` + `isPidAlive` 后置校验；
+ * pid 超时未退则落入 `killForce` 兜底，**确证进程已退之后**才清 pidfile。
  *
  * Windows 脱壳拉起（REQ-v0.6.2-2026-09-18-02 增补#2 节点 E-N1；与 machine 侧**同契约、异实现**）：
  *   常驻桥经 WMI `Win32_Process.Create` 脱壳（挂 WmiPrvSE，**不在**调用方作业 / 进程树内），
@@ -36,8 +39,17 @@
  * 等待语义（C1/C2）：`start` **缺省**等待服务可答（`/health` 200 且 `status:"ok"`）后返回
  * （≤ `READY_TIMEOUT_MS`）；`--no-wait` 发起即返（exit 0 = 已发起，**≠ 就绪**；仅 spawn
  * 同步失败才 exit 1）。**缺省 0 ≠ 业务就绪**。`restart --no-wait` **仅 start 段**生效，
- * stop 段仍阻塞（最长约 35s = shutdown 5s + 强杀等待 15s×2），**非瞬时返回**。
+ * stop 段仍阻塞（最长约 95s = `POST /shutdown` ≤5s + 等待端口释放 ≤45s×2），**非瞬时返回**。
  * 退出码恒 `{0,1}`（C5）。
+ *
+ * 退出卫生（v0.7.2 X1）：**主流程不使用 process.exit**（改设 `process.exitCode` 后自然排空），
+ * HTTP 一律走 `node:http`（`agent:false` + `Connection: close`，响应结束即释放 socket），
+ * 以规避 Windows 退出期 libuv 断言（`!(handle->flags & UV_HANDLE_CLOSING)`）污染退出码。
+ *
+ * opt-in `--wait-ready`（配 `--ready-timeout <ms>`，缺省 `READY_TIMEOUT_MS`）显式等待就绪：
+ * 判据 = `GET /health` 的 `status === "ok"`（与入口探测同判据键；不含 role / recover）。用途：
+ * 入口探测为 `starting` 时**续等至 ok**（缺省该分支即返 0），或放宽就绪预算（>30s，治 v0.7.1
+ * 的 `restart --no-wait` 就绪假阴性）；超时 exit 1。与 `--no-wait` 互斥（同传 ⇒ 显式报错 exit 1）。
  *
  * status 退出码约定（与 `cmdStatus` 实现一致）：桥在运行 → 0；未运行 → 0；
  * 探测/配置异常（端口被非本桥占用、`/health` 不健康、配置不可读）→ 非零。
@@ -58,14 +70,26 @@ import {
   rmSync,
   statSync,
 } from "node:fs";
+import { request as httpRequest } from "node:http";
 import { createConnection } from "node:net";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
+import { isPidAlive, killForce as killForceImpl } from "./lib/proc.mjs";
 
 /** start 等待 `/health` 就绪的超时（含启动自检 / `recover()`，故留足余量） */
 const READY_TIMEOUT_MS = 30_000;
-/** stop 等待端口释放的超时（优雅停机 / 强杀共用） */
-const STOP_TIMEOUT_MS = 15_000;
+/**
+ * stop 等待端口释放的超时（优雅停机 / 强杀共用）。
+ *
+ * **跨单元同源常量**：与 `orch/runtime/lifecycle.ts` 的 `readDrainGraceMs()` 对齐 ——
+ * 优雅停机内部的排空预算缺省 **30s**（env `BRIDGE_DRAIN_GRACE_MS`），故本超时须
+ * **≥ 排空上限 + 余量**，否则「排空尚未结束」的正常慢停机会被误判为优雅停机超时、
+ * 提前落入强杀兜底。取值 = 30s 排空 + 15s 余量（**不强行等值**）。
+ * 脚本不 import TS 产物，故此处常量须与 `readDrainGraceMs()` 缺省值手工保持一致
+ * （先例：`machine/scripts/launcherctl.mjs` 的 `DEFAULT_STARTUP_CHECK_TIMEOUT_MS`）。
+ * **改一侧必须同步改另一侧**；若运维经 `BRIDGE_DRAIN_GRACE_MS` 抬高排空预算，须同步抬升本值。
+ */
+const STOP_TIMEOUT_MS = 45_000;
 /** `POST /shutdown` 单次请求超时 */
 const SHUTDOWN_TIMEOUT_MS = 5_000;
 /** 单次 TCP 探测超时 / 轮询间隔 */
@@ -91,9 +115,22 @@ const PIDFILE_PATH = join(DATA_DIR, "bridge.pid");
 const LOG_DIR = join(DATA_DIR, "logs");
 const LOG_PATH = join(LOG_DIR, "bridge.log");
 
+/**
+ * 显式失败（退出码 1）——**不强制退出进程**：抛 `CliExit` 由 `main()` 收口设 `process.exitCode`，
+ * 让事件循环**自然排空**（治 v0.7.2 X1 退出期 libuv 断言 / 退出码被污染为 0xC0000409）。
+ * stderr 呈现与退出码契约 {0,1} 不变。
+ */
+class CliExit extends Error {
+  constructor(code) {
+    super(`explicit exit ${code}`);
+    this.name = "CliExit";
+    this.code = code;
+  }
+}
+
 function fail(message) {
   console.error(`[bridgectl] ${message}`);
-  process.exit(1);
+  throw new CliExit(1);
 }
 
 function info(message) {
@@ -103,6 +140,11 @@ function info(message) {
 /** 降级告警（stdout，必须可见）：如脱壳不可用时提示「调用方可能被拖住」 */
 function warn(message) {
   console.log(`[bridgectl] 警告：${message}`);
+}
+
+/** pid 展示：读不到（pidfile 未就位）如实呈现，**不编造** */
+function formatPid(pid) {
+  return typeof pid === "number" ? String(pid) : "未知（pidfile 未就位）";
 }
 
 function delay(ms) {
@@ -170,10 +212,6 @@ function formatHost(host) {
   return host.includes(":") ? `[${host}]` : host;
 }
 
-function baseUrl(host, port) {
-  return `http://${formatHost(host)}:${port}`;
-}
-
 /** 单次 TCP 连接探测：能连上即认为端口已监听 */
 function probePort(port, host, timeoutMs = PROBE_TIMEOUT_MS) {
   return new Promise((resolvePromise) => {
@@ -189,23 +227,58 @@ function probePort(port, host, timeoutMs = PROBE_TIMEOUT_MS) {
   });
 }
 
+/**
+ * 极简 HTTP 请求（**node:http**，非 fetch / undici）：`agent:false` + `Connection: close`
+ * ⇒ 一请求一 socket、响应结束即释放，**不残留 keep-alive 池化句柄**（治 v0.7.2 X1 退出期 libuv
+ * 断言：`fetch` 的 undici 全局 agent 会持有 socket，退出时句柄未收尾）。
+ * 网络错误 / 超时 ⇒ `null`；成功 ⇒ `{ statusCode, body }`（body 为 utf8 文本）。
+ */
+function httpRequestText(host, port, requestPath, method, timeoutMs) {
+  return new Promise((resolvePromise) => {
+    let settled = false;
+    const done = (value) => {
+      if (settled) return;
+      settled = true;
+      resolvePromise(value);
+    };
+    const req = httpRequest(
+      { host, port, path: requestPath, method, agent: false, headers: { connection: "close" } },
+      (res) => {
+        let body = "";
+        res.setEncoding("utf8");
+        res.on("data", (chunk) => {
+          body += chunk;
+        });
+        res.on("end", () => done({ statusCode: res.statusCode ?? 0, body }));
+        res.on("error", () => done(null));
+      },
+    );
+    req.setTimeout(timeoutMs, () => {
+      req.destroy();
+      done(null);
+    });
+    req.on("error", () => done(null));
+    req.end();
+  });
+}
+
 /** GET /health；网络错误 / 非 JSON 返回 null（其余情况带回 httpStatus + body 字段） */
 async function httpHealth(host, port, timeoutMs = 2_000) {
+  const res = await httpRequestText(host, port, "/health", "GET", timeoutMs);
+  if (res === null) return null;
+  let body;
   try {
-    const res = await fetch(`${baseUrl(host, port)}/health`, {
-      signal: AbortSignal.timeout(timeoutMs),
-    });
-    const body = await res.json().catch(() => null);
-    if (body === null || typeof body !== "object") return null;
-    return {
-      httpStatus: res.status,
-      status: typeof body.status === "string" ? body.status : undefined,
-      role: typeof body.role === "string" ? body.role : undefined,
-      version: typeof body.version === "string" ? body.version : undefined,
-    };
+    body = JSON.parse(res.body);
   } catch {
     return null;
   }
+  if (body === null || typeof body !== "object") return null;
+  return {
+    httpStatus: res.statusCode,
+    status: typeof body.status === "string" ? body.status : undefined,
+    role: typeof body.role === "string" ? body.role : undefined,
+    version: typeof body.version === "string" ? body.version : undefined,
+  };
 }
 
 /**
@@ -234,25 +307,26 @@ async function waitForReady(host, port, timeoutMs, onStatus) {
   }
 }
 
-/** 轮询端口释放；释放返回 true，超时返回 false */
-async function waitPortRelease(port, host, timeoutMs) {
+/**
+ * 轮询**停止收口判据**：`端口已释放 ∧ 进程已退出`（K5a；与 machine `launcherctl.mjs` 的
+ * `waitStopConverged` 同口径、各自实现，不共享代码）。
+ * `probePort` 只是单次 TCP connect（对端套接字一关即 false）⇒ 不能单独作准，须追加 `isPidAlive`
+ * 后置校验；pid 未知（pidfile 缺失）时退化为仅看端口，`exited` 置 null 表示无法校验。
+ * 返回 `{ released, exited }`：`exited` = true（已退出）/ false（仍存活）/ null（无法校验）。
+ */
+async function waitStopConverged(port, host, pid, timeoutMs) {
   const deadline = Date.now() + timeoutMs;
   for (;;) {
-    if (!(await probePort(port, host))) return true;
-    if (Date.now() >= deadline) return false;
+    const released = !(await probePort(port, host));
+    const exited = pid === undefined ? null : !isPidAlive(pid);
+    if (released && exited !== false) return { released, exited };
+    if (Date.now() >= deadline) return { released, exited };
     await delay(PROBE_INTERVAL_MS);
   }
 }
 
-/** 进程存活判定：ESRCH=不存在；EPERM=存在但无权限（视为存活） */
-function isPidAlive(pid) {
-  try {
-    process.kill(pid, 0);
-    return true;
-  } catch (err) {
-    return err?.code === "EPERM";
-  }
-}
+// 进程存活判定 `isPidAlive` 见 `./lib/proc.mjs`（K8/K9 收敛；注入式纯函数，三端可结构级断言）；
+// 语义：仅 `ESRCH` 判「不存在」，其余错误（EPERM / EINVAL / …）**保守判活**。
 
 function removePidfileIfPresent() {
   if (!existsSync(PIDFILE_PATH)) return;
@@ -393,14 +467,18 @@ function launchBridge(config) {
  * 入口探测（端口已监听）按 `/health` 的 `status` 三分类（键 = `status`，见文件头）：
  *   - `httpHealth === null`（可连但 /health 不可达 / 非 JSON）⇒ **真占用**（`occupied`，exit 1）
  *   - `status === "ok"` ⇒ 已就绪 / 已在运行（`already`，exit 0）
- *   - `status === "starting"` ⇒ 本服务启动中 ⇒ **缺省与 `--no-wait` 均即返 0**（`starting`）
+ *   - `status === "starting"` ⇒ 本服务启动中 ⇒ **缺省与 `--no-wait` 均即返 0**（`starting`）；
+ *     但 opt-in `--wait-ready` 时**续等至 `status === "ok"`** ⇒ `ready`（exit 0）/ `ready-timeout`（exit 1）
  *   - `status` 缺失 / 非白名单 ⇒ 占用（`occupied`，exit 1）
  * 端口未监听则拉起：`--no-wait` 发起即返（`spawned`）；缺省轮询至 `200 && status === "ok"`
- * （`started`），超时 `timeout`（exit 1）。spawn **同步**抛错 ⇒ `spawn-failed`（exit 1）。
- * 不退出，返回 `{ kind, host, port, health, pid, sawStarting?, error? }` 供调用方决定输出 / 退出码。
+ * （`started`，等待上限 = `options.readyTimeoutMs ?? READY_TIMEOUT_MS`），超时 `timeout`（exit 1）。
+ * spawn **同步**抛错 ⇒ `spawn-failed`（exit 1）。
+ * 不退出，返回 `{ kind, host, port, health, pid, sawStarting?, readyTimeoutMs?, error? }` 供调用方决定输出 / 退出码。
  */
 async function doStart(config, options = {}) {
   const noWait = options.noWait === true;
+  const waitReady = options.waitReady === true;
+  const readyTimeoutMs = options.readyTimeoutMs ?? READY_TIMEOUT_MS;
   const host = resolveProbeHost(config);
   const port = config.port;
 
@@ -415,7 +493,31 @@ async function doStart(config, options = {}) {
       return { kind: "already", host, port, health, pid: undefined };
     }
     if (health.status === "starting") {
-      // ③ 本服务启动中：入口探测遇 starting ⇒ 缺省 / --no-wait 均即返 0
+      // ③ 本服务启动中：缺省 / --no-wait 即返 0；`--wait-ready` 则续等至 status:"ok"
+      if (waitReady) {
+        const ready = await waitForReady(host, port, readyTimeoutMs, options.onStatus);
+        const pid = readPidfile()?.pid;
+        if (ready.health === null) {
+          return {
+            kind: "ready-timeout",
+            host,
+            port,
+            health: null,
+            pid,
+            sawStarting: true,
+            readyTimeoutMs,
+          };
+        }
+        return {
+          kind: "ready",
+          host,
+          port,
+          health: ready.health,
+          pid,
+          sawStarting: true,
+          readyTimeoutMs,
+        };
+      }
       return { kind: "starting", host, port, health, pid: undefined };
     }
     // ④ status 缺失 / 非白名单 / 不可解析 ⇒ 端口被非本桥进程占用
@@ -429,7 +531,14 @@ async function doStart(config, options = {}) {
   const launched = launchBridge(config);
   if (launched.kind === "spawn-failed") {
     // spawn **同步**失败（参数非法 / 资源不可用等）：按契约 exit 1，不得当作「已发起」
-    return { kind: "spawn-failed", host, port, health: null, pid: undefined, error: launched.error };
+    return {
+      kind: "spawn-failed",
+      host,
+      port,
+      health: null,
+      pid: undefined,
+      error: launched.error,
+    };
   }
 
   // 脱壳路径**无本地子进程句柄**（child=undefined）⇒ pid 以 pidfile 为准；缺失即 undefined（判「不确定」）
@@ -441,15 +550,20 @@ async function doStart(config, options = {}) {
     return { kind: "spawned", host, port, health: null, pid: launchPid };
   }
 
-  const ready = await waitForReady(host, port, READY_TIMEOUT_MS, options.onStatus);
+  const ready = await waitForReady(host, port, readyTimeoutMs, options.onStatus);
+  // wait-ready 完成后**重读**桥自写的 pidfile 取**权威 pid**（脱壳路径无本地子进程句柄；
+  // 上一轮曾报 WMI 壳进程 pid 6728，而 pidfile 的 36240 才是真桥）。读不到即 undefined，
+  // 由调用方**如实**输出 `pid=未知（pidfile 未就位）`，不编造。
+  const readyPid = readPidfile()?.pid;
   if (ready.health === null) {
     return {
       kind: "timeout",
       host,
       port,
       health: null,
-      pid: launchPid,
+      pid: readyPid,
       sawStarting: ready.sawStarting,
+      readyTimeoutMs,
     };
   }
   return {
@@ -457,54 +571,63 @@ async function doStart(config, options = {}) {
     host,
     port,
     health: ready.health,
-    pid: launchPid,
+    pid: readyPid,
     sawStarting: ready.sawStarting,
   };
 }
 
 /** 优雅停机端点（`POST /shutdown`，仅 loopback）；成功返回 true */
 async function tryShutdownEndpoint(host, port) {
-  try {
-    const res = await fetch(`${baseUrl(host, port)}/shutdown`, {
-      method: "POST",
-      signal: AbortSignal.timeout(SHUTDOWN_TIMEOUT_MS),
-    });
-    if (res.status === 200) {
-      info("已发送 POST /shutdown（优雅停机：排空在飞 → 关库 → 释放租约 → 删 pidfile）");
-      return true;
-    }
-    info(`/shutdown 返回 HTTP ${res.status}，转入强杀兜底`);
-    return false;
-  } catch (err) {
-    info(`/shutdown 请求失败（${err instanceof Error ? err.message : String(err)}），转入强杀兜底`);
+  const res = await httpRequestText(host, port, "/shutdown", "POST", SHUTDOWN_TIMEOUT_MS);
+  if (res === null) {
+    info("/shutdown 请求失败 / 超时，转入强杀兜底");
     return false;
   }
+  if (res.statusCode === 200) {
+    info("已发送 POST /shutdown（优雅停机：排空在飞 → 关库 → 释放租约 → 删 pidfile）");
+    return true;
+  }
+  info(`/shutdown 返回 HTTP ${res.statusCode}，转入强杀兜底`);
+  return false;
 }
 
-/** 强杀（Windows `taskkill /PID <pid> /T /F`；POSIX 发 SIGTERM） */
+/**
+ * 强杀（K5c/K8/K9）：杀法本身集中在 `./lib/proc.mjs`（可注入纯函数，三端分支可结构级断言；
+ * 与 `tools/bridgectl-probe.mjs` 的 `killTree` **同源**，避免两套实现）：
+ *   - Windows：`taskkill /PID <pid> /T /F`（不变）；
+ *   - POSIX：`SIGKILL` **进程组**杀 `kill(-pid)`（桥经 `spawnBridgeDetached` 以 `detached:true`
+ *     拉起 ⇒ 桥为进程组组长，组杀可覆盖其子进程）；组不存在（`ESRCH`，含「pid 非组长」的
+ *     兜底情形）时**回落** `kill(pid, "SIGKILL")` 单 pid，避免误伤同号进程组。
+ * 本函数只负责日志与错误呈现，不改动杀法分支。
+ */
 function killForce(pid) {
-  if (process.platform === "win32") {
+  const result = killForceImpl(pid);
+  if (result.method === "taskkill") {
     info(`强制停止（Windows taskkill /PID ${pid} /T /F）…`);
-    spawnSync("taskkill", ["/PID", String(pid), "/T", "/F"], {
-      stdio: ["ignore", "pipe", "pipe"],
-      windowsHide: true,
-    });
-    return;
+  } else if (result.method === "kill-group") {
+    info(`强制停止（POSIX SIGKILL 组杀 pid=${pid}）…`);
+  } else if (result.method === "kill-pid") {
+    info(`强制停止（POSIX 组杀 ESRCH ⇒ 回落单 pid SIGKILL pid=${pid}）…`);
   }
-  info(`发送 SIGTERM（优雅停止）pid=${pid} …`);
-  try {
-    process.kill(pid, "SIGTERM");
-  } catch (err) {
-    if (err?.code !== "ESRCH") {
-      console.error(
-        `[bridgectl] 发送 SIGTERM 失败：${err instanceof Error ? err.message : String(err)}`,
-      );
-    }
+  if (!result.ok) {
+    console.error(
+      `[bridgectl] 强杀失败：${
+        result.error instanceof Error ? result.error.message : String(result.error)
+      }`,
+    );
+  } else if (result.gone === true) {
+    info(`pid=${pid} 已不存在（无需强杀）`);
   }
 }
 
 /**
- * 停止：优先 `POST /shutdown` 优雅停机并等待退出；超时兜底强杀；清 pidfile。
+ * 停止：优先 `POST /shutdown` 优雅停机并等待退出；超时兜底强杀；**确证进程已退**后才清 pidfile。
+ *
+ * **成功判据 = 端口释放 ∧ 进程退出**（K5a；与 machine K7 同口径）：`/shutdown` 返回 200 仅代表
+ * 「受理」（handler 在触发停机前就回 200），端口释放亦不代表进程已退 ⇒ 须 `isPidAlive` 后置校验。
+ * pid 超时未退 ⇒ **落入 `killForce`**（判据收紧后该兜底才可达：此前「端口一释放即提前 return」
+ * 使其永不触发，即 wedge 主症状之一）。任何**未达标**路径一律 `ok:false` 且**保留 pidfile**
+ * （提前删 = 下次 stop 失去定位手段）。
  * pidfile 缺失/陈旧**只探测提示、不误杀**（pidfile 不是锁，陈旧无害）。
  * 不退出，返回 { ok, message }。
  */
@@ -516,11 +639,25 @@ async function doStop(config) {
 
   if (listening) {
     if (await tryShutdownEndpoint(host, port)) {
-      if (await waitPortRelease(port, host, STOP_TIMEOUT_MS)) {
+      // 判据 = 端口释放 ∧ 进程退出；pidfile 缺失（pid 不可知）时退化为仅看端口
+      const targetPid = pidfile?.pid;
+      const converged = await waitStopConverged(port, host, targetPid, STOP_TIMEOUT_MS);
+      if (converged.released && converged.exited !== false) {
         removePidfileIfPresent();
-        return { ok: true, message: `已停止（POST /shutdown 优雅停机，端口 ${port} 已释放）` };
+        const pidNote =
+          converged.exited === true
+            ? `，pid=${targetPid} 已退出`
+            : "（pidfile 缺失，进程退出未校验）";
+        return {
+          ok: true,
+          message: `已停止（POST /shutdown 优雅停机，端口 ${port} 已释放${pidNote}）`,
+        };
       }
-      info(`优雅停机超时（${STOP_TIMEOUT_MS}ms）端口 ${port} 仍占用，转入强杀兜底 …`);
+      info(
+        `优雅停机未达标（${STOP_TIMEOUT_MS}ms）：端口 ${port} ${
+          converged.released ? "已释放" : "仍占用"
+        }${converged.exited === false ? `，pid=${targetPid} 仍存活` : ""} ⇒ 转入强杀兜底 …`,
+      );
     }
 
     if (pidfile === null) {
@@ -538,25 +675,33 @@ async function doStop(config) {
 
     const pid = pidfile.pid;
     killForce(pid);
-    if (await waitPortRelease(port, host, STOP_TIMEOUT_MS)) {
+    const converged = await waitStopConverged(port, host, pid, STOP_TIMEOUT_MS);
+    if (converged.released && converged.exited !== false) {
       removePidfileIfPresent();
-      return { ok: true, message: `已停止（强杀 pid=${pid}，端口 ${port} 已释放）` };
+      return { ok: true, message: `已停止（强杀 pid=${pid}，端口 ${port} 已释放、进程已退出）` };
     }
-    return { ok: false, message: `停止超时：端口 ${port} 仍被占用（pid=${pid}）` };
+    // 未达标：不删 pidfile（保留定位手段），显式失败
+    return {
+      ok: false,
+      message: `停止超时：端口 ${port} ${converged.released ? "已释放" : "仍被占用"}，pid=${pid} ${
+        converged.exited === false ? "仍存活" : "状态未知"
+      }（pidfile 已保留 ${PIDFILE_PATH}）`,
+    };
   }
 
-  // 端口未监听：只探测提示，不误杀
-  if (pidfile !== null && !isPidAlive(pidfile.pid)) {
+  // 端口未监听 —— 判据仍为「端口释放 ∧ 进程退出」
+  if (pidfile === null) {
+    return { ok: true, message: `未运行（端口 ${port} 未监听）` };
+  }
+  if (!isPidAlive(pidfile.pid)) {
     removePidfileIfPresent();
     return { ok: true, message: `未运行（端口 ${port} 未监听）；已清理陈旧 pidfile` };
   }
-  if (pidfile !== null) {
-    return {
-      ok: true,
-      message: `未运行（端口 ${port} 未监听）；pidfile 指向的 pid=${pidfile.pid} 仍存活，仅探测提示、未强杀`,
-    };
-  }
-  return { ok: true, message: `未运行（端口 ${port} 未监听）` };
+  // 端口已释放但进程仍存活 ⇒ 判据不满足：不报成功、不误杀（可能正在启动或已 wedge），保留 pidfile
+  return {
+    ok: false,
+    message: `停止未达标：端口 ${port} 未监听，但 pidfile 指向的 pid=${pidfile.pid} 仍存活（可能正在启动或已 wedge）；未强杀、保留 pidfile ${PIDFILE_PATH}`,
+  };
 }
 
 /** 取文本尾部 count 行（忽略结尾空行） */
@@ -609,12 +754,29 @@ function parsePositiveInt(value, name) {
 }
 
 function parseArgs(argv) {
-  const flags = { lines: undefined, follow: false, help: false, noWait: false };
+  const flags = {
+    lines: undefined,
+    follow: false,
+    help: false,
+    noWait: false,
+    waitReady: false,
+    readyTimeout: undefined,
+  };
   const positionals = [];
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === "--no-wait") {
       flags.noWait = true;
+    } else if (arg === "--wait-ready") {
+      flags.waitReady = true;
+    } else if (arg === "--ready-timeout") {
+      i += 1;
+      flags.readyTimeout = parsePositiveInt(argv[i], "--ready-timeout");
+    } else if (arg.startsWith("--ready-timeout=")) {
+      flags.readyTimeout = parsePositiveInt(
+        arg.slice("--ready-timeout=".length),
+        "--ready-timeout",
+      );
     } else if (arg === "--follow" || arg === "-f") {
       flags.follow = true;
     } else if (arg === "--lines" || arg === "-n") {
@@ -629,6 +791,14 @@ function parseArgs(argv) {
     } else {
       positionals.push(arg);
     }
+  }
+  // C3：--no-wait（发起即返）与 --wait-ready（等待就绪）语义互斥 ⇒ 显式报错（不静默取其一）
+  if (flags.noWait && flags.waitReady) {
+    fail("--no-wait 与 --wait-ready 不能同时使用（前者发起即返，后者等待 status=ok）");
+  }
+  // --ready-timeout 仅承载 --wait-ready 的就绪等待上限，脱离 --wait-ready 无意义 ⇒ 显式报错
+  if (flags.readyTimeout !== undefined && !flags.waitReady) {
+    fail("--ready-timeout 仅在 --wait-ready 下有效");
   }
   return { command: positionals[0], flags };
 }
@@ -655,8 +825,13 @@ function printUsage() {
                         npm run bridge:start -- --no-wait
                         npm run bridge:restart -- --no-wait
                     ! restart 的 --no-wait 仅作用于 start 段：stop 段仍阻塞
-                      （最长约 35s = shutdown 5s + 强杀等待 15s×2），该次返回非瞬时。
+                      （最长约 95s = shutdown 5s + 强杀等待 45s×2），该次返回非瞬时。
                     ! --no-wait 报出的 pid 仅供参考，须另起 status 确认（C8）。
+  --wait-ready      显式等待就绪（GET /health 返回 status:"ok"）后才 exit 0；超时 exit 1。
+                    与 --no-wait 互斥（同传即报错）。用途：入口探测为 starting 时续等至 ok，
+                    或配合 --ready-timeout 放宽就绪预算（治 restart --no-wait 就绪假阴性）。
+  --ready-timeout <ms>
+                    --wait-ready 的就绪等待上限（缺省 30000）；仅在 --wait-ready 下有效。
 
 选项（logs）：
   -n, --lines <N>   仅输出尾部 N 行
@@ -676,6 +851,8 @@ function printUsage() {
 
 async function cmdStart(flags) {
   const noWait = flags.noWait === true;
+  const waitReady = flags.waitReady === true;
+  const readyTimeoutMs = flags.readyTimeout ?? READY_TIMEOUT_MS;
   const config = loadConfig();
   if (config.mode !== "http") {
     fail(
@@ -686,6 +863,8 @@ async function cmdStart(flags) {
 
   const result = await doStart(config, {
     noWait,
+    waitReady,
+    readyTimeoutMs,
     onStatus: (health) => {
       if (health !== null && health.status === "starting") {
         info("state: starting（服务已可答，尚未就绪；继续等待至 ok …）");
@@ -693,6 +872,8 @@ async function cmdStart(flags) {
     },
   });
 
+  // 各分支只设 `process.exitCode` 后 return（**不强制退出**）：让已打开的句柄自然排空，
+  // 避免 Windows 退出期 libuv 断言污染退出码（v0.7.2 X1）。退出码契约 {0,1} 不变。
   switch (result.kind) {
     case "occupied": {
       const detail =
@@ -703,7 +884,7 @@ async function cmdStart(flags) {
         `[bridgectl] 端口 ${result.port} 已被占用（非本桥）：${formatHost(result.host)}:${result.port} ${detail}；` +
           `已中止 start（exit 1、未写 pidfile、未启动桥）。请先释放该端口，或改用其它 transport.http.port。`,
       );
-      process.exit(1);
+      process.exitCode = 1;
       return;
     }
     case "spawn-failed": {
@@ -712,16 +893,38 @@ async function cmdStart(flags) {
           result.error instanceof Error ? result.error.message : String(result.error)
         }；exit 1（未发起）。`,
       );
-      process.exit(1);
+      process.exitCode = 1;
       return;
     }
     case "timeout": {
       console.error(
-        `[bridgectl] state: ${result.sawStarting === true ? "starting" : "unreachable"}；启动失败（超时 ${READY_TIMEOUT_MS}ms）：` +
-          `${formatHost(result.host)}:${result.port} /health 未达 200+status=ok（pid=${result.pid}）`,
+        `[bridgectl] state: ${result.sawStarting === true ? "starting" : "unreachable"}；启动失败（超时 ${
+          result.readyTimeoutMs ?? READY_TIMEOUT_MS
+        }ms）：` +
+          `${formatHost(result.host)}:${result.port} /health 未达 200+status=ok（pid=${formatPid(result.pid)}）`,
       );
       printLogTail(30);
-      process.exit(1);
+      process.exitCode = 1;
+      return;
+    }
+    case "ready": {
+      // --wait-ready 且入口探测为 starting：续等至 status:"ok" 成功
+      info(
+        `state: ok（--wait-ready 已就绪：${formatHost(result.host)}:${result.port}${config.mcpPath}，` +
+          `health=${result.health?.status ?? "ok"}，role=${result.health?.role ?? "未报"}）`,
+      );
+      process.exitCode = 0;
+      return;
+    }
+    case "ready-timeout": {
+      console.error(
+        `[bridgectl] state: starting；--wait-ready 超时（${
+          result.readyTimeoutMs ?? READY_TIMEOUT_MS
+        }ms）：` +
+          `${formatHost(result.host)}:${result.port} /health 未达 status=ok（pid=${formatPid(result.pid)}）；判为「启动未就绪」`,
+      );
+      printLogTail(30);
+      process.exitCode = 1;
       return;
     }
     case "already": {
@@ -730,7 +933,7 @@ async function cmdStart(flags) {
           `health=${result.health?.status ?? "ok"}，role=${result.health?.role ?? "未报"}）`,
       );
       info("提示：缺省 0 ≠ 业务就绪（退出码 0 仅表示 /health 就绪，业务就绪需另行验证）。");
-      process.exit(0);
+      process.exitCode = 0;
       return;
     }
     case "starting": {
@@ -739,19 +942,19 @@ async function cmdStart(flags) {
         `state: starting（${formatHost(result.host)}:${result.port} 上的本服务正在启动中；未接管、未重启）`,
       );
       info("提示：缺省 0 ≠ 业务就绪；本分支不等待 ok，如需确认请另起 `bridgectl status`。");
-      process.exit(0);
+      process.exitCode = 0;
       return;
     }
     case "spawned": {
       info(
-        `state: starting（--no-wait 发起即返：已拉起，未等待就绪）pid=${result.pid}（仅供参考），` +
+        `state: starting（--no-wait 发起即返：已拉起，未等待就绪）pid=${formatPid(result.pid)}（仅供参考），` +
           `endpoint=${formatHost(result.host)}:${result.port}${config.mcpPath}，日志：${LOG_PATH}`,
       );
       info(
         "提示：--no-wait 退出码 0 仅表示「已发起」，≠ 就绪；pid 仅供参考，请另起 `bridgectl status`" +
           "（npm run bridge:status）确认。",
       );
-      process.exit(0);
+      process.exitCode = 0;
       return;
     }
     case "started": {
@@ -759,17 +962,17 @@ async function cmdStart(flags) {
         info("state: starting（启动过程中服务已可答，尚未就绪）");
       }
       info(
-        `state: ok（已后台启动 pid=${result.pid}，health=${result.health?.status ?? "ok"}，` +
+        `state: ok（已后台启动 pid=${formatPid(result.pid)}，health=${result.health?.status ?? "ok"}，` +
           `role=${result.health?.role ?? "未报"}，endpoint=${formatHost(result.host)}:${result.port}${config.mcpPath}，` +
           `日志：${LOG_PATH}）`,
       );
       info("提示：缺省 0 ≠ 业务就绪（退出码 0 仅表示 /health 就绪，业务就绪需另行验证）。");
-      process.exit(0);
+      process.exitCode = 0;
       return;
     }
     default: {
       console.error(`[bridgectl] 未知启动结果：${String(result.kind)}`);
-      process.exit(1);
+      process.exitCode = 1;
       return;
     }
   }
@@ -780,11 +983,12 @@ async function cmdStop() {
   const result = await doStop(config);
   if (result.ok) {
     info(result.message);
-    process.exit(0);
+    process.exitCode = 0;
+    return;
   }
   console.error(`[bridgectl] ${result.message}`);
   console.error(`[bridgectl] 可手动排查：pidfile=${PIDFILE_PATH}`);
-  process.exit(1);
+  process.exitCode = 1;
 }
 
 async function cmdRestart(flags) {
@@ -801,7 +1005,8 @@ async function cmdRestart(flags) {
   const result = await doStop(config);
   if (!result.ok) {
     console.error(`[bridgectl] restart 中止（停止失败）：${result.message}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
   info(result.message);
   await cmdStart(flags);
@@ -860,47 +1065,92 @@ async function cmdStatus() {
   info(`log      : ${LOG_PATH}`);
 
   // 退出码（见本函数顶部注释）：桥在运行 → 0；未运行 → 0；探测异常（端口可连但 /health 不健康）→ 非零。
-  if (running || !listening) process.exit(0);
-  process.exit(1);
+  process.exitCode = running || !listening ? 0 : 1;
 }
 
 async function cmdLogs(flags) {
   if (!existsSync(LOG_PATH)) {
     console.error(`[bridgectl] 日志不存在：${LOG_PATH}`);
-    process.exit(1);
+    process.exitCode = 1;
+    return;
   }
   const content = readFileSync(LOG_PATH, "utf8");
   const output = flags.lines === undefined ? content : lastLines(content, flags.lines);
   process.stdout.write(output.endsWith("\n") || output.length === 0 ? output : `${output}\n`);
   if (flags.follow) await followLog();
-  process.exit(0);
+  process.exitCode = 0;
 }
 
+/**
+ * 主流程收口：**不再强制退出进程** —— `fail()` 抛出的 `CliExit` 在此转成 `process.exitCode`，
+ * 其余已打开句柄（HTTP socket / 子进程 / fd）在事件循环自然排空后一并收尾（v0.7.2 X1）。
+ * 未预期异常同样只设退出码 1（不 `process.exit`），避免再次触发 Windows 退出期 libuv 断言。
+ */
 async function main() {
-  const { command, flags } = parseArgs(process.argv.slice(2));
-  if (flags.help || command === "help" || command === undefined || command === "--help") {
-    printUsage();
-    process.exit(command === undefined ? 1 : 0);
-  }
-  switch (command) {
-    case "start":
-      await cmdStart(flags);
-      break;
-    case "stop":
-      await cmdStop();
-      break;
-    case "restart":
-      await cmdRestart(flags);
-      break;
-    case "status":
-      await cmdStatus();
-      break;
-    case "logs":
-      await cmdLogs(flags);
-      break;
-    default:
-      fail(`未知子命令：${command}（运行 node scripts/bridgectl.mjs --help 查看用法）`);
+  try {
+    const { command, flags } = parseArgs(process.argv.slice(2));
+    if (flags.help || command === "help" || command === undefined || command === "--help") {
+      printUsage();
+      process.exitCode = command === undefined ? 1 : 0;
+      return;
+    }
+    // --wait-ready / --ready-timeout 仅 start / restart 接受（其余命令显式报错，不静默忽略）
+    if (
+      (flags.waitReady || flags.readyTimeout !== undefined) &&
+      command !== "start" &&
+      command !== "restart"
+    ) {
+      fail(`--wait-ready / --ready-timeout 仅适用于 start / restart（当前命令：${command}）`);
+    }
+    switch (command) {
+      case "start":
+        await cmdStart(flags);
+        break;
+      case "stop":
+        await cmdStop();
+        break;
+      case "restart":
+        await cmdRestart(flags);
+        break;
+      case "status":
+        await cmdStatus();
+        break;
+      case "logs":
+        await cmdLogs(flags);
+        break;
+      default:
+        fail(`未知子命令：${command}（运行 node scripts/bridgectl.mjs --help 查看用法）`);
+    }
+  } catch (err) {
+    if (err instanceof CliExit) {
+      process.exitCode = err.code;
+      return;
+    }
+    console.error(
+      `[bridgectl] 未预期错误：${err instanceof Error ? (err.stack ?? err.message) : String(err)}`,
+    );
+    process.exitCode = 1;
   }
 }
 
-await main();
+/**
+ * 本模块是否被 node **作为入口脚本直接执行**（K8 前置；与 `orch/bridge/index.ts` 的
+ * `isEntryModule` 同构）。加此守卫后，`import` 本模块**零副作用**（不再一 import 就跑
+ * `main()`）⇒ `killForce` / `isPidAlive` 所在的 `./lib/proc.mjs` 可被注入式单测直接驱动，
+ * 本模块自身亦可被安全 import。三种真实启动路径（`npm run bridge:*` / 直接 `node
+ * scripts/bridgectl.mjs` / 探针 spawn）的 `argv[1]` 均指向本文件 ⇒ 生产行为零变化。
+ */
+function isEntryModule() {
+  const entry = process.argv[1];
+  if (entry === undefined) return false;
+  const self = fileURLToPath(import.meta.url);
+  const target = resolve(entry);
+  // Windows 路径大小写不敏感（盘符 / 路径段大小写可能不同）⇒ 折半比较
+  return process.platform === "win32"
+    ? self.toLowerCase() === target.toLowerCase()
+    : self === target;
+}
+
+if (isEntryModule()) {
+  await main();
+}

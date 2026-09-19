@@ -16,7 +16,7 @@
  * 至宽限上限（`drainGraceMs`）→ 停 watcher → 关 store → 释放租约 → 删 pidfile。
  * 排空**只等待，不取消远端 A2A 任务**（避免丢工作）。
  */
-import { mkdirSync, rmSync, writeFileSync } from "node:fs";
+import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 import { bridgeLog } from "../bridge/bridge-log.js";
 import {
@@ -31,9 +31,18 @@ import {
   releaseCoreLease,
   type CoreLeaseInfo,
   type CoreRole,
+  type HealthEndpoint,
 } from "./core-lease.js";
 
-/** 停机排空宽限上限（ms，可配 `BRIDGE_DRAIN_GRACE_MS`，默认 30s） */
+/**
+ * 停机排空宽限上限（ms，可配 `BRIDGE_DRAIN_GRACE_MS`，默认 30s）。
+ *
+ * **跨单元同源常量**：`orch/scripts/bridgectl.mjs` 的 `STOP_TIMEOUT_MS`（stop 等待端口释放）
+ * 须 **≥ 本缺省值 + 余量**（当前 45s = 30s 排空 + 15s 余量，**不强行等值**），否则正常慢停机
+ * 会被误判为超时而提前强杀。脚本不 import TS 产物，故两侧以注释互相锚定、值手工对齐
+ * （先例：`machine/scripts/launcherctl.mjs` 的 `DEFAULT_STARTUP_CHECK_TIMEOUT_MS`）。
+ * **改本缺省值时必须同步改 `bridgectl.mjs` 的 `STOP_TIMEOUT_MS`。**
+ */
 export function readDrainGraceMs(
   raw: string | undefined = process.env["BRIDGE_DRAIN_GRACE_MS"],
 ): number {
@@ -86,6 +95,12 @@ export interface BridgeRuntimeOptions {
   closeStore?: () => void;
   /** pidfile 路径；缺省 `<dataDir>/bridge.pid`，传 `null` 关闭（pidfile 不是锁，陈旧无害） */
   pidFile?: string | null;
+  /**
+   * 本进程的 `/health` 端点（K3，v0.7.2 REQ-01 ③）：owner 写入 pidfile，供**下一个实例**
+   * 的前置探针定位 holder 的真实端点（锁文件格式不可改，且不得假设 holder 与本进程同配置）。
+   * 缺省不写 host/port（旧形态零改动可用；此时探针按保守「不接管」处理）。
+   */
+  endpoint?: HealthEndpoint;
   /** 停机排空宽限上限（ms）；缺省 `readDrainGraceMs()` */
   drainGraceMs?: number;
   /** 就绪回调（供 `/health` 报 `role` 等） */
@@ -119,6 +134,48 @@ export interface RuntimeShutdownSummary {
 /** 默认 pidfile 路径（`<dataDir>/bridge.pid`） */
 export function defaultPidFile(dataDir: string): string {
   return join(dataDir, "bridge.pid");
+}
+
+/** pidfile 记录（桥自写；`host` / `port` 为 K3 端点广播，旧文件可能缺失） */
+export interface BridgePidFileRecord {
+  pid: number;
+  role?: string;
+  host?: string;
+  port?: number;
+}
+
+/**
+ * 读 pidfile（K3，v0.7.2 REQ-01 ③）：返回桥自写的 `{ pid, role, host?, port? }`。
+ *
+ * `host` / `port` 是 owner 广播的 `/health` 端点 —— 前置探针据此定位 holder 的**真实**端点
+ * （锁文件格式不可改，且不得假设 holder 与本进程同配置）。缺失 / 不可解析 / 形状不合法 ⇒ `null`
+ * （调用方按「保守不接管」处理）。
+ */
+export function readBridgePidFile(path: string): BridgePidFileRecord | null {
+  let raw: string;
+  try {
+    raw = readFileSync(path, "utf8");
+  } catch {
+    return null;
+  }
+  try {
+    const parsed: unknown = JSON.parse(raw);
+    if (typeof parsed !== "object" || parsed === null) return null;
+    const rec = parsed as Record<string, unknown>;
+    const pid = rec["pid"];
+    if (typeof pid !== "number" || !Number.isInteger(pid) || pid <= 0) return null;
+    const role = rec["role"];
+    const host = rec["host"];
+    const port = rec["port"];
+    return {
+      pid,
+      ...(typeof role === "string" ? { role } : {}),
+      ...(typeof host === "string" ? { host } : {}),
+      ...(typeof port === "number" && Number.isInteger(port) ? { port } : {}),
+    };
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -261,6 +318,9 @@ export class BridgeRuntime {
           mode: this.options.mode,
           role: this.role,
           startedAt: new Date().toISOString(),
+          // K3：广播 `/health` 端点，供下一个实例的前置探针定位 holder（缺省省略 ⇒ 保守不接管）
+          host: this.options.endpoint?.host,
+          port: this.options.endpoint?.port,
         })}\n`,
         "utf8",
       );
