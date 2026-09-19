@@ -81,7 +81,7 @@ import type {
   RiskLevel,
   TaskState,
 } from "../types.js";
-import { SUPPORTED_PEER_PROTOCOL_MAJORS } from "../types.js";
+import { AGENT_KINDS, SUPPORTED_PEER_PROTOCOL_MAJORS } from "../types.js";
 import { bridgeLog } from "./bridge-log.js";
 
 // ---------------------------------------------------------------------------
@@ -130,7 +130,6 @@ export const RUNNER_EVENT_TASK_STALE = "task.stale";
 /** 请求体上限（防御性；超出 413，与回调端点同量级） */
 const RUNNER_MAX_BODY_BYTES = 1_048_576;
 
-const AGENT_KINDS: readonly AgentKind[] = ["opencode", "codex", "claude"];
 const RISK_LEVELS: readonly RiskLevel[] = ["read", "write", "full"];
 const TASK_STATES: readonly TaskState[] = [
   "working",
@@ -1118,7 +1117,10 @@ function parseProjects(value: unknown): ProjectsOutcome {
       return { ok: false, message: `projects[${i}].projectId 必须是非空字符串` };
     }
     if (!isAgentKind(item["agentKind"])) {
-      return { ok: false, message: `projects[${i}].agentKind 非法（可选 opencode / codex / claude）` };
+      return {
+        ok: false,
+        message: `projects[${i}].agentKind 非法（可选 ${AGENT_KINDS.join(" / ")}）`,
+      };
     }
     const a2aPort = item["a2aPort"];
     if (typeof a2aPort !== "number" || !Number.isInteger(a2aPort) || a2aPort < 1 || a2aPort > 65535) {

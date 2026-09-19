@@ -89,6 +89,13 @@ function hintFor(kind: ProjectConfig["agentKind"], stage: SelfCheckFailure["stag
       return "检查认证与 provider：OPENAI_API_KEY 或 ~/.codex/auth.json；provider / 模型见 ~/.codex/config.toml（可经 agentConfig.codex 覆盖）。";
     case "opencode":
       return "检查 opencode CLI 可用且已登录，provider / 模型配置正确（用户全局或项目 opencode.json）。";
+    case "qoder":
+      return "检查 qodercn 认证与登录：把 QODERCN_PERSONAL_ACCESS_TOKEN 注入 Launcher 进程环境（或确认 ~/.qoder-cn/.auth 已 CLI 登录），并确认桥进程 acp-bridge 已随项目拉起（见 Launcher 日志）。";
+    default: {
+      // 编译期安全网（改造文档 §2.3-4）：新增 kind 时此处 `kind` 不再是 never ⇒ 编译报错。
+      const _exhaustive: never = kind;
+      return "该 agentKind 尚无专用修复提示；请查看 Launcher 日志中该项目的包装器输出。";
+    }
   }
 }
 

@@ -29,6 +29,7 @@ const SANDBOX_BY_RISK: Record<PermissionRisk, string> = {
 
 export class CodexAdapter implements Adapter {
   readonly kind: AgentKind = "codex";
+  readonly protocol = "wrapper";
 
   buildLaunch(request: LaunchRequest): LaunchSpec {
     const configPath = request.configPath ?? wrapperConfigPath(this.kind, request.projectId);

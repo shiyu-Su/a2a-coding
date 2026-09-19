@@ -281,19 +281,21 @@ node flow/install/uninstall.mjs --target <项目根>
 | `projects[]` | 本机项目列表 | - | 是 |
 | `projects[].projectId` | 项目标识，全局唯一 | - | 是 |
 | `projects[].workspace` | 执行目录 | - | 是 |
-| `projects[].agentKind` | `opencode` / `codex` / `claude` | - | 是 |
+| `projects[].agentKind` | `opencode` / `codex` / `claude` / `qoder` | - | 是 |
 | `projects[].a2aPort` | 该项目 A2A Server 监听端口 | - | 是 |
 | `projects[].risk` | 项目风险档位，`read` / `write` / `full`，决定包装器传给底层 CLI 的权限 / 沙箱参数 | `write` | 否 |
 | `projects[].agentConfig` | 包装器配置片段，顶层键如 `model` / `mcp` / `events` / `systemPrompt`；launcher 会与默认项 `{ "events": { "enabled": false } }` 深合并，写入 `agents/<agentKind>.<projectId>.json`，经 `--config` 传给包装器，再与包装器内置默认值深合并 | - | 否 |
 | `projects[].agentConfig.agentCard.pushNotifications` | worker push 能力开关；`true` 时项目 Agent 可向 orch 回调端点推送状态变化（配合 orch `callback` + `pushCallback` 使用） | `false`（默认关） | 否 |
 
-`risk` 到各端权限参数的映射（`write` 为默认，恰等于三端包装器内置默认；opencode 只有自动放行开 / 关一个旋钮，`write` 与 `full` 相同）：
+`risk` 到各端权限参数的映射（`write` 为默认，恰等于三端包装器内置默认；opencode 只有自动放行开 / 关一个旋钮，`write` 与 `full` 相同；**qoder（ACP 族）** 经仓内 ACP 桥的 `--risk <read|write|full>` 透传，由桥映射 ACP 权限请求）：
 
 | risk | opencode | codex（`--sandbox`） | claude（`--permission-mode`） |
 |------|----------|----------------------|-------------------------------|
 | `read` | `--no-auto-approve` | `read-only` | `plan` |
 | `write`（默认） | `--auto-approve` | `workspace-write` | `acceptEdits` |
 | `full` | `--auto-approve` | `danger-full-access` | `bypassPermissions` + 配置 `claude.dangerouslyAllowBypassPermissions=true` |
+
+> **qoder（ACP 族，v0.8.0）**：无仓外包装器，由**仓内自持 ACP 桥** `machine/acp-bridge/` 承担 A2A 服务面（桥绑定项目 `a2aPort`，内部以 stdio 拉起 `qodercn --acp`）；`risk` 经桥 `--risk <read|write|full>` 透传。认证优先文件凭据 `~/.qoder-cn/.auth`，备选 env `QODERCN_PERSONAL_ACCESS_TOKEN`（经 Launcher 进程环境透传）。示例见 `machine/config/config.json.default`。
 
 样例：
 

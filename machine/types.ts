@@ -3,19 +3,25 @@
  *
  * - 本机配置与运行态：launcher 直接依赖。
  * - 线协议类型（Bridge ⇄ Launcher HTTP）：按 option a 在两侧各自声明，
- *   orch 侧同名类型见 `src/orch/types.ts`，修改时需两侧同步。
+ *   orch 侧同名类型见 `orch/types.ts`，修改时需两侧同步。
  */
+import type { AgentKind } from "./agent-kinds.js";
 
 /**
  * Bridge ⇄ Launcher 线协议版本（单一事实源：仓库根 PROTOCOL.md；orch 侧同名常量见
  * orch/types.ts，修改需两侧同步并由契约测试锁定）。
- * 规则：加可选字段 minor+1；删字段 / 改语义 / 加必填请求体 major+1。
+ * 规则：加可选字段 minor+1；删字段 / 改语义 / 加必填请求体 major+1；
+ *      必填字段的取值集合扩展 minor+1。
  * v0.7.0：major 由 1.0 升到 2.0（删字段 / 改语义 / 加必填请求体的破坏性变更）。
+ * v0.8.0：minor 升到 2.1（`projects[].agentKind` 必填字段取值集合扩展 +qoder，非破坏）。
  */
-export const PROTOCOL_VERSION = "2.0";
+export const PROTOCOL_VERSION = "2.1";
 
-/** 执行层 Agent 类型（决定 A2A 包装器与 CLI 参数） */
-export type AgentKind = "opencode" | "codex" | "claude";
+/**
+ * 执行层 Agent 类型（决定 A2A 包装器与 CLI 参数）。
+ * 取值集合单一事实源 = `./agent-kinds.js`（本模块仅 re-export，既有 import 站点不变）。
+ */
+export type { AgentKind };
 
 /** 任务风险档位：由适配器映射为各 CLI 的权限 / 沙箱参数 */
 export type RiskLevel = "read" | "write" | "full";

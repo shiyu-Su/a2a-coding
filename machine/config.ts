@@ -1,7 +1,6 @@
 import { readFileSync } from "node:fs";
+import { AGENT_KINDS } from "./agent-kinds.js";
 import type { AgentKind, BridgeConfig, MachineConfig, ProjectConfig, RiskLevel } from "./types.js";
-
-const AGENT_KINDS: readonly AgentKind[] = ["opencode", "codex", "claude"];
 
 function fail(msg: string): never {
   throw new Error(`[config] ${msg}`);

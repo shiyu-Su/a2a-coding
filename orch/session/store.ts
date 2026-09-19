@@ -29,6 +29,7 @@ import type {
   TaskRecord,
   TaskState,
 } from "../types.js";
+import { AGENT_KINDS } from "../types.js";
 
 /**
  * 默认数据库文件：锚定 orch 单元根（`<orch>/data/sessions.sqlite`），**非 cwd 相对**，
@@ -82,7 +83,6 @@ export function truncatePrompt(text: string, max = PROMPT_MAX_CHARS): string {
   return text.length <= max ? text : text.slice(0, max);
 }
 
-const AGENT_KINDS: readonly AgentKind[] = ["opencode", "codex", "claude"];
 // `blocked` 为 orch 本地专属态（v0.4.0 失败传播），纳入校验清单但与 A2A 无对应
 const TASK_STATES: readonly TaskState[] = [
   "working",

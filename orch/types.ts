@@ -9,12 +9,14 @@
 /**
  * Bridge ⇄ Runner 线协议版本（单一事实源：仓库根 PROTOCOL.md；machine 侧同名常量见
  * machine/types.ts，修改需两侧同步并由契约测试锁定）。
- * 规则：加可选字段 minor+1；删字段 / 改语义 / 加必填请求体 major+1。
+ * 规则：加可选字段 minor+1；必填字段取值集合扩展 minor+1；删字段 / 改语义 / 加必填请求体 major+1。
  *
  * v0.7.0：连接模型整体反转为 pull（Launcher 升格 Runner），握手方向/语义为**破坏性变更**
  * ⇒ major bump `1.0 → 2.0`，**发版即硬切**（v1 通道退役，见 `SUPPORTED_PEER_PROTOCOL_MAJORS`）。
+ * v0.8.0：agentKind 取值集合扩展（`+qoder`），字段 / 形状不变 ⇒ minor bump `2.0 → 2.1`
+ * （实际强制来自 `agentKind` 闭集拒绝，版本握手只校验主版本）。
  */
-export const PROTOCOL_VERSION = "2.0";
+export const PROTOCOL_VERSION = "2.1";
 
 /**
  * 桥可支持的对端（Runner）主版本清单。主版本升级时按 PROTOCOL.md 维护流程
@@ -25,8 +27,19 @@ export const PROTOCOL_VERSION = "2.0";
  */
 export const SUPPORTED_PEER_PROTOCOL_MAJORS: readonly number[] = [2];
 
-/** 执行层 Agent 类型（决定 A2A 包装器与 CLI 参数） */
-export type AgentKind = "opencode" | "codex" | "claude";
+/**
+ * 执行层 Agent 类型取值集合（**orch 单元内唯一枚举源**）。
+ *
+ * 取值集合的规范源 = 仓库根 `PROTOCOL.md` 的机器可解析 `agent-kinds` 锚点；
+ * orch（本常量）与 machine（`machine/agent-kinds.ts` 的 `AGENT_KINDS`）各自派生、
+ * **不共享代码**，两侧一致性由回归断言「本地清单 == 锚点」锁定。
+ *
+ * orch 侧仅据此作**闭集校验 / 投影** —— 「决定 A2A 包装器与 CLI 参数」属 machine 侧语义。
+ */
+export const AGENT_KINDS = ["opencode", "codex", "claude", "qoder"] as const;
+
+/** 执行层 Agent 类型（由 `AGENT_KINDS` 派生；勿另立第二份清单） */
+export type AgentKind = (typeof AGENT_KINDS)[number];
 
 /**
  * A2A 任务态。

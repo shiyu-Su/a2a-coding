@@ -437,6 +437,7 @@ export class AgentManager {
       workspace: project.workspace,
       a2aPort: project.a2aPort,
       configPath,
+      agentConfig: project.agentConfig,
       permissionArgs: perm.args,
       ...(backend !== null ? { backendUrl: backend.url } : {}),
     });

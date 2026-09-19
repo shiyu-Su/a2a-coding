@@ -16,44 +16,48 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ProjectConfig } from "../types.js";
+import { A2A_OUTCOME_CONVENTION } from "../agent-outcome.js";
 
-/**
- * v0.3.1 机制②：「显式状态标记」约定文案（三端统一、简短、确定性）。
- *
- * worker 在「需要人工拍板」或「确认无法完成」时，于回复末尾输出一个
- * fenced `a2a-outcome` JSON 块；`@a2a-wrapper/core` 的 `resolveOutcome`
- * 在收口点解析后映射为标准 A2A 任务态（input-required / failed）；正常完成
- * 不输出该块（回退 completed）。文案经三端 wrapper 的 systemPrompt 类通道注入。
- */
-const A2A_OUTCOME_CONVENTION_LINES = [
-  "A2A task outcome convention (follow exactly):",
-  "1) If you need the user to decide something before you can continue, end your reply with this fenced block (replace the placeholder):",
-  "```a2a-outcome",
-  '{"state":"input-required","question":"<the question for the user>"}',
-  "```",
-  "2) If you are certain the task cannot be completed or is blocked, end your reply with:",
-  "```a2a-outcome",
-  '{"state":"failed","reason":"<why it is blocked>"}',
-  "```",
-  "3) On a normal successful completion, do NOT output any a2a-outcome block.",
-  "Output at most one such block, and only as the very last thing in your reply.",
-];
-
-/** 三端共用的约定文案（供适配器 baseConfig() 绑定到各自的 systemPrompt 类配置键）。 */
-export const A2A_OUTCOME_CONVENTION = A2A_OUTCOME_CONVENTION_LINES.join("\n");
+// REQ-v0.8.0-2026-09-19-01 · M1：`A2A_OUTCOME_CONVENTION` 已下沉**零依赖叶模块**
+// `machine/agent-outcome.ts`（消除未来 `acp-bridge → launcher` 依赖倒置）。
+// 此处 re-export 保持既有 import 站点（adapters/*、测试）零改动；本模块自身
+// （DEFAULT_AGENT_CONFIG）经上面的 import 继续使用该常量。
+export { A2A_OUTCOME_CONVENTION };
 
 /**
  * 默认覆盖项：关闭 events（trace / 中间调用）输出；注入 ② 约定。
  *
- * 三端 wrapper 各自只读取自己 kind 段（多余 kind 段被忽略），因此这里一次性写入
- * 三端键以保证约定「必达」；各适配器 `baseConfig()` 再做 kind 级显式绑定。
+ * 各端 wrapper 各自只读取自己 kind 段（多余 kind 段被忽略），因此这里一次性写入
+ * 全部 kind 键以保证约定「必达」；各适配器 `baseConfig()` 再做 kind 级显式绑定。
+ *
+ * qoder（ACP 族）注：桥不走包装器 JSON 配置模型，`qoder` 段当前为**占位** —— 保证
+ * `writeAgentConfig` 产物含 qoder 段（满足 `agent-config-segments` 断言）；outcome 注入
+ * 依 B5 定稿的 ACP 通道（session/new 或首轮 prompt）落地。
  */
 const DEFAULT_AGENT_CONFIG: Record<string, unknown> = {
   events: { enabled: false },
   opencode: { systemPrompt: A2A_OUTCOME_CONVENTION, systemPromptMode: "append" },
   codex: { developerInstructions: A2A_OUTCOME_CONVENTION },
   claude: { systemPromptAppend: A2A_OUTCOME_CONVENTION },
+  qoder: { systemPromptAppend: A2A_OUTCOME_CONVENTION },
 };
+
+/**
+ * 从项目 agentConfig 解析 **ACP 族**后端命令：读**顶层平铺键** `agentConfig.backendCmd`。
+ *
+ * 键位原则：`backendCmd` 是 **machine 自消费键** —— 由 `agentKind` 决定哪个 adapter 读它，
+ * 故**平铺**（同 `timeouts` 等先例）；而 **wrapper 消费的**分段键（`opencode` / `codex` /
+ * `claude` 段）是第三方包装器按段读取的**外部契约**，维持分段。
+ *
+ * `backendCmd` 为 **ACP 族必填**（代码零硬编码缺省，wrapper 族豁免）；缺键 / 非法 / 空串 →
+ * `undefined`（必填判定由调用方负责）。DEFAULT_AGENT_CONFIG **不预置**该键。
+ */
+export function resolveAcpBackendCmd(
+  agentConfig: Record<string, unknown> | undefined,
+): string | undefined {
+  const backendCmd = agentConfig?.["backendCmd"];
+  return typeof backendCmd === "string" && backendCmd.length > 0 ? backendCmd : undefined;
+}
 
 /** 纯对象判定（排除 null 与数组） */
 function isPlainObject(value: unknown): value is Record<string, unknown> {

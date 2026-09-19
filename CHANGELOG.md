@@ -6,6 +6,39 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.8.0] - 2026-09-19
+
+> 主题：**agentKind 分层与 ACP 接缝 + qoder（CN）真机接入**（双需求 · `REQ-v0.8.0-2026-09-18-01` / `REQ-v0.8.0-2026-09-19-01` + 5 条 Step 3 增补轨）。**线协议 2.0 → 2.1**（agentKind 取值集合扩展）。改造文档：`doc/v0.8.0/agentKind分层与ACP接缝-改造文档.md`（final）· `doc/v0.8.0/qoder接入-改造文档.md`（final）。
+
+### Added（REQ-01 · agentKind 分层与 ACP 接缝）
+
+- **单一事实源**：新增零依赖叶模块 `machine/agent-kinds.ts`（`AGENT_KINDS` 唯一声明源）；`machine/types.ts` 改 re-export、`config.ts` 改 import；orch 侧 `orch/types.ts` 单源 + `runner.ts`/`store.ts` 删本地常量改 import（两个 `isAgentKind` 按边界保留）；`PROTOCOL.md:35` 新增机器可解析锚点 `<!-- agent-kinds: ... -->` + 规范源声明，一致性由回归断言「三方清单 == 锚点」锁定（新增 `test-agent-kind-anchor.js`）。
+- **编译期安全网**：`self-check.ts` / `config-snapshot.ts`（×2）三处穷尽 switch 加 `never` 断言 default（新 kind 未加分支即编译报错，运行期兜底中性串）；`agents-prune.ts` 正则改由 `AGENT_KINDS` 派生（新 kind 不再漏清理）。
+- **ACP 接缝（契约级）**：`Adapter` 契约新增 `protocol: "wrapper" | "acp"` 维度 + `AcpAdapter` 接口占位（不含实现、不注册）。
+- **测试补齐**：machine +17（非法 kind 拒 / adapters 逐字锁定 buildLaunch·permission·baseConfig / prune 正则 / `DEFAULT_AGENT_CONFIG` 段一致）；orch +4（注册整包拒 / 写口拒 / 读回脏值守卫 ×2）。
+
+### Added（REQ-02 · qoder 真机接入 + 仓内 ACP 桥）
+
+- **`machine/acp-bridge/` 新子系统**（仓内自持 `a2a-<kind>` 等价物，每项目桥进程 bind 项目 `a2aPort`）：`node:http` A2A 服务（`/a2a/jsonrpc`，`message/send` blocking:false 立即回句柄 / `tasks/get` / `tasks/cancel`，形状逐字兼容 `launcher/a2a-client.ts`）· ACP stdio JSON-RPC 客户端（spawn 后端 + initialize 握手 + 通知分派，可注入）· session 生命周期（new / load|resume 失败回退 / prompt / update 流式累积）· `request_permission` → `read|write|full` 三档映射（含越权拒）· contextId↔sessionId 持久化（`.a2a/acp-sessions/<projectId>.json` 原子写）· outcome 解析 · artifacts 最小集 · 子进程树杀 / 超时 / 端口占用 fail-fast。
+- **`adapters/qoder.ts`**（`protocol="acp"`）：拉起桥进程；`ADAPTERS` 4 键（`Record<AgentKind,Adapter>` 完备性强制）；三处 never 断言 switch 加 qoder case。
+- **`agentConfig.backendCmd`（ACP 族必填，顶层平铺键）**：ACP 后端命令（绝对路径或 PATH 命令名）经 `LaunchRequest.agentConfig` 透传给桥 `--backend-cmd`；代码零硬编码缺省，未配置即启动报错；wrapper 族（opencode/codex/claude）豁免。`config.json.default` 四条目补全键位示例（`_agentConfigComment`，值内嵌必填/非必填标注 + 「占位勿原样拷贝」警示）。
+- **`machine/agent-outcome.ts`**：`A2A_OUTCOME_CONVENTION` 下沉零依赖叶模块（消除 `acp-bridge→launcher` 倒置），`agent-config.ts` 转 re-export（三家 adapter import 站点零改动）。
+- **outcome 注入**：桥经 ACP `session/new`（system-prompt 通道）注入约定；outcome 解析复用叶模块常量（input-required/failed/completed 回退）。
+
+### Changed
+
+- **线协议 2.0 → 2.1**：`PROTOCOL.md` 标题/当前版本/agentKind 枚举（+qoder）/锚点同步；版本规则**补条款「必填字段取值集合扩展 → minor +1」**；演进表加 2.1 行（注明实际强制来自 agentKind 闭集拒绝，版本握手只校验主版本）；双端 `PROTOCOL_VERSION` 常量同步 2.1；`SUPPORTED_PEER_PROTOCOL_MAJORS` 保持 `[2]`。
+- **回归面行级更新**：`test-protocol-version.js`（2.1 + 新增规则/演进行断言）· v0.3.0/v0.4.0/v0.5.0/v0.6.0/v0.7.0 五个历史用例的版本 pin · `orch/test/config.test.ts` 常量断言；`test-v0.7.2-wedge-fix.js` 版本 pin 改下限 ≥0.8.0；新增 `test-v0.8.0-agent-kind-acp.js`（37 断言：三方清单四值 / 线协议 2.1 / 新模块存在性 / backendCmd 平铺 / 文档对齐）。
+- **`LaunchRequest` 增 `agentConfig`**（`manager.ts` 传参接通），wrapper 族忽略。
+
+### Verified
+
+- 真机 E2E（win-dev）：Launcher 自检（真实 qoder 调用，"OK"）· V1 全链（注册→拉起桥→ACP→qoder 真实模型应答 391=17×23）· V2 多轮会话 resume（782=391×2）· V3 opencode 回归（1024）· V4 部署顺序（orch→machine→配置，注册 4 项目、整包拒未触发）。
+- 门禁：machine typecheck 0 / test 141·0（+26）· lint 0；orch typecheck 0 / test 235·0（+4）；回归 **870/870**（`reports/v0.8.0/regression-report.json`）。
+- 未覆盖（登记）：权限三档真机未触发写请求（单测覆盖含越权拒）；artifacts 真机未触发文件产物；P1 方言探针未完整产出（B2 按通用 ACP 规范实现 + 真机 E2E 兜底）；ACP 族 per-project model 透传 → **v0.8.2**；POSIX 侧桥行为仅结构级覆盖。
+
+
+
 ## [v0.7.2] - 2026-09-19
 
 > 主题：**bridge 停机 wedge 修复**（单一需求 · `REQ-v0.7.2-2026-09-18-01` + Step 3 实测增补轨）。**三端硬性要求**（Linux / macOS / Windows；POSIX = Linux + macOS 同分支）。改造文档：`doc/v0.7.2/bridge停机wedge修复-改造文档.md`（final）。

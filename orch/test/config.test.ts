@@ -12,7 +12,7 @@
  * 覆盖（v0.7.0 A1）：`launcherUrl` 必填→可选（缺省解析成功 + warn；存在非法 ⇒ warn + 忽略；
  * 存在合法 ⇒ 原样保留且不告警）、`machines[].token` 可选解析（存在须非空字符串）、
  * 顶层可选 `runner` 段（缺省 / 空段 / 部分缺省 ⇒ 25000 / 60000；非法结构 ⇒ fail-fast）、
- * 协议常量 `PROTOCOL_VERSION === "2.0"` 与 `SUPPORTED_PEER_PROTOCOL_MAJORS === [2]`。
+ * 协议常量 `PROTOCOL_VERSION === "2.1"` 与 `SUPPORTED_PEER_PROTOCOL_MAJORS === [2]`。
  * 覆盖（v0.7.2 K6）：warn **文案级 once-per-process 去重** —— 同一坏配置重复解析 ⇒ 同文案仅
  * warn 一次（次数 = 1）、不同文案（缺省 / 非法 / 不同机器下标 / allowStdio）互不去重、
  * 去重不改解析语义（结果一致、合法配置仍零告警）；`resetWarnOnceCache` 提供用例级隔离。
@@ -490,8 +490,8 @@ function machineConfig(machine: Record<string, unknown>, extra: Record<string, u
 
 const RUNNER_DEFAULTS = { holdMs: 25000, heartbeatTimeoutMs: 60000 };
 
-test("协议常量（v0.7.0 硬切 2.0）：PROTOCOL_VERSION=2.0 / SUPPORTED_PEER_PROTOCOL_MAJORS=[2]", () => {
-  assert.equal(PROTOCOL_VERSION, "2.0");
+test("协议常量（线协议 2.1）：PROTOCOL_VERSION=2.1 / SUPPORTED_PEER_PROTOCOL_MAJORS=[2]", () => {
+  assert.equal(PROTOCOL_VERSION, "2.1");
   assert.deepEqual([...SUPPORTED_PEER_PROTOCOL_MAJORS], [2]);
 });
 

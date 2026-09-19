@@ -22,6 +22,7 @@ import { A2A_OUTCOME_CONVENTION } from "../launcher/agent-config.js";
 
 export class OpenCodeAdapter implements Adapter {
   readonly kind: AgentKind = "opencode";
+  readonly protocol = "wrapper";
 
   buildLaunch(request: LaunchRequest): LaunchSpec {
     // a2a-opencode 真实参数；--opencode-url 指向 Launcher 前置的 `opencode serve`，

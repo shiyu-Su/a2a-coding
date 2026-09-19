@@ -30,6 +30,13 @@ export interface LaunchRequest {
   configPath?: string;
   /** 权限参数（launcher 传入 `permission(risk).args`，追加在基础参数之后） */
   permissionArgs?: string[];
+  /**
+   * 项目 `agentConfig`（本项目实际生效的配置片段，来源 = `ProjectConfig.agentConfig`，与
+   * `writeAgentConfig` / `baseConfig` 同一来源与命名惯例）。
+   * ACP 族（qoder）适配器据此读取**顶层平铺键** `agentConfig.backendCmd`（必填）作为后端命令；
+   * wrapper 族忽略本字段。
+   */
+  agentConfig?: Record<string, unknown>;
 }
 
 /** 一条可执行的启动命令 */
@@ -55,12 +62,44 @@ export interface PermissionSpec {
 /** 单个 agentKind 的完整适配面 */
 export interface Adapter {
   readonly kind: AgentKind;
+  /**
+   * 启动协议维度（改造文档 §2.2/§2.3）。
+   * - `"wrapper"`：经仓外 `a2a-<kind>` 包装器拉起（现有 opencode / codex / claude 三家）；
+   * - `"acp"`：经通用 ACP 接缝拉起（**本轮仅契约占位，无实现、未注册**）。
+   */
+  readonly protocol: "wrapper" | "acp";
   /** 组装拉起 A2A 包装器的命令与参数（含 workspace / port / 权限参数） */
   buildLaunch(request: LaunchRequest): LaunchSpec;
   /** 将任务风险映射为权限参数 + 可选配置补丁 */
   permission(risk: PermissionRisk): PermissionSpec;
   /** 该 kind 的默认包装器配置覆盖项（与 DEFAULT_AGENT_CONFIG 先合并） */
   baseConfig(): Record<string, unknown>;
+}
+
+/**
+ * ACP 族 adapter 契约（**占位**，REQ-v0.8.0-2026-09-18-01 改造文档 §2.2/§2.3）。
+ *
+ * 仅**类型 / 接口占位**：声明「以 ACP 作为启动协议」的 kind 的形状 —— `protocol:"acp"`
+ * 加命令 / 参数 / 认证等启动要素。当前**无实现类、不注册进 `ADAPTERS`**（三家均为
+ * `"wrapper"` 族）；未来接入 ACP kind 时以此接口为实现落点。
+ *
+ * 归属说明：本契约属**执行层适配接缝**，不在 `PROTOCOL.md`（Runner ⇄ Bridge 线协议）
+ * 定义域内；契约文档随本注释落在 machine 侧。
+ */
+export interface AcpAdapter {
+  readonly kind: AgentKind;
+  readonly protocol: "acp";
+  /** 拉起 ACP 后端进程的可执行命令（未来落点，如通用 `a2a-acp` 桥） */
+  readonly command: string;
+  /** 命令基础参数（不含认证；认证经 `auth` 注入） */
+  readonly args?: readonly string[];
+  /** 认证要素：凭据如何注入（形状待真正接入 ACP 时定稿） */
+  readonly auth?: {
+    /** 承载凭据的环境变量名 */
+    readonly envVar: string;
+    /** 凭据来源：进程环境 / 配置文件 */
+    readonly source: "env" | "config";
+  };
 }
 
 /**

@@ -1,0 +1,88 @@
+/**
+ * ACP 桥（`machine/acp-bridge/`）共享类型：A2A 任务形状 + 可注入执行器契约。
+ *
+ * 归属：REQ-v0.8.0-2026-09-19-01 · 节点 B1。**零依赖叶模块**：不 import 仓内任何模块，
+ * 也不 import `orch/**` / `launcher/**`（避免 acp-bridge → launcher 的依赖倒置）。
+ *
+ * 形状口径：与 `machine/launcher/a2a-client.ts` 的读取面**逐字兼容** ——
+ * `id` / `status.state` / `status.message.parts` / `artifacts[].parts`，
+ * 终态集合 = completed / canceled / failed / rejected / input-required / auth-required。
+ */
+
+/** A2A 任务态（`working` + `a2a-client.ts` 的 A2A_TERMINAL_STATES 全集）。 */
+export type TaskState =
+  | "working"
+  | "completed"
+  | "canceled"
+  | "failed"
+  | "rejected"
+  | "input-required"
+  | "auth-required";
+
+/** 终态子集（不含 `working`）。 */
+export type TerminalTaskState = Exclude<TaskState, "working">;
+
+/** v0.3 text part：`{ kind: "text", text }`。 */
+export interface TextPart {
+  kind: "text";
+  text: string;
+}
+
+/** v0.3 message（role 收敛为字面量，防字符串漂移）。 */
+export interface A2AMessage {
+  role: "user" | "agent";
+  parts: TextPart[];
+  messageId: string;
+  contextId?: string;
+}
+
+/** v0.3 artifact（最小集：文本 parts）。 */
+export interface A2AArtifact {
+  artifactId: string;
+  name?: string;
+  parts: TextPart[];
+}
+
+/**
+ * v0.3 Task。`a2a-client.ts` 读取的字段：`id`、`status.state`、
+ * `status.message.parts`、`artifacts[].parts`。
+ */
+export interface A2ATask {
+  id: string;
+  status: { state: TaskState; message?: A2AMessage };
+  artifacts: A2AArtifact[];
+}
+
+/** 执行器入参：桥收到一条 `message/send` 后交给执行器。 */
+export interface TaskExecutionInput {
+  /** 桥分配的任务 id（与 A2A Task.id 同值） */
+  taskId: string;
+  /** message parts 拼接后的文本（prompt） */
+  text: string;
+  /** A2A contextId（缺省为 ""） */
+  contextId: string;
+  /** 原始 A2A messageId */
+  messageId: string;
+}
+
+/** 执行器终态结果（由 B2/B3 的 ACP 会话执行器产出）。 */
+export interface TaskExecutionResult {
+  /** 终态（不含 working） */
+  state: TerminalTaskState;
+  /** 结果文本（写入 `status.message.parts`） */
+  text?: string;
+  /** 产物（写入 `artifacts`） */
+  artifacts?: A2AArtifact[];
+}
+
+/**
+ * 任务执行器（**可注入**）：B1 用 stub；B2/B3 以 ACP 会话执行器替换。
+ * `cancel` 可选：桥收到 `tasks/cancel` 时尽力通知执行器。
+ */
+export interface TaskExecutor {
+  execute(input: TaskExecutionInput): Promise<TaskExecutionResult>;
+  cancel?(taskId: string): void | Promise<void>;
+}
+
+/** 可注入时钟（缺省 `() => new Date()`）。 */
+export type Clock = () => Date;

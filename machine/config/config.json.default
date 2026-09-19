@@ -18,21 +18,55 @@
       "agentKind": "opencode",
       "a2aPort": 3010,
       "risk": "write",
-      "agentConfig": { "agentCard": { "pushNotifications": false } }
+      "_agentConfigComment": "本条目 agentConfig 为键位说明占位——非必填键不需要时请整键删除，勿原样拷贝。",
+      "agentConfig": {
+        "agentCard": { "pushNotifications": false },
+        "events": { "enabled": "<true|false>，非必填（缺省 false：关 trace/中间调用输出；全端共享段）" },
+        "opencode": {
+          "systemPrompt": "<自定义 systemPrompt>，非必填（缺省注入 a2a-outcome 约定）",
+          "systemPromptMode": "<append|replace>，非必填（缺省 append）"
+        },
+        "timeouts": { "prompt": "<毫秒数>，非必填（wrapper 族通用；不配用内置缺省）" }
+      }
     },
     {
       "projectId": "<codex-project-id>",
       "workspace": "<absolute path to the codex project on this machine>",
       "agentKind": "codex",
       "a2aPort": 3011,
-      "risk": "write"
+      "risk": "write",
+      "_agentConfigComment": "本条目 agentConfig 为键位说明占位——非必填键不需要时请整键删除，勿原样拷贝。",
+      "agentConfig": {
+        "codex": {
+          "skipGitRepoCheck": "<true|false>，非必填（缺省 true：workspace 无需是 git 仓库）",
+          "developerInstructions": "<开发者指令>，非必填（缺省注入 a2a-outcome 约定）"
+        }
+      }
     },
     {
       "projectId": "<claude-project-id>",
       "workspace": "<absolute path to the claude project on this machine>",
       "agentKind": "claude",
       "a2aPort": 3012,
-      "risk": "read"
+      "risk": "read",
+      "_agentConfigComment": "本条目 agentConfig 为键位说明占位——非必填键不需要时请整键删除，勿原样拷贝。",
+      "agentConfig": {
+        "claude": {
+          "settingSources": "<[\"user\"]｜[]>，非必填（缺省 [\"user\"]：加载 ~/.claude/settings.json；[] = 完全隔离用户级配置）",
+          "model": "<模型名>，非必填（缺省用 ~/.claude/settings.json 的模型）",
+          "systemPromptAppend": "<追加 systemPrompt>，非必填（缺省注入 a2a-outcome 约定）"
+        }
+      }
+    },
+    {
+      "_comment": "ACP 族（qoder CN）：无仓外 a2a-qoder 包装器，改由仓内自持 ACP 桥（machine/acp-bridge，构建产物 dist/acp-bridge/index.js）承担 A2A 服务面；桥绑定本项 a2aPort，内部再以 stdio 拉起 `qodercn --acp`。认证优先文件凭据 ~/.qoder-cn/.auth（qodercn CLI 登录）；备选 env QODERCN_PERSONAL_ACCESS_TOKEN（经 Launcher 进程环境透传；当前不支持 per-project env）。risk 经桥 --risk <read|write|full> 透传。**必填 agentConfig.backendCmd**（ACP 后端命令，绝对路径或 PATH 命令名；代码零硬编码缺省，未配置即启动报错）。键位原则：backendCmd 是 machine 自消费键（agentKind 已决定哪个 adapter 读它）故**平铺**；wrapper **消费的**分段键（opencode/codex/claude 段）是第三方包装器按段读取的**外部契约**，维持分段。",
+      "projectId": "<qoder-project-id>",
+      "workspace": "<absolute path to the qoder project on this machine>",
+      "agentKind": "qoder",
+      "a2aPort": 3013,
+      "risk": "write",
+      "_agentConfigComment": "agentConfig 键位说明（三类，按「谁来读」区分）：① **machine 自消费键（平铺）**——`backendCmd`（ACP 族必填，见上）· `timeouts`（超时覆盖，如 timeouts.prompt）；② **kind 分段键（wrapper 消费的外部契约）**——`events: {enabled}`（全端共享，缺省 false 关 trace/中间调用输出）· `opencode: {systemPrompt, systemPromptMode}` · `codex: {skipGitRepoCheck, developerInstructions}` · `claude: {settingSources, systemPromptAppend, model, ...}` · `qoder` 段当前为占位（桥不走 wrapper 配置模型）；本项目 agentConfig 里写其它 kind 的段合法但被忽略（运行时文件按段写入、各 wrapper 只读自己那段）；③ **风险补丁由 launcher 强制最后合并**（如 claude full 档 dangerouslyAllowBypassPermissions=true），agentConfig 覆盖不了。合并链：DEFAULT_AGENT_CONFIG ⊕ adapter baseConfig() ⊕ 项目 agentConfig ⊕ 风险补丁 → 产物 agents/<agentKind>.<projectId>.json（每次启动覆盖生成，运行态产物）。 ⚠ 各条目 agentConfig 值均为键位说明占位——非必填键不需要时整键删除，勿原样拷贝。",
+      "agentConfig": { "backendCmd": "<qoderclicn.exe 绝对路径或 PATH 命令名>，必填（ACP 后端命令；代码零硬编码缺省，未配置即启动报错）" }
     }
   ]
 }

@@ -101,6 +101,18 @@ export function resolveModelEndpoint(
         endpoint: "opencode provider 配置",
       };
     }
+    case "qoder": {
+      return {
+        model:
+          fromAgentConfig !== null ? `${fromAgentConfig}（agentConfig）` : "qodercn 配置（ACP）",
+        endpoint: "qoder CN 服务端（经 ACP 桥）",
+      };
+    }
+    default: {
+      // 编译期安全网（改造文档 §2.3-4）：新增 kind ⇒ 此处 `project.agentKind` 不再是 never。
+      const _exhaustive: never = project.agentKind;
+      return { model: "未知 agentKind（中性兜底）", endpoint: "未指定（中性兜底）" };
+    }
   }
 }
 
@@ -121,6 +133,13 @@ function describeHierarchy(project: ProjectConfig, configPath: string): string {
       return `项目 agentConfig（${configPath}）+ 用户级配置（~/.codex/config.toml，运行时始终读取）`;
     case "opencode":
       return `项目 agentConfig（${configPath}）+ 用户全局 opencode 配置与 workspace opencode.json（运行时读取）`;
+    case "qoder":
+      return `项目 agentConfig（${configPath}）+ qodercn 用户级配置（~/.qoder-cn/，经 ACP 桥运行时读取）`;
+    default: {
+      // 编译期安全网（改造文档 §2.3-4）：新增 kind ⇒ 此处 `project.agentKind` 不再是 never。
+      const _exhaustive: never = project.agentKind;
+      return `项目 agentConfig（${configPath}）+ 未知 agentKind 的用户级配置层`;
+    }
   }
 }
 

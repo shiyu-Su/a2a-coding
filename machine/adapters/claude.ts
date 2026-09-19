@@ -25,6 +25,7 @@ import { A2A_OUTCOME_CONVENTION } from "../launcher/agent-config.js";
 
 export class ClaudeAdapter implements Adapter {
   readonly kind: AgentKind = "claude";
+  readonly protocol = "wrapper";
 
   buildLaunch(request: LaunchRequest): LaunchSpec {
     const configPath = request.configPath ?? wrapperConfigPath(this.kind, request.projectId);
