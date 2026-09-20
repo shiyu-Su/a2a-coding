@@ -295,7 +295,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_events",
     {
       description:
-        "读取事件收件箱增量（任务结算/阻塞、Feature 流转、worker push）。省略 since 则自进程读游标起；无变化时廉价空返回。",
+        "读取事件收件箱增量（任务结算/阻塞、Feature 流转）。省略 since 则自进程读游标起；无变化时廉价空返回。",
       inputSchema: {
         since: z
           .number()

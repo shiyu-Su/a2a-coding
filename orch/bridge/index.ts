@@ -17,11 +17,8 @@
  * 跨 MCP 边界的错误一律结构化返回（`{ ok: false, code, error }`），不抛出。
  */
 import { randomUUID } from "node:crypto";
-import { createServer as createHttpServer } from "node:http";
-import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { TaskState as A2aTaskState, taskStateFromJSON } from "@a2a-js/sdk";
 import { appRootFromModule } from "../app-root.js";
 import { defaultProjectGroup, loadMachinesConfig, memberKey } from "../config.js";
 import { BRIDGE_VERSION } from "../version.js";
@@ -40,7 +37,6 @@ import {
 import {
   type AgentKind,
   type ArtifactRecord,
-  type CallbackConfig,
   type EventRecord,
   type FeatureRecord,
   type InputArtifactRef,
@@ -82,7 +78,6 @@ import {
 import { bridgeLog } from "./bridge-log.js";
 import {
   isTaskWatched,
-  notifyTaskPush,
   startTaskWatcher,
   WATCHER_MAX_CONSECUTIVE_FAILURES,
   type WatchedTaskView,
@@ -91,7 +86,7 @@ import {
  * 任务 id 双向解析（v0.6.1 REQ-05 §2.5 白捡 / A5-5）——
  * 从本模块抽出为 `task-lookup.ts`（单一事实源；避免进程入口模块被单测整座拉起）。
  */
-import { resolveLocalTaskId, resolveTaskLookup } from "./task-lookup.js";
+import { resolveTaskLookup } from "./task-lookup.js";
 import { createRunnerEndpoints, type RunnerEndpointHandle } from "./runner.js";
 import {
   FeatureScheduler,
@@ -116,7 +111,6 @@ import {
   type FeatureToolFailure,
 } from "./feature-tools.js";
 import {
-  isLoopbackHostOrAddress,
   startHttpTransport,
   type HttpTransportHandle,
 } from "./transports/http.js";
@@ -158,20 +152,12 @@ const TASK_WATCHER_POLL_INTERVAL_MS = readPositiveIntEnv("TASK_WATCHER_POLL_INTE
 /** 派发注入上游产物时的内联字符上限；超出仅保留头部 + 截断说明（完整内容按 uri 引用） */
 const ARTIFACT_INLINE_MAX_CHARS = readPositiveIntEnv("ARTIFACT_INLINE_MAX_CHARS", 4_000);
 
-/** 回调端点默认配置（`config.callback` 缺省时；默认关） */
-const DEFAULT_CALLBACK_CONFIG: CallbackConfig = { enabled: false, host: "127.0.0.1", port: 3200 };
-/** 回调请求体字节上限（防御性；超出即 400） */
-const CALLBACK_MAX_BODY_BYTES = readPositiveIntEnv("CALLBACK_MAX_BODY_BYTES", 1_048_576);
-/** 回调事件落库 payload 截断上限（事件表只作收件箱，不存全量 Task） */
-const CALLBACK_PAYLOAD_MAX_CHARS = readPositiveIntEnv("CALLBACK_PAYLOAD_MAX_CHARS", 2_000);
 /** `a2a_events` 单次返回条数上限 */
 const EVENTS_PAGE_LIMIT = readPositiveIntEnv("EVENTS_PAGE_LIMIT", 100);
 /** `a2a_wait` 除订阅唤醒外对 DB 的轮询对账间隔（兜底：非回调路径写入的事件） */
 const EVENT_WAIT_POLL_MS = readPositiveIntEnv("EVENT_WAIT_POLL_MS", 500);
 /** `a2a_wait` 内部 cap：须 < `SYNC_BUDGET_MS`（宿主 MCP 请求超时），留 5s 余量 */
 const EVENT_WAIT_MAX_MS = Math.max(1_000, SYNC_BUDGET_MS - 5_000);
-/** 事件 kind：收到 worker push 回调（v0.4.0 §2.6） */
-const EVENT_PUSH_RECEIVED = "push.received";
 /**
  * 事件 kind：`queued` 无人领取的一次性提示（v0.7.0 A5 / B3）。
  * **不表示失败**（不判 `failed`、不计连续失败）；处置走 `retryTaskIds` / `cancel`。
@@ -195,10 +181,6 @@ function toMessage(err: unknown): string {
 function asRecord(v: unknown): Record<string, unknown> | null {
   if (typeof v !== "object" || v === null || Array.isArray(v)) return null;
   return v as Record<string, unknown>;
-}
-
-function asNonEmptyString(v: unknown): string | null {
-  return typeof v === "string" && v.length > 0 ? v : null;
 }
 
 function nowIso(): string {
@@ -368,27 +350,6 @@ function memberMachines(machines: readonly MachineRef[], group: ProjectGroup): M
   return machines.filter((m) => group.memberMachineIds.has(m.machineId));
 }
 
-// ---------------------------------------------------------------------------
-// worker 回调配置（v0.4.0 §2.6：push 内联注册 + 本地事件端点；默认关）
-// ---------------------------------------------------------------------------
-
-/** 回调端点配置（懒加载 + 进程内缓存；加载失败回落默认关闭） */
-let cachedCallbackConfig: CallbackConfig | null = null;
-let callbackConfigLoaded = false;
-
-function callbackConfig(): CallbackConfig {
-  if (!callbackConfigLoaded) {
-    callbackConfigLoaded = true;
-    try {
-      cachedCallbackConfig = loadMachinesConfig(MACHINES_CONFIG_PATH).callback ?? null;
-    } catch (err) {
-      console.error(`[a2a-bridge] 加载回调配置失败：${toMessage(err)}`);
-      cachedCallbackConfig = null;
-    }
-  }
-  return cachedCallbackConfig ?? DEFAULT_CALLBACK_CONFIG;
-}
-
 /**
  * 解析 `project -> machine`（v0.7.0 A6：**注册视图**为唯一事实源，出站扫描退役）。
  *
@@ -494,26 +455,6 @@ interface ArtifactSummary {
   name: string;
   description: string;
   parts: ArtifactPartSummary[];
-}
-
-function mapTaskState(state: A2aTaskState): DomainTaskState {
-  switch (state) {
-    case A2aTaskState.TASK_STATE_COMPLETED:
-      return "completed";
-    case A2aTaskState.TASK_STATE_FAILED:
-    case A2aTaskState.TASK_STATE_CANCELED:
-    case A2aTaskState.TASK_STATE_REJECTED:
-      return "failed";
-    case A2aTaskState.TASK_STATE_INPUT_REQUIRED:
-    case A2aTaskState.TASK_STATE_AUTH_REQUIRED:
-      return "input-required";
-    case A2aTaskState.TASK_STATE_UNSPECIFIED:
-    case A2aTaskState.TASK_STATE_SUBMITTED:
-    case A2aTaskState.TASK_STATE_WORKING:
-    case A2aTaskState.UNRECOGNIZED:
-    default:
-      return "working";
-  }
 }
 
 /** 从本地存档的 artifactsJson（ArtifactSummary[]）拼接文本；兼容无 text 的旧记录 */
@@ -770,8 +711,6 @@ function startLocalTaskWatcher(taskId: string): void {
         scheduler.notifyTaskSettled(featureId, taskId, { state: task.state, text: task.text });
       }
     },
-    // pushCallback 通道保留（本节点不改其语义）：推送仅提前唤醒看护，对账口径仍以本地行为准
-    subscribePush: true,
     pollIntervalMs: TASK_WATCHER_POLL_INTERVAL_MS,
     maxConsecutiveFailures: WATCHER_MAX_CONSECUTIVE_FAILURES,
   });
@@ -1609,212 +1548,6 @@ async function handleWait(timeoutMs?: number): Promise<WaitOutcome> {
 }
 
 // ---------------------------------------------------------------------------
-// HTTP 事件端点（v0.4.0 §2.6：worker push 回调；默认关、绑 loopback、token 可选）
-// ---------------------------------------------------------------------------
-
-/** 事件端点 listener（未启用 / 已关闭时为 null） */
-let callbackServer: Server | null = null;
-
-interface PushInfo {
-  /** 远端 A2A 任务 id（push 载荷携带） */
-  remoteTaskId: string | null;
-  /** 远端任务态（A2A 状态串，如 `TASK_STATE_COMPLETED`；无则 null） */
-  state: string | null;
-}
-
-/** 取 stream 载荷（兼容 `{statusUpdate:…}` 与 `{payload:{statusUpdate:…}}` 两种形态） */
-function pickStreamRecord(parsed: unknown): Record<string, unknown> | null {
-  const root = asRecord(parsed);
-  if (root === null) return null;
-  const nested = asRecord(root["payload"]);
-  if (
-    nested !== null &&
-    (nested["task"] !== undefined ||
-      nested["statusUpdate"] !== undefined ||
-      nested["artifactUpdate"] !== undefined ||
-      nested["message"] !== undefined)
-  ) {
-    return nested;
-  }
-  return root;
-}
-
-function readTaskStateString(container: Record<string, unknown>): string | null {
-  const status = asRecord(container["status"]);
-  return status === null ? null : asNonEmptyString(status["state"]);
-}
-
-/** 解析 push 载荷：定位远端任务 id 与（若有）任务态串 */
-function parsePushInfo(parsed: unknown): PushInfo {
-  const rec = pickStreamRecord(parsed);
-  if (rec === null) return { remoteTaskId: null, state: null };
-  const task = asRecord(rec["task"]);
-  if (task !== null) {
-    return { remoteTaskId: asNonEmptyString(task["id"]), state: readTaskStateString(task) };
-  }
-  const statusUpdate = asRecord(rec["statusUpdate"]);
-  if (statusUpdate !== null) {
-    return {
-      remoteTaskId: asNonEmptyString(statusUpdate["taskId"]),
-      state: readTaskStateString(statusUpdate),
-    };
-  }
-  const artifactUpdate = asRecord(rec["artifactUpdate"]);
-  if (artifactUpdate !== null) {
-    return { remoteTaskId: asNonEmptyString(artifactUpdate["taskId"]), state: null };
-  }
-  const message = asRecord(rec["message"]);
-  if (message !== null) {
-    return { remoteTaskId: asNonEmptyString(message["taskId"]), state: null };
-  }
-  return { remoteTaskId: null, state: null };
-}
-
-/**
- * 命中本地任务时回写任务态（推送仅作「提前感知」，完整 artifacts/text 由轮询对账补齐）。
- * 只采纳 `completed` / `input-required`（`working` 不提前改写；`blocked` 为本地专属）。
- *
- * ⚠️ **不采纳 `failed`**（v0.5.0 D3/D5）：push 由 SDK fire-and-forget 代发、无 ack/重试、可重复/
- * 迟到/乱序 ⇒ 提前把 `failed` 写库会留下「**已写 failed、尚未分类/中性化**」的窗口，周期 tick
- * 撞上即把 Feature 判 `failed`（D3-flaky）；同理 `completed` 预写会让收敛抢在 re-arm 之前
- * （D5-flaky，故本版再删 push 回调里的 `kick()`）。
- * 收窄后 **`failed` 的唯一写者** = 看护 `persist`（`task-watcher.ts`）/ 看护放弃回调 /
- * 派发失败（`scheduler.ts`，同步完成 propagate + failFeature）—— 三者皆为同栈相邻序列，
- * 任何 `kick()` 都插不进「已写 `failed`、未分类」的窗口。
- */
-function applyPushedTaskState(localTaskId: string, a2aState: string): void {
-  let stateEnum: A2aTaskState;
-  try {
-    stateEnum = taskStateFromJSON(a2aState);
-  } catch {
-    return; // 未知状态串：忽略，交由轮询对账
-  }
-  const mapped = mapTaskState(stateEnum);
-  if (mapped !== "completed" && mapped !== "input-required") return;
-  const current = getTask(localTaskId);
-  if (current === null || isLocalTerminalTask(current)) return;
-  updateTaskState(localTaskId, mapped);
-}
-
-/** 处理一次 push：写 `push.received` 事件 + 命中本地任务回写任务态 + 唤醒看护/订阅（**不驱动流转**） */
-function applyPushNotification(raw: string): { taskId: string | null; localTaskId: string | null } {
-  const parsed: unknown = JSON.parse(raw);
-  const info = parsePushInfo(parsed);
-  const localTaskId = info.remoteTaskId === null ? null : resolveLocalTaskId(info.remoteTaskId);
-  const featureId = localTaskId === null ? null : (getTask(localTaskId)?.featureId ?? null);
-  appendEvent({
-    featureId,
-    taskId: info.remoteTaskId,
-    kind: EVENT_PUSH_RECEIVED,
-    state: info.state,
-    payload:
-      raw.length > CALLBACK_PAYLOAD_MAX_CHARS ? raw.slice(0, CALLBACK_PAYLOAD_MAX_CHARS) : raw,
-  });
-  if (localTaskId !== null && info.state !== null) {
-    applyPushedTaskState(localTaskId, info.state);
-  }
-  // 只唤醒看护（推送优先，立即对账）+ 唤醒长轮询订阅；**不** kick 调度器（v0.5.0 D5）：
-  // push 须幂等、不得驱动流转 —— 收敛交给看护 `onSettled` / 周期 tick（延迟 ≤ FEATURE_TICK_MS，
-  // 无契约含义）；且在 push 回调同栈内 kick() 会让收敛抢在 re-arm 之前（D5 确定性倒置）。
-  const wakeKey = localTaskId ?? info.remoteTaskId;
-  if (wakeKey !== null) notifyTaskPush(wakeKey);
-  signalEvents();
-  return { taskId: info.remoteTaskId, localTaskId };
-}
-
-function respondJson(res: ServerResponse, status: number, payload: unknown): void {
-  res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
-  res.end(JSON.stringify(payload));
-}
-
-function readHeaderValue(req: IncomingMessage, name: string): string | null {
-  const raw = req.headers[name];
-  if (Array.isArray(raw)) return raw.length > 0 ? (raw[0] ?? null) : null;
-  return raw ?? null;
-}
-
-/** 校验回调 token（可选；支持 `X-A2A-Notification-Token` 与 `Authorization: Bearer`） */
-function callbackTokenOk(req: IncomingMessage, expected: string): boolean {
-  const direct = readHeaderValue(req, "x-a2a-notification-token");
-  if (direct !== null && direct.length > 0) return direct === expected;
-  const auth = readHeaderValue(req, "authorization");
-  if (auth !== null && auth.startsWith("Bearer ")) return auth.slice(7) === expected;
-  return false;
-}
-
-/** 读取请求体（含字节上限；超限抛错） */
-async function readRequestBody(req: IncomingMessage, maxBytes: number): Promise<string> {
-  const chunks: Buffer[] = [];
-  let total = 0;
-  for await (const chunk of req) {
-    const buf = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
-    total += buf.length;
-    if (total > maxBytes) throw new Error(`回调请求体超过上限（${maxBytes} 字节）`);
-    chunks.push(buf);
-  }
-  return Buffer.concat(chunks).toString("utf8");
-}
-
-async function handleCallbackRequest(
-  req: IncomingMessage,
-  res: ServerResponse,
-  cfg: CallbackConfig,
-): Promise<void> {
-  try {
-    const path = (req.url ?? "").split("?")[0];
-    if (req.method !== "POST" || path !== "/callback") {
-      respondJson(res, 404, { ok: false, error: "not_found" });
-      return;
-    }
-    if (cfg.token !== undefined && cfg.token.length > 0 && !callbackTokenOk(req, cfg.token)) {
-      respondJson(res, 401, { ok: false, error: "unauthorized" });
-      return;
-    }
-    const raw = await readRequestBody(req, CALLBACK_MAX_BODY_BYTES);
-    const applied = applyPushNotification(raw);
-    respondJson(res, 200, { ok: true, taskId: applied.taskId, localTaskId: applied.localTaskId });
-  } catch (err) {
-    console.error(`[a2a-bridge] 回调处理失败：${toMessage(err)}`);
-    respondJson(res, 400, { ok: false, error: toMessage(err) });
-  }
-}
-
-/** 启动 HTTP 事件端点（幂等；`enabled=false` 时不启动） */
-function startCallbackServer(cfg: CallbackConfig): void {
-  if (!cfg.enabled || callbackServer !== null) return;
-  if (!isLoopbackHostOrAddress(cfg.host)) {
-    console.error(
-      `[a2a-bridge] 警告：回调端点绑定非 loopback 地址 ${cfg.host}` +
-        `（仅同机/受信网络 opt-in；跨机回调鉴权待 v0.7.0）`,
-    );
-  }
-  const server = createHttpServer((req, res) => {
-    void handleCallbackRequest(req, res, cfg);
-  });
-  server.on("error", (err) => {
-    console.error(`[a2a-bridge] 回调端点错误：${toMessage(err)}`);
-  });
-  server.listen(cfg.port, cfg.host, () => {
-    console.error(`[a2a-bridge] 回调端点已监听 http://${cfg.host}:${cfg.port}/callback`);
-  });
-  // 不因 listener 持有进程：桥退出 / shutdown 关闭（规避「桥孤儿进程」）
-  if (typeof server.unref === "function") server.unref();
-  callbackServer = server;
-}
-
-/** 关闭 HTTP 事件端点（幂等；纳入 shutdown / 信号路径） */
-function stopCallbackServer(): void {
-  const server = callbackServer;
-  callbackServer = null;
-  if (server === null) return;
-  try {
-    server.close();
-  } catch (err) {
-    console.error(`[a2a-bridge] 回调端点关闭失败：${toMessage(err)}`);
-  }
-}
-
-// ---------------------------------------------------------------------------
 // 编排内核（core）与 MCP server 工厂
 // ---------------------------------------------------------------------------
 // 工具注册与 `createServer(core)` 已迁至 `bridge/register-tools.ts`：stateless
@@ -2107,7 +1840,6 @@ async function startHttpBridge(): Promise<void> {
   activeHttp = handle;
   const readiness: RuntimeReadiness = runtime.start();
   logRecoverySummary(readiness.recovery);
-  startCallbackServer(callbackConfig());
   ready = true;
   bridgeLog.info(
     "a2a-bridge",
@@ -2145,7 +1877,6 @@ function shutdown(): void {
       const handle = activeHttp;
       activeHttp = null;
       if (handle !== null) await handle.close();
-      stopCallbackServer();
       const runtime = activeRuntime;
       activeRuntime = null;
       if (runtime === null) {

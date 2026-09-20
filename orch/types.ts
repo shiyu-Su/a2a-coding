@@ -132,24 +132,6 @@ export interface MachineRef {
    * 是否配置 / 准入裁决属注册端点（A3）。
    */
   token?: string;
-  /**
-   * 该机项目是否接收 orch push 回调（v0.4.0 §2.6；缺省 false）。
-   * 仅当 orch `callback.enabled` 与该位**同时**为真时，派发才内联注册回调（路径 1）。
-   */
-  pushCallback?: boolean;
-}
-
-/**
- * orch 回调端点配置（v0.4.0 §2.6 worker 回调）。
- * 默认关；开启后桥在 `host:port` 上监听 `POST /callback` 接收 worker push 通知。
- * `host` 默认 loopback（跨机回调鉴权待 v0.7.0）；`token` 可选，命中则校验通知请求。
- */
-export interface CallbackConfig {
-  enabled: boolean;
-  host: string;
-  port: number;
-  /** 可选校验令牌（worker push 以 `X-A2A-Notification-Token` 回传；缺省不校验） */
-  token?: string;
 }
 
 /**
@@ -240,8 +222,6 @@ export interface RunnerConfig {
 /** orch 侧：机器清单 */
 export interface MachinesConfig {
   machines: MachineRef[];
-  /** orch 回调端点（v0.4.0；缺省 = 关闭） */
-  callback?: CallbackConfig;
   /** 桥 transport（v0.4.1；配置缺省时解析为 `mode = "http"`，stdio 已退役） */
   transport: TransportConfig;
   /** 网页端只读工作台（v0.5.0；配置缺省时解析为 `{ true, "127.0.0.1", 3300 }`） */
@@ -431,7 +411,7 @@ export interface EventRecord {
   eventId: number;
   featureId: string | null;
   taskId: string | null;
-  /** `task.settled` / `task.blocked` / `feature.state`（后续可扩展 push.received 等） */
+  /** `task.settled` / `task.blocked` / `feature.state` */
   kind: string;
   /** 变化后的状态串（可空） */
   state: string | null;

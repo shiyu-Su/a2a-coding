@@ -88,21 +88,12 @@ export interface TaskWatcherOptions {
    * 仅供调度器据此推进 Feature DAG；不得抛错（实现方自行兜底）。
    */
   onSettled?: (task: WatchedTaskView | null, outcome: { abandoned: boolean }) => void;
-  /**
-   * 可选：订阅 worker 推送唤醒（v0.4.0 §2.6，缺省 false = 纯轮询）。
-   * 开启后，`notifyTaskPush(taskId)` 会打断当前休眠、令看护**立即** poll 一次（推送优先）；
-   * 周期性轮询（对账兜底）保持不变。
-   */
-  subscribePush?: boolean;
   pollIntervalMs: number;
   maxConsecutiveFailures: number;
 }
 
 /** 进程内看护去重表：同一 taskId 只允许一个看护循环 */
 const watching = new Set<string>();
-
-/** 推送唤醒订阅表：看护 taskId → 唤醒器集合（仅 `subscribePush=true` 的看护注册） */
-const pushWakeups = new Map<string, Set<() => void>>();
 
 /**
  * 看护子系统 owner 门闩（REQ-v0.4.1-2026-09-15-02）。
@@ -163,23 +154,6 @@ export async function drainTaskWatchers(
 }
 
 /**
- * 推送唤醒（v0.4.0）：通知该 taskId 的看护立即 poll（推送优先）。
- * 无看护订阅时返回 false（调用方据此忽略，轮询对账仍兜底）。实现方不得抛错。
- */
-export function notifyTaskPush(taskId: string): boolean {
-  const wakeups = pushWakeups.get(taskId);
-  if (wakeups === undefined || wakeups.size === 0) return false;
-  for (const wake of wakeups) {
-    try {
-      wake();
-    } catch (err) {
-      console.error(`[a2a-bridge] 后台看护 ${taskId} 推送唤醒异常：${toMessage(err)}`);
-    }
-  }
-  return true;
-}
-
-/**
  * **stale 的「watched」判据（v0.7.0 A5 重定义）**：由 `queue_state` 判定，不再依赖「进程内是否
  * 有看护循环」。口径（改造文档 §3.1 A5 / B2/B3）：
  * `queued`（待领取）/ `claimed`（已领取；超期者由 O7 清算回收为 `queued`）/ `running` ⇒ **在队**；
@@ -205,26 +179,14 @@ export function isTaskWatched(taskId: string): boolean {
 }
 
 /**
- * 可被推送唤醒打断的休眠：到时 / 收到推送均 resolve。
- * 未订阅推送时（`state.wake` 恒为 null）与普通 `sleep` 等价。
+ * 看护循环休眠（轮询对账节奏）：**unref** —— 看护是后台维护循环（B3 下 `queued` 任务可长期
+ * 驻留），**不得独撑事件循环** —— 常驻由 http listener / MCP transport 持有；单测 / 停机
+ * 不被拖住。与 runner 心跳清算循环的 `sweepTimer.unref()` 同一纪律。
  */
-function sleepOrPush(ms: number, state: { wake: (() => void) | null }): Promise<void> {
+function watchSleep(ms: number): Promise<void> {
   return new Promise((resolve) => {
-    const timer = setTimeout(() => {
-      state.wake = null;
-      resolve();
-    }, ms);
-    /**
-     * **unref**：看护是后台维护循环（B3 下 `queued` 任务可长期驻留），**不得独撑事件循环** ——
-     * 常驻由 http listener / MCP transport 持有；单测 / 停机不被拖住。与 runner 心跳清算循环
-     * 的 `sweepTimer.unref()` 同一纪律。
-     */
+    const timer = setTimeout(resolve, ms);
     if (typeof timer.unref === "function") timer.unref();
-    state.wake = () => {
-      clearTimeout(timer);
-      state.wake = null;
-      resolve();
-    };
   });
 }
 
@@ -283,112 +245,84 @@ async function watchLoop(options: TaskWatcherOptions): Promise<void> {
   let consecutiveFailures = 0;
   /** B3：本轮连续「queued 无人领取」是否已提示过（被领取 / 终态后复位） */
   let unclaimedNotified = false;
-  // 推送唤醒订阅（可选）：命中时打断休眠，令本轮立即 poll；轮询对账兜底不变。
-  const pushState: { wake: (() => void) | null; pending: boolean } = {
-    wake: null,
-    pending: false,
-  };
-  const onPush = (): void => {
-    pushState.pending = true;
-    pushState.wake?.();
-  };
-  if (options.subscribePush === true) {
-    const set = pushWakeups.get(taskId) ?? new Set<() => void>();
-    set.add(onPush);
-    pushWakeups.set(taskId, set);
-  }
-  try {
-    while (true) {
-      // 推送已到（含 poll 期间到达）：跳过休眠立即对账；否则按轮询间隔休眠
-      if (!pushState.pending) {
-        await sleepOrPush(options.pollIntervalMs, pushState);
-      }
-      pushState.pending = false;
+  while (true) {
+    await watchSleep(options.pollIntervalMs);
 
-      let task: WatchedTaskView | null;
-      try {
-        task = options.poll();
-      } catch (err) {
-        consecutiveFailures += 1;
-        console.error(
-          `[a2a-bridge] 后台看护 ${taskId} 本地对账失败（${consecutiveFailures}/${options.maxConsecutiveFailures}）：${toMessage(err)}`,
-        );
-        if (consecutiveFailures >= options.maxConsecutiveFailures) {
-          console.error(`[a2a-bridge] 后台看护 ${taskId} 连续失败超限，放弃看护`);
-          safeOnSettled(options, null, { abandoned: true });
-          return;
-        }
-        continue;
-      }
-
-      if (task === null) {
-        // 行缺失 = 异常态（正常路径「建行先于入队」）；计一次连续失败，防永久空转
-        consecutiveFailures += 1;
-        console.error(
-          `[a2a-bridge] 后台看护 ${taskId} 本地任务行缺失（${consecutiveFailures}/${options.maxConsecutiveFailures}）`,
-        );
-        if (consecutiveFailures >= options.maxConsecutiveFailures) {
-          console.error(`[a2a-bridge] 后台看护 ${taskId} 连续失败超限，放弃看护`);
-          safeOnSettled(options, null, { abandoned: true });
-          return;
-        }
-        continue;
-      }
-
-      // 成功读到行：任何后续分支都不再算「连续失败」
-      consecutiveFailures = 0;
-
-      if (options.isSettled(task)) {
-        /**
-         * v0.6.1 REQ-05 §2.5（A5-2 / N3）：**`persist` 异常与 `poll` 异常分离分类**。
-         * `persist` 失败**不得**走 abandoned、**不得**打断收尾（终态已确定是既成事实）；
-         * **已完成终态必须 `persist`（成功或失败）后仍 `safeOnSettled`** —— DAG 续推信号不丢。
-         */
-        try {
-          options.persist(task);
-        } catch (err) {
-          console.error(
-            `[a2a-bridge] 后台看护 ${taskId} 终态落库失败（不影响收尾，仍将回调 onSettled）：${toMessage(err)}`,
-          );
-        }
-        bridgeLog.info("a2a-bridge", `后台看护 ${taskId}：本地任务已终态，看护结束`);
-        safeOnSettled(options, task, { abandoned: false });
+    let task: WatchedTaskView | null;
+    try {
+      task = options.poll();
+    } catch (err) {
+      consecutiveFailures += 1;
+      console.error(
+        `[a2a-bridge] 后台看护 ${taskId} 本地对账失败（${consecutiveFailures}/${options.maxConsecutiveFailures}）：${toMessage(err)}`,
+      );
+      if (consecutiveFailures >= options.maxConsecutiveFailures) {
+        console.error(`[a2a-bridge] 后台看护 ${taskId} 连续失败超限，放弃看护`);
+        safeOnSettled(options, null, { abandoned: true });
         return;
       }
-
-      // B3：`queued` 无人领取 —— 不判 failed、不计连续失败，仅一次性事件提示
-      if (task.queueState === "queued") {
-        if (!unclaimedNotified && options.onUnclaimed !== undefined) {
-          try {
-            options.onUnclaimed(task);
-          } catch (err) {
-            console.error(`[a2a-bridge] 后台看护 ${taskId} 未领取提示回调异常：${toMessage(err)}`);
-          }
-        }
-        unclaimedNotified = true;
-        continue;
-      }
-      unclaimedNotified = false;
-
-      // B2：`claimed` / `running` 且领取者心跳超期 ⇒ O7 requeue / 事件路径（stale ≠ failed；不 stop）
-      if (
-        (task.queueState === "claimed" || task.queueState === "running") &&
-        options.isClaimStale !== undefined &&
-        options.isClaimStale(task)
-      ) {
-        try {
-          options.reclaimStale?.(task);
-        } catch (err) {
-          console.error(`[a2a-bridge] 后台看护 ${taskId} 超期回收回调异常：${toMessage(err)}`);
-        }
-      }
+      continue;
     }
-  } finally {
-    if (options.subscribePush === true) {
-      const set = pushWakeups.get(taskId);
-      if (set !== undefined) {
-        set.delete(onPush);
-        if (set.size === 0) pushWakeups.delete(taskId);
+
+    if (task === null) {
+      // 行缺失 = 异常态（正常路径「建行先于入队」）；计一次连续失败，防永久空转
+      consecutiveFailures += 1;
+      console.error(
+        `[a2a-bridge] 后台看护 ${taskId} 本地任务行缺失（${consecutiveFailures}/${options.maxConsecutiveFailures}）`,
+      );
+      if (consecutiveFailures >= options.maxConsecutiveFailures) {
+        console.error(`[a2a-bridge] 后台看护 ${taskId} 连续失败超限，放弃看护`);
+        safeOnSettled(options, null, { abandoned: true });
+        return;
+      }
+      continue;
+    }
+
+    // 成功读到行：任何后续分支都不再算「连续失败」
+    consecutiveFailures = 0;
+
+    if (options.isSettled(task)) {
+      /**
+       * v0.6.1 REQ-05 §2.5（A5-2 / N3）：**`persist` 异常与 `poll` 异常分离分类**。
+       * `persist` 失败**不得**走 abandoned、**不得**打断收尾（终态已确定是既成事实）；
+       * **已完成终态必须 `persist`（成功或失败）后仍 `safeOnSettled`** —— DAG 续推信号不丢。
+       */
+      try {
+        options.persist(task);
+      } catch (err) {
+        console.error(
+          `[a2a-bridge] 后台看护 ${taskId} 终态落库失败（不影响收尾，仍将回调 onSettled）：${toMessage(err)}`,
+        );
+      }
+      bridgeLog.info("a2a-bridge", `后台看护 ${taskId}：本地任务已终态，看护结束`);
+      safeOnSettled(options, task, { abandoned: false });
+      return;
+    }
+
+    // B3：`queued` 无人领取 —— 不判 failed、不计连续失败，仅一次性事件提示
+    if (task.queueState === "queued") {
+      if (!unclaimedNotified && options.onUnclaimed !== undefined) {
+        try {
+          options.onUnclaimed(task);
+        } catch (err) {
+          console.error(`[a2a-bridge] 后台看护 ${taskId} 未领取提示回调异常：${toMessage(err)}`);
+        }
+      }
+      unclaimedNotified = true;
+      continue;
+    }
+    unclaimedNotified = false;
+
+    // B2：`claimed` / `running` 且领取者心跳超期 ⇒ O7 requeue / 事件路径（stale ≠ failed；不 stop）
+    if (
+      (task.queueState === "claimed" || task.queueState === "running") &&
+      options.isClaimStale !== undefined &&
+      options.isClaimStale(task)
+    ) {
+      try {
+        options.reclaimStale?.(task);
+      } catch (err) {
+        console.error(`[a2a-bridge] 后台看护 ${taskId} 超期回收回调异常：${toMessage(err)}`);
       }
     }
   }

@@ -2,6 +2,52 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.8.3] - 2026-09-20
+
+> 主题：**拆除 push 通知附加链（worker→orch 直连回调通道退役）**（单需求 · `REQ-v0.8.3-2026-09-20-01`）。把 v0.4.0 遗留的 worker push 回调附加链从**代码 / 配置 / 文档 / 回归断言**四面彻底拆除 + 运行态清理（释放 3200），使「全系统 = Runner 单通道」**在代码面上也成立**；**不动 A2A 协议本身的 pushNotification 字段、`PROTOCOL.md` 零改动**。改造文档：`doc/v0.8.3/拆除push通知附加链-改造文档.md`（final）。（原定同版第二条需求 **B5 · orch 退化为 kind 无关** 发版时未做 ⇒ 已转出本版、归属待裁决，见 `planlog.md`。）
+
+### Removed
+
+- **orch 回调接收侧整套**（`bridge/index.ts`，**净 −270 行**）：`POST /callback` HTTP 端点（`PushInfo` / `parsePushInfo` / `applyPushedTaskState` / `applyPushNotification` / `callbackTokenOk` / `handleCallbackRequest` / `startCallbackServer` / `stopCallbackServer`，含段内 5 个局部件——经核无其它调用者）、`callbackConfig()` 配置缓存（进程启动一次性读）、`EVENT_PUSH_RECEIVED = "push.received"` 事件生产、`DEFAULT_CALLBACK_CONFIG` / `CALLBACK_MAX_BODY_BYTES` / `CALLBACK_PAYLOAD_MAX_CHARS` 三常量、启动/停机挂点（`startCallbackServer(callbackConfig())` / `stopCallbackServer()`）、`node:http` import 两行与相关 import 收窄。**背景**：该链发送侧（`message/send` 内联下发 `taskPushNotificationConfig`）已于 v0.7.0（`bb1f420`）删除；接收侧此后**零流量**（`push.received` 共 33,859 条、末条 `2026-09-18T09:31:30.456Z`、v0.7.0 后无新事件）。
+- **orch 看护 push 提前唤醒机制**（`bridge/task-watcher.ts`，**净 −66 行**）：`subscribePush` 选项、`pushWakeups` 表、`notifyTaskPush()`、`sleepOrPush()` 与 `watchLoop` 内订阅/唤醒接入、`finally` 退订（`try/finally` 壳收敛）。唯一生产者即上条回调端点（已死）；看护正确性由周期轮询承担（**回落 sleep 保留 `unref()`**：新写 `watchSleep`，B3 `queued` 长期驻留不独撑事件循环）。
+- **orch 配置面**：`types.ts` 删 `MachineRef.pushCallback` / `CallbackConfig` / `MachinesConfig.callback`（−22 行）；`config.ts` 删 `DEFAULT_CALLBACK_HOST/PORT` 与 `parseCallback`——`machines[].pushCallback` 由「解析无消费点」的死配置转为退役态。
+- **machine 模板与文档**：`config/config.json.default` 删 `agentCard.pushNotifications` 占位（含孤立逗号修复、「留 v0.8.2 专项」悬置措辞消解）；根 `README.md` **9 处**（machine 表 `agentCard` 行、orch 表 `machines[].pushCallback` 与 `callback.*` 四行、字段列举与 JSON 样例、callback 说明段、`a2a_events` 描述去「worker push」短语——`a2a_wait`「推送优先唤醒」指 MCP 事件收件箱机制、**保留**）。
+- **第三方**：不动（`patches/` 中 `pushNotificationStore=undefined` 系补丁 context 行；wrapper 族能力闲置即等效退役）。
+
+### Added
+
+- **旧键宽容兼容层**（用户裁决「删解析 + 残留旧键宽容忽略 + warnOnce」）：`config.ts` 对残留 `callback` 段 / `machines[].pushCallback` 键**出现即 warn 一次（文案级 once-per-process）后忽略**——旧配置零改动可启动；**不用裸 `console.warn`**（`loadMachinesConfig` 被 per-request 路径现读，走既有 `warnOnce` 集合）；**不再校验其值类型**（与 v0.7.1 `web.allowStdio` 先例同口径）。
+- **单元断言**：`test/config.test.ts` 两条新断言——含旧键的旧配置解析成功不抛错、返回对象无 `callback` 键；两条退役 warn 各恰一次（`resetWarnOnceCache`）。
+- **探针断言扩容**（`tools/bridgectl-probe.mjs`，6→8）：⑤ `3200 → ECONNREFUSED`（含 owner 归属判定：外部进程占用 ⇒ SKIP、本探针持有 ⇒ FAIL）；⑥ `POST /callback → 404 not_found`（桥存活窗口内执行）。
+- **回归用例**：`.omo` 新增 `test-v0.8.3-push-retire.js`（**23 条断言**：桥侧/唤醒/配置面符号零命中 · `unref` 在位 · 兼容层两条文案 + **旧键名仅现于 `config.ts`** 白名单 · 探针双断言 · orch/machine 模板与根 README、`PROTOCOL.md`、`store.test` 零残留）。
+
+### Changed
+
+- **回归套件退役/反转（拆除即红的旧断言）**：`test-v0.4.0-features.js` 约 12 条 push 断言退役、`:125`「◄ v0.7.0 反转：push 可选通道保留」沿革行**反转为「◄ v0.8.3 反转：push 附加链整体退役」**；`test-v0.6.1-failure-semantics.js` 事件 kind 清单「恰 6 值」→ **5 值**、`push.received` 挪入 `RETIRED_KINDS`；`test-v0.6.0-project-group.js` 模板顶层键集合去 `callback`；`test-v0.8.1-opencode-acp.js` B8′ 的 `agentCard` 行反转为「键已删除」。
+- **`orch/config/config.json.default` 模板**：删 `callback` 段 / `machines[].pushCallback` / `_comment` 回调说明（收尾轨补的清单缺口）。
+- **运行态清理（本机 `orch/config/config.json`，gitignored）**：删顶层 `callback` 段（`enabled:true` / token `e2e-callback-token`）与 `machines[].pushCallback` 键——**改前全文存档于改造文档 §7.3**；重启桥后 **3200 释放**。
+
+### Fixed
+
+- **探针断言 ⑥ 的编排顺序缺陷**（`tools/bridgectl-probe.mjs`）：⑥（`POST /callback ⇒ 404`）原位于断言 ④（`bridgectl stop`）之后、对**已停止**的临时桥端口发请求 ⇒ 永不可能通过；上移至桥存活窗口（③ 与 ④ 之间）⇒ 真跑 **8/8 PASS**（⑤ 同步正向确认 `connect=ECONNREFUSED`）。
+
+### 门禁与真机
+
+- **门禁**：orch `npm run typecheck` **0** / `lint` **0** / `npm run test` **237 pass · 0 fail · 1 skip**（POSIX-only 集成用例）；machine 零代码改动（仅模板 + 根 README）；**宿主回归 1022/1022 零失败**（`reports/v0.8.2/regression-report.json`，版本源 = 根 `package.json`）。
+- **真机（宿主执行 + 单元核实，全程未用 agent 自报）**：
+  - **V1**：`bridgectl stop`（优雅停机）→ `start --wait-ready` ⇒ `/health` ok、**3200 无监听**、`POST 127.0.0.1:8787/callback` ⇒ **HTTP 404 `{"ok":false,"error":"not_found"}`**。
+  - **V2 等效真机 4/4**（临时工作区 + 端口 8898 + 含旧键临时配置，不触碰常驻服务）：正常启动 + 两条 warnOnce 各恰一次 + 3200 未被 bind。
+  - **V3 端到端**：经新桥完整往返（派发 → 执行 → 回传）；`push.received` 仍 **33,859 条无新增**；`orch/config/config.json` 顶层键 = `provisioning, transport, machines`。
+  - **V4 零活性残留**（回归新断言 + 收口只读复核 grep）；**探针 8/8**；**编排链路设计式 E2E**（自测 Feature 单节点 completed → 自动 `integrating`，验证后 cancel）。
+- **收口只读复核（F1）**：落点齐全（file:line）/ 共用件零误伤（`mapTaskState`、`taskStateFromJSON`、`asNonEmptyString` 经核属回调专属死代码，随删正确）/ 源码零残留 / 门禁三绿 / 无越界。
+
+### 未覆盖（登记，不计通过）
+
+- **POSIX 未真机**（本需求为单机代码层拆除，跨端为结构级）。
+- **「旧键宽容」常驻窗口变体未做**（以等效真机代替）；`orch/config/config.json` 残留 `provisioning` 键不碰（观察项）。
+- **33,859 条历史 push 载荷发送方未溯源**（推断 `a2a-opencode` 包装器，v0.8.1 已退役）；wrapper 族「再声明 `agentCard.pushNotifications`」场景不验。
+- **历史 `push.received` 事件行保留不动**（只读历史，`events` 表无 kind 白名单约束）。
+
 ## [v0.8.2] - 2026-09-20
 
 > 主题：**ACP 桥参数面扩展（per-project 模型名称透传）+ 常规任务等待脚本**（双需求 · `REQ-v0.8.2-2026-09-20-01` / `REQ-v0.8.2-2026-09-20-02`）。两条需求分别补上「模型可配」与「等待可等」两块宿主/执行面缺口；**kind 名与线协议 2.1 不变、PROTOCOL.md 零改动、orch 源码零改动**。改造文档：`doc/v0.8.2/ACP桥参数面扩展-改造文档.md`（final）· `doc/v0.8.2/常规任务等待脚本-改造文档.md`（final）。

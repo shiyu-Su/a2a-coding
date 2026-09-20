@@ -1,6 +1,5 @@
 import { readFileSync } from "node:fs";
 import type {
-  CallbackConfig,
   HttpTransportConfig,
   MachineRef,
   MachinesConfig,
@@ -89,22 +88,6 @@ function asHttpPath(v: unknown, ctx: string): string {
   const s = asString(v, ctx);
   if (!s.startsWith("/")) fail(`${ctx} 必须以 "/" 开头`);
   return s;
-}
-
-/** 回调端点默认绑定 loopback / 默认端口（避开 Launcher 3100 与项目 A2A 3010-3012） */
-const DEFAULT_CALLBACK_HOST = "127.0.0.1";
-const DEFAULT_CALLBACK_PORT = 3200;
-
-/** 解析 `callback` 配置（缺省字段补默认值；`enabled` 缺省 false） */
-function parseCallback(v: unknown): CallbackConfig {
-  const c = asRecord(v, "callback");
-  const enabled = c["enabled"] === undefined ? false : asBool(c["enabled"], "callback.enabled");
-  const host =
-    c["host"] === undefined ? DEFAULT_CALLBACK_HOST : asString(c["host"], "callback.host");
-  const port = c["port"] === undefined ? DEFAULT_CALLBACK_PORT : asPort(c["port"], "callback.port");
-  const tokenRaw = c["token"];
-  const token = tokenRaw === undefined ? undefined : asString(tokenRaw, "callback.token");
-  return token === undefined ? { enabled, host, port } : { enabled, host, port, token };
 }
 
 /**
@@ -342,14 +325,14 @@ function parseLauncherUrl(v: unknown, index: number): string {
   return "";
 }
 
-/** 加载并校验「orch 侧机器清单」（含可选回调端点 / 桥 transport / 网页端只读工作台 / runner 阈值配置） */
+/** 加载并校验「orch 侧机器清单」（含桥 transport / 网页端只读工作台 / runner 阈值配置） */
 export function loadMachinesConfig(path: string): MachinesConfig {
   const raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
   const o = asRecord(raw, "machines config");
   const machines = o["machines"];
   if (!Array.isArray(machines)) fail("machines 必须是数组");
-  const callbackRaw = o["callback"];
-  const callback = callbackRaw === undefined ? undefined : parseCallback(callbackRaw);
+  if (o["callback"] !== undefined)
+    warnOnce("[config] callback 段已退役（push 通知链拆除）：按死配置 warn + 忽略。");
   const transportRaw = o["transport"];
   const transport = transportRaw === undefined ? defaultTransport() : parseTransport(transportRaw);
   const webRaw = o["web"];
@@ -358,16 +341,15 @@ export function loadMachinesConfig(path: string): MachinesConfig {
   const runner = runnerRaw === undefined ? defaultRunner() : parseRunner(runnerRaw);
   const machineRefs = machines.map((m, i): MachineRef => {
     const r = asRecord(m, `machines[${i}]`);
-    const pushCallbackRaw = r["pushCallback"];
+    if (r["pushCallback"] !== undefined)
+      warnOnce(
+        `[config] machines[${i}].pushCallback 已退役（push 通知链拆除）：按死配置 warn + 忽略。`,
+      );
     const tokenRaw = r["token"];
     return {
       machineId: asString(r["machineId"], `machines[${i}].machineId`),
       launcherUrl: parseLauncherUrl(r["launcherUrl"], i),
       token: tokenRaw === undefined ? undefined : asString(tokenRaw, `machines[${i}].token`),
-      pushCallback:
-        pushCallbackRaw === undefined
-          ? undefined
-          : asBool(pushCallbackRaw, `machines[${i}].pushCallback`),
     };
   });
   /**
@@ -380,7 +362,6 @@ export function loadMachinesConfig(path: string): MachinesConfig {
   );
   return {
     machines: machineRefs,
-    callback,
     transport,
     web,
     runner,

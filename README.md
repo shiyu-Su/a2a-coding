@@ -287,7 +287,6 @@ node flow/install/uninstall.mjs --target <项目根>
 | `projects[].risk` | 项目风险档位，`read` / `write` / `full`，决定包装器传给底层 CLI 的权限 / 沙箱参数 | `write` | 否 |
 | `projects[].agentConfig` | 包装器配置片段，顶层键如 `model` / `mcp` / `events` / `systemPrompt`；launcher 会与默认项 `{ "events": { "enabled": false } }` 深合并，写入 `agents/<agentKind>.<projectId>.json`，经 `--config` 传给包装器，再与包装器内置默认值深合并 | - | 否 |
 | `projects[].agentConfig.<kind>.model` | **per-project 模型名称**（v0.8.2 起，仅 ACP 族 opencode/qoder）：值 = 后端自己的 modelId（opencode 形如 `providerID/modelID`，qoder 取 `machine/config/model-catalog.json` 的 key）。adapter 原样透传 `--model` ⇒ 桥在每次会话建立后发一次 ACP `session/set_config_option`。**不配 / 空串 ⇒ 桥完全不发该请求**，走后端自身默认。配错（无效 modelId）⇒ **任务明确失败**（fail-fast，不静默回落）；qoder 与 opencode 均以 `-32602` 拒绝 | - | 否 |
-| `projects[].agentConfig.agentCard.pushNotifications` | worker push 能力开关；`true` 时项目 Agent 可向 orch 回调端点推送状态变化（配合 orch `callback` + `pushCallback` 使用） | `false`（默认关） | 否 |
 
 `risk` 到各端权限参数的映射（`write` 为默认，恰等于各包装器内置默认；**ACP 族（v0.8.1 起 opencode / qoder）** 无 CLI 权限开关，经仓内 ACP 桥 `--risk <read|write|full>` 透传，由桥映射 ACP 权限请求）：
 
@@ -323,18 +322,13 @@ node flow/install/uninstall.mjs --target <项目根>
 
 ### orch：`orch/config/config.json`
 
-orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自持（实际配置 `config/config.json` 不入库，首次部署从 `config/config.json.default` 复制并填入真实机器地址）。字段为 `machines[]`（每项含 `machineId` + `launcherUrl`）与可选的 `transport`（桥接入面，见[常驻部署形态](#常驻部署形态)）、`callback`、`web`。
+orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自持（实际配置 `config/config.json` 不入库，首次部署从 `config/config.json.default` 复制并填入真实机器地址）。字段为 `machines[]`（每项含 `machineId` + `launcherUrl`）与可选的 `transport`（桥接入面，见[常驻部署形态](#常驻部署形态)）、`web`。
 
 | 字段 | 说明 | 默认值 | 必填 |
 |------|------|--------|------|
 | `machines[].machineId` | 机器标识，需与本机 Launcher 配置一致 | - | 是 |
 | `machines[].launcherUrl` | 该机 Launcher 地址（如 `http://localhost:3100`） | - | 是 |
-| `machines[].pushCallback` | 按机 opt-in：允许该机 worker 向 orch 回调端点推送状态变化（需配合 `callback` 与项目 `agentConfig.agentCard.pushNotifications`） | `false` | 否 |
 | `projectGroup` | **v0.6.0**：静态「项目组」—— `{ name?: string, members: [{ machineId, projectId }] }`。声明后 orch **只连有成员的机器、只用列名成员的项目**（未列成员不 ensure / 不派发 / 不展示）；`members` **不得为空数组**；`machineId` 必须存在于 `machines[]`（否则本段 **fail-fast**，桥整体拒绝派发）。**段缺省 = 全量接纳**（与旧版行为一致） | 不设置（全量接纳） | 否 |
-| `callback.enabled` | 开启 orch HTTP 事件端点（`POST /callback`），接收 worker push；**默认关**，仅同机 / 受信网络 opt-in | `false` | 否 |
-| `callback.host` | 事件端点绑定地址（建议 loopback） | `127.0.0.1` | 否 |
-| `callback.port` | 事件端点监听端口 | - | `callback.enabled=true` 时是 |
-| `callback.token` | 事件端点校验令牌（worker 推送时携带）；不填则不校验 | 不校验 | 否 |
 | `transport` | 桥接入面配置（**可选**）；v0.7.1 起桥只有常驻 HTTP 形态 | 不设置（按 http 缺省启动） | 否 |
 | `transport.mode` | 只允许 `"http"`；显式 `"stdio"` 会被拒绝（fail-fast，stdio 形态已退役） | `"http"` | 否 |
 | `transport.http` | 常驻 HTTP 监听配置 `{ host, port, path }` | `{ "host": "127.0.0.1", "port": 8787, "path": "/mcp" }` | 否 |
@@ -346,14 +340,11 @@ orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自
 ```json
 {
   "machines": [
-    { "machineId": "win-dev", "launcherUrl": "http://localhost:3100", "pushCallback": false }
+    { "machineId": "win-dev", "launcherUrl": "http://localhost:3100" }
   ],
-  "callback": { "enabled": false, "host": "127.0.0.1", "port": 3200, "token": "<可选>" },
   "web": { "enabled": true, "host": "127.0.0.1", "port": 3300, "allowStdio": false }
 }
 ```
-
-> `callback` 默认关闭：跨机回调受鉴权边界约束（跨机鉴权待后续），当前仅同机 / 受信网络可 opt-in。关闭或端点不可达时，任务终态仍由 `task-watcher` 轮询对账兜底落库。
 
 > `web`（只读工作台）：缺省**仅常驻（`transport.mode=http`）形态 + 仅 `owner` 实例**提供页面（`allowStdio` 为旧字段，随 stdio 形态退役、现无实际作用）；端口被占 ⇒ **warn 降级、不伤 MCP**；只读、仅 loopback、**无鉴权** ⇒ 暴露到本机之外须先有 v0.7.0 的跨机鉴权。`/api/events` **直连 `listEvents`**，不会推移宿主收件箱的读游标。
 
@@ -435,7 +426,7 @@ Bridge ⇄ Launcher 的线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单�
 - `a2a_task_status(taskId)`：查询任务态并回写本地任务存储。已终结任务（completed / failed / input-required）由桥本地存档直接作答（不唤醒远端 Agent）；未终结任务走远端实时查询。
 - `a2a_tasks(project, [state], [limit])`：按项目列出本地任务记录（默认 `updatedAt` 倒序、默认 20 条、最多 100），每条含 `prompt` 片段 / state / text / contextId / updatedAt / stale。用于丢失 `taskId` 句柄后的兜底找回。
 - `a2a_cancel(taskId)`：取消任务，并回写本地任务存储。
-- `a2a_events(since?)`：读取事件收件箱增量（任务结算 / 阻塞、Feature 流转、worker push）。省略 `since` 则自进程读游标起；无变化时廉价空返回。
+- `a2a_events(since?)`：读取事件收件箱增量（任务结算 / 阻塞、Feature 流转）。省略 `since` 则自进程读游标起；无变化时廉价空返回。
 - `a2a_wait(timeoutMs?)`：长轮询等待新事件（推送优先唤醒 + 定时对账），最多 `timeoutMs`（内部上限低于同步预算）；超时无事件则 `timedOut=true`。
 
 #### Feature 工具组（5 个）

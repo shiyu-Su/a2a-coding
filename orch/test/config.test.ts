@@ -16,6 +16,8 @@
  * 覆盖（v0.7.2 K6）：warn **文案级 once-per-process 去重** —— 同一坏配置重复解析 ⇒ 同文案仅
  * warn 一次（次数 = 1）、不同文案（缺省 / 非法 / 不同机器下标 / allowStdio）互不去重、
  * 去重不改解析语义（结果一致、合法配置仍零告警）；`resetWarnOnceCache` 提供用例级隔离。
+ * 覆盖（v0.8.3 O2）：`callback` 段与 `machines[].pushCallback` 退役 ⇒ 旧配置宽容解析（不抛错、
+ * 返回对象无 `callback` 键）+ 两条退役 warn 各恰一次（文案级 once-per-process）。
  *
  * 运行：`npm test`（先 `tsc` 构建，再 `node --test dist/test/`）。
  */
@@ -659,4 +661,41 @@ test("K6：去重不改变解析语义（解析结果逐字段一致；合法配
 
   const legal = captureWarn(() => withConfig(minimalConfig(), loadMachinesConfig));
   assert.deepEqual(legal.warnings, []);
+});
+
+// ── v0.8.3 REQ-01 O2：callback / pushCallback 退役 ⇒ 死配置宽容 warn + 忽略 ──────
+
+/** 旧配置（含 `callback` 段 + `machines[].pushCallback`），其余字段均合法 */
+function retiredPushConfig(): unknown {
+  return {
+    machines: [{ machineId: "m1", launcherUrl: "http://127.0.0.1:3100", pushCallback: true }],
+    callback: { enabled: true, host: "127.0.0.1", port: 3200 },
+  };
+}
+
+test("callback/pushCallback 退役：旧配置解析成功不抛错、返回对象无 callback 键（宽容忽略，非 fail-fast）", () => {
+  const { value: cfg } = captureWarn(() => withConfig(retiredPushConfig(), loadMachinesConfig));
+  assert.equal("callback" in cfg, false, "退役后返回对象不得含 callback 键");
+  assert.equal(cfg.machines[0]?.machineId, "m1");
+  assert.equal("pushCallback" in (cfg.machines[0] ?? {}), false, "MachineRef 不得再带 pushCallback");
+});
+
+test("callback/pushCallback 退役：重复解析同一旧配置 ⇒ 两条退役 warn 各恰一次（文案级 once-per-process）", () => {
+  const callbackText = "[config] callback 段已退役（push 通知链拆除）：按死配置 warn + 忽略。";
+  const pushCallbackText =
+    "[config] machines[0].pushCallback 已退役（push 通知链拆除）：按死配置 warn + 忽略。";
+  const { warnings } = captureWarn(() => {
+    withConfig(retiredPushConfig(), loadMachinesConfig);
+    withConfig(retiredPushConfig(), loadMachinesConfig);
+  });
+  assert.equal(
+    warnings.filter((w) => w === callbackText).length,
+    1,
+    `callback 退役文案应恰 1 次：${JSON.stringify(warnings)}`,
+  );
+  assert.equal(
+    warnings.filter((w) => w === pushCallbackText).length,
+    1,
+    `pushCallback 退役文案应恰 1 次：${JSON.stringify(warnings)}`,
+  );
 });

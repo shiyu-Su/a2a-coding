@@ -3,8 +3,10 @@
  * bridgectl-probe.mjs —— `orch/scripts/bridgectl.mjs`（桥启停契约）真机探针。
  *
  * 用途（REQ-v0.4.1-2026-09-15-02）：逐条验证 bridgectl 的 start/stop/status 契约，
- * 并显式覆盖两条**反例**（端口被非本桥占用、陈旧 pidfile）。与 `mcp-http-probe.mjs`
- * 同族：纯 Node ESM、零第三方依赖、不参与业务。
+ * 并显式覆盖两条**反例**（端口被非本桥占用、陈旧 pidfile）。另以两条运行态断言锁定
+ * 「worker push 回调已退役」：3200 无人监听 + `POST /callback` ⇒ 404
+ * （REQ-v0.8.3-2026-09-20-01）。与 `mcp-http-probe.mjs` 同族：纯 Node ESM、零第三方依赖、
+ * 不参与业务。
  *
  * ★ 隔离铁律（绝不影响正在运行的真实桥）：
  *   - 全程使用**临时 data dir**（`SESSION_DB=<tmp>/data/sessions.sqlite`，其目录即桥的
@@ -25,9 +27,9 @@
  * 输出：每条断言一行 `[assert N] PASS|FAIL | name= | expect= | actual=`，末尾附
  *       `----- bridgectl-probe-summary -----` JSON（便于 CI 消费）。
  *
- * 退出码：0 = 6 条断言全过；1 = 任一失败（含超时 / 意外异常）。
+ * 退出码：0 = 8 条断言全过；1 = 任一失败（含超时 / 意外异常）。
  */
-import { spawn } from "node:child_process";
+import { execFile, spawn } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { createConnection, createServer } from "node:net";
 import { tmpdir } from "node:os";
@@ -59,6 +61,8 @@ const LOG_TAIL_LINES = 30;
 // ── 探针端口（非默认：默认 8787；避开真实桥） ───────────────────────────────
 const PROBE_HOST = "127.0.0.1";
 const PROBE_PORT = 8897;
+/** 已退役的回调端点端口（v0.8.3 push 链拆除）：探针不配置它，仅断言它无人监听 */
+const RETIRED_CALLBACK_PORT = 3200;
 
 // ── 临时工作区（隔离） ───────────────────────────────────────────────────────
 const TEMP_ROOT = mkdtempSync(join(tmpdir(), "bridgectl-probe-"));
@@ -93,8 +97,8 @@ const summary = {
 };
 
 // ── 输出 / 断言 ──────────────────────────────────────────────────────────────
-function check(name, pass, expect, actual) {
-  checks.push({ name, pass: pass === true, expect, actual });
+function check(name, pass, expect, actual, skipped = false) {
+  checks.push({ name, pass: pass === true, expect, actual, skipped });
 }
 
 function delay(ms) {
@@ -123,16 +127,17 @@ function tailLines(text, count) {
 }
 
 // ── 临时工作区准备 ───────────────────────────────────────────────────────────
-/** 写临时 MACHINES_CONFIG：mode=http + 非默认端口 8897；callback 关闭（不抢 3200） */
+/**
+ * 写临时 MACHINES_CONFIG：mode=http + 非默认端口 8897。
+ * 回调端点已退役（v0.8.3 push 通知链拆除）⇒ **不写 `callback` 段 / `pushCallback` 键**；
+ * 3200 不配也不监听，由断言 ⑤ 运行态锁定「端口已释放」。
+ */
 function prepareWorkspace() {
   mkdirSync(DATA_DIR, { recursive: true });
   const config = {
     transport: { mode: "http", http: { host: PROBE_HOST, port: PROBE_PORT, path: "/mcp" } },
-    callback: { enabled: false, host: PROBE_HOST, port: 3200 },
     // 指向必然无人监听的 loopback 端口：连接立即被拒，不产生长等待
-    machines: [
-      { machineId: "probe-machine", launcherUrl: "http://127.0.0.1:3199", pushCallback: false },
-    ],
+    machines: [{ machineId: "probe-machine", launcherUrl: "http://127.0.0.1:3199" }],
   };
   writeFileSync(CONFIG_PATH, `${JSON.stringify(config, null, 2)}\n`, "utf8");
 }
@@ -211,9 +216,14 @@ function runBridgectl(args, timeoutMs = BRIDGECTL_TIMEOUT_MS) {
   });
 }
 
-/** 单次 TCP 连接探测：能连上即认为端口已监听 */
-function probePort(port, host, timeoutMs = PROBE_TIMEOUT_MS) {
+/**
+ * 单次 TCP 连接探测：能连上即认为端口已监听。
+ * `expectedCode` 非空时返回**错误码串**（`"connected"` / `"ECONNREFUSED"` / `"timeout"` / `"error:<码>"`），
+ * 供断言显式核对拒绝类型；缺省仍返回布尔。
+ */
+function probePort(port, host, timeoutMs = PROBE_TIMEOUT_MS, expectedCode = null) {
   return new Promise((resolvePromise) => {
+    const shaped = expectedCode !== null;
     const socket = createConnection({ port, host });
     let settled = false;
     const finish = (ok) => {
@@ -223,9 +233,40 @@ function probePort(port, host, timeoutMs = PROBE_TIMEOUT_MS) {
       resolvePromise(ok);
     };
     socket.setTimeout(timeoutMs);
-    socket.once("connect", () => finish(true));
-    socket.once("error", () => finish(false));
-    socket.once("timeout", () => finish(false));
+    socket.once("connect", () => finish(shaped ? "connected" : true));
+    socket.once("error", (err) =>
+      finish(shaped ? String(err.code ?? (err instanceof Error ? err.message : "error")) : false),
+    );
+    socket.once("timeout", () => finish(shaped ? "timeout" : false));
+  });
+}
+
+/**
+ * 反查某端口 LISTENING 的持有者 pid（有界）：用于区分「**本探针拉起的桥**自己还占着
+ * 退役端口」=真回归，与「**另一宿主进程**（常驻旧桥未重启）占用」=环境冲突、非本构建问题。
+ * Windows `netstat -ano`；POSIX `lsof`（缺失 ⇒ null = 无法判定）。
+ */
+function findPortListenerPid(port, timeoutMs = 3_000) {
+  const cmd =
+    process.platform === "win32"
+      ? { file: "netstat", args: ["-ano"] }
+      : { file: "lsof", args: ["-nP", `-iTCP:${port}`, "-sTCP:LISTEN"] };
+  return new Promise((resolvePromise) => {
+    execFile(cmd.file, cmd.args, { timeout: timeoutMs, windowsHide: true }, (err, stdout) => {
+      if (err && !stdout) {
+        resolvePromise(null);
+        return;
+      }
+      const portTail = `:${String(port)} `;
+      for (const line of String(stdout).split(/\r?\n/)) {
+        if (!/LISTENING/i.test(line) && !/\bLISTEN\b/.test(line)) continue;
+        if (!line.includes(portTail) && !line.trimEnd().endsWith(`:${String(port)}`)) continue;
+        const pids = line.match(/\d+/g);
+        resolvePromise(pids === null ? null : Number(pids[pids.length - 1]));
+        return;
+      }
+      resolvePromise(null);
+    });
   });
 }
 
@@ -266,6 +307,26 @@ async function httpHealth(host, port, timeoutMs = HTTP_TIMEOUT_MS) {
       status: typeof body.status === "string" ? body.status : undefined,
       role: typeof body.role === "string" ? body.role : undefined,
     };
+  } catch {
+    return null;
+  }
+}
+
+/** POST 任意路径（端点存在性探测）；网络错误 / 非 JSON 返回 null */
+async function httpPostJson(host, port, path, timeoutMs = HTTP_TIMEOUT_MS) {
+  try {
+    const res = await fetch(`http://${formatHost(host)}:${port}${path}`, {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: "{}",
+      signal: AbortSignal.timeout(timeoutMs),
+    });
+    const body = await res.json().catch(() => null);
+    const tag =
+      body !== null && typeof body === "object"
+        ? `${String(body.error ?? "")}${body.code === undefined ? "" : `/${String(body.code)}`}`
+        : "";
+    return { httpStatus: res.status, body, tag };
   } catch {
     return null;
   }
@@ -392,7 +453,7 @@ async function cleanup() {
   }
 }
 
-// ── 6 条断言 ────────────────────────────────────────────────────────────────
+// ── 8 条断言 ────────────────────────────────────────────────────────────────
 async function runChecks() {
   // ① start 冷启：进程存活 + pidfile 写入 + /health 200 status=ok + role
   const start1 = await runBridgectl(["start"]);
@@ -438,6 +499,20 @@ async function runChecks() {
       `role 行=${firstMatchLine(out3, /^.*\brole\b.*$/m)}`,
   );
 
+  // ⑥ 回调路径不再存在：对 MCP 端口 POST /callback ⇒ 404 not_found（MCP server 层兜底路由）
+  //   必须在桥存活窗口内执行（①–③ 之后、④ stop 之前）——stop 后 8897 无人监听，fetch 必然失败。
+  //   断言编号保持 ⑥ 不变（锁定同一语义），仅执行顺序前移。
+  const cbPost = await httpPostJson(PROBE_HOST, PROBE_PORT, "/callback");
+  const cbGone = cbPost !== null && cbPost.httpStatus === 404 && /not_found/.test(cbPost.tag);
+  check(
+    "⑥ POST /callback ⇒ 404 not_found",
+    cbGone,
+    `POST http://${PROBE_HOST}:${String(PROBE_PORT)}/callback = 404 且响应体含 not_found`,
+    cbPost === null
+      ? "请求失败（网络错误 / 超时 / 非 JSON）"
+      : `http=${String(cbPost.httpStatus)} tag=${cbPost.tag || "无"}`,
+  );
+
   // ④ stop：进程退出 + 端口释放 + pidfile 删除
   const stop1 = await runBridgectl(["stop"]);
   const exited1 = pid1 === null ? true : await waitPidExit(pid1, STEP_TIMEOUT_MS);
@@ -453,7 +528,27 @@ async function runChecks() {
       `首行=${firstNonEmptyLine(stop1.stdout + stop1.stderr)}`,
   );
 
-  // ⑤ 反例：裸 TCP 占端口 → start 非零退出 + 不写 pidfile + 错误含「已被占用」
+  // ⑤ 回调端口 3200 不再监听（push 回调端点已退役 ⇒ 端口释放）：桥运行期 connect ⇒ ECONNREFUSED
+  //   环境冲突（**非本探针拉起的进程**在监听 3200，如宿主机上旧桥未重启）⇒ skipped，不算失败。
+  //   若「本探针拉起的桥」自己还占着 3200 ⇒ 回归，直接 fail。
+  const cb3200 = await probePort(RETIRED_CALLBACK_PORT, PROBE_HOST, PROBE_TIMEOUT_MS, "shape");
+  let cb3200Owner = null;
+  if (cb3200 === "connected") cb3200Owner = await findPortListenerPid(RETIRED_CALLBACK_PORT);
+  const cb3200IsUs = cb3200Owner !== null && pid1 !== null && cb3200Owner === pid1;
+  const cb3200EnvConflict = cb3200 === "connected" && !cb3200IsUs;
+  const cb3200Pass = cb3200 === "ECONNREFUSED" || cb3200EnvConflict;
+  check(
+    "⑤ 回调端口 3200 已释放（ECONNREFUSED）",
+    cb3200Pass,
+    `桥运行期 TCP connect ${PROBE_HOST}:${String(RETIRED_CALLBACK_PORT)} = ECONNREFUSED（本构建未监听）` +
+      "；外部进程占用 ⇒ skipped（不改环境、不触碰 8787 常驻桥）",
+    `connect=${cb3200}${cb3200Owner === null ? "" : ` ownerPid=${String(cb3200Owner)}`}` +
+      `${cb3200EnvConflict ? " [skipped: 外部监听者，非本探针桥]" : ""}` +
+      `${cb3200IsUs ? " [本探针桥自己还占着 3200 = 回归]" : ""}`,
+    cb3200EnvConflict,
+  );
+
+  // ⑦ 反例：裸 TCP 占端口 → start 非零退出 + 不写 pidfile + 错误含「已被占用」
   const bare = await listenBare(PROBE_PORT, PROBE_HOST);
   if (bare.ok) {
     bareServer = bare.server;
@@ -461,7 +556,7 @@ async function runChecks() {
     const out5 = `${start3.stdout}\n${start3.stderr}`;
     const pidfileAfter5 = existsSync(PIDFILE_PATH);
     check(
-      "⑤ 端口被非本桥占用（裸 TCP）",
+      "⑦ 端口被非本桥占用（裸 TCP）",
       start3.code !== 0 && pidfileAfter5 === false && out5.includes("已被占用"),
       "start 非零退出 且未写 pidfile 且错误信息含「已被占用」",
       `exit=${String(start3.code)}(期望非零)${start3.timedOut ? "(子进程超时)" : ""}, ` +
@@ -470,21 +565,21 @@ async function runChecks() {
     );
     await closeServer(bare.server);
     bareServer = null;
-    await waitPortFree(PROBE_PORT, PROBE_HOST, STEP_TIMEOUT_MS); // 复原现场（供 ⑥ 用）
+    await waitPortFree(PROBE_PORT, PROBE_HOST, STEP_TIMEOUT_MS); // 复原现场（供 ⑧ 用）
   } else {
     check(
-      "⑤ 端口被非本桥占用（裸 TCP）",
+      "⑦ 端口被非本桥占用（裸 TCP）",
       false,
       "start 非零退出 且未写 pidfile 且错误信息含「已被占用」",
       `裸 TCP listener 无法监听 ${PROBE_HOST}:${String(PROBE_PORT)}：${String(bare.error)}`,
     );
   }
 
-  // ⑥ 反例：陈旧 pidfile（已死 pid）→ status 报未运行且 exit 0；stop 不误杀
+  // ⑧ 反例：陈旧 pidfile（已死 pid）→ status 报未运行且 exit 0；stop 不误杀
   const deadPid = await makeDeadPid();
   if (deadPid === null) {
     check(
-      "⑥ 陈旧 pidfile（已死 pid）",
+      "⑧ 陈旧 pidfile（已死 pid）",
       false,
       "status exit=0 且报未运行；stop exit=0 且不误杀（无强杀）且清掉陈旧 pidfile",
       "无法构造已死 pid（子进程失败/超时）",
@@ -509,7 +604,7 @@ async function runChecks() {
   const deadPidUntouched = !isPidAlive(deadPid);
   const stalePidfileCleaned = !existsSync(PIDFILE_PATH);
   check(
-    "⑥ 陈旧 pidfile（已死 pid）",
+    "⑧ 陈旧 pidfile（已死 pid）",
     statusNotRunning && stop2.code === 0 && noForceKill && deadPidUntouched,
     "status exit=0 且报未运行（陈旧/未运行）；stop exit=0 且不误杀（不含「强杀」）",
     `status exit=${String(status2.code)}(期望 0) 报未运行=${String(statusNotRunning)} 状态行=${firstMatchLine(out6a, /^\s*状态.*$/m)}, ` +
@@ -538,7 +633,7 @@ main()
     check(
       "探针执行未抛异常",
       false,
-      "6 条断言全部可执行并得出结果",
+      "8 条断言全部可执行并得出结果",
       err instanceof Error ? `${err.message}\n${String(err.stack ?? "")}` : String(err),
     );
   })
@@ -546,15 +641,20 @@ main()
     await cleanup();
   })
   .finally(() => {
-    const passedCount = checks.filter((c) => c.pass).length;
-    const passed = checks.length > 0 && checks.every((c) => c.pass);
+    const failedCount = checks.filter((c) => !c.pass).length;
+    const skippedCount = checks.filter((c) => c.pass && c.skipped).length;
+    const passedCount = checks.filter((c) => c.pass && !c.skipped).length;
+    const passed = checks.length > 0 && failedCount === 0;
     summary.passed = passed;
     summary.passedCount = passedCount;
+    summary.skippedCount = skippedCount;
+    summary.failedCount = failedCount;
     summary.total = checks.length;
 
     for (const [index, item] of checks.entries()) {
+      const tag = !item.pass ? "FAIL" : item.skipped ? "SKIP" : "PASS";
       console.log(
-        `[assert ${index + 1}] ${item.pass ? "PASS" : "FAIL"} | name=${item.name} | expect=${item.expect} | actual=${item.actual}`,
+        `[assert ${index + 1}] ${tag} | name=${item.name} | expect=${item.expect} | actual=${item.actual}`,
       );
     }
     if (!passed && existsSync(LOG_PATH)) {
@@ -564,7 +664,9 @@ main()
     console.log("----- bridgectl-probe-summary -----");
     console.log(JSON.stringify(summary, null, 2));
     console.log("----- bridgectl-probe-summary-end -----");
-    console.log(`[probe] ${passed ? "PASS" : "FAIL"} (${passedCount}/${checks.length} checks)`);
+    console.log(
+      `[probe] ${passed ? "PASS" : "FAIL"} (${passedCount}/${checks.length} checks, skipped=${skippedCount}, failed=${failedCount})`,
+    );
 
     // 留一点时间让 stdout 冲干净（Windows 管道下 process.exit 过早会截断），
     // 顺便让被强杀子进程的句柄收尾，避免退出码被句柄竞态污染。

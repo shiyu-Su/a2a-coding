@@ -27,8 +27,7 @@
           "systemPromptMode": "<append|replace>，非必填（缺省 append；读者同 systemPrompt）"
         },
         "timeouts": { "prompt": "<毫秒数>，非必填——迁移后失效，登记不补（wrapper 族通用键，ACP 桥不消费，超时用桥内置缺省）" },
-        "events": { "enabled": "<true|false>，非必填——迁移后失效，登记不补（wrapper 族 trace/中间调用输出键，桥不消费；全端共享段）" },
-        "agentCard": { "pushNotifications": "<true|false>，非必填——迁移后失效，登记不补（push 回调为仓外包装器附加能力，桥路径不承载；push 附加链拆除留 v0.8.2 专项）" }
+        "events": { "enabled": "<true|false>，非必填——迁移后失效，登记不补（wrapper 族 trace/中间调用输出键，桥不消费；全端共享段）" }
       }
     },
     {

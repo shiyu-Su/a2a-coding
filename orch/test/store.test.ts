@@ -198,7 +198,7 @@ test("事件集中写：状态变化写 task.settled / task.blocked / feature.st
     assert.equal(store.latestEventId(), events[2]?.eventId);
 
     // 手动 appendEvent 亦纳入游标
-    const manual = store.appendEvent({ featureId: "f1", kind: "push.received", state: "working" });
+    const manual = store.appendEvent({ featureId: "f1", kind: "task.settled", state: "working" });
     assert.equal(store.latestEventId(), manual.eventId);
     assert.equal(store.listEvents({ since: cursor }).length, 3);
   } finally {

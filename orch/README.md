@@ -51,7 +51,7 @@ npm run bridge:logs      # 输出日志全文（支持 --lines N / --follow）
 
 | 环境变量 | 说明 | 缺省 |
 |----------|------|------|
-| `MACHINES_CONFIG` | 机器清单文件路径（`machines[]`，可选 `projectGroup` / `callback` / `web` / `transport`） | `config/config.json` |
+| `MACHINES_CONFIG` | 机器清单文件路径（`machines[]`，可选 `projectGroup` / `web` / `transport`） | `config/config.json` |
 | `SESSION_DB` | 会话 / 任务库 SQLite 路径；**其所在目录即桥的 data dir**（`bridge.pid` / `logs/` / `core.lock` 均落此，便于隔离实测） | `data/sessions.sqlite` |
 
 > 实际配置 `config/config.json` 不入库，首次部署从 `config/config.json.default` 复制并填入本机真实值。
