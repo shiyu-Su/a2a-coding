@@ -10,6 +10,8 @@
  * 依赖全部经构造注入（executor / clock / idFactory），便于单测确定性。
  */
 import { randomUUID } from "node:crypto";
+import { buildArtifacts } from "./artifacts.js";
+import { parseOutcome } from "./outcome.js";
 import type {
   A2AMessage,
   A2ATask,
@@ -114,17 +116,34 @@ export class TaskRegistry {
     }
   }
 
-  /** 终态回写：仅当仍为 `working`（`canceled` 等已落定终态优先，不被迟到结果覆盖）。 */
+  /**
+   * 终态回写（v0.8.1 M3 去重口径）：仅当仍为 `working`（`canceled` 等已落定终态优先，
+   * 不被迟到结果覆盖）。
+   * - **completed / canceled** ⇒ `status.message` **不带结果文本**，全文只落 artifact
+   *   （orch `resultText` 会把 message 与 artifacts **拼接**，双填即回归）；
+   * - **input-required / failed** ⇒ message = `question`/`reason` 短文（缺短文回退全文），
+   *   artifact = 剥块全文（短重复沿 wrapper 现状不修）；
+   * - artifact 恒为 `name="response"` 单 text part，text = `parseOutcome` 剥块后全文
+   *   （对执行器已剥块的文本为幂等再解析）。
+   */
   private applyResult(taskId: string, result: TaskExecutionResult): void {
     const record = this.records.get(taskId);
     if (record === undefined) return;
     if (record.task.status.state !== "working") return;
-    const parts: TextPart[] = [{ kind: "text", text: result.text ?? "" }];
-    record.task.status = {
-      state: result.state,
-      message: { role: "agent", parts, messageId: taskId },
-    };
-    record.task.artifacts = result.artifacts ?? [];
+    const full = parseOutcome(result.text ?? "").text;
+    const short =
+      result.state === "input-required" ? (result.question ?? full)
+        : result.state === "failed" ? (result.reason ?? full)
+          : "";
+    const status: A2ATask["status"] = { state: result.state };
+    if (short.length > 0) {
+      status.message = { role: "agent", parts: [{ kind: "text", text: short }], messageId: taskId };
+    }
+    record.task.status = status;
+    record.task.artifacts = [
+      ...buildArtifacts([{ name: "response", text: full }]),
+      ...(result.artifacts ?? []),
+    ];
     record.updatedAt = this.now().toISOString();
   }
 }

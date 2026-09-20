@@ -182,6 +182,15 @@ export class AcpClient {
     return await promise;
   }
 
+  /**
+   * 发送 JSON-RPC 通知（无 `id`，不等响应；REQ-v0.8.1 M1③）。
+   * 探针实证：opencode 的 `session/cancel` 为 notification 形态（请求形态反而无响应可回）。
+   */
+  notify(method: string, params?: unknown): void {
+    if (this.closed) return;
+    this.write(params === undefined ? { jsonrpc: "2.0", method } : { jsonrpc: "2.0", method, params });
+  }
+
   /** 关闭：拒绝在飞请求并**树杀**后端进程（防孤儿）。 */
   async close(): Promise<void> {
     if (this.closed) return;

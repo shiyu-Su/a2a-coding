@@ -2,7 +2,7 @@
  * 启动对账清理（REQ-v0.4.1-2026-09-15-03 §2.7）。
  *
  * **病根**：Launcher 被硬杀（`taskkill /F` / `kill -9`）时走不到 `shutdown()`，其拉起的
- * wrapper / `opencode serve` 成为孤儿并占住项目的 `a2aPort` ⇒ 下次启动的**启动自检**
+ * wrapper 成为孤儿并占住项目的 `a2aPort` ⇒ 下次启动的**启动自检**
  * `ensure` 撞 `EADDRINUSE` ⇒ fail-fast `exit(1)` ⇒ **服务根本起不来**。
  *
  * **做法**：在 `onListening` 内（`pruneStaleAgentConfigs` 之后、`runStartupSelfCheck` 之前）

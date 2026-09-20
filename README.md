@@ -40,8 +40,8 @@ flowchart TD
     USER([用户]) -->|需求讨论 / 任务派发| ORCH["orch Agent<br/>任意 MCP host（示例 opencode）"]
     ORCH -->|"MCP remote（Streamable HTTP）<br/>泛型工具 7 + Feature 工具组 5"| BRIDGE["MCP 薄桥 · orch/<br/>项目 → 机器解析 · 启动编排 · A2A Client · 任务态落库"]
     BRIDGE -->|"HTTP 长轮询（Runner ⇄ 桥）<br/>POST /runner/register · /runner/connect · /runner/result"| LAUNCHER["每机 Launcher→Runner · machine/<br/>本机项目自持 · Agent 生命周期 · 心跳/拉取"]
-    LAUNCHER -->|拉起包装器（按 agentKind）| WRAP["A2A 包装器<br/>a2a-opencode / a2a-codex / a2a-claude"]
-    WRAP -->|" CLI<br/>opencode run / codex exec / claude -p"| WS["目标 workspace 执行"]
+    LAUNCHER -->|拉起包装器 / ACP 桥（按 agentKind）| WRAP["A2A 包装器 · a2a-codex / a2a-claude<br/>仓内 ACP 桥 · opencode / qoder"]
+    WRAP -->|" CLI<br/>codex exec / claude -p<br/>opencode acp / qodercn --acp"| WS["目标 workspace 执行"]
     WS -.->|结果经 A2A 回传| BRIDGE
 ```
 
@@ -97,7 +97,7 @@ flowchart TD
 |----|------|
 | MCP 桥（orch 工具面） | Node.js + TypeScript，官方 `@a2a-js/sdk`（A2A Client）+ `@modelcontextprotocol/sdk` + zod |
 | 每机启动器（Launcher） | Node.js + TypeScript + express，常驻各机，管理本机项目 Agent 生命周期 |
-| 执行层包装 | `a2a-wrapper`（`a2a-opencode` / `a2a-codex` / `a2a-claude`，按 `agentKind` 分派） |
+| 执行层包装 | 仓外 `a2a-wrapper`（`a2a-codex` / `a2a-claude`）+ 仓内 ACP 桥 `machine/acp-bridge`（v0.8.1 起 opencode、v0.8.0 起 qoder 等 ACP 族），按 `agentKind` 分派 |
 | 会话 / 任务存储 | `node:sqlite`（SQLite，桥侧持久化 sessions + tasks + features） |
 | 会话落盘补丁 | `patch-package`（`postinstall` 自动应用三端 wrapper 补丁） |
 | 协议 | A2A（协议 1.0，跨 Agent 通信）；Bridge ⇄ Launcher 走 HTTP 线协议 |
@@ -110,7 +110,7 @@ flowchart TD
 - Node.js ≥ 22.5（会话 / 任务库用内置 `node:sqlite`）。
 - **orch agent 与 `orch/`（MCP 桥）的连接**：**唯一形态 = 常驻桥 + MCP `type: "remote"`（stateless Streamable HTTP，默认 `http://127.0.0.1:8787/mcp`）**；stdio 形态已随 v0.7.1 退役，桥不再由 orch agent 作为子进程拉起。桥须经 `orch/scripts/bridgectl.mjs` 常驻启动（`cd orch && npm run bridge:start -- --no-wait`，再 `npm run bridge:status` 确认就绪，见[常驻部署形态](#常驻部署形态)）。连接不再要求桥与 orch agent 同机：桥可运行在任意可达主机（默认只绑 `127.0.0.1`，非 loopback 暴露须反代 + 鉴权）。执行机器（Launcher + 项目 Agent）可在本机或远端。
 - 执行机器按项目 `agentKind` 准备对应的 CLI 与认证（Launcher 从自身进程环境继承）：
-  - `opencode`：PATH 上有 `opencode` CLI（三端中**唯一**需要预装 CLI 的 kind）；Launcher 会先拉起 `opencode serve` 作为前置后端。
+  - `opencode`（**ACP 族**，v0.8.1 起）：PATH 上有 `opencode` CLI；Launcher 拉起**仓内 ACP 桥**（`machine/acp-bridge`），桥内部 spawn `opencode acp`（不再拉起 `opencode serve` 前置后端，该 sidecar 已随迁 ACP 退役）。`agentConfig.backendCmd` **必填**且 Windows 下建议用 `opencode.exe` 绝对路径（npm 裸 PATH 只有 .cmd/.ps1 壳，桥无 shell 直调会 ENOENT）。
   - `codex`：**无需在 PATH 安装全局 `codex` CLI**，`a2a-codex` 依赖已内置 codex 运行时（`@openai/codex` + 对应平台包，`npm install` 按 OS/arch 自动选择，SDK 自动解析）；仅需认证（`OPENAI_API_KEY`，或 `codex login` 生成的 `~/.codex/auth.json`），无前置后端。自定义网关经 `~/.codex/config.toml` 的 `[model_providers.*]` 配置：`base_url` 须为 OpenAI 兼容地址，注意 codex 会在其后拼接 `/responses`（`wire_api = "responses"`），网关地址需含版本段（如 `https://…/v1`）。如需指定其它 codex 版本 / 二进制，可用 `agentConfig.codex.codexPathOverride`。
   - `claude`：**无需在 PATH 安装全局 `claude` CLI**，`a2a-claude` 依赖已内置 Claude Code 运行时（`@anthropic-ai/claude-agent-sdk` + 对应平台包，`npm install` 按 OS/arch 自动选择）。默认**加载用户级配置**（`settingSources: ["user"]`，读取 `~/.claude/settings.json` 的模型 / 网关 / 认证 `env`），交互式 Claude Code 已配好的用户开箱即用。项目可显式覆盖：`agentConfig.claude.settingSources: []` 恢复完全隔离（此时需把 `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` 注入 **Launcher 进程环境**）；模型可写在该项目 `agentConfig.claude.model`（优先于用户配置）。如需指定其它 Claude Code 版本 / 二进制，可用 `agentConfig.claude.executablePathOverride`。
 - codex 项目的 `workspace` 默认只需指向一个目录，不必是 Git 仓库（Launcher 默认注入 `codex.skipGitRepoCheck: true`）；若要强制 Git 校验，可在该项目的 `agentConfig.codex` 里覆盖为 `false`。
@@ -287,15 +287,15 @@ node flow/install/uninstall.mjs --target <项目根>
 | `projects[].agentConfig` | 包装器配置片段，顶层键如 `model` / `mcp` / `events` / `systemPrompt`；launcher 会与默认项 `{ "events": { "enabled": false } }` 深合并，写入 `agents/<agentKind>.<projectId>.json`，经 `--config` 传给包装器，再与包装器内置默认值深合并 | - | 否 |
 | `projects[].agentConfig.agentCard.pushNotifications` | worker push 能力开关；`true` 时项目 Agent 可向 orch 回调端点推送状态变化（配合 orch `callback` + `pushCallback` 使用） | `false`（默认关） | 否 |
 
-`risk` 到各端权限参数的映射（`write` 为默认，恰等于三端包装器内置默认；opencode 只有自动放行开 / 关一个旋钮，`write` 与 `full` 相同；**qoder（ACP 族）** 经仓内 ACP 桥的 `--risk <read|write|full>` 透传，由桥映射 ACP 权限请求）：
+`risk` 到各端权限参数的映射（`write` 为默认，恰等于各包装器内置默认；**ACP 族（v0.8.1 起 opencode / qoder）** 无 CLI 权限开关，经仓内 ACP 桥 `--risk <read|write|full>` 透传，由桥映射 ACP 权限请求）：
 
-| risk | opencode | codex（`--sandbox`） | claude（`--permission-mode`） |
-|------|----------|----------------------|-------------------------------|
-| `read` | `--no-auto-approve` | `read-only` | `plan` |
-| `write`（默认） | `--auto-approve` | `workspace-write` | `acceptEdits` |
-| `full` | `--auto-approve` | `danger-full-access` | `bypassPermissions` + 配置 `claude.dangerouslyAllowBypassPermissions=true` |
+| risk | codex（`--sandbox`） | claude（`--permission-mode`） |
+|------|----------------------|-------------------------------|
+| `read` | `read-only` | `plan` |
+| `write`（默认） | `workspace-write` | `acceptEdits` |
+| `full` | `danger-full-access` | `bypassPermissions` + 配置 `claude.dangerouslyAllowBypassPermissions=true` |
 
-> **qoder（ACP 族，v0.8.0）**：无仓外包装器，由**仓内自持 ACP 桥** `machine/acp-bridge/` 承担 A2A 服务面（桥绑定项目 `a2aPort`，内部以 stdio 拉起 `qodercn --acp`）；`risk` 经桥 `--risk <read|write|full>` 透传。认证优先文件凭据 `~/.qoder-cn/.auth`，备选 env `QODERCN_PERSONAL_ACCESS_TOKEN`（经 Launcher 进程环境透传）。示例见 `machine/config/config.json.default`。
+> **ACP 族（v0.8.0 qoder / v0.8.1 opencode）**：无仓外包装器，由**仓内自持 ACP 桥** `machine/acp-bridge/` 承担 A2A 服务面（桥绑定项目 `a2aPort`，内部以 stdio 拉起 `opencode acp` / `qodercn --acp`）；`risk` 经桥 `--risk <read|write|full>` 透传。opencode 认证沿用 `opencode` 自身配置；qoder 认证优先文件凭据 `~/.qoder-cn/.auth`，备选 env `QODERCN_PERSONAL_ACCESS_TOKEN`（经 Launcher 进程环境透传）。示例见 `machine/config/config.json.default`。
 
 样例：
 
@@ -479,14 +479,14 @@ a2a-coding/
 │  ├─ session/store.ts            # 会话/任务库（node:sqlite；sessions + tasks + features + artifacts + events）
 │  └─ data/                       # 运行态：sessions.sqlite（git 忽略）
 ├─ machine/                       # 部署单元 2（每台执行机器）：每机常驻
-│  ├─ package.json                # @a2a-coding/machine：express / a2a-opencode / a2a-codex / a2a-claude
+│  ├─ package.json                # @a2a-coding/machine：express / a2a-codex / a2a-claude（opencode/qoder 走仓内 acp-bridge，无仓外依赖）
 │  ├─ tsconfig.json
 │  ├─ config/config.json          # 本机项目配置（实际，git 忽略）
 │  ├─ config/config.json.default  # 本机项目配置模板（入库）
 │  ├─ types.ts  config.ts
 │  ├─ launcher/{index,server,manager,ports,process,agent-config,self-check,config-snapshot,agents-prune,app-root}.ts
 │  ├─ adapters/{index,types,json,opencode,codex,claude}.ts
-│  ├─ patches/                    # 会话落盘补丁（patch-package）：a2a-opencode / a2a-codex / a2a-claude
+│  ├─ patches/                    # 会话落盘补丁（patch-package）：@a2a-wrapper/core / a2a-codex / a2a-claude（opencode 补丁已随迁 ACP 退役）
 │  ├─ scripts/                    # 验证脚本：verify-session-persist{,-codex,-claude}.mjs、verify-config-precedence.mjs
 │  ├─ agents/                     # 运行态：launcher 生成的包装器配置（git 忽略）
 │  └─ .a2a/                       # 运行态：包装器会话映射 sessions.json（git 忽略）

@@ -118,8 +118,11 @@ test("形状兼容：completed 文本 + artifacts 经 a2a-client 解析", async 
     const settled = await waitTerminal(base, id);
     const view = taskViewOf(settled);
     assert.equal(view.state, "completed");
+    // M3 去重口径：completed ⇒ message 不带结果文本，全文只落 name="response" artifact（前置）
     assert.equal(view.text, "echo:hello\nfile");
-    assert.equal(view.artifacts.length, 1);
+    assert.equal(view.artifacts.length, 2);
+    const first = view.artifacts[0] as Record<string, unknown>;
+    assert.equal(first["name"], "response");
   });
 });
 

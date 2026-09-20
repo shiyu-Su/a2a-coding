@@ -10,11 +10,18 @@
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
 
-/** 单条映射记录。 */
+/**
+ * 单条映射记录。
+ *
+ * v0.8.1 · M2：增 `prompted`（该会话是否已发出过首轮 prompt ⇒ 注入只发生在首轮）。
+ * **旧文件兼容**：缺键 / `undefined` 视为 `false`（未注入），读取不报错。
+ */
 export interface SessionMapEntry {
   sessionId: string;
   /** 最近写入时刻（UTC ISO 8601） */
   updatedAt: string;
+  /** 首轮 prompt 是否已收到响应（缺省 = 未注入） */
+  prompted?: boolean;
 }
 
 /** 可注入文件系统（缺省 `createNodeSessionMapFs()`）。 */
@@ -92,9 +99,31 @@ export class SessionMap {
     return this.entries.get(contextId)?.sessionId ?? null;
   }
 
-  /** 写入映射并原子落盘。 */
+  /** 取 contextId 对应条目（含 `prompted` 原始值：缺键 ⇒ `undefined` = 未注入）；无则 `null`。 */
+  getEntry(contextId: string): SessionMapEntry | null {
+    return this.entries.get(contextId) ?? null;
+  }
+
+  /** 该 contextId 的会话是否已完成首轮 prompt；无映射 ⇒ `false`。 */
+  isPrompted(contextId: string): boolean {
+    return this.entries.get(contextId)?.prompted === true;
+  }
+
+  /**
+   * 写入映射并原子落盘（M2：初值 `prompted: false` = 未注入；
+   * 首轮 prompt 成功后由调用方另行 {@link markPrompted}，两次持久化拆开）。
+   */
   set(contextId: string, sessionId: string): void {
-    this.entries.set(contextId, { sessionId, updatedAt: this.now().toISOString() });
+    this.entries.set(contextId, { sessionId, updatedAt: this.now().toISOString(), prompted: false });
+    this.persist();
+  }
+
+  /** 标记该映射的会话已注入首轮 prompt 并落盘（无该键则不动）。 */
+  markPrompted(contextId: string): void {
+    const entry = this.entries.get(contextId);
+    if (entry === undefined) return;
+    entry.prompted = true;
+    entry.updatedAt = this.now().toISOString();
     this.persist();
   }
 
@@ -129,7 +158,10 @@ export class SessionMap {
       if (typeof sessionId !== "string" || sessionId.length === 0) continue;
       const updatedAt =
         typeof value["updatedAt"] === "string" ? value["updatedAt"] : this.now().toISOString();
-      this.entries.set(contextId, { sessionId, updatedAt });
+      const entry: SessionMapEntry = { sessionId, updatedAt };
+      // 旧条目兼容：prompted 缺键 / 非布尔 ⇒ 视为未注入（不报错、不写入 false 干扰旧格式）
+      if (value["prompted"] === true) entry.prompted = true;
+      this.entries.set(contextId, entry);
     }
   }
 

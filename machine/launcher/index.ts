@@ -194,7 +194,7 @@ async function onListening(): Promise<void> {
   }
 
   // 启动对账清理（本需求唯一能修「服务起不来」的动作）：清掉上次 Launcher 被硬杀留下的
-  // 无主孤儿（wrapper / `opencode serve`），否则它们占住项目 a2aPort ⇒ 下面自检的 `ensure`
+  // 无主孤儿（wrapper），否则它们占住项目 a2aPort ⇒ 下面自检的 `ensure`
   // 撞 `EADDRINUSE` ⇒ fail-fast 退出。红线：活 Launcher 在册的项目禁清（此刻本进程持有
   // 端口 = 唯一实例，在册集合仅自身 ⇒ 其余条目均无主）。
   // fail-safe：清理异常一律不阻断启动、不 exit（reconcileStartupLedger 自身亦不抛出）。

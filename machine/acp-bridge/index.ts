@@ -12,15 +12,25 @@
  * **子进程树杀**：退出时 `client.close()` 经 `lifecycle.killProcessTree` 杀后端进程树，防孤儿。
  *
  * CLI：`node dist/acp-bridge/index.js --port <n> --workspace <path>
- *       --project-id <id> --backend-cmd <cmd> --risk <read|write|full>`
+ *       --project-id <id> --backend-cmd <cmd> --risk <read|write|full>
+ *       [--backend-args <JSON字符串数组>] [--config-file <path> --config-segment <kind>]`
+ *
+ * v0.8.1 · M1：后端参数数组化（`--backend-args`，缺省 `["--acp"]` 保 qoder 逐字不变）；
+ * `--config-file` + `--config-segment` 最小配置面（读 writeAgentConfig 产物的指定段，
+ * 本节点只读取与透传，注入时机归 M2；缺文件 / 缺段 / 坏 JSON 一律告警不崩、配置取空）。
  *
  * 不 import `launcher/**` / `orch/**`；无第三方依赖（仅 node:*）。
  */
+import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { createAcpA2AServer, type AcpA2AServer } from "./a2a-server.js";
 import { AcpClient, createNodeAcpSpawn } from "./acp/client.js";
 import { createPermissionHandler } from "./acp/permission.js";
-import { AcpSessionRunner, DEFAULT_SESSION_TIMEOUT_MS } from "./acp/session.js";
+import {
+  AcpSessionRunner,
+  DEFAULT_SESSION_TIMEOUT_MS,
+  type AcpInjectionConfig,
+} from "./acp/session.js";
 import type { AcpSpawn } from "./acp/types.js";
 import { classifyFatal } from "./lifecycle.js";
 import { SessionMap } from "./session-map.js";
@@ -29,14 +39,23 @@ import type { TaskExecutionInput, TaskExecutionResult, TaskExecutor } from "./ty
 /** 风险档位（与线协议 `RiskLevel` 同口径；本模块自带字面量，不 import launcher/types）。 */
 export type BridgeRisk = "read" | "write" | "full";
 
+/** 后端参数缺省（qoder v0.8.0 行为逐字不变；opencode 由 adapter 传 `["acp"]`）。 */
+export const DEFAULT_BACKEND_ARGS: readonly string[] = ["--acp"];
+
 /** 桥启动参数。 */
 export interface BridgeArgs {
   port: number;
   workspace: string;
   projectId: string;
-  /** ACP 后端可执行命令（如 `qodercn`）；Bridge 以其 + `--acp` spawn 后端。 */
+  /** ACP 后端可执行命令（如 `qodercn`）；Bridge 以其 + `backendArgs` spawn 后端。 */
   backendCmd: string;
   risk: BridgeRisk;
+  /** 后端参数数组；缺省 = {@link DEFAULT_BACKEND_ARGS}。 */
+  backendArgs?: readonly string[];
+  /** writeAgentConfig 产物路径（可选；与 `configSegment` 同时给出才生效）。 */
+  configFile?: string;
+  /** 读取 configFile 中的段名（如 `opencode`；machine 自消费段的段选择器）。 */
+  configSegment?: string;
 }
 
 function requiredArg(map: ReadonlyMap<string, string>, key: string): string {
@@ -69,13 +88,95 @@ export function parseBridgeArgs(argv: readonly string[]): BridgeArgs {
   if (riskRaw !== "read" && riskRaw !== "write" && riskRaw !== "full") {
     throw new Error("--risk 必须是 read / write / full");
   }
+  const backendArgs = parseBackendArgs(map.get("backend-args"));
   return {
     port,
     workspace: requiredArg(map, "workspace"),
     projectId: requiredArg(map, "project-id"),
     backendCmd: requiredArg(map, "backend-cmd"),
     risk: riskRaw,
+    ...(backendArgs !== undefined ? { backendArgs } : {}),
+    ...(map.get("config-file") !== undefined ? { configFile: map.get("config-file") } : {}),
+    ...(map.get("config-segment") !== undefined
+      ? { configSegment: map.get("config-segment") }
+      : {}),
   };
+}
+
+/** `--backend-args` 解析：JSON 字符串数组；缺省返回 `undefined`（由调用方落 {@link DEFAULT_BACKEND_ARGS}）。 */
+export function parseBackendArgs(raw: string | undefined): string[] | undefined {
+  if (raw === undefined) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`--backend-args 不是合法 JSON：${raw.slice(0, 80)}`);
+  }
+  if (!Array.isArray(parsed) || parsed.some((item) => typeof item !== "string")) {
+    throw new Error("--backend-args 必须是 JSON 字符串数组");
+  }
+  return parsed as string[];
+}
+
+/**
+ * 读 `--config-file` 产物中 `--config-segment` 指定段（v0.8.1 · M1 最小配置面）。
+ * 容忍纪律：任何缺失 / 损坏都**只告警不抛错**，配置取空对象（注入面在 M2 消费）。
+ */
+export function readConfigSegment(opts: {
+  configFile?: string;
+  configSegment?: string;
+  logger?: (message: string) => void;
+}): Record<string, unknown> {
+  const log = opts.logger ?? ((message: string): void => console.log(message));
+  const { configFile, configSegment } = opts;
+  if (configFile === undefined || configFile.length === 0) return {};
+  if (configSegment === undefined || configSegment.length === 0) {
+    log(`[acp-bridge] 给出 --config-file 但缺 --config-segment，配置取空：${configFile}`);
+    return {};
+  }
+  let raw: string;
+  try {
+    raw = readFileSync(configFile, "utf8");
+  } catch (err) {
+    log(`[acp-bridge] 读 config-file 失败（配置取空）：${err instanceof Error ? err.message : String(err)}`);
+    return {};
+  }
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch (err) {
+    log(`[acp-bridge] config-file 非合法 JSON（配置取空）：${err instanceof Error ? err.message : String(err)}`);
+    return {};
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    log("[acp-bridge] config-file 顶层非对象（配置取空）");
+    return {};
+  }
+  const segment = (parsed as Record<string, unknown>)[configSegment];
+  if (typeof segment !== "object" || segment === null || Array.isArray(segment)) {
+    log(`[acp-bridge] config-file 缺段或段非对象（配置取空）：${configSegment}`);
+    return {};
+  }
+  return segment as Record<string, unknown>;
+}
+
+/**
+ * 从 config 段解析 M2 首轮注入参数（v0.8.1 · M2）。
+ * 容忍纪律同 M1：非法类型 ⇒ 忽略该键（缺省 = 仅缺省约定注入，不抛错）。
+ */
+export function parseInjectionConfig(segment: Record<string, unknown>): AcpInjectionConfig {
+  const config: AcpInjectionConfig = {};
+  const systemPrompt = segment["systemPrompt"];
+  if (typeof systemPrompt === "string" && systemPrompt.length > 0) {
+    config.systemPrompt = systemPrompt;
+  }
+  const mode = segment["systemPromptMode"];
+  if (mode === "append" || mode === "replace") {
+    config.systemPromptMode = mode;
+  } else if (typeof mode === "string" && mode.length > 0) {
+    console.log(`[acp-bridge] systemPromptMode 非法（忽略，缺省 append）：${mode}`);
+  }
+  return config;
 }
 
 /**
@@ -103,6 +204,8 @@ export interface RunningBridge {
   server: AcpA2AServer;
   client: AcpClient;
   runner: AcpSessionRunner;
+  /** `--config-file` 指定段的解析结果（无配置面时为空对象；M2 消费）。 */
+  config: Record<string, unknown>;
 }
 
 /**
@@ -113,7 +216,7 @@ export async function startBridge(args: BridgeArgs, deps: StartBridgeDeps = {}):
   const logger = deps.logger ?? ((message: string): void => console.log(message));
   const client = new AcpClient({
     command: args.backendCmd,
-    args: ["--acp"],
+    args: [...(args.backendArgs ?? DEFAULT_BACKEND_ARGS)],
     cwd: args.workspace,
     env: deps.env ?? { ...process.env },
     spawn: deps.spawn ?? createNodeAcpSpawn(),
@@ -122,16 +225,23 @@ export async function startBridge(args: BridgeArgs, deps: StartBridgeDeps = {}):
   await client.initialize();
   client.setRequestHandler(createPermissionHandler(args.risk, logger));
 
+  const config = readConfigSegment({
+    ...(args.configFile !== undefined ? { configFile: args.configFile } : {}),
+    ...(args.configSegment !== undefined ? { configSegment: args.configSegment } : {}),
+    logger,
+  });
+  const injection = parseInjectionConfig(config);
   const sessions = new SessionMap({ projectId: args.projectId, baseDir: args.workspace, logger });
   const runner = new AcpSessionRunner({
     client,
     cwd: args.workspace,
     sessions,
     timeoutMs: deps.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS,
+    injection,
     logger,
   });
   const server = createAcpA2AServer({ executor: runner, logger });
-  return { server, client, runner };
+  return { server, client, runner, config };
 }
 
 /** 判断是否作为入口直接执行（避免被 import 时触发 main）。 */

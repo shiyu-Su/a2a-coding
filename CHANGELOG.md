@@ -2,9 +2,48 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-# Changelog
+## [v0.8.1] - 2026-09-20
 
-本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
+> 主题：**opencode 改走 ACP 接入（去 `opencode serve` sidecar）** —— `REQ-v0.8.1-2026-09-19-01`（+ M9 三轮实现级增补轨）。opencode 从「仓外 `a2a-opencode` 包装器 + Launcher 前置 `opencode serve` sidecar」迁移为「复用 v0.8.0 qoder 落地的仓内 ACP 桥（桥直接 spawn `opencode acp`）」；**kind 名与线协议 2.1 不变、PROTOCOL.md 零改动、orch 源码零改动**。改造文档：`doc/v0.8.1/opencode改走ACP接入-改造文档.md`（final）。
+
+### Added
+
+- **桥参数面/配置面（machine/acp-bridge）**：`--backend-args <JSON 数组>`（缺省 `["--acp"]` 保 qoder 行为逐字不变；opencode 配 `["acp"]` 子命令）· `--config-file` + `--config-segment <kind>`（读 writeAgentConfig 产物并只取本项目 kind 段，缺文件/缺段容忍告警不崩）· `AcpClient.notify()` 公开出口（`session/cancel` 由带 id request 改为 notification 形态，opencode 探针实证）。
+- **注入语义对齐（跨 kind 行为变更）**：outcome 约定 + `opencode.{systemPrompt,systemPromptMode}` 注入改为**每 session 首轮**（append/replace 两模式），`prompted` 标志持久化到 session-map（旧条目缺省 false、跨进程 load 恢复不重注入）。
+- **artifacts 接线**：任务终态恒产 `name="response"` 单 text part artifact（text = `parseOutcome` 剥块全文）；**去重口径**——`completed` 时 `status.message` 不带结果文本（orch `resultText` 会拼接 message 与 artifacts，双填即结果×2），`input-required`/`failed` 时 message = question/reason 短文。
+- **`adapters/opencode.ts` 改写为 ACP 族**：`protocol="acp"`、`buildLaunch` 拉桥进程（含 `--backend-args '["acp"]'`、`--config-file/--config-segment opencode`）、权限 `--auto-approve` 二值 → `--risk read|write|full` 三档、`backendCmd` 必填零硬编码（报错文案含 Windows `.exe` 绝对路径提示）。
+- **回归测试**：machine 侧新增 30+ 用例（桥参数面/配置面/notify、注入时机与 prompted 持久化、artifact 三态与去重、M9 三轮轮边界回归）；`.omo` 新增 `test-v0.8.1-opencode-acp.js`（TC12，orch 侧对称与防顺手改锚点，38 断言）与 `test-v0.8.1-machine-retire.js`（TC13，退役负向锚点）。
+
+### Changed
+
+- **`machine/config/config.json.default` opencode 条目**：`agentConfig.backendCmd` 必填（示例为 `opencode.exe` 绝对路径，探针实证 Windows 裸命令名 ENOENT）；`opencode` 分段键**保持分段、读者从仓外包装器换为仓内 ACP 桥**（经 `--config-file`+段选择）；`agentCard`/`events`/`timeouts` 按「迁移后失效，登记不补」注记；条目级 push 回调 `_comment` 段删除。
+- **文档同步**：仓根 `README.md`（架构图执行层、opencode 前置描述、依赖与 patches 注释）· `CLAUDE.md` 执行层描述 · `machine/README.md` 侧段；`orch/README.md` :3/:33 纠偏（线协议 2.0→2.1 + 「A2A 包装器 / 仓内 ACP 桥」措辞；:22 与 :29 的「2.0 硬切」保留并加正向 pin）。
+
+### Removed（wrapper 全家退役）
+
+- `a2a-opencode` 依赖 + `patches/a2a-opencode+1.7.2.patch` + `scripts/verify-session-persist.mjs`（`@a2a-wrapper/core` 补丁保留——codex/claude 共用）。
+- `launcher/manager.ts`：opencode 特判（全仓唯一 kind 硬编码）、`startOpencodeServe` 全生命周期、`backendUrl` 注入、`serveChild` 及五条 serve 回收路径；`ports.ts` 的 `waitForHttpOk`/`allocateFreePort`（死导出）；`adapters/types.ts` 的 `LaunchRequest.backendUrl`；ChildLedger kind `"serve"`。
+- `.omo` 回归：`test-wrapper-session-patch.js`（TC5）删除，`test-v0.3.1-features.js` 摘除 opencode 段（语义断言迁 `acp-bridge` 新锚点），`test-task-exec-log.js`/`test-v0.2.1-features.js`/`test-codex-claude-adapter.js` 相应重定。
+
+### Fixed
+
+- **ACP 路径 needs_input 死循环（v0.8.0 遗留，波及全部 ACP 项目）**：桥的文本缓冲按 sessionId 跨轮共享，`session/load` 历史重放 chunk 混入本轮缓冲，`parseOutcome` last-block-wins 命中历史 `input-required` 块 ⇒ 续派永久判 input-required。**三轮收敛**：capturing 门控（窗外丢弃）→ messageId 轮隔离（qodercn 方言）→ **重放 messageId 集合普适规则**（prompt 前登记重放 id、窗内仅丢集合内 id；qodercn 活 chunk 无 id、opencode 活 chunk 带新 id 两种方言均正确）。真机闭环：原毒化会话续派 completed + Launcher 自检 4/4。
+- **桥 artifacts 未接线**（v0.8.0 遗留）：`artifacts.ts` 仅有单测引用、运行链路从不产出 ⇒ ACP 路径 artifacts 恒空；本期接入终态接线并加去重口径。
+- `--config-file` 段选择器缺失会让 qoder 桥误读 opencode 段（复核补 `--config-segment`）。
+- `CHANGELOG.md` 头部重复标题段（格式）。
+
+### 门禁与真机
+
+- 回归 **904/904**（`reports/v0.8.1/regression-report.json`，版本源 = 根 `package.json`）；machine `npm run typecheck` 0 + `npm test` 186/186。
+- 真机：Launcher 自检 **4/4**（opencode 项目经仓内桥拉起）· V1 opencode 全链（ensure→桥→`opencode acp`→派发→回传→completed 落库）· V2 会话 resume（opencode 同 contextId 续问 + qoder ≥2 轮）· V3 qoder 回归（含末轮 outcome 判定）· V4 artifacts 回传（`name="response"`）。
+
+### 未覆盖（登记，不计通过）
+
+- codex/claude 真机（本机无 CLI/项目配置）· POSIX 桥行为（仅结构级断言）· 权限 read 档真机（opencode 默认不发权限请求，read 语义弱化）· 交互式 needs_input 完整闭环（仅探针级验证）· `buildWorkspaceArtifacts`（workspace 文件形态，ACP 无文件清单通道）。
+
+### 已知边界（登记待排期，见 planlog「未排期需求」）
+
+- 传输层零输出死亡的有界重发（worker 首发早夭安全网）· 在飞任务在 Runner 重启后不被重新领取（孤儿结算缺失）· 长会话上下文疑致 ACP worker 崩溃。
 
 ## [v0.8.0] - 2026-09-19
 

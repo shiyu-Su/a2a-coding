@@ -24,7 +24,7 @@ const APP_ROOT = appRootFromModule(import.meta.url);
 
 /**
  * 子进程环境：把 `<root>/node_modules/.bin` 前置到 PATH，
- * 保证 `a2a-opencode` 等本地依赖在源码（machine/launcher/index.ts）与构建产物
+ * 保证 `a2a-codex` / `a2a-claude` 等本地依赖在源码（machine/launcher/index.ts）与构建产物
  * （dist/machine/launcher/index.js）两种启动方式下都可解析。
  */
 function buildChildEnv(): NodeJS.ProcessEnv {

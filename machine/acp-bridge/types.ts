@@ -69,9 +69,13 @@ export interface TaskExecutionInput {
 export interface TaskExecutionResult {
   /** 终态（不含 working） */
   state: TerminalTaskState;
-  /** 结果文本（写入 `status.message.parts`） */
+  /** 结果文本（**剥 outcome 块后的全文**，v0.8.1 M3 基线）→ 写入 `name="response"` artifact */
   text?: string;
-  /** 产物（写入 `artifacts`） */
+  /** `input-required` 短文（M3：写入 status.message；artifact 仍承载全文，短重复沿口径不修） */
+  question?: string;
+  /** `failed` 短文（同上） */
+  reason?: string;
+  /** 附加产物（追加在 `response` artifact 之后；缺省无） */
   artifacts?: A2AArtifact[];
 }
 

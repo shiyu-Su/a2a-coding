@@ -27,8 +27,12 @@ export { A2A_OUTCOME_CONVENTION };
 /**
  * 默认覆盖项：关闭 events（trace / 中间调用）输出；注入 ② 约定。
  *
- * 各端 wrapper 各自只读取自己 kind 段（多余 kind 段被忽略），因此这里一次性写入
+ * 各读者各自只取自己 kind 的段（多余 kind 段被忽略），因此这里一次性写入
  * 全部 kind 键以保证约定「必达」；各适配器 `baseConfig()` 再做 kind 级显式绑定。
+ *
+ * opencode（ACP 族，v0.8.1 起）注：本段**读者 = 仓内 ACP 桥**（经 `--config-file` +
+ * `--config-segment opencode` 读取），非仓外 `a2a-opencode` 包装器；键形状保持分段
+ * （systemPrompt / systemPromptMode）以兼容存量用户配置与既有产物（合并链与产物形状不变）。
  *
  * qoder（ACP 族）注：桥不走包装器 JSON 配置模型，`qoder` 段当前为**占位** —— 保证
  * `writeAgentConfig` 产物含 qoder 段（满足 `agent-config-segments` 断言）；outcome 注入
@@ -36,6 +40,7 @@ export { A2A_OUTCOME_CONVENTION };
  */
 const DEFAULT_AGENT_CONFIG: Record<string, unknown> = {
   events: { enabled: false },
+  // 读者 = 仓内 ACP 桥（--config-file + 段选择），非仓外包装器；键保持分段以兼容存量配置。
   opencode: { systemPrompt: A2A_OUTCOME_CONVENTION, systemPromptMode: "append" },
   codex: { developerInstructions: A2A_OUTCOME_CONVENTION },
   claude: { systemPromptAppend: A2A_OUTCOME_CONVENTION },

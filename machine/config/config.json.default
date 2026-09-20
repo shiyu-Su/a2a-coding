@@ -12,21 +12,21 @@
   },
   "projects": [
     {
-      "_comment": "可选：A2A push 回调能力（按机器/项目 opt-in，默认不开启）。将 agentConfig.agentCard.pushNotifications 设为 true 即对本项目开启；缺省或写 false = 不开启（沿用轮询对账）。回调 url/token 无需在此配置——由 orch 经 A2A message/send 的 configuration.taskPushNotificationConfig 内联下发，故无需改 ensure 或线协议。仅限同机/受信网络使用；跨机回调鉴权待 v0.7.0。",
       "projectId": "<project-id>",
       "workspace": "<absolute path to the project on this machine>",
       "agentKind": "opencode",
       "a2aPort": 3010,
       "risk": "write",
-      "_agentConfigComment": "本条目 agentConfig 为键位说明占位——非必填键不需要时请整键删除，勿原样拷贝。",
+      "_agentConfigComment": "本条目 agentConfig 键位说明（v0.8.1 起 opencode 为 **ACP 族**，与 qoder 同构：由仓内自持 ACP 桥（machine/acp-bridge）承担 A2A 服务面，桥内部以 stdio 拉起 `opencode acp`，`backendCmd` 经 `--backend-cmd` 透传）。**必填 `backendCmd`（顶层平铺）**：代码零硬编码缺省，未配置即启动报错。非必填键不需要时请整键删除，勿原样拷贝。",
       "agentConfig": {
-        "agentCard": { "pushNotifications": false },
-        "events": { "enabled": "<true|false>，非必填（缺省 false：关 trace/中间调用输出；全端共享段）" },
+        "backendCmd": "C:/Users/jimszw/AppData/Roaming/npm/node_modules/opencode-ai/bin/opencode.exe（必填；Windows 裸 PATH 命令名 ENOENT——npm 全局根只有 .cmd/.ps1 壳，须指到 .exe 绝对路径；绝对路径探针实证可用；部署时替换为本机实际路径）",
         "opencode": {
-          "systemPrompt": "<自定义 systemPrompt>，非必填（缺省注入 a2a-outcome 约定）",
-          "systemPromptMode": "<append|replace>，非必填（缺省 append）"
+          "systemPrompt": "<自定义 systemPrompt>，非必填（缺省注入 a2a-outcome 约定；读者 = 仓内 ACP 桥（--config-file + 段选择），非仓外包装器；键保持分段以兼容存量配置）",
+          "systemPromptMode": "<append|replace>，非必填（缺省 append；读者同 systemPrompt）"
         },
-        "timeouts": { "prompt": "<毫秒数>，非必填（wrapper 族通用；不配用内置缺省）" }
+        "timeouts": { "prompt": "<毫秒数>，非必填——迁移后失效，登记不补（wrapper 族通用键，ACP 桥不消费，超时用桥内置缺省）" },
+        "events": { "enabled": "<true|false>，非必填——迁移后失效，登记不补（wrapper 族 trace/中间调用输出键，桥不消费；全端共享段）" },
+        "agentCard": { "pushNotifications": "<true|false>，非必填——迁移后失效，登记不补（push 回调为仓外包装器附加能力，桥路径不承载；push 附加链拆除留 v0.8.2 专项）" }
       }
     },
     {

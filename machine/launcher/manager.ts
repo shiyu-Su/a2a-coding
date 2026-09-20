@@ -6,7 +6,6 @@ import type { ChildProcess } from "node:child_process";
 import { existsSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { getAdapter } from "../adapters/index.js";
-import type { LaunchSpec } from "../adapters/types.js";
 import type {
   ChildLedgerEntry,
   EnsureResult,
@@ -18,7 +17,7 @@ import type {
 import { writeAgentConfig } from "./agent-config.js";
 import { appRootFromModule } from "./app-root.js";
 import { describeAgentConfig } from "./config-snapshot.js";
-import { allocateFreePort, waitForHttpOk, waitForPort } from "./ports.js";
+import { waitForPort } from "./ports.js";
 import {
   errorMessage,
   hasExited,
@@ -81,17 +80,9 @@ export interface AgentManagerDeps {
   inFlight?: InFlightLedgerLike;
 }
 
-/** opencode 项目的前置 `opencode serve` 进程及其后端基址 */
-interface OpencodeBackend {
-  child: ChildProcess;
-  url: string;
-}
-
 interface RunningAgent {
   projectId: string;
   child: ChildProcess;
-  /** opencode 项目的前置 `opencode serve`；其他 kind 恒为 null */
-  serveChild: ChildProcess | null;
   endpoint: string;
   startedAt: string;
 }
@@ -260,8 +251,8 @@ export class AgentManager {
   private readonly pending = new Map<string, Promise<EnsureResult>>();
   /**
    * 唯一子进程生命周期注册表（spawn 返回即注册）：
-   * key 形如 `${projectId}:agent` / `${projectId}:serve`。这是退出清理的**唯一事实源**，
-   * 覆盖 `running` 与「spawn→注册窗口」的 child（含后台 `opencode serve`）。
+   * key 形如 `${projectId}:agent`。这是退出清理的**唯一事实源**，
+   * 覆盖 `running` 与「spawn→注册窗口」的 child。
    */
   private readonly allChildren = new Map<string, ChildProcess>();
   /** 退出中标志：置位后 `start()` 拒绝拉起，`running.set` 前二次校验，防止僵死注册 */
@@ -286,8 +277,7 @@ export class AgentManager {
    * `exit`/`error` 时自动移除，保证「spawn→注册窗口」归零（退出清理不漏）。
    *
    * 同时 **write-ahead 落账本** `<machine 根>/.a2a/children/<pid>.json`（一进程一文件），
-   * 供启动对账清理与 `reaper.mjs` 判定孤儿；wrapper 与 `opencode serve` **两条都记**
-   * （它们是被分别终止的两条进程，进程树不互相覆盖）。
+   * 供启动对账清理与 `reaper.mjs` 判定孤儿。
    */
   private trackChild(
     key: string,
@@ -410,7 +400,7 @@ export class AgentManager {
     }
 
     // 生成包装器配置（DEFAULT ← baseConfig ← agentConfig ← risk 配置补丁），经 --config 传给包装器；
-    // 生成失败即终止启动，避免已拉起 serve 后才失败
+    // 生成失败即终止启动
     const appRoot = appRootFromModule(import.meta.url);
     let configPath: string;
     try {
@@ -426,12 +416,6 @@ export class AgentManager {
       `[launcher] agent ${project.projectId} endpoint=${snapshot.endpoint}，model=${snapshot.model}`,
     );
 
-    // opencode 项目：先确保前置 `opencode serve`（cwd=workspace，本机空闲端口）
-    let backend: OpencodeBackend | null = null;
-    if (project.agentKind === "opencode") {
-      backend = await this.startOpencodeServe(project);
-    }
-
     const spec = adapter.buildLaunch({
       projectId: project.projectId,
       workspace: project.workspace,
@@ -439,14 +423,12 @@ export class AgentManager {
       configPath,
       agentConfig: project.agentConfig,
       permissionArgs: perm.args,
-      ...(backend !== null ? { backendUrl: backend.url } : {}),
     });
 
     let child: ChildProcess;
     try {
       child = spawnAgentProcess(spec, project.workspace);
     } catch (err) {
-      if (backend !== null) await terminateChild(backend.child);
       throw new AgentStartError(project.projectId, errorMessage(err));
     }
     // spawn 返回即注册（先于 waitForPort / running.set），退出清理不再漏
@@ -482,19 +464,12 @@ export class AgentManager {
       console.error(`[launcher] agent ${project.projectId} 进程错误：${errorMessage(err)}`);
     });
 
-    // 意外退出时清理内存态（避免 online 假象），并回收其前置 serve（无包装器即无用途）
+    // 意外退出时清理内存态（避免 online 假象）
     child.once("exit", (code, signal) => {
       const entry = this.running.get(project.projectId);
       if (entry !== undefined && entry.child === child) {
         this.idle.clear(project.projectId);
         this.running.delete(project.projectId);
-      }
-      if (backend !== null) {
-        void terminateChild(backend.child).catch((err: unknown) => {
-          console.error(
-            `[launcher] 回收 opencode serve ${project.projectId} 失败：${errorMessage(err)}`,
-          );
-        });
       }
       console.log(
         `[launcher] agent ${project.projectId} 退出（code=${String(code)}, signal=${String(signal)}）`,
@@ -508,7 +483,6 @@ export class AgentManager {
       });
     } catch (err) {
       await terminateChild(child);
-      if (backend !== null) await terminateChild(backend.child);
       // 早退快速失败：wrapper 因端口冲突等原因非零退出时，不等满 waitForPort 超时
       const reason =
         spawnState.error !== null
@@ -522,14 +496,12 @@ export class AgentManager {
     // 退出中：清理后拒绝注册（避免 shutdown 已跑完却又登记出「僵尸在线」）
     if (this.shuttingDown) {
       await terminateChild(child);
-      if (backend !== null) await terminateChild(backend.child);
       throw new AgentStartError(project.projectId, "Launcher 正在退出，已中止启动");
     }
 
     this.running.set(project.projectId, {
       projectId: project.projectId,
       child,
-      serveChild: backend !== null ? backend.child : null,
       endpoint,
       startedAt: new Date().toISOString(),
     });
@@ -539,62 +511,7 @@ export class AgentManager {
     return { projectId: project.projectId, endpoint, started: true };
   }
 
-  /**
-   * 拉起 opencode 前置 serve：
-   * 1. 本机分配空闲端口（与 a2aPort 独立，不占用 A2A 端口）；
-   * 2. `opencode serve --port <p> --hostname 127.0.0.1`，cwd=workspace；
-   * 3. 等待 `GET /global/health` 返回 200（复用启动超时 + 进程退出中止语义）。
-   * 未就绪即终止 serve 并抛 AgentStartError，保证不泄漏半启动进程。
-   */
-  private async startOpencodeServe(project: ProjectConfig): Promise<OpencodeBackend> {
-    let servePort: number;
-    try {
-      servePort = await allocateFreePort();
-    } catch (err) {
-      throw new AgentStartError(
-        project.projectId,
-        `无法分配 opencode serve 端口：${errorMessage(err)}`,
-      );
-    }
-
-    const spec: LaunchSpec = {
-      command: "opencode",
-      args: ["serve", "--port", String(servePort), "--hostname", "127.0.0.1"],
-    };
-    const child = spawnAgentProcess(spec, project.workspace);
-    // spawn 返回即注册（早于健康等待），退出清理覆盖半启动 serve
-    this.trackChild(`${project.projectId}:serve`, child, {
-      projectId: project.projectId,
-      kind: "serve",
-      command: [spec.command, ...spec.args].join(" "),
-    });
-    pipeChildOutput(child, `[serve:${project.projectId}]`);
-
-    const spawnState: { error: Error | null } = { error: null };
-    child.on("error", (err: Error) => {
-      spawnState.error = err;
-      console.error(
-        `[launcher] opencode serve ${project.projectId} 进程错误：${errorMessage(err)}`,
-      );
-    });
-
-    const url = `http://127.0.0.1:${servePort}`;
-    try {
-      await waitForHttpOk(`${url}/global/health`, {
-        timeoutMs: STARTUP_TIMEOUT_MS,
-        shouldAbort: () => hasExited(child) || spawnState.error !== null,
-      });
-    } catch (err) {
-      await terminateChild(child);
-      const reason = spawnState.error !== null ? errorMessage(spawnState.error) : errorMessage(err);
-      throw new AgentStartError(project.projectId, `opencode serve 未就绪：${reason}`);
-    }
-
-    console.log(`[launcher] opencode serve ${project.projectId} 已就绪：${url}`);
-    return { child, url };
-  }
-
-  /** 停止项目 Agent 及其前置 serve；未运行时返回 stopped=false */
+  /** 停止项目 Agent；未运行时返回 stopped=false */
   async stop(projectId: string): Promise<StopResult> {
     this.getProject(projectId);
     this.idle.clear(projectId);
@@ -602,23 +519,17 @@ export class AgentManager {
     const entry = this.running.get(projectId);
     if (entry === undefined || hasExited(entry.child)) {
       this.running.delete(projectId);
-      if (entry !== undefined && entry.serveChild !== null) {
-        await terminateChild(entry.serveChild);
-      }
       return { projectId, stopped: false };
     }
 
     this.running.delete(projectId);
     await terminateChild(entry.child);
-    if (entry.serveChild !== null) {
-      await terminateChild(entry.serveChild);
-    }
     console.log(`[launcher] agent ${projectId} 已停止`);
     return { projectId, stopped: true };
   }
 
   /**
-   * 停止所有 Agent 及其前置 serve（进程退出前调用）：遍历唯一注册表 allChildren。
+   * 停止所有 Agent（进程退出前调用）：遍历唯一注册表 allChildren。
    * `allChildren.clear()` 之前**显式清账本**（clear 后 untrack 守卫失效，不再自动清）。
    */
   async shutdown(): Promise<void> {

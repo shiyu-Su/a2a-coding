@@ -3,7 +3,7 @@
  *
  * 目的：Launcher 升格为 Runner 后，**出站运行态**需要一份本机可读的事实源，供
  * `machine/scripts/reaper.mjs` 判定「是否有活 Runner」，避免把活 Runner 拉起的
- * wrapper / `opencode serve` 当成孤儿误杀（reaper 判据重建）。
+ * wrapper 当成孤儿误杀（reaper 判据重建）。
  *
  * 落盘：`<machine 单元根>/.a2a/runner-state.json`
  *   { machineId, pid, port, registeredAt, lastHeartbeatAt, lastPollAt,

@@ -11,7 +11,7 @@
  *
  * 数据源：
  *   1. 子进程账本 `<machine 单元根>/.a2a/children/<pid>.json`
- *      = `{ pid, projectId, kind: "wrapper"|"serve", startedAt, command? }`（M1 落盘）；
+ *      = `{ pid, projectId, kind: "wrapper", startedAt, command? }`（M1 落盘；v0.8.1 起 `"serve"` 退役）；
  *   2. **runner-state** `<machine 单元根>/.a2a/runner-state.json`（M6·MC2 新增）
  *      = `{ machineId, pid, port, registeredAt, lastHeartbeatAt, lastPollAt,
  *           lastError, inflightCount, selfCheck, updatedAt }`（Runner 出站循环原子落盘）。

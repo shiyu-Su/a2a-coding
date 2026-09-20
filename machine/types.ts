@@ -137,8 +137,8 @@ export interface ChildLedgerEntry {
   pid: number;
   /** 所属项目（机器配置中的 projectId） */
   projectId: string;
-  /** wrapper = A2A 包装器；serve = opencode 前置 `opencode serve`（两条被分别杀） */
-  kind: "wrapper" | "serve";
+  /** wrapper = A2A 包装器 / ACP 桥（v0.8.1 起 `"serve"` 随 opencode serve 退役，旧磁盘条目由对账按 pid 处理、kind 无关） */
+  kind: "wrapper";
   /** 启动时刻（UTC ISO 8601） */
   startedAt: string;
   /** 诊断用启动命令行（可选；不含环境变量） */

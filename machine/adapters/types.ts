@@ -19,11 +19,6 @@ export interface LaunchRequest {
   /** 该项目的 A2A Server 监听端口 */
   a2aPort: number;
   /**
-   * 底层后端服务基址（opencode 项目为 Launcher 前置拉起的 `opencode serve`）。
-   * opencode 适配器映射为 `--opencode-url`；其他 kind 忽略。
-   */
-  backendUrl?: string;
-  /**
    * launcher 生成的包装器配置文件绝对路径。
    * 提供时经 `--config` 传给包装器；缺省时回退到 `wrapperConfigPath(kind, projectId)`。
    */
@@ -64,8 +59,8 @@ export interface Adapter {
   readonly kind: AgentKind;
   /**
    * 启动协议维度（改造文档 §2.2/§2.3）。
-   * - `"wrapper"`：经仓外 `a2a-<kind>` 包装器拉起（现有 opencode / codex / claude 三家）；
-   * - `"acp"`：经通用 ACP 接缝拉起（**本轮仅契约占位，无实现、未注册**）。
+   * - `"wrapper"`：经仓外 `a2a-<kind>` 包装器拉起（现存 codex / claude 两家）；
+   * - `"acp"`：经仓内通用 ACP 接缝拉起（`machine/acp-bridge/`，qoder / opencode 两家）。
    */
   readonly protocol: "wrapper" | "acp";
   /** 组装拉起 A2A 包装器的命令与参数（含 workspace / port / 权限参数） */

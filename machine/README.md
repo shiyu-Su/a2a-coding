@@ -74,15 +74,17 @@ npm run logs      # 输出日志全文（支持 --lines N / --follow）
 - `launcher.idleStopMs` 缺省 `300000`（5 分钟）；`0` 或负值 = **禁用**空闲回收（启动日志显示 `[launcher] idleStopMs=disabled`）；
 - **桥心跳失败只降 Runner 注册态**（`/health` 的 `bridge.registered` / `bridge.lastError`），**绝不触发 stop**（决策 D8，根治「桥停 5 分钟误杀在飞任务」缺陷）。
 
-## Agent 类型与 ACP 桥（v0.8.0）
+## Agent 类型与 ACP 桥（v0.8.0 / v0.8.1）
 
 本机 `projects[].agentKind` 取值集合 = `opencode` / `codex` / `claude` / `qoder`（单一事实源 `agent-kinds.ts`）。
 
-- **wrapper 族**（opencode / codex / claude）：`buildLaunch` 拉起仓外 npm 包装器 `a2a-<kind>`（见 `adapters/`）。
-- **ACP 族**（qoder，CN 版 `qodercn`）：**无仓外包装器**，由**仓内自持 ACP 桥** `machine/acp-bridge/`（构建产物 `dist/acp-bridge/index.js`）承担 A2A 服务面：
+- **wrapper 族**（codex / claude）：`buildLaunch` 拉起仓外 npm 包装器 `a2a-<kind>`（见 `adapters/`）。
+- **ACP 族**（opencode（v0.8.1 迁入）、qoder（CN 版 `qodercn`，v0.8.0 迁入））：**无仓外包装器**，由**仓内自持 ACP 桥** `machine/acp-bridge/`（构建产物 `dist/acp-bridge/index.js`）承担 A2A 服务面：
   - 桥由 Launcher 每项目 spawn，**绑定该项目的 `a2aPort`**（就绪判定 = TCP listen，与既有 endpoint 推导一致）；
   - 对外暴露 **`POST /a2a/jsonrpc`**（`message/send` / `tasks/get` / `tasks/cancel`），形状逐字兼容 `launcher/a2a-client.ts`；
-  - 内部以 **stdio NDJSON** 拉起 ACP 后端 `qodercn --acp`（`initialize` 握手 / `session/*`；详见 `acp-bridge/acp/`）。
-  - `buildLaunch` 形态：`node <appRoot>/dist/acp-bridge/index.js --port <a2aPort> --workspace <ws> --project-id <id> --backend-cmd <qodercn> --risk <read|write|full>`。
-- **认证**：优先文件凭据 `~/.qoder-cn/.auth`（`qodercn` CLI 登录）；备选 env `QODERCN_PERSONAL_ACCESS_TOKEN`（经 Launcher 进程环境透传）。
-- qoder 项目示例见 `config/config.json.default`。
+  - 内部以 **stdio NDJSON** 拉起 ACP 后端（`opencode acp` / `qodercn --acp`；`initialize` 握手 / `session/*`；详见 `acp-bridge/acp/`）。
+  - `buildLaunch` 形态：`node <appRoot>/dist/acp-bridge/index.js --port <a2aPort> --workspace <ws> --project-id <id> --backend-cmd <后端命令> --risk <read|write|full>`；opencode 另加 `--backend-args '["acp"]' --config-file <agents 产物> --config-segment opencode`（kind 级协议事实：opencode 的 ACP 入口是子命令 `acp`，非 `--acp` 旗标，由适配器内置透传）。
+  - **opencode serve 前置后端（sidecar）已随迁 ACP 退役**：桥直接 spawn `opencode acp`，无独立后端进程、无端口预分配。
+- **`agentConfig.backendCmd` 必填（ACP 族）**：代码零硬编码缺省，未配置即 `buildLaunch` 抛错。Windows 下 opencode **须为 `opencode.exe` 绝对路径**（npm 裸 PATH 只有 .cmd/.ps1 壳，桥 shell-less spawn 直调会 ENOENT）。
+- **认证**：opencode 沿用 `opencode` CLI 自身配置；qoder 优先文件凭据 `~/.qoder-cn/.auth`（`qodercn` CLI 登录），备选 env `QODERCN_PERSONAL_ACCESS_TOKEN`（经 Launcher 进程环境透传）。
+- qoder / opencode 项目示例见 `config/config.json.default`。
