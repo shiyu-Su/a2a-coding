@@ -10,6 +10,8 @@
  * 后端意外退出 → 所有在飞请求以**结构化** `AcpError`（kind `closed`/`spawn`）拒绝，绝不挂起。
  */
 import { spawn } from "node:child_process";
+import { existsSync } from "node:fs";
+import path from "node:path";
 import type {
   AcpChildProcess,
   AcpInbound,
@@ -328,12 +330,99 @@ function toText(chunk: unknown): string {
 }
 
 /**
+ * `shell:false` 下可直调的扩展名（CreateProcess 语义）。
+ * 探针实证（REQ-v0.8.2 P1 · Node v24/win32）：`.cmd`/`.bat` 直调抛 `EINVAL`、裸名（仅存 `.cmd` 壳）
+ * `ENOENT` ⇒ 批处理壳不可直调；按改造文档 B4 退化为「只补 `.exe` 候选」。
+ */
+const SHELL_SPAWNABLE_EXTS = new Set([".exe"]);
+
+/**
+ * win32 下 `shell:false` **不可直调**的扩展名（P1 实测：`.cmd`/`.bat` ⇒ EINVAL、`.ps1` ⇒ EFTYPE）。
+ * 命中即明确报错，不喂给 spawn、不解析批处理内容、不退回 `shell:true`（DEP0190 只拼接不转义）。
+ */
+const WIN_SPAWN_REJECTED_EXTS = new Set([".cmd", ".bat", ".ps1"]);
+
+export interface ResolveSpawnCommandDeps {
+  platform?: NodeJS.Platform;
+  env?: NodeJS.ProcessEnv;
+  cwd?: string;
+  /** 候选存在性判据（缺省 = 真实文件系统上的普通文件；注入便于单测）。 */
+  isFile?: (candidate: string) => boolean;
+}
+
+/**
+ * 命令别名 / PATHEXT 候选补全（REQ-v0.8.2 M2 · A4/B4）——消除「裸命令名 ENOENT」部署坑。
+ *
+ * 只在 win32 生效；**显式 `.cmd`/`.bat`/`.ps1`（含绝对路径）⇒ 抛 `AcpError("spawn")` 明确报错**
+ * （P1 实测直调 EINVAL/EFTYPE，静默失败难排查）；其余**绝对路径 / 已带扩展名 / 候选全不命中一律原样返回**
+ * （失败保持与现状一致的 ENOENT 路径，不得静默改写）。候选序列 = PATHEXT ∩ 可直调集（实测退化为
+ * `.exe`）；检索目录序：裸名 = cwd → PATH；带目录的相对路径 = 仅该目录（对齐 CreateProcess「相对路径
+ * 只按自身目录解析、不并入 PATH」语义）。
+ */
+export function resolveSpawnCommand(command: string, deps: ResolveSpawnCommandDeps = {}): string {
+  const platform = deps.platform ?? process.platform;
+  const env = deps.env ?? process.env;
+  if (platform !== "win32") return command;
+  if (command.length === 0) return command;
+
+  const ext = path.win32.extname(command).toLowerCase();
+  if (WIN_SPAWN_REJECTED_EXTS.has(ext)) {
+    throw new AcpError(
+      "spawn",
+      `ACP 后端命令 "${command}" 以 ${ext} 结尾：Windows shell:false 无法直调批处理/脚本壳（实测 EINVAL/EFTYPE）。` +
+        "请在项目配置中改为对应 .exe 真身的绝对路径（如 opencode → node_modules/opencode-ai/bin/opencode.exe）。",
+    );
+  }
+  if (path.win32.isAbsolute(command)) return command;
+  if (ext.length > 0) return command;
+
+  const isFile =
+    deps.isFile ??
+    ((candidate: string): boolean => {
+      try {
+        return existsSync(candidate);
+      } catch {
+        return false;
+      }
+    });
+
+  const pathExt = (env["PATHEXT"] ?? ".EXE")
+    .split(";")
+    .map((e) => e.trim().toLowerCase())
+    .filter((e) => e.length > 0 && SHELL_SPAWNABLE_EXTS.has(e));
+  if (pathExt.length === 0) return command;
+
+  const parsed = path.win32.parse(command);
+  const searchDirs: string[] = [];
+  if (parsed.dir.length > 0) {
+    if (!path.win32.isAbsolute(parsed.dir)) {
+      searchDirs.push(path.win32.resolve(deps.cwd ?? process.cwd(), parsed.dir));
+    }
+    // 绝对目录前缀的相对形态（`C:foo` 驱动器相对）极少见：不检索，原样返回走现状路径
+  } else {
+    searchDirs.push(deps.cwd ?? process.cwd());
+  }
+  for (const entry of (env["PATH"] ?? env["Path"] ?? "").split(";")) {
+    const dir = entry.trim().replace(/^"|"$/g, "");
+    if (dir.length > 0 && dir !== ".") searchDirs.push(dir);
+  }
+
+  for (const dir of searchDirs) {
+    for (const candidateExt of pathExt) {
+      const candidate = path.win32.join(dir, `${parsed.name}${candidateExt}`);
+      if (isFile(candidate)) return candidate;
+    }
+  }
+  return command;
+}
+
+/**
  * 缺省 spawn：`node:child_process`，POSIX `detached:true`（独立进程组 ⇒ 可组杀），
  * Windows 走 `taskkill /T /F`；`kill()` = **树杀**（防孤儿 qodercn）。
  */
 export function createNodeAcpSpawn(): AcpSpawn {
   return (command, args, options) => {
-    const child = spawn(command, [...args], {
+    const child = spawn(resolveSpawnCommand(command, { env: options.env, cwd: options.cwd }), [...args], {
       cwd: options.cwd,
       env: options.env,
       windowsHide: true,

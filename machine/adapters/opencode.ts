@@ -7,6 +7,7 @@
  *   `node <appRoot>/dist/acp-bridge/index.js
  *     --port <a2aPort> --workspace <workspace> --project-id <projectId>
  *     --backend-cmd <agentConfig.backendCmd> --backend-args '["acp"]'
+ *     [--model <agentConfig.opencode.model>]
  *     --risk <read|write|full>
  *     --config-file <agents 产物路径> --config-segment opencode`
  *
@@ -21,6 +22,12 @@
  *   `--config-segment opencode` 读取本段配置（M1 提供读取面；注入时机在 M2 落地）。
  * - outcome 注入：沿用 `A2A_OUTCOME_CONVENTION`（零依赖叶模块 `../agent-outcome.js`），
  *   保留 opencode 段形状供包装器时代产物与桥读者兼容。
+ * - **model 透传（REQ-v0.8.2-2026-09-20-01 · M1 协议面增补）**：`agentConfig.opencode.model` ⇒
+ *   桥 `--model <原样值>` ⇒ 桥发 ACP `session/set_config_option {configId:"model"}`。
+ *   旧 M1 探针实证 `acp` 子命令**严格拒绝** `-m/--model`（短/长旗标、前置/后置四组合均 rc=1 打
+ *   usage 退出，拼装即启动崩溃），故后端 argv 通道对 opencode 根本不可用 —— 协议面是两家
+ *   （opencode / qoder）**同方言**的唯一通路，本适配器据此启用透传。桥侧**不校验**值、
+ *   adapter 侧不做 name↔modelId 映射；未配 / 非法 ⇒ 不下发旗标（零回退）。
  */
 import { join } from "node:path";
 import type { AgentKind } from "../types.js";
@@ -33,7 +40,7 @@ import type {
 } from "./types.js";
 import { appRootFromModule } from "../launcher/app-root.js";
 import { A2A_OUTCOME_CONVENTION } from "../agent-outcome.js";
-import { resolveAcpBackendCmd } from "../launcher/agent-config.js";
+import { resolveAcpBackendCmd, resolveAcpModel } from "../launcher/agent-config.js";
 
 /** 缺少 `agentConfig.backendCmd` 时的明确错误文案（ACP 族必填）。 */
 export const OPENCODE_BACKEND_CMD_REQUIRED =
@@ -52,6 +59,7 @@ export class OpenCodeAdapter implements Adapter {
     if (backendCmd === undefined) {
       throw new Error(OPENCODE_BACKEND_CMD_REQUIRED);
     }
+    const model = resolveAcpModel(request.agentConfig, "opencode");
     // 拉起的是仓内自持桥进程（非仓外 a2a-opencode 包装器，也不再前置 opencode serve）。
     const appRoot = appRootFromModule(import.meta.url);
     const bridgeEntry = join(appRoot, "dist", "acp-bridge", "index.js");
@@ -67,6 +75,9 @@ export class OpenCodeAdapter implements Adapter {
       backendCmd,
       "--backend-args",
       JSON.stringify([...OPENCODE_BACKEND_ARGS]),
+      // 模型透传（REQ-v0.8.2 M1 协议面增补）：原样值经桥落到 ACP session/set_config_option；
+      // 未配/非法 ⇒ 不下发该旗标，argv 与现状逐字一致。不参与后端 argv 拼装。
+      ...(model !== undefined ? ["--model", model] : []),
       // permission(risk).args（`--risk <档>`）追加在基础参数之后。
       ...(request.permissionArgs ?? []),
     ];

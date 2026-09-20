@@ -184,6 +184,138 @@ test("qoder buildLaunch：agentConfig.backendCmd 原样透传（绝对路径）"
   assert.equal(spec.args[spec.args.indexOf("--backend-cmd") + 1], "/opt/qoder/qoderclicn");
 });
 
+// ---- REQ-v0.8.2-2026-09-20-01 · M1（协议面增补）：model 走桥 `--model` ⇒ ACP set_config_option ----
+
+/** ACP 族未配 model 时的桥侧参数基线（args[0]=桥入口绝对路径，运行环境相关，单列剔除）。 */
+const QODER_NO_MODEL_BASELINE = [
+  "--port",
+  "4100",
+  "--workspace",
+  "/ws/p1",
+  "--project-id",
+  "p1",
+  "--backend-cmd",
+  "qoderclicn",
+];
+
+function qoderBridgeArgs(agentConfig: Record<string, unknown> | undefined): string[] {
+  const spec = getAdapter("qoder").buildLaunch({
+    projectId: "p1",
+    workspace: "/ws/p1",
+    a2aPort: 4100,
+    agentConfig,
+  });
+  return spec.args.slice(1);
+}
+
+test("qoder model 已配 ⇒ 下发 --model，值逐字 = 配置值（不再拼后端 argv）", () => {
+  assert.deepEqual(qoderBridgeArgs({ backendCmd: "qoderclicn", qoder: { model: "provider/model-x" } }), [
+    ...QODER_NO_MODEL_BASELINE,
+    "--model",
+    "provider/model-x",
+  ]);
+});
+
+test("qoder model 已配 + permissionArgs：--model 在 --backend-cmd 后、--risk 前", () => {
+  const spec = getAdapter("qoder").buildLaunch({
+    projectId: "p1",
+    workspace: "/ws/p1",
+    a2aPort: 4100,
+    agentConfig: { backendCmd: "qoderclicn", qoder: { model: "m1" } },
+    permissionArgs: getAdapter("qoder").permission("read").args,
+  });
+  assert.deepEqual(spec.args.slice(1), [
+    ...QODER_NO_MODEL_BASELINE,
+    "--model",
+    "m1",
+    "--risk",
+    "read",
+  ]);
+});
+
+test("qoder model 未配 ⇒ 不下发 --model / --backend-args（argv 逐字 = 基线，桥不发 set）", () => {
+  const args = qoderBridgeArgs({ backendCmd: "qoderclicn" });
+  assert.deepEqual(args, QODER_NO_MODEL_BASELINE);
+  assert.ok(!args.includes("--model"));
+  assert.ok(!args.includes("--backend-args"));
+});
+
+test("qoder model 非法值（空串 / 非字符串 / 段缺失 / 段非对象）⇒ 与未配置同路径逐字一致", () => {
+  const invalidCases: Record<string, Record<string, unknown>> = {
+    "空串": { backendCmd: "qoderclicn", qoder: { model: "" } },
+    "数字": { backendCmd: "qoderclicn", qoder: { model: 42 } },
+    "null": { backendCmd: "qoderclicn", qoder: { model: null } },
+    "段缺失": { backendCmd: "qoderclicn" },
+    "段非对象（字符串）": { backendCmd: "qoderclicn", qoder: "oops" },
+    "段非对象（数组）": { backendCmd: "qoderclicn", qoder: [{ model: "m1" }] },
+  };
+  for (const [name, agentConfig] of Object.entries(invalidCases)) {
+    assert.deepEqual(qoderBridgeArgs(agentConfig), QODER_NO_MODEL_BASELINE, `非法值「${name}」应走未配置路径`);
+  }
+});
+
+test("qoder 旧 -m argv 拼装已撤除（model 唯一通道 = 协议面 set）", () => {
+  const args = qoderBridgeArgs({ backendCmd: "qoderclicn", qoder: { model: "provider/model-x" } });
+  assert.ok(!args.includes("-m"), "不得再出现后端 -m 旗标");
+  assert.ok(!args.some((a) => a.includes('"-m"')), "不得再出现 --backend-args 内的 -m 拼装");
+});
+
+/** opencode 未配 model 时的桥侧参数基线（`acp` 子命令恒定）。 */
+const OPENCODE_NO_MODEL_BASELINE = [
+  "--port",
+  "4100",
+  "--workspace",
+  "/ws/p1",
+  "--project-id",
+  "p1",
+  "--backend-cmd",
+  "opencode.exe",
+  "--backend-args",
+  '["acp"]',
+];
+
+function opencodeBridgeArgs(agentConfig: Record<string, unknown>): string[] {
+  return getAdapter("opencode")
+    .buildLaunch({ projectId: "p1", workspace: "/ws/p1", a2aPort: 4100, agentConfig })
+    .args.slice(1);
+}
+
+test("opencode model 已配 ⇒ 下发 --model（协议面通路对两家同方言启用）", () => {
+  assert.deepEqual(
+    opencodeBridgeArgs({ backendCmd: "opencode.exe", opencode: { model: "provider/model-x" } }),
+    [...OPENCODE_NO_MODEL_BASELINE, "--model", "provider/model-x"],
+  );
+});
+
+test("opencode model 已配 + permissionArgs：--model 在 --backend-args 后、--risk 前", () => {
+  const spec = getAdapter("opencode").buildLaunch({
+    projectId: "p1",
+    workspace: "/ws/p1",
+    a2aPort: 4100,
+    agentConfig: { backendCmd: "opencode.exe", opencode: { model: "m1" } },
+    permissionArgs: getAdapter("opencode").permission("read").args,
+  });
+  assert.deepEqual(spec.args.slice(1), [
+    ...OPENCODE_NO_MODEL_BASELINE,
+    "--model",
+    "m1",
+    "--risk",
+    "read",
+  ]);
+});
+
+test('opencode model 未配 / 非法 ⇒ argv 逐字 = 基线（后端 argv 恒 ["acp"]，不含 --model）', () => {
+  const cases: Record<string, Record<string, unknown>> = {
+    未配: { backendCmd: "opencode.exe" },
+    空串: { backendCmd: "opencode.exe", opencode: { model: "" } },
+    数字: { backendCmd: "opencode.exe", opencode: { model: 7 } },
+    段非对象: { backendCmd: "opencode.exe", opencode: "oops" },
+  };
+  for (const [name, agentConfig] of Object.entries(cases)) {
+    assert.deepEqual(opencodeBridgeArgs(agentConfig), OPENCODE_NO_MODEL_BASELINE, `「${name}」应走未配置路径`);
+  }
+});
+
 test("qoder buildLaunch：无 agentConfig ⇒ 抛错且信息含 backendCmd", () => {
   const minimal: LaunchRequest = { projectId: "p1", workspace: "/ws/p1", a2aPort: 4100 };
   assert.throws(() => getAdapter("qoder").buildLaunch(minimal), /backendCmd/);

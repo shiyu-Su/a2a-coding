@@ -12,7 +12,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -20,6 +20,7 @@ import {
   DEFAULT_BACKEND_ARGS,
   parseBackendArgs,
   parseBridgeArgs,
+  parseModelArg,
   readConfigSegment,
   startBridge,
   type BridgeArgs,
@@ -33,6 +34,13 @@ class FakeChild implements AcpChildProcess {
   readonly stdout = new PassThrough();
   readonly stderr = new PassThrough();
   readonly lines: Array<Record<string, unknown>> = [];
+  /**
+   * `initialize` 之外的应答钩子（返回 `undefined` ⇒ 不应答）；
+   * REQ-v0.8.2 · M1（协议面增补）用例据此观测桥实际写出的 ACP 请求。
+   */
+  responder:
+    | ((method: string, params: Record<string, unknown>) => Record<string, unknown> | undefined)
+    | undefined;
   private readonly exits: Array<(code: number | null, signal: NodeJS.Signals | null) => void> = [];
   private buffer = "";
 
@@ -50,6 +58,17 @@ class FakeChild implements AcpChildProcess {
         if (message["method"] === "initialize") {
           this.stdout.write(
             `${JSON.stringify({ jsonrpc: "2.0", id: message["id"], result: { protocolVersion: 1 } })}\n`,
+          );
+          continue;
+        }
+        if (this.responder === undefined || message["id"] === undefined) continue;
+        const result = this.responder(
+          String(message["method"]),
+          (message["params"] ?? {}) as Record<string, unknown>,
+        );
+        if (result !== undefined) {
+          this.stdout.write(
+            `${JSON.stringify({ jsonrpc: "2.0", id: message["id"], result })}\n`,
           );
         }
       }
@@ -69,13 +88,16 @@ class FakeChild implements AcpChildProcess {
   }
 }
 
-function makeSpawn(): { spawn: AcpSpawn; spawned: string[][] } {
+function makeSpawn(): { spawn: AcpSpawn; spawned: string[][]; children: FakeChild[] } {
   const spawned: string[][] = [];
+  const children: FakeChild[] = [];
   const spawn: AcpSpawn = (_command, args) => {
     spawned.push([...args]);
-    return new FakeChild();
+    const child = new FakeChild();
+    children.push(child);
+    return child;
   };
-  return { spawn, spawned };
+  return { spawn, spawned, children };
 }
 
 const DIR = mkdtempSync(join(tmpdir(), "a2a-acp-m1-"));
@@ -251,4 +273,82 @@ test("AcpClient.notify：关闭后静默丢弃（不写出、不抛错）", asyn
   await client.close();
   client.notify("session/cancel", { sessionId: "s1" });
   assert.deepEqual(fake.lines, []);
+});
+
+// ---------- ④ --model（REQ-v0.8.2-2026-09-20-01 · M1 协议面增补） ----------
+
+test("parseModelArg：缺省 / 空串 ⇒ undefined；非空原样（不校验取值）", () => {
+  assert.equal(parseModelArg(undefined), undefined);
+  assert.equal(parseModelArg(""), undefined);
+  assert.equal(parseModelArg("provider/model-x"), "provider/model-x");
+  assert.equal(parseModelArg("显示名也原样送"), "显示名也原样送");
+});
+
+test("parseBridgeArgs：--model 解析为 args.model；未给则键缺席", () => {
+  const common = ["--port", "4100", "--workspace", "/ws", "--project-id", "p1", "--backend-cmd", "b"];
+  assert.equal(parseBridgeArgs([...common, "--model", "m1"]).model, "m1");
+  const without = parseBridgeArgs(common);
+  assert.equal(without.model, undefined);
+  assert.equal("model" in without, false);
+});
+
+/** 让 fake 后端应答会话建立 + set + prompt，返回其收到的 set 参数。 */
+function wireBackend(child: FakeChild, sessionId = "s-remote"): Array<Record<string, unknown>> {
+  const sets: Array<Record<string, unknown>> = [];
+  child.responder = (method, params) => {
+    if (method === "session/new") {
+      return { sessionId, configOptions: [{ id: "model", type: "select", currentValue: "default" }] };
+    }
+    if (method === "session/set_config_option") {
+      sets.push(params);
+      return { currentValue: String(params["value"]) };
+    }
+    if (method === "session/prompt") return { stopReason: "end_turn" };
+    return {};
+  };
+  return sets;
+}
+
+test("startBridge --model ⇒ 会话建立后桥向后端发出 set_config_option（value 逐字 = 配置值）", async () => {
+  const { spawn, children } = makeSpawn();
+  const running = await startBridge(baseArgs({ model: "provider/model-x" }), {
+    spawn,
+    logger: () => undefined,
+  });
+  try {
+    const sets = wireBackend(children[0] as FakeChild);
+    const result = await running.runner.execute({
+      taskId: "t1",
+      text: "hi",
+      contextId: "ctx-with-model",
+      messageId: "m1",
+    });
+    assert.equal(result.state, "completed");
+    assert.deepEqual(sets, [{ sessionId: "s-remote", configId: "model", value: "provider/model-x" }]);
+  } finally {
+    await running.client.close();
+  }
+});
+
+test("startBridge 未给 --model ⇒ 后端收不到任何 set_config_option（现状逐字一致）", async () => {
+  const { spawn, children } = makeSpawn();
+  const running = await startBridge(baseArgs(), { spawn, logger: () => undefined });
+  try {
+    const sets = wireBackend(children[0] as FakeChild);
+    await running.runner.execute({
+      taskId: "t1",
+      text: "hi",
+      contextId: "ctx-no-model",
+      messageId: "m1",
+    });
+    assert.deepEqual(sets, []);
+    assert.deepEqual(
+      (children[0] as FakeChild).lines
+        .map((l) => String(l["method"]))
+        .filter((m) => m.startsWith("session/")),
+      ["session/new", "session/prompt"],
+    );
+  } finally {
+    await running.client.close();
+  }
 });

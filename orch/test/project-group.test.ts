@@ -6,7 +6,7 @@
  *    **不再出站** `GET /projects`；
  * ② 出参补 `runners[]`：**只列 memberMachines** 中已注册者（B4），含 `online` / `lastHeartbeatAt`；
  *    未注册 / 心跳超时 ⇒ 保留机器条目 + `error`（`launcher_unreachable` 语义改判）；
- * ③ **字段白名单**：全文不得出现 `workspace` / `agentConfig` / `runnerId` / token / `protocolVersion`；
+ * ③ **字段白名单**：全文不得出现 `workspace` / `agentConfig` / `runnerId` / token / `protocolVersion` / `model`；
  * ④ `locateProject` 改查注册视图：命中 ⇒ 入队；全部成员机器未注册/离线 ⇒ `launcher_unreachable`，
  *    注册在线但未上报该项目 ⇒ `project_not_found`；
  * ⑤ 成员判据（v0.6.0 语义保留）：非成员派发 / 查态 / 取消 ⇒ `project_not_a_member` 且**零 I/O**；
@@ -204,7 +204,7 @@ test("①/② 读注册表：项目来自投影 + runners[] 只列成员 + 未�
   assert.equal(outboundCount, 0, "handleProjects 必须零出站（读注册表）");
 });
 
-test("③ 字段白名单：全文不含 workspace / agentConfig / runnerId / token / protocolVersion", async () => {
+test("③ 字段白名单：全文不含 workspace / agentConfig / runnerId / token / protocolVersion / model", async () => {
   outboundCount = 0;
   writeConfig({ name: "g1", members: [{ machineId: "m1", projectId: "alpha" }] });
   registerRunner("m1", [{ projectId: "alpha" }]);
@@ -218,6 +218,8 @@ test("③ 字段白名单：全文不含 workspace / agentConfig / runnerId / to
     "runnerId",
     "protocolVersion",
     "token",
+    // 防「machine 误把 model 提到注册 ⇒ orch 静默忽略 = 假透传」：出参不得出现 model 键名
+    "model",
   ]) {
     assert.equal(raw.includes(forbidden), false, `出参不得含 ${forbidden}：${raw}`);
   }

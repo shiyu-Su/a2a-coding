@@ -110,7 +110,8 @@ flowchart TD
 - Node.js ≥ 22.5（会话 / 任务库用内置 `node:sqlite`）。
 - **orch agent 与 `orch/`（MCP 桥）的连接**：**唯一形态 = 常驻桥 + MCP `type: "remote"`（stateless Streamable HTTP，默认 `http://127.0.0.1:8787/mcp`）**；stdio 形态已随 v0.7.1 退役，桥不再由 orch agent 作为子进程拉起。桥须经 `orch/scripts/bridgectl.mjs` 常驻启动（`cd orch && npm run bridge:start -- --no-wait`，再 `npm run bridge:status` 确认就绪，见[常驻部署形态](#常驻部署形态)）。连接不再要求桥与 orch agent 同机：桥可运行在任意可达主机（默认只绑 `127.0.0.1`，非 loopback 暴露须反代 + 鉴权）。执行机器（Launcher + 项目 Agent）可在本机或远端。
 - 执行机器按项目 `agentKind` 准备对应的 CLI 与认证（Launcher 从自身进程环境继承）：
-  - `opencode`（**ACP 族**，v0.8.1 起）：PATH 上有 `opencode` CLI；Launcher 拉起**仓内 ACP 桥**（`machine/acp-bridge`），桥内部 spawn `opencode acp`（不再拉起 `opencode serve` 前置后端，该 sidecar 已随迁 ACP 退役）。`agentConfig.backendCmd` **必填**且 Windows 下建议用 `opencode.exe` 绝对路径（npm 裸 PATH 只有 .cmd/.ps1 壳，桥无 shell 直调会 ENOENT）。
+  - `opencode`（**ACP 族**，v0.8.1 起）：PATH 上有 `opencode` CLI；Launcher 拉起**仓内 ACP 桥**（`machine/acp-bridge`），桥内部 spawn `opencode acp`（不再拉起 `opencode serve` 前置后端，该 sidecar 已随迁 ACP 退役）。`agentConfig.backendCmd` **必填**且 Windows 下建议用 `opencode.exe` 绝对路径（npm 裸 PATH 只有 .cmd/.ps1 壳，桥无 shell 直调会 ENOENT）。模型可写在该项目 `agentConfig.opencode.model`（v0.8.2 起，值形如 `providerID/modelID`，见下「per-project 模型」）。
+  - `qoder`（**ACP 族**，v0.8.0 起）：`agentConfig.qoder.backendCmd` 指向 `qoderclicn.exe` 绝对路径；模型可写在该项目 `agentConfig.qoder.model`（v0.8.2 起，取值为 `model-catalog.json` 里的 modelId，如 `qmodel_38max`）。
   - `codex`：**无需在 PATH 安装全局 `codex` CLI**，`a2a-codex` 依赖已内置 codex 运行时（`@openai/codex` + 对应平台包，`npm install` 按 OS/arch 自动选择，SDK 自动解析）；仅需认证（`OPENAI_API_KEY`，或 `codex login` 生成的 `~/.codex/auth.json`），无前置后端。自定义网关经 `~/.codex/config.toml` 的 `[model_providers.*]` 配置：`base_url` 须为 OpenAI 兼容地址，注意 codex 会在其后拼接 `/responses`（`wire_api = "responses"`），网关地址需含版本段（如 `https://…/v1`）。如需指定其它 codex 版本 / 二进制，可用 `agentConfig.codex.codexPathOverride`。
   - `claude`：**无需在 PATH 安装全局 `claude` CLI**，`a2a-claude` 依赖已内置 Claude Code 运行时（`@anthropic-ai/claude-agent-sdk` + 对应平台包，`npm install` 按 OS/arch 自动选择）。默认**加载用户级配置**（`settingSources: ["user"]`，读取 `~/.claude/settings.json` 的模型 / 网关 / 认证 `env`），交互式 Claude Code 已配好的用户开箱即用。项目可显式覆盖：`agentConfig.claude.settingSources: []` 恢复完全隔离（此时需把 `ANTHROPIC_API_KEY` / `ANTHROPIC_BASE_URL` 注入 **Launcher 进程环境**）；模型可写在该项目 `agentConfig.claude.model`（优先于用户配置）。如需指定其它 Claude Code 版本 / 二进制，可用 `agentConfig.claude.executablePathOverride`。
 - codex 项目的 `workspace` 默认只需指向一个目录，不必是 Git 仓库（Launcher 默认注入 `codex.skipGitRepoCheck: true`）；若要强制 Git 校验，可在该项目的 `agentConfig.codex` 里覆盖为 `false`。
@@ -285,6 +286,7 @@ node flow/install/uninstall.mjs --target <项目根>
 | `projects[].a2aPort` | 该项目 A2A Server 监听端口 | - | 是 |
 | `projects[].risk` | 项目风险档位，`read` / `write` / `full`，决定包装器传给底层 CLI 的权限 / 沙箱参数 | `write` | 否 |
 | `projects[].agentConfig` | 包装器配置片段，顶层键如 `model` / `mcp` / `events` / `systemPrompt`；launcher 会与默认项 `{ "events": { "enabled": false } }` 深合并，写入 `agents/<agentKind>.<projectId>.json`，经 `--config` 传给包装器，再与包装器内置默认值深合并 | - | 否 |
+| `projects[].agentConfig.<kind>.model` | **per-project 模型名称**（v0.8.2 起，仅 ACP 族 opencode/qoder）：值 = 后端自己的 modelId（opencode 形如 `providerID/modelID`，qoder 取 `machine/config/model-catalog.json` 的 key）。adapter 原样透传 `--model` ⇒ 桥在每次会话建立后发一次 ACP `session/set_config_option`。**不配 / 空串 ⇒ 桥完全不发该请求**，走后端自身默认。配错（无效 modelId）⇒ **任务明确失败**（fail-fast，不静默回落）；qoder 与 opencode 均以 `-32602` 拒绝 | - | 否 |
 | `projects[].agentConfig.agentCard.pushNotifications` | worker push 能力开关；`true` 时项目 Agent 可向 orch 回调端点推送状态变化（配合 orch `callback` + `pushCallback` 使用） | `false`（默认关） | 否 |
 
 `risk` 到各端权限参数的映射（`write` 为默认，恰等于各包装器内置默认；**ACP 族（v0.8.1 起 opencode / qoder）** 无 CLI 权限开关，经仓内 ACP 桥 `--risk <read|write|full>` 透传，由桥映射 ACP 权限请求）：
@@ -622,6 +624,9 @@ Launcher 被硬杀（`taskkill /F`、崩溃、断电）时，它拉起的项目 
 
 **Q：任务很久不返回怎么办？**
 `a2a_call` 默认半异步：超过 `SYNC_BUDGET_MS`（默认 30000ms）未完成即返回 `working + taskId`，桥转后台看护至终态并落库，用 `a2a_task_status` 轮询即可。也可用 `wait=false` 让它立即返回句柄。注意 `SYNC_BUDGET_MS` 必须小于 orch agent 的 MCP 客户端请求超时（`@modelcontextprotocol/sdk` 默认 60s），否则句柄返回会被客户端超时截断。
+
+**Q：等待常规任务有现成脚本吗？**
+有（v0.8.2 起）：`node scripts/watch-task.mjs <taskId...>` —— 只读阻塞等待 orch 的 `GET /api/tasks/:taskId` 至终态，**只打印 state 一行**（不打印文本/失败原因/artifacts，详情退出后自行调 `a2a_task_status` 取）。**退出码三档**：`0` = 等到终态（含 `failed`，故 0 ≠ 成功）/ `20` = 窗口耗尽（默认 10s × 180 = 30 min，`--interval` / `--max` 可调）/ `1` = 脚本错误含未知 id。多 id 一条命令等全部，按入参顺序每行 `id + state`；未知 id 记 `not_found` 后仍继续等其余。**入参必须用 `a2a_call` 返回的 taskId**（端点走主键直查，传远端 remoteTaskId 会 404）。Feature 主链等待仍用 `scripts/watch-feature.mjs`。
 
 **Q：丢了 `taskId` 句柄还能找回任务吗？**
 可以，用 `a2a_tasks(project, [state], [limit])` 按项目列出本地任务记录兜底找回。

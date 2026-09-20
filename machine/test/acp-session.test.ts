@@ -8,6 +8,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { readFileSync } from "node:fs";
 import { AcpError } from "../acp-bridge/acp/client.js";
 import { AcpSessionRunner, type AcpRequestClient } from "../acp-bridge/acp/session.js";
 import { SessionMap, type SessionMapFs } from "../acp-bridge/session-map.js";
@@ -502,3 +503,305 @@ test("M9-c 无跨轮泄漏：重放 id 登记随收窗清空，不累积到次�
     logs.join("\n"),
   );
 });
+
+// ---- REQ-v0.8.2-2026-09-20-01 · M1（协议面增补）：model ⇒ session/set_config_option ----
+
+const SET_MODEL = "session/set_config_option";
+
+function modelRunner(
+  client: AcpRequestClient,
+  model?: string,
+  sessions?: SessionMap,
+  logger?: (message: string) => void,
+): AcpSessionRunner {
+  return new AcpSessionRunner({
+    client,
+    cwd: "/ws",
+    timeoutMs: 1000,
+    ...(model !== undefined ? { model } : {}),
+    ...(sessions !== undefined ? { sessions } : {}),
+    ...(logger !== undefined ? { logger } : {}),
+  });
+}
+
+/**
+ * 应答会话建立（new / load / resume）+ set_config_option + prompt 的通用 fake。
+ * `fail` 内的方法抛错（用于 load→resume→new 回退链）；返回已调用方法序列。
+ */
+function modelResponder(
+  client: FakeClient,
+  opts: { sessionId?: string; fail?: readonly string[] } = {},
+): string[] {
+  const sessionId = opts.sessionId ?? "s1";
+  const fail = new Set(opts.fail ?? []);
+  const methods: string[] = [];
+  client.responder = (method, params) => {
+    methods.push(method);
+    if (fail.has(method)) throw new Error(`${method} 不可用`);
+    if (method === "session/new") {
+      return { sessionId, configOptions: [{ id: "model", currentValue: "backend-default" }] };
+    }
+    if (method === "session/load" || method === "session/resume") return {};
+    if (method === SET_MODEL) {
+      const p = params as { value: string };
+      // 真机方言：顶层无 currentValue，生效值在 configOptions[] 内 id==="model" 项
+      return { configOptions: [{ id: "model", currentValue: p.value }] };
+    }
+    if (method === "session/prompt") {
+      client.emit("session/update", {
+        sessionId,
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "ok" } },
+      });
+    }
+    return { stopReason: "end_turn" };
+  };
+  return methods;
+}
+
+const setParams = (client: FakeClient): unknown[] =>
+  client.calls.filter((c) => c.method === SET_MODEL).map((c) => c.params);
+
+test("M1-model ① new 路径配 model ⇒ set 被调用一次，参数逐字 = {sessionId, configId:\"model\", value:配置值}", async () => {
+  const client = new FakeClient();
+  const methods = modelResponder(client);
+
+  const result = await modelRunner(client, "provider/model-x").execute(INPUT);
+
+  assert.equal(result.state, "completed");
+  assert.equal(result.text, "ok");
+  assert.deepEqual(setParams(client), [
+    { sessionId: "s1", configId: "model", value: "provider/model-x" },
+  ]);
+  assert.deepEqual(methods, ["session/new", SET_MODEL, "session/prompt"]);
+});
+
+test("M1-model ① 值原样透传：含空格 / 斜杠 / 显示名等任意字符串一律不加工", async () => {
+  for (const value of ["a b/c:d", "GLM-4.7 (max)", "与显示名同形-中文", "x".repeat(300)]) {
+    const client = new FakeClient();
+    modelResponder(client);
+    await modelRunner(client, value).execute(INPUT);
+    assert.deepEqual(setParams(client), [{ sessionId: "s1", configId: "model", value }]);
+  }
+});
+
+test("M1-model ② 未配 model ⇒ 完全不调 set，方法序列与现状逐字一致", async () => {
+  const client = new FakeClient();
+  const methods = modelResponder(client);
+  await runner(client).execute(INPUT);
+  assert.deepEqual(setParams(client), []);
+  assert.deepEqual(methods, ["session/new", "session/prompt"]);
+});
+
+test("M1-model ② 空串 / 非字符串 ⇒ 归一化为未配置（零调用，序列逐字一致）", async () => {
+  const cases: Array<[string, unknown]> = [
+    ["空串", ""],
+    ["数字", 42],
+    ["null", null],
+    ["undefined", undefined],
+  ];
+  for (const [name, model] of cases) {
+    const client = new FakeClient();
+    const methods = modelResponder(client);
+    await modelRunner(client, model as string | undefined).execute(INPUT);
+    assert.deepEqual(setParams(client), [], `「${name}」不得发 set_config_option`);
+    assert.deepEqual(methods, ["session/new", "session/prompt"], `「${name}」序列应回到现状`);
+  }
+});
+
+test("M1-model ③ load 复用路径同样 set（sessionId = 复用后的 id）", async () => {
+  const client = new FakeClient();
+  const sessions = new SessionMap({ projectId: "p1", baseDir: "/m", fs: new MemoryFs() });
+  sessions.set("ctx", "old-sess");
+  const methods = modelResponder(client, { sessionId: "old-sess" });
+
+  const result = await modelRunner(client, "provider/model-x", sessions).execute(INPUT);
+
+  assert.equal(result.state, "completed");
+  assert.deepEqual(methods, ["session/load", SET_MODEL, "session/prompt"]);
+  assert.deepEqual(setParams(client), [
+    { sessionId: "old-sess", configId: "model", value: "provider/model-x" },
+  ]);
+});
+
+test("M1-model ③ resume 复用路径（load 失败回落）同样 set", async () => {
+  const client = new FakeClient();
+  const sessions = new SessionMap({ projectId: "p1", baseDir: "/m", fs: new MemoryFs() });
+  sessions.set("ctx", "old-sess");
+  const methods = modelResponder(client, { sessionId: "old-sess", fail: ["session/load"] });
+
+  const result = await modelRunner(client, "provider/model-x", sessions).execute(INPUT);
+
+  assert.equal(result.state, "completed");
+  assert.deepEqual(methods, ["session/load", "session/resume", SET_MODEL, "session/prompt"]);
+  assert.deepEqual(setParams(client), [
+    { sessionId: "old-sess", configId: "model", value: "provider/model-x" },
+  ]);
+});
+
+test("M1-model ③ load + resume 双失败 ⇒ new 后 set 一次（不重复下发）", async () => {
+  const client = new FakeClient();
+  const sessions = new SessionMap({ projectId: "p1", baseDir: "/m", fs: new MemoryFs() });
+  sessions.set("ctx", "old-sess");
+  const methods = modelResponder(client, {
+    sessionId: "fresh",
+    fail: ["session/load", "session/resume"],
+  });
+
+  const result = await modelRunner(client, "m", sessions).execute(INPUT);
+
+  assert.equal(result.state, "completed");
+  assert.deepEqual(methods, ["session/load", "session/resume", "session/new", SET_MODEL, "session/prompt"]);
+  assert.deepEqual(setParams(client), [{ sessionId: "fresh", configId: "model", value: "m" }]);
+});
+
+test("M1-model set 失败 ⇒ fail-fast：会话建立失败（任务 failed），不继续 prompt、不回退默认", async () => {
+  const client = new FakeClient();
+  const logs: string[] = [];
+  const methods = modelResponder(client, { fail: [SET_MODEL] });
+
+  const result = await modelRunner(client, "provider/bad", undefined, (m) => logs.push(m)).execute(INPUT);
+
+  assert.equal(result.state, "failed");
+  const reason = result.text ?? "";
+  assert.ok(reason.includes("provider/bad"), `任务失败原因须含配置原值：${reason}`);
+  assert.ok(reason.includes("设置失败"), `任务失败原因须可读：${reason}`);
+  assert.deepEqual(methods, ["session/new", SET_MODEL], "set 失败后不得继续 prompt");
+  assert.equal(
+    logs.filter((l) => l.includes("设置失败") && l.includes("provider/bad")).length,
+    1,
+    logs.join("\n"),
+  );
+});
+
+test("M1-model set 失败（后端 RPC 错误带 code）⇒ 日志与任务原因均含 message + code", async () => {
+  const client = new FakeClient();
+  const logs: string[] = [];
+  const methods: string[] = [];
+  client.responder = (method) => {
+    methods.push(method);
+    if (method === SET_MODEL) {
+      throw new AcpError("rpc", "Invalid params: unknown model", { code: -32602 });
+    }
+    return method === "session/new" ? { sessionId: "s1" } : { stopReason: "end_turn" };
+  };
+
+  const result = await modelRunner(client, "provider/bad", undefined, (m) => logs.push(m)).execute(INPUT);
+
+  assert.equal(result.state, "failed");
+  const reason = result.text ?? "";
+  assert.ok(reason.includes("Invalid params: unknown model"), reason);
+  assert.ok(reason.includes("-32602"), `失败原因须含后端 code：${reason}`);
+  assert.ok(!methods.includes("session/prompt"), "set 失败后不得继续 prompt");
+  assert.equal(
+    logs.filter((l) => l.includes("model=provider/bad 设置失败") && l.includes("-32602")).length,
+    1,
+    logs.join("\n"),
+  );
+});
+
+test("M1-model F-a：currentValue 回显取 configOptions[] 内 id==\"model\" 项（顶层同名陷阱键不采信）", async () => {
+  const client = new FakeClient();
+  const logs: string[] = [];
+  client.responder = (method, params) => {
+    if (method === "session/new") return { sessionId: "s1" };
+    if (method === SET_MODEL) {
+      const p = params as { value: string };
+      // 真机原始报文形状：顶层另有同名 currentValue 陷阱键 + 数组内多 config id 项
+      return {
+        currentValue: "TOP-LEVEL-BOGUS",
+        configOptions: [
+          { id: "mode", currentValue: "default" },
+          { id: "model", currentValue: p.value },
+        ],
+      };
+    }
+    return { stopReason: "end_turn" };
+  };
+
+  await modelRunner(client, "provider/model-x", undefined, (m) => logs.push(m)).execute(INPUT);
+
+  const line = logs.find((l) => l.includes("已设置"));
+  assert.ok(line !== undefined, logs.join("\n"));
+  assert.ok(line.includes("currentValue=provider/model-x"), line);
+  assert.ok(!line.includes("TOP-LEVEL-BOGUS"), `不得采信顶层陷阱键：${line}`);
+  assert.ok(!line.includes("undefined"), `不得打裸 undefined：${line}`);
+});
+
+test("M1-model F-a：响应无 configOptions / 数组内无匹配项 ⇒ 回显 n/a（不打裸 undefined）", async () => {
+  const shapes: Array<[string, unknown]> = [
+    ["无 configOptions", {}],
+    ["数组内无 model 项", { configOptions: [{ id: "mode", currentValue: "default" }] }],
+    ["configOptions 非数组", { configOptions: "model" }],
+  ];
+  for (const [name, setResponse] of shapes) {
+    const client = new FakeClient();
+    const logs: string[] = [];
+    client.responder = (method) => {
+      if (method === "session/new") return { sessionId: "s1" };
+      if (method === SET_MODEL) return setResponse;
+      return { stopReason: "end_turn" };
+    };
+
+    const result = await modelRunner(client, "provider/model-x", undefined, (m) => logs.push(m)).execute(INPUT);
+
+    assert.equal(result.state, "completed", `「${name}」取不到只影响回显，不致命`);
+    const line = logs.find((l) => l.includes("已设置"));
+    assert.ok(line !== undefined && line.includes("currentValue=n/a"), `「${name}」应回显 n/a：${line ?? logs.join("\n")}`);
+    assert.ok(line !== undefined && !line.includes("undefined"), `「${name}」不得打裸 undefined：${line}`);
+  }
+});
+
+test("M1-model set 成功留观测日志（回显 currentValue，不做特殊处理）", async () => {
+  const client = new FakeClient();
+  const logs: string[] = [];
+  modelResponder(client);
+  await modelRunner(client, "provider/model-x", undefined, (m) => logs.push(m)).execute(INPUT);
+  assert.equal(
+    logs.filter((l) => l.includes("model=provider/model-x") && l.includes("currentValue=provider/model-x")).length,
+    1,
+    logs.join("\n"),
+  );
+});
+
+test("M4 负向锚点：协议面 set 只发 configId=model，不顺手碰其它 config id", async () => {
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  modelResponder(client, { sessionId: "s1" });
+  const r = modelRunner(client, "provider/model-x", sessions);
+
+  // 两轮均走 load 复用路径（load 直成功，不触 new/resume；建立路径由上面①③用例分别锁定）
+  client.calls.length = 0;
+  const turn1 = await r.execute(INPUT);
+  assert.equal(turn1.state, "completed");
+  const turn2 = await r.execute({ ...INPUT, taskId: "t2", text: "next", messageId: "m2" });
+  assert.equal(turn2.state, "completed");
+
+  const sets = client.calls.filter((c) => c.method === SET_MODEL);
+  assert.equal(sets.length, 2, "每次会话建立（含复用）恰好 set 一次，不重复下发");
+  for (const call of sets) {
+    const params = call.params as Record<string, unknown>;
+    // 逐字形状：仅 sessionId/configId/value 三键，configId 恒为 model
+    assert.deepEqual(Object.keys(params).sort(), ["configId", "sessionId", "value"]);
+    assert.equal(params["configId"], "model");
+  }
+  // 其它协议方法不被触碰（会话建立 + prompt 之外无请求）
+  const others = new Set(client.calls.map((c) => c.method).filter((m) => m !== SET_MODEL));
+  assert.deepEqual([...others].sort(), ["session/load", "session/prompt"]);
+});
+
+test("M4 负向锚点（源码级）：会话面 set_config_option 的 configId 字面量仅 \"model\"", () => {
+  // effort / reasoning_effort / mode 等其它 config id 属后端既有能力，桥不得顺手接线；
+  // 以源码扫描锁住「协议面只发 model」这一实现边界（行为断言只覆盖已跑路径，扫描兜底未跑路径）。
+  const src = readFileSync(
+    // 运行时 = dist/test/*.js，源码在 machine 根（../../）
+    new URL("../../acp-bridge/acp/session.ts", import.meta.url),
+    "utf8",
+  );
+  const configIds = [...src.matchAll(/configId:\s*"([^"]+)"/g)].map((m) => m[1] as string);
+  assert.ok(configIds.length > 0, "session.ts 应含 set_config_option 的 configId 字面量");
+  assert.deepEqual([...new Set(configIds)], ["model"]);
+  for (const forbidden of ["effort", "reasoning_effort", 'mode"']) {
+    assert.ok(!src.includes(`configId: "${forbidden}`), `不得出现 configId=${forbidden}`);
+  }
+});
+

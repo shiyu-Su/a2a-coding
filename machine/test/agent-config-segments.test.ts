@@ -49,3 +49,22 @@ test("writeAgentConfig：产物名为 agents/<agentKind>.<projectId>.json", () =
     rmSync(appRoot, { recursive: true, force: true });
   }
 });
+
+// ---- REQ-v0.8.2-2026-09-20-01 · M4 负向锚点：缺省配置不预置 model（model 只来自项目 agentConfig）----
+
+test("writeAgentConfig：缺省产物顶层无平铺 model 键、各 kind 段不预置 model", () => {
+  const appRoot = mkdtempSync(join(tmpdir(), "a2a-machine-seg-"));
+  try {
+    for (const kind of AGENT_KINDS) {
+      const path = writeAgentConfig(project(kind), appRoot, getAdapter(kind).baseConfig());
+      const written = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+      assert.equal("model" in written, false, `${kind}：顶层不得出现平铺 model 键`);
+      for (const member of AGENT_KINDS) {
+        const segment = written[member] as Record<string, unknown>;
+        assert.equal("model" in segment, false, `${kind}：缺省 ${member} 段不得预置 model`);
+      }
+    }
+  } finally {
+    rmSync(appRoot, { recursive: true, force: true });
+  }
+});

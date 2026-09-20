@@ -83,7 +83,8 @@ npm run logs      # 输出日志全文（支持 --lines N / --follow）
   - 桥由 Launcher 每项目 spawn，**绑定该项目的 `a2aPort`**（就绪判定 = TCP listen，与既有 endpoint 推导一致）；
   - 对外暴露 **`POST /a2a/jsonrpc`**（`message/send` / `tasks/get` / `tasks/cancel`），形状逐字兼容 `launcher/a2a-client.ts`；
   - 内部以 **stdio NDJSON** 拉起 ACP 后端（`opencode acp` / `qodercn --acp`；`initialize` 握手 / `session/*`；详见 `acp-bridge/acp/`）。
-  - `buildLaunch` 形态：`node <appRoot>/dist/acp-bridge/index.js --port <a2aPort> --workspace <ws> --project-id <id> --backend-cmd <后端命令> --risk <read|write|full>`；opencode 另加 `--backend-args '["acp"]' --config-file <agents 产物> --config-segment opencode`（kind 级协议事实：opencode 的 ACP 入口是子命令 `acp`，非 `--acp` 旗标，由适配器内置透传）。
+  - `buildLaunch` 形态：`node <appRoot>/dist/acp-bridge/index.js --port <a2aPort> --workspace <ws> --project-id <id> --backend-cmd <后端命令> [--model <modelId>] --risk <read|write|full>`；opencode 另加 `--backend-args '["acp"]' --config-file <agents 产物> --config-segment opencode`（kind 级协议事实：opencode 的 ACP 入口是子命令 `acp`，非 `--acp` 旗标，由适配器内置透传）。
+  - **model 通路（协议面）**：项目 `agentConfig.<kind>.model` ⇒ adapter 原样透传 `--model` ⇒ 桥在**每次会话建立后**（`session/new` / `load` / `resume` 三路）发一次 ACP `session/set_config_option {configId:"model", value:<原样>}`（set 是 per-session，恢复路径不假设后端保持模型）。值**不校验、不映射**（`-m` 吃显示名、协议面吃 modelId，两家取值口径不同 ⇒ 统一只走协议面，后端 argv 不再拼 `-m`）；未配 / 空串 ⇒ 桥完全不发该请求。
   - **opencode serve 前置后端（sidecar）已随迁 ACP 退役**：桥直接 spawn `opencode acp`，无独立后端进程、无端口预分配。
 - **`agentConfig.backendCmd` 必填（ACP 族）**：代码零硬编码缺省，未配置即 `buildLaunch` 抛错。Windows 下 opencode **须为 `opencode.exe` 绝对路径**（npm 裸 PATH 只有 .cmd/.ps1 壳，桥 shell-less spawn 直调会 ENOENT）。
 - **认证**：opencode 沿用 `opencode` CLI 自身配置；qoder 优先文件凭据 `~/.qoder-cn/.auth`（`qodercn` CLI 登录），备选 env `QODERCN_PERSONAL_ACCESS_TOKEN`（经 Launcher 进程环境透传）。

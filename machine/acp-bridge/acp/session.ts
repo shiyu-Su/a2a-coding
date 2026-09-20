@@ -22,6 +22,17 @@
  * - 终态：`stopReason:"cancelled"` → `canceled`；否则按 `parseOutcome` 映射 completed/input-required/failed；
  *   超时 → `failed`（对齐 600s 惯例，可配置）。
  *
+ * **model 通路（v0.8.2 · M1 协议面增补，协议面 set）**：`model` 非空 ⇒ 每次会话建立（`session/new` 或
+ * `session/load` / `session/resume` 复用）**成功后**、`session/prompt` 之前发一次
+ * `session/set_config_option {sessionId, configId:"model", value:<原样>}`；恢复路径同样 set（不假设
+ * 后端跨会话保持模型）。值**原样透传不校验**（双方言实测：opencode 与 qoder 同方言，qoder 须传
+ * modelId 而非显示名）。`model` 未配 / 空串 / 非字符串 ⇒ **完全不调用**，行为与旧版逐字一致。
+ * set 失败 ⇒ **fail-fast**（REQ-v0.8.2 M1 验证期裁决「配错就明确失败」）：记一条含配置原值与
+ * 失败原因（message / code）的日志后**抛错**，会话建立失败、不继续 prompt、不回退后端默认；
+ * 错误经 `execute` 的 `ensureSession` catch 冒泡为任务 `failed`。
+ * 成功日志回显的 `currentValue` 从响应 `configOptions[]` 内 `id==="model"` 项取（顶层无该键），
+ * 取不到 ⇒ 呈现 `n/a`（不打裸 `undefined`）。
+ *
  * 依赖可注入（`client` 经构造注入，fake 单测）；不 import `orch/**` / `launcher/**`。
  */
 import { AcpError } from "./client.js";
@@ -63,6 +74,11 @@ export interface AcpSessionRunnerOptions {
   mcpServers?: readonly unknown[];
   /** 首轮注入的 config 段（缺省 = 无 config，仅缺省约定注入） */
   injection?: AcpInjectionConfig;
+  /**
+   * ACP 模型标识（`agentConfig.<kind>.model` 原样透传值）；非空 ⇒ 会话建立成功后发一次
+   * `session/set_config_option {configId:"model"}`（new / load / resume 三路同此）。缺省 ⇒ 完全不调用。
+   */
+  model?: string;
   logger?: (message: string) => void;
 }
 
@@ -72,6 +88,18 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * `session/set_config_option` 响应的真值取位（F-a）：双方言实测顶层**无** `currentValue` 键，
+ * 生效值嵌在 `result.configOptions[]` 内 `id === configId` 项的 `currentValue`。取不到 ⇒ undefined。
+ */
+function configCurrentValue(result: unknown, configId: string): unknown {
+  if (!isRecord(result)) return undefined;
+  const options = result["configOptions"];
+  if (!Array.isArray(options)) return undefined;
+  const entry = options.find((item) => isRecord(item) && item["id"] === configId);
+  return isRecord(entry) ? entry["currentValue"] : undefined;
 }
 
 /**
@@ -101,6 +129,8 @@ export class AcpSessionRunner {
   private readonly timeoutMs: number;
   private readonly mcpServers: readonly unknown[];
   private readonly injection: AcpInjectionConfig;
+  /** 归一化后的 model：非空字符串才保留（空串 / 非字符串 ⇒ `undefined` ⇒ 永不 set） */
+  private readonly model: string | undefined;
   private readonly logger: (message: string) => void;
   /** sessionId → 已累积的 agent message chunks */
   private readonly buffers = new Map<string, string[]>();
@@ -132,6 +162,7 @@ export class AcpSessionRunner {
     this.timeoutMs = options.timeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS;
     this.mcpServers = options.mcpServers ?? [];
     this.injection = options.injection ?? {};
+    this.model = typeof options.model === "string" && options.model.length > 0 ? options.model : undefined;
     this.logger = options.logger ?? ((): void => undefined);
     this.client.onNotification((method, params) => this.onNotification(method, params));
   }
@@ -291,15 +322,50 @@ export class AcpSessionRunner {
     this.replayMessageIds.delete(sessionId);
   }
 
+  /**
+   * 会话保证：load → resume → new；**三条路径成功后**统一走一次 {@link applyModel}
+   * （恢复路径也 set，不假设后端跨会话保持模型）。
+   */
   private async ensureSession(contextId: string): Promise<string> {
     const cached = this.sessions?.get(contextId) ?? null;
+    let sessionId: string | null = null;
     if (cached !== null) {
-      if (await this.tryReuse("session/load", cached)) return cached;
-      if (await this.tryReuse("session/resume", cached)) return cached;
+      if (await this.tryReuse("session/load", cached)) sessionId = cached;
+      else if (await this.tryReuse("session/resume", cached)) sessionId = cached;
     }
-    const sessionId = await this.newSession();
-    this.sessions?.set(contextId, sessionId);
+    if (sessionId === null) {
+      sessionId = await this.newSession();
+      this.sessions?.set(contextId, sessionId);
+    }
+    await this.applyModel(sessionId);
     return sessionId;
+  }
+
+  /**
+   * 模型设置（v0.8.2 · M1 协议面增补）：`model` 缺省 ⇒ **零请求**（与旧版逐字一致）；
+   * 否则发 `session/set_config_option {configId:"model", value:<原样>}`，**不校验**值合法性。
+   * 失败（含后端 `-32602` 一类的取值错误）⇒ **fail-fast**：日志（含配置原值 + 原因）后抛错，
+   * 由 `ensureSession` 冒泡使会话建立失败，任务以 `failed` 收场（不回退后端默认、不继续 prompt）。
+   */
+  private async applyModel(sessionId: string): Promise<void> {
+    if (this.model === undefined) return;
+    let result: unknown;
+    try {
+      result = await this.requestWithTimeout("session/set_config_option", {
+        sessionId,
+        configId: "model",
+        value: this.model,
+      });
+    } catch (err) {
+      const code = err instanceof AcpError && err.code !== undefined ? `（code=${String(err.code)}）` : "";
+      const reason = `${messageOf(err)}${code}`;
+      this.logger(`[acp-session] model=${this.model} 设置失败（${reason}）`);
+      throw new Error(`model=${this.model} 设置失败：${reason}`);
+    }
+    const current = configCurrentValue(result, "model");
+    this.logger(
+      `[acp-session] model=${this.model} 已设置（currentValue=${current === undefined ? "n/a" : String(current)}）`,
+    );
   }
 
   private async tryReuse(method: string, sessionId: string): Promise<boolean> {

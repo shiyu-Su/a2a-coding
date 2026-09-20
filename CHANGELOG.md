@@ -2,6 +2,56 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.8.2] - 2026-09-20
+
+> 主题：**ACP 桥参数面扩展（per-project 模型名称透传）+ 常规任务等待脚本**（双需求 · `REQ-v0.8.2-2026-09-20-01` / `REQ-v0.8.2-2026-09-20-02`）。两条需求分别补上「模型可配」与「等待可等」两块宿主/执行面缺口；**kind 名与线协议 2.1 不变、PROTOCOL.md 零改动、orch 源码零改动**。改造文档：`doc/v0.8.2/ACP桥参数面扩展-改造文档.md`（final）· `doc/v0.8.2/常规任务等待脚本-改造文档.md`（final）。
+
+### Added
+
+- **per-project 模型名称透传（machine/acp-bridge）**：项目 `agentConfig.<kind>.model` ⇒ adapter 原样透传 `--model <modelId>` ⇒ 桥在**每次会话建立后**（`session/new` / `load` / `resume` 三路汇合到唯一 `applyModel` 调用点）发一次 ACP `session/set_config_option {sessionId, configId:"model", value:<原样>}`。**未配 / 空串 ⇒ 桥完全不发该请求**（零干预，走后端自身默认）。值**不校验、不映射**——`-m` 吃显示名、协议面吃 modelId，两家取值口径不同 ⇒ 统一只走协议面，后端 argv 不再拼 `-m`。
+- **`machine/config/model-catalog.json`（新）**：模型名称映射表（key = ACP 使用值 / value = 模型名称），per-kind；qoder 段 14 个合法 modelId ↔ 显示名，opencode 段 103 项 `providerID/modelID` 形态。**位置在 machine 侧**（orch 只是编排宿主、不持模型目录）；`config.json.default` 新增注记指向该表。
+- **`scripts/watch-task.mjs`（新，宿主面）**：常规 `a2a_call` 任务的只读阻塞等待脚本。数据源 = orch 既有只读端点 `GET /api/tasks/:taskId`（3300 端口，与 `watch-feature.mjs` 同服务、同 `--base` 默认值，GET-only 无鉴权）；只读轮询、阻塞至终态、**只打印 state**（不打印文本/失败原因/artifacts，详情由宿主退出后自行调 MCP 工具取）；**退出码三档**：`0` 等到终态（含 `failed`，故 **0 ≠ 成功**）/ `20` 窗口耗尽仍有未终态 / `1` 脚本错误含未知 id。多 id ⇒ 一条命令等全部，按入参顺序每行 `id + state`；未知 id 记 `not_found` 行后继续等其余。默认窗口 10s × 180 = 30 min。**脚本内无写路径**（无 POST / 无文件写入 / 无 SQLite）。
+- **宿主等待纪律**：`CLAUDE.md` / `AGENTS.md` 各补一行——派发常规 `a2a_call` 后必须 `node scripts/watch-task.mjs <taskId...>` 阻塞等待；入参用 `a2a_call` 返回的 taskId（web 端点走主键直查，传远端 id 会 404）；以退出码为准判断等待是否正常结束，任务成败看状态行。
+- **回归用例**：`.omo` 新增 `test-v0.8.2-acp-model.js`（TC14，56 条断言：桥 `--model` CLI 面 / `applyModel` 取位与 fail-fast / model-catalog / config.default 注记 / 负向锚点 / 单测锚点）与 `test-v0.8.2-watch-task.js`（TC15，36 条断言：脚本存在与 ESM 面 / 用法入参纪律 / 退出码三档 / 只读性负向 / 只报 state / orch 零改动负向 / 只读端点契约 / watch-feature 并列零接线）。
+
+### Changed
+
+- **set 失败语义改为 fail-fast（用户 2026-09-20 裁决「配错就明确失败」）**：`applyModel()` catch 内记 `[acp-session] model=<v> 设置失败（<原因>）` 后 **throw**，经 `ensureSession` 唯一调用点冒泡到 `execute()` 既有 catch ⇒ 任务终态 `failed`，**不执行 prompt、不静默回落**到后端默认模型。**升级注意**：既有配置含无效模型名时，行为从「告警/静默」变为任务失败。
+- **`machine/adapters/{opencode,qoder}.ts`**：透传 `--model`；**qoder 旧 `-m` 拼装撤除**（模型只走协议面）。
+- **`machine/config/config.json.default`**：新增 `agentConfig.<kind>.model` 键位注记 + 指向 model-catalog + 「未配 = 后端默认」口径 + 「effort / mode / reasoning_effort 明确不做」注记。
+- **`machine/README.md`**：`buildLaunch` 形态补 `[--model <modelId>]`；新增「model 通路（协议面）」小节。
+- **`orch/test/project-group.test.ts`**：字段白名单负向断言加 `model`——防「machine 误把 model 提到注册 ⇒ orch 静默忽略 = 假透传」。**orch 源码零 diff。**
+- **`flow/spec/需求流程.md`**：Step 0 核实条款补「**技术可行性假设**」必须由执行单元核实（若该假设不成立则整个方案路径需改变的事实，如 CLI 兼容性、协议行为、命令组合、文件解析方式等），不得仅作为方案设计阶段的待验证项。
+
+### Fixed
+
+- **F-a：`[acp-session] model=<v> 已设置（currentValue=undefined）` 恒为 undefined**（`acp/session.ts`）：回显取位写在 set 响应的**顶层**，而真值嵌在 `configOptions[id==="model"].currentValue` 数组里。改为从 `configOptions[]` 按 `id === "model"` 取；取不到（无 `configOptions` / 数组内无匹配 / 非数组）时日志打 `n/a` 而非 `undefined`。单测含**顶层同名陷阱键**断言，直接锁死该回归。
+
+### 门禁与真机
+
+- 回归 **998/998 零失败**（`reports/v0.8.2/regression-report.json`，版本源 = 根 `package.json`）；machine `npm run typecheck` 0 error + `npm test` **229/229**（基线 226 + 净 3）；orch `npm run typecheck` 0 error + `npm test` 235 pass / 0 fail / 1 skip（POSIX-only 集成用例）。
+- **真机三证（宿主派发探测 + 机器侧只读取证，未用 agent 自报）**：
+  - **① session/new 双后端「配置值 = 实际生效」**：machine 配 `qmodel_38max` ⇒ 后端 run 日志实际绑定 `model_config={"key":"qmodel_38max","display_name":"Qwen3.8-Max"}`；orch 配 `opencode/big-pickle` ⇒ `opencode export` 落盘 `info.model={"id":"big-pickle","providerID":"opencode"}`；flow **未配** ⇒ 桥无 `--model`、**零 set 请求**、走用户级默认 `qfmodel` ⇒ 「配置值 = 实际生效」双后端成立，「未配即不干预」成立。
+  - **② session/load 续接路径**：qoder + opencode 续接轮均绑定配置模型（load 后都执行了 model set）。
+  - **③ fail-fast 受控复验（含后端原始报文）**：给 orch 临时配无效值 `qmodel_bogus_verify_faf` + 两次重启 ⇒ launcher.log:81793→81826 完整证据链 —— launcher 读到该值 → 后端原始报文 `session/set_config_option{configId:'model',value:'qmodel_bogus_verify_faf'}` → `-32602 Invalid params: Invalid value for config option model` → 桥 `[acp-session] model=… 设置失败（…code=-32602）` → `[self-check] orch 失败（settle）：任务终态为 failed…` → `启动自检未通过…退出（fail-fast）`。**证实 qoder 与 opencode 一致拒绝无效 modelId，「配错就明确失败」在 qoder 侧成立，且发生在启动自检、先于任何真实任务。**
+- **watch-task 真机 V1–V6 全过**：已终态 completed / 已终态 failed 退 0 且不打印文本 / 未知 id 快速退 1 / 多 id 一条命令等全部 / 多 id 含未知 id 仍等其余 / 窗口耗尽退 20。实战验证：单次调用阻塞 2 分 30 秒 → `completed`/exit 0；窗口耗尽 7 分 20 秒 → 退 20 → 再调一次续等 30 秒 → `completed`。
+- **F-a 修后真机复证**：launcher.log:81678 `[agent:flow] [acp-session] model=opencode/big-pickle 已设置（currentValue=opencode/big-pickle）` —— `currentValue` 为真实值而非 `undefined`，修复在生产路径上证实生效。
+
+### 未覆盖（登记，不计通过）
+
+- **`session/resume` 路径无直接日志样本**（load 均一次成功、未触发 resume 回退）；依据为代码结构（resume 成功后汇合到同一 `applyModel` 调用点）+ 历史回退案例。
+- **POSIX 未真机**（`.exe` / PATHEXT 解析为 Windows 专属；`.omo` 侧仅结构级断言）。
+- **watch-task**：任务失联 / 看护放弃 ⇒ 永久 `working`，脚本无法区分「仍在跑」与「已失联」（详情端点刻意不透出 `stale`）⇒ 只能等 `--max` 耗尽退 20，**这是正确表现**；长任务窗口默认值（30 min）与「qoder 免费模型排队致长时间零输出」的匹配度未实测。
+- **模型端点 / API key 不在本需求范围**（用户 2026-09-20 裁决：只做模型名称）——由后端自身配置承担（opencode `opencode.json` provider 段 + `auth.json`；qoder `~/.qoder-cn`），当前架构下不新增任何配置通道。
+- codex / claude 真机（本机无 CLI/项目配置）。
+
+### 已知边界（登记待排期）
+
+- **F-e：自检失败的「修复提示」与真实原因不匹配**（本仓缺陷）：模型名非法时提示指向「检查 qodercn 认证与登录」，误导排查方向；提示生成逻辑未按失败原因分流。
+- **自检失败粒度错配**（设计取舍待用户决策）：本轮 machine/flow 自检均通过、仅 orch 失败，launcher 仍整体退出 ⇒ **一个项目配错 = 全机所有项目不可用**。是否改为「仅该项目标记不可用、其余放行」待定。
+- **launcher 把 `machine/config/config.json` 缓存在内存**（运维事实）：热改文件不生效，**配置变更必须重启 machine 服务**；且「未配 model」（零 `[acp-session]` 行）与「配错」（一条带「设置失败」的行）在日志上形态不同，判读勿混。
+- 进程级模型是否可 per-session 切换取决于后端实现（本需求只经协议面设置，不宣称覆盖）。
+
 ## [v0.8.1] - 2026-09-20
 
 > 主题：**opencode 改走 ACP 接入（去 `opencode serve` sidecar）** —— `REQ-v0.8.1-2026-09-19-01`（+ M9 三轮实现级增补轨）。opencode 从「仓外 `a2a-opencode` 包装器 + Launcher 前置 `opencode serve` sidecar」迁移为「复用 v0.8.0 qoder 落地的仓内 ACP 桥（桥直接 spawn `opencode acp`）」；**kind 名与线协议 2.1 不变、PROTOCOL.md 零改动、orch 源码零改动**。改造文档：`doc/v0.8.1/opencode改走ACP接入-改造文档.md`（final）。

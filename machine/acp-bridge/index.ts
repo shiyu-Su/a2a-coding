@@ -13,11 +13,17 @@
  *
  * CLI：`node dist/acp-bridge/index.js --port <n> --workspace <path>
  *       --project-id <id> --backend-cmd <cmd> --risk <read|write|full>
- *       [--backend-args <JSON字符串数组>] [--config-file <path> --config-segment <kind>]`
+ *       [--backend-args <JSON字符串数组>] [--config-file <path> --config-segment <kind>]
+ *       [--model <value>]`
  *
  * v0.8.1 · M1：后端参数数组化（`--backend-args`，缺省 `["--acp"]` 保 qoder 逐字不变）；
  * `--config-file` + `--config-segment` 最小配置面（读 writeAgentConfig 产物的指定段，
  * 本节点只读取与透传，注入时机归 M2；缺文件 / 缺段 / 坏 JSON 一律告警不崩、配置取空）。
+ *
+ * v0.8.2 · M1（协议面增补）：`--model` = 项目 `agentConfig.<kind>.model` 的**原样透传值**，
+ * 由 `AcpSessionRunner` 在会话建立（new / load / resume）成功后经 ACP
+ * `session/set_config_option {configId:"model"}` 下发；缺省 / 空串 ⇒ 不发该请求（与旧版逐字一致）。
+ * 走 CLI 而非 `--config-file` 白名单扩展：后者只覆盖 opencode，qoder 不接该通道。
  *
  * 不 import `launcher/**` / `orch/**`；无第三方依赖（仅 node:*）。
  */
@@ -56,6 +62,11 @@ export interface BridgeArgs {
   configFile?: string;
   /** 读取 configFile 中的段名（如 `opencode`；machine 自消费段的段选择器）。 */
   configSegment?: string;
+  /**
+   * `--model` 解析结果（`agentConfig.<kind>.model` 原样值）；缺省 / 空串 ⇒ `undefined`
+   * （此时桥**不发** `session/set_config_option`）。
+   */
+  model?: string;
 }
 
 function requiredArg(map: ReadonlyMap<string, string>, key: string): string {
@@ -89,6 +100,7 @@ export function parseBridgeArgs(argv: readonly string[]): BridgeArgs {
     throw new Error("--risk 必须是 read / write / full");
   }
   const backendArgs = parseBackendArgs(map.get("backend-args"));
+  const model = parseModelArg(map.get("model"));
   return {
     port,
     workspace: requiredArg(map, "workspace"),
@@ -100,7 +112,16 @@ export function parseBridgeArgs(argv: readonly string[]): BridgeArgs {
     ...(map.get("config-segment") !== undefined
       ? { configSegment: map.get("config-segment") }
       : {}),
+    ...(model !== undefined ? { model } : {}),
   };
+}
+
+/**
+ * `--model` 解析：**不做校验**（值原样透传给 ACP `session/set_config_option`）。
+ * 缺省 / 空串 ⇒ `undefined`（⇒ 桥不发该请求，行为与未引入本通路时逐字一致）。
+ */
+export function parseModelArg(raw: string | undefined): string | undefined {
+  return raw === undefined || raw.length === 0 ? undefined : raw;
 }
 
 /** `--backend-args` 解析：JSON 字符串数组；缺省返回 `undefined`（由调用方落 {@link DEFAULT_BACKEND_ARGS}）。 */
@@ -238,6 +259,7 @@ export async function startBridge(args: BridgeArgs, deps: StartBridgeDeps = {}):
     sessions,
     timeoutMs: deps.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS,
     injection,
+    ...(args.model !== undefined ? { model: args.model } : {}),
     logger,
   });
   const server = createAcpA2AServer({ executor: runner, logger });

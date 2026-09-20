@@ -16,6 +16,7 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ProjectConfig } from "../types.js";
+import type { AgentKind } from "../agent-kinds.js";
 import { A2A_OUTCOME_CONVENTION } from "../agent-outcome.js";
 
 // REQ-v0.8.0-2026-09-19-01 · M1：`A2A_OUTCOME_CONVENTION` 已下沉**零依赖叶模块**
@@ -62,6 +63,27 @@ export function resolveAcpBackendCmd(
 ): string | undefined {
   const backendCmd = agentConfig?.["backendCmd"];
   return typeof backendCmd === "string" && backendCmd.length > 0 ? backendCmd : undefined;
+}
+
+/**
+ * 从项目 agentConfig 解析 **ACP 族**模型标识：读**分段键** `agentConfig.<kind>.model`
+ * （REQ-v0.8.2-2026-09-20-01 · M1 协议面增补）。
+ *
+ * 键位原则：`model` 由 ACP 后端自己消费（桥经 `session/set_config_option` 原样下发），
+ * 属外部契约 ⇒ **分段**（同 `opencode` / `codex` / `claude` 段），与 machine 自消费的
+ * 平铺键 `backendCmd` 相对。
+ *
+ * 宽容缺省：缺段 / 段非对象 / 缺键 / 空串 / 非字符串 → `undefined`（⇒ 不配 model，
+ * 后端用自身默认）。machine 侧**不做取值校验**（透传语义；校验归后端）。
+ */
+export function resolveAcpModel(
+  agentConfig: Record<string, unknown> | undefined,
+  kind: AgentKind,
+): string | undefined {
+  const segment = agentConfig?.[kind];
+  if (!isPlainObject(segment)) return undefined;
+  const model = segment["model"];
+  return typeof model === "string" && model.length > 0 ? model : undefined;
 }
 
 /** 纯对象判定（排除 null 与数组） */
