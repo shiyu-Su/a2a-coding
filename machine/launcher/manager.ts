@@ -416,6 +416,23 @@ export class AgentManager {
       `[launcher] agent ${project.projectId} endpoint=${snapshot.endpoint}，model=${snapshot.model}`,
     );
 
+    // 遗留键告警（REQ-v0.8.4-2026-09-20-01 · M2）：ACP 族 model 已迁顶层平铺键
+    // agentConfig.model；段内 agentConfig.<kind>.model 检测到即告警、不生效（不双读、不 fail）。
+    // wrapper 族（claude / codex）的段内 model 是合法外部契约，不告警。
+    if (project.agentKind === "qoder" || project.agentKind === "opencode") {
+      const legacySection = (project.agentConfig ?? {})[project.agentKind];
+      if (
+        typeof legacySection === "object" &&
+        legacySection !== null &&
+        !Array.isArray(legacySection) &&
+        "model" in legacySection
+      ) {
+        console.warn(
+          `[launcher] agent ${project.projectId} 遗留键告警：agentConfig.${project.agentKind}.model 已废弃（ACP 族 model 为顶层平铺键 agentConfig.model），本键不生效——请迁移后重启`,
+        );
+      }
+    }
+
     const spec = adapter.buildLaunch({
       projectId: project.projectId,
       workspace: project.workspace,

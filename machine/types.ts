@@ -39,9 +39,14 @@ export interface ProjectConfig {
    */
   risk?: RiskLevel;
   /**
-   * 包装器配置片段（顶层键如 `opencode` / `mcp` / `events` / `systemPrompt`）。
-   * 由 launcher 生成到 `agents/<agentKind>.<projectId>.json`，经 `--config` 传给包装器，
-   * 与其内置默认值深合并；未提供时仅写入默认覆盖项（关闭 events）。
+   * 项目 agentConfig（键位口径 = 自消费键平铺 / wrapper 契约分段，REQ-v0.8.4-2026-09-20-01 定稿）：
+   * - **ACP 族自消费键（顶层平铺）**：`backendCmd`（必填）· `model`（非必填，adapter 读出后经
+   *   `--model` 透传给 ACP 桥）；段内 `model` 为遗留键（不消费、启动告警）；
+   * - **wrapper 族契约键（`<kind>` 段内，如 `claude` / `codex`，同 `mcp` / `events` 等）**：
+   *   由 launcher 深合并进 `agents/<agentKind>.<projectId>.json`，经 `--config` 传给仓外包装器，
+   *   与其内置默认值合并；未提供时仅写入默认覆盖项（关闭 events）。
+   * （显式例外：opencode 段注入键 `systemPrompt` / `systemPromptMode` 暂留段内，见
+   *   `launcher/agent-config.ts` B3 后置注记。）
    */
   agentConfig?: Record<string, unknown>;
 }

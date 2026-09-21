@@ -28,8 +28,10 @@ export interface LaunchRequest {
   /**
    * 项目 `agentConfig`（本项目实际生效的配置片段，来源 = `ProjectConfig.agentConfig`，与
    * `writeAgentConfig` / `baseConfig` 同一来源与命名惯例）。
-   * ACP 族（qoder）适配器据此读取**顶层平铺键** `agentConfig.backendCmd`（必填）作为后端命令；
-   * wrapper 族忽略本字段。
+   * ACP 族（qoder / opencode）适配器据此读取**顶层平铺自消费键**：`agentConfig.backendCmd`
+   * （必填，后端命令）与 `agentConfig.model`（非必填，协议面模型标识，原样经 `--model` 透传；
+   * REQ-v0.8.4-2026-09-20-01 起平铺，段内 `model` 为遗留键——不消费、启动告警）；
+   * wrapper 族忽略本字段（其契约键在 `agentConfig.<kind>` 段内、由仓外包装器读取）。
    */
   agentConfig?: Record<string, unknown>;
 }

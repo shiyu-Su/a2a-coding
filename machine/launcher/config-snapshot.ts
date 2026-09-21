@@ -27,12 +27,32 @@ function readJsonIfExists(path: string): Record<string, unknown> | null {
   }
 }
 
-/** 包装器配置片段里的 model（agentConfig.<kind>.model） */
+/**
+ * 启动日志播报的 model 读点（REQ-v0.8.4-2026-09-20-01 · M2，与 M1 的 `agent-config.ts`
+ * 实际生效读点同键位口径）：
+ * - **ACP 族**（qoder / opencode）：读**顶层平铺键** `agentConfig.model`；
+ * - **wrapper 族**（claude / codex）：维持**段读** `agentConfig.<kind>.model`
+ *   （wrapper 消费的外部契约，播报保持原样）。
+ */
 function agentConfigModel(project: ProjectConfig): string | null {
-  const section = (project.agentConfig ?? {})[project.agentKind];
-  if (typeof section !== "object" || section === null || Array.isArray(section)) return null;
-  const model = (section as Record<string, unknown>)["model"];
+  const agentConfig = project.agentConfig ?? {};
+  const model =
+    project.agentKind === "qoder" || project.agentKind === "opencode"
+      ? agentConfig["model"]
+      : readSectionModel(agentConfig, project.agentKind);
   return typeof model === "string" && model.length > 0 ? model : null;
+}
+
+/** 包装器配置片段里的 model（agentConfig.<kind>.model）；段缺失 / 非对象 → undefined */
+function readSectionModel(
+  agentConfig: Record<string, unknown>,
+  kind: string,
+): unknown {
+  const section = agentConfig[kind];
+  if (typeof section !== "object" || section === null || Array.isArray(section)) {
+    return undefined;
+  }
+  return (section as Record<string, unknown>)["model"];
 }
 
 function envString(name: string): string | null {

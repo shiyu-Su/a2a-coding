@@ -1,6 +1,6 @@
 {
   "name": "@a2a-coding/machine",
-  "version": "0.8.3",
+  "version": "0.8.4",
   "private": true,
   "type": "module",
   "engines": {
@@ -20,6 +20,7 @@
     "status": "node scripts/launcherctl.mjs status",
     "logs": "node scripts/launcherctl.mjs logs",
     "reap": "node scripts/reaper.mjs",
+    "zip": "node scripts/pack.mjs",
     "postinstall": "patch-package --error-on-fail"
   },
   "dependencies": {

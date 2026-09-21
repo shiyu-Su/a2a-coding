@@ -12,11 +12,16 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, readFileSync, rmSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { AGENT_KINDS } from "../agent-kinds.js";
 import { getAdapter, wrapperConfigPath } from "../adapters/index.js";
 import { A2A_OUTCOME_CONVENTION } from "../launcher/agent-config.js";
+import { appRootFromModule } from "../launcher/app-root.js";
+import { AgentManager } from "../launcher/manager.js";
 import type { LaunchRequest } from "../adapters/types.js";
+import type { MachineConfig } from "../types.js";
 
 /** 覆盖全部可选字段的拉起请求（用于逐字锁定参数形状） */
 const FULL_REQUEST: LaunchRequest = {
@@ -185,6 +190,7 @@ test("qoder buildLaunch：agentConfig.backendCmd 原样透传（绝对路径）"
 });
 
 // ---- REQ-v0.8.2-2026-09-20-01 · M1（协议面增补）：model 走桥 `--model` ⇒ ACP set_config_option ----
+// ---- REQ-v0.8.4-2026-09-20-01 · M3 翻向：读点 = 顶层平铺 agentConfig.model，段内 model = 遗留键 ----
 
 /** ACP 族未配 model 时的桥侧参数基线（args[0]=桥入口绝对路径，运行环境相关，单列剔除）。 */
 const QODER_NO_MODEL_BASELINE = [
@@ -208,20 +214,20 @@ function qoderBridgeArgs(agentConfig: Record<string, unknown> | undefined): stri
   return spec.args.slice(1);
 }
 
-test("qoder model 已配 ⇒ 下发 --model，值逐字 = 配置值（不再拼后端 argv）", () => {
-  assert.deepEqual(qoderBridgeArgs({ backendCmd: "qoderclicn", qoder: { model: "provider/model-x" } }), [
+test("qoder 平铺 model 已配 ⇒ 下发 --model，值逐字 = 配置值（不再拼后端 argv）", () => {
+  assert.deepEqual(qoderBridgeArgs({ backendCmd: "qoderclicn", model: "provider/model-x" }), [
     ...QODER_NO_MODEL_BASELINE,
     "--model",
     "provider/model-x",
   ]);
 });
 
-test("qoder model 已配 + permissionArgs：--model 在 --backend-cmd 后、--risk 前", () => {
+test("qoder 平铺 model 已配 + permissionArgs：--model 在 --backend-cmd 后、--risk 前", () => {
   const spec = getAdapter("qoder").buildLaunch({
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "qoderclicn", qoder: { model: "m1" } },
+    agentConfig: { backendCmd: "qoderclicn", model: "m1" },
     permissionArgs: getAdapter("qoder").permission("read").args,
   });
   assert.deepEqual(spec.args.slice(1), [
@@ -240,22 +246,27 @@ test("qoder model 未配 ⇒ 不下发 --model / --backend-args（argv 逐字 = 
   assert.ok(!args.includes("--backend-args"));
 });
 
-test("qoder model 非法值（空串 / 非字符串 / 段缺失 / 段非对象）⇒ 与未配置同路径逐字一致", () => {
+test("qoder 平铺 model 非法值（缺键 / 空串 / 非字符串）⇒ 与未配置同路径逐字一致", () => {
   const invalidCases: Record<string, Record<string, unknown>> = {
-    "空串": { backendCmd: "qoderclicn", qoder: { model: "" } },
-    "数字": { backendCmd: "qoderclicn", qoder: { model: 42 } },
-    "null": { backendCmd: "qoderclicn", qoder: { model: null } },
-    "段缺失": { backendCmd: "qoderclicn" },
-    "段非对象（字符串）": { backendCmd: "qoderclicn", qoder: "oops" },
-    "段非对象（数组）": { backendCmd: "qoderclicn", qoder: [{ model: "m1" }] },
+    缺键: { backendCmd: "qoderclicn" },
+    空串: { backendCmd: "qoderclicn", model: "" },
+    数字: { backendCmd: "qoderclicn", model: 42 },
+    null: { backendCmd: "qoderclicn", model: null },
   };
   for (const [name, agentConfig] of Object.entries(invalidCases)) {
     assert.deepEqual(qoderBridgeArgs(agentConfig), QODER_NO_MODEL_BASELINE, `非法值「${name}」应走未配置路径`);
   }
 });
 
+test("qoder 遗留段内 model（v0.8.4 翻向）⇒ 不生效：argv 逐字 = 未配置基线", () => {
+  assert.deepEqual(
+    qoderBridgeArgs({ backendCmd: "qoderclicn", qoder: { model: "provider/model-x" } }),
+    QODER_NO_MODEL_BASELINE,
+  );
+});
+
 test("qoder 旧 -m argv 拼装已撤除（model 唯一通道 = 协议面 set）", () => {
-  const args = qoderBridgeArgs({ backendCmd: "qoderclicn", qoder: { model: "provider/model-x" } });
+  const args = qoderBridgeArgs({ backendCmd: "qoderclicn", model: "provider/model-x" });
   assert.ok(!args.includes("-m"), "不得再出现后端 -m 旗标");
   assert.ok(!args.some((a) => a.includes('"-m"')), "不得再出现 --backend-args 内的 -m 拼装");
 });
@@ -280,19 +291,19 @@ function opencodeBridgeArgs(agentConfig: Record<string, unknown>): string[] {
     .args.slice(1);
 }
 
-test("opencode model 已配 ⇒ 下发 --model（协议面通路对两家同方言启用）", () => {
+test("opencode 平铺 model 已配 ⇒ 下发 --model（协议面通路对两家同方言启用）", () => {
   assert.deepEqual(
-    opencodeBridgeArgs({ backendCmd: "opencode.exe", opencode: { model: "provider/model-x" } }),
+    opencodeBridgeArgs({ backendCmd: "opencode.exe", model: "provider/model-x" }),
     [...OPENCODE_NO_MODEL_BASELINE, "--model", "provider/model-x"],
   );
 });
 
-test("opencode model 已配 + permissionArgs：--model 在 --backend-args 后、--risk 前", () => {
+test("opencode 平铺 model 已配 + permissionArgs：--model 在 --backend-args 后、--risk 前", () => {
   const spec = getAdapter("opencode").buildLaunch({
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "opencode.exe", opencode: { model: "m1" } },
+    agentConfig: { backendCmd: "opencode.exe", model: "m1" },
     permissionArgs: getAdapter("opencode").permission("read").args,
   });
   assert.deepEqual(spec.args.slice(1), [
@@ -304,16 +315,119 @@ test("opencode model 已配 + permissionArgs：--model 在 --backend-args 后、
   ]);
 });
 
-test('opencode model 未配 / 非法 ⇒ argv 逐字 = 基线（后端 argv 恒 ["acp"]，不含 --model）', () => {
+test("opencode 遗留段内 model（v0.8.4 翻向）⇒ 不生效：argv 逐字 = 未配置基线", () => {
+  assert.deepEqual(
+    opencodeBridgeArgs({ backendCmd: "opencode.exe", opencode: { model: "provider/model-x" } }),
+    OPENCODE_NO_MODEL_BASELINE,
+  );
+});
+
+test('opencode 平铺 model 未配 / 非法 ⇒ argv 逐字 = 基线（后端 argv 恒 ["acp"]，不含 --model）', () => {
   const cases: Record<string, Record<string, unknown>> = {
     未配: { backendCmd: "opencode.exe" },
-    空串: { backendCmd: "opencode.exe", opencode: { model: "" } },
-    数字: { backendCmd: "opencode.exe", opencode: { model: 7 } },
-    段非对象: { backendCmd: "opencode.exe", opencode: "oops" },
+    空串: { backendCmd: "opencode.exe", model: "" },
+    数字: { backendCmd: "opencode.exe", model: 7 },
+    非字符串: { backendCmd: "opencode.exe", model: null },
   };
   for (const [name, agentConfig] of Object.entries(cases)) {
     assert.deepEqual(opencodeBridgeArgs(agentConfig), OPENCODE_NO_MODEL_BASELINE, `「${name}」应走未配置路径`);
   }
+});
+
+// ---------- REQ-v0.8.4-2026-09-20-01 · M3：遗留键告警锚（段内 model ⇒ ACP 族告警 / wrapper 族不告警）----------
+
+test("遗留键告警（manager.start）：ACP 族段内 model ⇒ 启动告警一次；无段内 model ⇒ 无告警", async () => {
+  const workspace = mkdtempSync(join(tmpdir(), "a2a-machine-legacy-"));
+  const originalWarn = console.warn;
+  // 后端命令取必然不存在的绝对路径：桥进程快速失败退出 ⇒ 拉起不依赖本机环境
+  const bogusBackend = join(tmpdir(), "a2a-machine-legacy-nonexistent-backend.exe");
+  const mkConfig = (agentConfig: Record<string, unknown>): MachineConfig => ({
+    machineId: "m-test",
+    launcher: { port: 3199 },
+    projects: [
+      { projectId: "p-legacy", workspace, agentKind: "qoder", a2aPort: 4199, agentConfig },
+    ],
+  });
+  const warnings: string[] = [];
+  console.warn = (...args: unknown[]): void => {
+    warnings.push(args.map(String).join(" "));
+  };
+  try {
+    const manager = new AgentManager(mkConfig({ backendCmd: bogusBackend, qoder: { model: "legacy-m" } }));
+    try {
+      // 拉起成败与告警无关（告警在 spawn 之前）；两种收敛都接受
+      await manager.ensure("p-legacy").catch(() => undefined);
+    } finally {
+      await manager.stop("p-legacy").catch(() => undefined);
+    }
+    assert.equal(
+      warnings.filter((w) => w.includes("遗留键告警")).length,
+      1,
+      "ACP 族段内 model 应触发恰好一次遗留键告警",
+    );
+    const warning = warnings.find((w) => w.includes("遗留键告警")) ?? "";
+    assert.match(warning, /agentConfig\.qoder\.model 已废弃/);
+    assert.match(warning, /顶层平铺键 agentConfig\.model/);
+    assert.match(warning, /本键不生效/);
+
+    warnings.length = 0;
+    const clean = new AgentManager(mkConfig({ backendCmd: bogusBackend, model: "flat-m" }));
+    try {
+      await clean.ensure("p-legacy").catch(() => undefined);
+    } finally {
+      await clean.stop("p-legacy").catch(() => undefined);
+    }
+    assert.equal(
+      warnings.filter((w) => w.includes("遗留键告警")).length,
+      0,
+      "平铺 model（合法键）不得告警",
+    );
+  } finally {
+    console.warn = originalWarn;
+    rmSync(workspace, { recursive: true, force: true });
+  }
+});
+
+test("遗留键不生效（谓词口径，与 manager.start 告警同源）：ACP 族 adapter 不消费段内 model", () => {
+  assert.ok(
+    !qoderBridgeArgs({ backendCmd: "qoderclicn", qoder: { model: "legacy-m" } }).includes("--model"),
+  );
+  assert.ok(
+    !opencodeBridgeArgs({ backendCmd: "opencode.exe", opencode: { model: "legacy-m" } }).includes(
+      "--model",
+    ),
+  );
+  // 平铺 + 段内并存 ⇒ 只透传平铺值（段内不掺入、不双读）
+  assert.deepEqual(
+    qoderBridgeArgs({ backendCmd: "qoderclicn", model: "flat-m", qoder: { model: "legacy-m" } }),
+    [...QODER_NO_MODEL_BASELINE, "--model", "flat-m"],
+  );
+});
+
+test("wrapper 族（codex/claude）段内 model = 外部契约 ⇒ 不告警、不生效（adapter 不消费）", () => {
+  for (const kind of ["codex", "claude"] as const) {
+    const spec = getAdapter(kind).buildLaunch({
+      projectId: "p1",
+      workspace: "/ws/p1",
+      a2aPort: 4100,
+      configPath: `/cfg/${kind}.p1.json`,
+      agentConfig: { [kind]: { model: "seg-model" } },
+    });
+    assert.ok(!spec.args.includes("--model"), `${kind}：adapter 不得消费段内 model`);
+  }
+  // 告警门控源码锚：manager.start 的遗留键告警分支只挂 ACP 族 ⇒ wrapper 族恒不进告警路径
+  const managerSrc = readFileSync(
+    join(appRootFromModule(import.meta.url), "launcher", "manager.ts"),
+    "utf8",
+  );
+  assert.ok(
+    managerSrc.includes('project.agentKind === "qoder" || project.agentKind === "opencode"'),
+    "遗留键告警门控必须限定 ACP 族",
+  );
+  assert.ok(
+    !/agentKind === "codex"[\s\S]{0,200}遗留键告警/.test(managerSrc),
+    "wrapper 族不得进入遗留键告警路径",
+  );
 });
 
 test("qoder buildLaunch：无 agentConfig ⇒ 抛错且信息含 backendCmd", () => {

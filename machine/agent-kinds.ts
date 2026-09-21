@@ -11,3 +11,23 @@
 export const AGENT_KINDS = ["opencode", "codex", "claude", "qoder"] as const;
 
 export type AgentKind = (typeof AGENT_KINDS)[number];
+
+/**
+ * `agentConfig` **顶层平铺命名空间**的保留键（REQ-v0.8.4-2026-09-20-01 · M3 锚定）：
+ * 任何 kind 段键（= {@link AGENT_KINDS} 成员）不得与此重名，否则平铺自消费键会与
+ * 分段 wrapper 契约命名空间撞车。
+ *
+ * **「保留」= 命名空间占用，≠ 本需求提供平铺读点** —— 当前实际具备平铺读点的仅
+ * `backendCmd` / `model`（见 `launcher/agent-config.ts`）；其余为既有顶层键
+ * （wrapper 契约 / 观测键）的占位登记。
+ */
+export const RESERVED_AGENT_CONFIG_FLAT_KEYS = [
+  "backendCmd",
+  "model",
+  "systemPrompt",
+  "systemPromptMode",
+  "timeouts",
+  "agentCard",
+  "events",
+  "mcp",
+] as const;

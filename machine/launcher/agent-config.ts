@@ -16,7 +16,6 @@
 import { mkdirSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import type { ProjectConfig } from "../types.js";
-import type { AgentKind } from "../agent-kinds.js";
 import { A2A_OUTCOME_CONVENTION } from "../agent-outcome.js";
 
 // REQ-v0.8.0-2026-09-19-01 · M1：`A2A_OUTCOME_CONVENTION` 已下沉**零依赖叶模块**
@@ -34,6 +33,9 @@ export { A2A_OUTCOME_CONVENTION };
  * opencode（ACP 族，v0.8.1 起）注：本段**读者 = 仓内 ACP 桥**（经 `--config-file` +
  * `--config-segment opencode` 读取），非仓外 `a2a-opencode` 包装器；键形状保持分段
  * （systemPrompt / systemPromptMode）以兼容存量用户配置与既有产物（合并链与产物形状不变）。
+ * 「键保持分段」的**适用键 = `systemPrompt` / `systemPromptMode` 两枚注入键**（REQ-v0.8.4-2026-09-20-01
+ * 登记为**显式例外** = B3 后置：平铺会动对外产物契约形状，待异仓核实后再评估）；
+ * 自消费键按定稿口径**平铺**（`backendCmd` / `model`），不得以本注记扩到其它键。
  *
  * qoder（ACP 族）注：桥不走包装器 JSON 配置模型，`qoder` 段当前为**占位** —— 保证
  * `writeAgentConfig` 产物含 qoder 段（满足 `agent-config-segments` 断言）；outcome 注入
@@ -51,9 +53,9 @@ const DEFAULT_AGENT_CONFIG: Record<string, unknown> = {
 /**
  * 从项目 agentConfig 解析 **ACP 族**后端命令：读**顶层平铺键** `agentConfig.backendCmd`。
  *
- * 键位原则：`backendCmd` 是 **machine 自消费键** —— 由 `agentKind` 决定哪个 adapter 读它，
- * 故**平铺**（同 `timeouts` 等先例）；而 **wrapper 消费的**分段键（`opencode` / `codex` /
- * `claude` 段）是第三方包装器按段读取的**外部契约**，维持分段。
+ * 键位原则（REQ-v0.8.4-2026-09-20-01 定稿）：**自消费键（机器读）平铺 / 外包契约键（wrapper 读）分段**
+ * —— `backendCmd` 由 machine adapter 读取，故**平铺**（同 `timeouts` 等先例）；而 **wrapper 消费的**
+ * 分段键（`opencode` / `codex` / `claude` 段）是第三方包装器按段读取的**外部契约**，维持分段。
  *
  * `backendCmd` 为 **ACP 族必填**（代码零硬编码缺省，wrapper 族豁免）；缺键 / 非法 / 空串 →
  * `undefined`（必填判定由调用方负责）。DEFAULT_AGENT_CONFIG **不预置**该键。
@@ -66,23 +68,20 @@ export function resolveAcpBackendCmd(
 }
 
 /**
- * 从项目 agentConfig 解析 **ACP 族**模型标识：读**分段键** `agentConfig.<kind>.model`
- * （REQ-v0.8.2-2026-09-20-01 · M1 协议面增补）。
+ * 从项目 agentConfig 解析 **ACP 族**模型标识：读**顶层平铺键** `agentConfig["model"]`
+ * （REQ-v0.8.4-2026-09-20-01 · M1：读点平铺化，取代 v0.8.2 的分段键 `agentConfig.<kind>.model`）。
  *
- * 键位原则：`model` 由 ACP 后端自己消费（桥经 `session/set_config_option` 原样下发），
- * 属外部契约 ⇒ **分段**（同 `opencode` / `codex` / `claude` 段），与 machine 自消费的
- * 平铺键 `backendCmd` 相对。
+ * 键位原则（定稿口径见 `resolveAcpBackendCmd`）：`model` 的**读者是 machine adapter**（读出后
+ * 经 `--model` 透传给桥，桥原样下发、不解释取值）⇒ 属**自消费键** ⇒ **平铺**，与 `backendCmd`
+ * 同轨；取值判定口径同 `resolveAcpBackendCmd`（仅非空字符串才取，否则 `undefined`）。
  *
- * 宽容缺省：缺段 / 段非对象 / 缺键 / 空串 / 非字符串 → `undefined`（⇒ 不配 model，
- * 后端用自身默认）。machine 侧**不做取值校验**（透传语义；校验归后端）。
+ * 宽容缺省：缺键 / 空串 / 非字符串 → `undefined`（⇒ 不配 model，后端用自身默认）。
+ * machine 侧**不做取值校验**（透传语义；校验归后端）。
  */
 export function resolveAcpModel(
   agentConfig: Record<string, unknown> | undefined,
-  kind: AgentKind,
 ): string | undefined {
-  const segment = agentConfig?.[kind];
-  if (!isPlainObject(segment)) return undefined;
-  const model = segment["model"];
+  const model = agentConfig?.["model"];
   return typeof model === "string" && model.length > 0 ? model : undefined;
 }
 

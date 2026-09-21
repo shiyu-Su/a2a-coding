@@ -2,7 +2,35 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
-## [v0.8.3] - 2026-09-20
+## [v0.8.4] - 2026-09-21
+
+> 主题：**agentConfig 键位口径统一（平铺 vs 分段）**（单需求 · `REQ-v0.8.4-2026-09-20-01`）。按判据「**谁执行读取动作**」把 `agentConfig` 收口为「**自消费键（机器读）平铺 / wrapper 契约键（外包程序读）分段**」：ACP 族（qoder / opencode）`model` 由 `agentConfig.<kind>.model` **迁为顶层平铺** `agentConfig.model`（**判据变更 ⇒ 显式推翻 v0.8.2 对 model 键位的归属**）；wrapper 族（codex / claude）段内写法不变；opencode 段注入键（`systemPrompt` / `systemPromptMode`）**B3 后置**为显式例外（解锁前置与 v0.8.5 接力约定见 `planlog.md`）。生效链路（adapter → argv `--model` → ACP 桥 `session/set_config_option`）与 `writeAgentConfig` 产物合并链**零改动**；**orch / flow 零改动、`PROTOCOL.md` 零 diff、kind 集合不变**。改造文档：`doc/v0.8.4/agentConfig键位统一-改造文档.md`（v7 final，边界 v3 三轮收敛 + 两轮实现期细化）。
+
+### Changed
+
+- **读取点平铺**（M1）：`launcher/agent-config.ts` `resolveAcpModel(agentConfig)` 改读**平铺** `agentConfig["model"]`（取值口径同 `resolveAcpBackendCmd`：仅非空字符串；**去掉 `kind` 形参**）；`adapters/qoder.ts:52` / `opencode.ts:63` 调用点随签名改（各 1 行）；argv `--model` 拼装逻辑零改动；两 adapter 头注定稿口径。
+- **播报面按 kind 分支**（M2）：`launcher/config-snapshot.ts` —— ACP 族读平铺 `model`；wrapper 族（claude / codex）维持**段读**（`readSectionModel`），其启动日志播报保持原样。
+- **测试锚翻向 + 新增防撞锚**（M3 + 增补轨）：`test/acp-model-config.test.ts`（平铺正读 / 段内 ⇒ 不生效 / 缺省零回退）· `test/adapters.test.ts`（平铺输入 + 段内旧键不生效 + **遗留键告警用例**：ACP 族段内 ⇒ 恰一次告警且不生效、wrapper 族不告警）· `test/agent-config-segments.test.ts`（平铺合法 + 新锚 `AGENT_KINDS ∩ 保留集 = ∅`）· `test/config-snapshot-model.test.ts`（增补轨 **7 条**：ACP 平铺命中 / 段内不影响播报·未配平铺落兜底 / wrapper 段读 / 外层平铺对其不生效 / 四 kind 未配兜底 / 非法平铺值视同未配 / `describeAgentConfig` 透传）。
+- **文档口径收口**：`config/config.json.default`（键位原则段「自消费键平铺 / wrapper 契约分段」+ 四条目示例改平铺 + `_agentConfigComment` 补「kind 扩展须先增补保留平铺键名清单」注记）· `config/model-catalog.json` `_comment` 指向平铺键 · `machine/README.md` · `adapters/types.ts` / `types.ts` 注记；**仓根 `README.md` 两处现存矛盾顺修**（`:114` `agentConfig.qoder.backendCmd` 笔误 → 平铺；`:288-289` 与分段说明自相矛盾 → 改键位原则 + `projects[].agentConfig.model` 行）。
+
+### Added
+
+- **遗留键启动告警**（B4）：`launcher/manager.ts` —— ACP 族项目存在段内 `agentConfig.<kind>.model` ⇒ 启动 warn；**语义写死「不生效 + 告警」**（不双读、不 fail）；**仅 ACP 族告警**（claude / codex 段内 model 合法、不告警）。
+- **保留平铺键清单 + 机械防撞锚**（B7）：`machine/agent-kinds.ts` 新增 `RESERVED_AGENT_CONFIG_FLAT_KEYS`（8 键 `{backendCmd, model, systemPrompt, systemPromptMode, timeouts, agentCard, events, mcp}`，旁注「保留 = 命名空间占用，≠ 提供平铺读点」）+ 测试锚 `AGENT_KINDS ∩ 保留集 = ∅` + 模板注记（kind 扩展 PR 须先增补保留集）。
+- **回归用例**：`.omo` 新增 `test-v0.8.4-key-layout.js`（静态锁定 v0.8.4 交付物：新单测文件 / 保留键常量 / 告警文案 / `resolveAcpModel` 平铺读点 / 播报面分支 / 模板键位原则与平铺示例 / model-catalog 注记 / 仓根 README 顺修 / machine 版本 0.8.4）。
+- **machine 侧 v0.8.3 部署打包工具入库**（用户裁决「保留 + 入库」）：`machine/package.json` 的 `zip` 脚本 · `machine/scripts/pack.mjs` · `machine-0.8.3-validation.zip` 随本版 commit 入库（非 v0.8.4 产出，部署遗留）。
+
+### Removed
+
+- **段内 `agentConfig.<kind>.model`（ACP 族）自本版起不生效**：**硬切、无双读**（存量 = 0；检测到旧键 ⇒ 告警且不生效）；`qoder` 段本就无读者（纯清理对象）；opencode 段**注入键**（`systemPrompt` / `systemPromptMode`）**维持段内**（B3 后置显式例外 —— 其解锁前置「核实仓外 wrapper 是否消费产物顶层 systemPrompt」随 **v0.8.5 wrapper 族迁 ACP** 一并归零，接力约定见 planlog）。
+
+### 门禁与真机
+
+- **门禁**：machine `typecheck` **0** / `lint` **0** / `npm test` **243/243**（236 + 增补轨 7）；**orch 源码零 diff**（仅 `package.json` 版本号）；**宿主回归 1039/1039 零失败**（`reports/v0.8.4/regression-report.json`，版本源 = 根 `package.json`）。
+- **回归套件反转/退役（同 v0.8.3 惯例）**：`test-v0.8.2-acp-model.js` 分段键位断言**反转**为平铺口径（顶层平铺在位 / 段内遗留键不应存在 / qoder 平铺示例 = catalog 可解析 modelId）；`test-v0.8.1-machine-retire.js`「manager.ts 无 opencode 字样」**收窄**为「无 opencode serve 特判 / 专用后端符号」（kind 字样属遗留键告警门控，豁免）；`test-v0.8.1-opencode-acp.js` 分段注记锚改为「B3 后置显式例外（暂留段内）」；`test-doc-final.js` 依 `| final |` 行通过。
+- **真机（用户重启 + machine 单元只读取证任务 `08e8ccc9`，全程未用 agent 自报）**：① **配了就生效 ✓ 双后端** —— machine（qoder）平铺 `model=qmodel_38max` ⇒ `launcher.log:82440 已设置（currentValue=qmodel_38max）`；orch（opencode）`model=opencode-go/glm-5.3-flash` ⇒ `:82449 已设置（currentValue=…）`；**argv 第三线** `--model qmodel_38max`（`Get-CimInstance`，只读）。② **不配零回退 ✓** —— flow 未配 ⇒ 重启后**零** `acp-session` 行、快照走未配口径、自检通过。**时序合规**：`dist` mtime 09:54:52 < launcher 启动 10:13:20（跑新构建）；自检 3/3、`status=ok`、Runner 注册成功、无 `设置失败` 行。
+- **未覆盖（不得默算通过）**：③ 遗留键告警未触发（配置无遗留键 ⇒ 无对象；**用户裁决「不用管」**）· 播报面运行期输出（**真机已补证** `:82437/:82446`；自动化锚由增补轨补齐）· POSIX / macOS 面 · 真机混布过渡窗。
+
 
 > 主题：**拆除 push 通知附加链（worker→orch 直连回调通道退役）**（单需求 · `REQ-v0.8.3-2026-09-20-01`）。把 v0.4.0 遗留的 worker push 回调附加链从**代码 / 配置 / 文档 / 回归断言**四面彻底拆除 + 运行态清理（释放 3200），使「全系统 = Runner 单通道」**在代码面上也成立**；**不动 A2A 协议本身的 pushNotification 字段、`PROTOCOL.md` 零改动**。改造文档：`doc/v0.8.3/拆除push通知附加链-改造文档.md`（final）。（原定同版第二条需求 **B5 · orch 退化为 kind 无关** 发版时未做 ⇒ 已转出本版、归属待裁决，见 `planlog.md`。）
 

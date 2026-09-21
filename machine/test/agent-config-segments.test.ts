@@ -13,7 +13,7 @@ import { mkdtempSync, readFileSync, rmSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { writeAgentConfig } from "../launcher/agent-config.js";
-import { AGENT_KINDS } from "../agent-kinds.js";
+import { AGENT_KINDS, RESERVED_AGENT_CONFIG_FLAT_KEYS } from "../agent-kinds.js";
 import { getAdapter } from "../adapters/index.js";
 import type { ProjectConfig } from "../types.js";
 
@@ -58,7 +58,7 @@ test("writeAgentConfig：缺省产物顶层无平铺 model 键、各 kind 段不
     for (const kind of AGENT_KINDS) {
       const path = writeAgentConfig(project(kind), appRoot, getAdapter(kind).baseConfig());
       const written = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-      assert.equal("model" in written, false, `${kind}：顶层不得出现平铺 model 键`);
+      assert.equal("model" in written, false, `${kind}：缺省不预置平铺 model 键`);
       for (const member of AGENT_KINDS) {
         const segment = written[member] as Record<string, unknown>;
         assert.equal("model" in segment, false, `${kind}：缺省 ${member} 段不得预置 model`);
@@ -66,5 +66,33 @@ test("writeAgentConfig：缺省产物顶层无平铺 model 键、各 kind 段不
     }
   } finally {
     rmSync(appRoot, { recursive: true, force: true });
+  }
+});
+
+test("writeAgentConfig（v0.8.4 平铺语义）：项目平铺 agentConfig.model 原样进入产物顶层", () => {
+  const appRoot = mkdtempSync(join(tmpdir(), "a2a-machine-seg-"));
+  try {
+    const withModel: ProjectConfig = {
+      ...project("qoder"),
+      agentConfig: { backendCmd: "qoderclicn", model: "m-flat" },
+    };
+    const path = writeAgentConfig(withModel, appRoot, getAdapter("qoder").baseConfig());
+    const written = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+    assert.equal(written["model"], "m-flat");
+  } finally {
+    rmSync(appRoot, { recursive: true, force: true });
+  }
+});
+
+// ---- REQ-v0.8.4-2026-09-20-01 · M3 防撞锚：kind 段命名空间与平铺保留键互斥 ----
+
+test("防撞锚：AGENT_KINDS ∩ 保留平铺键 = ∅（分段契约与平铺自消费键不撞车）", () => {
+  const reserved = new Set<string>(RESERVED_AGENT_CONFIG_FLAT_KEYS);
+  for (const kind of AGENT_KINDS) {
+    assert.equal(
+      reserved.has(kind),
+      false,
+      `kind 段键「${kind}」不得占用平铺保留命名空间（保留 = 命名空间占用，≠ 平铺读点）`,
+    );
   }
 });

@@ -7,7 +7,7 @@
  *   `node <appRoot>/dist/acp-bridge/index.js
  *     --port <a2aPort> --workspace <workspace> --project-id <projectId>
  *     --backend-cmd <agentConfig.backendCmd> --backend-args '["acp"]'
- *     [--model <agentConfig.opencode.model>]
+ *     [--model <agentConfig.model>]
  *     --risk <read|write|full>
  *     --config-file <agents 产物路径> --config-segment opencode`
  *
@@ -22,7 +22,8 @@
  *   `--config-segment opencode` 读取本段配置（M1 提供读取面；注入时机在 M2 落地）。
  * - outcome 注入：沿用 `A2A_OUTCOME_CONVENTION`（零依赖叶模块 `../agent-outcome.js`），
  *   保留 opencode 段形状供包装器时代产物与桥读者兼容。
- * - **model 透传（REQ-v0.8.2-2026-09-20-01 · M1 协议面增补）**：`agentConfig.opencode.model` ⇒
+ * - **model 透传（REQ-v0.8.2-2026-09-20-01 · M1 协议面增补；REQ-v0.8.4-2026-09-20-01 · M1 键位平铺）**：
+ *   **平铺** `agentConfig.model` ⇒
  *   桥 `--model <原样值>` ⇒ 桥发 ACP `session/set_config_option {configId:"model"}`。
  *   旧 M1 探针实证 `acp` 子命令**严格拒绝** `-m/--model`（短/长旗标、前置/后置四组合均 rc=1 打
  *   usage 退出，拼装即启动崩溃），故后端 argv 通道对 opencode 根本不可用 —— 协议面是两家
@@ -59,7 +60,7 @@ export class OpenCodeAdapter implements Adapter {
     if (backendCmd === undefined) {
       throw new Error(OPENCODE_BACKEND_CMD_REQUIRED);
     }
-    const model = resolveAcpModel(request.agentConfig, "opencode");
+    const model = resolveAcpModel(request.agentConfig);
     // 拉起的是仓内自持桥进程（非仓外 a2a-opencode 包装器，也不再前置 opencode serve）。
     const appRoot = appRootFromModule(import.meta.url);
     const bridgeEntry = join(appRoot, "dist", "acp-bridge", "index.js");
