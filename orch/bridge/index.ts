@@ -1220,7 +1220,7 @@ type CancelOutcome =
 
 /**
  * `a2a_cancel`（v0.7.0 A6 / B1）：**命令族第三类 `cancel-task`** —— 经 `/runner/connect`
- * 下一轮轮询下发给目标 Runner，由其对本地 wrapper 执行取消；终态经 `/runner/result` 回传落库。
+ * 下一轮轮询下发给目标 Runner，由其对本地执行层 / 项目进程执行取消；终态经 `/runner/result` 回传落库。
  *
  * 桥侧**不再** `tasks/cancel`（A2A 出站退役）。命令为**异步投递**：本函数返回「已下发」，
  * 任务态仍以本地回传落库为准（宿主按 `a2a_task_status` 观察）。

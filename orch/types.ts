@@ -34,7 +34,7 @@ export const SUPPORTED_PEER_PROTOCOL_MAJORS: readonly number[] = [2];
  * orch（本常量）与 machine（`machine/agent-kinds.ts` 的 `AGENT_KINDS`）各自派生、
  * **不共享代码**，两侧一致性由回归断言「本地清单 == 锚点」锁定。
  *
- * orch 侧仅据此作**闭集校验 / 投影** —— 「决定 A2A 包装器与 CLI 参数」属 machine 侧语义。
+ * orch 侧仅据此作**闭集校验 / 投影** —— 「决定**执行层后端（ACP 桥 / 适配器）**与 CLI 参数」属 machine 侧语义。
  */
 export const AGENT_KINDS = ["opencode", "codex", "claude", "qoder"] as const;
 

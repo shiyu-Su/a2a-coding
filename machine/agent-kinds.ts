@@ -17,9 +17,10 @@ export type AgentKind = (typeof AGENT_KINDS)[number];
  * 任何 kind 段键（= {@link AGENT_KINDS} 成员）不得与此重名，否则平铺自消费键会与
  * 分段 wrapper 契约命名空间撞车。
  *
- * **「保留」= 命名空间占用，≠ 本需求提供平铺读点** —— 当前实际具备平铺读点的仅
- * `backendCmd` / `model`（见 `launcher/agent-config.ts`）；其余为既有顶层键
- * （wrapper 契约 / 观测键）的占位登记。
+ * **「保留」= 命名空间占用，≠ 本需求提供平铺读点** —— 当前实际具备平铺读点的为
+ * `backendCmd` / `model`（自消费键）与 `systemPrompt` / `systemPromptMode`
+ * （v0.8.5 · M4：段退役后自定义注入的平铺键，见 `launcher/agent-config.ts`）；
+ * 其余为既有顶层键（观测键）的占位登记。
  */
 export const RESERVED_AGENT_CONFIG_FLAT_KEYS = [
   "backendCmd",

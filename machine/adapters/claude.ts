@@ -1,17 +1,42 @@
 /**
- * Claude Code 执行层适配器。
+ * Claude Code 执行层适配器 —— **ACP 族**（`protocol = "acp"`，REQ-v0.8.5-2026-09-21-01 · M3）。
  *
- * - 包装器：`a2a-claude`（a2a-wrapper），按真实 CLI 拉起 A2A Server：
- *   `a2a-claude --config <f> --port <n> --hostname 127.0.0.1 --advertise-host localhost
- *    --workspace <workspace> [permission...]`
- * - 会话由包装器按 A2A `contextId` 内部持有（+ 会话落盘补丁），Launcher 不传任何 resume 参数。
- * - 权限：`--permission-mode plan | acceptEdits | bypassPermissions`
- *   （无头模式拒绝 `default` / `auto`，只读档用 `plan`）。
- * - full 档的 `bypassPermissions` 无对应 CLI 开关，需同时注入配置项
- *   `claude.dangerouslyAllowBypassPermissions=true`（见 `permission().config`）。
- * - 默认配置：`claude.settingSources=["user"]`（加载用户级 `~/.claude/settings.json`，
- *   与 opencode / codex 的配置继承语义一致；项目可用 `agentConfig.claude.settingSources` 覆盖）。
+ * v0.8.5 起从「仓外 `a2a-claude` 包装器」迁移到**仓内自持 ACP 桥**（`machine/acp-bridge/`），
+ * 与 opencode / qoder 适配器同构拉起**桥进程**：
+ *
+ *   `node <appRoot>/dist/acp-bridge/index.js
+ *     --port <a2aPort> --workspace <workspace> --project-id <projectId>
+ *     --backend-cmd <归一后的命令> --backend-args <归一后的参数>   // 脚本形态 ⇒ node + 脚本路径；.exe ⇒ 直调
+ *     [--model <agentConfig.model>]
+ *     [--system-prompt <agentConfig.systemPrompt> [--system-prompt-mode <append|replace>]]
+ *     --risk <read|write|full> --mode <plan|acceptEdits|bypassPermissions>
+ *     [--session-meta-json <full 档 _meta>]`
+ *
+ * - ACP 后端命令**必须**由项目配置**顶层平铺键** `agentConfig.backendCmd` 指定，代码零硬编码缺省；
+ *   未配置 ⇒ `buildLaunch` 抛明确错误。探针实证：Windows 下 `.cmd` / `.ps1` 壳在 `shell:false`
+ *   **Windows 形态**：`backendCmd` 填该适配器 `dist/index.js` 的**绝对路径**（该包 `bin` =
+ *   `claude-agent-acp` → `dist/index.js`，本身即 JS 入口）⇒ 适配器自动以 `process.execPath` +
+ *   脚本路径拉起（形态归一见 `./backend-command.ts`）；`.cmd` / `.ps1` 壳不可直调。
+ * - `--backend-args` 由**形态归一**产出：可执行体形态 = `[]`（`--acp` 已被两家适配器**静默忽略**、
+ *   报文逐字节同构 ⇒ 裸 bin + stdio 即规范形态）；脚本形态 = `[<适配器入口绝对路径>]`。
+ * - 权限三档（B2-①）：risk **恒映射**出会话模式，单一出口 = `permission(risk)`，产出
+ *   `--risk <档>`（桥的权限门档位，语义与 opencode / qoder 一致）+ `--mode <modeId>`
+ *   （会话模式；桥对 kind 无知、只收原样值）。claude **三档逐档同名对齐**：
+ *   `read → plan` · `write → acceptEdits` · `full → bypassPermissions`
+ *   （三档均为真机 `session/new` 报文 `modes` 中的可用值）。
+ * - full 档的 `bypassPermissions`（B2-③）：**替代**旧 `PermissionSpec.config`
+ *   （`claude:{dangerouslyAllowBypassPermissions:true}`）—— 经 **`--session-meta-json`** 下发
+ *   `_meta.claudeCode.options.allowDangerouslySkipPermissions=true`（键名与默认值已按适配器
+ *   源码自证：`acp-agent.js` 读 `params._meta.claudeCode.options.allowDangerouslySkipPermissions`，
+ *   判定为 `!== false` ⇒ **缺省即 true**，与今天配置开关语义一致）；桥在
+ *   new / load / resume **三路统一携带**（否则复用会话静默降级）。
+ * - **model 平铺（B14′ 必做）**：读**顶层平铺** `agentConfig.model`（复用 `resolveAcpModel`，
+ *   kind 无关、零新函数）⇒ 桥 `--model <原样值>` ⇒ ACP `session/set_config_option{configId:"model"}`。
+ *   真机报文证 claude 有 `configOptions{id:"model"}`（options default/opus/fable/sonnet/haiku）——
+ *   段退役后若不补平铺 model，claude 会**丢能力**（旧 `agentConfig.claude.model` 随段死）。
+ * - outcome 注入：由**桥缺省**注入 `A2A_OUTCOME_CONVENTION`（B12③ 单一源），本适配器不再产出段覆盖项。
  */
+import { join } from "node:path";
 import type { AgentKind } from "../types.js";
 import type {
   Adapter,
@@ -20,55 +45,89 @@ import type {
   PermissionRisk,
   PermissionSpec,
 } from "./types.js";
-import { wrapperConfigPath } from "./types.js";
-import { A2A_OUTCOME_CONVENTION } from "../launcher/agent-config.js";
+import { appRootFromModule } from "../launcher/app-root.js";
+import {
+  resolveAcpBackendCmd,
+  resolveAcpModel,
+  resolveSystemPrompt,
+  resolveSystemPromptMode,
+} from "../launcher/agent-config.js";
+import { resolveBackendSpawn } from "./backend-command.js";
+
+/** 缺少 `agentConfig.backendCmd` 时的明确错误文案（ACP 族必填，纪律对齐 `OPENCODE_BACKEND_CMD_REQUIRED`）。 */
+export const CLAUDE_BACKEND_CMD_REQUIRED =
+  "claude 项目必须配置 agentConfig.backendCmd（ACP 适配器入口 = @agentclientprotocol/claude-agent-acp：填其 dist/index.js 绝对路径 ⇒ 适配器自动以 node 拉起；或填可直接 spawn 的 .exe 真身——.cmd/.ps1 壳在无 shell 的 spawn 下会 ENOENT/EINVAL）";
+
+/** wrapper 族迁 ACP 后显式下发的空后端参数（B11′）：`--acp` 已被适配器静默忽略 ⇒ 裸 bin + stdio 即规范形态。 */
+export const CLAUDE_BACKEND_ARGS: readonly string[] = [];
+
+/** risk → 会话模式（claude **三档逐档同名**；映射表唯一落点 = adapter，桥只收原样值）。 */
+const MODE_BY_RISK: Record<PermissionRisk, string> = {
+  read: "plan",
+  write: "acceptEdits",
+  full: "bypassPermissions",
+};
+
+/**
+ * full 档会话建立期 `_meta`（替代旧 `PermissionSpec.config`）：
+ * `_meta.claudeCode.options.allowDangerouslySkipPermissions = true`。
+ */
+export const CLAUDE_FULL_SESSION_META: Record<string, unknown> = {
+  claudeCode: { options: { allowDangerouslySkipPermissions: true } },
+};
 
 export class ClaudeAdapter implements Adapter {
   readonly kind: AgentKind = "claude";
-  readonly protocol = "wrapper";
+  readonly protocol = "acp";
 
   buildLaunch(request: LaunchRequest): LaunchSpec {
-    const configPath = request.configPath ?? wrapperConfigPath(this.kind, request.projectId);
+    // ACP 族后端命令必填：代码零硬编码缺省（未配置即抛错，避免静默落到错误命令）。
+    const backendCmd = resolveAcpBackendCmd(request.agentConfig);
+    if (backendCmd === undefined) {
+      throw new Error(CLAUDE_BACKEND_CMD_REQUIRED);
+    }
+    const model = resolveAcpModel(request.agentConfig);
+    // 平铺 systemPrompt(Mode)（v0.8.5 · N1）：自定义注入复用 resolveSystemPrompt / resolveSystemPromptMode。
+    const systemPrompt = resolveSystemPrompt(request.agentConfig);
+    const systemPromptMode = resolveSystemPromptMode(request.agentConfig);
+    // 后端启动形态归一（v0.8.5 · M8 增补）：脚本形态 ⇒ node + 脚本路径；可执行体 ⇒ 直调。
+    const backend = resolveBackendSpawn(backendCmd, CLAUDE_BACKEND_ARGS);
+    // 拉起的是仓内自持桥进程（非仓外 a2a-claude 包装器）。
+    const appRoot = appRootFromModule(import.meta.url);
+    const bridgeEntry = join(appRoot, "dist", "acp-bridge", "index.js");
     const args: string[] = [
-      "--config",
-      configPath,
+      bridgeEntry,
       "--port",
       String(request.a2aPort),
-      "--hostname",
-      "127.0.0.1",
-      "--advertise-host",
-      "localhost",
       "--workspace",
       request.workspace,
+      "--project-id",
+      request.projectId,
+      "--backend-cmd",
+      backend.command,
+      "--backend-args",
+      JSON.stringify(backend.args),
+      // 模型透传（B14′）：原样值经桥落到 ACP session/set_config_option；
+      // 未配 / 空串 ⇒ 不下发该旗标（零回退）。不参与后端 argv 拼装。
+      ...(model !== undefined ? ["--model", model] : []),
+      // 自定义注入（v0.8.5 · M4 / N1）：平铺 systemPrompt(Mode) ⇒ 桥 --system-prompt / --system-prompt-mode；
+      // 未配 ⇒ 不下发该旗标（桥只用缺省 outcome 约定注入）。
+      ...(systemPrompt !== undefined ? ["--system-prompt", systemPrompt] : []),
+      ...(systemPromptMode !== undefined ? ["--system-prompt-mode", systemPromptMode] : []),
+      // permission(risk).args（`--risk <档>` / `--mode <modeId>` / full 档 `--session-meta-json`）。
       ...(request.permissionArgs ?? []),
     ];
-    return { command: "a2a-claude", args };
+    return { command: "node", args };
   }
 
   permission(risk: PermissionRisk): PermissionSpec {
-    switch (risk) {
-      case "read":
-        // 只读档：plan 模式仅允许规划与只读探索，写入类操作被拒绝。
-        return { args: ["--permission-mode", "plan"] };
-      case "write":
-        // 工作区写入档：自动接受文件编辑，其余操作仍按默认（拒绝）策略。
-        return { args: ["--permission-mode", "acceptEdits"] };
-      case "full":
-        // 全权档：bypassPermissions 需配合配置开关，否则包装器拒绝启动。
-        return {
-          args: ["--permission-mode", "bypassPermissions"],
-          config: { claude: { dangerouslyAllowBypassPermissions: true } },
-        };
+    // 单一出口：风险档位 → 权限门档位（--risk）+ 会话模式（--mode）。
+    const args: string[] = ["--risk", risk, "--mode", MODE_BY_RISK[risk]];
+    if (risk === "full") {
+      // bypassPermissions 的承载：会话建立期 `_meta`（替代旧 PermissionSpec.config）。
+      args.push("--session-meta-json", JSON.stringify(CLAUDE_FULL_SESSION_META));
     }
+    return { args };
   }
 
-  baseConfig(): Record<string, unknown> {
-    // 默认加载用户级配置（~/.claude/settings.json 的模型 / 网关 / 认证 env），
-    // 与 opencode / codex「默认继承用户配置」语义一致；
-    // 项目可经 agentConfig.claude.settingSources 覆盖（如 [] 恢复完全隔离）。
-    // v0.3.1 机制②：注入「a2a-outcome」约定（append 到 claude_code preset）。
-    return {
-      claude: { settingSources: ["user"], systemPromptAppend: A2A_OUTCOME_CONVENTION },
-    };
-  }
 }

@@ -789,9 +789,9 @@ test("M4 负向锚点：协议面 set 只发 configId=model，不顺手碰其它
   assert.deepEqual([...others].sort(), ["session/load", "session/prompt"]);
 });
 
-test("M4 负向锚点（源码级）：会话面 set_config_option 的 configId 字面量仅 \"model\"", () => {
-  // effort / reasoning_effort / mode 等其它 config id 属后端既有能力，桥不得顺手接线；
-  // 以源码扫描锁住「协议面只发 model」这一实现边界（行为断言只覆盖已跑路径，扫描兜底未跑路径）。
+test("M4 翻向（v0.8.5 · M1）：会话内 set_config_option 的 configId 字面量仅 model / mode / collaboration_mode", () => {
+  // v0.8.5 · B2-① 起：`model`（既有）+ `mode`（仅 -32601 回落用）+ `collaboration_mode` 是桥协议面
+  // set_config_option 出参的**全部** config id；`effort` / `reasoning_effort` 仍不得顺手接线（扫描兜底未跑路径）。
   const src = readFileSync(
     // 运行时 = dist/test/*.js，源码在 machine 根（../../）
     new URL("../../acp-bridge/acp/session.ts", import.meta.url),
@@ -799,8 +799,8 @@ test("M4 负向锚点（源码级）：会话面 set_config_option 的 configId 
   );
   const configIds = [...src.matchAll(/configId:\s*"([^"]+)"/g)].map((m) => m[1] as string);
   assert.ok(configIds.length > 0, "session.ts 应含 set_config_option 的 configId 字面量");
-  assert.deepEqual([...new Set(configIds)], ["model"]);
-  for (const forbidden of ["effort", "reasoning_effort", 'mode"']) {
+  assert.deepEqual([...new Set(configIds)].sort(), ["collaboration_mode", "mode", "model"]);
+  for (const forbidden of ["effort", "reasoning_effort"]) {
     assert.ok(!src.includes(`configId: "${forbidden}`), `不得出现 configId=${forbidden}`);
   }
 });

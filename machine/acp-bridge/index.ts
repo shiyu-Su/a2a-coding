@@ -13,21 +13,30 @@
  *
  * CLI：`node dist/acp-bridge/index.js --port <n> --workspace <path>
  *       --project-id <id> --backend-cmd <cmd> --risk <read|write|full>
- *       [--backend-args <JSON字符串数组>] [--config-file <path> --config-segment <kind>]
- *       [--model <value>]`
+ *       [--backend-args <JSON字符串数组>]
+ *       [--system-prompt <text> --system-prompt-mode <append|replace>]
+ *       [--model <value>] [--mode <modeId>] [--collaboration-mode <value>]
+ *       [--session-meta-json <JSON对象>]`
+ *
+ * v0.8.5 · M1（模式 / 会话元信息通道，REQ-v0.8.5-2026-09-21-01）：`--mode`（adapter 按 risk 映射后的
+ * **原样值**，桥**不做 kind→mode 映射**）与 `--collaboration-mode` 均原样透传、不校验（缺省 / 空串 ⇒ 不下发）；
+ * 前者优先 `session/set_mode`、**仅 `-32601`** 回落 `set_config_option{configId:"mode"}`；后者只走
+ * `session/set_config_option{configId:"collaboration_mode"}`。`--session-meta-json`（JSON 对象）= 会话建立期
+ * `_meta` 注入，`session/new` / `load` / `resume` **三路统一携带**。
  *
  * v0.8.1 · M1：后端参数数组化（`--backend-args`，缺省 `["--acp"]` 保 qoder 逐字不变）；
- * `--config-file` + `--config-segment` 最小配置面（读 writeAgentConfig 产物的指定段，
- * 本节点只读取与透传，注入时机归 M2；缺文件 / 缺段 / 坏 JSON 一律告警不崩、配置取空）。
+ * 同版引入的 `--config-file` + `--config-segment` 最小配置面**已于 v0.8.5 · M4 整体退役**
+ * （`agentConfig.<kind>` 段与配置通道退役）⇒ 自定义注入改走本文件的
+ * `--system-prompt` / `--system-prompt-mode`（解析逐字复用 `parseModelArg`；缺省 / 空串 ⇒ 不下发）。
  *
- * v0.8.2 · M1（协议面增补）：`--model` = 项目 `agentConfig.<kind>.model` 的**原样透传值**，
+ * v0.8.2 · M1（协议面增补）：`--model` = 项目 `agentConfig.model` 的**原样透传值**（读点自 v0.8.4 起平铺，
+ * v0.8.5 段退役后为唯一口径），
  * 由 `AcpSessionRunner` 在会话建立（new / load / resume）成功后经 ACP
  * `session/set_config_option {configId:"model"}` 下发；缺省 / 空串 ⇒ 不发该请求（与旧版逐字一致）。
  * 走 CLI 而非 `--config-file` 白名单扩展：后者只覆盖 opencode，qoder 不接该通道。
  *
  * 不 import `launcher/**` / `orch/**`；无第三方依赖（仅 node:*）。
  */
-import { readFileSync } from "node:fs";
 import { pathToFileURL } from "node:url";
 import { createAcpA2AServer, type AcpA2AServer } from "./a2a-server.js";
 import { AcpClient, createNodeAcpSpawn } from "./acp/client.js";
@@ -58,15 +67,30 @@ export interface BridgeArgs {
   risk: BridgeRisk;
   /** 后端参数数组；缺省 = {@link DEFAULT_BACKEND_ARGS}。 */
   backendArgs?: readonly string[];
-  /** writeAgentConfig 产物路径（可选；与 `configSegment` 同时给出才生效）。 */
-  configFile?: string;
-  /** 读取 configFile 中的段名（如 `opencode`；machine 自消费段的段选择器）。 */
-  configSegment?: string;
   /**
-   * `--model` 解析结果（`agentConfig.<kind>.model` 原样值）；缺省 / 空串 ⇒ `undefined`
+   * `--system-prompt` 解析结果（自定义注入文本；v0.8.5 · M4）：缺省 / 空串 ⇒ `undefined`
+   * ⇒ 桥只用**缺省 outcome 约定**注入（B12③ 单一源）。
+   */
+  systemPrompt?: string;
+  /** `--system-prompt-mode` 解析结果（`append` | `replace`）；缺省 / 非法 ⇒ `undefined` ⇒ 桥缺省 `append`。 */
+  systemPromptMode?: "append" | "replace";
+  /**
+   * `--model` 解析结果（平铺 `agentConfig.model` 原样值）；缺省 / 空串 ⇒ `undefined`
    * （此时桥**不发** `session/set_config_option`）。
    */
   model?: string;
+  /**
+   * `--mode` 解析结果（**原样值**；REQ-v0.8.5 · M1）；缺省 / 空串 ⇒ `undefined`
+   * ⇒ 桥**不发** mode 请求（`session/set_mode` 与回落用的 `set_config_option{configId:"mode"}` 均不发）。
+   */
+  mode?: string;
+  /** `--collaboration-mode` 解析结果（**原样值**）；缺省 / 空串 ⇒ `undefined` ⇒ 桥不发该请求。 */
+  collaborationMode?: string;
+  /**
+   * `--session-meta-json` 解析结果（会话建立期 `_meta` 注入，供 claude full 档用）；
+   * 缺省 ⇒ 三路（new / load / resume）均不携带 `_meta` 键。
+   */
+  sessionMeta?: Record<string, unknown>;
 }
 
 function requiredArg(map: ReadonlyMap<string, string>, key: string): string {
@@ -101,6 +125,11 @@ export function parseBridgeArgs(argv: readonly string[]): BridgeArgs {
   }
   const backendArgs = parseBackendArgs(map.get("backend-args"));
   const model = parseModelArg(map.get("model"));
+  const mode = parseModelArg(map.get("mode"));
+  const collaborationMode = parseModelArg(map.get("collaboration-mode"));
+  const sessionMeta = parseSessionMetaArg(map.get("session-meta-json"));
+  const systemPrompt = parseModelArg(map.get("system-prompt"));
+  const systemPromptMode = parseSystemPromptModeArg(map.get("system-prompt-mode"));
   return {
     port,
     workspace: requiredArg(map, "workspace"),
@@ -108,11 +137,12 @@ export function parseBridgeArgs(argv: readonly string[]): BridgeArgs {
     backendCmd: requiredArg(map, "backend-cmd"),
     risk: riskRaw,
     ...(backendArgs !== undefined ? { backendArgs } : {}),
-    ...(map.get("config-file") !== undefined ? { configFile: map.get("config-file") } : {}),
-    ...(map.get("config-segment") !== undefined
-      ? { configSegment: map.get("config-segment") }
-      : {}),
     ...(model !== undefined ? { model } : {}),
+    ...(systemPrompt !== undefined ? { systemPrompt } : {}),
+    ...(systemPromptMode !== undefined ? { systemPromptMode } : {}),
+    ...(mode !== undefined ? { mode } : {}),
+    ...(collaborationMode !== undefined ? { collaborationMode } : {}),
+    ...(sessionMeta !== undefined ? { sessionMeta } : {}),
   };
 }
 
@@ -122,6 +152,35 @@ export function parseBridgeArgs(argv: readonly string[]): BridgeArgs {
  */
 export function parseModelArg(raw: string | undefined): string | undefined {
   return raw === undefined || raw.length === 0 ? undefined : raw;
+}
+
+/**
+ * `--system-prompt-mode` 解析（v0.8.5 · M4）：取值仅 `append` / `replace`。
+ * 缺省 / 空串 / 其它值 ⇒ `undefined`（⇒ `AcpInjectionConfig` 缺省 `append`，与退役前行为一致）。
+ */
+export function parseSystemPromptModeArg(
+  raw: string | undefined,
+): "append" | "replace" | undefined {
+  return raw === "append" || raw === "replace" ? raw : undefined;
+}
+
+/**
+ * `--session-meta-json` 解析（REQ-v0.8.5 · M1）：JSON **对象**，原样作为会话建立参数的 `_meta` 注入
+ * （`session/new` / `load` / `resume` **三路统一携带**）。缺省 / 空串 ⇒ `undefined`（⇒ 零注入）。
+ * 非法 JSON / 非对象 ⇒ 抛错（参数格式错误 fail-fast，纪律同 `--backend-args`）。
+ */
+export function parseSessionMetaArg(raw: string | undefined): Record<string, unknown> | undefined {
+  if (raw === undefined || raw.length === 0) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`--session-meta-json 不是合法 JSON：${raw.slice(0, 80)}`);
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    throw new Error("--session-meta-json 必须是 JSON 对象");
+  }
+  return parsed as Record<string, unknown>;
 }
 
 /** `--backend-args` 解析：JSON 字符串数组；缺省返回 `undefined`（由调用方落 {@link DEFAULT_BACKEND_ARGS}）。 */
@@ -137,67 +196,6 @@ export function parseBackendArgs(raw: string | undefined): string[] | undefined 
     throw new Error("--backend-args 必须是 JSON 字符串数组");
   }
   return parsed as string[];
-}
-
-/**
- * 读 `--config-file` 产物中 `--config-segment` 指定段（v0.8.1 · M1 最小配置面）。
- * 容忍纪律：任何缺失 / 损坏都**只告警不抛错**，配置取空对象（注入面在 M2 消费）。
- */
-export function readConfigSegment(opts: {
-  configFile?: string;
-  configSegment?: string;
-  logger?: (message: string) => void;
-}): Record<string, unknown> {
-  const log = opts.logger ?? ((message: string): void => console.log(message));
-  const { configFile, configSegment } = opts;
-  if (configFile === undefined || configFile.length === 0) return {};
-  if (configSegment === undefined || configSegment.length === 0) {
-    log(`[acp-bridge] 给出 --config-file 但缺 --config-segment，配置取空：${configFile}`);
-    return {};
-  }
-  let raw: string;
-  try {
-    raw = readFileSync(configFile, "utf8");
-  } catch (err) {
-    log(`[acp-bridge] 读 config-file 失败（配置取空）：${err instanceof Error ? err.message : String(err)}`);
-    return {};
-  }
-  let parsed: unknown;
-  try {
-    parsed = JSON.parse(raw);
-  } catch (err) {
-    log(`[acp-bridge] config-file 非合法 JSON（配置取空）：${err instanceof Error ? err.message : String(err)}`);
-    return {};
-  }
-  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
-    log("[acp-bridge] config-file 顶层非对象（配置取空）");
-    return {};
-  }
-  const segment = (parsed as Record<string, unknown>)[configSegment];
-  if (typeof segment !== "object" || segment === null || Array.isArray(segment)) {
-    log(`[acp-bridge] config-file 缺段或段非对象（配置取空）：${configSegment}`);
-    return {};
-  }
-  return segment as Record<string, unknown>;
-}
-
-/**
- * 从 config 段解析 M2 首轮注入参数（v0.8.1 · M2）。
- * 容忍纪律同 M1：非法类型 ⇒ 忽略该键（缺省 = 仅缺省约定注入，不抛错）。
- */
-export function parseInjectionConfig(segment: Record<string, unknown>): AcpInjectionConfig {
-  const config: AcpInjectionConfig = {};
-  const systemPrompt = segment["systemPrompt"];
-  if (typeof systemPrompt === "string" && systemPrompt.length > 0) {
-    config.systemPrompt = systemPrompt;
-  }
-  const mode = segment["systemPromptMode"];
-  if (mode === "append" || mode === "replace") {
-    config.systemPromptMode = mode;
-  } else if (typeof mode === "string" && mode.length > 0) {
-    console.log(`[acp-bridge] systemPromptMode 非法（忽略，缺省 append）：${mode}`);
-  }
-  return config;
 }
 
 /**
@@ -225,8 +223,6 @@ export interface RunningBridge {
   server: AcpA2AServer;
   client: AcpClient;
   runner: AcpSessionRunner;
-  /** `--config-file` 指定段的解析结果（无配置面时为空对象；M2 消费）。 */
-  config: Record<string, unknown>;
 }
 
 /**
@@ -246,12 +242,11 @@ export async function startBridge(args: BridgeArgs, deps: StartBridgeDeps = {}):
   await client.initialize();
   client.setRequestHandler(createPermissionHandler(args.risk, logger));
 
-  const config = readConfigSegment({
-    ...(args.configFile !== undefined ? { configFile: args.configFile } : {}),
-    ...(args.configSegment !== undefined ? { configSegment: args.configSegment } : {}),
-    logger,
-  });
-  const injection = parseInjectionConfig(config);
+  // 自定义注入（v0.8.5 · M4）：段与 `--config-file` 通道退役 ⇒ 直接来自桥 flag。
+  const injection: AcpInjectionConfig = {
+    ...(args.systemPrompt !== undefined ? { systemPrompt: args.systemPrompt } : {}),
+    ...(args.systemPromptMode !== undefined ? { systemPromptMode: args.systemPromptMode } : {}),
+  };
   const sessions = new SessionMap({ projectId: args.projectId, baseDir: args.workspace, logger });
   const runner = new AcpSessionRunner({
     client,
@@ -260,10 +255,13 @@ export async function startBridge(args: BridgeArgs, deps: StartBridgeDeps = {}):
     timeoutMs: deps.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS,
     injection,
     ...(args.model !== undefined ? { model: args.model } : {}),
+    ...(args.mode !== undefined ? { mode: args.mode } : {}),
+    ...(args.collaborationMode !== undefined ? { collaborationMode: args.collaborationMode } : {}),
+    ...(args.sessionMeta !== undefined ? { sessionMeta: args.sessionMeta } : {}),
     logger,
   });
   const server = createAcpA2AServer({ executor: runner, logger });
-  return { server, client, runner, config };
+  return { server, client, runner };
 }
 
 /** 判断是否作为入口直接执行（避免被 import 时触发 main）。 */

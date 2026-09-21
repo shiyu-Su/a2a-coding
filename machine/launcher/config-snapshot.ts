@@ -2,13 +2,18 @@
  * Agent 配置面快照（观测用）。
  *
  * 每次拉起 Agent（manager.start，含自检触发的启动）向 Launcher 日志报告：
- * 1. 配置获取层级：项目 agentConfig（渲染产物路径）+ 用户级配置层（按 kind 各异，
- *    claude 依生成的 settingSources 标注「已加载（路径）/未加载（隔离）」）；
+ * 1. 配置获取层级：项目 agentConfig（**平铺键**）+ 各 kind 的用户级配置层；
  * 2. endpoint 与模型 id（配置面解析，值标注来源）。
  *
- * 注意：这是「配置面」解析，不是运行时确认——运行时权威模型 id 只在包装器
- * events（默认关闭）中，endpoint 不经 A2A 暴露；env 与用户配置文件并存且不同时
- * 都列出，优先级不猜测（claude 的 env vs settings 先后属「需实测」项）。
+ * v0.8.5 语义级重写（REQ-v0.8.5-2026-09-21-01 · M6，随 `agentConfig.<kind>` 段与
+ * wrapper 配置通道退役）：
+ * - 播报读点**四 kind 统一**为顶层平铺 `agentConfig.model`（段内 model 随段死）；
+ * - claude 用户级配置层**直读** `~/.claude/settings.json` —— **存在即播报路径、
+ *   不存在即 `n/a`**，不再由段键 `settingSources` 推断「是否加载用户配置」。
+ *
+ * 注意：这是「配置面」解析，不是运行时确认——运行时权威模型 id 只在后端报文里，
+ * endpoint 不经 A2A 暴露；env 与用户配置文件并存且不同时都列出，优先级不猜测
+ * （claude 的 env vs settings 先后属「需实测」项）。
  */
 import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
@@ -28,31 +33,22 @@ function readJsonIfExists(path: string): Record<string, unknown> | null {
 }
 
 /**
- * 启动日志播报的 model 读点（REQ-v0.8.4-2026-09-20-01 · M2，与 M1 的 `agent-config.ts`
- * 实际生效读点同键位口径）：
- * - **ACP 族**（qoder / opencode）：读**顶层平铺键** `agentConfig.model`；
- * - **wrapper 族**（claude / codex）：维持**段读** `agentConfig.<kind>.model`
- *   （wrapper 消费的外部契约，播报保持原样）。
+ * claude 用户级配置文件路径。**每次调用时求值**（不缓存）：`os.homedir()` 读
+ * `HOME` / `USERPROFILE` ⇒ 单测可借它把用户目录重定向到临时目录，从而在**不碰真实
+ * `~/.claude/settings.json`**（本节点只读纪律）的前提下覆盖「存在 / 不存在」两个分支。
  */
-function agentConfigModel(project: ProjectConfig): string | null {
-  const agentConfig = project.agentConfig ?? {};
-  const model =
-    project.agentKind === "qoder" || project.agentKind === "opencode"
-      ? agentConfig["model"]
-      : readSectionModel(agentConfig, project.agentKind);
-  return typeof model === "string" && model.length > 0 ? model : null;
+function claudeSettingsPath(): string {
+  return join(homedir(), ".claude", "settings.json");
 }
 
-/** 包装器配置片段里的 model（agentConfig.<kind>.model）；段缺失 / 非对象 → undefined */
-function readSectionModel(
-  agentConfig: Record<string, unknown>,
-  kind: string,
-): unknown {
-  const section = agentConfig[kind];
-  if (typeof section !== "object" || section === null || Array.isArray(section)) {
-    return undefined;
-  }
-  return (section as Record<string, unknown>)["model"];
+/**
+ * 启动日志播报的 model 读点（REQ-v0.8.5-2026-09-21-01 · M6）：**四 kind 统一读
+ * 顶层平铺** `agentConfig.model` —— 段内 `agentConfig.<kind>.model` 随段退役，
+ * 不再被播报消费。
+ */
+function agentConfigModel(project: ProjectConfig): string | null {
+  const model = (project.agentConfig ?? {})["model"];
+  return typeof model === "string" && model.length > 0 ? model : null;
 }
 
 function envString(name: string): string | null {
@@ -62,19 +58,19 @@ function envString(name: string): string | null {
 
 /**
  * 模型 / endpoint 的配置面解析（值标注出处：agentConfig / env / settings）。
- * `userSettingsLoaded=false`（claude 隔离模式）时不读 settings——与运行时加载语义一致。
+ *
+ * v0.8.5：wrapper 配置通道退役 ⇒ **去 `userSettingsLoaded` 入参**；claude 分支**总是**
+ * 直读 `~/.claude/settings.json`（文件不存在 ⇒ `readJsonIfExists` 返回 null，即 `n/a`）。
  */
-export function resolveModelEndpoint(
-  project: ProjectConfig,
-  userSettingsLoaded: boolean,
-): { model: string; endpoint: string } {
+export function resolveModelEndpoint(project: ProjectConfig): {
+  model: string;
+  endpoint: string;
+} {
   const fromAgentConfig = agentConfigModel(project);
   switch (project.agentKind) {
     case "claude": {
-      // 模型优先级（高→低）：agentConfig（→SDK --model）> env ANTHROPIC_MODEL > settings.model
-      const settings = userSettingsLoaded
-        ? readJsonIfExists(join(homedir(), ".claude", "settings.json"))
-        : null;
+      // 模型优先级（高→低）：agentConfig（→ ACP `set_config_option`）> env ANTHROPIC_MODEL > settings.model
+      const settings = readJsonIfExists(claudeSettingsPath());
       const settingsModel =
         typeof settings?.["model"] === "string" ? (settings["model"] as string) : null;
       const settingsEnv = settings?.["env"];
@@ -136,46 +132,6 @@ export function resolveModelEndpoint(
   }
 }
 
-/** 配置获取层级：项目 agentConfig（渲染产物路径）+ 各 kind 的用户级配置层 */
-function describeHierarchy(project: ProjectConfig, configPath: string): string {
-  switch (project.agentKind) {
-    case "claude": {
-      // settingSources 由生成的包装器配置决定（baseConfig 默认 ["user"]，agentConfig 可覆盖）
-      const settingSources = generatedSettingSources(configPath);
-      const userPath = join(homedir(), ".claude", "settings.json");
-      if (settingSources.includes("user")) {
-        const exists = existsSync(userPath);
-        return `项目 agentConfig（${configPath}）+ 用户级配置（${userPath}${exists ? "" : "，文件不存在"}）`;
-      }
-      return `项目 agentConfig（${configPath}）+ 用户级配置未加载（settingSources=${JSON.stringify(settingSources)}，隔离）`;
-    }
-    case "codex":
-      return `项目 agentConfig（${configPath}）+ 用户级配置（~/.codex/config.toml，运行时始终读取）`;
-    case "opencode":
-      return `项目 agentConfig（${configPath}）+ 用户全局 opencode 配置与 workspace opencode.json（运行时读取）`;
-    case "qoder":
-      return `项目 agentConfig（${configPath}）+ qodercn 用户级配置（~/.qoder-cn/，经 ACP 桥运行时读取）`;
-    default: {
-      // 编译期安全网（改造文档 §2.3-4）：新增 kind ⇒ 此处 `project.agentKind` 不再是 never。
-      const _exhaustive: never = project.agentKind;
-      return `项目 agentConfig（${configPath}）+ 未知 agentKind 的用户级配置层`;
-    }
-  }
-}
-
-/** 读取生成的包装器配置里 claude 的 settingSources；缺失视为未加载（包装器内置默认隔离） */
-function generatedSettingSources(configPath: string): string[] {
-  const generated = readJsonIfExists(configPath);
-  const claude = generated?.["claude"];
-  const settingSources =
-    claude !== null && typeof claude === "object" && !Array.isArray(claude)
-      ? (claude as Record<string, unknown>)["settingSources"]
-      : undefined;
-  return Array.isArray(settingSources)
-    ? settingSources.filter((s): s is string => typeof s === "string")
-    : [];
-}
-
 /** 单次 Agent 启动的配置快照：配置层级 + endpoint / 模型 id */
 export interface AgentConfigSnapshot {
   hierarchy: string;
@@ -183,15 +139,45 @@ export interface AgentConfigSnapshot {
   endpoint: string;
 }
 
-/** 汇总单次启动的配置面快照（launcher 与 self-check 共用）；快照遵循 settingSources 隔离语义 */
-export function describeAgentConfig(
-  project: ProjectConfig,
-  configPath: string,
-): AgentConfigSnapshot {
-  const userSettingsLoaded =
-    project.agentKind !== "claude" || generatedSettingSources(configPath).includes("user");
+/**
+ * 用户级配置层播报文案（配置获取层级的第二项；项目侧恒为平铺 `agentConfig`）。
+ *
+ * v0.8.5 · M6：退役 `describeHierarchy`（其 `configPath` 产物路径与 `settingSources`
+ * 推断随 wrapper 配置通道一并退役）⇒ 收敛为「只描述用户级配置层」；claude 的判据
+ * 改为**直读文件**：存在即播报路径，不存在即 `n/a`。
+ */
+function userConfigLayer(project: ProjectConfig): string {
+  switch (project.agentKind) {
+    case "claude": {
+      const userPath = claudeSettingsPath();
+      return existsSync(userPath)
+        ? `claude 用户级配置（${userPath}）`
+        : `claude 用户级配置 n/a（${userPath} 不存在）`;
+    }
+    case "codex":
+      return "codex 用户级配置（~/.codex/config.toml，运行时始终读取）";
+    case "opencode":
+      return "opencode 用户级配置（全局配置与 workspace opencode.json，运行时读取）";
+    case "qoder":
+      return "qodercn 用户级配置（~/.qoder-cn/，经 ACP 桥运行时读取）";
+    default: {
+      // 编译期安全网（改造文档 §2.3-4）：新增 kind ⇒ 此处 `project.agentKind` 不再是 never。
+      const _exhaustive: never = project.agentKind;
+      return "未知 agentKind 的用户级配置层（中性兜底）";
+    }
+  }
+}
+
+/**
+ * 汇总单次启动的配置面快照（manager.start 播报用）。
+ *
+ * v0.8.5 · M6：**去 `configPath` 入参**（`agents/` 产物退役 ⇒ 无产物路径可播报），
+ * `userSettingsLoaded` 随段键推断一并退役 ⇒ 快照 = 平铺 `agentConfig` + 用户级配置层
+ * + 模型 / endpoint（claude 的用户级层按文件存在性直读判定）。
+ */
+export function describeAgentConfig(project: ProjectConfig): AgentConfigSnapshot {
   return {
-    hierarchy: describeHierarchy(project, configPath),
-    ...resolveModelEndpoint(project, userSettingsLoaded),
+    hierarchy: `项目 agentConfig（平铺键）+ ${userConfigLayer(project)}`,
+    ...resolveModelEndpoint(project),
   };
 }

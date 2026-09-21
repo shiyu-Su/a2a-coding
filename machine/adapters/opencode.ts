@@ -8,8 +8,8 @@
  *     --port <a2aPort> --workspace <workspace> --project-id <projectId>
  *     --backend-cmd <agentConfig.backendCmd> --backend-args '["acp"]'
  *     [--model <agentConfig.model>]
- *     --risk <read|write|full>
- *     --config-file <agents 产物路径> --config-segment opencode`
+ *     [--system-prompt <agentConfig.systemPrompt> [--system-prompt-mode <append|replace>]]
+ *     --risk <read|write|full>`
  *
  * - ACP 后端命令**必须**由项目配置**顶层平铺键** `agentConfig.backendCmd` 指定，代码零硬编码缺省；
  *   未配置 ⇒ `buildLaunch` 抛明确错误。探针实证：Windows 下 npm 裸 PATH 只有 .cmd/.ps1 壳，
@@ -18,10 +18,10 @@
  *   由本适配器内置并以 `--backend-args` JSON 数组透传给桥。
  * - 权限：risk 三档经 `--risk` 透传给桥（替代旧 `--auto-approve` 二值开关），
  *   由桥映射 ACP `session/request_permission`。
- * - 配置消费：桥经 `--config-file`（launcher 生成的 `agents/opencode.<projectId>.json`）+
- *   `--config-segment opencode` 读取本段配置（M1 提供读取面；注入时机在 M2 落地）。
- * - outcome 注入：沿用 `A2A_OUTCOME_CONVENTION`（零依赖叶模块 `../agent-outcome.js`），
- *   保留 opencode 段形状供包装器时代产物与桥读者兼容。
+ * - 自定义注入（v0.8.5 · M4）：`agentConfig.<kind>` 段与 `--config-file` / `--config-segment`
+ *   配置通道**整体退役** ⇒ 改走**平铺键 + 桥 flag**：`agentConfig.systemPrompt` ⇒
+ *   `--system-prompt`、`agentConfig.systemPromptMode` ⇒ `--system-prompt-mode`；桥自带缺省注入
+ *   （outcome 约定）保持不变（B12③ 单一源）。
  * - **model 透传（REQ-v0.8.2-2026-09-20-01 · M1 协议面增补；REQ-v0.8.4-2026-09-20-01 · M1 键位平铺）**：
  *   **平铺** `agentConfig.model` ⇒
  *   桥 `--model <原样值>` ⇒ 桥发 ACP `session/set_config_option {configId:"model"}`。
@@ -40,8 +40,12 @@ import type {
   PermissionSpec,
 } from "./types.js";
 import { appRootFromModule } from "../launcher/app-root.js";
-import { A2A_OUTCOME_CONVENTION } from "../agent-outcome.js";
-import { resolveAcpBackendCmd, resolveAcpModel } from "../launcher/agent-config.js";
+import {
+  resolveAcpBackendCmd,
+  resolveAcpModel,
+  resolveSystemPrompt,
+  resolveSystemPromptMode,
+} from "../launcher/agent-config.js";
 
 /** 缺少 `agentConfig.backendCmd` 时的明确错误文案（ACP 族必填）。 */
 export const OPENCODE_BACKEND_CMD_REQUIRED =
@@ -61,6 +65,8 @@ export class OpenCodeAdapter implements Adapter {
       throw new Error(OPENCODE_BACKEND_CMD_REQUIRED);
     }
     const model = resolveAcpModel(request.agentConfig);
+    const systemPrompt = resolveSystemPrompt(request.agentConfig);
+    const systemPromptMode = resolveSystemPromptMode(request.agentConfig);
     // 拉起的是仓内自持桥进程（非仓外 a2a-opencode 包装器，也不再前置 opencode serve）。
     const appRoot = appRootFromModule(import.meta.url);
     const bridgeEntry = join(appRoot, "dist", "acp-bridge", "index.js");
@@ -79,25 +85,17 @@ export class OpenCodeAdapter implements Adapter {
       // 模型透传（REQ-v0.8.2 M1 协议面增补）：原样值经桥落到 ACP session/set_config_option；
       // 未配/非法 ⇒ 不下发该旗标，argv 与现状逐字一致。不参与后端 argv 拼装。
       ...(model !== undefined ? ["--model", model] : []),
+      // 自定义注入（v0.8.5 · M4）：段与 `--config-file` 通道退役 ⇒ 走平铺键 + 桥 flag。
+      ...(systemPrompt !== undefined ? ["--system-prompt", systemPrompt] : []),
+      ...(systemPromptMode !== undefined ? ["--system-prompt-mode", systemPromptMode] : []),
       // permission(risk).args（`--risk <档>`）追加在基础参数之后。
       ...(request.permissionArgs ?? []),
     ];
-    if (request.configPath !== undefined) {
-      args.push("--config-file", request.configPath, "--config-segment", "opencode");
-    }
     return { command: "node", args };
   }
 
   permission(risk: PermissionRisk): PermissionSpec {
     // risk 三档经桥透传，由桥映射 ACP session/request_permission。
     return { args: ["--risk", risk] };
-  }
-
-  baseConfig(): Record<string, unknown> {
-    // opencode 段形状保持不变（systemPrompt/systemPromptMode 键是项目 opencode.json
-    // 消费的配置契约；桥读者 M2 起经 --config-segment 读取本段）。
-    return {
-      opencode: { systemPrompt: A2A_OUTCOME_CONVENTION, systemPromptMode: "append" },
-    };
   }
 }

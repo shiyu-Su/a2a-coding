@@ -4,7 +4,7 @@
 
 - 当前版本：**2.1**（两侧同名常量 `PROTOCOL_VERSION`）
 - 主笔归属：**orch 主笔、machine 审阅**（仓根唯一单写面）。
-- 适用范围：仅 Runner ⇄ Bridge HTTP（`/runner/*`，挂载于桥的常驻 HTTP transport、复用 MCP 端口，不引第二接入面）。Runner ⇄ 包装器（本地 A2A 端点）走标准 A2A 协议（自带版本）；MCP 工具面（`a2a_*` 工具出入参）不属本契约。约束：两部署单元自包含、无跨单元 import —— 因此协议以「文档 + 契约测试」对齐，不做共享 schema 包。
+- 适用范围：仅 Runner ⇄ Bridge HTTP（`/runner/*`，挂载于桥的常驻 HTTP transport、复用 MCP 端口，不引第二接入面）。Runner ⇄ 本地 A2A 端点走标准 A2A 协议（自带版本）；MCP 工具面（`a2a_*` 工具出入参）不属本契约。约束：两部署单元自包含、无跨单元 import —— 因此协议以「文档 + 契约测试」对齐，不做共享 schema 包。
 
 ## 非契约面（明示）
 
@@ -98,7 +98,7 @@ Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持�
 | `text` | string | 否 | 结果文本 |
 | `artifacts` | array \| string | 否 | 产物（数组或 JSON 字符串） |
 | `projectId` / `contextId` | string | 否 | 缺省沿用桥侧落库值 |
-| `remoteTaskId` | string | 否 | 远端（包装器）任务句柄（观测用） |
+| `remoteTaskId` | string | 否 | 远端任务句柄（观测用） |
 
 响应 200：`{ "result": "ok", "data": { "ack": true, "taskId": string, "state": string, "idempotent": boolean }, "error": null }`
 

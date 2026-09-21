@@ -16,7 +16,7 @@ export type {
   PermissionRisk,
   PermissionSpec,
 } from "./types.js";
-export { wrapperConfigPath } from "./types.js";
+
 
 const ADAPTERS: Record<AgentKind, Adapter> = {
   opencode: new OpenCodeAdapter(),

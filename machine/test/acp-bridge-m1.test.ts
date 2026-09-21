@@ -4,15 +4,14 @@
  * 判据：
  * - `--backend-args`：parseBackendArgs（缺省 / 合法 / 非法）与 parseBridgeArgs 透传；
  *   startBridge 实际 spawn 参数 —— 缺省 `["--acp"]`（qoder v0.8.0 逐字不变）与自定义数组；
- * - `--config-file` + `--config-segment`：readConfigSegment 全部容忍路径（缺文件 / 缺段 /
- *   坏 JSON / 顶层非对象 / 段非对象 ⇒ 告警不抛错、取空）与正常读取；startBridge 落 `config`；
+ * - `--system-prompt` + `--system-prompt-mode`：parseBridgeArgs 解析（缺省 / 空串 / 非法值 ⇒ 键缺席）；
  * - `AcpClient.notify`：无 `id` 的 NDJSON 通知出口；关闭后静默丢弃。
  *
  * 运行：`npm test`。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync } from "node:fs";
+import { mkdtempSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { PassThrough } from "node:stream";
@@ -21,7 +20,6 @@ import {
   parseBackendArgs,
   parseBridgeArgs,
   parseModelArg,
-  readConfigSegment,
   startBridge,
   type BridgeArgs,
 } from "../acp-bridge/index.js";
@@ -102,12 +100,6 @@ function makeSpawn(): { spawn: AcpSpawn; spawned: string[][]; children: FakeChil
 
 const DIR = mkdtempSync(join(tmpdir(), "a2a-acp-m1-"));
 
-function writeJson(name: string, content: string): string {
-  const path = join(DIR, name);
-  writeFileSync(path, content, "utf8");
-  return path;
-}
-
 function baseArgs(extra: Partial<BridgeArgs> = {}): BridgeArgs {
   return {
     port: 0,
@@ -142,6 +134,26 @@ test("parseBridgeArgs：--backend-args 透传为数组；未给则键缺席（�
   assert.equal(without.backendArgs, undefined);
 });
 
+test("parseBridgeArgs：--system-prompt / --system-prompt-mode 解析；未给 / 非法 ⇒ 键缺席", () => {
+  const common = ["--port", "4100", "--workspace", "/ws", "--project-id", "p1", "--backend-cmd", "b"];
+  const withInjection = parseBridgeArgs([
+    ...common,
+    "--system-prompt",
+    "be terse",
+    "--system-prompt-mode",
+    "replace",
+  ]);
+  assert.equal(withInjection.systemPrompt, "be terse");
+  assert.equal(withInjection.systemPromptMode, "replace");
+  const without = parseBridgeArgs(common);
+  assert.equal(without.systemPrompt, undefined);
+  assert.equal(without.systemPromptMode, undefined);
+  assert.equal(
+    parseBridgeArgs([...common, "--system-prompt-mode", "bogus"]).systemPromptMode,
+    undefined,
+  );
+});
+
 test("startBridge spawn 实参：缺省 = [\"--acp\"]（qoder v0.8.0 逐字不变）", async () => {
   const { spawn, spawned } = makeSpawn();
   const running = await startBridge(baseArgs(), { spawn, logger: () => undefined });
@@ -163,95 +175,6 @@ test("startBridge spawn 实参：自定义 backendArgs（opencode [\"acp\"]）�
     assert.deepEqual(spawned[0], ["acp"]);
   } finally {
     await running.client.close();
-  }
-});
-
-// ---------- ② --config-file + --config-segment ----------
-
-test("readConfigSegment：未给 configFile ⇒ 空对象且不告警", () => {
-  const warnings: string[] = [];
-  assert.deepEqual(readConfigSegment({ logger: (m) => warnings.push(m) }), {});
-  assert.deepEqual(readConfigSegment({ configFile: "", logger: (m) => warnings.push(m) }), {});
-  assert.deepEqual(warnings, []);
-});
-
-test("readConfigSegment：正常读取指定段", () => {
-  const path = writeJson("ok.json", JSON.stringify({ opencode: { systemPrompt: "x" }, qoder: { a: 1 } }));
-  const warnings: string[] = [];
-  assert.deepEqual(
-    readConfigSegment({ configFile: path, configSegment: "opencode", logger: (m) => warnings.push(m) }),
-    { systemPrompt: "x" },
-  );
-  assert.deepEqual(warnings, []);
-});
-
-test("readConfigSegment：容忍路径全谱 ⇒ 一律告警（除缺 segment 外均取空）不抛错", () => {
-  const collect = (opts: Parameters<typeof readConfigSegment>[0]): { config: Record<string, unknown>; warnings: string[] } => {
-    const warnings: string[] = [];
-    const config = readConfigSegment({ ...opts, logger: (m) => warnings.push(m) });
-    return { config, warnings };
-  };
-  const missingFile = collect({ configFile: join(DIR, "nope.json"), configSegment: "opencode" });
-  assert.deepEqual(missingFile.config, {});
-  assert.equal(missingFile.warnings.length, 1);
-
-  const noSegment = collect({ configFile: join(DIR, "ok.json") });
-  assert.deepEqual(noSegment.config, {});
-  assert.equal(noSegment.warnings.length, 1);
-
-  const badJson = collect({
-    configFile: writeJson("bad.json", "{oops"),
-    configSegment: "opencode",
-  });
-  assert.deepEqual(badJson.config, {});
-  assert.equal(badJson.warnings.length, 1);
-
-  const topLevelArray = collect({
-    configFile: writeJson("arr.json", "[1,2]"),
-    configSegment: "opencode",
-  });
-  assert.deepEqual(topLevelArray.config, {});
-  assert.equal(topLevelArray.warnings.length, 1);
-
-  const missingSegment = collect({ configFile: join(DIR, "ok.json"), configSegment: "absent" });
-  assert.deepEqual(missingSegment.config, {});
-  assert.equal(missingSegment.warnings.length, 1);
-
-  const segmentNotObject = collect({
-    configFile: writeJson("scalar.json", JSON.stringify({ opencode: "just-a-string" })),
-    configSegment: "opencode",
-  });
-  assert.deepEqual(segmentNotObject.config, {});
-  assert.equal(segmentNotObject.warnings.length, 1);
-});
-
-test("parseBridgeArgs：--config-file / --config-segment 解析；未给则键缺席", () => {
-  const common = ["--port", "4100", "--workspace", "/ws", "--project-id", "p1", "--backend-cmd", "b"];
-  const withConfig = parseBridgeArgs([...common, "--config-file", "/cfg/p.json", "--config-segment", "opencode"]);
-  assert.equal(withConfig.configFile, "/cfg/p.json");
-  assert.equal(withConfig.configSegment, "opencode");
-  const without = parseBridgeArgs(common);
-  assert.equal(without.configFile, undefined);
-  assert.equal(without.configSegment, undefined);
-});
-
-test("startBridge：config 落解析段；未给配置面 ⇒ 空对象", async () => {
-  const { spawn } = makeSpawn();
-  const path = writeJson("bridge.json", JSON.stringify({ opencode: { systemPromptMode: "append" } }));
-  const withConfig = await startBridge(baseArgs({ configFile: path, configSegment: "opencode" }), {
-    spawn,
-    logger: () => undefined,
-  });
-  try {
-    assert.deepEqual(withConfig.config, { systemPromptMode: "append" });
-  } finally {
-    await withConfig.client.close();
-  }
-  const bare = await startBridge(baseArgs(), { spawn, logger: () => undefined });
-  try {
-    assert.deepEqual(bare.config, {});
-  } finally {
-    await bare.client.close();
   }
 });
 
@@ -348,6 +271,33 @@ test("startBridge 未给 --model ⇒ 后端收不到任何 set_config_option（�
         .filter((m) => m.startsWith("session/")),
       ["session/new", "session/prompt"],
     );
+  } finally {
+    await running.client.close();
+  }
+});
+
+// ---------- ⑤ --system-prompt / --system-prompt-mode（REQ-v0.8.5-2026-09-21-01 · M4） ----------
+
+test("startBridge --system-prompt（replace）⇒ 首轮 prompt 前缀 = 自定义注入（替换缺省约定）", async () => {
+  const { spawn, children } = makeSpawn();
+  const running = await startBridge(
+    baseArgs({ systemPrompt: "be terse", systemPromptMode: "replace" }),
+    { spawn, logger: () => undefined },
+  );
+  try {
+    wireBackend(children[0] as FakeChild);
+    const result = await running.runner.execute({
+      taskId: "t1",
+      text: "任务",
+      contextId: "ctx-injection",
+      messageId: "m1",
+    });
+    assert.equal(result.state, "completed");
+    const prompt = (children[0] as FakeChild).lines.find(
+      (l) => String(l["method"]) === "session/prompt",
+    );
+    const params = (prompt?.["params"] ?? {}) as { prompt?: Array<{ text?: string }> };
+    assert.equal(params.prompt?.[0]?.text, "be terse\n\n---\n\n任务");
   } finally {
     await running.client.close();
   }

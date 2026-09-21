@@ -1,13 +1,14 @@
 /**
- * 清理 `agents/` 下不属于当前 `projects[]` 的过期包装器配置（REQ-v0.2.0-2026-09-13-05）。
+ * 清理 `agents/` 下不属于当前 `projects[]` 的过期配置（REQ-v0.2.0-2026-09-13-05）。
  *
- * `writeAgentConfig` 每次启动覆盖生成 `agents/<agentKind>.<projectId>.json`，项目从
- * `projects[]` 移除后旧文件残留。Launcher 启动时以当前 `projects[]` 的期望文件名集合为
- * 白名单，删除符合命名模式但不在白名单的过期文件。
+ * ⚠ **本函数现为空转遗留**（v0.8.5 · M4）：其清理对象 `agents/<agentKind>.<projectId>.json` 由
+ * `writeAgentConfig` 每次启动覆盖生成，而该通道已随 `agentConfig.<kind>` 段整体退役 ⇒
+ * **不再有任何产物写入**，本函数只在目录不存在时空转（仍被既有测试用作判据锚，未删）。
  *
- * 仅删匹配 `<agentKind>.<projectId>.json`（agentKind ∈ `AGENT_KINDS`，取值集合单一事实源
- * 见 `../agent-kinds.ts`）的文件；目录不存在 / 单文件删除失败均不抛出（尽力而为），
- * 避免影响 Launcher 启动。
+ * 历史语义：Launcher 启动时以当前 `projects[]` 的期望文件名集合为白名单，删除符合命名模式但
+ * 不在白名单的过期文件；仅删匹配 `<agentKind>.<projectId>.json`（agentKind ∈ `AGENT_KINDS`，
+ * 取值集合单一事实源见 `../agent-kinds.ts`）的文件；目录不存在 / 单文件删除失败均不抛出
+ * （尽力而为），避免影响 Launcher 启动。
  */
 import { readdirSync, unlinkSync, type Dirent } from "node:fs";
 import { join } from "node:path";

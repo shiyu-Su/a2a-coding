@@ -34,6 +34,14 @@
  * 取不到 ⇒ 呈现 `n/a`（不打裸 `undefined`）。
  *
  * 依赖可注入（`client` 经构造注入，fake 单测）；不 import `orch/**` / `launcher/**`。
+ *
+ * **mode / collaboration_mode / session-meta 通路（v0.8.5 · M1）**：`mode` 非空 ⇒ 每次会话建立后发一次
+ * `session/set_mode {sessionId, modeId}`（**仅**后端回 `-32601` 才回落
+ * `session/set_config_option {configId:"mode"}`）；`collaboration_mode` 非空 ⇒ **只走**
+ * `session/set_config_option {configId:"collaboration_mode"}`（它不在 `modes` 里）。两者与 `model` **同形**：
+ * 缺省 / 空串 ⇒ **零请求**；失败 ⇒ **fail-fast**（日志 + 抛错，不静默回落）。`sessionMeta` 非空 ⇒
+ * `session/new` / `load` / `resume` **三路统一携带 `_meta`**（否则复用会话拿不到 ⇒ full 档静默降级）。
+ * 桥只收 adapter 的原样值，**不做 kind→mode 映射**。
  */
 import { AcpError } from "./client.js";
 import type { TaskExecutionInput, TaskExecutionResult } from "../types.js";
@@ -54,8 +62,8 @@ export interface AcpRequestClient {
 }
 
 /**
- * 首轮注入的 config 段来源（`--config-file` 指定段，v0.8.1 · M2 消费）。
- * 键形状与 `opencode.{systemPrompt, systemPromptMode}` 配置契约一致。
+ * 首轮注入来源（v0.8.5 · M4：`--config-file` 段通道退役后 = 桥 flag `--system-prompt`
+ * / `--system-prompt-mode` 的解析结果；键形状保持 `systemPrompt` / `systemPromptMode`）。
  */
 export interface AcpInjectionConfig {
   /** 段内自定义注入文本（缺省 ⇒ 仅缺省 outcome 约定） */
@@ -75,10 +83,26 @@ export interface AcpSessionRunnerOptions {
   /** 首轮注入的 config 段（缺省 = 无 config，仅缺省约定注入） */
   injection?: AcpInjectionConfig;
   /**
-   * ACP 模型标识（`agentConfig.<kind>.model` 原样透传值）；非空 ⇒ 会话建立成功后发一次
+   * ACP 模型标识（平铺 `agentConfig.model` 原样透传值）；非空 ⇒ 会话建立成功后发一次
    * `session/set_config_option {configId:"model"}`（new / load / resume 三路同此）。缺省 ⇒ 完全不调用。
    */
   model?: string;
+  /**
+   * ACP 会话模式标识（v0.8.5 · M1；adapter 按 `risk` 映射后的**原样值**，桥不做 kind→mode 映射）。
+   * 非空 ⇒ 会话建立成功后发一次（优先 `session/set_mode`，仅 `-32601` 回落
+   * `session/set_config_option {configId:"mode"}`）；缺省 / 空串 ⇒ **完全不调用**。
+   */
+  mode?: string;
+  /**
+   * ACP `collaboration_mode` 取值（v0.8.5 · M1；原样、不校验）。非空 ⇒ 会话建立成功后发一次
+   * `session/set_config_option {configId:"collaboration_mode"}`；缺省 / 空串 ⇒ **完全不调用**。
+   */
+  collaborationMode?: string;
+  /**
+   * 会话建立期 `_meta` 注入（v0.8.5 · M1）：`session/new` / `load` / `resume` **三路统一携带**；
+   * 缺省 ⇒ 三路均不带该键。
+   */
+  sessionMeta?: Record<string, unknown>;
   logger?: (message: string) => void;
 }
 
@@ -88,6 +112,17 @@ function isRecord(value: unknown): value is Record<string, unknown> {
 
 function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/** 失败原因串 = 后端原文 + 可选 `（code=…）`（与 `applyModel` 的拼装逐字同形；v0.8.5 · M1）。 */
+function reasonOf(err: unknown): string {
+  const code = err instanceof AcpError && err.code !== undefined ? `（code=${String(err.code)}）` : "";
+  return `${messageOf(err)}${code}`;
+}
+
+/** 后端未实现该方法（JSON-RPC `-32601` Method not found）—— **仅此错误**允许回落。 */
+function isMethodNotFound(err: unknown): boolean {
+  return err instanceof AcpError && err.code === -32601;
 }
 
 /**
@@ -131,6 +166,12 @@ export class AcpSessionRunner {
   private readonly injection: AcpInjectionConfig;
   /** 归一化后的 model：非空字符串才保留（空串 / 非字符串 ⇒ `undefined` ⇒ 永不 set） */
   private readonly model: string | undefined;
+  /** 归一化后的 mode：非空字符串才保留（空串 / 非字符串 ⇒ `undefined` ⇒ 永不下发）。 */
+  private readonly mode: string | undefined;
+  /** 归一化后的 collaboration_mode：同 mode。 */
+  private readonly collaborationMode: string | undefined;
+  /** 会话建立期 `_meta`（`undefined` ⇒ 三路均不携带）。 */
+  private readonly sessionMeta: Record<string, unknown> | undefined;
   private readonly logger: (message: string) => void;
   /** sessionId → 已累积的 agent message chunks */
   private readonly buffers = new Map<string, string[]>();
@@ -163,6 +204,12 @@ export class AcpSessionRunner {
     this.mcpServers = options.mcpServers ?? [];
     this.injection = options.injection ?? {};
     this.model = typeof options.model === "string" && options.model.length > 0 ? options.model : undefined;
+    this.mode = typeof options.mode === "string" && options.mode.length > 0 ? options.mode : undefined;
+    this.collaborationMode =
+      typeof options.collaborationMode === "string" && options.collaborationMode.length > 0
+        ? options.collaborationMode
+        : undefined;
+    this.sessionMeta = options.sessionMeta;
     this.logger = options.logger ?? ((): void => undefined);
     this.client.onNotification((method, params) => this.onNotification(method, params));
   }
@@ -323,8 +370,8 @@ export class AcpSessionRunner {
   }
 
   /**
-   * 会话保证：load → resume → new；**三条路径成功后**统一走一次 {@link applyModel}
-   * （恢复路径也 set，不假设后端跨会话保持模型）。
+   * 会话保证：load → resume → new；**三条路径成功后**统一依次走一次 {@link applyModel} /
+   * {@link applyMode} / {@link applyCollaborationMode}（恢复路径同样下发，不假设后端跨会话保持）。
    */
   private async ensureSession(contextId: string): Promise<string> {
     const cached = this.sessions?.get(contextId) ?? null;
@@ -338,6 +385,8 @@ export class AcpSessionRunner {
       this.sessions?.set(contextId, sessionId);
     }
     await this.applyModel(sessionId);
+    await this.applyMode(sessionId);
+    await this.applyCollaborationMode(sessionId);
     return sessionId;
   }
 
@@ -368,11 +417,78 @@ export class AcpSessionRunner {
     );
   }
 
+  /**
+   * 模式设置（v0.8.5 · M1；与 {@link applyModel} 逐行同形）：`mode` 缺省 ⇒ **零请求**。
+   * 下发**优先** `session/set_mode {sessionId, modeId}`；**仅当后端回 `-32601`**（方法不存在）
+   * 才回落 `session/set_config_option {configId:"mode"}`；**其余错误一律 fail-fast**
+   * （日志含配置原值 + 原因后抛错 ⇒ 会话建立失败、任务 `failed`，不静默回落）。
+   * 成功日志回显方式同 {@link applyModel}（`configCurrentValue(result, "mode")`，取不到呈现 `n/a`）。
+   */
+  private async applyMode(sessionId: string): Promise<void> {
+    const mode = this.mode;
+    if (mode === undefined) return;
+    let result: unknown = undefined;
+    try {
+      result = await this.requestWithTimeout("session/set_mode", { sessionId, modeId: mode });
+    } catch (err) {
+      if (!isMethodNotFound(err)) {
+        const reason = reasonOf(err);
+        this.logger(`[acp-session] mode=${mode} 设置失败（${reason}）`);
+        throw new Error(`mode=${mode} 设置失败：${reason}`);
+      }
+      // 后端未实现 `session/set_mode`（JSON-RPC -32601）⇒ 回落到 config option 通道
+      try {
+        result = await this.requestWithTimeout("session/set_config_option", {
+          sessionId,
+          configId: "mode",
+          value: mode,
+        });
+      } catch (fallbackErr) {
+        const reason = reasonOf(fallbackErr);
+        this.logger(`[acp-session] mode=${mode} 设置失败（${reason}）`);
+        throw new Error(`mode=${mode} 设置失败：${reason}`);
+      }
+    }
+    const current = configCurrentValue(result, "mode");
+    this.logger(
+      `[acp-session] mode=${mode} 已设置（currentValue=${current === undefined ? "n/a" : String(current)}）`,
+    );
+  }
+
+  /**
+   * 协作模式设置（v0.8.5 · M1；与 {@link applyModel} 逐行同形）：`collaborationMode` 缺省 ⇒ **零请求**。
+   * `collaboration_mode` **不在 `modes` 集合内** ⇒ **只走**
+   * `session/set_config_option {configId:"collaboration_mode"}`，无 `session/set_mode` 优先路径、也不回落；
+   * 失败 ⇒ fail-fast（同 applyModel：日志 + 抛错）。
+   */
+  private async applyCollaborationMode(sessionId: string): Promise<void> {
+    const value = this.collaborationMode;
+    if (value === undefined) return;
+    let result: unknown = undefined;
+    try {
+      result = await this.requestWithTimeout("session/set_config_option", {
+        sessionId,
+        configId: "collaboration_mode",
+        value,
+      });
+    } catch (err) {
+      const reason = reasonOf(err);
+      this.logger(`[acp-session] collaboration_mode=${value} 设置失败（${reason}）`);
+      throw new Error(`collaboration_mode=${value} 设置失败：${reason}`);
+    }
+    const current = configCurrentValue(result, "collaboration_mode");
+    this.logger(
+      `[acp-session] collaboration_mode=${value} 已设置（currentValue=${current === undefined ? "n/a" : String(current)}）`,
+    );
+  }
+
   private async tryReuse(method: string, sessionId: string): Promise<boolean> {
-    const params =
+    const base =
       method === "session/load"
         ? { sessionId, cwd: this.cwd, mcpServers: [...this.mcpServers] }
         : { sessionId };
+    // `--session-meta-json` **三路统一携带**（load / resume 亦带；否则经 load/resume 的会话拿不到 ⇒ full 档静默降级）
+    const params = this.sessionMeta === undefined ? base : { ...base, _meta: this.sessionMeta };
     try {
       await this.requestWithTimeout(method, params);
       return true;
@@ -386,6 +502,7 @@ export class AcpSessionRunner {
     const result = await this.requestWithTimeout("session/new", {
       cwd: this.cwd,
       mcpServers: [...this.mcpServers],
+      ...(this.sessionMeta !== undefined ? { _meta: this.sessionMeta } : {}),
     });
     if (!isRecord(result) || typeof result["sessionId"] !== "string" || result["sessionId"].length === 0) {
       throw new AcpError("protocol", "session/new 响应缺少 sessionId");

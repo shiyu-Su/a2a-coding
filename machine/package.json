@@ -1,6 +1,6 @@
 {
   "name": "@a2a-coding/machine",
-  "version": "0.8.4",
+  "version": "0.8.5",
   "private": true,
   "type": "module",
   "engines": {
@@ -20,12 +20,9 @@
     "status": "node scripts/launcherctl.mjs status",
     "logs": "node scripts/launcherctl.mjs logs",
     "reap": "node scripts/reaper.mjs",
-    "zip": "node scripts/pack.mjs",
-    "postinstall": "patch-package --error-on-fail"
+    "zip": "node scripts/pack.mjs"
   },
   "dependencies": {
-    "a2a-claude": "0.4.1",
-    "a2a-codex": "1.7.2",
     "express": "^4.21.2"
   },
   "devDependencies": {
@@ -33,7 +30,6 @@
     "@types/node": "^22.10.0",
     "eslint": "^10.10.0",
     "eslint-config-prettier": "^10.1.8",
-    "patch-package": "^8.0.1",
     "prettier": "^3.9.6",
     "typescript": "^5.7.0",
     "typescript-eslint": "^8.70.0"

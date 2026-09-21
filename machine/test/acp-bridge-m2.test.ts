@@ -6,7 +6,7 @@
  * - `prompted` 置位时机 = `session/prompt` 收到响应即置（end_turn / input-required / cancelled）；
  * - 「映射写入」（set 初值 false）与「prompted 置位」（markPrompted）两次持久化；
  * - 旧条目兼容：缺键 / undefined ⇒ 视为 false，读旧文件不报错；
- * - append = 追加缺省注入之后；replace = 替换缺省注入；无 config-file ⇒ 仅缺省约定；
+ * - append = 追加缺省注入之后；replace = 替换缺省注入；无自定义注入 ⇒ 仅缺省约定；
  * - load/resume 恢复的会话按持久化 prompted 值（新 SessionMap 实例 = 模拟跨进程重启，不重注入）；
  * - qoder ≥2 轮模拟（无 config 段）：末轮 outcome 块仍被 parse 生效。
  *
@@ -18,7 +18,7 @@ import { join } from "node:path";
 import { AcpSessionRunner, type AcpInjectionConfig, type AcpRequestClient } from "../acp-bridge/acp/session.js";
 import { SessionMap, type SessionMapFs } from "../acp-bridge/session-map.js";
 import { parseOutcome, A2A_OUTCOME_CONVENTION } from "../acp-bridge/outcome.js";
-import { parseInjectionConfig } from "../acp-bridge/index.js";
+
 
 class FakeClient implements AcpRequestClient {
   readonly calls: Array<{ method: string; params: unknown }> = [];
@@ -255,34 +255,13 @@ test("replace = 替换缺省约定（不再含 outcome 约定文案）", async (
   assert.equal(text, "只说 replacements\n\n---\n\n任务");
 });
 
-test("无 config-file（injection 缺省）⇒ 仅缺省约定注入", async () => {
+test("无自定义注入（injection 缺省）⇒ 仅缺省约定注入", async () => {
   const client = new FakeClient();
   echoBackend(client);
   const r = makeRunner(client, makeMap(new MemoryFs()));
   await r.execute({ taskId: "t1", text: "任务", contextId: "ctx", messageId: "m1" });
   assert.equal(client.promptTexts()[0], `${A2A_OUTCOME_CONVENTION}\n\n---\n\n任务`);
 });
-
-test("parseInjectionConfig：合法键读取；非法类型忽略；未知 mode 忽略并告警", () => {
-  assert.deepEqual(parseInjectionConfig({ systemPrompt: "s", systemPromptMode: "replace" }), {
-    systemPrompt: "s",
-    systemPromptMode: "replace",
-  });
-  assert.deepEqual(parseInjectionConfig({}), {});
-  assert.deepEqual(parseInjectionConfig({ systemPrompt: 42, systemPromptMode: "append" }), {
-    systemPromptMode: "append",
-  });
-  const logs: string[] = [];
-  const original = console.log;
-  console.log = (m: unknown): number => logs.push(String(m));
-  try {
-    assert.deepEqual(parseInjectionConfig({ systemPromptMode: "bogus" }), {});
-  } finally {
-    console.log = original;
-  }
-  assert.equal(logs.length, 1);
-});
-
 // ---------- ④ load/resume 跨进程不重注入 ----------
 
 test("新 SessionMap 实例（模拟进程重启）load 恢复：prompted=true ⇒ 不重注入；false ⇒ 注入", async () => {

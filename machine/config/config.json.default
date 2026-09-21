@@ -1,5 +1,6 @@
 {
   "_comment": "可选字段：listenHost（v0.7.0 起缺省 127.0.0.1 = Launcher 仅绑本机 loopback；跨机直连需显式改回 0.0.0.0 并自行加反向代理鉴权）。启用 shutdownEndpoint=true 时建议保持 listenHost=127.0.0.1，并由反向代理 deny /shutdown（反代转发后源地址为 loopback，会绕过 loopback 校验）。launcher.bridge（v0.7.0 Runner 反向注册）：整段省略 = 不启动 Runner 出站（零出站、同现状）；一旦写出本段，url 与 token 必须同时为非空字符串，缺一即启动 fail-fast（配置解析期抛错、进程退出）。url = 桥常驻 HTTP transport 基址（不含路径；Runner 在其上拼 /runner/register · /runner/connect · /runner/result，要求桥以 transport.mode=http 常驻，stdio 形态不承载 /runner/*）；token = per-machine 静态 Bearer，须与 orch 侧 machines[].token 一致。",
+  "_adapterComment": "适配器安装与后端命令示例（v0.8.5 起四 kind 同构：一律由仓内 ACP 桥（machine/acp-bridge）拉起**外部安装**的 ACP 后端）。machine 不内联任何后端、package.json 零新增依赖 ⇒ 每个 kind 的后端命令必须由本项目 agentConfig 的**顶层平铺键 backendCmd（必填）**给出（代码零硬编码缺省，未配置即启动报错）。安装示例（全局或项目本地，任选）：opencode → npm i -g opencode-ai（ACP 入口 = **子命令** acp，由适配器内置为 `--backend-args [\"acp\"]`；Windows 填 opencode.exe 绝对路径）；qoder → 安装 qodercn（ACP 入口 `--acp`，走桥缺省 backend-args）；codex → npm i -g @agentclientprotocol/codex-acp（自带 @openai/codex）；claude → npm i -g @agentclientprotocol/claude-agent-acp。**backendCmd 的语义 = 适配器入口，由适配器归一为桥可直调的形态**（桥的 `--backend-cmd` 是单 token、不能承载「命令 + 参数」的命令串）：① 填**脚本**（.js / .mjs / .cjs，如 @agentclientprotocol/*-acp 的 dist/index.js）⇒ 适配器自动组 `--backend-cmd <process.execPath>` + `--backend-args [<脚本绝对路径>]`（两家包本体都是 JS 入口 ⇒ **推荐填这类路径**）；② 填**可执行体**（.exe）⇒ 直调 + `--backend-args []`（`.cmd` / `.bat` / `.ps1` 壳会被桥显式拒收）。改后端版本 = 改**适配器依赖版本**（codex-acp 自带 @openai/codex，其 ACP 主路径既不看 CODEX_PATH 也不看 PATH）。",
   "machineId": "<machine-id>",
   "launcher": {
     "port": 3100,
@@ -17,17 +18,11 @@
       "agentKind": "opencode",
       "a2aPort": 3010,
       "risk": "write",
-      "_agentConfigComment": "本条目 agentConfig 键位说明（v0.8.1 起 opencode 为 **ACP 族**，与 qoder 同构：由仓内自持 ACP 桥（machine/acp-bridge）承担 A2A 服务面，桥内部以 stdio 拉起 `opencode acp`，`backendCmd` 经 `--backend-cmd` 透传）。**必填 `backendCmd`（顶层平铺）**：代码零硬编码缺省，未配置即启动报错。非必填键不需要时请整键删除，勿原样拷贝。model 键见下条 `_modelComment`。",
-      "_modelComment": "agentConfig.model（**顶层平铺键**，REQ-v0.8.4-2026-09-20-01 起；REQ-v0.8.2-2026-09-20-01 · M1 协议面透传语义不变：本键 ⇒ adapter 原样下发桥 `--model` ⇒ 桥发 ACP `session/set_config_option {configId:\"model\"}`；machine 侧不校验、不做 name↔modelId 映射；缺键/空串/非字符串 ⇒ 不下发旗标，后端用自身默认）。`model` 的读取动作由 machine 代码执行（adapter 取键 ⇒ 桥透传），属**自消费键** ⇒ 平铺；段内遗留写法 `agentConfig.opencode.model` 自本版起**不生效**（启动告警提示迁移）。(a) **值必须是后端自己的 modelId** —— opencode 形态为 `providerID/modelID`（示例值 `opencode-go/glm-5.3-flash`，非占位、可解析）；provider 须先在 opencode.json 的 `provider.<id>.options` 里定义才会出现在清单里 ⇒ **自定义端点/代理走这里**；可填值查同目录 `model-catalog.json` 的 `opencode` 段（key=可填 modelId，value=显示名）。(b) **枚举方式**：`opencode models`（只给 providerID/modelID、无显示名），或开一次 ACP 会话读 `session/new` 响应 `configOptions[]` 中 `id==\"model\"` 的 `options[]`（id↔name）。(c) **无效值行为（实测）**：opencode ACP ⇒ `session/set_config_option` 直接硬报错 `-32602`，不回落 ⇒ 会话建立失败，可见但代价是整会话不可用；**写前请核对 id**。(d) **本需求只做 `model`**：`effort` / `reasoning_effort` / `mode` 同在 `configOptions` 面上但**明确不做**，配置面无对应键。(e) **生效链路 ≠ 启动日志**：`launcher/config-snapshot.ts` 启动日志播报的 `model=…` 出自 `resolveModelEndpoint`，是**观测日志**，与「会话内是否真 set 成功」不同源，勿据日志推断生效。不需要时整键删除 `model`，勿原样拷贝。**可用值清单见同目录 `model-catalog.json`（key 即此处该填的 modelId；含 qoder/opencode 全清单与枚举方式）。",
+      "_agentConfigComment": "本项目 agentConfig 键位说明。键位口径（REQ-v0.8.4-2026-09-20-01 定稿；v0.8.5 段退役后为**唯一**口径）= **自消费键顶层平铺**：`backendCmd`（**ACP 族必填**，代码零硬编码缺省，未配置即启动报错，见顶层 `_adapterComment` 与 README「后端命令」）、`model`（非必填，协议面透传，见下条 `_modelComment`）、`systemPrompt` / `systemPromptMode`（非必填，自定义注入 ⇒ 桥 `--system-prompt` / `--system-prompt-mode`，缺省 append；桥缺省注入的 a2a-outcome 约定不可被覆盖）。**`agentConfig.<kind>` 段已整体退役**：段内键不再被任何人消费、写了无效（本项目曾用的段内注入键已改为上面的平铺键，B3 后置项归零）。非必填键不需要时请整键删除，勿原样拷贝。",
+      "_modelComment": "agentConfig.model（**顶层平铺键**，REQ-v0.8.4-2026-09-20-01 起；REQ-v0.8.2-2026-09-20-01 · M1 协议面透传语义不变：本键 ⇒ adapter 原样下发桥 `--model` ⇒ 桥发 ACP `session/set_config_option {configId:\"model\"}`；machine 侧不校验、不做 name↔modelId 映射；缺键/空串/非字符串 ⇒ 不下发旗标，后端用自身默认）。`model` 的读取动作由 machine 代码执行（adapter 取键 ⇒ 桥透传），属**自消费键** ⇒ 平铺；段内遗留写法 `agentConfig.opencode.model` 自 v0.8.5 起**不生效**（段与告警分支一并退役：写了无效、也不再告警）。(a) **值必须是后端自己的 modelId** —— opencode 形态为 `providerID/modelID`（示例值 `opencode-go/glm-5.3-flash`，非占位、可解析）；provider 须先在 opencode.json 的 `provider.<id>.options` 里定义才会出现在清单里 ⇒ **自定义端点/代理走这里**；可填值查同目录 `model-catalog.json` 的 `opencode` 段（key=可填 modelId，value=显示名）。(b) **枚举方式**：`opencode models`（只给 providerID/modelID、无显示名），或开一次 ACP 会话读 `session/new` 响应 `configOptions[]` 中 `id==\"model\"` 的 `options[]`（id↔name）。(c) **无效值行为（实测）**：opencode ACP ⇒ `session/set_config_option` 直接硬报错 `-32602`，不回落 ⇒ 会话建立失败，可见但代价是整会话不可用；**写前请核对 id**。(d) **本需求只做 `model`**：`effort` / `reasoning_effort` / `mode` 同在 `configOptions` 面上但**明确不做**，配置面无对应键。(e) **生效链路 ≠ 启动日志**：`launcher/config-snapshot.ts` 启动日志播报的 `model=…` 出自 `resolveModelEndpoint`，是**观测日志**，与「会话内是否真 set 成功」不同源，勿据日志推断生效。不需要时整键删除 `model`，勿原样拷贝。**可用值清单见同目录 `model-catalog.json`（key 即此处该填的 modelId；含 qoder/opencode 全清单与枚举方式）。",
       "agentConfig": {
-        "backendCmd": "C:/Users/jimszw/AppData/Roaming/npm/node_modules/opencode-ai/bin/opencode.exe（必填；Windows 裸 PATH 命令名 ENOENT——npm 全局根只有 .cmd/.ps1 壳，须指到 .exe 绝对路径；绝对路径探针实证可用；部署时替换为本机实际路径）",
-        "model": "opencode-go/glm-5.3-flash",
-        "opencode": {
-          "systemPrompt": "<自定义 systemPrompt>，非必填（缺省注入 a2a-outcome 约定；读者 = 仓内 ACP 桥（--config-file + 段选择），非仓外包装器；B3 后置显式例外——暂留段内以兼容存量配置）",
-          "systemPromptMode": "<append|replace>，非必填（缺省 append；读者同 systemPrompt；同属 B3 后置显式例外）"
-        },
-        "timeouts": { "prompt": "<毫秒数>，非必填——迁移后失效，登记不补（wrapper 族通用键，ACP 桥不消费，超时用桥内置缺省）" },
-        "events": { "enabled": "<true|false>，非必填——迁移后失效，登记不补（wrapper 族 trace/中间调用输出键，桥不消费；全端共享段）" }
+        "backendCmd": "C:/Users/jimszw/AppData/Roaming/npm/node_modules/opencode-ai/bin/opencode.exe（必填；Windows 须为 .exe 真身绝对路径——npm 裸 PATH 只有 .cmd/.ps1 壳，桥的 shell:false spawn 直调会 ENOENT/EINVAL；部署时替换为本机实际路径）",
+        "model": "opencode-go/glm-5.3-flash"
       }
     },
     {
@@ -36,12 +31,10 @@
       "agentKind": "codex",
       "a2aPort": 3011,
       "risk": "write",
-      "_agentConfigComment": "本条目 agentConfig 为键位说明占位——非必填键不需要时请整键删除，勿原样拷贝。",
+      "_agentConfigComment": "agentConfig 键位说明（codex = **ACP 族**，与 opencode / qoder 同构）。v0.8.5 起 `agentConfig.<kind>` 段与配置通道（生成 `agents/` 产物那一套）**整体退役** ⇒ 旧段键（wrapper 族契约键，如非 git 仓库检查、开发者指令、路径覆盖等）**全部删除、写了无效**。键位口径 = **自消费键顶层平铺**：`backendCmd`（**必填**：@agentclientprotocol/codex-acp 的 ACP 入口 —— 填其 `dist/index.js` 绝对路径，适配器自动以 node 拉起；见顶层 `_adapterComment`）、`model`（非必填，协议面透传：四 kind 统一读平铺键，可填值见同目录 `model-catalog.json` 的 `codex` 段）、`systemPrompt` / `systemPromptMode`（非必填，自定义注入）。risk 三档经 `--risk` + `--mode` 下发（read 档另加 `--collaboration-mode plan`）。非必填键不需要时请整键删除，勿原样拷贝。",
       "agentConfig": {
-        "codex": {
-          "skipGitRepoCheck": "<true|false>，非必填（缺省 true：workspace 无需是 git 仓库）",
-          "developerInstructions": "<开发者指令>，非必填（缺省注入 a2a-outcome 约定）"
-        }
+        "backendCmd": "<@agentclientprotocol/codex-acp 包内 dist/index.js 的绝对路径>，必填（脚本入口 ⇒ 适配器自动以 node 拉起；也可填可直调的 .exe 真身）",
+        "model": "deepseek-v4-pro"
       }
     },
     {
@@ -49,25 +42,22 @@
       "workspace": "<absolute path to the claude project on this machine>",
       "agentKind": "claude",
       "a2aPort": 3012,
-      "risk": "read",
-      "_agentConfigComment": "本条目 agentConfig 为键位说明占位——非必填键不需要时请整键删除，勿原样拷贝。",
+      "risk": "write",
+      "_agentConfigComment": "agentConfig 键位说明（claude = **ACP 族**，与 opencode / qoder 同构）。v0.8.5 起 `agentConfig.<kind>` 段与配置通道（生成 `agents/` 产物那一套）**整体退役** ⇒ 旧段键（wrapper 族契约键，如用户级配置加载源、段内 model、追加 systemPrompt 等）**全部删除、写了无效**。键位口径 = **自消费键顶层平铺**：`backendCmd`（**必填**：@agentclientprotocol/claude-agent-acp 的 ACP 入口 —— 填其 `dist/index.js` 绝对路径，适配器自动以 node 拉起；见顶层 `_adapterComment`）、`model`（非必填，协议面透传：真机报文证 claude 有 `configOptions{id:\"model\"}` = default / opus / fable / sonnet / haiku）、`systemPrompt` / `systemPromptMode`（非必填，自定义注入）。risk 三档经 `--risk` + `--mode` 下发（full 档另带 `--session-meta-json`）。非必填键不需要时请整键删除，勿原样拷贝。",
       "agentConfig": {
-        "claude": {
-          "settingSources": "<[\"user\"]｜[]>，非必填（缺省 [\"user\"]：加载 ~/.claude/settings.json；[] = 完全隔离用户级配置）",
-          "model": "<模型名>，非必填（缺省用 ~/.claude/settings.json 的模型；wrapper 契约位——读者 = 仓外 a2a-claude 包装器按段读取，保持段内，REQ-v0.8.4 不动；与 ACP 族的平铺 agentConfig.model 是两回事）",
-          "systemPromptAppend": "<追加 systemPrompt>，非必填（缺省注入 a2a-outcome 约定）"
-        }
+        "backendCmd": "<@agentclientprotocol/claude-agent-acp 包内 dist/index.js 的绝对路径>，必填（脚本入口 ⇒ 适配器自动以 node 拉起；也可填可直调的 .exe 真身）",
+        "model": "default"
       }
     },
     {
-      "_comment": "ACP 族（qoder CN）：无仓外 a2a-qoder 包装器，改由仓内自持 ACP 桥（machine/acp-bridge，构建产物 dist/acp-bridge/index.js）承担 A2A 服务面；桥绑定本项 a2aPort，内部再以 stdio 拉起 `qodercn --acp`。认证优先文件凭据 ~/.qoder-cn/.auth（qodercn CLI 登录）；备选 env QODERCN_PERSONAL_ACCESS_TOKEN（经 Launcher 进程环境透传；当前不支持 per-project env）。risk 经桥 --risk <read|write|full> 透传。**必填 agentConfig.backendCmd**（ACP 后端命令，绝对路径或 PATH 命令名；代码零硬编码缺省，未配置即启动报错）。键位原则（REQ-v0.8.4-2026-09-20-01 定稿）：**自消费键平铺 / wrapper 契约分段**——判据 = 「谁执行读取动作」：读取由 machine 代码 / 仓内 ACP 桥执行的键放 `agentConfig` **顶层平铺**（`backendCmd`、`model`；model 的取值虽由后端消费，但执行读取动作的是 adapter ⇒ 自消费）；由外部程序直接读配置文件的键（仓外包装器按段读取）维持 `agentConfig.<kind>` **分段**（wrapper 契约，如 codex / claude 段）。**显式例外（B3 后置）**：opencode 段注入键 `systemPrompt` / `systemPromptMode` 暂留段内（读者 = 仓内 ACP 桥，经 --config-file + 段选择读取；平铺会动对外产物契约形状，核实异仓 wrapper 容忍度后再评估，见改造文档 §6）。",
+      "_comment": "ACP 族（qoder CN）：无仓外包装器，由仓内自持 ACP 桥（machine/acp-bridge，构建产物 dist/acp-bridge/index.js）承担 A2A 服务面；桥绑定本项 a2aPort，内部再以 stdio 拉起 `qodercn --acp`。认证优先文件凭据 ~/.qoder-cn/.auth（qodercn CLI 登录）；备选 env QODERCN_PERSONAL_ACCESS_TOKEN（经 Launcher 进程环境透传；当前不支持 per-project env）。risk 经桥 `--risk <read|write|full>` 透传。**必填 agentConfig.backendCmd**（ACP 后端命令，绝对路径或可补全为 .exe 的裸名；代码零硬编码缺省，未配置即启动报错）。**键位口径（v0.8.5 · M4 起唯一口径）= 自消费键顶层平铺**：读取由 machine 代码 / 仓内 ACP 桥执行的键放 agentConfig **顶层**（`backendCmd` · `model` · `systemPrompt` / `systemPromptMode`）；**`agentConfig.<kind>` 段已整体退役**（含 opencode 段注入键这一 B3 后置例外：已随段归零，自定义注入改走平铺键 + 桥 flag）。**「保留」≠ 提供读点**：kind 扩展（新增 agentKind 名）的 PR 须先增补保留平铺键名清单（`backendCmd` / `model` / `systemPrompt` / `systemPromptMode` / `timeouts` / `agentCard` / `events` / `mcp`；机械锚 `AGENT_KINDS ∩ 保留集 = ∅`），保留只占命名空间、不等于该键已有平铺读点。",
       "projectId": "<qoder-project-id>",
       "workspace": "<absolute path to the qoder project on this machine>",
       "agentKind": "qoder",
       "a2aPort": 3013,
       "risk": "write",
-      "_agentConfigComment": "agentConfig 键位说明（三类，按「谁来读」区分）：① **machine 自消费键（顶层平铺）**——`backendCmd`（ACP 族必填，见上）· `model`（ACP 族协议面键，平铺、非必填，见下条 `_modelComment`）· `timeouts`（超时覆盖，如 timeouts.prompt）；② **kind 分段键（外部程序直接读文件的契约，维持分段）**——`events: {enabled}`（全端共享，缺省 false 关 trace/中间调用输出）· `opencode: {systemPrompt, systemPromptMode}` · `codex: {skipGitRepoCheck, developerInstructions}` · `claude: {settingSources, systemPromptAppend, model, ...}`。注意**同键名 `model` 按族两种落位**：ACP 族（qoder / opencode）⇒ 平铺 `agentConfig.model`；wrapper 族（codex / claude）⇒ 段内 `agentConfig.claude.model` / `agentConfig.codex.model`（仓外包装器契约，继续合法、不告警）。**段内 `model` 对 ACP 族是遗留键**（REQ-v0.8.4-2026-09-20-01 起）：`agentKind ∈ {qoder, opencode}` 且段内出现 `model` ⇒ 启动**告警**且**不生效**（非双读，任务走默认模型；平铺误配进 wrapper 项目同理不被机器消费）。段内注入键例外注记：opencode 段 `systemPrompt`/`systemPromptMode` 读者实为仓内 ACP 桥，因 B3 后置**暂留段内**（显式例外，见上条键位原则）。另：kind 扩展（新增 agentKind 名）的 PR 须先增补保留平铺键名清单（`backendCmd` / `model` / `systemPrompt` / `systemPromptMode` / `timeouts` / `agentCard` / `events` / `mcp`；机械锚 `AGENT_KINDS ∩ 保留集 = ∅`；「保留」≠ 该键已提供平铺读点）；本项目 agentConfig 里写其它 kind 的段合法但被忽略（运行时文件按段写入、各 wrapper 只读自己那段）；③ **风险补丁由 launcher 强制最后合并**（如 claude full 档 dangerouslyAllowBypassPermissions=true），agentConfig 覆盖不了。合并链：DEFAULT_AGENT_CONFIG ⊕ adapter baseConfig() ⊕ 项目 agentConfig ⊕ 风险补丁 → 产物 agents/<agentKind>.<projectId>.json（每次启动覆盖生成，运行态产物）。 ⚠ 各条目 agentConfig 值均为键位说明占位（**例外**：`model` 示例值为真实 modelId，供对照，不用则该键整删）——非必填键不需要时整键删除，勿原样拷贝。",
-      "_modelComment": "agentConfig.model（**顶层平铺键**，REQ-v0.8.4-2026-09-20-01 起；REQ-v0.8.2-2026-09-20-01 · M1 协议面透传语义不变：本键 ⇒ adapter 原样下发桥 `--model` ⇒ 桥发 ACP `session/set_config_option {configId:\"model\"}`；machine 侧不校验、不做 name↔modelId 映射；缺键/空串/非字符串 ⇒ 不下发旗标，后端用自身默认）。段内遗留写法 `agentConfig.qoder.model` 自本版起**不生效**（启动告警提示迁移）。(a) **值必须是后端自己的 modelId** —— qoder 形态为 modelId（示例值 `qfmodel` = Qwen3.8-Flash，非占位、可解析）；端点/可见模型由 ~/.qoder-cn 登录态决定，无可文件声明的 provider 块 ⇒ 只能填 `model-catalog.json` 的 `qoder` 段列出的 14 个 modelId 之一；**显示名（如 `Qwen3.8-Flash`）不是合法值**（~/.qoder-cn/settings.json 存显示名、ACP 面用 modelId，两处不可混用）。(b) **枚举方式**：`qoderclicn --list-models`（只给显示名、无 modelId，不能直接当配置值），或开一次 ACP 会话读 `session/new` 响应 `configOptions[]` 中 `id==\"model\"` 的 `options[]`（id↔name）；对照表即同目录 `model-catalog.json`.`qoder`。(c) **无效值行为（实测，三处不一致）**：qoder ACP ⇒ `session/set_config_option` 当下不报错、**延迟到 `session/new` 才报 `-32000`**（后端进程活着，失败点后移）；qoder `--print` 形态 ⇒ **静默回落**（stderr 打 `using \"auto\" instead`，「看起来成功其实换了模型」是真风险）；（对照：opencode ACP ⇒ 即时硬报错 `-32602` 不回落）⇒ **写前请核对 id**。(d) **本需求只做 `model`**：`effort` / `reasoning_effort` / `mode` 同在 `configOptions` 面上但**明确不做**，配置面无对应键。(e) **生效链路 ≠ 启动日志**：`launcher/config-snapshot.ts` 启动日志播报的 `model=…` 出自 `resolveModelEndpoint`，是**观测日志**，与「会话内是否真 set 成功」不同源，勿据日志推断生效。不需要时整键删除 `model`，勿原样拷贝。",
+      "_agentConfigComment": "agentConfig 键位说明（**machine 自消费键顶层平铺，v0.8.5 起为唯一口径**）：`backendCmd`（ACP 族必填，见上条注释）· `model`（ACP 族协议面键，非必填，见下条 `_modelComment`）· `systemPrompt` / `systemPromptMode`（非必填，自定义注入 ⇒ 桥 `--system-prompt` / `--system-prompt-mode`）。**`agentConfig.<kind>` 段已整体退役**：段内键不再被任何人消费（写了无效、也不再告警），故此前模板里按段列举的各类段键示例（各 kind 专属段与 ACP 族段内 `model`）**已全部删除**；model 一律写**平铺** `agentConfig.model`（四 kind 统一）。风险补丁（如 full 档的会话 `_meta`）由适配器 / 桥强制注入，agentConfig 覆盖不了。⚠ 本条目 agentConfig 值均为键位说明占位（**例外**：`model` 示例值为真实 modelId，供对照，不用则该键整删）——非必填键不需要时整键删除，勿原样拷贝。",
+      "_modelComment": "agentConfig.model（**顶层平铺键**，REQ-v0.8.4-2026-09-20-01 起；REQ-v0.8.2-2026-09-20-01 · M1 协议面透传语义不变：本键 ⇒ adapter 原样下发桥 `--model` ⇒ 桥发 ACP `session/set_config_option {configId:\"model\"}`；machine 侧不校验、不做 name↔modelId 映射；缺键/空串/非字符串 ⇒ 不下发旗标，后端用自身默认）。段内遗留写法 `agentConfig.qoder.model` 自 v0.8.5 起**不生效**（段与告警分支一并退役：写了无效、也不再告警）。(a) **值必须是后端自己的 modelId** —— qoder 形态为 modelId（示例值 `qfmodel` = Qwen3.8-Flash，非占位、可解析）；端点/可见模型由 ~/.qoder-cn 登录态决定，无可文件声明的 provider 块 ⇒ 只能填 `model-catalog.json` 的 `qoder` 段列出的 14 个 modelId 之一；**显示名（如 `Qwen3.8-Flash`）不是合法值**（~/.qoder-cn/settings.json 存显示名、ACP 面用 modelId，两处不可混用）。(b) **枚举方式**：`qoderclicn --list-models`（只给显示名、无 modelId，不能直接当配置值），或开一次 ACP 会话读 `session/new` 响应 `configOptions[]` 中 `id==\"model\"` 的 `options[]`（id↔name）；对照表即同目录 `model-catalog.json`.`qoder`。(c) **无效值行为（实测，三处不一致）**：qoder ACP ⇒ `session/set_config_option` 当下不报错、**延迟到 `session/new` 才报 `-32000`**（后端进程活着，失败点后移）；qoder `--print` 形态 ⇒ **静默回落**（stderr 打 `using \"auto\" instead`，「看起来成功其实换了模型」是真风险）；（对照：opencode ACP ⇒ 即时硬报错 `-32602` 不回落）⇒ **写前请核对 id**。(d) **本需求只做 `model`**：`effort` / `reasoning_effort` / `mode` 同在 `configOptions` 面上但**明确不做**，配置面无对应键。(e) **生效链路 ≠ 启动日志**：`launcher/config-snapshot.ts` 启动日志播报的 `model=…` 出自 `resolveModelEndpoint`，是**观测日志**，与「会话内是否真 set 成功」不同源，勿据日志推断生效。不需要时整键删除 `model`，勿原样拷贝。",
       "agentConfig": {
         "backendCmd": "<qoderclicn.exe 绝对路径或 PATH 命令名>，必填（ACP 后端命令；代码零硬编码缺省，未配置即启动报错）",
         "model": "qfmodel"

@@ -1,6 +1,6 @@
 # orch 单元（MCP 薄桥）
 
-> orch 侧的 MCP 薄桥：连接模型已反转为 **pull**（线协议 2.1）—— 执行机 Launcher 升格为 **Runner**，主动出站连桥（`/runner/register` → `/runner/connect` 长轮询拉命令 → `/runner/result` 回传结果）；桥只做「项目 → 机器」解析、任务入队 / claim 与结果落库，任务态与会话映射落本机 SQLite，再由执行机侧拉起 A2A 包装器 / 仓内 ACP 桥驱动底层 CLI。启停一律经 `scripts/bridgectl.mjs`（纯 Node ESM、零第三方依赖、无需构建），入口 `dist/bridge/index.js`。
+> orch 侧的 MCP 薄桥：连接模型已反转为 **pull**（线协议 2.1）—— 执行机 Launcher 升格为 **Runner**，主动出站连桥（`/runner/register` → `/runner/connect` 长轮询拉命令 → `/runner/result` 回传结果）；桥只做「项目 → 机器」解析、任务入队 / claim 与结果落库，任务态与会话映射落本机 SQLite，再由执行机侧拉起仓内 ACP 桥驱动底层 CLI。启停一律经 `scripts/bridgectl.mjs`（纯 Node ESM、零第三方依赖、无需构建），入口 `dist/bridge/index.js`。
 
 ## 整体形态
 

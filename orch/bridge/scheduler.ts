@@ -70,7 +70,7 @@ import { bridgeLog } from "./bridge-log.js";
 import type { CoreRole } from "../runtime/core-lease.js";
 import type { FeatureRecord, TaskRecord, TaskState } from "../types.js";
 
-/** 桥重启后对账在飞任务时写入的结果文本（对齐 wrapper `failed(interrupted)` 语义） */
+/** 桥重启后对账在飞任务时写入的结果文本（对齐本单元 C11 派发占位语义「已发出即有占位 ⇒ 保守不重派」） */
 export const FEATURE_INTERRUPTED_TEXT =
   "任务因桥进程重启而中断（interrupted），未产出终态；请重新发起或重试。";
 
@@ -667,7 +667,7 @@ export class FeatureScheduler {
   /**
    * 桥重启恢复（**纯本地对账 + 状态收敛，不 ensure、不派发**）。
    * - `executing` 且存在**已派发**（`remoteTaskId` 非空）的 `working` 任务：收集**全部**在飞节点，
-   *   各按 wrapper `failed(interrupted)` 语义收敛（任务置 failed）；
+   *   各按本单元 C11 派发占位语义「已发出即有占位 ⇒ 保守不重派」收敛（任务置 failed）；
    *   **Feature 不再置 `failed`**（v0.6.1 REQ-05 §2.1 / N3）—— 留给**静止收敛**叙事：
    *   下一 tick（此处显式 `kick`）由 `advanceExecuting` 判静止并发 `feature.failure_report`，
    *   由宿主持账单经 `retryTaskIds` 重派或显式取消；

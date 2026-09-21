@@ -2,9 +2,9 @@
  * 「a2a-outcome」约定文案 —— **零依赖叶模块**（不 import 仓内任何其它模块）。
  *
  * 归属：REQ-v0.8.0-2026-09-19-01 · 节点 M1。本常量自 `launcher/agent-config.ts`
- * **原文逐字搬迁**（值零变化），动机 = 消除未来 `acp-bridge → launcher` 的依赖倒置：
- * launcher（适配器 baseConfig / DEFAULT_AGENT_CONFIG）与未来的 ACP 桥均从本叶模块取用，
- * 本模块不得反向依赖任何仓内模块（保持零依赖，作为分层中的叶）。
+ * **原文逐字搬迁**（值零变化），动机 = 消除 `acp-bridge → launcher` 的依赖倒置：
+ * **唯一消费者 = 仓内 ACP 桥**（v0.8.5 · M4：段与配置通道退役后，桥的缺省注入是 outcome
+ * 约定的单一落点，B12③）。本模块不得反向依赖任何仓内模块（保持零依赖，作为分层中的叶）。
  *
  * 原始语义（v0.3.1 机制②）：「显式状态标记」约定文案（三端统一、简短、确定性）。
  * worker 在「需要人工拍板」或「确认无法完成」时，于回复末尾输出一个
@@ -26,5 +26,5 @@ const A2A_OUTCOME_CONVENTION_LINES = [
   "Output at most one such block, and only as the very last thing in your reply.",
 ];
 
-/** 三端共用的约定文案（供适配器 baseConfig() 绑定到各自的 systemPrompt 类配置键）。 */
+/** 桥缺省注入的约定文案（v0.8.5 · M4 起唯一落点 = 仓内 ACP 桥的缺省注入；段键注入通路已退役）。 */
 export const A2A_OUTCOME_CONVENTION = A2A_OUTCOME_CONVENTION_LINES.join("\n");

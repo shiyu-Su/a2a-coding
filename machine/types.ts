@@ -18,7 +18,7 @@ import type { AgentKind } from "./agent-kinds.js";
 export const PROTOCOL_VERSION = "2.1";
 
 /**
- * 执行层 Agent 类型（决定 A2A 包装器与 CLI 参数）。
+ * 执行层 Agent 类型（决定执行层适配器与 CLI 参数）。
  * 取值集合单一事实源 = `./agent-kinds.js`（本模块仅 re-export，既有 import 站点不变）。
  */
 export type { AgentKind };
@@ -34,19 +34,27 @@ export interface ProjectConfig {
   /** 该项目的 A2A Server 监听端口 */
   a2aPort: number;
   /**
-   * 任务风险档位（可选）：由适配器 `permission(risk)` 映射为各 CLI 权限 / 沙箱参数。
-   * 缺省写入档 `write`（= 三端包装器内置默认，保证现有 opencode 项目行为不变）。
+   * 任务风险档位（可选）：由适配器 `permission(risk)` 映射为 ACP 会话模式 / 权限门档位
+   * （v0.8.5 起四 kind 同构；codex 的 read 档另加 `--collaboration-mode plan`）。
+   * 缺省写入档 `write`（= 执行层适配器内置默认，保证既有项目行为不变）。
    */
   risk?: RiskLevel;
   /**
-   * 项目 agentConfig（键位口径 = 自消费键平铺 / wrapper 契约分段，REQ-v0.8.4-2026-09-20-01 定稿）：
-   * - **ACP 族自消费键（顶层平铺）**：`backendCmd`（必填）· `model`（非必填，adapter 读出后经
-   *   `--model` 透传给 ACP 桥）；段内 `model` 为遗留键（不消费、启动告警）；
-   * - **wrapper 族契约键（`<kind>` 段内，如 `claude` / `codex`，同 `mcp` / `events` 等）**：
-   *   由 launcher 深合并进 `agents/<agentKind>.<projectId>.json`，经 `--config` 传给仓外包装器，
-   *   与其内置默认值合并；未提供时仅写入默认覆盖项（关闭 events）。
-   * （显式例外：opencode 段注入键 `systemPrompt` / `systemPromptMode` 暂留段内，见
-   *   `launcher/agent-config.ts` B3 后置注记。）
+   * 项目 agentConfig（键位口径 = **自消费键顶层平铺**；`agentConfig.<kind>` 段已整体退役，
+   * v0.8.5 · M4 起为**唯一**口径）。
+   *
+   * **具备平铺读点的键**（读者 = machine 代码 / 仓内 ACP 桥）：
+   * - `backendCmd` —— ACP **适配器入口**，**必填**（代码零硬编码缺省，未配置即 `buildLaunch` 抛错）：
+   *   脚本形态（`.js` / `.mjs` / `.cjs`）⇒ 适配器自动以 `process.execPath` + 脚本路径拉起；
+   *   可执行体形态（`.exe`）⇒ 直调（形态归一见 `adapters/backend-command.ts`）；
+   * - `model` —— 非必填，适配器读出后经 `--model` 透传给 ACP 桥（协议面 set，不校验、不映射）；
+   * - `systemPrompt` / `systemPromptMode` —— 非必填，自定义注入经 `--system-prompt` /
+   *   `--system-prompt-mode` 透传（缺省 `append`）。
+   *
+   * **段键（`<kind>` 段）已退役**：段内键不再被任何人消费（写了无效、也不再告警）—— 其读者
+   * （`writeAgentConfig` / `agents/` 产物 / `--config-file` / `--config-segment`）随段一并删除。
+   * **「保留」≠ 提供读点**：命名空间保留键清单见 `./agent-kinds.ts` 的
+   * `RESERVED_AGENT_CONFIG_FLAT_KEYS`（保留只占命名空间，不等于该键已有平铺读点）。
    */
   agentConfig?: Record<string, unknown>;
 }
@@ -146,7 +154,7 @@ export interface ChildLedgerEntry {
   kind: "wrapper";
   /** 启动时刻（UTC ISO 8601） */
   startedAt: string;
-  /** 诊断用启动命令行（可选；不含环境变量） */
+  /** 诊断用启动命令行（可选；不含环境变量；敏感 argv 取值经脱敏，如 `--session-meta-json` ⇒ `<redacted>`） */
   command?: string;
 }
 

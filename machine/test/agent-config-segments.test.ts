@@ -1,87 +1,44 @@
 /**
- * `DEFAULT_AGENT_CONFIG` 段一致性（REQ-v0.8.0-2026-09-18-01 §4.1-8）。
+ * `agentConfig` 平铺读取器（REQ-v0.8.5-2026-09-21-01 · M4）。
  *
- * 行为化测试（**不扩大导出面**）：经 `writeAgentConfig` 写临时目录 → 读回 →
- * 断言每个 `AGENT_KINDS` 成员对应键存在（+ `events` 段），并锁产物命名
- * `agents/<agentKind>.<projectId>.json`。
+ * 本文件原为「`DEFAULT_AGENT_CONFIG` 段一致性」断言；段与配置通道（`writeAgentConfig` /
+ * `deepMerge` / `agents/` 产物）整体退役后，**段一致性断言改为平铺断言**：
+ * 锁 `resolveSystemPrompt` / `resolveSystemPromptMode` 的宽容缺省口径，并以负向锚点锁
+ * 「段与通道产物不再导出」。
  *
  * 运行：`npm test`（先 `tsc` 构建，再 `node --test dist/test/`）。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, readFileSync, rmSync } from "node:fs";
-import { tmpdir } from "node:os";
-import { join } from "node:path";
-import { writeAgentConfig } from "../launcher/agent-config.js";
+import * as agentConfig from "../launcher/agent-config.js";
 import { AGENT_KINDS, RESERVED_AGENT_CONFIG_FLAT_KEYS } from "../agent-kinds.js";
-import { getAdapter } from "../adapters/index.js";
-import type { ProjectConfig } from "../types.js";
 
-function project(agentKind: ProjectConfig["agentKind"]): ProjectConfig {
-  return { projectId: "p1", workspace: "/ws/p1", agentKind, a2aPort: 4100 };
-}
+// ---- 平铺 reader 口径（v0.8.5 · M4：自定义注入改走 `--system-prompt(Mode)`）----
 
-test("writeAgentConfig：读回配置含每个 AGENT_KINDS 成员段 + events 段", () => {
-  const appRoot = mkdtempSync(join(tmpdir(), "a2a-machine-seg-"));
-  try {
-    for (const kind of AGENT_KINDS) {
-      const path = writeAgentConfig(project(kind), appRoot, getAdapter(kind).baseConfig());
-      const written = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-      assert.equal(typeof written["events"], "object", "缺少 events 段");
-      for (const member of AGENT_KINDS) {
-        assert.ok(
-          typeof written[member] === "object" && written[member] !== null,
-          `缺少 ${member} 段`,
-        );
-      }
-    }
-  } finally {
-    rmSync(appRoot, { recursive: true, force: true });
-  }
+test("resolveSystemPrompt：非空字符串原样；缺键 / 空串 / 非字符串 ⇒ undefined", () => {
+  assert.equal(agentConfig.resolveSystemPrompt({ systemPrompt: "be terse" }), "be terse");
+  assert.equal(agentConfig.resolveSystemPrompt({}), undefined);
+  assert.equal(agentConfig.resolveSystemPrompt({ systemPrompt: "" }), undefined);
+  assert.equal(agentConfig.resolveSystemPrompt({ systemPrompt: 42 }), undefined);
+  assert.equal(agentConfig.resolveSystemPrompt(undefined), undefined);
 });
 
-test("writeAgentConfig：产物名为 agents/<agentKind>.<projectId>.json", () => {
-  const appRoot = mkdtempSync(join(tmpdir(), "a2a-machine-seg-"));
-  try {
-    const path = writeAgentConfig(project("codex"), appRoot, getAdapter("codex").baseConfig());
-    assert.equal(path, join(appRoot, "agents", "codex.p1.json"));
-  } finally {
-    rmSync(appRoot, { recursive: true, force: true });
-  }
+test("resolveSystemPromptMode：仅 append / replace；其余（含非法串）⇒ undefined（桥缺省 append）", () => {
+  assert.equal(agentConfig.resolveSystemPromptMode({ systemPromptMode: "append" }), "append");
+  assert.equal(agentConfig.resolveSystemPromptMode({ systemPromptMode: "replace" }), "replace");
+  assert.equal(agentConfig.resolveSystemPromptMode({ systemPromptMode: "bogus" }), undefined);
+  assert.equal(agentConfig.resolveSystemPromptMode({}), undefined);
+  assert.equal(agentConfig.resolveSystemPromptMode(undefined), undefined);
 });
 
-// ---- REQ-v0.8.2-2026-09-20-01 · M4 负向锚点：缺省配置不预置 model（model 只来自项目 agentConfig）----
+// ---- 负向锚点：段与配置通道产物不再导出 ----
 
-test("writeAgentConfig：缺省产物顶层无平铺 model 键、各 kind 段不预置 model", () => {
-  const appRoot = mkdtempSync(join(tmpdir(), "a2a-machine-seg-"));
-  try {
-    for (const kind of AGENT_KINDS) {
-      const path = writeAgentConfig(project(kind), appRoot, getAdapter(kind).baseConfig());
-      const written = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-      assert.equal("model" in written, false, `${kind}：缺省不预置平铺 model 键`);
-      for (const member of AGENT_KINDS) {
-        const segment = written[member] as Record<string, unknown>;
-        assert.equal("model" in segment, false, `${kind}：缺省 ${member} 段不得预置 model`);
-      }
-    }
-  } finally {
-    rmSync(appRoot, { recursive: true, force: true });
+test("负向锚点：writeAgentConfig / DEFAULT_AGENT_CONFIG / deepMerge 随段退役不再导出", () => {
+  for (const retired of ["writeAgentConfig", "DEFAULT_AGENT_CONFIG", "deepMerge"]) {
+    assert.equal(retired in agentConfig, false, `${retired} 应随「段与配置通道整体退役」消失`);
   }
-});
-
-test("writeAgentConfig（v0.8.4 平铺语义）：项目平铺 agentConfig.model 原样进入产物顶层", () => {
-  const appRoot = mkdtempSync(join(tmpdir(), "a2a-machine-seg-"));
-  try {
-    const withModel: ProjectConfig = {
-      ...project("qoder"),
-      agentConfig: { backendCmd: "qoderclicn", model: "m-flat" },
-    };
-    const path = writeAgentConfig(withModel, appRoot, getAdapter("qoder").baseConfig());
-    const written = JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
-    assert.equal(written["model"], "m-flat");
-  } finally {
-    rmSync(appRoot, { recursive: true, force: true });
-  }
+  // outcome 约定的 re-export 保留（既有 import 站点零改动）
+  assert.equal(typeof agentConfig.A2A_OUTCOME_CONVENTION, "string");
 });
 
 // ---- REQ-v0.8.4-2026-09-20-01 · M3 防撞锚：kind 段命名空间与平铺保留键互斥 ----

@@ -14,7 +14,6 @@ import type {
   ProjectStatus,
   StopResult,
 } from "../types.js";
-import { writeAgentConfig } from "./agent-config.js";
 import { appRootFromModule } from "./app-root.js";
 import { describeAgentConfig } from "./config-snapshot.js";
 import { waitForPort } from "./ports.js";
@@ -32,6 +31,25 @@ const STARTUP_TIMEOUT_MS = 30_000;
 
 /** 空闲回收（用完退出）缺省时长：超过该毫秒数无 ensure 调用即自动 stop */
 export const DEFAULT_IDLE_STOP_MS = 300_000;
+
+/**
+ * 账本 `command` 的**脱敏**（REQ-v0.8.5-2026-09-21-01 · B17）：`--session-meta-json` 的取值
+ * 遮蔽为 `<redacted>` —— 该字段语义「不含环境变量」保持为真，且**敏感 argv 取值不得进账本**
+ * （硬约束：凭据类值一律不进 argv）。其余参数逐字保留，便于诊断。
+ */
+export function redactArgv(args: readonly string[]): string {
+  const redacted: string[] = [];
+  for (let i = 0; i < args.length; i += 1) {
+    const token = args[i];
+    if (token === undefined) continue;
+    redacted.push(token);
+    if (token === "--session-meta-json" && i + 1 < args.length) {
+      redacted.push("<redacted>");
+      i += 1; // 跳过原值
+    }
+  }
+  return redacted.join(" ");
+}
 
 /** 请求的项目不在本机配置中 */
 export class ProjectNotFoundError extends Error {
@@ -399,45 +417,19 @@ export class AgentManager {
       throw new AgentStartError(project.projectId, `workspace 不存在：${project.workspace}`);
     }
 
-    // 生成包装器配置（DEFAULT ← baseConfig ← agentConfig ← risk 配置补丁），经 --config 传给包装器；
-    // 生成失败即终止启动
-    const appRoot = appRootFromModule(import.meta.url);
-    let configPath: string;
-    try {
-      configPath = writeAgentConfig(project, appRoot, adapter.baseConfig(), perm.config);
-    } catch (err) {
-      throw new AgentStartError(project.projectId, `生成包装器配置失败：${errorMessage(err)}`);
-    }
-
-    // 启动配置快照（每次拉起都打）：配置获取层级 + endpoint / 模型 id（配置面解析，观测用）
-    const snapshot = describeAgentConfig(project, configPath);
+    // 启动配置快照（每次拉起都打）：配置获取层级 + endpoint / 模型 id（配置面解析，观测用）。
+    // v0.8.5 · M4：包装器配置产物（`agents/`）随段与配置通道退役 ⇒ 不再生成、无 configPath。
+    const snapshot = describeAgentConfig(project);
     console.log(`[launcher] agent ${project.projectId} 配置层级：${snapshot.hierarchy}`);
     console.log(
       `[launcher] agent ${project.projectId} endpoint=${snapshot.endpoint}，model=${snapshot.model}`,
     );
 
-    // 遗留键告警（REQ-v0.8.4-2026-09-20-01 · M2）：ACP 族 model 已迁顶层平铺键
-    // agentConfig.model；段内 agentConfig.<kind>.model 检测到即告警、不生效（不双读、不 fail）。
-    // wrapper 族（claude / codex）的段内 model 是合法外部契约，不告警。
-    if (project.agentKind === "qoder" || project.agentKind === "opencode") {
-      const legacySection = (project.agentConfig ?? {})[project.agentKind];
-      if (
-        typeof legacySection === "object" &&
-        legacySection !== null &&
-        !Array.isArray(legacySection) &&
-        "model" in legacySection
-      ) {
-        console.warn(
-          `[launcher] agent ${project.projectId} 遗留键告警：agentConfig.${project.agentKind}.model 已废弃（ACP 族 model 为顶层平铺键 agentConfig.model），本键不生效——请迁移后重启`,
-        );
-      }
-    }
 
     const spec = adapter.buildLaunch({
       projectId: project.projectId,
       workspace: project.workspace,
       a2aPort: project.a2aPort,
-      configPath,
       agentConfig: project.agentConfig,
       permissionArgs: perm.args,
     });
@@ -452,7 +444,7 @@ export class AgentManager {
     this.trackChild(`${project.projectId}:agent`, child, {
       projectId: project.projectId,
       kind: "wrapper",
-      command: [spec.command, ...spec.args].join(" "),
+      command: redactArgv([spec.command, ...spec.args]),
     });
     const endpoint = agentEndpoint(project.a2aPort);
 
