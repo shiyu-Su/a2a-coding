@@ -22,7 +22,7 @@
  *
  * 就绪语义（REQ-v0.6.2-2026-09-18-02，C1–C8）：
  *   - 判据键一律取 `/health` 的 `status`（launcher 自检期 = 200 + starting；不得依赖 HTTP 码）。
- *   - 缺省 start：等 L1（/health 可答 = HTTP 200）即返回；exit 0 ≠ 业务就绪（starting 时业务路由 503）。
+ *   - 缺省 start：等 L1（/health 可答 = HTTP 200）即返回；exit 0 ≠ 业务就绪（starting = 自检未过，status 还不是 ok）。
  *   - `--no-wait`：发起即返（exit 0 = 已发起，≠ 就绪）；spawn 同步失败才 exit 1；pid 仅供参考。
  *   - `--wait-ready`：等待 status=ok 才 exit 0；超时/失败 exit 1（按 `自检失败`/`[self-check]` 过滤行输出）。
  *   - 三分类占用（键 = status）：不可答 / status 非 `ok`|`starting` ⇒ 真占用 exit 1；
@@ -919,7 +919,7 @@ function printUsage() {
 
 就绪语义：
   缺省 start 只等 L1（/health 可答 = HTTP 200）即返回 0 —— **缺省 exit 0 ≠ 业务就绪**
-  （health.status=starting 时业务路由仍 503）；需业务就绪请加 --wait-ready。
+  （health.status=starting 时自检未过，status 还不是 ok；就绪态只由 /health 的 status 表达）；需业务就绪请加 --wait-ready。
 
 调用拼写（重要，C7）：
   npm 会吞掉裸 --no-* 选项，透传给脚本必须加 -- 分隔：
@@ -953,7 +953,7 @@ async function cmdStart(flags) {
     case "already-starting": {
       info(`已在运行：${endpoint}（health=starting，自检进行中）；exit 0`);
       info(
-        "注意：缺省 exit 0 ≠ 业务就绪（starting 时 /health 可答为 200，但业务路由仍 503）；如需等待自检通过请用 --wait-ready。",
+        "注意：缺省 exit 0 ≠ 业务就绪（starting 时 /health 已可答为 200，但 status 还不是 ok）；如需等待自检通过请用 --wait-ready。",
       );
       break;
     }

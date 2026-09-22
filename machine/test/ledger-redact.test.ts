@@ -55,10 +55,10 @@ test("redactArgv：真实 claude full 档 argv（adapter 产出）⇒ 明文 JSO
   assert.ok(!out.includes("allowDangerouslySkipPermissions"), out);
 });
 
-test("redactArgv：不含该 flag 的 argv 逐字不变（codex / qoder / opencode 零副作用）", () => {
+test("redactArgv：不含该 flag 的 argv 逐字不变（codex / qoder-cn / opencode 零副作用）", () => {
   const samples: ReadonlyArray<readonly string[]> = [
     ["node", "bridge.js", ...getAdapter("codex").permission("read").args],
-    ["node", "bridge.js", ...getAdapter("qoder").permission("full").args],
+    ["node", "bridge.js", ...getAdapter("qoder-cn").permission("full").args],
     ["node", "bridge.js", ...getAdapter("opencode").permission("write").args],
   ];
 

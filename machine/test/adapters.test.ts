@@ -2,25 +2,158 @@
  * v0.8.5（REQ-v0.8.5-2026-09-21-01 · M2 codex / M3 claude）：**wrapper 族两家断言由 wrapper 翻向 ACP**
  * （`protocol:"acp"` / 拉桥进程 / `--risk`+`--mode` 三档 / 平铺 model / 段与配置通道（M4）退役；
  * M3 另含 claude full 档 `--session-meta-json`）。播报面归 M6、**全量全绿归 M7**。
- * 锁 ACP 族（opencode / qoder / codex / claude）的 `buildLaunch` 命令与参数形状、
- * `permission` 三档映射**逐字**断言；并锁协议维度与 backendCmd 必填抛错。
+ * 锁 ACP 族（opencode / qoder-cn / codex / claude）的 `buildLaunch` 命令与参数形状、
+ * `permission` 三档映射**逐字**断言；并锁协议维度与 backendCmd 的**三态解析**（v0.8.6 起）。
  * `getAdapter` 四家可达、恰 4 个不同实例。
+ *
+ * v0.8.6（REQ-v0.8.6-2026-09-21-02 · N2）：**`backendCmd` 由「四 kind 必填」翻向「可选覆盖 + 逐层自动解析」**
+ * ⇒ 原「缺 `backendCmd` ⇒ 抛」类断言一律翻成**三态**（见本文件「入口解析三态锚」段）：
+ * 命中 ⇒ 不抛（脚本入口 = `process.execPath` / 可执行体 = 真身直调）· 未命中 ⇒ 抛且文案含**分层摘要** ·
+ * `backendCmd: ""` ⇒ **回落解析**而非抛。
  */
-import { test } from "node:test";
+import { test, after } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync } from "node:fs";
-import { join } from "node:path";
+import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { dirname, join, resolve } from "node:path";
 import { AGENT_KINDS } from "../agent-kinds.js";
 import { getAdapter } from "../adapters/index.js";
 
 import { appRootFromModule } from "../launcher/app-root.js";
 import { resolveBackendSpawn, SCRIPT_BACKEND_EXTS } from "../adapters/backend-command.js";
+import { BACKEND_LOOKUP_BY_KIND } from "../adapters/backend-entry.js";
 
-import type { LaunchRequest } from "../adapters/types.js";
+import type { AgentKind } from "../types.js";
+import type { LaunchRequest, LaunchSpec } from "../adapters/types.js";
 
+// ---------- REQ-v0.8.6-2026-09-21-02 · N2：adapter 层「入口解析三态」的沙箱 ----------
+// adapter 的 `buildLaunch` 不接 `deps` 形参（纯 fs 注入面在 `test/backend-entry.test.ts`）⇒
+// 本文件的注入面 = **进程环境**（解析器缺省读 `process.env` + 真实 fs）：
+//   `NPM_CONFIG_PREFIX`（L2 首候选）· `APPDATA`（win32 L2 次候选）· `PATH`（L3）·
+//   `HOME` / `USERPROFILE`（qoder `knownPaths` 的 `~` 展开）。
+// ⚠ 残留（改造文档 §5.2-2 / §5.2-4）：L1 = `machine/node_modules`、posix 的两个系统级 npm root
+// **不可由环境覆盖** ⇒ 「逐层均未命中」在本机（win32 + machine 零后端依赖）确定性成立。
 
-/** codex ACP 后端命令样例 = **适配器入口脚本路径**（v0.8.5 · M8 形态归一：`.js` ⇒ 适配器自动以 node 拉起）。 */
-const CODEX_BACKEND_CMD_SAMPLE = "C:/npm/@agentclientprotocol/codex-acp/dist/index.js";
+/** 沙箱根（进程级唯一，退出时删除）。 */
+const SANDBOX = mkdtempSync(join(tmpdir(), "a2a-adapters-entry-"));
+after(() => rmSync(SANDBOX, { recursive: true, force: true }));
+
+/** 空的封层目录（PATH / APPDATA / home 都指向它 ⇒ 除被测层外全部必然 miss）。 */
+const SANDBOX_EMPTY = join(SANDBOX, "empty");
+mkdirSync(SANDBOX_EMPTY, { recursive: true });
+
+/** 落一个 L0 显式夹具（沙箱内真实空文件），返回其绝对路径。
+ *  v0.8.6 真机补正：L0 显式 `backendCmd` **必须存在且是文件**（`rejected-missing` 不回落下层）
+ *  ⇒ 显式值一律用沙箱真文件，不再用假路径 / 裸命令名（裸名 = 删键走 L3 才是 PATH 的正确表达）。 */
+function writeExplicitFixture(rel: string): string {
+  const abs = join(SANDBOX, "explicit", rel);
+  mkdirSync(dirname(abs), { recursive: true });
+  writeFileSync(abs, "", "utf8");
+  return abs;
+}
+
+/** 在沙箱内落真实文件并保持字符串形态为 POSIX 斜杠（与原假夹具 `C:/…` 书写习惯一致）。 */
+function posixFixture(rel: string): string {
+  return writeExplicitFixture(rel).split("\\").join("/");
+}
+
+/** npm 包根的落点：win32 = 前缀目录本身、posix = `前缀/node_modules`（与解析器 `defaultNpmRoots` 同口径）。 */
+function npmRootFor(prefix: string): string {
+  return process.platform === "win32" ? prefix : join(prefix, "node_modules");
+}
+
+/** 在覆盖后的环境下执行 `fn`，结束（含抛错）一律恢复原值。 */
+function withEnv<T>(overrides: Record<string, string | undefined>, fn: () => T): T {
+  const saved = new Map<string, string | undefined>();
+  for (const key of Object.keys(overrides)) saved.set(key, process.env[key]);
+  try {
+    for (const [key, value] of Object.entries(overrides)) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+    return fn();
+  } finally {
+    for (const [key, value] of saved) {
+      if (value === undefined) delete process.env[key];
+      else process.env[key] = value;
+    }
+  }
+}
+
+/** 落一个 npm 包素材（`bin` 单条目 + 真身文件），返回 bin 的绝对路径。 */
+function writeNpmPackage(root: string, pkg: string, binKey: string, binRel: string): string {
+  const pkgDir = join(root, ...pkg.split("/"));
+  const binAbs = resolve(pkgDir, binRel);
+  mkdirSync(dirname(binAbs), { recursive: true });
+  writeFileSync(
+    join(pkgDir, "package.json"),
+    JSON.stringify({ name: pkg, bin: { [binKey]: binRel } }),
+    "utf8",
+  );
+  writeFileSync(binAbs, "", "utf8");
+  return binAbs;
+}
+
+/** 落一个 qoder 真身素材（按平台取 `BACKEND_LOOKUP_BY_KIND` 的 knownPaths 项），返回其绝对路径。 */
+function writeKnownPackage(home: string): string {
+  const spec = BACKEND_LOOKUP_BY_KIND["qoder-cn"];
+  const known = (spec.knownPaths ?? []).find((k) =>
+    k.platform === "win32" ? process.platform === "win32" : process.platform !== "win32",
+  );
+  assert.ok(known, "qoder-cn 表须登记本平台 knownPath");
+  const abs = join(home, ...known.path.slice(2).split("/"));
+  mkdirSync(dirname(abs), { recursive: true });
+  writeFileSync(abs, "", "utf8");
+  return abs;
+}
+
+/** 封空的沙箱环境：只留 `prefix` 这一条 L2 根，其余层（L3 / known / win 全局根）一律指向空目录。 */
+function sealedEnv(prefix: string): Record<string, string> {
+  return {
+    NPM_CONFIG_PREFIX: prefix,
+    APPDATA: SANDBOX_EMPTY,
+    PATH: SANDBOX_EMPTY,
+    HOME: SANDBOX_EMPTY,
+    USERPROFILE: SANDBOX_EMPTY,
+  };
+}
+
+/** 取 `--backend-cmd` / `--backend-args` 的实际值（args[0] 是桥入口绝对路径，运行环境相关）。 */
+function backendPair(spec: LaunchSpec): { cmd: string; args: string[] } {
+  const i = spec.args.indexOf("--backend-cmd");
+  const j = spec.args.indexOf("--backend-args");
+  return {
+    cmd: spec.args[i + 1] ?? "",
+    args: JSON.parse((spec.args[j + 1] ?? "[]") as string) as string[],
+  };
+}
+
+/** 三态锚共用的最小请求（无 `agentConfig`）。 */
+const BARE_REQUEST: LaunchRequest = { projectId: "p1", workspace: "/ws/p1", a2aPort: 4100 };
+
+/** 某 kind 在「逐层均未命中」的沙箱里 `buildLaunch` 的抛错文案。 */
+function missMessage(kind: AgentKind): string {
+  const env = sealedEnv(join(SANDBOX, "miss-prefix"));
+  try {
+    withEnv(env, () => getAdapter(kind).buildLaunch(BARE_REQUEST));
+  } catch (err) {
+    return (err as Error).message;
+  }
+  throw new Error(`${kind}：沙箱内应当解析失败而未失败`);
+}
+
+/** codex ACP 后端命令样例 = **适配器入口脚本路径**（v0.8.5 · M8 形态归一：`.js` ⇒ 适配器自动以 node 拉起；
+ *  v0.8.6 真机补正：L0 存在性门 ⇒ 沙箱真实文件）。 */
+const CODEX_BACKEND_CMD_SAMPLE = posixFixture("codex-acp-entry.js");
+
+/** claude 显式夹具 = 本机 node 真身（可执行体形态 ⇒ `--backend-cmd` 原样透传 + `--backend-args '[]'`）。 */
+const CLAUDE_NODE_CMD = process.execPath;
+
+/** qoder-cn 显式夹具（可执行体真身名，无扩展名 ⇒ 直调 + 桥缺省 `["--acp"]`）。 */
+const QODER_EXPLICIT = posixFixture("qoderclicn");
+
+/** opencode 显式夹具（`.exe` 可执行体 ⇒ 直调 + `["acp"]`）。 */
+const OPENCODE_EXE = posixFixture("opencode.exe");
 
 /** codex 未配 model 时的桥侧参数基线（args[0]=桥入口绝对路径，运行环境相关，单列剔除）。 */
 const CODEX_NO_MODEL_BASELINE = [
@@ -52,13 +185,13 @@ test("getAdapter：AGENT_KINDS 每个成员可达、kind 对应、恰 4 个不�
   assert.equal(new Set(adapters).size, AGENT_KINDS.length);
 });
 
-test("协议维度：opencode/qoder/claude = \"acp\"（v0.8.5 M3 claude 迁桥）", () => {
-  for (const kind of ["opencode", "qoder", "claude"] as const) {
+test('协议维度：opencode/qoder-cn/claude = "acp"（v0.8.5 M3 claude 迁桥）', () => {
+  for (const kind of ["opencode", "qoder-cn", "claude"] as const) {
     assert.equal(getAdapter(kind).protocol, "acp");
   }
 });
 
-test("协议维度：codex = \"acp\"（v0.8.5 M2 codex 迁桥）", () => {
+test('协议维度：codex = "acp"（v0.8.5 M2 codex 迁桥）', () => {
   assert.equal(getAdapter("codex").protocol, "acp");
 });
 
@@ -89,7 +222,7 @@ test("claude buildLaunch（ACP 族）：拉起仓内桥进程 + 可执行体形�
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "node", model: "sonnet" },
+    agentConfig: { backendCmd: CLAUDE_NODE_CMD, model: "sonnet" },
   });
   assert.equal(spec.command, "node");
   assert.ok((spec.args[0] ?? "").endsWith(join("dist", "acp-bridge", "index.js")));
@@ -101,7 +234,7 @@ test("claude buildLaunch（ACP 族）：拉起仓内桥进程 + 可执行体形�
     "--project-id",
     "p1",
     "--backend-cmd",
-    "node",
+    CLAUDE_NODE_CMD,
     "--backend-args",
     "[]",
     "--model",
@@ -126,16 +259,77 @@ test("claude buildLaunch（ACP 族）：configPath 退役 ⇒ 不产出 --config
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "node" },
+    agentConfig: { backendCmd: CLAUDE_NODE_CMD },
   });
   assert.ok(!spec.args.includes("--config"));
   assert.ok(!spec.args.includes("--config-file"));
   assert.ok(!spec.args.includes("--config-segment"));
 });
 
-test("claude buildLaunch：无 agentConfig ⇒ 抛错且信息含 backendCmd（ACP 族必填）", () => {
-  const minimal: LaunchRequest = { projectId: "p1", workspace: "/ws/p1", a2aPort: 4100 };
-  assert.throws(() => getAdapter("claude").buildLaunch(minimal), /backendCmd/);
+// ◄ v0.8.6 反转（REQ-v0.8.6-2026-09-21-02）：原「claude 无 agentConfig ⇒ 抛 /backendCmd/」（必填语义）
+// ⇒ 三态：命中不抛（脚本入口 ⇒ node）/ 未命中抛且文案含分层摘要 / 空串回落解析。
+test("claude buildLaunch：无 agentConfig · L2 命中 ⇒ 不抛，--backend-cmd = node + 脚本入口；全 miss ⇒ 抛且含分层摘要", () => {
+  const prefix = join(SANDBOX, "claude-prefix");
+  const binAbs = writeNpmPackage(
+    npmRootFor(prefix),
+    "@agentclientprotocol/claude-agent-acp",
+    "claude-agent-acp",
+    "dist/index.js",
+  );
+  const spec = withEnv(sealedEnv(prefix), () => getAdapter("claude").buildLaunch(BARE_REQUEST));
+  const pair = backendPair(spec);
+  assert.equal(pair.cmd, process.execPath, "脚本入口 ⇒ 以 node 拉起");
+  assert.deepEqual(pair.args, [binAbs]);
+
+  const msg = missMessage("claude");
+  assert.match(msg, /backendCmd/);
+  assert.match(msg, /L0[\s\S]*L1[\s\S]*L2[\s\S]*L3/, "文案含分层摘要");
+  assert.ok(
+    msg.length <= 300,
+    `分层清单不进 message（self-check singleLine 截 300）：实际 ${msg.length}`,
+  );
+});
+
+test("claude buildLaunch：backendCmd 空串 ⇒ 回落解析而非抛（与读取器宽容口径一致）", () => {
+  const prefix = join(SANDBOX, "claude-prefix");
+  writeNpmPackage(
+    npmRootFor(prefix),
+    "@agentclientprotocol/claude-agent-acp",
+    "claude-agent-acp",
+    "dist/index.js",
+  );
+  const spec = withEnv(sealedEnv(prefix), () =>
+    getAdapter("claude").buildLaunch({ ...BARE_REQUEST, agentConfig: { backendCmd: "" } }),
+  );
+  assert.equal(backendPair(spec).cmd, process.execPath);
+});
+
+// REQ-v0.8.6-2026-09-21-02 真机补正①：L0 显式值必须存在且是文件；不满足 ⇒ 项目级失败收口，
+// **不得静默回落**下层（即使下层备好可命中素材）。裸命令名同样被拒（走 PATH 的正确表达 = 删键）。
+test("L0 显式路径不存在 ⇒ rejected-missing：抛专项文案（含原样路径），下层备好可命中素材也不回落", () => {
+  const prefix = join(SANDBOX, "l0-reject-prefix");
+  writeNpmPackage(
+    npmRootFor(prefix),
+    "@agentclientprotocol/claude-agent-acp",
+    "claude-agent-acp",
+    "dist/index.js",
+  );
+  const fake = join(SANDBOX, "explicit", "not-exists-entry.js");
+  let msg = "";
+  withEnv(sealedEnv(prefix), () => {
+    assert.throws(
+      () => getAdapter("claude").buildLaunch({ ...BARE_REQUEST, agentConfig: { backendCmd: fake } }),
+      /显式 agentConfig\.backendCmd 指向的 ACP 后端入口不存在/,
+    );
+    try {
+      getAdapter("claude").buildLaunch({ ...BARE_REQUEST, agentConfig: { backendCmd: fake } });
+    } catch (err) {
+      msg = (err as Error).message;
+    }
+  });
+  assert.ok(msg.includes(fake.replace(/\\/g, "/")) || msg.includes(fake), `文案须含原样配置值：${msg}`);
+  assert.match(msg, /删除 backendCmd 键/, "文案须引导删键走自动解析");
+  assert.ok(msg.length <= 300, `分层清单不进 message：实际 ${msg.length}`);
 });
 
 test("claude buildLaunch：未配平铺 model ⇒ argv 无 --model（零回退）", () => {
@@ -143,7 +337,7 @@ test("claude buildLaunch：未配平铺 model ⇒ argv 无 --model（零回退�
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "node" },
+    agentConfig: { backendCmd: CLAUDE_NODE_CMD },
   });
   assert.ok(!spec.args.includes("--model"));
 });
@@ -181,12 +375,12 @@ test("claude permission 三档逐字：--risk <档> + --mode <modeId>（三档�
   assert.ok(!getAdapter("claude").permission("write").args.includes("--session-meta-json"));
 });
 
-test("qoder buildLaunch（ACP 族）：拉起仓内桥进程（node + dist/acp-bridge/index.js）", () => {
-  const spec = getAdapter("qoder").buildLaunch({
+test("qoder-cn buildLaunch（ACP 族）：拉起仓内桥进程（node + dist/acp-bridge/index.js）", () => {
+  const spec = getAdapter("qoder-cn").buildLaunch({
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "qoderclicn" },
+    agentConfig: { backendCmd: QODER_EXPLICIT },
   });
   assert.equal(spec.command, "node");
   // 桥入口为绝对路径（appRoot 取决运行环境），只断言尾部稳定段
@@ -199,42 +393,46 @@ test("qoder buildLaunch（ACP 族）：拉起仓内桥进程（node + dist/acp-b
     "--project-id",
     "p1",
     "--backend-cmd",
-    "qoderclicn",
+    QODER_EXPLICIT,
+    // ◄ v0.8.6 反转（REQ-v0.8.6-2026-09-21-02）：接形态归一后 `--backend-args` **显式下发**
+    // （值 = 原桥缺省 ["--acp"] ⇒ 后端命令行逐字不变）。
+    "--backend-args",
+    '["--acp"]',
   ]);
 });
 
-test("qoder buildLaunch：permissionArgs（--risk <档>）追加在基础参数之后", () => {
-  const spec = getAdapter("qoder").buildLaunch({
+test("qoder-cn buildLaunch：permissionArgs（--risk <档>）追加在基础参数之后", () => {
+  const spec = getAdapter("qoder-cn").buildLaunch({
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "qoderclicn" },
-    permissionArgs: getAdapter("qoder").permission("read").args,
+    agentConfig: { backendCmd: QODER_EXPLICIT },
+    permissionArgs: getAdapter("qoder-cn").permission("read").args,
   });
   assert.deepEqual(spec.args.slice(-2), ["--risk", "read"]);
 });
 
-test("qoder permission 三档映射：read/write/full → --risk <档>", () => {
-  assert.deepEqual(getAdapter("qoder").permission("read"), { args: ["--risk", "read"] });
-  assert.deepEqual(getAdapter("qoder").permission("write"), { args: ["--risk", "write"] });
-  assert.deepEqual(getAdapter("qoder").permission("full"), { args: ["--risk", "full"] });
+test("qoder-cn permission 三档映射：read/write/full → --risk <档>", () => {
+  assert.deepEqual(getAdapter("qoder-cn").permission("read"), { args: ["--risk", "read"] });
+  assert.deepEqual(getAdapter("qoder-cn").permission("write"), { args: ["--risk", "write"] });
+  assert.deepEqual(getAdapter("qoder-cn").permission("full"), { args: ["--risk", "full"] });
 });
 
-test("qoder buildLaunch：agentConfig.backendCmd 原样透传（绝对路径）", () => {
-  const spec = getAdapter("qoder").buildLaunch({
+test("qoder-cn buildLaunch：agentConfig.backendCmd 原样透传（绝对路径）", () => {
+  const spec = getAdapter("qoder-cn").buildLaunch({
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "/opt/qoder/qoderclicn" },
+    agentConfig: { backendCmd: QODER_EXPLICIT },
   });
-  assert.equal(spec.args[spec.args.indexOf("--backend-cmd") + 1], "/opt/qoder/qoderclicn");
+  assert.equal(spec.args[spec.args.indexOf("--backend-cmd") + 1], QODER_EXPLICIT);
 });
 
 // ---- REQ-v0.8.2-2026-09-20-01 · M1（协议面增补）：model 走桥 `--model` ⇒ ACP set_config_option ----
 // ---- REQ-v0.8.4-2026-09-20-01 · M3 翻向：读点 = 顶层平铺 agentConfig.model，段内 model = 遗留键 ----
 
 /** ACP 族未配 model 时的桥侧参数基线（args[0]=桥入口绝对路径，运行环境相关，单列剔除）。 */
-const QODER_NO_MODEL_BASELINE = [
+const QODER_CN_NO_MODEL_BASELINE = [
   "--port",
   "4100",
   "--workspace",
@@ -242,11 +440,14 @@ const QODER_NO_MODEL_BASELINE = [
   "--project-id",
   "p1",
   "--backend-cmd",
-  "qoderclicn",
+  QODER_EXPLICIT,
+  // ◄ v0.8.6 反转（REQ-v0.8.6-2026-09-21-02）：qoder 也接形态归一 ⇒ `--backend-args` 显式下发。
+  "--backend-args",
+  '["--acp"]',
 ];
 
-function qoderBridgeArgs(agentConfig: Record<string, unknown> | undefined): string[] {
-  const spec = getAdapter("qoder").buildLaunch({
+function qoderCnBridgeArgs(agentConfig: Record<string, unknown> | undefined): string[] {
+  const spec = getAdapter("qoder-cn").buildLaunch({
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
@@ -255,24 +456,24 @@ function qoderBridgeArgs(agentConfig: Record<string, unknown> | undefined): stri
   return spec.args.slice(1);
 }
 
-test("qoder 平铺 model 已配 ⇒ 下发 --model，值逐字 = 配置值（不再拼后端 argv）", () => {
-  assert.deepEqual(qoderBridgeArgs({ backendCmd: "qoderclicn", model: "provider/model-x" }), [
-    ...QODER_NO_MODEL_BASELINE,
+test("qoder-cn 平铺 model 已配 ⇒ 下发 --model，值逐字 = 配置值（不再拼后端 argv）", () => {
+  assert.deepEqual(qoderCnBridgeArgs({ backendCmd: QODER_EXPLICIT, model: "provider/model-x" }), [
+    ...QODER_CN_NO_MODEL_BASELINE,
     "--model",
     "provider/model-x",
   ]);
 });
 
-test("qoder 平铺 model 已配 + permissionArgs：--model 在 --backend-cmd 后、--risk 前", () => {
-  const spec = getAdapter("qoder").buildLaunch({
+test("qoder-cn 平铺 model 已配 + permissionArgs：--model 在 --backend-cmd 后、--risk 前", () => {
+  const spec = getAdapter("qoder-cn").buildLaunch({
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "qoderclicn", model: "m1" },
-    permissionArgs: getAdapter("qoder").permission("read").args,
+    agentConfig: { backendCmd: QODER_EXPLICIT, model: "m1" },
+    permissionArgs: getAdapter("qoder-cn").permission("read").args,
   });
   assert.deepEqual(spec.args.slice(1), [
-    ...QODER_NO_MODEL_BASELINE,
+    ...QODER_CN_NO_MODEL_BASELINE,
     "--model",
     "m1",
     "--risk",
@@ -280,34 +481,44 @@ test("qoder 平铺 model 已配 + permissionArgs：--model 在 --backend-cmd 后
   ]);
 });
 
-test("qoder model 未配 ⇒ 不下发 --model / --backend-args（argv 逐字 = 基线，桥不发 set）", () => {
-  const args = qoderBridgeArgs({ backendCmd: "qoderclicn" });
-  assert.deepEqual(args, QODER_NO_MODEL_BASELINE);
+// ◄ v0.8.6 反转（REQ-v0.8.6-2026-09-21-02）：原锚同时负向锁「不下发 --backend-args」（qoder 由桥缺省兜底）
+// ⇒ 现由 adapter 显式下发（值不变）；本用例保留「未配 model ⇒ 无 --model、argv 逐字 = 基线」的主轴。
+test("qoder-cn model 未配 ⇒ 不下发 --model（argv 逐字 = 基线，桥不发 set）", () => {
+  const args = qoderCnBridgeArgs({ backendCmd: QODER_EXPLICIT });
+  assert.deepEqual(args, QODER_CN_NO_MODEL_BASELINE);
   assert.ok(!args.includes("--model"));
-  assert.ok(!args.includes("--backend-args"));
-});
-
-test("qoder 平铺 model 非法值（缺键 / 空串 / 非字符串）⇒ 与未配置同路径逐字一致", () => {
-  const invalidCases: Record<string, Record<string, unknown>> = {
-    缺键: { backendCmd: "qoderclicn" },
-    空串: { backendCmd: "qoderclicn", model: "" },
-    数字: { backendCmd: "qoderclicn", model: 42 },
-    null: { backendCmd: "qoderclicn", model: null },
-  };
-  for (const [name, agentConfig] of Object.entries(invalidCases)) {
-    assert.deepEqual(qoderBridgeArgs(agentConfig), QODER_NO_MODEL_BASELINE, `非法值「${name}」应走未配置路径`);
-  }
-});
-
-test("qoder 遗留段内 model（v0.8.4 翻向）⇒ 不生效：argv 逐字 = 未配置基线", () => {
-  assert.deepEqual(
-    qoderBridgeArgs({ backendCmd: "qoderclicn", qoder: { model: "provider/model-x" } }),
-    QODER_NO_MODEL_BASELINE,
+  assert.equal(
+    args[args.indexOf("--backend-args") + 1],
+    '["--acp"]',
+    "kind 级参数由 adapter 显式下发",
   );
 });
 
-test("qoder 旧 -m argv 拼装已撤除（model 唯一通道 = 协议面 set）", () => {
-  const args = qoderBridgeArgs({ backendCmd: "qoderclicn", model: "provider/model-x" });
+test("qoder-cn 平铺 model 非法值（缺键 / 空串 / 非字符串）⇒ 与未配置同路径逐字一致", () => {
+  const invalidCases: Record<string, Record<string, unknown>> = {
+    缺键: { backendCmd: QODER_EXPLICIT },
+    空串: { backendCmd: QODER_EXPLICIT, model: "" },
+    数字: { backendCmd: QODER_EXPLICIT, model: 42 },
+    null: { backendCmd: QODER_EXPLICIT, model: null },
+  };
+  for (const [name, agentConfig] of Object.entries(invalidCases)) {
+    assert.deepEqual(
+      qoderCnBridgeArgs(agentConfig),
+      QODER_CN_NO_MODEL_BASELINE,
+      `非法值「${name}」应走未配置路径`,
+    );
+  }
+});
+
+test("qoder-cn 遗留段内 model（v0.8.4 翻向）⇒ 不生效：argv 逐字 = 未配置基线", () => {
+  assert.deepEqual(
+    qoderCnBridgeArgs({ backendCmd: QODER_EXPLICIT, "qoder-cn": { model: "provider/model-x" } }),
+    QODER_CN_NO_MODEL_BASELINE,
+  );
+});
+
+test("qoder-cn 旧 -m argv 拼装已撤除（model 唯一通道 = 协议面 set）", () => {
+  const args = qoderCnBridgeArgs({ backendCmd: QODER_EXPLICIT, model: "provider/model-x" });
   assert.ok(!args.includes("-m"), "不得再出现后端 -m 旗标");
   assert.ok(!args.some((a) => a.includes('"-m"')), "不得再出现 --backend-args 内的 -m 拼装");
 });
@@ -321,7 +532,7 @@ const OPENCODE_NO_MODEL_BASELINE = [
   "--project-id",
   "p1",
   "--backend-cmd",
-  "opencode.exe",
+  OPENCODE_EXE,
   "--backend-args",
   '["acp"]',
 ];
@@ -333,10 +544,11 @@ function opencodeBridgeArgs(agentConfig: Record<string, unknown>): string[] {
 }
 
 test("opencode 平铺 model 已配 ⇒ 下发 --model（协议面通路对两家同方言启用）", () => {
-  assert.deepEqual(
-    opencodeBridgeArgs({ backendCmd: "opencode.exe", model: "provider/model-x" }),
-    [...OPENCODE_NO_MODEL_BASELINE, "--model", "provider/model-x"],
-  );
+  assert.deepEqual(opencodeBridgeArgs({ backendCmd: OPENCODE_EXE, model: "provider/model-x" }), [
+    ...OPENCODE_NO_MODEL_BASELINE,
+    "--model",
+    "provider/model-x",
+  ]);
 });
 
 test("opencode 平铺 model 已配 + permissionArgs：--model 在 --backend-args 后、--risk 前", () => {
@@ -344,7 +556,7 @@ test("opencode 平铺 model 已配 + permissionArgs：--model 在 --backend-args
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "opencode.exe", model: "m1" },
+    agentConfig: { backendCmd: OPENCODE_EXE, model: "m1" },
     permissionArgs: getAdapter("opencode").permission("read").args,
   });
   assert.deepEqual(spec.args.slice(1), [
@@ -358,20 +570,24 @@ test("opencode 平铺 model 已配 + permissionArgs：--model 在 --backend-args
 
 test("opencode 遗留段内 model（v0.8.4 翻向）⇒ 不生效：argv 逐字 = 未配置基线", () => {
   assert.deepEqual(
-    opencodeBridgeArgs({ backendCmd: "opencode.exe", opencode: { model: "provider/model-x" } }),
+    opencodeBridgeArgs({ backendCmd: OPENCODE_EXE, opencode: { model: "provider/model-x" } }),
     OPENCODE_NO_MODEL_BASELINE,
   );
 });
 
 test('opencode 平铺 model 未配 / 非法 ⇒ argv 逐字 = 基线（后端 argv 恒 ["acp"]，不含 --model）', () => {
   const cases: Record<string, Record<string, unknown>> = {
-    未配: { backendCmd: "opencode.exe" },
-    空串: { backendCmd: "opencode.exe", model: "" },
-    数字: { backendCmd: "opencode.exe", model: 7 },
-    非字符串: { backendCmd: "opencode.exe", model: null },
+    未配: { backendCmd: OPENCODE_EXE },
+    空串: { backendCmd: OPENCODE_EXE, model: "" },
+    数字: { backendCmd: OPENCODE_EXE, model: 7 },
+    非字符串: { backendCmd: OPENCODE_EXE, model: null },
   };
   for (const [name, agentConfig] of Object.entries(cases)) {
-    assert.deepEqual(opencodeBridgeArgs(agentConfig), OPENCODE_NO_MODEL_BASELINE, `「${name}」应走未配置路径`);
+    assert.deepEqual(
+      opencodeBridgeArgs(agentConfig),
+      OPENCODE_NO_MODEL_BASELINE,
+      `「${name}」应走未配置路径`,
+    );
   }
 });
 
@@ -379,17 +595,23 @@ test('opencode 平铺 model 未配 / 非法 ⇒ argv 逐字 = 基线（后端 ar
 
 test("遗留键不生效（谓词口径，与 manager.start 告警同源）：ACP 族 adapter 不消费段内 model", () => {
   assert.ok(
-    !qoderBridgeArgs({ backendCmd: "qoderclicn", qoder: { model: "legacy-m" } }).includes("--model"),
+    !qoderCnBridgeArgs({ backendCmd: QODER_EXPLICIT, "qoder-cn": { model: "legacy-m" } }).includes(
+      "--model",
+    ),
   );
   assert.ok(
-    !opencodeBridgeArgs({ backendCmd: "opencode.exe", opencode: { model: "legacy-m" } }).includes(
+    !opencodeBridgeArgs({ backendCmd: OPENCODE_EXE, opencode: { model: "legacy-m" } }).includes(
       "--model",
     ),
   );
   // 平铺 + 段内并存 ⇒ 只透传平铺值（段内不掺入、不双读）
   assert.deepEqual(
-    qoderBridgeArgs({ backendCmd: "qoderclicn", model: "flat-m", qoder: { model: "legacy-m" } }),
-    [...QODER_NO_MODEL_BASELINE, "--model", "flat-m"],
+    qoderCnBridgeArgs({
+      backendCmd: QODER_EXPLICIT,
+      model: "flat-m",
+      "qoder-cn": { model: "legacy-m" },
+    }),
+    [...QODER_CN_NO_MODEL_BASELINE, "--model", "flat-m"],
   );
 });
 
@@ -414,7 +636,7 @@ test("claude 段内 model = 外部契约 ⇒ 不生效（只读平铺 agentConfi
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "node", claude: { model: "seg-model" } },
+    agentConfig: { backendCmd: CLAUDE_NODE_CMD, claude: { model: "seg-model" } },
   });
   assert.ok(!only.args.includes("--model"), "claude：adapter 不得消费段内 model（只读平铺）");
   // 平铺 + 段内并存 ⇒ 只透传平铺值
@@ -422,42 +644,53 @@ test("claude 段内 model = 外部契约 ⇒ 不生效（只读平铺 agentConfi
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "node", model: "flat-m", claude: { model: "seg-model" } },
+    agentConfig: { backendCmd: CLAUDE_NODE_CMD, model: "flat-m", claude: { model: "seg-model" } },
   });
   assert.equal(both.args[both.args.indexOf("--model") + 1], "flat-m");
 });
 
-test("qoder buildLaunch：无 agentConfig ⇒ 抛错且信息含 backendCmd", () => {
-  const minimal: LaunchRequest = { projectId: "p1", workspace: "/ws/p1", a2aPort: 4100 };
-  assert.throws(() => getAdapter("qoder").buildLaunch(minimal), /backendCmd/);
+// ◄ v0.8.6 反转（REQ-v0.8.6-2026-09-21-02）：原两条「qoder 无 agentConfig / 缺 backendCmd ⇒ 抛」
+// （kind 级必填语义）⇒ 三态。qoder 无 npm 包 ⇒ 命中层 = knownPaths（`~` 由 HOME/USERPROFILE 注入），
+// 形态 = **可执行体真身直调**（`.exe` / posix 无扩展名）。
+test("qoder-cn buildLaunch：无 agentConfig · knownPaths 命中 ⇒ 不抛且真身直调；全 miss ⇒ 抛且含分层摘要", () => {
+  const home = join(SANDBOX, "qoder-home");
+  const known = writeKnownPackage(home);
+  const spec = withEnv(
+    { ...sealedEnv(join(SANDBOX, "qoder-prefix")), HOME: home, USERPROFILE: home },
+    () => getAdapter("qoder-cn").buildLaunch(BARE_REQUEST),
+  );
+  const pair = backendPair(spec);
+  assert.equal(pair.cmd, known, "可执行体形态 ⇒ 真身原样直调（不套 node）");
+  assert.deepEqual(pair.args, ["--acp"]);
+
+  const msg = missMessage("qoder-cn");
+  assert.match(msg, /backendCmd/);
+  assert.match(msg, /L0[\s\S]*known[\s\S]*L3/, "文案含分层摘要（qoder 无 npm 包 ⇒ 不列 L1/L2）");
+  assert.match(msg, /qoderclicn/, "文案点到命令名（≠ kind 名）");
+  assert.ok(msg.length <= 300, `分层清单不进 message：实际 ${msg.length}`);
 });
 
-test("qoder buildLaunch：agentConfig 缺 backendCmd（缺键 / 空串）⇒ 抛错", () => {
-  const missing: LaunchRequest = {
-    projectId: "p1",
-    workspace: "/ws/p1",
-    a2aPort: 4100,
-    agentConfig: { systemPromptAppend: "x" },
-  };
-  const empty: LaunchRequest = {
-    projectId: "p1",
-    workspace: "/ws/p1",
-    a2aPort: 4100,
-    agentConfig: { backendCmd: "" },
-  };
-  assert.throws(() => getAdapter("qoder").buildLaunch(missing), /backendCmd/);
-  assert.throws(() => getAdapter("qoder").buildLaunch(empty), /backendCmd/);
+test("qoder-cn buildLaunch：backendCmd 缺键 / 空串 ⇒ 一律回落解析，不抛（◄ v0.8.6 反转「必填」）", () => {
+  const home = join(SANDBOX, "qoder-home");
+  const known = writeKnownPackage(home);
+  const env = { ...sealedEnv(join(SANDBOX, "qoder-prefix")), HOME: home, USERPROFILE: home };
+  for (const agentConfig of [{ systemPromptAppend: "x" }, { backendCmd: "" }]) {
+    const spec = withEnv(env, () =>
+      getAdapter("qoder-cn").buildLaunch({ ...BARE_REQUEST, agentConfig }),
+    );
+    assert.equal(backendPair(spec).cmd, known, "缺键 / 空串均应回落解析");
+  }
 });
 
 // ---------- v0.8.1 M4：opencode 迁 ACP 桥（与 qoder 同构，差异 = --backend-args + 配置面） ----------
 
-test("opencode buildLaunch（ACP 族）逐字锁定：桥进程 + --backend-args [\"acp\"] + --risk（--config-file/segment 已退役）", () => {
+test('opencode buildLaunch（ACP 族）逐字锁定：桥进程 + --backend-args ["acp"] + --risk（--config-file/segment 已退役）', () => {
   const spec = getAdapter("opencode").buildLaunch({
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
     permissionArgs: getAdapter("opencode").permission("write").args,
-    agentConfig: { backendCmd: "C:/npm/opencode.exe" },
+    agentConfig: { backendCmd: OPENCODE_EXE },
   });
   assert.equal(spec.command, "node");
   // 桥入口为绝对路径（appRoot 取决运行环境），只断言尾部稳定段
@@ -470,7 +703,7 @@ test("opencode buildLaunch（ACP 族）逐字锁定：桥进程 + --backend-args
     "--project-id",
     "p1",
     "--backend-cmd",
-    "C:/npm/opencode.exe",
+    OPENCODE_EXE,
     "--backend-args",
     '["acp"]',
     "--risk",
@@ -483,7 +716,7 @@ test("opencode buildLaunch：无平铺 systemPrompt ⇒ 不注入 --system-promp
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "opencode" },
+    agentConfig: { backendCmd: OPENCODE_EXE },
   });
   assert.ok(!spec.args.includes("--system-prompt"));
   assert.ok(!spec.args.includes("--system-prompt-mode"));
@@ -496,23 +729,39 @@ test("opencode permission 三档映射：read/write/full → --risk <档>（替�
   assert.deepEqual(getAdapter("opencode").permission("full"), { args: ["--risk", "full"] });
 });
 
-test("opencode buildLaunch：backendCmd 必填零硬编码，缺省 ⇒ 抛错且提示 Windows 须 .exe 绝对路径", () => {
-  const minimal: LaunchRequest = { projectId: "p1", workspace: "/ws/p1", a2aPort: 4100 };
-  assert.throws(() => getAdapter("opencode").buildLaunch(minimal), /backendCmd/);
-  assert.throws(
-    () => getAdapter("opencode").buildLaunch({ ...minimal, agentConfig: { backendCmd: "" } }),
-    /backendCmd/,
+// ◄ v0.8.6 反转（REQ-v0.8.6-2026-09-21-02）：原「opencode backendCmd 必填、缺省 / 空串 ⇒ 抛」
+// ⇒ 三态；「Windows 须 .exe 绝对路径」的探针实证**保留为未命中时的指引**（不再出现在成功路径）。
+test('opencode buildLaunch：无 agentConfig · L2 命中 ⇒ 不抛且真身直调 + ["acp"]；全 miss ⇒ 抛且含分层摘要与 .exe 指引', () => {
+  const prefix = join(SANDBOX, "opencode-prefix");
+  const binAbs = writeNpmPackage(npmRootFor(prefix), "opencode-ai", "opencode", "bin/opencode.exe");
+  const spec = withEnv(sealedEnv(prefix), () => getAdapter("opencode").buildLaunch(BARE_REQUEST));
+  const pair = backendPair(spec);
+  assert.equal(pair.cmd, binAbs, "可执行体形态 ⇒ 真身原样直调（不套 node）");
+  assert.deepEqual(pair.args, ["acp"], "kind 级子命令 acp 由形态归一后置");
+
+  const msg = missMessage("opencode");
+  assert.match(msg, /backendCmd/);
+  assert.match(msg, /L0[\s\S]*L1[\s\S]*L2[\s\S]*L3/, "文案含分层摘要");
+  assert.match(msg, /Windows.*\.exe|\.exe.*绝对路径/, "未命中时的 Windows 形态指引仍在文案内");
+  assert.ok(msg.length <= 300, `分层清单不进 message：实际 ${msg.length}`);
+});
+
+test("opencode buildLaunch：backendCmd 空串 ⇒ 回落解析而非抛（◄ v0.8.6 反转「必填」）", () => {
+  const prefix = join(SANDBOX, "opencode-prefix");
+  const binAbs = writeNpmPackage(npmRootFor(prefix), "opencode-ai", "opencode", "bin/opencode.exe");
+  const spec = withEnv(sealedEnv(prefix), () =>
+    getAdapter("opencode").buildLaunch({ ...BARE_REQUEST, agentConfig: { backendCmd: "" } }),
   );
-  assert.throws(
-    () => getAdapter("opencode").buildLaunch(minimal),
-    /Windows.*\.exe|\.exe.*绝对路径/,
-  );
+  assert.equal(backendPair(spec).cmd, binAbs);
 });
 
 // ---------- v0.8.5-2026-09-21-01 · M2：codex 迁 ACP 桥（wrapper → acp） ----------
 
 test("codex buildLaunch（ACP 族）：脚本入口形态 --backend-args [<入口>]（无 kind 级子命令）", () => {
-  assert.deepEqual(codexBridgeArgs({ backendCmd: CODEX_BACKEND_CMD_SAMPLE }), CODEX_NO_MODEL_BASELINE);
+  assert.deepEqual(
+    codexBridgeArgs({ backendCmd: CODEX_BACKEND_CMD_SAMPLE }),
+    CODEX_NO_MODEL_BASELINE,
+  );
 });
 
 test("codex 平铺 model 已配 ⇒ 下发 --model（复用 resolveAcpModel，kind 无关）", () => {
@@ -530,7 +779,11 @@ test("codex 平铺 model 未配 / 非法 ⇒ 不下发 --model（零回退，arg
     非字符串: { backendCmd: CODEX_BACKEND_CMD_SAMPLE, model: null },
   };
   for (const [name, agentConfig] of Object.entries(cases)) {
-    assert.deepEqual(codexBridgeArgs(agentConfig), CODEX_NO_MODEL_BASELINE, `「${name}」应走未配置路径`);
+    assert.deepEqual(
+      codexBridgeArgs(agentConfig),
+      CODEX_NO_MODEL_BASELINE,
+      `「${name}」应走未配置路径`,
+    );
   }
 });
 
@@ -571,16 +824,41 @@ test("codex 三档 argv：read 含 --risk read + --mode read-only + --collaborat
   assert.ok(!full.includes("--collaboration-mode"), "full 档不得下发 --collaboration-mode");
 });
 
-test("codex buildLaunch：backendCmd 必填零硬编码（缺键 / 空串 ⇒ 抛错，文案指适配器 dist/index.js 入口）", () => {
-  const minimal: LaunchRequest = { projectId: "p1", workspace: "/ws/p1", a2aPort: 4100 };
-  assert.throws(() => getAdapter("codex").buildLaunch(minimal), /backendCmd/);
-  assert.throws(() => getAdapter("codex").buildLaunch(minimal), /dist\/index\.js/);
-  assert.throws(
-    () => getAdapter("codex").buildLaunch({ ...minimal, agentConfig: { backendCmd: "" } }),
-    /backendCmd/,
+// ◄ v0.8.6 反转（REQ-v0.8.6-2026-09-21-02）：原「codex backendCmd 必填（缺键 / 空串 ⇒ 抛）」⇒ 三态。
+// 文案仍指到适配器 `dist/index.js` 入口（未命中指引，锚 #6 重测正则）。
+test("codex buildLaunch：无 agentConfig · L2 命中 ⇒ 不抛且 node + 脚本入口；全 miss ⇒ 抛且含分层摘要与 dist/index.js 指引", () => {
+  const prefix = join(SANDBOX, "codex-prefix");
+  const binAbs = writeNpmPackage(
+    npmRootFor(prefix),
+    "@agentclientprotocol/codex-acp",
+    "codex-acp",
+    "dist/index.js",
   );
+  const spec = withEnv(sealedEnv(prefix), () => getAdapter("codex").buildLaunch(BARE_REQUEST));
+  const pair = backendPair(spec);
+  assert.equal(pair.cmd, process.execPath, "脚本入口 ⇒ 以 node 拉起");
+  assert.deepEqual(pair.args, [binAbs]);
+
+  const msg = missMessage("codex");
+  assert.match(msg, /backendCmd/);
+  assert.match(msg, /dist\/index\.js/);
+  assert.match(msg, /L0[\s\S]*L1[\s\S]*L2[\s\S]*L3/, "文案含分层摘要");
+  assert.ok(msg.length <= 300, `分层清单不进 message：实际 ${msg.length}`);
 });
 
+test("codex buildLaunch：backendCmd 空串 ⇒ 回落解析而非抛（◄ v0.8.6 反转「必填」）", () => {
+  const prefix = join(SANDBOX, "codex-prefix");
+  const binAbs = writeNpmPackage(
+    npmRootFor(prefix),
+    "@agentclientprotocol/codex-acp",
+    "codex-acp",
+    "dist/index.js",
+  );
+  const spec = withEnv(sealedEnv(prefix), () =>
+    getAdapter("codex").buildLaunch({ ...BARE_REQUEST, agentConfig: { backendCmd: "" } }),
+  );
+  assert.deepEqual(backendPair(spec), { cmd: process.execPath, args: [binAbs] });
+});
 
 // ---------- v0.8.5-2026-09-21-01 · M8 实现级增补：`backendCmd` 形态归一 ----------
 
@@ -610,7 +888,7 @@ test("resolveBackendSpawn：脚本形态（.js/.mjs/.cjs）⇒ node + 脚本路�
 });
 
 test("codex/claude：backendCmd 为脚本入口 ⇒ --backend-cmd <node 绝对路径> + --backend-args [<脚本入口>]", () => {
-  const script = "C:/npm/@agentclientprotocol/codex-acp/dist/index.js";
+  const script = CODEX_BACKEND_CMD_SAMPLE;
   assert.deepEqual(codexBridgeArgs({ backendCmd: script }), [
     "--port",
     "4100",
@@ -647,7 +925,7 @@ test("codex/claude：backendCmd 为脚本入口 ⇒ --backend-cmd <node 绝对�
 });
 
 test("codex/claude：backendCmd 为可执行体 ⇒ 直调 + --backend-args '[]'（旧形态逐字不变）", () => {
-  const exe = "C:/npm/opencode.exe";
+  const exe = posixFixture("pureexe-form.exe");
   assert.deepEqual(codexBridgeArgs({ backendCmd: exe }), [
     "--port",
     "4100",
@@ -674,7 +952,7 @@ test("codex/claude：backendCmd 为可执行体 ⇒ 直调 + --backend-args '[]'
 
 // ---------- v0.8.5 增补轨（Feature c0e388d7 · 节点 N1）：codex / claude 平铺 systemPrompt(Mode) 接线 ----------
 
-/** claude 未配 model 时的桥侧参数基线（`backendCmd:"node"` ⇒ 可执行体形态，`--backend-args '[]'`）。 */
+/** claude 未配 model 时的桥侧参数基线（`backendCmd` = node 真身 ⇒ 可执行体形态，`--backend-args '[]'`）。 */
 const CLAUDE_BASELINE_N1 = [
   "--port",
   "4100",
@@ -683,7 +961,7 @@ const CLAUDE_BASELINE_N1 = [
   "--project-id",
   "p1",
   "--backend-cmd",
-  "node",
+  CLAUDE_NODE_CMD,
   "--backend-args",
   "[]",
 ];
@@ -732,7 +1010,11 @@ test("codex 平铺 systemPrompt 非法（空串 / 数字 / null）⇒ 与未配�
     非字符串: { backendCmd: CODEX_BACKEND_CMD_SAMPLE, systemPrompt: null },
   };
   for (const [name, agentConfig] of Object.entries(invalid)) {
-    assert.deepEqual(codexBridgeArgs(agentConfig), CODEX_NO_MODEL_BASELINE, `「${name}」应走未配置路径`);
+    assert.deepEqual(
+      codexBridgeArgs(agentConfig),
+      CODEX_NO_MODEL_BASELINE,
+      `「${name}」应走未配置路径`,
+    );
   }
   assert.deepEqual(
     codexBridgeArgs({
@@ -772,12 +1054,12 @@ test("codex systemPrompt 与 --backend-args / permissionArgs 共存互不覆盖�
 });
 
 test("claude 平铺 systemPrompt 已配 ⇒ argv 含 --system-prompt <值>；未配 ⇒ 无该 flag", () => {
-  assert.deepEqual(claudeBridgeArgsN1({ backendCmd: "node", systemPrompt: "be terse" }), [
+  assert.deepEqual(claudeBridgeArgsN1({ backendCmd: CLAUDE_NODE_CMD, systemPrompt: "be terse" }), [
     ...CLAUDE_BASELINE_N1,
     "--system-prompt",
     "be terse",
   ]);
-  const unset = claudeBridgeArgsN1({ backendCmd: "node" });
+  const unset = claudeBridgeArgsN1({ backendCmd: CLAUDE_NODE_CMD });
   assert.deepEqual(unset, CLAUDE_BASELINE_N1);
   assert.ok(!unset.includes("--system-prompt"));
   assert.ok(!unset.includes("--system-prompt-mode"));
@@ -786,11 +1068,11 @@ test("claude 平铺 systemPrompt 已配 ⇒ argv 含 --system-prompt <值>；未
 
 test("claude 平铺 systemPromptMode 已配 ⇒ 下发 --system-prompt-mode；非法 ⇒ 不下发（只留 systemPrompt）", () => {
   assert.deepEqual(
-    claudeBridgeArgsN1({ backendCmd: "node", systemPrompt: "sp", systemPromptMode: "replace" }),
+    claudeBridgeArgsN1({ backendCmd: CLAUDE_NODE_CMD, systemPrompt: "sp", systemPromptMode: "replace" }),
     [...CLAUDE_BASELINE_N1, "--system-prompt", "sp", "--system-prompt-mode", "replace"],
   );
   assert.deepEqual(
-    claudeBridgeArgsN1({ backendCmd: "node", systemPrompt: "sp", systemPromptMode: "bogus" }),
+    claudeBridgeArgsN1({ backendCmd: CLAUDE_NODE_CMD, systemPrompt: "sp", systemPromptMode: "bogus" }),
     [...CLAUDE_BASELINE_N1, "--system-prompt", "sp"],
   );
 });
@@ -800,7 +1082,7 @@ test("claude systemPrompt 与 --backend-args / permissionArgs（full 档）共�
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: "node", systemPrompt: "sp" },
+    agentConfig: { backendCmd: CLAUDE_NODE_CMD, systemPrompt: "sp" },
     permissionArgs: getAdapter("claude").permission("full").args,
   });
   assert.deepEqual(spec.args.slice(1, 11), CLAUDE_BASELINE_N1);
@@ -816,11 +1098,14 @@ test("claude systemPrompt 与 --backend-args / permissionArgs（full 档）共�
   ]);
 });
 
-test("平铺 systemPrompt(Mode) 读点 = 4 家（opencode/qoder/codex/claude）且与 backend-args 形态解析无耦合（N1 接线锚）", () => {
+test("平铺 systemPrompt(Mode) 读点 = 4 家（opencode/qoder-cn/codex/claude）且与 backend-args 形态解析无耦合（N1 接线锚）", () => {
   const root = appRootFromModule(import.meta.url);
-  for (const kind of ["opencode", "qoder", "codex", "claude"]) {
+  for (const kind of ["opencode", "qoder-cn", "codex", "claude"]) {
     const src = readFileSync(join(root, "adapters", `${kind}.ts`), "utf8");
-    assert.ok(src.includes("resolveSystemPrompt(request.agentConfig)"), `${kind} 应读平铺 systemPrompt`);
+    assert.ok(
+      src.includes("resolveSystemPrompt(request.agentConfig)"),
+      `${kind} 应读平铺 systemPrompt`,
+    );
     assert.ok(
       src.includes("resolveSystemPromptMode(request.agentConfig)"),
       `${kind} 应读平铺 systemPromptMode`,

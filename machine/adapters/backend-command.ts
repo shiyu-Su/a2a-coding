@@ -17,8 +17,10 @@
  * - **桥零改动**：两种形态都只经既有 `--backend-cmd` / `--backend-args` 表达，不动 `spawn` 主链。
  * - **`process.execPath` 可含空格**（如 `C:\Program Files\nodejs\node.exe`）—— 它是**单个 argv
  *   元素**（不是命令串），桥按整条路径 spawn ⇒ 无引号雷（已真机实测：桥 ready + `initialize` 往返）。
- * - **不启用范围**：opencode / qoder 当前只走直调形态（其 `opencode.exe` / `qoderclicn.exe` 有
- *   `.exe` 真身）；本模块对它们**暂不接线**（授权范围外）。
+ * - **启用范围**：四条 kind **全部接线**（REQ-v0.8.6-2026-09-21-02 · B2 起，与入口解析
+ *   `./backend-entry.ts` 正交串联：解析器给出真身路径，本模块决定启动形态）。三家 npm 适配器
+ *   的入口通常是 `.js` 脚本 ⇒ 脚本形态；`qoderclicn`（`.exe` / posix 无扩展名真身）与显式填的
+ *   `opencode.exe` ⇒ 直调形态（对可执行体与裸命令名是**恒等变换**）。
  *
  * 本模块**不做存在性 / 取值校验**（与 machine 侧既有纪律一致：校验归调用方与运行期报错）；
  * 路径不存在时由 `spawn` 给出既有的 ENOENT 明确报错。

@@ -1,9 +1,13 @@
 #!/usr/bin/env node
 // a2a-coding 需求流程规范「旁路引入」安装器（零依赖 ESM）
-// 用法：node flow/install/install.mjs --target <项目根> [--host opencode] [--bridge-url <url>] [--dry-run] [--force]
+// 用法：node flow/install/install.mjs --target <项目根> [--host opencode] [--bridge-url <url>] [--group <组名>] [--dry-run] [--force]
 //
 // 硬约束：只增不改。绝不触碰目标项目既有的 CLAUDE.md / AGENTS.md；
 // 宿主配置仅按下述确定性条目追加，且可被 uninstall.mjs 精确还原。
+//
+// 组身份（v0.8.6）：--group 把组名拼为条目 url 的路径首段（…/mcp → …/<组名>/mcp）；
+// 缺省不拼 = 现状 /mcp（未配组环境零破坏）。⚠ 组不是安全边界——桥端点零鉴权，
+// 分组只界定该连接的可见性与派发范围，不是鉴权/授权机制。
 
 import { existsSync, mkdirSync, readFileSync, readdirSync, statSync, writeFileSync } from 'node:fs';
 import path from 'node:path';
@@ -60,22 +64,39 @@ function mcpEntry(bridgeUrl) {
   };
 }
 
+/** 组身份 = url 路径首段（v0.8.6）：…/mcp → …/<组名>/mcp；不传组名则原样返回（现状 /mcp）。 */
+function applyGroup(url, group) {
+  if (!group) return url;
+  if (!/^[A-Za-z0-9_-]+$/.test(group)) fail(`--group 组名不合法：${group}（允许字符集 [A-Za-z0-9_-]+，不得含 /）`);
+  if (['health', 'shutdown', 'runner', 'mcp'].includes(group.toLowerCase())) fail(`--group 组名 "${group}" 与桥的保留首段冲突（health / shutdown / runner / mcp），请改用其它组名`);
+  let u;
+  try {
+    u = new URL(url);
+  } catch {
+    return fail(`--bridge-url 无法解析，无法拼组名段：${url}`);
+  }
+  u.pathname = `/${group}${u.pathname === '/' ? '' : u.pathname}`;
+  return u.toString();
+}
+
 // ---------------------------------------------------------------------------
 // 参数与规划
 // ---------------------------------------------------------------------------
 function parseArgs(argv) {
-  const out = { target: process.cwd(), host: 'opencode', bridgeUrl: DEFAULT_BRIDGE_URL, orchIgnored: false, dryRun: false, force: false };
+  const out = { target: process.cwd(), host: 'opencode', bridgeUrl: DEFAULT_BRIDGE_URL, group: '', orchIgnored: false, dryRun: false, force: false };
   for (let i = 0; i < argv.length; i += 1) {
     const arg = argv[i];
     if (arg === '--target') out.target = argv[++i] ?? fail('--target 需要一个路径参数');
     else if (arg === '--host') out.host = argv[++i] ?? fail('--host 需要一个值');
     else if (arg === '--bridge-url') out.bridgeUrl = argv[++i] ?? fail('--bridge-url 需要一个 URL 参数');
+    else if (arg === '--group') out.group = argv[++i] ?? fail('--group 需要一个组名参数');
     else if (arg === '--orch') { argv[++i] ?? fail('--orch 需要一个路径参数'); out.orchIgnored = true; }
     else if (arg === '--dry-run') out.dryRun = true;
     else if (arg === '--force') out.force = true;
-    else if (arg === '--help' || arg === '-h') { console.log('用法：node flow/install/install.mjs --target <项目根> [--host opencode] [--bridge-url <url>] [--dry-run] [--force]\n  --orch 已弃用（接受并忽略，仅为兼容既有调用）。'); process.exit(0); }
+    else if (arg === '--help' || arg === '-h') { console.log('用法：node flow/install/install.mjs --target <项目根> [--host opencode] [--bridge-url <url>] [--group <组名>] [--dry-run] [--force]\n  --group：把组名写为条目 url 的路径首段（…/mcp → …/<组名>/mcp，组身份=本组视野）；缺省不拼，维持现状 /mcp。\n  ⚠ 组不是安全边界：桥端点零鉴权，分组只界定可见性与派发范围。\n  --orch 已弃用（接受并忽略，仅为兼容既有调用）。'); process.exit(0); }
     else fail(`未知参数：${arg}（用 --help 查看用法）`);
   }
+  out.bridgeUrl = applyGroup(out.bridgeUrl, out.group);
   return out;
 }
 
@@ -185,6 +206,7 @@ function main() {
   console.log('安装完成：');
   for (const a of adds) console.log(`  新增文件  ${toPosix(path.relative(target, a.to))}`);
   for (const c of cfg.changes) console.log(`  配置改动  ${CONFIG_FILE}：${c}`);
+  if (args.group) console.log(`\n提示：本次以组身份安装（url=${args.bridgeUrl}，视野=组 "${args.group}"）。⚠ 组不是安全边界（桥端点零鉴权，只界定可见性/派发范围）。卸载时请给 uninstall.mjs 传同一 --bridge-url ${args.bridgeUrl} 以精确还原。`);
   console.log('\n请重启宿主以加载 instructions 与 mcp.a2a；目标项目既有 CLAUDE.md / AGENTS.md 未被改动。');
 }
 

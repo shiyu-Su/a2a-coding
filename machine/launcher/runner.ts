@@ -80,7 +80,7 @@ export interface RunnerProjectPayload {
   a2aPort: number;
 }
 
-/** 注册载荷中的自检结论（保持 fail-fast：只有自检通过（或跳过）才会走到注册） */
+/** 注册载荷中的自检结论（部分项目失败 `ok=true` 仍注册；仅**全部项目不可用**才不注册） */
 export interface RunnerSelfCheckPayload {
   ok: boolean;
   failures: SelfCheckFailure[];

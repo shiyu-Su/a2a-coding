@@ -13,7 +13,7 @@
 Claude Code 的 MCP server 写在 `mcpServers` 对象里，位置二选一：
 
 - **项目级**：项目根的 `.mcp.json`（随仓库走，建议入库）；
-- **用户级**：`~/.claude.json`；或用命令 `claude mcp add --transport http a2a http://127.0.0.1:8787/mcp` 登记。
+- **用户级**：`~/.claude.json`；或用命令 `claude mcp add --transport http a2a http://127.0.0.1:8787/mcp` 登记（配组环境把 url 写成 `http://127.0.0.1:8787/<组名>/mcp`）。
 
 格式（**严格 JSON，无注释** —— 说明见本文与范例文件名）：
 
@@ -28,7 +28,10 @@ Claude Code 的 MCP server 写在 `mcpServers` 对象里，位置二选一：
 }
 ```
 
-- `url` 指向桥的 MCP HTTP 端点。
+- `url` 指向桥的 MCP HTTP 端点。**一座桥、多个身份**：组身份由 url **路径首段**承载 ——
+  - 未配组环境：`http://127.0.0.1:8787/mcp`（全量入口）；
+  - 配组环境：`http://127.0.0.1:8787/<组名>/mcp`（该连接的项目 / 任务 / Feature / 事件视野限定本组；漏写组名段会被桥以 **403 `group_identity_required`** 拒绝）。
+  - 多个 agent 各以本组身份接桥 ⇒ 注册多个 `mcpServers` 子键、url 各带组名段（键名任意，如 `a2a-teamA`）。**不需要 headers**（身份不进 header，组也不是安全边界）。
 
 ## ② 桥以 HTTP 形态运行
 

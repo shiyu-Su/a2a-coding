@@ -16,8 +16,10 @@ export { A2A_OUTCOME_CONVENTION } from "../agent-outcome.js";
  * 从项目 agentConfig 解析 **ACP 族**后端命令：读**顶层平铺键** `agentConfig.backendCmd`。
  *
  * 键位原则（REQ-v0.8.4-2026-09-20-01 定稿；v0.8.5 段退役后为**唯一**键位口径）：
- * **自消费键（机器读）平铺**。`backendCmd` 为 **ACP 族必填**（代码零硬编码缺省）；
- * 缺键 / 非法 / 空串 → `undefined`（必填判定由调用方负责）。
+ * **自消费键（机器读）平铺**。`backendCmd` 对**四个 kind 一律是「可选覆盖」**（REQ-v0.8.6-2026-09-21-02 · B2
+ * 起：不再必填，未配置时由 `../adapters/backend-entry.ts` 逐层自动解析）；
+ * 缺键 / 非法 / 空串 → `undefined`（⇒ 交调用方回落解析；「解析不到 ⇒ 抛」也归调用方）。
+ * 本函数**只服务 L0 显式层**，自身语义不变。
  */
 export function resolveAcpBackendCmd(
   agentConfig: Record<string, unknown> | undefined,

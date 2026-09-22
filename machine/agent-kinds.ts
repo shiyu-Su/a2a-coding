@@ -8,7 +8,7 @@
  * 与 orch 侧 `orch/types.ts` 的 `AGENT_KINDS` 各自派生、不共享代码；两侧一致性由
  * 回归断言「本地清单 == PROTOCOL.md 锚点」锁定（见改造文档 §2.1）。
  */
-export const AGENT_KINDS = ["opencode", "codex", "claude", "qoder"] as const;
+export const AGENT_KINDS = ["opencode", "codex", "claude", "qoder-cn"] as const;
 
 export type AgentKind = (typeof AGENT_KINDS)[number];
 

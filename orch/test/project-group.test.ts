@@ -66,9 +66,10 @@ function writeConfig(projectGroup: GroupSpec | null): void {
   const machines = MACHINE_IDS.map((machineId) => ({ machineId }));
   const doc: Record<string, unknown> = { machines };
   if (projectGroup !== null) {
+    // v0.8.6 N1 形状：`projectGroup` = **组数组**（每组 { name, members[] }；本套件恒单组）
     const group: Record<string, unknown> = { members: projectGroup.members };
     if (projectGroup.name !== undefined) group["name"] = projectGroup.name;
-    doc["projectGroup"] = group;
+    doc["projectGroup"] = [group];
   }
   writeFileSync(CFG_PATH, JSON.stringify(doc, null, 2), "utf8");
 }

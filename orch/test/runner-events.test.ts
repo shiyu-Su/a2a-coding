@@ -101,14 +101,16 @@ function memberConfig(
   heartbeatTimeoutMs: number,
 ): MachinesConfig {
   const members = [{ machineId, projectId }];
-  const projectGroup: ProjectGroup = {
-    name: null,
-    members,
-    memberKeys: new Set([memberKey(machineId, projectId)]),
-    memberMachineIds: new Set([machineId]),
-    selective: true,
-  };
-  return { ...makeConfig([machine(machineId, token)], heartbeatTimeoutMs), projectGroup };
+  const groups: ProjectGroup[] = [
+    {
+      name: "g1",
+      members,
+      memberKeys: new Set([memberKey(machineId, projectId)]),
+      memberMachineIds: new Set([machineId]),
+      selective: true,
+    },
+  ];
+  return { ...makeConfig([machine(machineId, token)], heartbeatTimeoutMs), groups };
 }
 
 interface Harness {

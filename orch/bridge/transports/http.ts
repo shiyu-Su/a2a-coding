@@ -8,6 +8,10 @@
  *
  * 路由（仅这三条 + Runner 入站分支）：
  * - `POST {path}`（默认 `/mcp`）：MCP JSON-RPC（stateless）；未就绪时 503，非 POST 时 405。
+ *   **v0.8.6 §2.2 B 形态**：MCP 端点亦可写成 **`/<组名>{path}`**（如 `/g1/mcp`）——
+ *   **URL 首段 = 连接身份（组名）**，其余须**恰好等于** `options.path`；`path === options.path`
+ *   ⇒ 无身份。身份经 `coreFor(identity)` 装配每请求内核视图；**配了组而未带身份 ⇒ 403**
+ *   `group_identity_required`（fail-closed，判据由 `identityRequired` 注入；未配组全量接纳照旧）。
  * - `GET /health`：`{ status, role, version }`；`role` 取自 core 租约（`owner` / `follower`）。
  *   就绪信号**晚于** lifecycle 的 `recover()`：未就绪返回 503 + `status="starting"`。
  * - `POST /shutdown`：**仅 loopback 来源**（Windows 无可靠 SIGTERM，优雅停机走此端点，§2.5）；
@@ -61,13 +65,29 @@ export function isLoopbackHostOrAddress(value: string): boolean {
 }
 
 export interface HttpTransportOptions {
-  /** 编排内核（每请求 `createServer(core)` 复用同一内核） */
+  /**
+   * 编排内核**兜底**（未注入 `coreFor` 时使用 = 全量身份视图；生产 http 接线恒走 `coreFor`）。
+   */
   core: BridgeCore;
+  /**
+   * 按连接身份装配内核视图（v0.8.6 §2.2 设计，身份载体 = **URL 路径首段**，非 header）：
+   * `(identity) => BridgeCore`，`identity = null` 表示无身份（`path === options.path`）。
+   * **每请求轻量视图、不按身份缓存 core**（`createCore` 只是领域入口的结构化装配，成本低；
+   * 进程级可变状态共享，见改造文档 B1）。缺省 ⇒ 一律用 `options.core`（未接线形态）。
+   */
+  coreFor?: (identity: string | null) => BridgeCore;
+  /**
+   * 「配了组 ⇒ 必须带身份」判据谓词（v0.8.6 §2.2 G5，fail-closed）：返回 `true` 时，
+   * 匿名请求（`path === options.path`）在 MCP 端点被 **403** `group_identity_required` 拒绝。
+   * 单一来源 = `groups.length > 0`，由 `bridge/index.ts` 注入（配置不可读时按 `true` 处理，
+   * **绝不回退全量接纳**，I2）。缺省 `false` = 全量接纳照旧（未配组语义 / 既有测试形态）。
+   */
+  identityRequired?: () => boolean;
   /** 绑定地址（默认配置为 `127.0.0.1`） */
   host: string;
   /** 绑定端口（`0` = 系统分配，实测用） */
   port: number;
-  /** MCP 端点路径（如 `/mcp`） */
+  /** MCP 端点路径（如 `/mcp`）；组身份形态 = `/<组名>{path}`（首段为身份，其余须恰好等于本值） */
   path: string;
   /** 就绪谓词：lifecycle `start()`（含 `recover()`）完成前为 false */
   isReady: () => boolean;
@@ -109,6 +129,28 @@ function toMessage(err: unknown): string {
 function respondJson(res: ServerResponse, status: number, payload: unknown): void {
   res.writeHead(status, { "content-type": "application/json; charset=utf-8" });
   res.end(JSON.stringify(payload));
+}
+
+/** MCP 端点路径匹配结果（`identity = null` ⇒ 无身份 = `path === options.path` 的匿名入口） */
+export interface McpPathMatch {
+  identity: string | null;
+}
+
+/**
+ * 身份提取（v0.8.6 §2.2 B 形态，**HTTP 层唯一注入点**）：
+ * - `path === optionsPath` ⇒ `{ identity: null }`（无身份；未配组环境的合法全量入口）；
+ * - `path === "/" + identity + optionsPath`（首段非空；其余**恰好**等于 `optionsPath`）⇒ `{ identity }`
+ *   （`/<组名>/mcp`，组名作首段）；首段按构造不含 `/`，「其余恰好相等」即排除任何额外段；
+ * - 其余 ⇒ `undefined`（落后续路由 / 404；尾斜杠 `/<组名>/mcp/` 因余段不精确相等而落 404）。
+ */
+export function matchMcpPath(path: string, optionsPath: string): McpPathMatch | undefined {
+  if (path === optionsPath) return { identity: null };
+  if (!path.startsWith("/")) return undefined; // origin-form 之外（如 absolute-form URI）不截身份
+  const rest = path.slice(1); // 去掉开头 "/"
+  const slash = rest.indexOf("/");
+  if (slash <= 0) return undefined; // 无余段（含纯 "/组名"）或空首段（"//…"）
+  if (rest.slice(slash) !== optionsPath) return undefined;
+  return { identity: rest.slice(0, slash) };
 }
 
 /**
@@ -202,8 +244,9 @@ async function handleRequest(
   options: HttpTransportOptions,
 ): Promise<void> {
   const path = (req.url ?? "").split("?")[0] ?? "";
-  if (path === options.path) {
-    await handleMcpRequest(req, res, options);
+  const mcp = matchMcpPath(path, options.path);
+  if (mcp !== undefined) {
+    await handleMcpRequest(req, res, options, mcp.identity);
     return;
   }
   if (path === "/health") {
@@ -235,24 +278,37 @@ async function handleRequest(
 }
 
 /**
- * MCP 端点（stateless）：每请求新建 `server` + `transport`，应答后两者即弃。
- * 非 POST → 405（含 DELETE：stateless 无会话可终止）；未就绪 → 503（避免客户端在
- * `recover()` 落地前拿到工具面，§2.5 顺序要点）。
+ * MCP 端点（stateless）：每请求新建 `server` + `transport`，应答后两者即弃；
+ * 内核视图按连接身份装配（`coreFor(identity)`，缺省回退 `options.core`）。
+ * 非 POST → 405（含 DELETE：stateless 无会话可终止）；**配了组而未带身份 → 403**
+ * `group_identity_required`（§2.2 G5，先于就绪门——配置级错误不等就绪）；
+ * 未就绪 → 503（避免客户端在 `recover()` 落地前拿到工具面，§2.5 顺序要点）。
  */
 async function handleMcpRequest(
   req: IncomingMessage,
   res: ServerResponse,
   options: HttpTransportOptions,
+  identity: string | null,
 ): Promise<void> {
   if (req.method !== "POST") {
     respondJson(res, 405, { ok: false, error: "method_not_allowed" });
+    return;
+  }
+  if (identity === null && options.identityRequired?.() === true) {
+    respondJson(res, 403, {
+      ok: false,
+      error: "group_identity_required",
+      message:
+        `本机已配置 projectGroup，禁止不带身份直连 ${options.path}：` +
+        `请访问 /<组名>${options.path}（组名见 orch/config/config.json 的 projectGroup[].name）`,
+    });
     return;
   }
   if (!options.isReady()) {
     respondJson(res, 503, { ok: false, error: "bridge_starting" });
     return;
   }
-  const server = createServer(options.core);
+  const server = createServer((options.coreFor ?? (() => options.core))(identity));
   const transport = new StreamableHTTPServerTransport({
     // stateless：不下发 Mcp-Session-Id（宿主客户端据此也不会回带）
     sessionIdGenerator: undefined,

@@ -253,11 +253,11 @@ function httpGetJson(host, port, path, timeoutMs = HTTP_TIMEOUT_MS) {
 }
 
 /**
- * 探测 Launcher 状态：
+ * 探测 Launcher 状态（就绪判据 = `/health` 的 `status` 字段；入站业务路由已退役，不再探测）：
  *   "starting"        /health 200 且 status=starting ⇒ 不清理
- *   "not-ready"       /projects 503 ⇒ 不清理
- *   "ready"           /health 200 且 /projects 200 ⇒ 活 Launcher ⇒ 只列不杀
- *   "unreachable"     /health 不可达（连接拒绝 / 超时 / 非 200）⇒ 候选可清（另受 pidfile 红线约束）
+ *   "ready"           /health 200 且 status=ok ⇒ 活 Launcher ⇒ 只列不杀
+ *   "not-ready"       /health 可达但读不出明确就绪态（非 200 / status 异常）⇒ 不可判，按 fail-safe 不清理
+ *   "unreachable"     /health 不可达（连接拒绝 / 超时）⇒ 候选可清（另受 pidfile 红线约束）
  */
 async function probeLauncher(host, port) {
   const health = await httpGetJson(host, port, "/health");
@@ -265,16 +265,12 @@ async function probeLauncher(host, port) {
   if (health.status === 200 && health.body?.status === "starting") {
     return { state: "starting", detail: "GET /health status=starting" };
   }
-  const projects = await httpGetJson(host, port, "/projects");
-  if (projects !== null && projects.status === 503) {
-    return { state: "not-ready", detail: "GET /projects 503" };
-  }
-  if (health.status === 200 && projects !== null && projects.status === 200) {
-    return { state: "ready", detail: "GET /health + /projects 均 200" };
+  if (health.status === 200 && health.body?.status === "ok") {
+    return { state: "ready", detail: "GET /health status=ok" };
   }
   return {
     state: "not-ready",
-    detail: `未预期的响应（/health=${health.status}, /projects=${projects === null ? "不可达" : projects.status}）`,
+    detail: `未预期的响应（/health=${health.status}, body.status=${health.body?.status ?? "-"}）`,
   };
 }
 

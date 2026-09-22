@@ -2,8 +2,10 @@
  * Launcher 启动自检（REQ-v0.1.1-2026-09-11-03）。
  *
  * 对本机全部已配置项目逐个：`ensure` 拉起 → 经 A2A JSON-RPC 发送一条真实最小任务
- * → 轮询至终态并校验（completed 且响应文本非空）→ `stop` 回收。任一失败 / 超时
- * 记入结果，由入口（launcher/index.ts）在监听端口前 fail-fast 退出（非零）。
+ * → 轮询至终态并校验（completed 且响应文本非空）→ `stop` 回收。任一失败 / 超时记入
+ * 结果（附根因 `cause`）。**粒度（§2.4-⑤ 改判 · REQ-v0.8.6-2026-09-21-02 收口）**：`ok = 至少
+ * 一项可服务`，单项失败不再判负全机；由入口（launcher/index.ts）逐项登记不可用，**仅全部项目
+ * 不可用**这一种机器级故障时 fail-fast 退出（非零）。
  *
  * 线协议：包装器服务端以 legacyCompat 挂载 `/a2a/jsonrpc`（v0.3 兼容），故用原生
  * fetch 直发 v0.3 形状的 `message/send` / `tasks/get`（role "user"、parts
@@ -39,11 +41,25 @@ const POLL_INTERVAL_MS = 1_000;
  */
 const SELF_CHECK_LEDGER_PREFIX = "self-check:";
 
-/** 自检失败明细：项目 + 阶段 + 原因（+ 修复提示） */
+/**
+ * 失败根因分类（REQ-v0.8.6-2026-09-21-02 · §2.4-⑥ F-e）：
+ * `hintFor` 旧版**只按 kind 分流**（模型名非法也走「检查认证」那支），提示与真因不匹配。
+ * 新增本字段后 `hintFor` **先按 cause 分流**、kind 文案仅作兜底。
+ * - `backend-entry`：四层解析未命中 ACP 入口（指向分层清单）；
+ * - `auth`：认证/登录态问题；
+ * - `model`：模型名/参数非法；
+ * - `timeout`：任务未在超时窗内达终态。
+ * `undefined` = 未识别（多为端口/进程级故障），此时 ensure 类走「检查端口」文案。
+ */
+export type SelfCheckCause = "backend-entry" | "auth" | "model" | "timeout";
+
+/** 自检失败明细：项目 + 阶段 + 根因分类 + 原因（+ 修复提示） */
 export interface SelfCheckFailure {
   projectId: string;
   /** 失败阶段：ensure（拉起）/ send（发送）/ settle（执行与校验） */
   stage: "ensure" | "send" | "settle";
+  /** 根因分类（可空 = 未识别，端口/进程级故障）；仅驱动 hintFor 的错误文案分流（REQ-v0.8.6-2026-09-21-02 起不再参与 index.ts 机器级判据） */
+  cause?: SelfCheckCause;
   reason: string;
   hint?: string;
 }
@@ -66,9 +82,20 @@ export interface SelfCheckPass {
 /** 单项目自检结果：失败（SelfCheckFailure，以 stage 判别）或通过（SelfCheckPass） */
 export type SelfCheckOutcome = SelfCheckPass | SelfCheckFailure;
 
+/**
+ * 自检汇总结果。
+ *
+ * **粒度口径（§2.4-⑤ 改判）**：`ok` 由旧的「任一项目失败即全机失败」改为「**至少一项可服务**」——
+ * 单项目失败不再判负全机。`failures` 保留**全量**失败明细（供注册载荷 `selfCheck.failures` 观测），
+ * `unavailable` 为**判定不可用的项目集**（machine 私有面，`index.ts` 据此逐项登记 `manager.unavailable`）；
+ * 当前与 `failures` 同集（每项失败即该项目不可服务），单列以便语义显式、与「全量保留」区分。
+ */
 export interface SelfCheckResult {
+  /** 至少一项可服务（或本机无项目）即 true；全部不可用为 false（机器级故障） */
   ok: boolean;
   failures: SelfCheckFailure[];
+  /** 判定不可用的项目集（machine 私有；不入注册载荷新顶层字段，红线 §2.7-2） */
+  unavailable: SelfCheckFailure[];
 }
 
 function sleep(ms: number): Promise<void> {
@@ -77,8 +104,42 @@ function sleep(ms: number): Promise<void> {
   });
 }
 
-/** 按 agentKind 与失败阶段给出修复提示 */
-function hintFor(kind: ProjectConfig["agentKind"], stage: SelfCheckFailure["stage"]): string {
+/**
+ * 从失败原因文本分类根因（§2.4-⑥ F-e）。顺序敏感：
+ * `backend-entry`（适配器四层解析未命中，文案统一含「ACP 后端入口」+「[backend] 行」）
+ * 先判 → `model`（模型名/参数非法，或 `-32602` 无效参数）→ 端口/进程类**返回 undefined**
+ * （交 ensure 文案）→ `auth`（认证/登录态）。未命中返回 undefined，由 kind 文案兜底。
+ */
+export function classifySelfCheckCause(reason: string): SelfCheckCause | undefined {
+  if (/ACP 后端入口|\[backend\] 行|后端入口/.test(reason)) return "backend-entry";
+  if (/模型|\bmodel\b|-32602|invalid (request )?param/i.test(reason)) return "model";
+  // 端口 / 进程级故障（EADDRINUSE、包装器提前退出等）：非项目根因，交 ensure 文案（机器级判据已收敛为「全部项目不可用」，cause 不再参与）
+  if (/EADDRINUSE|端口|包装器进程提前退出|spawn/i.test(reason)) return undefined;
+  if (/auth|api[ _-]?key|token|认证|登录|login|unauthorized|forbidden|credential|401|403/i.test(reason)) {
+    return "auth";
+  }
+  return undefined;
+}
+
+/** 按根因（cause）分流修复提示；cause 缺省时按 kind + stage 文案兜底（改造文档 §2.4-⑥ F-e） */
+export function hintFor(
+  kind: ProjectConfig["agentKind"],
+  stage: SelfCheckFailure["stage"],
+  cause?: SelfCheckCause,
+): string {
+  switch (cause) {
+    case "backend-entry":
+      return "未能解析到该后端的 ACP 入口（四层：L0 显式 agentConfig.backendCmd / L1 机器本地 / L2 全局 npm / L3 PATH）。见 launcher.log 上方 [backend] 分层清单：安装对应适配器、设 NPM_CONFIG_PREFIX，或显式配置 agentConfig.backendCmd。";
+    case "model":
+      return "模型名/参数非法：检查 agentConfig 的 model 与 provider 参数（如 claude 的 agentConfig.claude.model、codex 的 ~/.codex/config.toml、opencode 的 provider 配置），属参数问题而非凭据问题。";
+    case "auth":
+      return "认证/登录态问题：确认对应 API Key / 登录凭据已注入 Launcher 进程环境（详见该 agentKind 的配置说明）。";
+    case "timeout":
+      return "自检超时：任务未在超时窗内达终态。可提高 launcher.startupCheckTimeoutMs，或检查后端是否响应（认证挂起 / 模型排队亦会表现为超时）。";
+    default:
+      break;
+  }
+  // cause 未知 → kind 文案兜底（保持既有分 kind 的认证/模型指引）
   if (stage === "ensure") {
     return "检查该项目 workspace 是否存在、a2aPort 是否被占用；详见 Launcher 日志中该项目的包装器输出。";
   }
@@ -89,7 +150,7 @@ function hintFor(kind: ProjectConfig["agentKind"], stage: SelfCheckFailure["stag
       return "检查认证与 provider：OPENAI_API_KEY 或 ~/.codex/auth.json；provider / 模型见 ~/.codex/config.toml（可经 agentConfig.codex 覆盖）。";
     case "opencode":
       return "检查 opencode CLI 可用且已登录，provider / 模型配置正确（用户全局或项目 opencode.json）。";
-    case "qoder":
+    case "qoder-cn":
       return "检查 qodercn 认证与登录：把 QODERCN_PERSONAL_ACCESS_TOKEN 注入 Launcher 进程环境（或确认 ~/.qoder-cn/.auth 已 CLI 登录），并确认桥进程 acp-bridge 已随项目拉起（见 Launcher 日志）。";
     default: {
       // 编译期安全网（改造文档 §2.3-4）：新增 kind 时此处 `kind` 不再是 never ⇒ 编译报错。
@@ -133,11 +194,14 @@ async function checkProject(
     const ensured = await manager.ensure(project.projectId);
     endpoint = ensured.endpoint;
   } catch (err) {
+    const reason = errorMessage(err);
+    const cause = classifySelfCheckCause(reason);
     return {
       projectId: project.projectId,
       stage: "ensure",
-      reason: errorMessage(err),
-      hint: hintFor(project.agentKind, "ensure"),
+      cause,
+      reason,
+      hint: hintFor(project.agentKind, "ensure", cause),
     };
   }
 
@@ -180,11 +244,14 @@ async function checkProject(
         taskId = (result as Record<string, unknown>)["id"] as string;
       }
     } catch (err) {
+      const reason = errorMessage(err);
+      const cause = classifySelfCheckCause(reason);
       return {
         projectId: project.projectId,
         stage: "send",
-        reason: errorMessage(err),
-        hint: hintFor(project.agentKind, "send"),
+        cause,
+        reason,
+        hint: hintFor(project.agentKind, "send", cause),
       };
     }
 
@@ -198,11 +265,14 @@ async function checkProject(
         settled = await postJsonRpc(endpoint, "tasks/get", { id: taskId }, remaining());
       }
     } catch (err) {
+      const reason = errorMessage(err);
+      const cause = classifySelfCheckCause(reason);
       return {
         projectId: project.projectId,
         stage: "settle",
-        reason: errorMessage(err),
-        hint: hintFor(project.agentKind, "settle"),
+        cause,
+        reason,
+        hint: hintFor(project.agentKind, "settle", cause),
       };
     }
 
@@ -212,13 +282,18 @@ async function checkProject(
       if (state !== "completed") {
         const timedOut = remaining() <= 0;
         const errorText = singleLine(statusMessageText(settled));
+        const reason = timedOut
+          ? `自检超时（${timeoutMs}ms）：任务未达终态`
+          : `任务终态为 ${state ?? "unknown"}（要求 completed）${errorText ? `：${errorText}` : ""}`;
+        const cause: SelfCheckCause | undefined = timedOut
+          ? "timeout"
+          : classifySelfCheckCause(errorText.length > 0 ? errorText : reason);
         return {
           projectId: project.projectId,
           stage: "settle",
-          reason: timedOut
-            ? `自检超时（${timeoutMs}ms）：任务未达终态`
-            : `任务终态为 ${state ?? "unknown"}（要求 completed）${errorText ? `：${errorText}` : ""}`,
-          hint: hintFor(project.agentKind, "settle"),
+          cause,
+          reason,
+          hint: hintFor(project.agentKind, "settle", cause),
         };
       }
     }
@@ -228,7 +303,7 @@ async function checkProject(
         projectId: project.projectId,
         stage: "settle",
         reason: "任务完成但响应文本为空",
-        hint: hintFor(project.agentKind, "settle"),
+        hint: hintFor(project.agentKind, "settle", undefined),
       };
     }
     return {
@@ -246,8 +321,9 @@ async function checkProject(
 }
 
 /**
- * 启动自检入口：对本机全部项目顺序执行，返回汇总结果（不抛出、不退出，
- * fail-fast 的 process.exit 由入口 launcher/index.ts 决定）。
+ * 启动自检入口：对本机全部项目顺序执行，返回汇总结果（不抛出、不退出）。
+ * **粒度口径（§2.4-⑤）**：`ok = 至少一项可服务`（无项目亦视为 ok）；单项失败**不再判负全机**，
+ * 而是进 `unavailable` 集，由入口 `launcher/index.ts` 逐项登记不可用、仅在机器级故障时 fail-fast 退出。
  */
 export async function runStartupSelfCheck(
   manager: AgentManager,
@@ -265,7 +341,7 @@ export async function runStartupSelfCheck(
     const outcome = await checkProject(manager, project, prompt, timeoutMs);
     if ("stage" in outcome) {
       console.error(
-        `[self-check] ${project.projectId} 失败（${outcome.stage}）：${outcome.reason}`,
+        `[self-check] ${project.projectId} 失败（${outcome.stage}${outcome.cause ? "/" + outcome.cause : ""}）：${outcome.reason}`,
       );
       failures.push(outcome);
     } else {
@@ -274,5 +350,9 @@ export async function runStartupSelfCheck(
       );
     }
   }
-  return { ok: failures.length === 0, failures };
+  // 每项失败即该项目不可服务 → 不可用集当前与 failures 同集（全量保留于 failures 供注册载荷观测）
+  const unavailable = failures;
+  const usable = machine.projects.length - unavailable.length;
+  const ok = machine.projects.length === 0 || usable >= 1;
+  return { ok, failures, unavailable };
 }

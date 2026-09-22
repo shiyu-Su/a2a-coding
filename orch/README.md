@@ -1,13 +1,33 @@
 # orch 单元（MCP 薄桥）
 
-> orch 侧的 MCP 薄桥：连接模型已反转为 **pull**（线协议 2.1）—— 执行机 Launcher 升格为 **Runner**，主动出站连桥（`/runner/register` → `/runner/connect` 长轮询拉命令 → `/runner/result` 回传结果）；桥只做「项目 → 机器」解析、任务入队 / claim 与结果落库，任务态与会话映射落本机 SQLite，再由执行机侧拉起仓内 ACP 桥驱动底层 CLI。启停一律经 `scripts/bridgectl.mjs`（纯 Node ESM、零第三方依赖、无需构建），入口 `dist/bridge/index.js`。
+> orch 侧的 MCP 薄桥：连接模型已反转为 **pull**（线协议 2.2）—— 执行机 Launcher 升格为 **Runner**，主动出站连桥（`/runner/register` → `/runner/connect` 长轮询拉命令 → `/runner/result` 回传结果）；桥只做「项目 → 机器」解析、任务入队 / claim 与结果落库，任务态与会话映射落本机 SQLite，再由执行机侧拉起仓内 ACP 桥驱动底层 CLI。启停一律经 `scripts/bridgectl.mjs`（纯 Node ESM、零第三方依赖、无需构建），入口 `dist/bridge/index.js`。
 
 ## 整体形态
 
-- **接入面**：**常驻 stateless Streamable HTTP**（唯一形态；**stdio 已于 v0.7.1 退役**），桥经 `bridgectl` 常驻，以 **stateless Streamable HTTP** 暴露 MCP（路由 `POST /mcp`、`GET /health`、`POST /shutdown`），宿主经 MCP `type: "remote"` 连接。
+- **接入面**：**常驻 stateless Streamable HTTP**（唯一形态；**stdio 已于 v0.7.1 退役**），桥经 `bridgectl` 常驻，以 **stateless Streamable HTTP** 暴露 MCP（路由 `POST /mcp`、`GET /health`、`POST /shutdown`），宿主经 MCP `type: "remote"` 连接。配组后端点亦可写成 **`POST /<组名>/mcp`**（组身份，见「连接身份与可见性」）。
 - **工具面**：泛型工具 7（`a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` / `a2a_events` / `a2a_wait`）+ Feature 工具组 5（`a2a_feature_create` / `a2a_feature_status` / `a2a_feature_advance` / `a2a_feature_approve` / `a2a_feature_cancel`），静态注册、零重连。
 - **单实例与单调度权**：靠 core 租约（`core.lock`）—— 只有租约持有者运行 scheduler 与 task-watcher；同一 data dir 的第二个实例降级为 `follower`，照常提供 MCP 工具但不跑后台循环。`GET /health` 报当前 `role`（`owner` / `follower`）。
-- **只读工作台**：常驻形态下可另起只读 HTTP 服务（默认仅 `owner`、绑 loopback），只读自桥的 SQLite（含 Runner 注册投影 `runners` / `runner_projects`），不做第二编排入口。
+- **只读工作台**：常驻形态下可另起只读 HTTP 服务（默认仅 `owner`、绑 loopback），只读自桥的 SQLite（含 Runner 注册投影 `runners` / `runner_projects`），不做第二编排入口。**它是运维全量视图，不是身份面**（见「只读工作台（3300）」）。
+
+## 连接身份与可见性
+
+一台桥可同时服务多个编排 agent：`config.json` 顶层 `projectGroup` 段写成**组数组**，每组 `name` + `members[]`（每项 `{machineId, projectId}`）。
+
+- **身份载体 = URL 路径首段**：宿主侧 MCP 的 url 写 `http://<host>:<port>/<组名>/mcp`（默认端口 8787）—— 首段即连接身份，其余须**恰好等于** `transport.http.path`（缺省 `/mcp`）。**没有第二种通道**（不读 header、不复用 Runner token）。
+- **未配组**（`projectGroup` 段缺省）⇒ 只有 `POST /mcp` 一个入口，**全量接纳**：列出与派发覆盖所有已配置机器 / 项目，旧配置零改动可用。
+- **配了组** ⇒
+  - 不带身份的 `POST /mcp` 被 **403 `group_identity_required`** 拒绝（fail-closed；文案指路 `/<组名>/mcp`），**不会**回退成全量；
+  - 带身份的连接**只见本组**：`a2a_projects` / `a2a_tasks` / `a2a_task_status` / `a2a_events` / `a2a_wait` 与 Feature 工具组（**谁建谁见**：`create` 打组归属，`status` / `advance` / `approve` / `cancel` 校验归属）一律按身份收窄；事件收件箱游标随身份分离，互不推走；
+  - 向非本组项目派发 / 查任务 / 取消 ⇒ `project_not_a_member`，文案能区分「非本组成员」与「属另一组（在哪个组）」。
+- **组名未命中任何组**（拼错）⇒ fail-closed 空组：该连接一切操作均被拒，**绝不回退全量接纳**。
+- **组间互斥**：同一 `(machineId, projectId)` 出现在两个组 ⇒ **配置期 fail-fast**（桥拒绝启动，不 bind）。
+- ⚠ **组不是鉴权边界，`/mcp` 零鉴权**：`/<组名>/mcp` 上的组名只决定「视野收窄到哪」，**不决定「谁能连」** —— 任何能访问该端口的进程写上组名即取得该组视野。真正的访问控制（跨机鉴权 / 反向代理）归已登记的「安全与治理」待办，本单元不提供；桥的 loopback 绑定与 Runner 侧 Bearer 是各自独立的另一回事。
+
+## 只读工作台（3300）
+
+- ⚠ **3300 不作为 orch agent 的身份面**：网页接面注入的是**「全量身份」的内核视图**，即**运维全量视图** —— 一眼看全桥所有组的项目 / 任务 / Feature / 事件；**不存在**「按组渲染」的网页入口，也不接受任何身份参数。
+- 要**本组视野**只能走 MCP 端点 `/<组名>/mcp`（见上节），不是在网页上切换。
+- 因此网页侧的可见范围**始终 ⊇** 任一组身份的连接；运维页面用于观察与排障，不用于编排。
 
 ## Runner 反向注册（pull）
 
@@ -30,7 +50,7 @@ Runner（machine，出站）                        Bridge（orch，http transpo
 - **命令族三类**：`dispatch`（派发任务）/ `stop`（停本机**单个项目** Agent）/ `cancel-task`（取消在飞任务）；三类载荷一律携 `commandId`（桥侧 uuid，回执原样带回），`stop` / `cancel-task` 另携 `projectId`；控制命令优先于 claim 下发。
 - **结果回传**：Runner 先落盘 outbox 再回传，**2xx = ack ⇒ 删文件**；桥按 `(machineId, taskId)` 幂等落库（首个终态胜出）；`stop` / `cancel-task` 的回执随下一轮 `connect` 的 `acks[]` 带回（观测通道）。
 - **调度语义**：`a2a_call(mode="execute")` 登记 Feature DAG 节点后**入队**（不直接拨机器），由 Runner 领取；`mode="inquiry"` 同样经队列、`wake` 后尽快下发；无 Runner 在线照常入队、不拒绝（成员 / 配置错仍同步零 I/O fail-fast）。
-- 契约全文见 [PROTOCOL.md](../PROTOCOL.md)（Runner ⇄ Bridge 线协议契约 2.1）。
+- 契约全文见 [PROTOCOL.md](../PROTOCOL.md)（Runner ⇄ Bridge 线协议契约 2.2）。
 
 ## 服务启停
 
@@ -57,6 +77,7 @@ npm run bridge:logs      # 输出日志全文（支持 --lines N / --follow）
 > 实际配置 `config/config.json` 不入库，首次部署从 `config/config.json.default` 复制并填入本机真实值。
 
 - 机器清单 `machines[]`：每项 `machineId` + 可选 `launcherUrl`（出站指挥通道已退役，仅作观测 / 兼容占位）+ `token`（Runner 出站 Bearer，须与 machine 侧 `launcher.bridge.token` 一致）；顶层可选 `runner { holdMs, heartbeatTimeoutMs }`（缺省 `25000` / `60000`）。
+- 顶层可选 `projectGroup`：**组数组** `[{ name, members[] }]`，形状与语义见「连接身份与可见性」；缺省（不写该键）= 无组 = 全量接纳。
 
 ## 启停与就绪语义（统一口径锚点）
 

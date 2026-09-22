@@ -1089,3 +1089,97 @@ test("A2 迁移：四段前向幂等（连续三跑库状态一致）+ 注册表
     cleanupDb(dbPath);
   }
 });
+
+// ---------------------------------------------------------------------------
+// v0.8.6 §2.3 · N4：features.owner_group 归属列（打标 + 幂等迁移 + 列表过滤 fail-closed）
+// ---------------------------------------------------------------------------
+
+test("createFeature 落 owner_group（打标 + 无身份 = NULL + 重跑不改归属）", () => {
+  const store = newStore();
+  try {
+    const tagged = store.createFeature({
+      featureId: "f-owner-g1",
+      title: "有归属",
+      ownerGroup: "g1",
+    });
+    assert.equal(tagged.ownerGroup, "g1", "创建时按连接身份打标 owner_group");
+
+    const orphan = store.createFeature({ featureId: "f-owner-null", title: "无归属" });
+    assert.equal(orphan.ownerGroup, null, "无 ownerGroup 入参 ⇒ NULL（未配组 / 存量语义）");
+
+    // 重跑（ON CONFLICT）不得覆盖已有归属（Feature 谁建谁见，owner 不可变）
+    const reCreate = store.createFeature({
+      featureId: "f-owner-g1",
+      title: "有归属",
+      ownerGroup: "g2",
+    });
+    assert.equal(reCreate.ownerGroup, "g1", "同 featureId 重跑不改归属（owner_group 不进 ON CONFLICT UPDATE）");
+  } finally {
+    store.close();
+  }
+});
+
+test("listFeatures owner_group 过滤：给定组名只见本组（NULL 被排除 = fail-closed）；缺省全量", () => {
+  const store = newStore();
+  try {
+    store.createFeature({ featureId: "a", title: "A", ownerGroup: "g1" });
+    store.createFeature({ featureId: "b", title: "B", ownerGroup: "g2" });
+    store.createFeature({ featureId: "c", title: "C" }); // NULL 无归属（存量）
+
+    const g1 = store.listFeatures({ ownerGroup: "g1" }).map((f) => f.featureId);
+    assert.deepEqual([...g1].sort(), ["a"], "g1 只见自己的 a（b 属另一组、c 无归属都被排除）");
+
+    const g2 = store.listFeatures({ ownerGroup: "g2" }).map((f) => f.featureId);
+    assert.deepEqual(g2, ["b"], "g2 只见自己的 b");
+
+    const all = store.listFeatures().map((f) => f.featureId);
+    assert.deepEqual(
+      [...all].sort(),
+      ["a", "b", "c"],
+      "缺省（未配组匿名 / web 运维视图）⇒ 全量，含 NULL 无归属行",
+    );
+  } finally {
+    store.close();
+  }
+});
+
+test("owner_group 列幂等迁移：老库（无该列）以新代码打开后自动补列，重启不报错", () => {
+  const dbPath = join(tmpdir(), `orch-owner-mig-${process.pid}-${Math.random().toString(36).slice(2)}.sqlite`);
+  try {
+    // 造一个「无 owner_group 列」的老 features 表（模拟配组改造前的库）
+    const legacy = openStoreDatabase(dbPath);
+    legacy.exec(
+      `CREATE TABLE features (
+         feature_id  TEXT PRIMARY KEY,
+         state       TEXT NOT NULL,
+         title       TEXT NOT NULL,
+         requirement TEXT,
+         created_at  TEXT NOT NULL,
+         updated_at  TEXT NOT NULL
+       )`,
+    );
+    legacy
+      .prepare(
+        `INSERT INTO features (feature_id, state, title, requirement, created_at, updated_at)
+         VALUES ('legacy-1', 'completed', '存量', NULL, '2020-01-01T00:00:00.000Z', '2020-01-01T00:00:00.000Z')`,
+      )
+      .run();
+    legacy.close();
+
+    // 以新代码打开 ⇒ ctor try-ALTER 幂等补列，存量行 owner_group = NULL（不回填）
+    const store = new SessionStore(dbPath);
+    try {
+      const got = store.getFeature("legacy-1");
+      assert.ok(got !== null, "存量行仍可读回");
+      assert.equal(got.ownerGroup, null, "补列不回填 ⇒ 存量 owner_group = NULL");
+    } finally {
+      store.close();
+    }
+    // 再开一次：列已存在 ⇒ try-ALTER 命中 catch，不抛（幂等）
+    const again = new SessionStore(dbPath);
+    assert.equal(again.getFeature("legacy-1")?.ownerGroup, null);
+    again.close();
+  } finally {
+    cleanupDb(dbPath);
+  }
+});

@@ -2,6 +2,46 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.8.6] - 2026-09-22
+
+> 主题：**三条需求**（同版串行 `req03 → req02 → req01`）。**① `agentKind` 更名 `qoder` → `qoder-cn`（硬切）**：把国内版构建应有的名字还给 kind，`AGENT_KINDS` 保持 **4 值**、无别名表、旧值两侧均非法，线协议 `2.1 → 2.2`（minor：变更取值集合；**握手只校验主版本 ⇒ 版本号不构成兼容窗口，两端须同窗口切换**）。**② 适配器入口自动解析（`backendCmd` 去手填）**：四个 kind 的入口由机器按**四层链**（L0 显式 → L1 机器本地 → L2 全局 npm 候选表 → L3 PATH）自动解析 ⇒ `backendCmd` 对四者一律降级为**可选覆盖**；**解析期对显式值加存在性校验**（不静默回落）；**自检失败粒度改判 = 单项目失败不再拖垮全机**（机器级退出只保留「全部项目不可用」）。**③ orch 多编排者视野隔离（一桥多组）**：身份载体 = **连接 URL 路径段 `/<组名>/mcp`**（`url` 是所有 MCP 客户端的唯一公共必需项），补齐**四个此前完全无组约束的出口面**（任务列表 / Feature 五工具 / 事件收件箱 / Runner claim）；**Feature 谁建谁见**、**组间成员互斥**、**存量 `owner_group=NULL` 走 fail-closed**。改造文档（三份，均 **final**）：`doc/v0.8.6/agentKind改名为qoder-cn-改造文档.md` · `doc/v0.8.6/适配器入口自动解析-改造文档.md` · `doc/v0.8.6/一桥多组视野隔离-改造文档.md`。
+
+### Changed
+
+- **kind 更名硬切**（req03）：`machine/agent-kinds.ts` / `orch/types.ts` 的 `AGENT_KINDS` 由 `qoder` 换为 **`qoder-cn`**（保持 4 值）；产物随名走 —— `adapters/qoder.ts` → **`adapters/qoder-cn.ts`**、类 `QoderCnAdapter`、常量 `QODER_CN_BACKEND_CMD_REQUIRED`、`model-catalog.json` 段键、`config.json.default` 条目、文档与注释。**产品名/CLI/目录名一律不动**（`qoderclicn` / `~/.qoder-cn` / `.qoder` 是后端真名）。一次性迁移见 `orch/scripts/migrate-agent-kind-qoder-cn.mjs`（缺省 dry-run、`--apply` 才写、可重入；**须在部署新桥之前执行**）。
+- **`backendCmd` 降级为可选覆盖**（req02）：四 adapter 的必填判定统一改 `requireBackendEntry(...)`；**L0 显式值须「存在且是文件」**（否则归 `backend-entry` 类项目级失败、**不静默回落**下层，文案含「后端入口」+ 原样路径）；裸命令名同样被拒（删键即走自动解析）。
+- **自检失败粒度改判**（req02）：机器级退出**只保留「全部项目不可用」**（删掉原「ensure 阶段端口/进程故障」那条机器级判据）；单项目失败 ⇒ 该项目 `unavailable` + 「自检部分通过：可用 N/M」告警，**其余项目照常服务**。**F-e 修**：自检失败提示按 `cause`（`backend-entry` / `auth` / `model` / `timeout`）分流，不再把模型名非法指向认证。
+- **连接身份 = URL 路径段**（req01）：`/<组名>/mcp`（**组名作首段**，其余须恰等于 `options.path`）；**未配组 ⇒ 全量接纳（零破坏）；配了组 ⇒ 未带身份 = 403 `group_identity_required`**；`coreFor(identity)` 每请求轻量视图、**不留双通道**。
+- **四个出口面补齐组约束**（req01）：`a2a_tasks`（成员前置 + `locateProject` 按身份）· `a2a_events` / `a2a_wait`（案 B 读时反查 join，**孤儿事件归全体可见**）· Feature 五工具（create 落 `owner_group`、status/advance/approve/cancel 归属校验 + **`registerFeatureNode` 归属校验**）；**按身份游标 `Map<identity, cursor>`** 与 **`latestEventId(scope)`**（两处同谓词）。
+- **Runner claim 判据**（req01）：由「全局 `selective` 单组」改为「**本机在任一组中的项目**」；**machine 侧零改动**。
+- **文档面**：`PROTOCOL.md` 版本规则由「**扩展**取值集合」扩为「**变更**取值集合（**新增 / 更名 / 移除成员**）」并载明「单向不兼容 + 整包项目级拒绝 + 版本号不构成兼容窗口」；`orch/README.md` 补「一桥多组 / 3300 非身份面 / 组不是鉴权边界」；`machine/README.md` 四层链与「机器级自检只有一种 = 全部项目不可用」；仓根 `README.md` 组配置与宿主接入示例；`flow/**` 宿主接入改「url 带组名段」（`flow/spec/需求流程.md` 零改动，`引擎映射.md §4.1` 补一句限定）。
+
+### Added
+
+- **解析器**（req02）：`machine/adapters/backend-entry.ts` —— kind → 入口表（`opencode-ai` / `@agentclientprotocol/codex-acp` / `@agentclientprotocol/claude-agent-acp` / **qoder-cn → `pathCommand:"qoderclicn"` + 双平台 `knownPaths`**）+ 四层解析 + 逐层 `probes`；**铁律**：绝不回退包 `main`（实测 `claude-agent-acp` 的 `bin=dist/index.js` 而 `main=dist/lib.js`）· PATH 只按适配器命令名查、绝不按 kind 名 · 壳扩展名与桥共享同一常量。
+- **`[backend]` 分层日志**（req02）：随既有启动快照落 `launcher.log`（含 projectId / kind / 层名 / 真身路径；失败给完整逐层清单），**清单不进 Error message**。
+- **组 schema**（req01）：`projectGroup` **沿用键名、形状扩为组数组**（每项 `{name, members[{machineId,projectId}]}`），**组间成员互斥 ⇒ 配置期 fail-fast**；`features.owner_group` 幂等补列（未引入 DDL 版本管理）+ 可选迁移脚本 `orch/scripts/migrate-feature-owner.mjs`（缺省 dry-run）。
+- **单测**：machine `test/backend-entry.test.ts`（21+ 例：`bin`≠`main` / PATH 绝不用 kind 名 / 四层顺序命中即停 / qoder 平台过滤 / 显式路径不存在 ⇒ `rejected-missing` 不回落）、`test/self-check-granularity.test.ts`（粒度 + F-e）；orch `test/http-identity.test.ts`、`test/group-read-scope.test.ts`、`test/mount-ownership-scope.test.ts`（跨组挂载被拒 + 不泄漏他组名 + 零入库 + 零出站）、`test/feature-tools.test.ts`。
+- **回归用例**：`.omo` 新增 `test-v0.8.6-backend-entry.js`（四层链 / 三铁律 / 四 kind 可选 / 分层日志 / 自检粒度 / 三红线 / 文档面 + 真机补正锚），`TESTCASES.md` 新增 TC19。
+
+### Removed
+
+- **别名/兼容机制**（req03 未采纳）：无别名表、无归一谓词、无旧键兼容 —— 硬切（`AGENT_KINDS` 4 值、旧值两侧均非法）。
+- **机器级 fail-fast 的旧判据**（req02）：`fatalEnsureFault`（`stage === "ensure" && cause !== "backend-entry"`）及旧文案「ensure 阶段端口/进程故障」。
+- **「约定目录」解析层**（req02，Step 1 自行取消）：四层链定案为 L0 → L1 → L2 → L3（无该层）。
+- **旧措辞**（发版前清理）：`machine/launcher/index.ts` 与 `scripts/launcherctl.mjs` 的「业务路由 503」表述；`scripts/reaper.mjs` 的 `not-ready = /projects 503` 判据（`/projects` 恒 404 ⇒ 实质不可达，改以 `/health` 的 `status` 判就绪，**逐输入证明 `canClean` 不变**）。
+
+### 门禁与真机
+
+- **门禁**：machine `typecheck` **0** / `npm test` **321/321**（基线 281 → +40）· orch `typecheck` **0** / `npm test` **278 tests（277 pass / 0 fail / 1 skip ≈ POSIX 真 SIGKILL）** · **宿主回归 1183 / 1183 零失败**（`reports/v0.8.6/regression-report.json`；v0.8.5 为 1113 —— 差额来自本版新增两套用例与若干反转/新增断言）。
+- **实现期三类纪律教训（已写进 `planlog.md`）**：**① 节点首发普遍撞 ACP `session/prompt` 600s 传输层超时，重派即收敛**（req02 主轨 7 节点首发全超时、重派 1–4 次全绿；req01 十节点同形）· **② 超时被判 `failed` 后 agent 可能仍在写文件**（实测引擎判死后 37 秒仍有写入）⇒ **重派前须确认「无人在写」**（无该项目的 `acp-bridge` 子进程 + 目标文件 mtime 静默 + CPU 零增量）· **③ 真机窗口（重启 Launcher/桥）与代码改动轨不可交错** —— req02 补正轨的节点曾因用户在改造期重启 Launcher 而成孤儿（引擎不 reconcile），按 playbook `cancel` + 续体重建。
+- **收口复核（两轮独立只读）**：req02 的 F1′ 抽查确认「夹具收口是真用沙箱临时文件解决，无删例 / 无跳例 / 无弱化」（`assert.throws` 10→1 可逐条归因到被需求本体废止的必填语义，其负向语义转由 `missMessage()` 承担）· req01 的 F1 判 **3 红 2 黄**（**跨组写入洞** / 示例配置未同步 / 项目侧文案未接满 / 派发归属注释不实 / 文档与实现偏离）⇒ 补正轨全收、F1′ 复审**总判全收**（3 红均有可执行测试佐证），文档升 **v7/v8**。
+- **真机（Step 3）**：
+  - **req02**（用户一次重启 + 宿主取证，日志 `launcher.log:84991–85050`）：**7/8 项目自检通过仍整机退出**（真机暴露「粒度假改判未覆盖 `ensure` 失败这一支」）⇒ 双修补正后复验 **`自检部分通过：可用 3/5，不可用项目 test_codex,test_badpath`**、**无「机器级自检故障」行**、机器继续服务；两处补正各自生效且原因可分（`test_badpath` 归 `（ensure/backend-entry）` 且**全块无任何 `[agent:test_badpath]` 行** ⇒ 未走到 spawn；`test_codex` 为「路径存在但填错对象」⇒ 降级为项目级）。**mac 侧 `knownPaths` 分支顺带闭环**（mac 去掉 `backendCmd` 后 inquiry 10 秒 completed）。
+  - **req01**（用户配两组 + 重启**编排桥**，未动 Launcher；宿主以直连 HTTP 扮演组身份取证）：**判据 ①–⑦ 全通过** —— 各组只列本组项目（双向无泄漏）· 裸 `/mcp` ⇒ 403 + 指路 · 跨组项目操作 `project_not_a_member` 且文案点名「属另一项目组」· 存量 Feature 配组后列表返回 `[]`（fail-closed）· **Feature 谁建谁见**（跨组 单查/advance/approve/cancel/**execute 挂载** 五路全拒、不泄漏他组名）· 单桥单库 · 事件面不泄漏且 `a2a_wait` 不被误唤醒。**组间互斥「启动即 fail-fast」由用户亲手负向测试补验**（`[a2a-bridge] fatal: [config] projectGroup 组间成员互斥：{ machineId: "win-dev", projectId: "machine" } 同时出现在 projectGroup[0] 与 projectGroup[1]`；`status` 未运行 / pidfile 不存在；还原后恢复）。
+- **未覆盖（不得默算通过）**：**POSIX / macOS 面**（本机 Windows 固有跳过）· **跨机 × 跨 kind 单 Feature 端到端（L3 通过线）** 归 v0.8.7 · **`a2a_events` 首次读的游标语义**（身份首次读基线 = 本组可见队尾 + 严格 `>` ⇒ 队尾那条永不返回；设计为「先订阅后收增量」，须显式传 `since`）· **组间事件隔离的「不被他组唤醒」未真机构造**（`shop-image` 组唯一机器 mac-dev 曾在配组初期离线 ⇒ 产生不了他组事件；单测已覆盖「全局长进、本组长不进」）· **`runner-endpoints.test.ts` / `runner-events.test.ts` 里 `ProjectGroup` 引用性质**（类型 vs 断言，低风险）· **该机 `machine/config/config.json` 的组配置为运行态、不入库**。
+- **同轮新登记（非本版缺陷，已入 `planlog.md`）**：**① 同 project 串行不变式失效**（忙集 SQL 用 `remote_task_id`，而 pull 模型下 Feature 节点该列**全程 NULL** ⇒ 忙集恒空、只余 30s 批次的 `reservedProjects` ⇒ 实际语义「同批互斥、跨批不设防」；真机实证三条同项目节点并发在飞 541s）⇒ **排入 v0.8.7** · **② 孤儿自动结算待核**（桥内已有「领取超期判据」扫描，先核实现状再定是否要修）⇒ **排入 v0.8.7** · **③ pull 模型下任务完成不写 `task.settled` 事件**（最后一条停在 2026-09-18；根因 = `upsertTaskResult` 直接 UPSERT 不 `appendEvent`）⇒ 建议归 v0.8.8 可观测性面。
+
 ## [v0.8.5] - 2026-09-21
 
 > 主题：**wrapper 族（codex / claude）迁 ACP、废弃 A2A 包装器**（单需求 · `REQ-v0.8.5-2026-09-21-01`）。把 codex / claude 的执行链路从「仓外 A2A 包装器」整体换到「**仓内 ACP 桥 + 第三方 ACP 适配器**」，使**四条 kind 执行层同构**（opencode / qoder 直连 CLI 自带的 ACP 入口，codex / claude 经 ACP 适配器再驱动官方 CLI）；`agentConfig.<kind>` 段**及其配置通道整体退役** ⇒ v0.8.4 定下的「自消费键平铺」键位口径在本版**达成终局**。**kind 名 / 线协议 / machine 内 A2A 面零改动**（`PROTOCOL.md` 仅 2 处散文措辞、未 bump）。改造文档：`doc/v0.8.5/包装器族迁移至ACP-改造文档.md`（**v10 final**，边界 R1→R5 五轮收敛 + 两次运行时探针驱动的事实更正）。

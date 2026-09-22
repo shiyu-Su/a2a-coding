@@ -33,7 +33,7 @@
 
 a2a-coding 让开发协作时 orch 只管派发任务；目标项目的执行 Agent 按需拉起，在对应 workspace 实际执行，结果回传 orch，用完退出但会话可继承。架构不依赖「必须跨机器」：同一台机器上跑 orch 与 Launcher 同样成立，链路只是简化为本机调用。
 
-架构为三段式：orch 侧的 MCP 薄桥只做「项目 → 机器」解析与转发；每台执行机器常驻一个 Launcher（Runner），负责本机项目 Agent 的生命周期；Launcher 按 `agentKind` 拉起**仓内 ACP 桥**（`machine/acp-bridge`）—— 四条 kind（opencode / codex / claude / qoder）执行层**同构**：桥以 ACP over stdio 驱动后端（codex / claude 经第三方 ACP 适配器，opencode / qoder 直连其 ACP 入口）。跨机通信走 A2A，orch 的工具面走 MCP，全程无中心注册。三端均已完成真实模型端到端验证（拉起 → 派发 → 执行 → 回传，退出后携带同一 `contextId` 续接）。
+架构为三段式：orch 侧的 MCP 薄桥只做「项目 → 机器」解析与转发；每台执行机器常驻一个 Launcher（Runner），负责本机项目 Agent 的生命周期；Launcher 按 `agentKind` 拉起**仓内 ACP 桥**（`machine/acp-bridge`）—— 四条 kind（opencode / codex / claude / qoder-cn）执行层**同构**：桥以 ACP over stdio 驱动后端（codex / claude 经第三方 ACP 适配器，opencode / qoder-cn 直连其 ACP 入口）。跨机通信走 A2A，orch 的工具面走 MCP，全程无中心注册。三端均已完成真实模型端到端验证（拉起 → 派发 → 执行 → 回传，退出后携带同一 `contextId` 续接）。
 
 ```mermaid
 flowchart TD
@@ -41,7 +41,7 @@ flowchart TD
     ORCH -->|"MCP remote（Streamable HTTP）<br/>泛型工具 7 + Feature 工具组 5"| BRIDGE["MCP 薄桥 · orch/<br/>项目 → 机器解析 · 启动编排 · A2A Client · 任务态落库"]
     BRIDGE -->|"HTTP 长轮询（Runner ⇄ 桥）<br/>POST /runner/register · /runner/connect · /runner/result"| LAUNCHER["每机 Launcher→Runner · machine/<br/>本机项目自持 · Agent 生命周期 · 心跳/拉取"]
     LAUNCHER -->|"拉起 ACP 桥（全 kind 同构）"| WRAP["仓内 ACP 桥 · machine/acp-bridge<br/>+ 各 kind 适配器 / 后端 CLI"]
-    WRAP -->|" ACP over stdio → 适配器 → 后端 CLI<br/>codex / claude / opencode / qoder"| WS["目标 workspace 执行"]
+    WRAP -->|" ACP over stdio → 适配器 → 后端 CLI<br/>codex / claude / opencode / qoder-cn"| WS["目标 workspace 执行"]
     WS -.->|结果经 A2A 回传| BRIDGE
 ```
 
@@ -68,13 +68,13 @@ flowchart TD
 
 ## 功能特性
 
-- ✅ **四 kind 执行 Agent（同构）**：Launcher 按 `agentKind` 统一拉起**仓内 ACP 桥**（`machine/acp-bridge`）—— codex / claude 由桥 spawn 第三方 ACP 适配器（`codex-acp` / `claude-agent-acp`）再驱动后端运行时，opencode / qoder 由桥直连其 ACP 入口（`opencode acp` / `qodercn --acp`）。
+- ✅ **四 kind 执行 Agent（同构）**：Launcher 按 `agentKind` 统一拉起**仓内 ACP 桥**（`machine/acp-bridge`）—— codex / claude 由桥 spawn 第三方 ACP 适配器（`codex-acp` / `claude-agent-acp`）再驱动后端运行时，opencode / qoder-cn 由桥直连其 ACP 入口（`opencode acp` / `qodercn --acp`）。
 - ✅ **静态分布，无中心注册**：项目到机器的映射来自配置，不做自注册、心跳、TTL 或服务发现。
 - ✅ **Runner 反向注册（v0.7.0 pull）**：Launcher 升格 Runner——出站注册（携带 machineId + projects + capabilities + selfCheck + protocolVersion）→ 长轮询拉取任务/指令 → 本地 ensure 执行 → 结果回传（outbox + ack，可重放）；入站 `/projects`·`/ensure`·`/{id}/stop` 退役（404）。
 - ✅ **按需幂等（pull 语义保持）**：命令族 dispatch/stop/cancel-task 均携 commandId；claim 用 CAS 幂等，控制面离线不清在飞任务（心跳失败只降注册态、不触发 stop）。
 - ✅ **常驻桥接入（v0.7.1）**：桥以**常驻进程**运行（`orch/scripts/bridgectl.mjs` 启停），orch 经 MCP `type: "remote"`（stateless Streamable HTTP，默认 `http://127.0.0.1:8787/mcp`）连接；**stdio 形态已退役**（不再由 orch agent 作为子进程拉起）。
 - ✅ **泛型 MCP 工具面**：orch 只经 `a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` / `a2a_events` / `a2a_wait` 通信，agent 增减无需重连或刷新工具面。其中 **`a2a_call` 的 `mode` 必填**（`"inquiry"` 只读询问 / `"execute"` 执行型派发，后者必带 `featureId`）—— **保证"执行必走引擎"**。
-- ✅ **项目组与选择性连接（v0.6.0）**：orch 侧可声明**静态项目组**（`orch/config/config.json` 的 `projectGroup.members`，成员 = `machineId × projectId`）。声明后 orch **只连「有成员的机器」、只用「列名成员的项目」** —— 未列成员的项目**不 ensure、不派发、不出现在 `a2a_projects`**；派发到非成员会**显式失败**（`project_not_a_member`，与「项目不存在」的 `project_not_found` 分开）。**段缺省时行为与旧版完全一致（全量接纳）**。`a2a_projects` 出参新增 `group` 字段（**恒存在**）。**machine 侧零改动、线协议不动、架构约束不变。**
+- ✅ **项目组与选择性连接（v0.6.0 · v0.8.6 扩为一桥多组）**：orch 侧可声明**静态项目组**（`orch/config/config.json` 的 `projectGroup` **组数组**，每项 `{ name, members[] }`，成员 = `machineId × projectId`；**键名沿用、形状由「单组对象」扩为数组**）。声明后 orch **只连「有成员的机器」、只用「列名成员的项目」** —— 未列成员的项目**不 ensure、不派发、不出现在 `a2a_projects`**；派发到非成员会**显式失败**（`project_not_a_member`，与「项目不存在」的 `project_not_found` 分开）。**一桥多组**：一座编排桥同时服务多个 orch agent，**连接身份 = url 路径首段**（`http://127.0.0.1:8787/<组名>/mcp`），带身份的连接只见本组（任务 / 事件 / Feature **谁建谁见**）；未配组 ⇒ `/mcp` 全量接纳（零破坏），**配了组 ⇒ 不带身份 = 403 `group_identity_required`**（fail-closed，不回退全量）。**组间互斥**：同一 `(machineId, projectId)` 只能属一组 ⇒ 配置期 fail-fast。⚠ **组不是鉴权边界**（`/mcp` 零鉴权，组名只收窄视野、不决定「谁能连」；3300 网页面是运维全量视图，不是身份面）。**machine 侧零改动、线协议不动、架构约束不变。**
 - ✅ **Feature 编排**：把一个需求作为 Feature，经状态机 + Task DAG 调度器跨项目自动派发，中途可停下审批 / 澄清；**同 project 粒度串行**（同一时刻最多一个任务在写同一工作区）、跨 project 并行；**失败只冻结依赖闭包**（未派发的下游），不带病继续也不连坐其它 project。
 - ✅ **会话映射持久化**：`contextId ↔ sessionId` 落 SQLite（`node:sqlite`），两侧进程重启均不丢。
 - ✅ **任务态回传与兜底找回**：任务态与结果落库；丢失 `taskId` 句柄可用 `a2a_tasks` 找回。
@@ -97,7 +97,7 @@ flowchart TD
 |----|------|
 | MCP 桥（orch 工具面） | Node.js + TypeScript，官方 `@a2a-js/sdk`（A2A Client）+ `@modelcontextprotocol/sdk` + zod |
 | 每机启动器（Launcher） | Node.js + TypeScript + express，常驻各机，管理本机项目 Agent 生命周期 |
-| 执行层（ACP 桥 + 适配器） | 仓内 ACP 桥 `machine/acp-bridge`（**四条 kind 同构**：v0.8.0 起 qoder、v0.8.1 起 opencode、**v0.8.5 起 codex / claude**）+ 各 kind 适配器 / 后端（`codex-acp` / `claude-agent-acp` / `opencode acp` / `qodercn --acp`），按 `agentKind` 分派；仓外 A2A 包装器已于 v0.8.5 退役 |
+| 执行层（ACP 桥 + 适配器） | 仓内 ACP 桥 `machine/acp-bridge`（**四条 kind 同构**：v0.8.0 起 qoder-cn、v0.8.1 起 opencode、**v0.8.5 起 codex / claude**）+ 各 kind 适配器 / 后端（`codex-acp` / `claude-agent-acp` / `opencode acp` / `qodercn --acp`），按 `agentKind` 分派；仓外 A2A 包装器已于 v0.8.5 退役 |
 | 会话 / 任务存储 | `node:sqlite`（SQLite，桥侧持久化 sessions + tasks + features） |
 | 协议 | A2A（协议 1.0，跨 Agent 通信）；Bridge ⇄ Launcher 走 HTTP 线协议 |
 | 运行时 | Node.js ≥ 22.5（使用内置 `node:sqlite`）、TypeScript、ESM |
@@ -109,10 +109,10 @@ flowchart TD
 - Node.js ≥ 22.5（会话 / 任务库用内置 `node:sqlite`）。
 - **orch agent 与 `orch/`（MCP 桥）的连接**：**唯一形态 = 常驻桥 + MCP `type: "remote"`（stateless Streamable HTTP，默认 `http://127.0.0.1:8787/mcp`）**；stdio 形态已随 v0.7.1 退役，桥不再由 orch agent 作为子进程拉起。桥须经 `orch/scripts/bridgectl.mjs` 常驻启动（`cd orch && npm run bridge:start -- --no-wait`，再 `npm run bridge:status` 确认就绪，见[常驻部署形态](#常驻部署形态)）。连接不再要求桥与 orch agent 同机：桥可运行在任意可达主机（默认只绑 `127.0.0.1`，非 loopback 暴露须反代 + 鉴权）。执行机器（Launcher + 项目 Agent）可在本机或远端。
 - 执行机器按项目 `agentKind` 准备对应的 CLI 与认证（Launcher 从自身进程环境继承）：
-  - `opencode`（v0.8.1 起走 ACP 桥）：PATH 上有 `opencode` CLI；Launcher 拉起**仓内 ACP 桥**（`machine/acp-bridge`），ACP 桥内部 spawn `opencode acp`（不再拉起 `opencode serve` 前置后端，该 sidecar 已随迁 ACP 退役）。`agentConfig.backendCmd` **必填**且 Windows 下建议用 `opencode.exe` 绝对路径（npm 裸 PATH 只有 .cmd/.ps1 壳，ACP 桥无 shell 直调会 ENOENT）。模型写在该项目**平铺** `agentConfig.model`（v0.8.4 起由 `agentConfig.opencode.model` 迁入平铺，值形如 `providerID/modelID`，见下「per-project 模型」；段内遗留键随 v0.8.5 段退役，一律不生效）。
-  - `qoder`（v0.8.0 起走 ACP 桥）：`agentConfig.backendCmd` 指向 `qoderclicn.exe` 绝对路径；模型写在该项目**平铺** `agentConfig.model`（v0.8.4 起由 `agentConfig.qoder.model` 迁入平铺，取值为 `machine/config/model-catalog.json` 里的 modelId，如 `qmodel_38max`；段内遗留键随 v0.8.5 段退役，一律不生效）。
-  - `codex`（v0.8.5 起走 ACP 桥）：由第三方 **ACP 适配器 `codex-acp`** 承载（适配器自带 `@openai/codex` 运行时，**无需在 PATH 安装全局 `codex` CLI**；改 codex 版本 = 改适配器依赖版本）。`agentConfig.backendCmd` **必填**，指向适配器入口 —— Windows 下须用 `node <adapter>/dist/index.js`（或 `.exe`）绝对路径：`.cmd` / `.ps1` 壳在无 shell spawn 下会 `ENOENT`。模型写在该项目**平铺** `agentConfig.model`（见 `machine/config/model-catalog.json` 的 codex 段）。认证 / 自定义网关沿用 codex 自身配置（`OPENAI_API_KEY`，或 `codex login` 生成的 `~/.codex/auth.json`）：网关经 `~/.codex/config.toml` 的 `[model_providers.*]` 配置，`base_url` 须为 OpenAI 兼容地址，注意 codex 会在其后拼接 `/responses`（`wire_api = "responses"`），网关地址需含版本段（如 `https://…/v1`）。
-  - `claude`（v0.8.5 起走 ACP 桥）：由第三方 **ACP 适配器 `claude-agent-acp`** 承载（适配器自带 Claude Code 运行时，**无需在 PATH 安装全局 `claude` CLI**）。`agentConfig.backendCmd` **必填**（Windows 下用 `node <adapter>/dist/index.js` 绝对路径）。默认**加载用户级配置**（读取 `~/.claude/settings.json` 的模型 / 网关 / 认证 `env`），交互式 Claude Code 已配好的用户开箱即用；模型写在该项目**平铺** `agentConfig.model`（`default` / `opus` / `fable` / `sonnet` / `haiku`，见 `machine/config/model-catalog.json` 的 claude 段）。
+  - `opencode`（v0.8.1 起走 ACP 桥）：PATH 上有 `opencode` CLI；Launcher 拉起**仓内 ACP 桥**（`machine/acp-bridge`），ACP 桥内部 spawn `opencode acp`（不再拉起 `opencode serve` 前置后端，该 sidecar 已随迁 ACP 退役）。`agentConfig.backendCmd` 为**可选覆盖**（v0.8.6 起缺省按四层链自动解析 `opencode-ai` 的 ACP 入口；显式填写时 Windows 下用 `opencode.exe` 绝对路径——npm 裸 PATH 只有 .cmd/.ps1 壳，ACP 桥无 shell 直调会 ENOENT）。模型写在该项目**平铺** `agentConfig.model`（v0.8.4 起由 `agentConfig.opencode.model` 迁入平铺，值形如 `providerID/modelID`，见下「per-project 模型」；段内遗留键随 v0.8.5 段退役，一律不生效）。
+  - `qoder-cn`（v0.8.0 起走 ACP 桥）：`agentConfig.backendCmd` 为**可选覆盖**（v0.8.6 起自动解析：已知安装位置白名单 —— win `~/.qoder-cn/bin/qoderclicn/qoderclicn.exe` · mac `~/.local/bin/qoderclicn` —— 加 PATH 命令名 `qoderclicn`；装在非标准位置时显式填 `qoderclicn.exe` 绝对路径覆盖）；模型写在该项目**平铺** `agentConfig.model`（v0.8.4 起由 `agentConfig.qoder-cn.model` 迁入平铺，取值为 `machine/config/model-catalog.json` 里的 modelId，如 `qmodel_38max`；段内遗留键随 v0.8.5 段退役，一律不生效）。
+  - `codex`（v0.8.5 起走 ACP 桥）：由第三方 **ACP 适配器 `codex-acp`** 承载（适配器自带 `@openai/codex` 运行时，**无需在 PATH 安装全局 `codex` CLI**；改 codex 版本 = 改适配器依赖版本）。`agentConfig.backendCmd` 为**可选覆盖**（v0.8.6 起缺省按四层链自动解析适配器入口；显式填写时指向其 `dist/index.js` 绝对路径 ⇒ 适配器自动以 node 拉起，npm 产的 `.cmd` / `.ps1` 壳在无 shell spawn 下会 `ENOENT`）。模型写在该项目**平铺** `agentConfig.model`（见 `machine/config/model-catalog.json` 的 codex 段）。认证 / 自定义网关沿用 codex 自身配置（`OPENAI_API_KEY`，或 `codex login` 生成的 `~/.codex/auth.json`）：网关经 `~/.codex/config.toml` 的 `[model_providers.*]` 配置，`base_url` 须为 OpenAI 兼容地址，注意 codex 会在其后拼接 `/responses`（`wire_api = "responses"`），网关地址需含版本段（如 `https://…/v1`）。
+  - `claude`（v0.8.5 起走 ACP 桥）：由第三方 **ACP 适配器 `claude-agent-acp`** 承载（适配器自带 Claude Code 运行时，**无需在 PATH 安装全局 `claude` CLI**）。`agentConfig.backendCmd` 为**可选覆盖**（v0.8.6 起缺省按四层链自动解析适配器入口；显式填写时用其 `dist/index.js` 绝对路径 ⇒ 适配器自动以 node 拉起）。默认**加载用户级配置**（读取 `~/.claude/settings.json` 的模型 / 网关 / 认证 `env`），交互式 Claude Code 已配好的用户开箱即用；模型写在该项目**平铺** `agentConfig.model`（`default` / `opus` / `fable` / `sonnet` / `haiku`，见 `machine/config/model-catalog.json` 的 claude 段）。
 - `agentConfig.<kind>` 段（`agentConfig.codex` / `agentConfig.claude` 等）已于 v0.8.5 **整体退役** —— 旧段内键（含 `codex.skipGitRepoCheck`、`claude.settingSources`、段内 `model`）不再被读取；codex 项目在**非 git workspace** 下的可用性列为 v0.8.5 待复核项（见改造文档 §4.2-16）。
 - orch（**任意支持 MCP `type: "remote"`（Streamable HTTP）的 agent**，如 opencode / Claude Code / Codex / Cursor）与执行机器的 CLI 都已配好模型 provider，否则无法调用模型。
 - Windows / macOS 均可，单元内的 CLI 参数已做跨平台处理。
@@ -167,7 +167,7 @@ npm run bridge:status               # 确认就绪（pid / host:port / health / 
 }
 ```
 
-`url` 默认即 `http://127.0.0.1:8787/mcp`（= `transport.http` 的 `host:port/path`，见下）；桥可运行在任意可达主机，改 `url` 指向实际地址即可（默认只绑 loopback，跨机暴露须反向代理 + 鉴权）。若 orch 不是 opencode，按该 agent 登记 remote MCP server / Streamable HTTP 端点的方式配置同一 URL 即可，桥本身不绑定任何宿主。仓库内 `orch/opencode.json.example` 与根 `opencode.json.example` 都是把 `mcp.a2a` 配进 orch 的样例。
+`url` 默认即 `http://127.0.0.1:8787/mcp`（= `transport.http` 的 `host:port/path`，见下）；桥可运行在任意可达主机，改 `url` 指向实际地址即可（默认只绑 loopback，跨机暴露须反向代理 + 鉴权）。若 orch 不是 opencode，按该 agent 登记 remote MCP server / Streamable HTTP 端点的方式配置同一 URL 即可，桥本身不绑定任何宿主。**桥配了项目组（`projectGroup` 组数组）时，url 把组名写在路径首段** —— `http://127.0.0.1:8787/<组名>/mcp`（身份由 url 决定、一座桥可同时接多个 orch agent；未配组仍写 `/mcp` 即全量接纳，详见下「配置说明」`projectGroup` 行）。仓库内 `orch/opencode.json.example` 与根 `opencode.json.example` 都是把 `mcp.a2a` 配进 orch 的样例。
 
 > **唯一接入形态（v0.7.1）**：**常驻桥 + MCP `type: "remote"`**（stateless Streamable HTTP，默认绑 `127.0.0.1`、端口 `8787`、路由 `/mcp`）。stdio 形态已退役：桥不再作为 orch agent 的子进程拉起，`transport.mode = "stdio"` 会被拒绝（fail-fast）。常驻部署见[常驻部署形态](#常驻部署形态)。
 
@@ -281,11 +281,11 @@ node flow/install/uninstall.mjs --target <项目根>
 | `projects[]` | 本机项目列表 | - | 是 |
 | `projects[].projectId` | 项目标识，全局唯一 | - | 是 |
 | `projects[].workspace` | 执行目录 | - | 是 |
-| `projects[].agentKind` | `opencode` / `codex` / `claude` / `qoder` | - | 是 |
+| `projects[].agentKind` | `opencode` / `codex` / `claude` / `qoder-cn` | - | 是 |
 | `projects[].a2aPort` | 该项目 A2A Server 监听端口 | - | 是 |
 | `projects[].risk` | 项目风险档位，`read` / `write` / `full`，由**适配器**映射为 **ACP 会话模式**（经 ACP 桥 `--mode` 下发），决定可读 / 可写 / 全权限；映射表见下「`risk` 到各端权限 / 模式的映射」 | `write` | 否 |
 | `projects[].agentConfig` | 项目级运行参数（**v0.8.5 起全 kind 统一平铺，无 `agentConfig.<kind>` 段**）：平铺键由 Launcher / ACP 桥自消费（如 `model` / `backendCmd` / `systemPrompt` / `systemPromptMode`），旧段内键（`events` / `timeouts` / `agentCard` / `codex.*` / `claude.*` / 段内 `model`）随段退役。Launcher **不再生成** `agents/<agentKind>.<projectId>.json`、**不再传** `--config-file` / `--config-segment`；自定义注入改走「平铺键 + 桥 flag」。键位明细见 `machine/README.md` | - | 否 |
-| `projects[].agentConfig.model` | **per-project 模型名（v0.8.5 起四条 kind 统一平铺键）**：值 = 后端自己的 modelId（opencode 形如 `providerID/modelID`；qoder / codex / claude 取 `machine/config/model-catalog.json` 的 key）。适配器原样透传 `--model` ⇒ ACP 桥在每次会话建立后（`session/new` / `load` / `resume` 三路）发一次 ACP `session/set_config_option { configId: "model" }`（set 是 per-session，恢复路径不假设后端保持模型）。值**不校验、不映射**（`-m` 吃显示名、协议面吃 modelId，两家取值口径不同 ⇒ 统一只走协议面，后端 argv 不再拼 `-m`）；**不配 / 空串 ⇒ ACP 桥完全不发该请求**，走后端自身默认。配错（无效 modelId）⇒ **任务明确失败**（fail-fast，不静默回落）。**v0.8.4 起由 `agentConfig.<kind>.model` 迁入平铺、v0.8.5 收口至全 kind**：段内 `model`（含 codex / claude）**一律不生效**（段已退役，Launcher 不再读取） | - | 否 |
+| `projects[].agentConfig.model` | **per-project 模型名（v0.8.5 起四条 kind 统一平铺键）**：值 = 后端自己的 modelId（opencode 形如 `providerID/modelID`；qoder-cn / codex / claude 取 `machine/config/model-catalog.json` 的 key）。适配器原样透传 `--model` ⇒ ACP 桥在每次会话建立后（`session/new` / `load` / `resume` 三路）发一次 ACP `session/set_config_option { configId: "model" }`（set 是 per-session，恢复路径不假设后端保持模型）。值**不校验、不映射**（`-m` 吃显示名、协议面吃 modelId，两家取值口径不同 ⇒ 统一只走协议面，后端 argv 不再拼 `-m`）；**不配 / 空串 ⇒ ACP 桥完全不发该请求**，走后端自身默认。配错（无效 modelId）⇒ **任务明确失败**（fail-fast，不静默回落）。**v0.8.4 起由 `agentConfig.<kind>.model` 迁入平铺、v0.8.5 收口至全 kind**：段内 `model`（含 codex / claude）**一律不生效**（段已退役，Launcher 不再读取） | - | 否 |
 
 `risk` 到各端权限 / 模式的映射（**v0.8.5 起四条 kind 同构**：`risk` 由**适配器**映射为 ACP **会话模式**、经 ACP 桥 `--mode` 下发；**映射表唯一落点 = 适配器**，桥对 kind 无知）。`write` 为默认：
 
@@ -297,7 +297,7 @@ node flow/install/uninstall.mjs --target <项目根>
 
 > **codex `read` 档 = 可读、不可写（已由决定性组合探针验证）**：`mode=read-only` + `collaboration_mode=plan` + 客户端全拒 + 带写意图 ⇒ **文件不落盘、只输出计划**。两点须注意：① 终态是 **`end_turn`**（后端把拒绝释为「保持 plan 模式」，模型只给出计划），**不是** `cancelled`；② 因此上层**不得把「只出计划」误当成功**（§4.2-17，待验）。完整组合探针结论见改造文档 §4.2-4 / §6.1。
 > **claude `full` 档**：`bypassPermissions` 经桥 `--session-meta-json` 下发 `session/new` 的 `_meta`（new / load / resume 三路统一携带，否则经 `load` / `resume` 的会话会静默降级）；旧段键 `claude.dangerouslyAllowBypassPermissions` 随段退役。
-> **四 kind 执行层同构**：由**仓内自持 ACP 桥** `machine/acp-bridge/` 承担 A2A 服务面（桥绑定项目 `a2aPort`，以 ACP over stdio 驱动 `backendCmd`）：codex / claude 的 `backendCmd` = 第三方 ACP 适配器（`codex-acp` / `claude-agent-acp`），opencode / qoder = CLI 自带 ACP 入口（`opencode acp` / `qodercn --acp`）。`risk` 经桥 `--risk <read|write|full>` 透传（同时决定 ACP 权限应答策略）。opencode 认证沿用 `opencode` 自身配置；qoder 优先文件凭据 `~/.qoder-cn/.auth`，备选 env `QODERCN_PERSONAL_ACCESS_TOKEN`（经 Launcher 进程环境透传）；codex / claude 认证沿用各自 CLI 配置（`~/.codex/auth.json` / `~/.claude/settings.json`）。示例见 `machine/config/config.json.default`。
+> **四 kind 执行层同构**：由**仓内自持 ACP 桥** `machine/acp-bridge/` 承担 A2A 服务面（桥绑定项目 `a2aPort`，以 ACP over stdio 驱动 `backendCmd`）：codex / claude 的 `backendCmd` = 第三方 ACP 适配器（`codex-acp` / `claude-agent-acp`），opencode / qoder-cn = CLI 自带 ACP 入口（`opencode acp` / `qodercn --acp`）。`risk` 经桥 `--risk <read|write|full>` 透传（同时决定 ACP 权限应答策略）。opencode 认证沿用 `opencode` 自身配置；qoder-cn 优先文件凭据 `~/.qoder-cn/.auth`，备选 env `QODERCN_PERSONAL_ACCESS_TOKEN`（经 Launcher 进程环境透传）；codex / claude 认证沿用各自 CLI 配置（`~/.codex/auth.json` / `~/.claude/settings.json`）。示例见 `machine/config/config.json.default`。
 
 样例：
 
@@ -323,13 +323,13 @@ node flow/install/uninstall.mjs --target <项目根>
 
 ### orch：`orch/config/config.json`
 
-orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自持（实际配置 `config/config.json` 不入库，首次部署从 `config/config.json.default` 复制并填入真实机器地址）。字段为 `machines[]`（每项含 `machineId` + `launcherUrl`）与可选的 `transport`（桥接入面，见[常驻部署形态](#常驻部署形态)）、`web`。
+orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自持（实际配置 `config/config.json` 不入库，首次部署从 `config/config.json.default` 复制并填入真实机器地址）。字段为 `machines[]`（每项含 `machineId` + `launcherUrl`）与可选的 `projectGroup`（项目组数组，见下「一桥多组示例」）、`transport`（桥接入面，见[常驻部署形态](#常驻部署形态)）、`web`。
 
 | 字段 | 说明 | 默认值 | 必填 |
 |------|------|--------|------|
 | `machines[].machineId` | 机器标识，需与本机 Launcher 配置一致 | - | 是 |
 | `machines[].launcherUrl` | 该机 Launcher 地址（如 `http://localhost:3100`） | - | 是 |
-| `projectGroup` | **v0.6.0**：静态「项目组」—— `{ name?: string, members: [{ machineId, projectId }] }`。声明后 orch **只连有成员的机器、只用列名成员的项目**（未列成员不 ensure / 不派发 / 不展示）；`members` **不得为空数组**；`machineId` 必须存在于 `machines[]`（否则本段 **fail-fast**，桥整体拒绝派发）。**段缺省 = 全量接纳**（与旧版行为一致） | 不设置（全量接纳） | 否 |
+| `projectGroup` | **v0.6.0 · v0.8.6 一桥多组**：静态「项目组」—— **组数组** `[{ name, members: [{ machineId, projectId }] }]`（**键名沿用 `projectGroup`、不叫 `projectGroups`**；`name` = 组名，必填，字符集 `[A-Za-z0-9_-]+`，且不得与保留 URL 首段 `health`/`shutdown`/`runner` 冲突）。声明后 orch **只连有成员的机器、只用列名成员的项目**（未列成员不 ensure / 不派发 / 不展示）；每组 `members` **不得为空数组**；`machineId` 必须存在于 `machines[]`；**组间互斥**——同一 `(machineId, projectId)` 只能属一个组，出现在两组 ⇒ **配置期 fail-fast**（桥拒绝启动）。**连接身份 = url 路径首段**：宿主 MCP url 写 `http://<host>:8787/<组名>/mcp`；**配了组后不带身份的 `/mcp` 被 403 `group_identity_required` 拒绝**（fail-closed，不回退全量）。⚠ **组不是鉴权边界**（`/mcp` 零鉴权，组名只决定视野收窄、不决定谁能连；3300 只读工作台是**运维全量视图**，不作为身份面）。**段缺省 = 未配任何组 = 全量接纳**（与旧版行为一致、零破坏） | 不设置（全量接纳） | 否 |
 | `transport` | 桥接入面配置（**可选**）；v0.7.1 起桥只有常驻 HTTP 形态 | 不设置（按 http 缺省启动） | 否 |
 | `transport.mode` | 只允许 `"http"`；显式 `"stdio"` 会被拒绝（fail-fast，stdio 形态已退役） | `"http"` | 否 |
 | `transport.http` | 常驻 HTTP 监听配置 `{ host, port, path }` | `{ "host": "127.0.0.1", "port": 8787, "path": "/mcp" }` | 否 |
@@ -375,6 +375,29 @@ orch 只持有「有哪些机器、Launcher 地址」，项目明细由各机自
 ```
 
 orch 用 `project`（如 `frontend` / `backend`）派发到对应项目。
+
+### 一桥多组示例
+
+一座编排桥可同时服务多个 orch agent（多组）：`projectGroup` 写成**组数组**，宿主侧 MCP url 把**组名写在路径首段**（身份由连接 url 决定，没有第二种通道 —— 不读 header、不复用 Runner token）：
+
+`orch/config/config.json`（多组 + 双宿主接入）：
+
+```json
+{
+  "machines": [
+    { "machineId": "win-dev", "launcherUrl": "http://localhost:3100" }
+  ],
+  "projectGroup": [
+    { "name": "frontend", "members": [ { "machineId": "win-dev", "projectId": "web" } ] },
+    { "name": "backend",  "members": [ { "machineId": "win-dev", "projectId": "api" } ] }
+  ]
+}
+```
+
+- 宿主 A 的 `mcp.a2a.url` = `http://127.0.0.1:8787/frontend/mcp` ⇒ 只见 `frontend` 组；宿主 B = `http://127.0.0.1:8787/backend/mcp` ⇒ 只见 `backend` 组（任务列表 / 事件收件箱 / Feature 均按身份收窄，Feature **谁建谁见**）。
+- **配了组后**，不带身份的 `http://127.0.0.1:8787/mcp` 被 **403 `group_identity_required`** 拒绝（fail-closed，绝不回退全量接纳）；**未配任何组**时仍只有 `/mcp` 一个入口、全量接纳（旧部署零改动）。
+- **组间互斥**：同一 `(machineId, projectId)` 出现在两个组 ⇒ **配置期 fail-fast**（桥拒绝启动）。
+- ⚠ **组不是鉴权边界**：组名只决定「视野收窄到哪」，不决定「谁能连」—— 任何能访问该端口的进程写上组名即取得该组视野；真正的访问控制归「跨机鉴权 / 反向代理」待办。3300 只读工作台是**运维全量视图，不是身份面**。
 
 ### 桥的环境变量
 
@@ -422,7 +445,7 @@ Bridge ⇄ Launcher 的线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单�
 
 #### 泛型工具（7 个）
 
-- `a2a_projects()`：列出**项目组成员**（未配置 `projectGroup` 时列出全部），含运行态与 A2A 端点。出参含 `group`（**恒存在**）：`{ name: string | null, selective: boolean, memberMachines: string[] }` —— `memberMachines` = **配置声明的成员机器集合**（**非**运行时在线集合）；`selective: false` = 未配置项目组（全量接纳）。**无成员的机器整条不出现（含其 `error` 条目）。**
+- `a2a_projects()`：列出**项目组成员**（未配置 `projectGroup` 时列出全部），含运行态与 A2A 端点。多组时**可见集由连接身份（url 路径首段 `/<组名>/mcp`）决定**，带身份的连接只列本组（详见「配置说明 · 一桥多组示例」）。出参含 `group`（**恒存在**）：`{ name: string | null, selective: boolean, memberMachines: string[] }` —— `memberMachines` = **配置声明的成员机器集合**（**非**运行时在线集合）；`selective: false` = 未配置项目组（全量接纳）。**无成员的机器整条不出现（含其 `error` 条目）。**
 - `a2a_call(project, message, mode, contextId?, wait?, featureId?, dependencies?, inputs?)`：解析项目到机器，幂等 ensure。**`mode` 必填**：`"inquiry"` = 只读询问/核实（**不得带 `featureId`**）⇒ 立即派发；`"execute"` = 执行型派发（**必带 `featureId`**）⇒ 登记 Feature 队列节点，由调度器派发。默认半异步：≤30s 完成直接返回文本结果与 artifacts，更长返回 `working + taskId` 并用 `a2a_task_status` 轮询；`wait=false` 时永远立即返回 `working + taskId + contextId`（不进入同步轮询，后台看护照常落库）。
 - `a2a_task_status(taskId)`：查询任务态并回写本地任务存储。已终结任务（completed / failed / input-required）由桥本地存档直接作答（不唤醒远端 Agent）；未终结任务走远端实时查询。
 - `a2a_tasks(project, [state], [limit])`：按项目列出本地任务记录（默认 `updatedAt` 倒序、默认 20 条、最多 100），每条含 `prompt` 片段 / state / text / contextId / updatedAt / stale。用于丢失 `taskId` 句柄后的兜底找回。
@@ -608,7 +631,7 @@ Launcher 被硬杀（`taskkill /F`、崩溃、断电）时，它拉起的项目 
 不必须。桥以**常驻进程**运行并暴露 stateless Streamable HTTP（v0.7.1 起 stdio 形态已退役，此为唯一接入形态），orch 经 MCP `type: "remote"` 连接（见[常驻部署形态](#常驻部署形态)）。默认只绑 `127.0.0.1`，故同机是最简部署；桥放在可达的其它主机（改 `url` + 反代鉴权）亦可。执行机器（Launcher + 项目 Agent）可在本机或远端。
 
 **Q：`codex` / `claude` 需要预先安装全局 CLI 吗？**
-不需要。`codex` / `claude` 由第三方 ACP 适配器（`codex-acp` / `claude-agent-acp`）承载，适配器自带对应运行时（**外部安装**，`backendCmd` 指其入口）；四条 kind（opencode / codex / claude / qoder）的 `agentConfig.backendCmd` 均**必填**、指向后端 / 适配器可执行入口（Windows 用绝对路径，见 [machine/README.md](machine/README.md)）。
+不需要。`codex` / `claude` 由第三方 ACP 适配器（`codex-acp` / `claude-agent-acp`）承载，适配器自带对应运行时（**外部安装**，`backendCmd` 指其入口）；四条 kind（opencode / codex / claude / qoder-cn）的 `agentConfig.backendCmd` 均为**可选覆盖**（v0.8.6 起缺省按四层链自动解析后端 / 适配器可执行入口：L0 显式 → L1 机器本地 → L2 全局 npm 候选表 → L3 PATH；解析不到则该项目明确不可用，显式填写时用绝对路径，见 [machine/README.md](machine/README.md)）。
 
 **Q：跨机鉴权做了吗？**
 尚未实现，计划反向代理 TLS + Bearer（预留 mTLS）。执行层入站鉴权依赖反向代理补足（本地 A2A 端点默认没有入站鉴权）。启用 `POST /shutdown` 时，反向代理必须 deny `/shutdown`。

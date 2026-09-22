@@ -20,7 +20,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { appRootFromModule } from "../app-root.js";
-import { defaultProjectGroup, loadMachinesConfig, memberKey } from "../config.js";
+import { aggregateProjectGroup, loadMachinesConfig, memberKey } from "../config.js";
 import { BRIDGE_VERSION } from "../version.js";
 import {
   BridgeRuntime,
@@ -72,6 +72,7 @@ import {
   truncatePrompt,
   updateTaskState,
   close as closeSessionStore,
+  type EventVisibilityScope,
   type RunnerProjectRecord,
   type RunnerRecord,
 } from "../session/store.js";
@@ -99,6 +100,7 @@ import {
   handleFeatureCancel,
   handleFeatureCreate,
   handleFeatureStatus,
+  ownershipFailure,
   type FeatureAdvanceArgs,
   type FeatureAdvanceSuccess,
   type FeatureApproveArgs,
@@ -246,15 +248,16 @@ type LocateResult =
   | { ok: false; code: string; error: string };
 
 type MachinesLoad =
-  | { ok: true; machines: MachineRef[]; group: ProjectGroup }
+  | { ok: true; machines: MachineRef[]; groups: ProjectGroup[] }
   | { ok: false; error: string };
 
 /**
- * 机器清单 + 项目组（v0.6.0 §2.1 总纲 2）。
+ * 机器清单 + **项目组数组**（v0.6.0 §2.1 总纲 2；v0.8.6 §2.2 起改为产 `groups[]`，
+ * 「传哪个组」由 {@link resolveGroup} 按连接身份解析）。
  *
  * **不新增进程级缓存**：与 `machines[]` 同生命周期 —— 每次调用现读配置文件，
- * 配置热改（成员增删 / 段增删）**即时生效**，无需重启桥。`projectGroup` 段缺失 ⇒
- * `selective: false`（全量接纳，旧 `config.json` 零改动可用）；段存在但非法 ⇒
+ * 配置热改（成员增删 / 组增删）**即时生效**，无需重启桥。`projectGroup` 段缺失 ⇒
+ * `groups: []`（全量接纳，旧 `config.json` 零改动可用）；段存在但非法 ⇒
  * `loadMachinesConfig` 抛错 ⇒ 此处 `{ ok: false }` ⇒ 调用方一律 `machines_config_error`
  * （**绝不 fail-open**，I2）。
  */
@@ -264,8 +267,8 @@ function loadMachines(): MachinesLoad {
     return {
       ok: true,
       machines: config.machines,
-      // `projectGroup` 只由 `loadMachinesConfig` 产出（恒有值）；`??` 仅为可选字段的类型收窄
-      group: config.projectGroup ?? defaultProjectGroup(),
+      // `groups` 只由 `loadMachinesConfig` 产出（恒有数组）；`??` 仅为可选字段的类型收窄
+      groups: config.groups ?? [],
     };
   } catch (err) {
     return {
@@ -273,6 +276,41 @@ function loadMachines(): MachinesLoad {
       error: `加载机器清单失败（${MACHINES_CONFIG_PATH}）：${toMessage(err)}`,
     };
   }
+}
+
+/**
+ * **身份 → 组视图**（v0.8.6 §2.2 / §2.3）：「传哪个组」的唯一入口。
+ * 成员判定函数（`isMemberProject` / `assertMember` / `memberMachines`）**形参即组、判据不变**（I1），
+ * 本函数只负责把连接身份（= URL 路径首段组名，`http.ts#matchMcpPath` 提取，经 `coreFor(identity)` 透入）
+ * 解析成判定所用的组。
+ *
+ * - `identity === null`（无身份）⇒ **全组聚合视图**（与 `MachinesConfig.projectGroup` 同源，
+ *   复用 `config.ts#aggregateProjectGroup`，禁第二套并集拼接）：
+ *   未配组 ⇒ `defaultProjectGroup()`（`selective:false` 全量接纳，HTTP 匿名合法）；
+ *   配了组 ⇒ 匿名在 HTTP 层已被 403 门挡住（§2.2 G5），此分支实际只服务 web 运维视图（§2.7 / N6）；
+ * - `identity` 命中组名 ⇒ 该组；
+ * - `identity` **未命中任何组**（如组名拼错）⇒ **fail-closed 空组**（`selective:true`、零成员，
+ *   `name` 保留该身份）：该连接一切操作均 `project_not_a_member`（错误文案直接暴露所连组名），
+ *   **绝不回退全量接纳**（I2）。
+ *
+ * 纯函数（无 I/O）；现读、不按身份缓存（身份解析每请求成本 = 数组线性查）。
+ */
+export function resolveGroup(
+  identity: string | null,
+  groups: readonly ProjectGroup[],
+): ProjectGroup {
+  if (identity === null) {
+    return aggregateProjectGroup(groups);
+  }
+  const hit = groups.find((g) => g.name === identity);
+  if (hit !== undefined) return hit;
+  return {
+    name: identity,
+    members: [],
+    memberKeys: new Set<string>(),
+    memberMachineIds: new Set<string>(),
+    selective: true,
+  };
 }
 
 // ---------------------------------------------------------------------------
@@ -293,13 +331,62 @@ function isMemberProject(machineId: string, projectId: string, group: ProjectGro
   return group.memberKeys.has(memberKey(machineId, projectId));
 }
 
-/** 构造 `project_not_a_member` 结构化失败（`machineId === null` = 未知落点机器的通用表述） */
+/**
+ * 找「**属另一组**」：目标 `(machineId?, projectId)` 由**非本连接组**的某组声明成员 ⇒ 返回该组名，
+ * 否则 `null`。用于 {@link notAMemberFailure} 区分两类拒绝文案（§2.3 / §6.1-3）。
+ *
+ * 判据**同源于** {@link isMemberProject}（`memberKey` 单一构造）；`callerGroup` 以**引用相等**跳过
+ * （`resolveGroup` 命中配置组时返回 `groups` 内**同一对象**）。无身份连接（`identity=null`）拿到的是
+ * **聚合组**（并集，非 `groups` 成员）—— 若目标不在聚合组内 ⇒ 它不在任何组 ⇒ 本函数恒 `null`（不误报
+ * 「属另一组」）。`memberMachineIds` × `memberKey` 遍历与 {@link assertMember} 的 `null` 机器形态同构。
+ */
+function findOtherOwnerGroup(
+  groups: readonly ProjectGroup[],
+  callerGroup: ProjectGroup,
+  machineId: string | null,
+  projectId: string,
+): string | null {
+  for (const g of groups) {
+    if (g === callerGroup) continue;
+    if (machineId !== null) {
+      if (g.memberKeys.has(memberKey(machineId, projectId))) return g.name ?? "(未命名组)";
+    } else {
+      for (const candidate of g.memberMachineIds) {
+        if (g.memberKeys.has(memberKey(candidate, projectId))) return g.name ?? "(未命名组)";
+      }
+    }
+  }
+  return null;
+}
+
+/**
+ * 构造 `project_not_a_member` 结构化失败（`machineId === null` = 未知落点机器的通用表述）。
+ *
+ * v0.8.6 §2.3：**两类拒绝文案可区分**（§6.1-3 明文验收）——
+ * - **非本组成员**（`groups` 未给 / 目标不在任何组）：登记指引（既有文案，保持不破坏既有断言）；
+ * - **属另一组**（给了 `groups` 且目标由他组声明）：点明「属另一组 + 跨组本版不支持」，
+ *   但**不泄漏他组的完整成员清单**（只给组名，组名本身是连接可见的 URL 身份）。
+ */
 function notAMemberFailure(
   machineId: string | null,
   projectId: string,
   group: ProjectGroup,
+  groups?: readonly ProjectGroup[],
 ): Failure {
   const where = machineId === null ? `项目 ${projectId}` : `项目 ${projectId}@${machineId}`;
+  const other =
+    groups === undefined
+      ? null
+      : findOtherOwnerGroup(groups, group, machineId, projectId);
+  if (other !== null) {
+    return {
+      ok: false,
+      code: "project_not_a_member",
+      error:
+        `${where} 属另一项目组「${other}」，不是本连接${group.name === null ? "" : `项目组「${group.name}」`}的可见 / 可派对象：` +
+        `组间成员互斥，跨组操作本版不支持（归 v0.11.0 跨组协作 / 授权）。`,
+    };
+  }
   const who = group.name === null ? "项目组" : `项目组「${group.name}」`;
   return {
     ok: false,
@@ -318,6 +405,7 @@ function notAMemberFailure(
  * - `machineId === null` ⇒ 只要求「**该项目被任一成员机器声明**」—— 派发 / 登记前置
  *   （`dispatchTask` / `registerFeatureNode` / `locateProject`）尚**不知道落点机器**，
  *   用本形态可**零 I/O** 判定「未被选中」，避免把「没选它」降级成 `project_not_found`。
+ * - `groups`（可选，v0.8.6 §2.3）⇒ 传入全组数组以启用「属另一组」区分文案；缺省 ⇒ 沿用「非本组成员」单文案。
  *
  * 两种形态**同源**：给定机器走 {@link isMemberProject}；未给定机器遍历
  * `memberMachineIds` × `memberKey` —— 无第二套拼接 / 第二套判据（I1）。
@@ -326,17 +414,18 @@ function assertMember(
   machineId: string | null,
   projectId: string,
   group: ProjectGroup,
+  groups?: readonly ProjectGroup[],
 ): Failure | null {
   if (!group.selective) return null;
   if (machineId !== null) {
     return isMemberProject(machineId, projectId, group)
       ? null
-      : notAMemberFailure(machineId, projectId, group);
+      : notAMemberFailure(machineId, projectId, group, groups);
   }
   for (const candidate of group.memberMachineIds) {
     if (group.memberKeys.has(memberKey(candidate, projectId))) return null;
   }
-  return notAMemberFailure(null, projectId, group);
+  return notAMemberFailure(null, projectId, group, groups);
 }
 
 /**
@@ -364,15 +453,15 @@ function memberMachines(machines: readonly MachineRef[], group: ProjectGroup): M
  *    原「握手失败」现指「Runner 未注册 / 心跳超时」，仅状态报告用途）；
  *    否则 ⇒ `project_not_found`。
  */
-async function locateProject(projectId: string): Promise<LocateResult> {
+async function locateProject(projectId: string, identity: string | null = null): Promise<LocateResult> {
   const config = loadMachines();
   if (!config.ok) {
     return { ok: false, code: "machines_config_error", error: config.error };
   }
-  const { group } = config;
+  const group = resolveGroup(identity, config.groups);
   const targets = memberMachines(config.machines, group);
 
-  const denied = assertMember(null, projectId, group);
+  const denied = assertMember(null, projectId, group, config.groups);
   if (denied !== null) {
     return { ok: false, code: denied.code, error: denied.error };
   }
@@ -594,6 +683,17 @@ export interface DispatchTaskInput {
    * Feature 节点行已存在（`registerFeatureNode` 已建）⇒ 传 `null`，不重复落库。
    */
   newTask: { prompt: string; dispatchMessage: string } | null;
+  /**
+   * 连接身份（v0.8.6 §2.2；`null` / 缺省 = 无身份 ⇒ 全组聚合视图）。
+   * - **inquiry 路径**（`handleCall`）：由 `coreFor(identity)` 绑定注入 = 调用方连接身份；
+   * - **Feature 节点派发路径**（`dispatchFeatureNode`，req01 补正 Y-1）：注入
+   *   `feature.ownerGroup` ⇒ 成员判据按该 Feature 的 **owner 组**，与 R-1 挂载归属判据
+   *   同源一致；`owner_group === null`（未配组 / 存量 / 3300 运维全量视图）⇒ 传 `null`
+   *   = 全组聚合视图（旧行为，零破坏）。
+   * 注：`owner_group` 既 gate 五个 Feature 工具出口（`ownershipFailure`），也经本参数 gate
+   * Feature 节点派发的成员判据 —— 原注释「派发暂无身份 / 判定归 N4」不准确，已更正。
+   */
+  identity?: string | null;
 }
 
 /** 未终态（超预算 / 全异步）的派发返回：`working` + 本地 `taskId` 句柄 */
@@ -718,19 +818,25 @@ function startLocalTaskWatcher(taskId: string): void {
 
 export async function dispatchTask(input: DispatchTaskInput): Promise<DispatchOutcome> {
   const { taskId, projectId, contextId, wait } = input;
+  const identity = input.identity ?? null;
 
   // ① 成员前置：同步零 I/O fail-fast（判据同源 assertMember；非成员不产生任何副作用）
   const config = loadMachines();
   if (!config.ok) {
     return { ok: false, code: "machines_config_error", error: config.error, contextId };
   }
-  const denied = assertMember(null, projectId, config.group);
+  const denied = assertMember(
+    null,
+    projectId,
+    resolveGroup(identity, config.groups),
+    config.groups,
+  );
   if (denied !== null) {
     return { ok: false, code: denied.code, error: denied.error, contextId };
   }
 
   // ② 落点解析（projectId → machineId）。过渡期 = locateProject；A6 切 Runner 注册表。
-  const located = await locateProject(projectId);
+  const located = await locateProject(projectId, identity);
   if (!located.ok) {
     return { ok: false, code: located.code, error: located.error, contextId };
   }
@@ -739,7 +845,12 @@ export async function dispatchTask(input: DispatchTaskInput): Promise<DispatchOu
   if (!recheck.ok) {
     return { ok: false, code: "machines_config_error", error: recheck.error, contextId };
   }
-  const deniedAtTarget = assertMember(located.machine.machineId, projectId, recheck.group);
+  const deniedAtTarget = assertMember(
+    located.machine.machineId,
+    projectId,
+    resolveGroup(identity, recheck.groups),
+    recheck.groups,
+  );
   if (deniedAtTarget !== null) {
     return { ok: false, code: deniedAtTarget.code, error: deniedAtTarget.error, contextId };
   }
@@ -810,6 +921,7 @@ async function handleCall(
   contextIdInput: string | undefined,
   wait: boolean,
   mode: "inquiry" = "inquiry",
+  identity: string | null = null,
 ): Promise<CallOutcome> {
   void mode; // 类型级契约：运行时无需分支（非 inquiry 无法通过编译）
   const contextId =
@@ -821,6 +933,7 @@ async function handleCall(
     contextId,
     wait,
     newTask: { prompt: text, dispatchMessage: text },
+    identity,
   });
   if (!sent.ok) {
     return { ok: false, code: sent.code, error: sent.error, contextId };
@@ -1029,6 +1142,7 @@ function registerFeatureNode(
   featureId: string,
   dependencies: readonly string[],
   inputs?: readonly InputArtifactRef[] | undefined,
+  identity: string | null = null,
 ): CallOutcome {
   const contextId =
     contextIdInput !== undefined && contextIdInput.length > 0 ? contextIdInput : randomUUID();
@@ -1045,6 +1159,20 @@ function registerFeatureNode(
     };
   }
   /**
+   * v0.8.6 req01 补正 R-1（跨组写入洞 · 安全）：挂载前必须校验「本连接身份 == Feature 归属组」。
+   * 五出口归属判据 **`ownershipFailure` 同源**（禁止第二套判据），三分支语义完全一致：
+   * - `identity === null`（未配组 / 3300 运维全量视图）⇒ 放行；
+   * - `feature.ownerGroup === identity` ⇒ 放行；
+   * - 其余（含 `ownerGroup` 为 NULL 的存量 Feature）⇒ **拒**（fail-closed），
+   *   沿用 `ownershipFailure` 的「属另一项目组 / 无归属」文案（**不泄漏**他组组名 / 成员清单）。
+   * 防他组连接用 `a2a_call(mode="execute", featureId=<他组 Feature>)` 把**本组项目**挂进
+   * **他组 DAG**（推动对方自动流转 / 污染对方失败账单）。零 I/O，置于成员断言之前。
+   */
+  const owned = ownershipFailure(feature, identity);
+  if (owned !== null) {
+    return { ok: false, code: owned.code, error: owned.error, contextId };
+  }
+  /**
    * 登记前断言（v0.6.0 §2.2）：防「登记成功、异步才失败」—— 越界必须**即时**失败。
    * 此处仍在 `createTask` **之前** ⇒ 非成员节点绝不入库、调度器也不会被 kick。
    * 判据同源 {@link assertMember}（`machineId === null`：任一成员机器声明即可）。
@@ -1053,7 +1181,12 @@ function registerFeatureNode(
   if (!config.ok) {
     return { ok: false, code: "machines_config_error", error: config.error, contextId };
   }
-  const denied = assertMember(null, projectId, config.group);
+  const denied = assertMember(
+    null,
+    projectId,
+    resolveGroup(identity, config.groups),
+    config.groups,
+  );
   if (denied !== null) {
     return { ok: false, code: denied.code, error: denied.error, contextId };
   }
@@ -1135,6 +1268,10 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
     contextId: node.contextId,
     wait: true,
     newTask: null,
+    // v0.8.6 req01 补正 Y-1：Feature 节点派发按 **owner 组**判定成员（`owner_group`），
+    // 与 R-1 挂载归属判据一致 ⇒ 收「他组项目混入本组 Feature DAG」的残余路径。
+    // 未配组 / 存量 / 3300 运维 ⇒ `owner_group === null` ⇒ 传 `null` = 全组聚合视图（旧行为）。
+    identity: feature?.ownerGroup ?? null,
   });
   if (!sent.ok) {
     /**
@@ -1179,7 +1316,10 @@ type TaskStatusOutcome = TaskStatusSuccess | (Failure & { task?: TaskRecord });
  * 任务尚未回传时返回其**当前本地态**（通常 `working`），由宿主按句柄轮询至终态。
  * 仍保留成员前置（非成员任务 ⇒ `project_not_a_member`，零 I/O）。
  */
-async function handleTaskStatus(taskId: string): Promise<TaskStatusOutcome> {
+async function handleTaskStatus(
+  taskId: string,
+  identity: string | null = null,
+): Promise<TaskStatusOutcome> {
   const lookup = resolveTaskLookup(taskId);
   if (lookup === null) {
     return {
@@ -1193,7 +1333,12 @@ async function handleTaskStatus(taskId: string): Promise<TaskStatusOutcome> {
   if (!config.ok) {
     return { ok: false, code: "machines_config_error", error: config.error, task: record };
   }
-  const denied = assertMember(null, record.projectId, config.group);
+  const denied = assertMember(
+    null,
+    record.projectId,
+    resolveGroup(identity, config.groups),
+    config.groups,
+  );
   if (denied !== null) {
     return { ok: false, code: denied.code, error: denied.error, task: record };
   }
@@ -1226,7 +1371,10 @@ type CancelOutcome =
  * 任务态仍以本地回传落库为准（宿主按 `a2a_task_status` 观察）。
  * 非成员 ⇒ `project_not_a_member`（零 I/O）；无 Runner 端点（未接线 / 非 owner）⇒ `cancel_unavailable`。
  */
-async function handleCancel(taskId: string): Promise<CancelOutcome> {
+async function handleCancel(
+  taskId: string,
+  identity: string | null = null,
+): Promise<CancelOutcome> {
   const lookup = resolveTaskLookup(taskId);
   if (lookup === null) {
     return {
@@ -1240,7 +1388,12 @@ async function handleCancel(taskId: string): Promise<CancelOutcome> {
   if (!config.ok) {
     return { ok: false, code: "machines_config_error", error: config.error, task: record };
   }
-  const denied = assertMember(null, record.projectId, config.group);
+  const denied = assertMember(
+    null,
+    record.projectId,
+    resolveGroup(identity, config.groups),
+    config.groups,
+  );
   if (denied !== null) {
     return { ok: false, code: denied.code, error: denied.error, task: record };
   }
@@ -1252,7 +1405,7 @@ async function handleCancel(taskId: string): Promise<CancelOutcome> {
       task: record,
     };
   }
-  const located = await locateProject(record.projectId);
+  const located = await locateProject(record.projectId, identity);
   if (!located.ok) {
     return { ok: false, code: located.code, error: located.error, task: record };
   }
@@ -1330,12 +1483,12 @@ function groupView(group: ProjectGroup): GroupView {
  *   （`launcher_unreachable` 语义：Runner 未注册 / 心跳超时）；
  * - 出参补 `runners[]`：**只列 memberMachines** 中已注册者（B4），字段白名单见 {@link MachinesView}。
  */
-async function handleProjects(): Promise<MachinesView | Failure> {
+async function handleProjects(identity: string | null = null): Promise<MachinesView | Failure> {
   const config = loadMachines();
   if (!config.ok) {
     return { ok: false, code: "machines_config_error", error: config.error };
   }
-  const { group } = config;
+  const group = resolveGroup(identity, config.groups);
   const targets = memberMachines(config.machines, group);
   let runners: RunnerRecord[];
   try {
@@ -1403,12 +1556,26 @@ interface TasksView {
  * （`isTaskWatched`：`queue_state ∈ queued/claimed/running` ⇒ 在队、不算 stale）+
  * 一次只读可达性探测（`locateProject`：v0.7.0 A6 起读**桥注册表投影**，零出站），
  * 不做逐任务远端查询。
+ *
+ * v0.8.6 §2.4(c) / 出口 6：**成员前置 + 探测按身份**（形态照 {@link handleTaskStatus}）——
+ * 非本组项目 ⇒ `project_not_a_member`（**零副作用**：不 prune、不查库、不探测）；
+ * 可达性探测走的 `locateProject` 同样收身份（否则「列得到本组任务、探测到他组机器」= 第二套判据）。
  */
 async function handleTasks(
   projectId: string,
   state?: DomainTaskState,
   limit?: number,
+  identity: string | null = null,
 ): Promise<TasksView | Failure> {
+  const config = loadMachines();
+  if (!config.ok) {
+    return { ok: false, code: "machines_config_error", error: config.error };
+  }
+  const denied = assertMember(null, projectId, resolveGroup(identity, config.groups), config.groups);
+  if (denied !== null) {
+    return { ok: false, code: denied.code, error: denied.error };
+  }
+
   try {
     pruneTasks();
   } catch (err) {
@@ -1420,7 +1587,7 @@ async function handleTasks(
   let reachable = true;
   let notice: string | undefined;
   if (records.some((r) => r.state === "working")) {
-    const located = await locateProject(projectId);
+    const located = await locateProject(projectId, identity);
     reachable = located.ok && located.project.status === "online";
     if (!located.ok) {
       notice = located.error;
@@ -1449,18 +1616,67 @@ async function handleTasks(
 // 事件收件箱（v0.4.0 §2.6：a2a_events / a2a_wait）
 // ---------------------------------------------------------------------------
 
-/** 进程内读游标（`since` 省略时以它为起点；进程重启回落库内最大 `eventId`） */
-let eventsCursor: number | null = null;
+/**
+ * 进程内读游标 **按连接身份分离**（v0.8.6 §1.3 R-2）：key = 身份（组名，`null` = 无身份）。
+ *
+ * 全局单游标 = 唯一的跨组泄漏点：A 组读口推进游标会把 B 组的起点一起抬高 ⇒
+ * B 组**永久漏读**（不是多读）—— 故游标必须随身份走，且**初值也按身份取**
+ * （`latestEventId(scope)`，见 {@link currentEventsCursor}）。
+ */
+const eventsCursor = new Map<string | null, number>();
 
-/** 取当前游标（首次读取时按库内最大 `eventId` 初始化） */
-function currentEventsCursor(): number {
-  if (eventsCursor === null) eventsCursor = latestEventId();
-  return eventsCursor;
+/**
+ * 身份 → 事件可见性范围（§2.4 案 B：**读时经 `feature_id` / `task_id` 反查 join**）——
+ * `events` 表零 DDL、写路径零改动，`owner_group` 的单一事实源留在 `features`（与 N4 打标同源）。
+ *
+ * - `identity === null` ⇒ `scope = null` = **不过滤**（未配组环境的匿名全量入口 /
+ *   web 运维视图 §2.7 —— 与 N4「无身份不校验归属」同口径）；
+ * - `identity` 命中组 ⇒ `ownerGroup` = 该身份 + `projectIds` = 本组成员项目
+ *   （后者覆盖**无 Feature 归属**的任务事件，如 `mode="inquiry"`）；
+ * - `identity` **未命中任何组** ⇒ {@link resolveGroup} 的 fail-closed 空组 ⇒ `projectIds: []`
+ *   ⇒ 只见孤儿事件（**绝不回退全量**，I2）；
+ * - 配置不可读 ⇒ `machines_config_error`（**不静默降级成「0 条事件」**）。
+ */
+function resolveEventScope(
+  identity: string | null,
+): { ok: true; scope: EventVisibilityScope | null } | Failure {
+  if (identity === null) return { ok: true, scope: null };
+  const config = loadMachines();
+  if (!config.ok) {
+    return { ok: false, code: "machines_config_error", error: config.error };
+  }
+  const group = resolveGroup(identity, config.groups);
+  return {
+    ok: true,
+    scope: {
+      ownerGroup: identity,
+      projectIds: Array.from(new Set(group.members.map((m) => m.projectId))).sort(),
+    },
+  };
 }
 
-/** 推进游标（只前进不回退） */
-function advanceEventsCursor(cursor: number): void {
-  eventsCursor = Math.max(currentEventsCursor(), cursor);
+/** 取该身份的当前游标（首次读取时按**本组可见**的最大 `eventId` 初始化） */
+function currentEventsCursor(
+  identity: string | null,
+  scope: EventVisibilityScope | null,
+): number {
+  let cursor = eventsCursor.get(identity);
+  if (cursor === undefined) {
+    cursor = latestEventId(scope);
+    eventsCursor.set(identity, cursor);
+  }
+  return cursor;
+}
+
+/** 推进该身份的游标（只前进不回退），返回推进后的游标 */
+function advanceEventsCursor(
+  identity: string | null,
+  scope: EventVisibilityScope | null,
+  cursor: number,
+): number {
+  const next = Math.max(currentEventsCursor(identity, scope), cursor);
+  eventsCursor.set(identity, next);
+  return next;
 }
 
 /** 长轮询订阅者（事件写入时经 `signalEvents` 唤醒，避免空等到超时） */
@@ -1505,35 +1721,47 @@ interface WaitOutcome extends EventsOutcome {
   timedOut: boolean;
 }
 
-/** 读取 `events` 增量；无变化时以 `latestEventId()` 廉价空返回（不查 events 表） */
-function handleEvents(since?: number): EventsOutcome {
-  const cursor = since === undefined ? currentEventsCursor() : Math.max(since, 0);
-  if (latestEventId() <= cursor) {
-    advanceEventsCursor(cursor);
+/** 读取 `events` 增量（按身份可见性）；无变化时以 `latestEventId(scope)` 廉价空返回（不查 events 表） */
+function handleEvents(identity: string | null, since?: number): EventsOutcome | Failure {
+  const scoped = resolveEventScope(identity);
+  if (!scoped.ok) return scoped;
+  const { scope } = scoped;
+  const cursor = since === undefined ? currentEventsCursor(identity, scope) : Math.max(since, 0);
+  if (latestEventId(scope) <= cursor) {
+    advanceEventsCursor(identity, scope, cursor);
     return { ok: true, cursor, count: 0, events: [] };
   }
-  const events = listEvents({ since: cursor, limit: EVENTS_PAGE_LIMIT });
+  const events = listEvents({ since: cursor, limit: EVENTS_PAGE_LIMIT, scope });
   const last = events.length > 0 ? (events[events.length - 1]?.eventId ?? cursor) : cursor;
-  advanceEventsCursor(last);
-  return { ok: true, cursor: eventsCursor ?? last, count: events.length, events };
+  const next = advanceEventsCursor(identity, scope, last);
+  return { ok: true, cursor: next, count: events.length, events };
 }
 
 /**
- * 长轮询：等待 `cursor` 之后的新事件，最多 `timeoutMs`（内部 cap < `SYNC_BUDGET_MS`）。
+ * 长轮询：等待**本身份可见**的 `cursor` 之后新事件，最多 `timeoutMs`（内部 cap < `SYNC_BUDGET_MS`）。
  * 推送路径写入事件时经 `signalEvents()` 立即唤醒；非推送路径（调度器落库）由定时对账兜底。
+ *
+ * 「有新事件」判定必须走 `latestEventId(scope)`（R-2）：用全局最大 id 会被他组事件误唤醒 ⇒
+ * 空转到超时（读不到任何事件）。唤醒本身是广播（`eventWaiters` 不身份化），
+ * 但每轮都用本身份谓词复核 ⇒ 误唤醒只是多跑一次廉价判定，不会误报有事件。
  */
-async function handleWait(timeoutMs?: number): Promise<WaitOutcome> {
-  const cursor = currentEventsCursor();
+async function handleWait(
+  identity: string | null,
+  timeoutMs?: number,
+): Promise<WaitOutcome | Failure> {
+  const scoped = resolveEventScope(identity);
+  if (!scoped.ok) return scoped;
+  const { scope } = scoped;
+  const cursor = currentEventsCursor(identity, scope);
   const waitMs = Math.min(Math.max(timeoutMs ?? EVENT_WAIT_MAX_MS, 0), EVENT_WAIT_MAX_MS);
   const deadline = Date.now() + waitMs;
   for (;;) {
-    if (latestEventId() > cursor) {
-      const events = listEvents({ since: cursor, limit: EVENTS_PAGE_LIMIT });
+    if (latestEventId(scope) > cursor) {
+      const events = listEvents({ since: cursor, limit: EVENTS_PAGE_LIMIT, scope });
       const last = events.length > 0 ? (events[events.length - 1]?.eventId ?? cursor) : cursor;
-      advanceEventsCursor(last);
       return {
         ok: true,
-        cursor: eventsCursor ?? last,
+        cursor: advanceEventsCursor(identity, scope, last),
         count: events.length,
         events,
         timedOut: false,
@@ -1585,8 +1813,8 @@ export interface BridgeCore {
   ): CallOutcome;
   taskStatus(taskId: string): Promise<TaskStatusOutcome>;
   cancel(taskId: string): Promise<CancelOutcome>;
-  events(since?: number): EventsOutcome;
-  wait(timeoutMs?: number): Promise<WaitOutcome>;
+  events(since?: number): EventsOutcome | Failure;
+  wait(timeoutMs?: number): Promise<WaitOutcome | Failure>;
   featureCreate(args: FeatureCreateArgs): FeatureCreateSuccess | FeatureToolFailure;
   featureStatus(args: FeatureStatusArgs): FeatureStatusSuccess | FeatureToolFailure;
   featureAdvance(args: FeatureAdvanceArgs): FeatureAdvanceSuccess | FeatureToolFailure;
@@ -1596,22 +1824,41 @@ export interface BridgeCore {
   kickScheduler(): void;
 }
 
-/** 装配内核：既有领域处理器的结构化聚合（N6 常驻化时改为注入 runtime 生命周期）。 */
-export function createCore(): BridgeCore {
+/**
+ * 装配内核：既有领域处理器的结构化聚合（N6 常驻化时改为注入 runtime 生命周期）。
+ *
+ * v0.8.6 §2.2：按**连接身份**装配每请求轻量视图 —— `http.ts` 的 `coreFor(identity)` 即
+ * `(identity) => createCore(identity)`（**不按身份缓存**：本函数只是闭包装配，无重资源；
+ * 进程级可变状态共享，组判定经 {@link resolveGroup} 按身份取组）。
+ * `identity = null`（缺省）= 无身份：未配组环境的匿名全量入口 / web 运维视图（N6 起显式注入）。
+ * v0.8.6 §2.4 出口补齐 A 起：**12 个出口的只读三路（`tasks` / `events` / `wait`）也已按身份**
+ * （游标随身份分离 = R-2；Feature 工具组五路归 N4）。
+ */
+export function createCore(identity: string | null = null): BridgeCore {
   return {
-    projects: handleProjects,
-    tasks: handleTasks,
-    call: handleCall,
-    registerFeatureNode,
-    taskStatus: handleTaskStatus,
-    cancel: handleCancel,
-    events: handleEvents,
-    wait: handleWait,
-    featureCreate: handleFeatureCreate,
-    featureStatus: handleFeatureStatus,
-    featureAdvance: handleFeatureAdvance,
-    featureApprove: handleFeatureApprove,
-    featureCancel: handleFeatureCancel,
+    projects: (): Promise<MachinesView | Failure> => handleProjects(identity),
+    tasks: (projectId, state, limit): Promise<TasksView | Failure> =>
+      handleTasks(projectId, state, limit, identity),
+    call: (projectId, text, contextId, wait, mode): Promise<CallOutcome> =>
+      handleCall(projectId, text, contextId, wait, mode, identity),
+    registerFeatureNode: (projectId, message, contextId, featureId, dependencies, inputs): CallOutcome =>
+      registerFeatureNode(projectId, message, contextId, featureId, dependencies, inputs, identity),
+    taskStatus: (taskId): Promise<TaskStatusOutcome> => handleTaskStatus(taskId, identity),
+    cancel: (taskId): Promise<CancelOutcome> => handleCancel(taskId, identity),
+    events: (since): EventsOutcome | Failure => handleEvents(identity, since),
+    wait: (timeoutMs): Promise<WaitOutcome | Failure> => handleWait(identity, timeoutMs),
+    // Feature 工具组：按连接身份打标（create）+ 归属校验（status/advance/approve/cancel 谁建谁见）。
+    // `identity = null`（未配组匿名 / web 运维视图）⇒ 全量放行，零破坏（v0.8.6 §2.3 / N4）。
+    featureCreate: (args): FeatureCreateSuccess | FeatureToolFailure =>
+      handleFeatureCreate(args, identity),
+    featureStatus: (args): FeatureStatusSuccess | FeatureToolFailure =>
+      handleFeatureStatus(args, identity),
+    featureAdvance: (args): FeatureAdvanceSuccess | FeatureToolFailure =>
+      handleFeatureAdvance(args, identity),
+    featureApprove: (args): FeatureStateChangeSuccess | FeatureToolFailure =>
+      handleFeatureApprove(args, identity),
+    featureCancel: (args): FeatureStateChangeSuccess | FeatureToolFailure =>
+      handleFeatureCancel(args, identity),
     kickScheduler: (): void => scheduler.kick(),
   };
 }
@@ -1742,6 +1989,8 @@ function logRecoverySummary(recovery: unknown): void {
  * - follower **一律不 bind**（同机多桥互抢端口随之消失）；
  * - **不 throw**：非 loopback / 端口被占 / 未启用 ⇒ 不 bind 且不报错（`startWebTransport` 自吞，
  *   返回未启用句柄）；「无页面」是合法状态，**MCP 工具面不受影响**；
+ * - **身份 = 全量（§2.7 / S6）**：注入 `createCore(null)` —— 网页面**只作运维全量视图**，
+ *   不承担 orch agent 的身份面（身份唯一载体 = MCP 端点 URL 路径首段 `/<组名>/mcp`）；
  * - listener 不 `unref`：桥恒常驻 http（由 HTTP listener 持住进程），`shutdown()` 会显式关闭。
  */
 async function startWebIfEnabled(mode: TransportMode, readiness: RuntimeReadiness): Promise<void> {
@@ -1760,7 +2009,12 @@ async function startWebIfEnabled(mode: TransportMode, readiness: RuntimeReadines
 
   try {
     activeWeb = await startWebTransport({
-      core: createCore(),
+      // v0.8.6 §2.7（S6 / N6）：网页接面**显式**注入「全量身份」core（`identity = null`
+      // ⇒ `resolveGroup` 走全组聚合视图）。3300 是**运维全量视图**，**不作为 orch agent 的
+      // 身份面**（agent 身份只经 MCP 端点的 URL 路径段 `/<组名>/mcp` 承载，§2.2）；
+      // 组不是鉴权边界（`/mcp` 零鉴权，真边界归「安全与治理」）。
+      // `web.ts` 内部零改动：五条路由经 `WebCore = Pick<BridgeCore, …>` 间接转发。
+      core: createCore(null),
       host: web.host,
       port: web.port,
       // 页面标识（role / pid / startedAt）来自 lifecycle；此处恒非 null（已过 `runtime.start()`）
@@ -1814,7 +2068,16 @@ async function startHttpBridge(): Promise<void> {
   }
   const runtime = createBridgeRuntime("http", { host, port });
   activeRuntime = runtime;
-  const core = createCore();
+  /**
+   * v0.8.6 §2.2：HTTP 面**按连接身份装配每请求内核视图**（`coreFor(identity)`，不缓存）；
+   * `options.core` 仅作未注入时的全量兜底（本接线恒有 `coreFor`，实际不被使用）。
+   * 403 门判据单一来源 = `groups.length > 0`；配置不可读 ⇒ 按「需身份」处理（fail-closed，I2）。
+   */
+  const coreFor = (identity: string | null): BridgeCore => createCore(identity);
+  const identityRequired = (): boolean => {
+    const load = loadMachines();
+    return load.ok ? load.groups.length > 0 : true;
+  };
   /**
    * Runner 入站端点（v0.7.0 A3 模块 + A4 接线）：仅常驻 http 形态创建。
    * `mode` / `role` 用惰性闭包（`runtime.start()` 在本行之后，角色此刻尚未确定）；
@@ -1827,7 +2090,9 @@ async function startHttpBridge(): Promise<void> {
     signalEvents,
   });
   const handle = await startHttpTransport({
-    core,
+    core: coreFor(null), // 兜底视图（匿名/全量）；生产请求路径走 coreFor(identity)
+    coreFor,
+    identityRequired,
     host,
     port,
     path,

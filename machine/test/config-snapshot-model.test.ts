@@ -19,16 +19,17 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { describeAgentConfig, resolveModelEndpoint } from "../launcher/config-snapshot.js";
+import type { BackendEntryDeps } from "../adapters/backend-entry.js";
 import type { ProjectConfig } from "../types.js";
 
-const KINDS = ["claude", "codex", "opencode", "qoder"] as const;
+const KINDS = ["claude", "codex", "opencode", "qoder-cn"] as const;
 
 /** 四 kind 未配平铺 `model` 时的兜底口径（与实现逐字一致的可判据点） */
 const FALLBACK_MODEL: Record<ProjectConfig["agentKind"], string> = {
   claude: "未指定（CLI 默认）",
   codex: "~/.codex/config.toml",
   opencode: "opencode 配置",
-  qoder: "qodercn 配置（ACP）",
+  "qoder-cn": "qodercn 配置（ACP）",
 };
 
 function project(
@@ -104,7 +105,7 @@ test("平铺命中：四 kind 均取 agentConfig.model（标注 agentConfig）",
         assert.equal(model, "m-flat（agentConfig）", `${kind}：平铺 model 应为播报读点`);
       }
       assert.equal(
-        resolveModelEndpoint(project("qoder", { model: "m-flat" })).endpoint,
+        resolveModelEndpoint(project("qoder-cn", { model: "m-flat" })).endpoint,
         "qoder CN 服务端（经 ACP 桥）",
       );
       assert.equal(
@@ -160,7 +161,7 @@ test("非法平铺值（空串 / 非字符串 / 非法容器）视同未配，�
     withFakeHome(() => {
       for (const bad of ["", 42, null, undefined, {}, []]) {
         assert.equal(
-          resolveModelEndpoint(project("qoder", { model: bad })).model,
+          resolveModelEndpoint(project("qoder-cn", { model: bad })).model,
           "qodercn 配置（ACP）",
           `平铺 model=${JSON.stringify(bad)} 不应被播报`,
         );
@@ -178,7 +179,10 @@ test("非法平铺值（空串 / 非字符串 / 非法容器）视同未配，�
 test("claude 用户级层 · 不存在分支：settings.json 缺 ⇒ 播报 n/a，值不参与解析", () => {
   withScrubbedEnv(() =>
     withFakeHome((home) => {
-      const snapshot = describeAgentConfig(project("claude", { backendCmd: "x" }));
+      // backendCmd 给沙箱内真文件（L0 契约 = 存在且是文件）；本例只测 model 播报面，不碰 backend 段
+      const entryFile = join(home, "fake-acp-entry.js");
+      writeFileSync(entryFile, "", "utf8");
+      const snapshot = describeAgentConfig(project("claude", { backendCmd: entryFile }));
       assert.match(
         snapshot.hierarchy,
         /^项目 agentConfig（平铺键）\+ /,
@@ -241,7 +245,7 @@ test("describeAgentConfig：四 kind 层级与模型 / endpoint 同快照（无 
         claude: /claude 用户级配置 n\/a（.*不存在）/,
         codex: /codex 用户级配置（~\/\.codex\/config\.toml，运行时始终读取）/,
         opencode: /opencode 用户级配置（全局配置与 workspace opencode\.json，运行时读取）/,
-        qoder: /qodercn 用户级配置（~\/\.qoder-cn\/，经 ACP 桥运行时读取）/,
+        "qoder-cn": /qodercn 用户级配置（~\/\.qoder-cn\/，经 ACP 桥运行时读取）/,
       };
       for (const kind of KINDS) {
         const snapshot = describeAgentConfig(project(kind, { model: "m-flat" }));
@@ -254,14 +258,78 @@ test("describeAgentConfig：四 kind 层级与模型 / endpoint 同快照（无 
   );
 });
 
-// ---- model-catalog.json（改造文档 §2.2-11）----
+// ---- backend 段：分层解析日志正文（§2.3 · B4，注入 deps 造命中 / 全 miss 两例）----
+
+/** codex 在 L2 全局 npm 根命中：L1 机器本地空、L2 有包、L0 未显式配。 */
+const codexHitDeps: BackendEntryDeps = {
+  platform: "win32",
+  env: {},
+  machineModulesRoot: "C:/machine-empty",
+  npmRoots: ["C:/npm-global"],
+  isFile: (p) => p.includes("npm-global"),
+  readJson: () => ({ bin: { "codex-acp": "dist/index.js" } }),
+};
+
+test("backend 段 · 命中：kind + 命中层名 + 绝对路径", () => {
+  const snapshot = describeAgentConfig(project("codex"), codexHitDeps);
+  assert.match(
+    snapshot.backend,
+    /^p1 kind=codex L2-npm-global hit C:[/\\]npm-global[/\\]/,
+    `命中形态异常：${snapshot.backend}`,
+  );
+  assert.doesNotMatch(snapshot.backend, /逐层清单/, "命中不得输出失败清单");
+});
+
+/** 四层全 miss：机器本地空、全局根无包、PATH 空目录 ⇒ 完整分层清单入日志。 */
+const allMissDeps: BackendEntryDeps = {
+  platform: "win32",
+  env: {},
+  machineModulesRoot: "C:/machine-empty",
+  npmRoots: ["C:/npm-empty"],
+  isFile: () => false,
+  readJson: () => ({}),
+};
+
+test("backend 段 · 未命中：解析失败 + 逐层清单（含各层与 outcome）", () => {
+  const snapshot = describeAgentConfig(project("codex"), allMissDeps);
+  assert.match(snapshot.backend, /^p1 解析失败，逐层清单：/, `失败形态异常：${snapshot.backend}`);
+  assert.match(snapshot.backend, /L0-explicit=miss/);
+  assert.match(snapshot.backend, /L1-local=miss/);
+  assert.match(snapshot.backend, /L2-npm-global=miss/);
+  assert.match(snapshot.backend, /L3-path=miss/);
+});
+
+test("backend 段 · L0 显式 backendCmd 命中即停（不扫后续层）", () => {
+  // L0 存在性门（REQ-v0.8.6-2026-09-21-02 真机补正①）：显式值必须「存在且是文件」才 hit
+  // ⇒ 本例 isFile 只放行显式路径，其余层仍全空 ⇒ 「命中即停」由「无后续层被扫描」佐证。
+  const l0HitDeps: BackendEntryDeps = {
+    ...allMissDeps,
+    isFile: (p) => p === "D:/mine.cmd",
+  };
+  const snapshot = describeAgentConfig(project("codex", { backendCmd: "D:/mine.cmd" }), l0HitDeps);
+  assert.equal(snapshot.backend, "p1 kind=codex L0-explicit hit D:/mine.cmd");
+});
+
+test("backend 段 · L0 显式路径不存在 ⇒ rejected-missing 且不回落（下层备好可命中素材）", () => {
+  const l0RejectDeps: BackendEntryDeps = {
+    platform: "win32",
+    env: {},
+    machineModulesRoot: "C:/machine-empty",
+    npmRoots: ["C:/npm-global"],
+    isFile: (p) => p.includes("npm-global"),
+    readJson: () => ({ bin: { "codex-acp": "dist/index.js" } }),
+  };
+  const snapshot = describeAgentConfig(project("codex", { backendCmd: "D:/mine.cmd" }), l0RejectDeps);
+  assert.match(snapshot.backend, /^p1 解析失败，逐层清单：L0-explicit=rejected-missing\(D:\/mine\.cmd\)/);
+  assert.doesNotMatch(snapshot.backend, /L1-local|L2-npm-global|L3-path/, "显式被拒 ⇒ 不扫后续层、不静默回落");
+});
 
 const CATALOG_URL = new URL("../../config/model-catalog.json", import.meta.url);
 
 test("model-catalog：JSON 合法，codex / claude 两段与既有段同形且键集齐备", () => {
   const catalog = JSON.parse(readFileSync(CATALOG_URL, "utf8")) as Record<string, unknown>;
 
-  for (const seg of ["qoder", "opencode", "codex", "claude"] as const) {
+  for (const seg of ["qoder-cn", "opencode", "codex", "claude"] as const) {
     const section = catalog[seg];
     assert.equal(typeof section, "object", `${seg} 段应为对象`);
     assert.ok(section !== null && !Array.isArray(section), `${seg} 段应为非数组对象`);

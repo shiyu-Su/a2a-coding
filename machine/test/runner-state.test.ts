@@ -38,7 +38,7 @@ const MACHINE: MachineConfig = {
   ],
 };
 
-const SELF_CHECK_OK: SelfCheckResult = { ok: true, failures: [] };
+const SELF_CHECK_OK: SelfCheckResult = { ok: true, failures: [], unavailable: [] };
 
 function tempDir(): string {
   return mkdtempSync(join(tmpdir(), "runner-state-"));

@@ -22,7 +22,7 @@
 1. clone 本仓，分别 `npm install` `orch/` 与 `machine/`，并构建桥（`orch` 下 `npm run build`）。
 2. 起 Launcher（执行机器，一律经 `machine/scripts/launcherctl.mjs`；在 machine 单元根用 `npm run start -- --no-wait` 发起 → `npm run status` 确认就绪）。
 3. 填两份配置：`machine/config/config.json` 的 `projects[]`，`orch/config/config.json` 的 `machines[]`。
-4. 启动宿主（如 opencode），经 `opencode.json` 的 `instructions` 加载 `flow/spec/*.md`，并注册 `mcp.a2a`。
+4. 启动宿主（如 opencode），经 `opencode.json` 的 `instructions` 加载 `flow/spec/*.md`，并注册 `mcp.a2a`。**一座桥、多个编排身份**：组身份由 url **路径首段**承载——未配组环境注册 `http://127.0.0.1:8787/mcp`（全量入口）；配了组的环境注册 `http://127.0.0.1:8787/<组名>/mcp`（该连接视野限定本组，漏写组名段被 403 拒绝），细节见各 `hosts/*.md`。
 5. 验证：`a2a_projects()` 能列出项目即接入成功。
 
 交付 A 的增量只有两件：把规范接进宿主的 `instructions`，以及本目录的接入说明。详见 [hosts/opencode.md](./hosts/opencode.md)。
@@ -35,7 +35,7 @@
 node flow/install/install.mjs --host opencode --orch <orch 单元路径>
 ```
 
-它做两件事：向宿主配置**新增** `mcp.a2a`（remote MCP）；在宿主 `instructions` 追加 `flow/spec/` 两份规范文件。`--dry-run` 只打印将发生的改动。撤销：
+它做两件事：向宿主配置**新增** `mcp.a2a`（remote MCP）；在宿主 `instructions` 追加 `flow/spec/` 两份规范文件。配组环境加 `--group <组名>`，写入条目的 url 即为 `…/<组名>/mcp`（缺省不拼，维持现状 `/mcp`）。`--dry-run` 只打印将发生的改动。撤销：
 
 ```bash
 node flow/install/uninstall.mjs --target <项目根>
@@ -67,5 +67,6 @@ v0.4.1 只把 opencode 路径做到完整可用，其余宿主给接入指引，
 ## 边界
 
 - 本包只描述**流程与状态机语义**，实现细节（工具名、项目来源、传输）留给运行底座；换操作面、换项目来源、换传输都不改规范。
+- **组 ≠ 安全边界**：桥的 MCP 端点零鉴权，url 组名段只界定该连接的可见性与派发范围，不构成鉴权/授权；真正的安全边界归「安全与治理」专项。
 - 网页可视化服务（v0.8 / v0.9）尚未提供，本包不承诺任何网页操作能力。
 - `flow/` 不含源码单元，不参与 `npm` 构建。

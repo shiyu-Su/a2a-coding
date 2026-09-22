@@ -1,8 +1,8 @@
-# PROTOCOL — Runner ⇄ Bridge 线协议契约（2.1）
+# PROTOCOL — Runner ⇄ Bridge 线协议契约（2.2）
 
 本文件是 machine（Launcher 升格为 **Runner**，出站方）与 orch（**Bridge**，入站承载方）之间 HTTP 线协议的**单一事实源**。v0.7.0 起连接模型整体反转为 **pull**：**Runner 主动出站连桥**，桥不再向机器发起业务调用。线协议类型与版本常量在两侧各自声明（`orch/types.ts` / `machine/types.ts`），以本文件 + 契约测试（`.omo/skills/regression-test/tests/test-protocol-version.js`）保持一致；修改协议时**先改本文件**，再同步两侧实现。
 
-- 当前版本：**2.1**（两侧同名常量 `PROTOCOL_VERSION`）
+- 当前版本：**2.2**（两侧同名常量 `PROTOCOL_VERSION`）
 - 主笔归属：**orch 主笔、machine 审阅**（仓根唯一单写面）。
 - 适用范围：仅 Runner ⇄ Bridge HTTP（`/runner/*`，挂载于桥的常驻 HTTP transport、复用 MCP 端口，不引第二接入面）。Runner ⇄ 本地 A2A 端点走标准 A2A 协议（自带版本）；MCP 工具面（`a2a_*` 工具出入参）不属本契约。约束：两部署单元自包含、无跨单元 import —— 因此协议以「文档 + 契约测试」对齐，不做共享 schema 包。
 
@@ -31,8 +31,8 @@ Runner 启动自检通过后首触（注册 / 刷新投影）。
 | `selfCheck` | object | 否 | Runner 自检结论 `{ ok, failures }`；桥**不解析**（宽容忽略） |
 | `version` | string | 否 | Runner 软件版本（观测用） |
 
-`projects[]` 项：`projectId`（必填）/ `agentKind`（必填，`"opencode" \| "codex" \| "claude" \| "qoder"`）/ `a2aPort`（必填，1–65535 整数）/ `risk`（可选，`"read" \| "write" \| "full"`）/ `status`（可选，`"online" \| "offline"`）/ `workspace`、`endpoint`、`startedAt`（可选，观测用）。未知字段忽略。
-<!-- agent-kinds: opencode,codex,claude,qoder -->
+`projects[]` 项：`projectId`（必填）/ `agentKind`（必填，`"opencode" \| "codex" \| "claude" \| "qoder-cn"`）/ `a2aPort`（必填，1–65535 整数）/ `risk`（可选，`"read" \| "write" \| "full"`）/ `status`（可选，`"online" \| "offline"`）/ `workspace`、`endpoint`、`startedAt`（可选，观测用）。未知字段忽略。
+<!-- agent-kinds: opencode,codex,claude,qoder-cn -->
 
 > **`agentKind` 取值集合规范源**：上行为 `agentKind` 取值集合的**机器可解析规范源锚点**（供回归断言以正则捕获）。orch（`orch/types.ts` 的 `AGENT_KINDS`）与 machine（`machine/agent-kinds.ts` 的 `AGENT_KINDS`）**各自派生常量、不共享代码**（两单元自包含），两侧一致性由回归断言「本地清单 == 锚点」锁定（两侧同一捕获正则）。
 
@@ -135,7 +135,9 @@ Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持�
 ## 版本规则
 
 - **加可选字段**（请求或响应）→ minor +1，主版本不变，旧对端可忽略；
-- **扩展必填字段的取值集合**（如 `agentKind` 新增成员）→ minor +1，主版本不变；旧对端仅在未使用新取值时兼容；
+- **变更必填字段的取值集合**（**新增 / 更名 / 移除成员**，如 `agentKind` 的成员增减或改名）→ minor +1，主版本不变；旧对端仅在未使用变更取值时兼容；
+  - ⚠ **更名与移除是「单向不兼容」**：变更后的取值对未升级对端会被拒，旧取值对已升级对端同样被拒；且拒绝发生在**整包项目级**（`projects[]` 结构校验失败 ⇒ 该 Runner 上报的**全部项目**一起被 `400 bad_request` 拒、该机对桥不可见），**不是只拒那一个项目**。
+  - ⇒ 因此**版本号本身不构成兼容窗口**（`/runner/register` 的版本握手只校验**主版本**，枚举取值集合由闭集校验强制）⇒ **更名 / 移除必须由部署侧在同一切换窗口内完成（两侧同升）**，并**在本节下方演进记录表新增一行**登记；**不得跨版本混跑**（旧机与新机同时在线时，必有一侧整包被拒）。
 - **删字段 / 改字段语义 / 加必填请求体或必填参数** → major +1；
 - 桥在 `/runner/register` 校验 Runner 主版本：不在桥侧 `SUPPORTED_PEER_PROTOCOL_MAJORS`（`orch/types.ts`）清单内即 **403 `protocol_version_mismatch`**（结构化错误含机器 ID、实测版本、可支持清单与升级指引）；同主版本内 minor 差异兼容放行；
 - 跨主版本一律明确拒绝（fail-fast），不做静默降级猜测；按版本的行为降级适配必须显式写分支（以注册载荷中的完整版本号为依据）。
@@ -162,3 +164,4 @@ v0.7.0 发版即**硬切**：连接模型由 push（Bridge → Launcher 入站�
 | 1.0（v0.1.2） | 初始版本化：**push 模型**（Bridge → Launcher 入站）：`GET /projects`、`POST /projects/{id}/ensure`、`POST /projects/{id}/stop`；`GET /health` 自报 `protocolVersion` | — | 机器 ≥ 1.0；桥 ≥ 1.0（首触握手校验） |
 | 2.0（v0.7.0） | **pull 模型**（Runner → Bridge 出站）：`/runner/register`、`/runner/connect`（长轮询 hold 缺省 25s + wake）、`/runner/result`（ack）；命令族三类 dispatch / stop / cancel-task；幂等键 `(machineId, taskId)`；`capabilities` 可扩展 + 未知字段忽略；错误码族 `runner_not_allowed` / `runner_unauthorized` / `runner_not_owner` / `project_not_a_member`；**1.0 端点与握手硬切退役（本版发版时）**；machine 本地 `/health` 明示为**机器本地内部接口、非契约面** | 是（major） | Runner ≥ 2.0（携 `protocolVersion`，主版本 ∈ `[2]`）；Bridge ≥ 2.0（`SUPPORTED_PEER_PROTOCOL_MAJORS = [2]`，拒 1.0） |
 | 2.1（v0.8.0） | agentKind 取值集合扩展（+qoder）；实际强制来自 agentKind 闭集拒绝，版本握手只校验主版本（SUPPORTED_PEER_PROTOCOL_MAJORS=[2]） | 否（minor） | 使用 qoder 的 Runner 要求 Bridge ≥ 2.1（旧 Bridge 对 qoder 注册以 400 bad_request 拒绝） |
+| 2.2（v0.8.6） | agentKind 取值集合**更名**：`qoder` → `qoder-cn`（**旧值不再合法**）；实际强制来自 agentKind 闭集拒绝，版本握手只校验主版本（SUPPORTED_PEER_PROTOCOL_MAJORS=[2]） | 否（minor，沿 2.1 先例：取值集合变更 + 单向不兼容） | 使用 `qoder-cn` 的 Runner 要求 Bridge ≥ 2.2；**旧值 `qoder` 本版起于两侧均非法**（旧 Bridge 对新值同样 400 拒整包） |

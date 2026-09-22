@@ -50,11 +50,11 @@ const CFG_DIR = mkdtempSync(join(tmpdir(), "a2a-a4-dispatch-"));
 const CFG_PATH = join(CFG_DIR, "config.json");
 process.env["MACHINES_CONFIG"] = CFG_PATH; // 必须在 import bridge/index.js **之前**
 
-/** 写机器清单：选择性项目组（m1 仅声明成员项目；未声明者 ⇒ project_not_a_member） */
+/** 写机器清单：选择性项目组（v0.8.6 组数组形状；m1 仅声明成员项目；未声明者 ⇒ project_not_a_member） */
 function writeConfig(members: Array<{ machineId: string; projectId: string }>): void {
   writeFileSync(
     CFG_PATH,
-    JSON.stringify({ machines: [{ machineId: "m1" }], projectGroup: { members } }, null, 2),
+    JSON.stringify({ machines: [{ machineId: "m1" }], projectGroup: [{ name: "g1", members }] }, null, 2),
     "utf8",
   );
 }

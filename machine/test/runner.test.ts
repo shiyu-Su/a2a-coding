@@ -46,7 +46,7 @@ const MACHINE: MachineConfig = {
   ],
 };
 
-const SELF_CHECK_OK: SelfCheckResult = { ok: true, failures: [] };
+const SELF_CHECK_OK: SelfCheckResult = { ok: true, failures: [], unavailable: [] };
 
 interface CapturingLogger extends RunnerLogger {
   lines: string[];

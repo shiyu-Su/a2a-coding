@@ -6,6 +6,8 @@
  *   `runner_not_allowed`；协议主版本 ∉ `[2]` ⇒ 403 `protocol_version_mismatch`（结构化拒绝）；
  * - **成员拒绝**：选择性项目组下，非成员项目不 claim（心跳），显式请求非成员项目 ⇒ 403
  *   `project_not_a_member`；
+ * - **多组 claim（v0.8.6 §2.5 N5）**：判据 = 「本机在**任一组**中的项目」—— 配组且属本组 ⇒ 放 ·
+ *   属另一组 / 未配组内 ⇒ 拒 · **未配任何组 ⇒ 全放**（旧部署零破坏）；
  * - **CAS claim 唯一**：同一入队任务被两个并发 `/connect` 争抢 ⇒ 恰一个 `dispatch`、另一个心跳；
  * - **wake 唤醒**：挂起的 `/connect` 被 `wake(machineId)` 立即唤醒并领取新入队任务（远早于 hold）；
  * - **hold 超时**：无命令时到点返回 204（心跳）；
@@ -85,25 +87,26 @@ function machine(machineId: string, token?: string): MachineRef {
 
 function makeConfig(opts: {
   machines: MachineRef[];
-  members?: Array<{ machineId: string; projectId: string }>;
+  /** v0.8.6 §2.5 N5：claim 判据读**组数组**（`groups[]`，任一组放行）；`undefined` = 未配组段 */
+  groups?: Array<{ name: string; members: Array<{ machineId: string; projectId: string }> }>;
   holdMs?: number;
 }): MachinesConfig {
-  let projectGroup: ProjectGroup | undefined;
-  if (opts.members !== undefined) {
-    projectGroup = {
-      name: null,
-      members: opts.members,
-      memberKeys: new Set(opts.members.map((m) => memberKey(m.machineId, m.projectId))),
-      memberMachineIds: new Set(opts.members.map((m) => m.machineId)),
+  let groups: ProjectGroup[] | undefined;
+  if (opts.groups !== undefined) {
+    groups = opts.groups.map((g) => ({
+      name: g.name,
+      members: g.members,
+      memberKeys: new Set(g.members.map((m) => memberKey(m.machineId, m.projectId))),
+      memberMachineIds: new Set(g.members.map((m) => m.machineId)),
       selective: true,
-    };
+    }));
   }
   return {
     machines: opts.machines,
     transport: { mode: "http", http: { host: "127.0.0.1", port: 0, path: "/mcp" } },
     web: { enabled: false, host: "127.0.0.1", port: 0 },
     runner: { holdMs: opts.holdMs ?? 100, heartbeatTimeoutMs: 60_000 },
-    ...(projectGroup === undefined ? {} : { projectGroup }),
+    ...(groups === undefined ? {} : { groups }),
   };
 }
 
@@ -342,7 +345,7 @@ test("register：upsertRunner/全量替换投影 + runner.registered 事件；ca
 test("成员拒绝：非成员项目不 claim（心跳）；显式请求非成员项目 ⇒ project_not_a_member", async () => {
   const cfg = makeConfig({
     machines: [machine("m-member", "tok-member")],
-    members: [{ machineId: "m-member", projectId: "p-in" }],
+    groups: [{ name: "g1", members: [{ machineId: "m-member", projectId: "p-in" }] }],
     holdMs: 60,
   });
   const h = await startHarness(cfg);
@@ -380,6 +383,121 @@ test("成员拒绝：非成员项目不 claim（心跳）；显式请求非成�
   const ghost = await post(h.port, RUNNER_CONNECT_PATH, { machineId: "m-ghost2" }, "tok-member");
   assert.equal(ghost.status, 403);
   assert.equal(errorCodeOf(ghost), "runner_not_allowed");
+});
+
+// ---------------------------------------------------------------------------
+// 多组 claim「任一组放行」（v0.8.6 §2.5 S5 / N5）
+// ---------------------------------------------------------------------------
+
+test("N5 ① 配组 + 项目属本机所在组 ⇒ 放（claim 成功下发 dispatch）", async () => {
+  const cfg = makeConfig({
+    machines: [machine("m-n5a", "tok-n5a")],
+    groups: [
+      { name: "gA", members: [{ machineId: "m-n5a", projectId: "n5a-in" }] },
+      { name: "gB", members: [{ machineId: "m-n5b", projectId: "n5a-other" }] },
+    ],
+    holdMs: 60,
+  });
+  const h = await startHarness(cfg);
+  await register(h.port, "m-n5a", "tok-n5a", [
+    { projectId: "n5a-in", agentKind: "opencode", a2aPort: 3061 },
+  ]);
+  seedQueuedTask("t-n5a-in", "n5a-in", "ctx-n5a-in", "claim me");
+
+  const dispatch = await post(h.port, RUNNER_CONNECT_PATH, { machineId: "m-n5a" }, "tok-n5a");
+  assert.equal(dispatch.status, 200);
+  const command = dataOf(dispatch) as DispatchShape;
+  assert.equal(command.command, "dispatch");
+  assert.equal(command.taskId, "t-n5a-in");
+  assert.equal(command.projectId, "n5a-in");
+});
+
+test("N5 ② 项目属另一组 / 不属任何组 ⇒ 静默不 claim（心跳）；显式请求则 403 project_not_a_member", async () => {
+  const cfg = makeConfig({
+    machines: [machine("m-n5b", "tok-n5b"), machine("m-n5c", "tok-n5c")],
+    groups: [
+      // 本机自己在 gA 只有一个成员项目
+      { name: "gA", members: [{ machineId: "m-n5b", projectId: "n5b-in" }] },
+      // 同 projectId 挂在**另一台机器**的 gB 组下 ⇒ 对本机不是成员（memberKey 同源于 (machineId,projectId)）
+      { name: "gB", members: [{ machineId: "m-n5c", projectId: "n5b-foreign" }] },
+    ],
+    holdMs: 60,
+  });
+  const h = await startHarness(cfg);
+  await register(h.port, "m-n5b", "tok-n5b", [
+    { projectId: "n5b-in", agentKind: "opencode", a2aPort: 3062 },
+    { projectId: "n5b-foreign", agentKind: "opencode", a2aPort: 3063 },
+    { projectId: "n5b-ungrouped", agentKind: "opencode", a2aPort: 3064 },
+  ]);
+
+  // 另一组的项目 + 未配进任何组的项目：均不入 claim（心跳），且任务仍留队列
+  seedQueuedTask("t-n5b-foreign", "n5b-foreign", "ctx-n5b-1", "should not be claimed");
+  seedQueuedTask("t-n5b-ungrouped", "n5b-ungrouped", "ctx-n5b-2", "should not be claimed");
+  const heartbeat = await post(h.port, RUNNER_CONNECT_PATH, { machineId: "m-n5b" }, "tok-n5b");
+  assert.equal(heartbeat.status, 204);
+  assert.equal(getQueuedTask("t-n5b-foreign")?.queueState, "queued");
+  assert.equal(getQueuedTask("t-n5b-ungrouped")?.queueState, "queued");
+
+  // 显式请求另一组的项目 ⇒ 403 + 结构化错误码 + 文案指路
+  const denied = await post(
+    h.port,
+    RUNNER_CONNECT_PATH,
+    { machineId: "m-n5b", projects: ["n5b-foreign"] },
+    "tok-n5b",
+  );
+  assert.equal(denied.status, 403);
+  assert.equal(errorCodeOf(denied), "project_not_a_member");
+  assert.match(String(envelope(denied).error?.message ?? ""), /不在本机任一组成员集合/);
+
+  // 显式请求未配组的项目 ⇒ 同样 403
+  const denied2 = await post(
+    h.port,
+    RUNNER_CONNECT_PATH,
+    { machineId: "m-n5b", projects: ["n5b-ungrouped"] },
+    "tok-n5b",
+  );
+  assert.equal(denied2.status, 403);
+  assert.equal(errorCodeOf(denied2), "project_not_a_member");
+
+  // 本机所在组的项目照旧可 claim（对照组：证明上面被拒不是「全拒」造成）
+  seedQueuedTask("t-n5b-in", "n5b-in", "ctx-n5b-3", "claim me");
+  const dispatch = await post(h.port, RUNNER_CONNECT_PATH, { machineId: "m-n5b" }, "tok-n5b");
+  assert.equal(dispatch.status, 200);
+  assert.equal((dataOf(dispatch) as DispatchShape).taskId, "t-n5b-in");
+});
+
+test("N5 ③ 未配任何组 ⇒ 本机注册项目全放（零破坏，含显式清单）", async () => {
+  const cfg = makeConfig({
+    machines: [machine("m-n5c", "tok-n5c")],
+    groups: [], // 显式空组数组 = 未配组（与段缺失同语义）
+    holdMs: 60,
+  });
+  const h = await startHarness(cfg);
+  await register(h.port, "m-n5c", "tok-n5c", [
+    { projectId: "n5c-p1", agentKind: "opencode", a2aPort: 3065 },
+    { projectId: "n5c-p2", agentKind: "opencode", a2aPort: 3066 },
+  ]);
+
+  seedQueuedTask("t-n5c-p1", "n5c-p1", "ctx-n5c-1", "claim me first");
+  const first = await post(h.port, RUNNER_CONNECT_PATH, { machineId: "m-n5c" }, "tok-n5c");
+  assert.equal(first.status, 200);
+  const c1 = dataOf(first) as DispatchShape;
+  assert.equal(c1.command, "dispatch");
+  assert.equal(c1.taskId, "t-n5c-p1");
+  assert.equal(c1.projectId, "n5c-p1");
+
+  // 显式请求清单里的项目：未配组 ⇒ 不因成员判定被拒（仍按本机注册投影放行）
+  seedQueuedTask("t-n5c-p2", "n5c-p2", "ctx-n5c-2", "claim me second");
+  const scoped = await post(
+    h.port,
+    RUNNER_CONNECT_PATH,
+    { machineId: "m-n5c", projects: ["n5c-p2"] },
+    "tok-n5c",
+  );
+  assert.equal(scoped.status, 200);
+  const c2 = dataOf(scoped) as DispatchShape;
+  assert.equal(c2.taskId, "t-n5c-p2");
+  assert.equal(c2.projectId, "n5c-p2");
 });
 
 // ---------------------------------------------------------------------------

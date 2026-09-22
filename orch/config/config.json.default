@@ -1,5 +1,5 @@
 {
-  "_comment": "projectGroup：orch 侧静态「项目组」+ 选择性连接（v0.6.0，可选段、单组）。① 本段缺省 = 全量接纳（与今天行为一致：不写 projectGroup 键 ⇒ selective=false，全部已配置机器/项目照常列出与派发，旧配置零改动可用）。② 本段存在时 members 必须是非空数组 —— 空数组成员列表视为配置错误（要么删掉该段、要么列出成员）。③ 本段 fail-fast：成员 machineId 拼错（不在 machines[] 中）会让桥整体拒绝派发（错误码 machines_config_error），且该配置解析失败会让 transport 读取一并 fail-fast（桥拒绝启动、不 bind；v0.7.1 起），web 仍回落各自默认—— 改完配置请先验证（先校验 JSON 合法性，再起桥看日志）。④ 推荐入组机器保持 launcher.idleStopMs > 0（缺省 300000）：把项目移出成员后，靠 Launcher 空闲回收把已拉起的 agent 自动收回；为 0（显式禁用回收）时该 agent 可能长期驻留，需人工 POST {launcherUrl}/projects/{projectId}/stop（注意 launcherctl.mjs 不含单项目 stop）。样例（启用时才把下列内容从注释搬成真实键 projectGroup；不写 = 全量接纳）：{\"name\":\"<组名>\",\"members\":[{\"machineId\":\"<machine-id>\",\"projectId\":\"<project-id>\"}]} transport：桥 transport（v0.4.1 桥常驻化，可选段）。mode 取值仅 http（v0.7.1 起 stdio 已退役，显式 stdio ⇒ 解析期 fail-fast），缺省 http（旧配置无此段时零改动可用、行为不变）；桥恒常驻监听 http.host:http.port+http.path，缺省 host=127.0.0.1、port=8787、path=/mcp（避开 Launcher 3100、项目 A2A 3010-3012）。web：网页端只读工作台（v0.5.0，可选段）。缺省 {enabled:true, host:127.0.0.1, port:3300}（3300 避开 Launcher 3100 / 项目 A2A 3010-3012 / MCP http 8787）。enabled 决定常驻桥是否另起只读工作台；v0.7.1 起 web.allowStdio 已随 stdio 退役成死配置（显式出现 ⇒ warn + 忽略）；实际是否 bind 由运行时判定 enabled && role===owner，且 host 非 loopback 一律拒起（本段只承载配置，不实现监听）。 runner：Runner 反向注册阈值（v0.7.0 D2，可选段）。缺省 {holdMs:25000, heartbeatTimeoutMs:60000}；holdMs = 桥端 /runner/connect 长轮询单次挂起上限（空超时即心跳），heartbeatTimeoutMs = 注册心跳判死阈值（超期只降在线态、不得触发 stop）。两者均为正整数毫秒，非法（非整数 / <1 / 类型错）解析期 fail-fast。 machines[].token：per-machine Runner 鉴权 token（v0.7.0 D4，可选）；桥按 machineId 校验 Runner 注册 / 领任务 / 回传携带的静态 Bearer（对应机器侧 launcher.bridge.token），声明时须为非空字符串。 machines[].launcherUrl：**已作废（deprecated，v0.7.0）** —— 入站指挥通道随 Runner 反向注册退役；解析已放宽为**可选**（缺省 / 非法仅告警，不 fail-fast、不回退全量接纳），出站路径退役前仍兼容保留（可继续填旧值，也可省略）。",
+  "_comment": "projectGroup：orch 侧静态「项目组」+ 选择性连接（v0.6.0 引入，v0.8.6 一桥多组扩为组数组，可选段）。① 本段缺省 = 全量接纳（与今天行为一致：不写 projectGroup 键 ⇒ 全部已配置机器/项目照常列出与派发，旧配置零改动可用）。② 本段存在时必须是**组数组**，每项 { name, members: [{ machineId, projectId }] }：组名 name 必填（身份 = 连接 URL 路径首段，字符集 [A-Za-z0-9_-]+，且不得与保留首段 health/shutdown/runner 或 transport.http.path 首段冲突）；每组 members 必须是非空数组 —— 空数组视为配置错误（要么删掉该段、要么列出成员）。③ 成员互斥：同一 (machineId, projectId) 只能属于一个组，跨组重复 ⇒ 启动 fail-fast（组内重复项由集合去重、不算冲突）。④ 本段 fail-fast：成员 machineId 拼错（不在 machines[] 中）会让桥整体拒绝派发（错误码 machines_config_error），且该配置解析失败会让 transport 读取一并 fail-fast（桥拒绝启动、不 bind；v0.7.1 起），web 仍回落各自默认—— 改完配置请先验证（先校验 JSON 合法性，再起桥看日志）。⑤ 配组后连接必须带组名首段：http://<host>:8787/<组名>/mcp（如组名 team-a ⇒ http://127.0.0.1:8787/team-a/mcp）；不带组名段（裸 /mcp）⇒ 403 group_identity_required。⑥ 推荐入组机器保持 launcher.idleStopMs > 0（缺省 300000）：把项目移出成员后，靠 Launcher 空闲回收把已拉起的 agent 自动收回；为 0（显式禁用回收）时该 agent 可能长期驻留，需人工 POST {launcherUrl}/projects/{projectId}/stop（注意 launcherctl.mjs 不含单项目 stop）。可直接照抄的组数组样例见下方 _projectGroupExample（启用时把该键改名为 projectGroup 并填真实值；不写 = 全量接纳、样例键不参与解析）。 transport：桥 transport（v0.4.1 桥常驻化，可选段）。mode 取值仅 http（v0.7.1 起 stdio 已退役，显式 stdio ⇒ 解析期 fail-fast），缺省 http（旧配置无此段时零改动可用、行为不变）；桥恒常驻监听 http.host:http.port+http.path，缺省 host=127.0.0.1、port=8787、path=/mcp（避开 Launcher 3100、项目 A2A 3010-3012）。web：网页端只读工作台（v0.5.0，可选段）。缺省 {enabled:true, host:127.0.0.1, port:3300}（3300 避开 Launcher 3100 / 项目 A2A 3010-3012 / MCP http 8787）。enabled 决定常驻桥是否另起只读工作台；v0.7.1 起 web.allowStdio 已随 stdio 退役成死配置（显式出现 ⇒ warn + 忽略）；实际是否 bind 由运行时判定 enabled && role===owner，且 host 非 loopback 一律拒起（本段只承载配置，不实现监听）。 runner：Runner 反向注册阈值（v0.7.0 D2，可选段）。缺省 {holdMs:25000, heartbeatTimeoutMs:60000}；holdMs = 桥端 /runner/connect 长轮询单次挂起上限（空超时即心跳），heartbeatTimeoutMs = 注册心跳判死阈值（超期只降在线态、不得触发 stop）。两者均为正整数毫秒，非法（非整数 / <1 / 类型错）解析期 fail-fast。 machines[].token：per-machine Runner 鉴权 token（v0.7.0 D4，可选）；桥按 machineId 校验 Runner 注册 / 领任务 / 回传携带的静态 Bearer（对应机器侧 launcher.bridge.token），声明时须为非空字符串。 machines[].launcherUrl：**已作废（deprecated，v0.7.0）** —— 入站指挥通道随 Runner 反向注册退役；解析已放宽为**可选**（缺省 / 非法仅告警，不 fail-fast、不回退全量接纳），出站路径退役前仍兼容保留（可继续填旧值，也可省略）。",
   "transport": {
     "mode": "http",
     "http": {
@@ -25,8 +25,14 @@
       "token": "<runner-bearer-token>"
     }
   ],
-  "_projectGroupExample": {
-    "name": "示例：启用时把本键改名为 projectGroup 并填真实值；不启用则保持本键不动（不参与解析）",
-    "members": [ { "machineId": "<machine-id>", "projectId": "<project-id>" } ]
-  }
+  "_projectGroupExample": [
+    {
+      "name": "team-a",
+      "members": [ { "machineId": "<machine-id>", "projectId": "<project-id-a>" } ]
+    },
+    {
+      "name": "team-b",
+      "members": [ { "machineId": "<machine-id>", "projectId": "<project-id-b>" } ]
+    }
+  ]
 }

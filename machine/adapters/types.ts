@@ -24,7 +24,8 @@ export interface LaunchRequest {
   permissionArgs?: string[];
   /**
    * 项目 `agentConfig`（来源 = `ProjectConfig.agentConfig`）。四 kind 均为 ACP 族，一律读
-   * **顶层平铺自消费键**：`backendCmd`（必填，后端命令）· `model`（非必填，协议面模型标识，
+   * **顶层平铺自消费键**：`backendCmd`（**可选覆盖**，四 kind 一致 —— 未配置时由
+   * `./backend-entry.ts` 逐层自动解析，见 REQ-v0.8.6-2026-09-21-02）· `model`（非必填，协议面模型标识，
    * 原样经 `--model` 透传）· `systemPrompt` / `systemPromptMode`（非必填，自定义注入，
    * 经 `--system-prompt` / `--system-prompt-mode` 透传）。
    */

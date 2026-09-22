@@ -12,9 +12,11 @@
  *     --risk <read|write|full> --mode <plan|acceptEdits|bypassPermissions>
  *     [--session-meta-json <full 档 _meta>]`
  *
- * - ACP 后端命令**必须**由项目配置**顶层平铺键** `agentConfig.backendCmd` 指定，代码零硬编码缺省；
- *   未配置 ⇒ `buildLaunch` 抛明确错误。探针实证：Windows 下 `.cmd` / `.ps1` 壳在 `shell:false`
- *   **Windows 形态**：`backendCmd` 填该适配器 `dist/index.js` 的**绝对路径**（该包 `bin` =
+ * - ACP 后端命令 = **可选覆盖**（REQ-v0.8.6-2026-09-21-02 · B2：四 kind 一致）：顶层平铺键
+ *   `agentConfig.backendCmd` 以显式值为准；未配置 ⇒ `./backend-entry.ts` 逐层解析（L1 机器本地 →
+ *   L2 全局 npm 包 `@agentclientprotocol/claude-agent-acp` → L3 PATH 命令名 `claude-agent-acp`），
+ *   均未命中 ⇒ `buildLaunch` 抛明确错误（逐层清单落 launcher.log，不进 message）。
+ *   **Windows 形态**：显式值填该适配器 `dist/index.js` 的**绝对路径**（该包 `bin` =
  *   `claude-agent-acp` → `dist/index.js`，本身即 JS 入口）⇒ 适配器自动以 `process.execPath` +
  *   脚本路径拉起（形态归一见 `./backend-command.ts`）；`.cmd` / `.ps1` 壳不可直调。
  * - `--backend-args` 由**形态归一**产出：可执行体形态 = `[]`（`--acp` 已被两家适配器**静默忽略**、
@@ -47,16 +49,16 @@ import type {
 } from "./types.js";
 import { appRootFromModule } from "../launcher/app-root.js";
 import {
-  resolveAcpBackendCmd,
   resolveAcpModel,
   resolveSystemPrompt,
   resolveSystemPromptMode,
 } from "../launcher/agent-config.js";
+import { requireBackendEntry } from "./backend-entry.js";
 import { resolveBackendSpawn } from "./backend-command.js";
 
-/** 缺少 `agentConfig.backendCmd` 时的明确错误文案（ACP 族必填，纪律对齐 `OPENCODE_BACKEND_CMD_REQUIRED`）。 */
+/** 四层均未解析到入口时的明确错误文案（含分层摘要；纪律对齐 `OPENCODE_BACKEND_CMD_REQUIRED`）。 */
 export const CLAUDE_BACKEND_CMD_REQUIRED =
-  "claude 项目必须配置 agentConfig.backendCmd（ACP 适配器入口 = @agentclientprotocol/claude-agent-acp：填其 dist/index.js 绝对路径 ⇒ 适配器自动以 node 拉起；或填可直接 spawn 的 .exe 真身——.cmd/.ps1 壳在无 shell 的 spawn 下会 ENOENT/EINVAL）";
+  "未能解析到 claude 的 ACP 后端入口：L0 显式 agentConfig.backendCmd / L1 机器本地 / L2 全局 npm（@agentclientprotocol/claude-agent-acp）/ L3 PATH（命令名 claude-agent-acp）均未命中——请安装该适配器、设 NPM_CONFIG_PREFIX，或显式配置 agentConfig.backendCmd（其 dist/index.js 绝对路径 ⇒ 以 node 拉起；.cmd/.ps1 壳不可直调）；清单见 launcher.log [backend] 行";
 
 /** wrapper 族迁 ACP 后显式下发的空后端参数（B11′）：`--acp` 已被适配器静默忽略 ⇒ 裸 bin + stdio 即规范形态。 */
 export const CLAUDE_BACKEND_ARGS: readonly string[] = [];
@@ -81,11 +83,12 @@ export class ClaudeAdapter implements Adapter {
   readonly protocol = "acp";
 
   buildLaunch(request: LaunchRequest): LaunchSpec {
-    // ACP 族后端命令必填：代码零硬编码缺省（未配置即抛错，避免静默落到错误命令）。
-    const backendCmd = resolveAcpBackendCmd(request.agentConfig);
-    if (backendCmd === undefined) {
-      throw new Error(CLAUDE_BACKEND_CMD_REQUIRED);
-    }
+    // 后端入口：显式 `backendCmd` 优先，未配置 ⇒ 逐层自动解析（四 kind 一致，REQ-v0.8.6 · B2）。
+    const backendCmd = requireBackendEntry(
+      "claude",
+      request.agentConfig,
+      CLAUDE_BACKEND_CMD_REQUIRED,
+    );
     const model = resolveAcpModel(request.agentConfig);
     // 平铺 systemPrompt(Mode)（v0.8.5 · N1）：自定义注入复用 resolveSystemPrompt / resolveSystemPromptMode。
     const systemPrompt = resolveSystemPrompt(request.agentConfig);
@@ -129,5 +132,4 @@ export class ClaudeAdapter implements Adapter {
     }
     return { args };
   }
-
 }

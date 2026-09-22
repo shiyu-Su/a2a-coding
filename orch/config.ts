@@ -84,9 +84,42 @@ function asTransportMode(v: unknown, ctx: string): TransportMode {
   fail(`${ctx} 必须是 "http"`);
 }
 
+/**
+ * HTTP 接入面**保留首段**（v0.8.6 §2.2 B 形态：`/<组名>/mcp` 身份 = URL 首段）。
+ * 两处消费（均为启动 fail-fast）：
+ * - ① `transport.http.path` 不得为这些段本身或其前缀（否则保留路由空间的请求会被身份首段解析牵连）；
+ * - ④ 组名不得取这些段（否则 `/health` / `/shutdown` / `/runner` 流量的归属产生歧义）。
+ */
+export const RESERVED_FIRST_SEGMENTS = ["health", "shutdown", "runner"] as const;
+
+/**
+ * 组名字符集（v0.8.6 §2.2 启动校验 ③）：组名进 URL 路径首段 ⇒ 只允许
+ * `[A-Za-z0-9_-]+`（不含 `/`、空白与其它需要百分号编码的字符）。
+ */
+const GROUP_NAME_RE = /^[A-Za-z0-9_-]+$/;
+
+/**
+ * 解析 `transport.http.path`（v0.8.6 §2.2 B 形态三项启动校验合一）：
+ * 非空字符串、以 `/` 开头、**拒尾斜杠**（②：「首段 = 组身份」解析下 `"/mcp/"` 产生空段歧义）、
+ * **不得为保留首段本身或其前缀**（①：如 `/health` / `/runner/…`）。非法一律 `fail()`。
+ */
 function asHttpPath(v: unknown, ctx: string): string {
   const s = asString(v, ctx);
   if (!s.startsWith("/")) fail(`${ctx} 必须以 "/" 开头`);
+  if (s.endsWith("/")) {
+    fail(
+      `${ctx} "${s}" 非法：不得以 "/" 结尾（组身份 = URL 首段解析下尾斜杠产生空段歧义，请去掉结尾的 "/"）`,
+    );
+  }
+  for (const reserved of RESERVED_FIRST_SEGMENTS) {
+    if (s.startsWith(`/${reserved}`)) {
+      fail(
+        `${ctx} "${s}" 非法：MCP 端点不得为 /${reserved} 本身或其前缀` +
+          `（占用保留路由空间会令 /${reserved} 系请求与「/<组名>/…」身份解析纠缠，` +
+          `请改用独立路径，如 /mcp）`,
+      );
+    }
+  }
   return s;
 }
 
@@ -241,7 +274,8 @@ export function memberKey(machineId: string, projectId: string): string {
 /**
  * `projectGroup` 段缺省态（v0.6.0）= **全量接纳**：`selective: false`、无成员。
  *
- * 这是「段缺省」这一唯一情形下的合法结果；**配置异常一律 fail-fast**，绝不复用本默认
+ * 这是「段缺省 / 未配任何组」这一唯一情形下的合法结果（v0.8.6 起亦作 N1 过渡聚合视图
+ * `aggregateProjectGroup([])` 的空态）；**配置异常一律 fail-fast**，绝不复用本默认
  * （§2.3-I2：任何「未命中 / 配置异常」都不得回退成全量接纳）。
  */
 export function defaultProjectGroup(): ProjectGroup {
@@ -255,46 +289,116 @@ export function defaultProjectGroup(): ProjectGroup {
 }
 
 /**
- * 解析 `projectGroup` 配置段（v0.6.0 静态项目组；纯函数，可单测）。
+ * 解析 `projectGroup` 配置段（v0.8.6 一桥多组 §2.1；纯函数，可单测）。
  *
- * - **段缺失**（`value === undefined`）⇒ `selective: false` 全量接纳（旧 `config.json` 零改动可用，
- *   **绝不 fail-fast** —— 这是验收项）；
- * - **段存在** ⇒ 严格校验：必须对象；`name` 缺省/`null` ⇒ `null`，否则须非空字符串；
+ * 键名沿用 `projectGroup`，**形状由「单组对象」扩为「组数组」**，每项 `{ name, members[] }`。
+ *
+ * - **段缺失**（`value === undefined` / `null`）⇒ 返回 `[]`（顶层 `groups: []` = **全量接纳**，
+ *   与今天 `defaultProjectGroup()` 语义一致，**绝不 fail-fast** —— 验收项）；
+ * - **段存在** ⇒ 必须是**数组**（每个元素是一个组对象）；逐组严格校验：
+ *   组项必须对象；**`name` 必填**（v0.8.6 §2.2 B 形态：组名 = URL 路径首段身份，
+ *   无名组不可被寻址 ⇒ 配组后匿名又被 403 拒绝 = 死配置 ⇒ **fail-fast**）且匹配 `[A-Za-z0-9_-]+`；
  *   `members` 必须为**非空**数组（**空数组 = 配置错误 ⇒ fail**，U1 裁定：要么删段、要么列成员）；
  *   成员项必须为对象且 `{ machineId, projectId }` 均为非空字符串；
- *   **`machineId` 必须 ∈ `machines[]`，否则 fail-fast**（拼错机器名的代价 = 桥整体拒绝该段）。
- * - 派生：`memberKeys` / `memberMachineIds` / `selective: true`（成员判定同源于 `memberKey`）。
+ *   **`machineId` 必须 ∈ `machines[]`，否则 fail-fast**（拼错机器名的代价 = 桥整体拒绝该段）；
+ *   每组派生 `selective: true`。
+ * - **组间成员互斥（用户 2026-09-21 已裁）**：同一 `(machineId, projectId)` **只能出现在一个组**
+ *   ⇒ 配置期 **fail-fast**。判据同源于 `memberKey()`（禁第二套拼接）；**组内重复项**由集合去重、
+ *   不触发互斥（互斥只针对**跨组**）。
  *
- * 非法一律走既有 `fail()` 约定（`[config]` 前缀 + 字段路径），不新造第二种错误风格、不静默降级。
+ * 非法一律走既有 `fail()` 约定（`[config]` 前缀 + 字段路径 + 中文解释 + 对策），
+ * 不新造第二种错误风格、不静默降级。
  */
-export function parseProjectGroup(value: unknown, machineIds: ReadonlySet<string>): ProjectGroup {
-  if (value === undefined) return defaultProjectGroup();
-  const g = asRecord(value, "projectGroup");
-  const nameRaw = g["name"];
-  const name =
-    nameRaw === undefined || nameRaw === null ? null : asString(nameRaw, "projectGroup.name");
-  const membersRaw = g["members"];
-  if (!Array.isArray(membersRaw)) fail("projectGroup.members 必须是数组");
-  if (membersRaw.length === 0) {
-    fail("projectGroup.members 必须是非空数组（要么删除本段 = 全量接纳，要么列出成员）");
+export function parseProjectGroups(
+  value: unknown,
+  machineIds: ReadonlySet<string>,
+): ProjectGroup[] {
+  if (value === undefined || value === null) return [];
+  if (!Array.isArray(value)) {
+    fail("projectGroup 必须是组数组（每个元素是一个项目组对象：{ name, members[] }）");
   }
-  const members = membersRaw.map((m, i): ProjectMember => {
-    const ctx = `projectGroup.members[${i}]`;
-    const r = asRecord(m, ctx);
-    const machineId = asString(r["machineId"], `${ctx}.machineId`);
-    const projectId = asString(r["projectId"], `${ctx}.projectId`);
-    if (!machineIds.has(machineId)) {
-      fail(`${ctx}.machineId "${machineId}" 不在 machines[] 中（成员必须指向已配置机器）`);
+  /** 成员 key → 首个声明它的组下标（跨组去重判据，同源于 `memberKey`） */
+  const ownerGroupIndex = new Map<string, number>();
+  const groups: ProjectGroup[] = [];
+  value.forEach((item, gi) => {
+    const ctx = `projectGroup[${gi}]`;
+    const g = asRecord(item, ctx);
+    const nameRaw = g["name"];
+    if (nameRaw === undefined || nameRaw === null) {
+      fail(
+        `${ctx}.name 组名必填：身份由 URL 路径首段承载（访问 /<组名>/mcp），` +
+          `无名组不可被寻址、且配组后匿名访问已被 403 拒绝（请为本组补 name，字符集 [A-Za-z0-9_-]+）`,
+      );
     }
-    return { machineId, projectId };
+    const name = asString(nameRaw, `${ctx}.name`);
+    if (!GROUP_NAME_RE.test(name)) {
+      fail(
+        `${ctx}.name "${name}" 非法：组名进 URL 路径首段，只允许字母 / 数字 / 下划线 / 连字符` +
+          `（[A-Za-z0-9_-]+），请改名`,
+      );
+    }
+    const membersRaw = g["members"];
+    if (!Array.isArray(membersRaw)) fail(`${ctx}.members 必须是数组`);
+    if (membersRaw.length === 0) {
+      fail(`${ctx}.members 必须是非空数组（要么删除本段 = 全量接纳，要么列出成员）`);
+    }
+    const members = membersRaw.map((m, mi): ProjectMember => {
+      const mctx = `${ctx}.members[${mi}]`;
+      const r = asRecord(m, mctx);
+      const machineId = asString(r["machineId"], `${mctx}.machineId`);
+      const projectId = asString(r["projectId"], `${mctx}.projectId`);
+      if (!machineIds.has(machineId)) {
+        fail(`${mctx}.machineId "${machineId}" 不在 machines[] 中（成员必须指向已配置机器）`);
+      }
+      return { machineId, projectId };
+    });
+    const memberKeys = new Set<string>();
+    const memberMachineIds = new Set<string>();
+    for (const m of members) {
+      const key = memberKey(m.machineId, m.projectId);
+      memberMachineIds.add(m.machineId);
+      if (memberKeys.has(key)) continue; // 组内重复项：集合去重即可，非跨组冲突
+      const owner = ownerGroupIndex.get(key);
+      if (owner !== undefined) {
+        fail(
+          `projectGroup 组间成员互斥：{ machineId: "${m.machineId}", projectId: "${m.projectId}" } ` +
+            `同时出现在 projectGroup[${owner}] 与 ${ctx}` +
+            `（同一成员只能属于一个组，请从其中一组删除）`,
+        );
+      }
+      ownerGroupIndex.set(key, gi);
+      memberKeys.add(key);
+    }
+    groups.push({ name, members, memberKeys, memberMachineIds, selective: true });
   });
-  return {
-    name,
-    members,
-    memberKeys: new Set(members.map((m) => memberKey(m.machineId, m.projectId))),
-    memberMachineIds: new Set(members.map((m) => m.machineId)),
-    selective: true,
-  };
+  return groups;
+}
+
+/**
+ * **全组聚合视图**（v0.8.6 §2.1）：把 `groups[]` 并成单个 `ProjectGroup`（「无身份 / 全量视图」口径）。
+ *
+ * 消费者（均为**刻意**使用聚合语义，而非旧单组遗留）：
+ * - `bridge/index.ts#resolveGroup(identity)` 在 `identity === null`（配组环境的 web 运维视图 /
+ *   HTTP 匿名在 403 门后理论不可达）时**同源复用**（禁第二套并集拼接）；
+ * - Runner claim **不再走本聚合视图**：v0.8.6 §2.5 N5 起直接读 `groups[]` 做「任一组放行」判定
+ *   （`bridge/runner.ts#claimableProjects`）；`MachinesConfig.projectGroup` 字段仅剩存量断言消费，
+ *   待收尾节点与本函数一并退役。
+ *
+ * 聚合口径：`members` = 各组声明拼接；`memberKeys` / `memberMachineIds` = 各组并集（互斥保证不重叠）；
+ * `selective` = `groups.length > 0`；空组 ⇒ 回 `defaultProjectGroup()`（全量接纳）。
+ * 纯函数，无 I/O、无副作用。
+ */
+export function aggregateProjectGroup(groups: readonly ProjectGroup[]): ProjectGroup {
+  if (groups.length === 0) return defaultProjectGroup();
+  const members: ProjectMember[] = [];
+  const memberKeys = new Set<string>();
+  const memberMachineIds = new Set<string>();
+  for (const g of groups) {
+    members.push(...g.members);
+    for (const k of g.memberKeys) memberKeys.add(k);
+    for (const id of g.memberMachineIds) memberMachineIds.add(id);
+  }
+  return { name: groups[0]?.name ?? null, members, memberKeys, memberMachineIds, selective: true };
 }
 
 /**
@@ -353,18 +457,38 @@ export function loadMachinesConfig(path: string): MachinesConfig {
     };
   });
   /**
-   * v0.6.0 项目组：在 `machines[]` 解析之后接入（成员 `machineId ∈ machines[]` 校验依赖其派生集合）。
-   * 段缺失 ⇒ `selective: false`（全量接纳），**恒返回完整对象**（运行时不存在 `undefined`）。
+   * v0.8.6 一桥多组：在 `machines[]` 解析之后接入（成员 `machineId ∈ machines[]` 校验依赖其派生集合）。
+   * 段缺失 / 未配任何组 ⇒ `groups: []`（全量接纳），**恒返回数组**（运行时不会出现 `undefined`）。
+   * `projectGroup` = 全组聚合视图（v0.8.6 §2.2 起桥侧组判定走 `bridge/index.ts#resolveGroup(identity)`；
+   * §2.5 N5 起 Runner claim 亦直接读 `groups[]`「任一组放行」，本字段生产路径已无消费者）。
    */
-  const projectGroup = parseProjectGroup(
+  const groups = parseProjectGroups(
     o["projectGroup"],
     new Set(machineRefs.map((r) => r.machineId)),
   );
+  /**
+   * B 形态启动校验 ④：组名不得与**保留 URL 首段**冲突 —— {health, shutdown, runner} ∪
+   * {`transport.http.path` 的首段}。身份 = 首段的解析下，撞首段的组地址与既有路由无法区分 ⇒ fail-fast。
+   */
+  const reservedFirstSegments = new Set<string>([
+    ...RESERVED_FIRST_SEGMENTS,
+    transport.http.path.slice(1).split("/")[0] ?? "",
+  ]);
+  for (const [gi, g] of groups.entries()) {
+    if (g.name !== null && reservedFirstSegments.has(g.name)) {
+      fail(
+        `projectGroup[${gi}].name "${g.name}" 与保留 URL 首段冲突` +
+          `（保留段 = health / shutdown / runner / transport.http.path 首段 "${transport.http.path.slice(1).split("/")[0]}"）：` +
+          `组地址 /<组名>… 与既有路由无法区分，请改用其它 [A-Za-z0-9_-]+ 组名`,
+      );
+    }
+  }
   return {
     machines: machineRefs,
     transport,
     web,
     runner,
-    projectGroup,
+    groups,
+    projectGroup: aggregateProjectGroup(groups),
   };
 }

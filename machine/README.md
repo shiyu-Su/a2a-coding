@@ -52,7 +52,7 @@ npm run logs      # 输出日志全文（支持 --lines N / --follow）
 > 本段是启停 / 就绪语义的**持久锚点**：与 orch 侧同口径、各单元独立实现、不共享代码。运维、编排与根 README 的启停说明均以本段为准。
 
 - **`--no-wait`：发起即返**（不等待任何就绪判据）；`exit 0` = **已发起（≠ 已就绪）**，仅 spawn 同步失败才 `exit 1`。
-- **缺省 `start` 的等待目标 = L1（`/health` 可答 = HTTP 200）**，**不含启动自检**；因此**缺省 `exit 0` ≠ 业务就绪** —— 自检未过时 `/health` 报 `status:"starting"`；自检失败则 fail-fast 退出。入站业务路由已于 v2.0 退役，就绪态现仅由 `/health` 的 `status` 表达（不再有 503 业务路由）。
+- **缺省 `start` 的等待目标 = L1（`/health` 可答 = HTTP 200）**，**不含启动自检**；因此**缺省 `exit 0` ≠ 业务就绪** —— 自检未过时 `/health` 报 `status:"starting"`；**机器级**自检失败**只有一种：全部项目不可用**，仅此 fail-fast 退出，**单项目失败（含 ensure 过程中命中的端口/进程类故障）不再拖垮全机**（v0.8.6 补正口径，见「后端命令」失败语义）。另：**启动期 `listen` 失败**（`EADDRINUSE` 端口被占等）仍是机器级故障 —— 端口即双实例互斥锁，该路径在自检之前直接退出，与自检口径无关。入站业务路由已于 v2.0 退役，就绪态现仅由 `/health` 的 `status` 表达（不再有 503 业务路由）。
 - 需要业务就绪时用 **`--wait-ready`**：等待 `/health` 的 `status === "ok"` 才 `exit 0`；超时 / 自检失败 ⇒ `exit 1`。
   - 缺省整段硬上限 = `max(60s, N × startupCheckTimeoutMs + 60s)`（`N` = 本机 `projects` 数，`startupCheckTimeoutMs` 缺省 120s；该上界未计入启动对账清理耗时）；`--ready-timeout <ms>` 可覆盖。
   - `--wait-ready` 与 `--no-wait` **互斥**（同传 ⇒ 显式报错）；`--ready-timeout` 仅在 `--wait-ready` 下有效。
@@ -76,7 +76,7 @@ npm run logs      # 输出日志全文（支持 --lines N / --follow）
 
 ## Agent 类型与 ACP 桥（四条 kind 同构）
 
-本机 `projects[].agentKind` 取值集合 = `opencode` / `codex` / `claude` / `qoder`（单一事实源 `agent-kinds.ts`）。
+本机 `projects[].agentKind` 取值集合 = `opencode` / `codex` / `claude` / `qoder-cn`（单一事实源 `agent-kinds.ts`）。
 
 v0.8.5 起四条 kind **同构**：适配器 `protocol` 恒为 `"acp"`，`buildLaunch` 一律拉起**仓内自持 ACP 桥** `machine/acp-bridge/`（构建产物 `dist/acp-bridge/index.js`），桥再以 **stdio NDJSON** 拉起**外部安装的 ACP 后端**（各家 CLI 的 ACP 入口）：
 
@@ -93,18 +93,43 @@ v0.8.5 起四条 kind **同构**：适配器 `protocol` 恒为 `"acp"`，`buildL
     [--session-meta-json <JSON 对象>]
   ```
 
-### 后端命令：外部安装 + `backendCmd` 必填
+### 后端命令：外部安装 + `backendCmd` 可选覆盖（四层自动解析）
 
-machine **不内联任何后端**（`package.json` 零新增依赖）：ACP 后端由**适配器包各自外部安装**，命令**必须**由项目配置的**顶层平铺键** `agentConfig.backendCmd` 给出 —— 代码零硬编码缺省，未配置（缺键 / 非字符串 / 空串）⇒ `buildLaunch` 抛错。
+machine **不内联任何后端**（`package.json` 零新增依赖）：ACP 后端由**适配器包各自外部安装**。v0.8.6 起 `agentConfig.backendCmd` 对四个 kind 一律为**可选覆盖**：缺省时机器按**四层链**自动解析适配器入口（`KIND → 入口` 表唯一事实源 = `adapters/backend-entry.ts` 的 `BACKEND_LOOKUP_BY_KIND`）；写了显式值则**以显式值为准**（含指向非标准位置安装的自建适配器）——显式值的契约 = **入口文件路径，必须存在且是文件**，不满足 ⇒ 该项目明确不可用、**不静默回落下层**（想按命令名走 PATH 的正确表达 = 删键，见 L0 行）。
 
-| kind | ACP 后端（外部安装） | `--backend-args` | `backendCmd` 形态 |
-|---|---|---|---|
-| `opencode` | `opencode` CLI（自带 ACP 入口） | `["acp"]`（**子命令**，适配器内置；非 `--acp` 旗标） | `…\node_modules\opencode-ai\bin\opencode.exe`（**`.exe` 绝对路径**，实测可用） |
-| `qoder` | `qodercn` CLI（CN 版） | 缺省 `["--acp"]`（走桥缺省） | `qoderclicn.exe` 的 `.exe` 绝对路径（或可补全为 `.exe` 的裸名） |
-| `codex` | `@agentclientprotocol/codex-acp` | 可执行体 `[]` / 脚本入口 `[<入口路径>]` | `…\@agentclientprotocol\codex-acp\dist\index.js`（**脚本入口**，推荐） |
-| `claude` | `@agentclientprotocol/claude-agent-acp` | 可执行体 `[]` / 脚本入口 `[<入口路径>]` | `…\@agentclientprotocol\claude-agent-acp\dist\index.js`（**脚本入口**，推荐） |
+**四层链**（逐层探测、**命中即停**；`backendCmd` 缺键 / 空串 / 非字符串 ⇒ 回落自动解析）：
 
-**`backendCmd` 的语义与归一（v0.8.5，真机实测）**：`backendCmd` 填的是**适配器入口**，由适配器归一为桥可直调的形态：
+| 层 | 找什么 |
+|---|---|
+| **L0 显式** | 顶层平铺键 `agentConfig.backendCmd`（**显式值须存在且是文件** —— `backendCmd` 的契约 = **ACP 适配器入口文件路径**；不满足 ⇒ **该项目明确不可用、不静默回落**下层，文案含「后端入口」+ 原样路径；裸命令名（如 `node` / `qoderclicn`）同样被拒，**删键即可走自动解析**） |
+| **L1 机器本地** | `machine/node_modules/<包>` 的入口（本机 `machine/package.json` 现零后端依赖 ⇒ 该层今天实质恒空，日后 machine 加依赖即自动生效） |
+| **L2 全局 npm** | 固定候选表（不起子进程跑 `npm root -g`）：`NPM_CONFIG_PREFIX` + win `%APPDATA%/npm/node_modules` + posix `/usr/local/lib/node_modules`、`/usr/lib/node_modules`（按 root 去重）→ 逐根找 `<包>/package.json` 的 `bin` 入口 |
+| **L3 PATH** | 按**适配器命令名**查 PATH（`opencode` / `codex-acp` / `claude-agent-acp` / `qoderclicn`），只命中**真身可执行体**（`.exe` / POSIX 可执行文件）——三家 JS 适配器全局安装通常只有 `.cmd/.ps1` 壳 ⇒ 该层对它们实质恒 `rejected-shell`，**保留但不指望兜底** |
+
+| kind | ACP 后端（外部安装） | 自动解析入口 | `--backend-args` | 显式覆盖示例（`backendCmd`） |
+|---|---|---|---|---|
+| `opencode` | `opencode` CLI（自带 ACP 入口） | 包 `opencode-ai`（L1/L2）+ PATH 命令名 `opencode` | `["acp"]`（**子命令**，适配器内置；非 `--acp` 旗标） | `…\node_modules\opencode-ai\bin\opencode.exe`（**`.exe` 真身绝对路径**，实测可用） |
+| `qoder-cn` | `qodercn` CLI（CN 版） | `pathCommand="qoderclicn"` + 双平台 `knownPaths`（见下） | 缺省 `["--acp"]`（走桥缺省） | `qoderclicn.exe` 的 `.exe` 绝对路径（或可补全为 `.exe` 的裸名） |
+| `codex` | `@agentclientprotocol/codex-acp` | 同名 npm 包（L1/L2）+ PATH 命令名 `codex-acp` | 可执行体 `[]` / 脚本入口 `[<入口路径>]` | `…\@agentclientprotocol\codex-acp\dist\index.js`（**脚本入口**，推荐） |
+| `claude` | `@agentclientprotocol/claude-agent-acp` | 同名 npm 包（L1/L2）+ PATH 命令名 `claude-agent-acp` | 可执行体 `[]` / 脚本入口 `[<入口路径>]` | `…\@agentclientprotocol\claude-agent-acp\dist\index.js`（**脚本入口**，推荐） |
+
+**`qoder-cn` 无 npm 包、另有 `known` 白名单层**（排在 L3 之前）：按 kind · 按平台登记的**具体文件**（非扫目录）——win `~/.qoder-cn/bin/qoderclicn/qoderclicn.exe` · mac/linux `~/.local/bin/qoderclicn`；PATH 层命令名 `qoderclicn` **≠ kind 名 `qoder-cn`**，故表里必须显式登记。
+
+**两条铁律（解析器不许踩）**：
+
+- **绝不回退包 `main`**：claude 包 `bin=dist/index.js` 而 `main=dist/lib.js`，后者**不是 ACP stdio 入口**，误拉起来的表现是「`initialize` 无响应」，比 ENOENT 更难查。`bin` 解析规则：字符串直用；对象取 `bin[包 unscoped 名]`；key 未命中但对象仅单条目 ⇒ 宽容取该条目并记 `bin-key-mismatch`；多条目不匹配 ⇒ 判未命中进下一层（不猜）；`bin` 值两种写法（带 `./` / 不带）⇒ 一律 `resolve(pkgDir, value)` 后 `isFile` 校验。
+- **PATH 层只按适配器命令名查、绝不按 kind 名**：按 kind 名会命中 `claude.exe` 这类**不会说 ACP 的 native CLI**（真实误解析来源）。
+
+**`[backend]` 分层日志行**（解析结果落 `.a2a/logs/launcher.log`；挂在启动快照 `describeAgentConfig` 这一「每次拉起都打」的读点 ⇒ 自检期 / 派发期 / 复用期自动携带）：
+
+```
+[backend] <projectId> kind=codex L2-npm-global hit C:\...\codex-acp\dist\index.js        （命中即停，只记到命中层）
+[backend] <projectId> 解析失败，逐层清单：L0-explicit=miss(backendCmd) | L1-local=miss(…) | L2-npm-global=miss(…) | L3-path=rejected-shell(…\codex-acp.cmd)
+```
+
+**失败语义**：解析不到 ⇒ **该项目明确不可用**——启动抛错（message 只带一句摘要 + 「详见 launcher.log 上方 `[backend]` 行」，分层清单不进 Error 以免被截断）+ 分层原因清单，**不静默降级、不回落 CLI**。v0.8.6 补正后自检粒度 = **单项目失败不再拖垮全机**：其余项目照常服务，**机器级自检故障只有一种 = 全部项目不可用**，仅此才退出；ensure 过程中命中的端口/进程类故障按项目级登记不可用（启动期 `listen` 失败另属双实例互斥语义，仍直接退出，不在自检口径内）。非标准 npm 前缀（nvm / volta / 自定义 prefix）⇒ 设 `NPM_CONFIG_PREFIX` 或显式填 `backendCmd`（L0 出口常在）。
+
+**`backendCmd` 的语义与归一（v0.8.5，真机实测）**：`backendCmd`（显式填写的，或自动解析命中的）是**适配器入口**，由适配器归一为桥可直调的形态：
 
 - **入口是脚本**（`.js` / `.mjs` / `.cjs`）⇒ 适配器组 `--backend-cmd <node 绝对路径（`process.execPath`）>` + `--backend-args [<脚本绝对路径>]`；
 - **入口是可执行体**（`.exe` 等）⇒ **直调**：`--backend-cmd <原样>` + `--backend-args []`。
@@ -125,7 +150,7 @@ risk 恒经 `permission(risk)` **单一出口**下发（桥对 kind 无知、只
 
 | kind | `read` | `write` | `full` |
 |---|---|---|---|
-| `opencode` / `qoder` | `--risk read` | `--risk write` | `--risk full` |
+| `opencode` / `qoder-cn` | `--risk read` | `--risk write` | `--risk full` |
 | `codex` | `--mode read-only` **+ `--collaboration-mode plan`** | `--mode agent` | `--mode agent-full-access` |
 | `claude` | `--mode plan` | `--mode acceptEdits` | `--mode bypassPermissions` **+ `--session-meta-json`** |
 
@@ -144,7 +169,7 @@ risk 恒经 `permission(risk)` **单一出口**下发（桥对 kind 无知、只
 ### 键位口径与自定义注入
 
 - **`agentConfig.<kind>` 段与配置通道整体退役**（v0.8.5）：`--config-file` / `--config-segment` / `writeAgentConfig` / `agents/` 产物全部退役 ⇒ 段内键（wrapper 族契约键、ACP 族段内 `model` 等）**不再被任何人消费**，写了无效、也不再告警。
-- 键位口径 = **自消费键顶层平铺**：`backendCmd`（**必填**）· `model` · `systemPrompt` / `systemPromptMode`（自定义注入 ⇒ 桥 `--system-prompt` / `--system-prompt-mode`，缺省 `append`）。
+- 键位口径 = **自消费键顶层平铺**：`backendCmd`（**可选覆盖**，缺省走四层自动解析，见「后端命令」）· `model` · `systemPrompt` / `systemPromptMode`（自定义注入 ⇒ 桥 `--system-prompt` / `--system-prompt-mode`，缺省 `append`）。
 - **「保留」≠ 提供读点**：命名空间保留键清单见 `agent-kinds.ts` 的 `RESERVED_AGENT_CONFIG_FLAT_KEYS`。
 - **outcome 约定注入的唯一落点 = ACP 桥缺省**（单一源 `agent-outcome.ts`），不随项目配置覆盖。
 - **opencode serve 前置后端（sidecar）已随迁 ACP 退役**：桥直接 spawn 后端，无独立后端进程、无端口预分配。
@@ -152,6 +177,6 @@ risk 恒经 `permission(risk)` **单一出口**下发（桥对 kind 无知、只
 ### 认证
 
 - `opencode` / `codex` / `claude`：沿用各自 CLI 的用户级凭据（`~/.codex/config.toml`、`~/.claude/settings.json`）；
-- `qoder`：优先文件凭据 `~/.qoder-cn/.auth`（`qodercn` CLI 登录），备选 env `QODERCN_PERSONAL_ACCESS_TOKEN`（经 Launcher 进程环境透传）。
+- `qoder-cn`：优先文件凭据 `~/.qoder-cn/.auth`（`qodercn` CLI 登录），备选 env `QODERCN_PERSONAL_ACCESS_TOKEN`（经 Launcher 进程环境透传）。
 
 四 kind 项目示例 + 「适配器安装与后端命令示例」见 `config/config.json.default`。

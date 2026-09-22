@@ -339,8 +339,10 @@ const SHELL_SPAWNABLE_EXTS = new Set([".exe"]);
 /**
  * win32 下 `shell:false` **不可直调**的扩展名（P1 实测：`.cmd`/`.bat` ⇒ EINVAL、`.ps1` ⇒ EFTYPE）。
  * 命中即明确报错，不喂给 spawn、不解析批处理内容、不退回 `shell:true`（DEP0190 只拼接不转义）。
+ *
+ * **导出**：`adapters/backend-entry.ts` 的分层探测复用**同一集合**判 `rejected-shell`（勿两处字面量漂移）。
  */
-const WIN_SPAWN_REJECTED_EXTS = new Set([".cmd", ".bat", ".ps1"]);
+export const WIN_SPAWN_REJECTED_EXTS = new Set([".cmd", ".bat", ".ps1"]);
 
 export interface ResolveSpawnCommandDeps {
   platform?: NodeJS.Platform;

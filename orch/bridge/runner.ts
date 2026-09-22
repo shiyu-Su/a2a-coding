@@ -8,7 +8,7 @@
  * | 端点 | 作用 | 关键判据 |
  * |---|---|---|
  * | `POST /runner/register` | 注册 / 刷新投影 | Bearer token（常量时间）→ machineId ∈ `machines[]` → `protocolVersion` 主版本 ∈ `SUPPORTED_PEER_PROTOCOL_MAJORS`；`upsertRunner` + `runnerProjectsReplace` + `runner.registered` 事件 |
- * | `POST /runner/connect` | 长轮询（poll 即心跳） | 同上鉴权；claim 前置 = `(machineId,projectId) ∈ memberKeys` **且**任务归属该机器（= 本机注册过的项目）；命中 claim CAS 即下发 `dispatch`，另可下发 `stop` / `cancel-task`；空超时 = 心跳（204） |
+ * | `POST /runner/connect` | 长轮询（poll 即心跳） | 同上鉴权；claim 前置 = **未配组 ⇒ 全放**，配了组 ⇒ `(machineId,projectId) ∈ 任一组 memberKeys` **且**任务归属该机器（= 本机注册过的项目）；命中 claim CAS 即下发 `dispatch`，另可下发 `stop` / `cancel-task`；空超时 = 心跳（204） |
  * | `POST /runner/result` | 结果回传（ack） | 同上鉴权 + **claim_token 校验**（比对落库领取令牌）→ `upsertTaskResult`（幂等键 `(machineId, taskId)`）→ 200 ack |
  *
  * 门闩与接入面（节点验收项）：
@@ -109,7 +109,7 @@ export const RUNNER_ERR_BAD_REQUEST = "bad_request";
 export const RUNNER_ERR_PAYLOAD_TOO_LARGE = "payload_too_large";
 /** 方法不符（端点仅 POST） */
 export const RUNNER_ERR_METHOD_NOT_ALLOWED = "method_not_allowed";
-/** 项目不在本机成员集合（与既有 `project_not_a_member` 同码） */
+/** 项目不在本机任一组成员集合（与既有 `project_not_a_member` 同码） */
 export const RUNNER_ERR_PROJECT_NOT_MEMBER = "project_not_a_member";
 /** 回传的任务在本地库中不存在 */
 export const RUNNER_ERR_TASK_NOT_FOUND = "task_not_found";
@@ -254,7 +254,7 @@ const DEFAULT_SWEEP_INTERVAL_MS = 15_000;
 export interface RunnerEndpointOptions {
   /** core 租约角色（`follower` ⇒ 503 `runner_not_owner`） */
   role: () => CoreRole;
-  /** 机器清单（`machines[].token` 鉴权 / `projectGroup` 成员判定 / `runner.holdMs` 阈值） */
+  /** 机器清单（`machines[].token` 鉴权 / `groups[]` 成员判定 / `runner.holdMs` 阈值） */
   config: () => MachinesConfig;
   /** hold 上限覆盖（缺省取 `config().runner.holdMs`；单测用） */
   holdMs?: () => number;
@@ -857,32 +857,32 @@ class RunnerEndpoints implements RunnerEndpointHandle {
   // ------------------------------------------------------------------
 
   /**
-   * 计算本机可领取项目集合。判据（claim 前置）：
-   * `(machineId, projectId) ∈ memberKeys` **且**项目归属该机器（本机注册投影）。
-   * 显式 `projects` 请求中若含非成员项目 ⇒ `project_not_a_member`。
+   * 计算本机可领取项目集合。判据（claim 前置，v0.8.6 §2.5 S5「任一组放行」）：
+   * **未配任何组 ⇒ 全量接纳（零破坏）**；配了组 ⇒ `(machineId, projectId)` **属本机任一组**
+   * `groups.some(g => g.memberKeys.has(memberKey(machineId, projectId)))` **且**项目归属该机器
+   * （本机注册投影）。Runner 通道无 MCP 身份（machine 侧零组字段），故按**全组并集**判定，
+   * 不按连接所在组收窄。显式 `projects` 请求中若含非成员项目 ⇒ `project_not_a_member`。
    */
   private claimableProjects(
     machineId: string,
     requested: string[] | null,
     config: MachinesConfig,
   ): { ok: true; projects: string[] } | { ok: false; message: string } {
-    const group = config.projectGroup;
-    const selective = group?.selective === true;
+    const groups = config.groups ?? [];
+    const selective = groups.length > 0;
+    const inAnyGroup = (projectId: string): boolean =>
+      groups.some((g) => g.memberKeys.has(memberKey(machineId, projectId)));
     if (requested !== null && selective) {
-      const denied = requested.filter(
-        (projectId) => !(group?.memberKeys.has(memberKey(machineId, projectId)) ?? false),
-      );
+      const denied = requested.filter((projectId) => !inAnyGroup(projectId));
       if (denied.length > 0) {
         return {
           ok: false,
-          message: `项目不在本机成员集合（machineId=${machineId}）：${denied.join(", ")}`,
+          message: `项目不在本机任一组成员集合（machineId=${machineId}）：${denied.join(", ")}`,
         };
       }
     }
     const registered = this.store.listRunnerProjects(machineId).map((project) => project.projectId);
-    let claimable = registered.filter(
-      (projectId) => !selective || (group?.memberKeys.has(memberKey(machineId, projectId)) ?? false),
-    );
+    let claimable = registered.filter((projectId) => !selective || inAnyGroup(projectId));
     if (requested !== null) {
       claimable = claimable.filter((projectId) => requested.includes(projectId));
     }

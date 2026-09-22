@@ -11,13 +11,15 @@
  *     [--system-prompt <agentConfig.systemPrompt> [--system-prompt-mode <append|replace>]]
  *     --risk <read|write|full> --mode <modeId> [--collaboration-mode plan]`
  *
- * - ACP 后端命令**必须**由项目配置**顶层平铺键** `agentConfig.backendCmd` 指定，代码零硬编码缺省；
- *   未配置（缺键 / 非字符串 / 空串）⇒ `buildLaunch` 抛明确错误。后端 = `@agentclientprotocol/codex-acp`；
- *   **Windows 形态**：`backendCmd` 填该适配器 `dist/index.js` 的**绝对路径** ⇒ 适配器自动以
+ * - ACP 后端命令 = **可选覆盖**（REQ-v0.8.6-2026-09-21-02 · B2：四 kind 一致）：顶层平铺键
+ *   `agentConfig.backendCmd` 以显式值为准；未配置 ⇒ `./backend-entry.ts` 逐层解析
+ *   （L1 机器本地 → L2 全局 npm 包 `@agentclientprotocol/codex-acp` → L3 PATH 命令名 `codex-acp`），
+ *   均未命中 ⇒ `buildLaunch` 抛明确错误（逐层清单落 launcher.log，不进 message）。
+ *   **Windows 形态**：显式值填该适配器 `dist/index.js` 的**绝对路径** ⇒ 适配器自动以
  *   `process.execPath` + 脚本路径拉起（形态归一见 `./backend-command.ts`）；`.cmd` / `.ps1`
  *   壳在桥的 shell:false spawn 下会 ENOENT/EINVAL，故不能指向 npm 生成的壳。
  * - `--backend-args` 由**形态归一**产出：可执行体形态 = `[]`（codex-acp 自带 bin + stdio 入口、
- *   无 kind 级子命令 ⇒ 区别于 opencode 的 `["acp"]` 与 qoder 的缺省 `["--acp"]`）；脚本形态 =
+ *   无 kind 级子命令 ⇒ 区别于 opencode 的 `["acp"]` 与 qoder 的 `["--acp"]`）；脚本形态 =
  *   `[<适配器入口绝对路径>]`（B11′ 的「显式下发」语义保留）。
  * - 权限：risk 三档经 `permission(risk)` **单一出口**下发 —— `--risk <档>`（桥映射 ACP
  *   `session/request_permission`）**加** `--mode <modeId>`（桥 `applyMode()`：优先
@@ -49,16 +51,16 @@ import type {
 } from "./types.js";
 import { appRootFromModule } from "../launcher/app-root.js";
 import {
-  resolveAcpBackendCmd,
   resolveAcpModel,
   resolveSystemPrompt,
   resolveSystemPromptMode,
 } from "../launcher/agent-config.js";
+import { requireBackendEntry } from "./backend-entry.js";
 import { resolveBackendSpawn } from "./backend-command.js";
 
-/** 缺少 `agentConfig.backendCmd` 时的明确错误文案（ACP 族必填；文案纪律对齐 opencode）。 */
+/** 四层均未解析到入口时的明确错误文案（含分层摘要；完整清单在 launcher.log，不进本 message）。 */
 export const CODEX_BACKEND_CMD_REQUIRED =
-  "codex 项目必须配置 agentConfig.backendCmd（ACP 适配器入口 = @agentclientprotocol/codex-acp：填其 dist/index.js 绝对路径 ⇒ 适配器自动以 node 拉起；或填可直接 spawn 的 .exe 真身——.cmd/.ps1 壳在无 shell 的 spawn 下会 ENOENT/EINVAL）";
+  "未能解析到 codex 的 ACP 后端入口：L0 显式 agentConfig.backendCmd / L1 机器本地 / L2 全局 npm（@agentclientprotocol/codex-acp）/ L3 PATH（命令名 codex-acp）均未命中——请安装该适配器、设 NPM_CONFIG_PREFIX，或显式配置 agentConfig.backendCmd（其 dist/index.js 绝对路径 ⇒ 以 node 拉起；.cmd/.ps1 壳不可直调）；清单见 launcher.log [backend] 行";
 
 /** codex 的 ACP 后端参数（kind 级协议事实：自带 bin + stdio 入口、无子命令 ⇒ 空数组）。 */
 export const CODEX_BACKEND_ARGS: readonly string[] = [];
@@ -78,11 +80,12 @@ export class CodexAdapter implements Adapter {
   readonly protocol = "acp";
 
   buildLaunch(request: LaunchRequest): LaunchSpec {
-    // ACP 族后端命令必填：代码零硬编码缺省（未配置即抛错，避免静默落到错误命令）。
-    const backendCmd = resolveAcpBackendCmd(request.agentConfig);
-    if (backendCmd === undefined) {
-      throw new Error(CODEX_BACKEND_CMD_REQUIRED);
-    }
+    // 后端入口：显式 `backendCmd` 优先，未配置 ⇒ 逐层自动解析（四 kind 一致，REQ-v0.8.6 · B2）。
+    const backendCmd = requireBackendEntry(
+      "codex",
+      request.agentConfig,
+      CODEX_BACKEND_CMD_REQUIRED,
+    );
     const model = resolveAcpModel(request.agentConfig);
     // 平铺 systemPrompt(Mode)（v0.8.5 · N1）：自定义注入复用 resolveSystemPrompt / resolveSystemPromptMode。
     const systemPrompt = resolveSystemPrompt(request.agentConfig);

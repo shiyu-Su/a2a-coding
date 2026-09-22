@@ -160,6 +160,44 @@ test("未知 agentKind：注册 fail-fast 拒整包（400 bad_request），同�
 });
 
 // ---------------------------------------------------------------------------
+// 1b. req03 硬切：旧值 qoder 不再合法 / 新值 qoder-cn 合法（无别名、无归一）
+// ---------------------------------------------------------------------------
+
+test("硬切负向：agentKind=qoder（旧值）注册 ⇒ 400 bad_request 整包拒、同包合法项不落库、文案含新值清单", async () => {
+  const port = await startHarness("m-qoder-cut", "tok-qoder-cut");
+
+  const rejected = await postRegister(port, "tok-qoder-cut", {
+    machineId: "m-qoder-cut",
+    protocolVersion: "2.0",
+    projects: [
+      { projectId: "p-ok", agentKind: "qoder-cn", a2aPort: 4001 },
+      { projectId: "p-old", agentKind: "qoder", a2aPort: 4002 },
+    ],
+  });
+  assert.equal(rejected.status, 400);
+  assert.equal(rejected.body.error?.code, "bad_request");
+  // 文案整串断言：证明「可选值」由改名后的 AGENT_KINDS.join(" / ") 派生（含 qoder-cn、不含旧值）
+  assert.equal(
+    String(rejected.body.error?.message),
+    `projects[1].agentKind 非法（可选 ${AGENT_KINDS.join(" / ")}）`,
+  );
+  // 整包拒：旧值 qoder 不合法 ⇒ 同包内合法的 p-ok 也不得写入投影
+  assert.deepEqual(listRunnerProjects("m-qoder-cut").map((p) => p.projectId), []);
+});
+
+test("硬切正向：agentKind=qoder-cn（新值）注册 ⇒ 200 且投影落库", async () => {
+  const port = await startHarness("m-qoder-cn", "tok-qoder-cn");
+
+  const ok = await postRegister(port, "tok-qoder-cn", {
+    machineId: "m-qoder-cn",
+    protocolVersion: "2.0",
+    projects: [{ projectId: "p-cn", agentKind: "qoder-cn", a2aPort: 4001 }],
+  });
+  assert.equal(ok.status, 200);
+  assert.deepEqual(listRunnerProjects("m-qoder-cn").map((p) => p.projectId), ["p-cn"]);
+});
+
+// ---------------------------------------------------------------------------
 // 2. 写口拒（SessionStore.runnerProjectsReplace）
 // ---------------------------------------------------------------------------
 

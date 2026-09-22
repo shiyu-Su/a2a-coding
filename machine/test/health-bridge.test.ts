@@ -30,7 +30,7 @@ const MACHINE_WITH_BRIDGE: MachineConfig = {
   projects: [],
 };
 
-const SELF_CHECK_OK: SelfCheckResult = { ok: true, failures: [] };
+const SELF_CHECK_OK: SelfCheckResult = { ok: true, failures: [], unavailable: [] };
 
 const SILENT: RunnerLogger = {
   info: (message) => void message,

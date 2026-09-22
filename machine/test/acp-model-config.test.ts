@@ -21,18 +21,18 @@ test("M4 配置面（v0.8.4 翻向）：读顶层平铺 agentConfig.model，值�
 });
 
 test("M4 负向锚点（v0.8.4 翻向）：段内 model 一律不读（遗留键视同未配，不做段回退）", () => {
-  assert.equal(resolveAcpModel({ qoder: { model: "seg-should-be-ignored" } }), undefined);
+  assert.equal(resolveAcpModel({ "qoder-cn": { model: "seg-should-be-ignored" } }), undefined);
   assert.equal(resolveAcpModel({ opencode: { model: "seg-should-be-ignored" } }), undefined);
   // 平铺键缺失 ⇒ 不因段内值兜底
   assert.equal(
-    resolveAcpModel({ backendCmd: "b", qoder: { model: "seg", systemPromptAppend: "x" } }),
+    resolveAcpModel({ backendCmd: "b", "qoder-cn": { model: "seg", systemPromptAppend: "x" } }),
     undefined,
   );
 });
 
 test("M4 平铺优先（v0.8.4）：平铺与遗留段内并存 ⇒ 只取平铺值，段内不掺入", () => {
   assert.equal(
-    resolveAcpModel({ model: "flat", qoder: { model: "legacy-segment" } }),
+    resolveAcpModel({ model: "flat", "qoder-cn": { model: "legacy-segment" } }),
     "flat",
   );
 });

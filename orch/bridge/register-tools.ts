@@ -295,7 +295,8 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_events",
     {
       description:
-        "读取事件收件箱增量（任务结算/阻塞、Feature 流转）。省略 since 则自进程读游标起；无变化时廉价空返回。",
+        "读取事件收件箱增量（任务结算/阻塞、Feature 流转）。省略 since 则自进程读游标起；无变化时廉价空返回。" +
+        "**按连接身份过滤**（v0.8.6 §2.4）：已配组连接只见本组可见事件（孤儿机器级事件全体可见）。",
       inputSchema: {
         since: z
           .number()
@@ -307,7 +308,8 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     },
     async (args) => {
       try {
-        return textResult(core.events(args.since));
+        const outcome = core.events(args.since);
+        return outcome.ok === false ? errorResult(outcome) : textResult(outcome);
       } catch (err) {
         return internalError(err);
       }
@@ -318,7 +320,8 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_wait",
     {
       description:
-        "长轮询等待新事件（推送优先唤醒 + 定时对账），最多 timeoutMs（内部上限低于同步预算）；超时无事件则 timedOut=true。",
+        "长轮询等待新事件（推送优先唤醒 + 定时对账），最多 timeoutMs（内部上限低于同步预算）；超时无事件则 timedOut=true。" +
+        "**按连接身份过滤**（v0.8.6 §1.3 R-2）：游标与「有新事件」判定都只算本组可见事件 ⇒ 他组事件不会让本组空转或误唤醒。",
       inputSchema: {
         timeoutMs: z
           .number()
@@ -330,7 +333,8 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     },
     async (args) => {
       try {
-        return textResult(await core.wait(args.timeoutMs));
+        const outcome = await core.wait(args.timeoutMs);
+        return outcome.ok === false ? errorResult(outcome) : textResult(outcome);
       } catch (err) {
         return internalError(err);
       }

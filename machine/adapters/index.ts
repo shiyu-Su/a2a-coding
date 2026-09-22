@@ -6,7 +6,7 @@ import type { AgentKind } from "../types.js";
 import { ClaudeAdapter } from "./claude.js";
 import { CodexAdapter } from "./codex.js";
 import { OpenCodeAdapter } from "./opencode.js";
-import { QoderAdapter } from "./qoder.js";
+import { QoderCnAdapter } from "./qoder-cn.js";
 import type { Adapter } from "./types.js";
 
 export type {
@@ -22,7 +22,7 @@ const ADAPTERS: Record<AgentKind, Adapter> = {
   opencode: new OpenCodeAdapter(),
   codex: new CodexAdapter(),
   claude: new ClaudeAdapter(),
-  qoder: new QoderAdapter(),
+  "qoder-cn": new QoderCnAdapter(),
 };
 
 /** 按 agentKind 取适配器；kind 由配置加载器校验，必命中。 */

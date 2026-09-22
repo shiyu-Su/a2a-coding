@@ -15,8 +15,10 @@
  * ⇒ major bump `1.0 → 2.0`，**发版即硬切**（v1 通道退役，见 `SUPPORTED_PEER_PROTOCOL_MAJORS`）。
  * v0.8.0：agentKind 取值集合扩展（`+qoder`），字段 / 形状不变 ⇒ minor bump `2.0 → 2.1`
  * （实际强制来自 `agentKind` 闭集拒绝，版本握手只校验主版本）。
+ * v0.8.x（req03 硬切）：agentKind 取值 `qoder` 更名为 `qoder-cn`，字段 / 形状不变但**取值集合变更、
+ * 旧值 `qoder` 不再合法** ⇒ minor bump `2.1 → 2.2`（同由 `agentKind` 闭集拒绝强制，握手只校验主版本）。
  */
-export const PROTOCOL_VERSION = "2.1";
+export const PROTOCOL_VERSION = "2.2";
 
 /**
  * 桥可支持的对端（Runner）主版本清单。主版本升级时按 PROTOCOL.md 维护流程
@@ -36,7 +38,7 @@ export const SUPPORTED_PEER_PROTOCOL_MAJORS: readonly number[] = [2];
  *
  * orch 侧仅据此作**闭集校验 / 投影** —— 「决定**执行层后端（ACP 桥 / 适配器）**与 CLI 参数」属 machine 侧语义。
  */
-export const AGENT_KINDS = ["opencode", "codex", "claude", "qoder"] as const;
+export const AGENT_KINDS = ["opencode", "codex", "claude", "qoder-cn"] as const;
 
 /** 执行层 Agent 类型（由 `AGENT_KINDS` 派生；勿另立第二份清单） */
 export type AgentKind = (typeof AGENT_KINDS)[number];
@@ -91,6 +93,14 @@ export interface FeatureRecord {
   decisions: string | null;
   /** 契约（JSON 字符串；可空） */
   contracts: string | null;
+  /**
+   * 归属组（v0.8.6 §2.3 / REQ-v0.8.6-2026-09-21-01）：= 建 Feature 时的**连接身份**（组名）。
+   *
+   * - `null` = **无归属**：未配组环境（连接无身份）下创建的 Feature，或配组改造前的存量行；
+   *   可见性走 **fail-closed**（未配组环境全量可见；已配组环境对该组身份不可见，不猜默认组，§1.3 R-3 / G2）。
+   * - 非空 = 该组名：Feature **谁建谁见**（列表 / 单查 / advance / approve / cancel 一律按此校验）。
+   */
+  ownerGroup: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -102,6 +112,11 @@ export interface FeatureCreateInput {
   requirement?: string | null;
   /** Feature 级会话上下文（可空；亦可后续经 `updateFeatureContext` 写入） */
   contextId?: string | null;
+  /**
+   * 归属组（v0.8.6 §2.3）：建 Feature 时的连接身份（组名）；`null` / 缺省 = 无归属
+   * （未配组环境的匿名入口）。落 `features.owner_group`，Feature 五出口的可见性/可操作性据此判定。
+   */
+  ownerGroup?: string | null;
   /** 缺省 `waiting_approval`（主链起点 / 审批门停靠点） */
   state?: FeatureState;
   createdAt?: string;
@@ -181,19 +196,25 @@ export interface ProjectMember {
 }
 
 /**
- * 静态「项目组」（v0.6.0 §2.1；`orch/config/config.json` 的 `projectGroup` 段，**单组**、
- * 每请求现读、不缓存）。
+ * 静态「项目组」（v0.8.6 一桥多组 §2.1；`orch/config/config.json` 的 `projectGroup` 段的
+ * **单个组元素**，键名沿用、形状由「单组对象」扩为「**组数组**」，每请求现读、不缓存）。
  *
- * 段**缺省** ⇒ `selective: false`（全量接纳，与旧版行为完全一致，**绝不 fail-fast**）；
- * 段**存在** ⇒ 严格结构校验、非法即 `fail()`（成员列表空数组 / 成员项非法 /
- * `machineId ∉ machines[]` 一律 fail-fast，见 §2.3-I2「绝不 fail-open」）。
+ * 段**缺省 / 未配任何组** ⇒ 顶层 `groups: []` = **全量接纳**（`selective: false`，与旧版一致、零破坏）；
+ * 段**存在** ⇒ 每个 Group 恒 `selective: true`、严格结构校验、非法即 `fail()`；
+ * **组间成员互斥**（同一 `(machineId, projectId)` 只能属一个组）⇒ 配置期 fail-fast。
  *
- * `name` / `members` = 配置声明态；`memberKeys` / `memberMachineIds` / `selective` =
- * 解析期由 `config.ts#parseProjectGroup` 产出的**派生态**（`loadMachinesConfig()` 恒填充）。
- * 成员判定**必须**同源于 `memberKey(machineId, projectId)`（§2.3-I1 单一判据，禁第二套拼接）。
+ * `name` / `members` = 配置声明态（`name` 用于错误文案与 `owner_group` 归属列）；
+ * `memberKeys` / `memberMachineIds` / `selective` = 解析期由 `config.ts#parseProjectGroups`
+ * 产出的**派生态**。成员判定**必须**同源于 `memberKey(machineId, projectId)`
+ * （§2.3-I1 单一判据，禁第二套拼接）。
  */
 export interface ProjectGroup {
-  /** 组名（缺省 `null`；遵循本仓「不省略字段、无数据返 `null`」） */
+  /**
+   * 组名（v0.8.6 §2.2 B 形态起：`projectGroup[]` 段内**必填**，字符集 `[A-Za-z0-9_-]+`，
+   * 且不得与保留 URL 首段冲突 —— 组名 = `/mcp` 端点地址的 URL 路径首段身份 `/<组名>/mcp`）；
+   * `null` 仅出现在**非配置态**：`defaultProjectGroup()`（未配组全量接纳）与 `resolveGroup`
+   * 未命中身份时构造的 fail-closed 空组（name = 该身份）。**不省略字段**。
+   */
   name: string | null;
   /** 声明态成员（保持配置内声明顺序；重复项由派生集合去重） */
   members: ProjectMember[];
@@ -201,7 +222,7 @@ export interface ProjectGroup {
   memberKeys: Set<string>;
   /** 派生：成员机器 id 集合（「发现」路径的扫描范围收窄依据） */
   memberMachineIds: Set<string>;
-  /** 派生：是否启用选择性连接（段缺省 ⇒ `false` = 全量接纳） */
+  /** 派生：是否启用选择性连接（段缺省 ⇒ `false` = 全量接纳；配了组 ⇒ 每组恒 `true`） */
   selective: boolean;
 }
 
@@ -229,8 +250,17 @@ export interface MachinesConfig {
   /** Runner 反向注册阈值（v0.7.0；配置缺省时解析为 `{ holdMs: 25000, heartbeatTimeoutMs: 60000 }`） */
   runner: RunnerConfig;
   /**
-   * 静态项目组（v0.6.0；**段缺省时解析为 `selective: false` 的全量接纳态**，
-   * 由 `loadMachinesConfig()` **恒填充** —— 运行时不会出现 `undefined`，字段可选仅为对齐配置段可选）。
+   * 静态项目组数组（v0.8.6 一桥多组 §2.1；`projectGroup` 段，**段缺省 / 未配任何组 ⇒ `[]` = 全量接纳**，
+   * 由 `loadMachinesConfig()` **恒填充** —— 运行时不会出现 `undefined`；组间成员互斥 ⇒ 配置期 fail-fast）。
+   * 字段可选仅为兼容既有 `MachinesConfig` 字面量夹具（N1 未迁移的构造点），生产路径恒有值。
+   */
+  groups?: ProjectGroup[];
+  /**
+   * **全组聚合视图**（v0.8.6 §2.1：`groups[]` 并为单 `ProjectGroup`，`selective` = `groups.length > 0`；
+   * 空组 ⇒ `defaultProjectGroup()` 全量接纳）。
+   * v0.8.6 N2 起桥侧组判定走 `bridge/index.ts#resolveGroup(identity)`；**N5 起 Runner claim 也已改读
+   * `groups[]`「任一组放行」**（`bridge/runner.ts#claimableProjects`），本字段**生产路径已无消费者**，
+   * 仅存量断言仍在校验聚合语义 —— 待收尾节点随 `aggregateProjectGroup` 一并退役。
    */
   projectGroup?: ProjectGroup;
 }

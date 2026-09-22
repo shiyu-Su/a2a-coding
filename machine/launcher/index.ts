@@ -9,8 +9,11 @@
  *   2. `'listening'` 后写 pidfile（`<machine 根>/.a2a/launcher.pid`）→ 清理过期包装器配置
  *      → **启动对账清理**（清上次硬杀留下的无主孤儿，防其占住 a2aPort 令自检 EADDRINUSE）
  *      → 启动自检。
- *   3. 就绪门：自检通过前 `GET /health` 报 `status:"starting"`、业务路由 503；通过后 `status:"ok"`。
- *   4. 自检失败 fail-fast：关闭端口 → 回收全部子进程 → 删 pidfile → `exit(1)`。
+ *   3. 就绪门：自检通过前 `GET /health` 报 `status:"starting"`；通过后 `status:"ok"`
+ *      （入站业务路由已退役，就绪态仅由 `/health` 的 `status` 字段表达）。
+ *   4. 自检**粒度按可否服务**（§2.4-⑤ 改判 · REQ-v0.8.6-2026-09-21-02 收口）：单项目失败
+ *      → 逐项登记 `manager.unavailable` 后继续服务其余项目（`ready=true` 只要至少一项可用）；
+ *      **机器级故障 = 全部项目不可用**，仅此一种才关端口 → 回收子进程 → 删 pidfile → `exit(1)`。
  *   5. 优雅停止（SIGINT/SIGTERM 或可选 `POST /shutdown`）共享同一幂等 `startShutdown()`。
  */
 import { mkdirSync, rmSync, writeFileSync } from "node:fs";
@@ -51,7 +54,7 @@ const listenHost = machine.launcher.listenHost;
 
 let server: Server | null = null;
 let shuttingDown = false;
-/** 就绪门状态：自检通过前 false（业务路由 503） */
+/** 就绪门状态：自检通过前 false（`/health` 报 `status:"starting"`） */
 let ready = false;
 /** Runner 出站循环（v0.7.0 Phase A；仅当 launcher.bridge 配置齐全时非 null） */
 let runner: Runner | null = null;
@@ -172,7 +175,7 @@ process.on("exit", () => {
   removePidfile();
 });
 
-/** 自检通过前业务路由 503，通过后置就绪 */
+/** 自检通过前 `/health` 报 `status:"starting"`，通过后置就绪 */
 async function onListening(): Promise<void> {
   const boundHost = resolveBoundHost();
   console.log(
@@ -204,29 +207,50 @@ async function onListening(): Promise<void> {
     console.error(`[launcher] 启动对账清理异常（不阻断启动）：${errorMessage(err)}`);
   }
 
-  // 启动自检（缺省开）：端口已监听（互斥锁已生效），全部项目通过才放行业务路由
-  const selfCheck: SelfCheckResult = { ok: true, failures: [] };
+  // 启动自检（缺省开）：端口已监听（互斥锁已生效）。
+  // **粒度口径（§2.4-⑤ 改判 · REQ-v0.8.6-2026-09-21-02 收口）**：单项目失败一律项目级——
+  // 逐项登记不可用、继续服务其余项目；`process.exit(1)` 只保留给**机器级故障 = 全部项目不可用**
+  // （真机 2026-09-22：包装器进程提前退出等项目级 ensure 故障曾被误判机器级，致 7/8 可用仍整机退出）。
+  const selfCheck: SelfCheckResult = { ok: true, failures: [], unavailable: [] };
   if (machine.launcher.startupCheck ?? true) {
     const result = await runStartupSelfCheck(manager, machine);
     selfCheck.ok = result.ok;
     selfCheck.failures = result.failures;
-    if (!result.ok) {
-      for (const failure of result.failures) {
-        console.error(
-          `[launcher] 自检失败 ${failure.projectId}（${failure.stage}）：${failure.reason}`,
-        );
-        if (failure.hint !== undefined) {
-          console.error(`[launcher]   修复提示：${failure.hint}`);
-        }
-      }
+    selfCheck.unavailable = result.unavailable;
+
+    const total = machine.projects.length;
+    const allUnavailable = total > 0 && result.unavailable.length >= total;
+
+    for (const failure of result.failures) {
       console.error(
-        `[launcher] 启动自检未通过（${result.failures.length} 个项目失败），退出（fail-fast；设 launcher.startupCheck=false 可跳过自检）`,
+        `[launcher] 自检失败 ${failure.projectId}（${failure.stage}${failure.cause ? "/" + failure.cause : ""}）：${failure.reason}`,
+      );
+      if (failure.hint !== undefined) {
+        console.error(`[launcher]   修复提示：${failure.hint}`);
+      }
+    }
+
+    if (allUnavailable) {
+      console.error(
+        `[launcher] 机器级自检故障（全部项目不可用），退出（fail-fast；设 launcher.startupCheck=false 可跳过自检）`,
       );
       // 必须关端口再退出，否则下次 start 撞残留；同时回收全部子进程 / 删 pidfile
       await closeServer();
       await manager.shutdown();
       removePidfile();
       process.exit(1);
+    }
+
+    // 非机器级：逐项登记不可用，机器继续服务其余项目
+    for (const failure of result.unavailable) {
+      manager.markUnavailable(failure.projectId, `${failure.stage}: ${failure.reason}`);
+    }
+    if (result.unavailable.length > 0) {
+      console.warn(
+        `[launcher] 自检部分通过：可用 ${total - result.unavailable.length}/${total}，不可用项目 ${result.unavailable
+          .map((f) => f.projectId)
+          .join(",")}（已登记不可用，不影响其余项目服务）`,
+      );
     }
   }
 

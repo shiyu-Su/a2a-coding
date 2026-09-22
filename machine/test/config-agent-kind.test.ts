@@ -46,6 +46,15 @@ test("config：未知 agentKind（dsh）被拒，文案含由 AGENT_KINDS 动态
   });
 });
 
+test("config：旧值 `qoder` 已闭集更名 → 加载期被拒，文案含 `qoder-cn`（无别名表）", () => {
+  withConfig([project("qoder")], (path) => {
+    assert.throws(
+      () => loadMachineConfig(path),
+      /\[config\].*agentKind.*qoder-cn/,
+    );
+  });
+});
+
 test("config：空串 agentKind 被拒（非空字符串校验）", () => {
   withConfig([project("")], (path) => {
     assert.throws(() => loadMachineConfig(path), /\[config\].*agentKind/);

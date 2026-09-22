@@ -5,32 +5,39 @@
  * 显式 http（含 `http` 段部分缺省）、空段、非法 mode、非法 http 端口 / 路径。
  * 覆盖（v0.5.0 web）：无 `web` 段 / 空段缺省、部分缺省、显式覆盖、非法端口（含 1/65535 边界）、
  * 非法 host / enabled、段非对象、`allowStdio` 死配置 warn + 忽略，以及「非 loopback host 不在解析层拒绝」的边界锁定。
- * 覆盖（v0.6.0 projectGroup）：段缺省 ⇒ selective=false 全量接纳（**不得 fail-fast**）、
- * 正常解析 + 派生集合（memberKeys / memberMachineIds / selective）、`name` 缺省 null、
+ * 覆盖（v0.6.0 projectGroup / v0.8.6 一桥多组）：段缺省 / 空数组 ⇒ groups=[] 全量接纳（**不得 fail-fast**）、
+ * 键名沿用 `projectGroup` 但形状扩为**组数组**、每组 selective=true、派生集合（memberKeys / memberMachineIds）、
+ * ★ **B 形态启动校验（N2）**：`transport.http.path` 拒尾斜杠 / 不得为 /health /shutdown /runner 本身或前缀、
+ * `name` **必填**且字符集 `[A-Za-z0-9_-]+`、组名不得与保留 URL 首段（health/shutdown/runner/options.path 首段）冲突、
  * 空数组 ⇒ fail、成员项缺字段 / 非对象 / 非字符串 ⇒ fail、未知 `machineId` ⇒ fail、
- * `memberKey` 单射性与集合去重、`defaultProjectGroup` 唯一默认构造。
+ * ★ **组间成员互斥 fail-fast**（同一 `(machineId, projectId)` 落两组）、组内重复项仅集合去重、
+ * `memberKey` 单射性与集合去重、`defaultProjectGroup` 唯一默认构造、N1 过渡聚合视图 `projectGroup` = 各组并集。
  * 覆盖（v0.7.0 A1）：`launcherUrl` 必填→可选（缺省解析成功 + warn；存在非法 ⇒ warn + 忽略；
  * 存在合法 ⇒ 原样保留且不告警）、`machines[].token` 可选解析（存在须非空字符串）、
  * 顶层可选 `runner` 段（缺省 / 空段 / 部分缺省 ⇒ 25000 / 60000；非法结构 ⇒ fail-fast）、
- * 协议常量 `PROTOCOL_VERSION === "2.1"` 与 `SUPPORTED_PEER_PROTOCOL_MAJORS === [2]`。
+ * 协议常量 `PROTOCOL_VERSION === "2.2"` 与 `SUPPORTED_PEER_PROTOCOL_MAJORS === [2]`。
  * 覆盖（v0.7.2 K6）：warn **文案级 once-per-process 去重** —— 同一坏配置重复解析 ⇒ 同文案仅
  * warn 一次（次数 = 1）、不同文案（缺省 / 非法 / 不同机器下标 / allowStdio）互不去重、
  * 去重不改解析语义（结果一致、合法配置仍零告警）；`resetWarnOnceCache` 提供用例级隔离。
  * 覆盖（v0.8.3 O2）：`callback` 段与 `machines[].pushCallback` 退役 ⇒ 旧配置宽容解析（不抛错、
  * 返回对象无 `callback` 键）+ 两条退役 warn 各恰一次（文案级 once-per-process）。
+ * 覆盖（v0.8.6 FIX-2 R-2）：模板 `config/config.json.default` 的 `_projectGroupExample`（组数组样例）
+ * 原样喂给 `parseProjectGroups` 正向接受（防样例与 schema 二次漂移）。
  *
  * 运行：`npm test`（先 `tsc` 构建，再 `node --test dist/test/`）。
  */
 import { beforeEach, test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { appRootFromModule } from "../app-root.js";
 import {
   defaultProjectGroup,
   defaultRunner,
   loadMachinesConfig,
   memberKey,
+  parseProjectGroups,
   resetWarnOnceCache,
 } from "../config.js";
 import { PROTOCOL_VERSION, SUPPORTED_PEER_PROTOCOL_MAJORS } from "../types.js";
@@ -141,6 +148,42 @@ test("非法 http 路径 → 结构化报错（非空字符串且以 / 开头）
   }
 });
 
+// ── v0.8.6 N2 B 形态启动校验（身份 = URL 首段：path 尾斜杠 / 保留路由前缀）─────
+
+test("transport.http.path 尾斜杠 ⇒ fail-fast（②：身份首段解析下尾斜杠产生空段歧义）", () => {
+  for (const path of ["/", "/mcp/", "/orch/mcp/"]) {
+    assert.throws(
+      () =>
+        withConfig(
+          minimalConfig({ transport: { mode: "http", http: { path } } }),
+          loadMachinesConfig,
+        ),
+      /\[config\] transport\.http\.path "\/.*" 非法：不得以 "\/" 结尾/,
+      `path=${path} 应被拒`,
+    );
+  }
+});
+
+test("transport.http.path 撞保留路由 ⇒ fail-fast（①：/health /shutdown /runner 本身或其前缀）", () => {
+  for (const path of ["/health", "/healthz", "/shutdown", "/runner", "/runner/register"]) {
+    assert.throws(
+      () =>
+        withConfig(
+          minimalConfig({ transport: { mode: "http", http: { path } } }),
+          loadMachinesConfig,
+        ),
+      /\[config\] transport\.http\.path .* 非法：MCP 端点不得为 \/(health|shutdown|runner) 本身或其前缀/,
+      `path=${path} 应被拒`,
+    );
+  }
+  // 不撞保留段的多段路径合法（身份 = 首段、其余须恰等于 path 的 B 形态入口）
+  const ok = withConfig(
+    minimalConfig({ transport: { mode: "http", http: { path: "/orch/mcp" } } }),
+    loadMachinesConfig,
+  );
+  assert.equal(ok.transport.http.path, "/orch/mcp");
+});
+
 // ── v0.5.0 `web` 段（网页端只读工作台）────────────────────────────────────────
 
 test("web 缺省：无 web 段 → enabled=true / host=127.0.0.1 / port=3300", () => {
@@ -246,7 +289,7 @@ test("web 段非对象 → 结构化报错（字符串 / 数字 / 数组 / null�
   }
 });
 
-// ── v0.6.0 `projectGroup` 段（项目组与选择性连接）──────────────────────────────
+// ── v0.8.6 一桥多组 `projectGroup` 段（组数组 + 组间成员互斥 fail-fast）─────────
 
 /** 两台机器的配置（成员校验需要 `machineId ∈ machines[]`） */
 function twoMachinesConfig(extra: Record<string, unknown> = {}): unknown {
@@ -259,43 +302,53 @@ function twoMachinesConfig(extra: Record<string, unknown> = {}): unknown {
   };
 }
 
-/** 1/ 缺省兼容：无 `projectGroup` 段 ⇒ selective=false（全量接纳），**不 fail-fast** */
-test("projectGroup 缺省：无该段 → selective=false（全量接纳）、name=null、成员集合空，且不抛错", () => {
+/** 1/ 缺省兼容：无 `projectGroup` 段 ⇒ 顶层 groups=[]（全量接纳）、聚合视图 selective=false，**不 fail-fast** */
+test("projectGroup 缺省：无该段 → groups=[]（全量接纳）、聚合 name=null/成员空/selective=false，且不抛错", () => {
   const cfg = withConfig(minimalConfig(), loadMachinesConfig);
-  const g = cfg.projectGroup;
-  assert.ok(g, "段缺省也必须产出完整 projectGroup（不得 undefined）");
-  assert.equal(g.selective, false);
-  assert.equal(g.name, null);
-  assert.deepEqual(g.members, []);
-  assert.equal(g.memberKeys.size, 0);
-  assert.equal(g.memberMachineIds.size, 0);
+  assert.deepEqual(cfg.groups, []);
+  const agg = cfg.projectGroup;
+  assert.ok(agg, "段缺省也必须产出 N1 过渡聚合视图（不得 undefined）");
+  assert.equal(agg.selective, false);
+  assert.equal(agg.name, null);
+  assert.deepEqual(agg.members, []);
+  assert.equal(agg.memberKeys.size, 0);
+  assert.equal(agg.memberMachineIds.size, 0);
 });
 
-test("projectGroup 缺省：多机配置下同样 selective=false（缺省绝不因机器数变化而 fail）", () => {
+test("projectGroup 缺省：多机配置下同样 groups=[] 且聚合 selective=false（缺省绝不因机器数变化而 fail）", () => {
   const cfg = withConfig(twoMachinesConfig(), loadMachinesConfig);
+  assert.deepEqual(cfg.groups, []);
   assert.equal(cfg.projectGroup?.selective, false);
   assert.equal(cfg.projectGroup?.members.length, 0);
 });
 
-// 2/ 正常解析 + 派生集合
-test("projectGroup 正常解析：声明态保留顺序，派生 memberKeys / memberMachineIds / selective 正确", () => {
+test("projectGroup 空数组段：[] 视同未配组（全量接纳 ⇒ groups=[]）", () => {
+  const cfg = withConfig(twoMachinesConfig({ projectGroup: [] }), loadMachinesConfig);
+  assert.deepEqual(cfg.groups, []);
+  assert.equal(cfg.projectGroup?.selective, false);
+});
+
+// 2/ 单组正常解析 + 派生集合 + 聚合同步
+test("projectGroup 单组：声明态保留顺序，派生 memberKeys / memberMachineIds / selective 正确 + 聚合同步", () => {
   const cfg = withConfig(
     twoMachinesConfig({
-      projectGroup: {
-        name: "团队A",
-        members: [
-          { machineId: "m1", projectId: "p1" },
-          { machineId: "m1", projectId: "p2" },
-          { machineId: "m2", projectId: "p3" },
-        ],
-      },
+      projectGroup: [
+        {
+          name: "team-a",
+          members: [
+            { machineId: "m1", projectId: "p1" },
+            { machineId: "m1", projectId: "p2" },
+            { machineId: "m2", projectId: "p3" },
+          ],
+        },
+      ],
     }),
     loadMachinesConfig,
   );
-  const g = cfg.projectGroup;
-  assert.ok(g);
+  assert.equal(cfg.groups?.length, 1);
+  const g = cfg.groups![0]!;
   assert.equal(g.selective, true);
-  assert.equal(g.name, "团队A");
+  assert.equal(g.name, "team-a");
   assert.deepEqual(g.members, [
     { machineId: "m1", projectId: "p1" },
     { machineId: "m1", projectId: "p2" },
@@ -306,79 +359,194 @@ test("projectGroup 正常解析：声明态保留顺序，派生 memberKeys / me
   assert.equal(g.memberKeys.has(memberKey("m1", "p2")), true);
   assert.equal(g.memberKeys.has(memberKey("m1", "p3")), false);
   assert.equal(g.memberKeys.has(memberKey("m2", "p2")), false);
+  // N1 过渡聚合视图：单组即该组（并集）
+  assert.equal(cfg.projectGroup?.selective, true);
+  assert.equal(cfg.projectGroup?.memberKeys.size, 3);
 });
 
-test("projectGroup.name：缺省 / 显式 null ⇒ null；非空字符串按声明取值", () => {
-  const noName = withConfig(
-    twoMachinesConfig({ projectGroup: { members: [{ machineId: "m1", projectId: "p1" }] } }),
-    loadMachinesConfig,
-  );
-  assert.equal(noName.projectGroup?.name, null);
-
-  const nullName = withConfig(
+// 3/ 多组解析 + 聚合并集
+test("projectGroup 多组：两组各自 selective=true、聚合 memberKeys / memberMachineIds 为并集、name 取首组", () => {
+  const cfg = withConfig(
     twoMachinesConfig({
-      projectGroup: { name: null, members: [{ machineId: "m1", projectId: "p1" }] },
+      projectGroup: [
+        { name: "gA", members: [{ machineId: "m1", projectId: "p1" }] },
+        {
+          name: "gB",
+          members: [
+            { machineId: "m1", projectId: "p2" },
+            { machineId: "m2", projectId: "p3" },
+          ],
+        },
+      ],
     }),
     loadMachinesConfig,
   );
-  assert.equal(nullName.projectGroup?.name, null);
-
-  const named = withConfig(
-    twoMachinesConfig({
-      projectGroup: { name: "g", members: [{ machineId: "m1", projectId: "p1" }] },
-    }),
-    loadMachinesConfig,
+  assert.equal(cfg.groups?.length, 2);
+  assert.deepEqual(
+    cfg.groups!.map((g) => g.name),
+    ["gA", "gB"],
   );
-  assert.equal(named.projectGroup?.name, "g");
+  assert.equal(cfg.groups![0]!.selective, true);
+  assert.equal(cfg.groups![1]!.memberKeys.size, 2);
+  assert.equal(cfg.projectGroup?.selective, true);
+  assert.equal(cfg.projectGroup?.memberKeys.size, 3);
+  assert.equal(cfg.projectGroup?.memberKeys.has(memberKey("m1", "p1")), true);
+  assert.equal(cfg.projectGroup?.memberKeys.has(memberKey("m2", "p3")), true);
+  assert.deepEqual([...cfg.projectGroup!.memberMachineIds].sort(), ["m1", "m2"]);
+  assert.equal(cfg.projectGroup?.name, "gA");
 });
 
-test("projectGroup.name 非法（空串 / 非字符串）→ 结构化报错", () => {
-  for (const name of ["", 1, true]) {
+test("projectGroup[].name 必填（B 形态：组名 = URL 首段身份）：缺省 / null / 非字符串 ⇒ fail-fast；合法值按声明取", () => {
+  // 缺省与显式 null 不再产出 `name:null` 组（配组下无名组不可寻址 = 死配置 ⇒ 启动校验 ③ 拒绝）
+  for (const bad of [undefined, null]) {
     assert.throws(
       () =>
         withConfig(
           twoMachinesConfig({
-            projectGroup: { name, members: [{ machineId: "m1", projectId: "p1" }] },
+            projectGroup: [{ ...(bad === undefined ? {} : { name: bad }), members: [{ machineId: "m1", projectId: "p1" }] }],
           }),
           loadMachinesConfig,
         ),
-      /\[config\] projectGroup\.name 必须是非空字符串/,
+      /\[config\] projectGroup\[0\]\.name 组名必填/,
+      `name=${String(bad)} 应被拒`,
+    );
+  }
+  for (const bad of ["", 1, true]) {
+    assert.throws(
+      () =>
+        withConfig(
+          twoMachinesConfig({
+            projectGroup: [{ name: bad, members: [{ machineId: "m1", projectId: "p1" }] }],
+          }),
+          loadMachinesConfig,
+        ),
+      /\[config\] projectGroup\[0\]\.name 必须是非空字符串/,
+      `name=${String(bad)} 应被拒`,
+    );
+  }
+
+  const named = withConfig(
+    twoMachinesConfig({
+      projectGroup: [{ name: "g", members: [{ machineId: "m1", projectId: "p1" }] }],
+    }),
+    loadMachinesConfig,
+  );
+  assert.equal(named.groups![0]!.name, "g");
+});
+
+test("projectGroup[].name 字符集 [A-Za-z0-9_-]+（启动校验 ③：组名进 URL 路径首段）", () => {
+  // 合法：字母 / 数字 / 下划线 / 连字符
+  for (const ok of ["g1", "team-a", "T_2", "0"]) {
+    const cfg = withConfig(
+      twoMachinesConfig({
+        projectGroup: [{ name: ok, members: [{ machineId: "m1", projectId: "p1" }] }],
+      }),
+      loadMachinesConfig,
+    );
+    assert.equal(cfg.groups![0]!.name, ok);
+  }
+  // 非法：空白 / 路径分隔 / 中文 / 点号（URL 段不安全）
+  for (const bad of ["bad name", "a/b", "团队A", "g.env", "%41"]) {
+    assert.throws(
+      () =>
+        withConfig(
+          twoMachinesConfig({
+            projectGroup: [{ name: bad, members: [{ machineId: "m1", projectId: "p1" }] }],
+          }),
+          loadMachinesConfig,
+        ),
+      /\[config\] projectGroup\[0\]\.name .* 非法：组名进 URL 路径首段/,
+      `name=${bad} 应被拒`,
     );
   }
 });
 
-// 3/ 空数组 ⇒ fail（U1 裁定：要么删段、要么列成员）
-test("projectGroup.members 空数组 → fail-fast（不得静默锁死 / 不得 fail-open）", () => {
+test("组名不得与保留 URL 首段冲突（启动校验 ④：health / shutdown / runner / options.path 首段）", () => {
+  for (const bad of ["health", "shutdown", "runner", "mcp"]) {
+    assert.throws(
+      () =>
+        withConfig(
+          twoMachinesConfig({
+            projectGroup: [{ name: bad, members: [{ machineId: "m1", projectId: "p1" }] }],
+          }),
+          loadMachinesConfig,
+        ),
+      /\[config\] projectGroup\[0\]\.name ".*" 与保留 URL 首段冲突/,
+      `默认 /mcp 下组名 ${bad} 应被拒`,
+    );
+  }
+  // 自定义 options.path=/orch/mcp ⇒ 保留首段含 "orch"，而 "mcp" 脱离保留集 ⇒ 放行
   assert.throws(
-    () => withConfig(twoMachinesConfig({ projectGroup: { members: [] } }), loadMachinesConfig),
-    /\[config\] projectGroup\.members 必须是非空数组/,
+    () =>
+      withConfig(
+        twoMachinesConfig({
+          transport: { http: { path: "/orch/mcp" } },
+          projectGroup: [{ name: "orch", members: [{ machineId: "m1", projectId: "p1" }] }],
+        }),
+        loadMachinesConfig,
+      ),
+    /与保留 URL 首段冲突/,
+  );
+  const ok = withConfig(
+    twoMachinesConfig({
+      transport: { http: { path: "/orch/mcp" } },
+      projectGroup: [{ name: "mcp", members: [{ machineId: "m1", projectId: "p1" }] }],
+    }),
+    loadMachinesConfig,
+  );
+  assert.equal(ok.groups![0]!.name, "mcp");
+});
+
+// 4/ 段形态：顶层必须数组（旧单组对象形状已废弃）；组项必须对象
+test("projectGroup 段非数组（旧单组对象 / 字符串 / 数字）→ 结构化报错（形状已扩为组数组）", () => {
+  for (const projectGroup of [{ members: [{ machineId: "m1", projectId: "p1" }] }, "on", 1]) {
+    assert.throws(
+      () => withConfig(twoMachinesConfig({ projectGroup }), loadMachinesConfig),
+      /\[config\] projectGroup 必须是组数组/,
+    );
+  }
+});
+
+test("projectGroup[i] 组项非对象（字符串 / 数字 / 数组 / null）→ 结构化报错", () => {
+  for (const item of ["on", 1, [], null]) {
+    assert.throws(
+      () => withConfig(twoMachinesConfig({ projectGroup: [item] }), loadMachinesConfig),
+      /\[config\] projectGroup\[0\] 必须是对象/,
+    );
+  }
+});
+
+// 5/ members：空数组 / 非数组 ⇒ fail（U1 裁定：要么删段、要么列成员）
+test("projectGroup[].members 空数组 → fail-fast（不得静默锁死 / 不得 fail-open）", () => {
+  assert.throws(
+    () =>
+      withConfig(
+        twoMachinesConfig({ projectGroup: [{ name: "g", members: [] }] }),
+        loadMachinesConfig,
+      ),
+    /\[config\] projectGroup\[0\]\.members 必须是非空数组/,
   );
 });
 
-test("projectGroup.members 非数组（缺失 / 字符串 / 对象 / null）→ 结构化报错", () => {
+test("projectGroup[].members 非数组（缺失 / 字符串 / 对象 / null）→ 结构化报错", () => {
   assert.throws(
-    () => withConfig(twoMachinesConfig({ projectGroup: {} }), loadMachinesConfig),
-    /\[config\] projectGroup\.members 必须是数组/,
+    () => withConfig(twoMachinesConfig({ projectGroup: [{ name: "g" }] }), loadMachinesConfig),
+    /\[config\] projectGroup\[0\]\.members 必须是数组/,
   );
   for (const members of ["m1", { machineId: "m1" }, null]) {
     assert.throws(
-      () => withConfig(twoMachinesConfig({ projectGroup: { members } }), loadMachinesConfig),
-      /\[config\] projectGroup\.members 必须是数组/,
+      () =>
+        withConfig(
+          twoMachinesConfig({ projectGroup: [{ name: "g", members }] }),
+          loadMachinesConfig,
+        ),
+      /\[config\] projectGroup\[0\]\.members 必须是数组/,
     );
   }
 });
 
-test("projectGroup 段非对象（字符串 / 数字 / 数组 / null）→ 结构化报错", () => {
-  for (const projectGroup of ["on", 1, [], null]) {
-    assert.throws(
-      () => withConfig(twoMachinesConfig({ projectGroup }), loadMachinesConfig),
-      /\[config\] projectGroup 必须是对象/,
-    );
-  }
-});
-
-// 4/ 成员项缺字段 / 非法 ⇒ fail
-test("projectGroup 成员项缺字段 / 非字符串 → 结构化报错（machineId / projectId 均须非空字符串）", () => {
+// 6/ 成员项缺字段 / 非法 ⇒ fail
+test("projectGroup[].members 成员项缺字段 / 非字符串 → 结构化报错（machineId / projectId 均须非空字符串）", () => {
   const badMembers: unknown[] = [
     { projectId: "p1" },
     { machineId: "m1" },
@@ -392,42 +560,51 @@ test("projectGroup 成员项缺字段 / 非字符串 → 结构化报错（machi
   for (const member of badMembers) {
     assert.throws(
       () =>
-        withConfig(twoMachinesConfig({ projectGroup: { members: [member] } }), loadMachinesConfig),
-      /\[config\] projectGroup\.members\[0\]/,
+        withConfig(
+          twoMachinesConfig({ projectGroup: [{ name: "g", members: [member] }] }),
+          loadMachinesConfig,
+        ),
+      /\[config\] projectGroup\[0\]\.members\[0\]/,
     );
   }
 });
 
-// 5/ 未知 machineId ⇒ fail-fast
-test("projectGroup.members[].machineId 不在 machines[] → fail-fast（拼错机器名不得被静默接受）", () => {
-  assert.throws(
-    () =>
-      withConfig(
-        twoMachinesConfig({ projectGroup: { members: [{ machineId: "m9", projectId: "p1" }] } }),
-        loadMachinesConfig,
-      ),
-    /\[config\] projectGroup\.members\[0\]\.machineId "m9" 不在 machines\[\] 中/,
-  );
-  // 第二项才越界：错误信息须指向该下标（定位到出错项，不误报第一项）
+// 7/ 未知 machineId ⇒ fail-fast（错误定位到出错组与该组内下标）
+test("projectGroup[].members[].machineId 不在 machines[] → fail-fast（拼错机器名不得被静默接受）", () => {
   assert.throws(
     () =>
       withConfig(
         twoMachinesConfig({
-          projectGroup: {
-            members: [
-              { machineId: "m1", projectId: "p1" },
-              { machineId: "m2", projectId: "p2" },
-              { machineId: "nope", projectId: "p3" },
-            ],
-          },
+          projectGroup: [{ name: "g", members: [{ machineId: "m9", projectId: "p1" }] }],
         }),
         loadMachinesConfig,
       ),
-    /\[config\] projectGroup\.members\[2\]\.machineId "nope" 不在 machines\[\] 中/,
+    /\[config\] projectGroup\[0\]\.members\[0\]\.machineId "m9" 不在 machines\[\] 中/,
+  );
+  // 第二组第三项才越界：错误信息须指向该组该下标（不误报第一项）
+  assert.throws(
+    () =>
+      withConfig(
+        twoMachinesConfig({
+          projectGroup: [
+            { name: "gA", members: [{ machineId: "m1", projectId: "p1" }] },
+            {
+              name: "gB",
+              members: [
+                { machineId: "m1", projectId: "p2" },
+                { machineId: "m2", projectId: "p2b" },
+                { machineId: "nope", projectId: "p3" },
+              ],
+            },
+          ],
+        }),
+        loadMachinesConfig,
+      ),
+    /\[config\] projectGroup\[1\]\.members\[2\]\.machineId "nope" 不在 machines\[\] 中/,
   );
 });
 
-// 6/ memberKey（唯一构造）与集合去重
+// 8/ memberKey（唯一构造）与组内去重
 test("memberKey：同一元组恒定、不同元组分叉，且对含分隔符的 id 不碰撞（禁第二套拼接）", () => {
   assert.equal(memberKey("m1", "p1"), memberKey("m1", "p1"));
   assert.notEqual(memberKey("m1", "p1"), memberKey("m1", "p2"));
@@ -438,24 +615,85 @@ test("memberKey：同一元组恒定、不同元组分叉，且对含分隔符�
   assert.notEqual(memberKey("a", "b/c"), memberKey("a/b", "c"));
 });
 
-test("memberKeys / memberMachineIds 去重：重复成员项 ⇒ 集合不重复，声明态 members 保留原样", () => {
+test("组内重复成员项 ⇒ 集合去重（memberKeys 不重复、声明态 members 保留原样），不触发跨组互斥", () => {
   const cfg = withConfig(
     twoMachinesConfig({
-      projectGroup: {
-        members: [
-          { machineId: "m1", projectId: "p1" },
-          { machineId: "m1", projectId: "p1" },
-          { machineId: "m1", projectId: "p2" },
-        ],
-      },
+      projectGroup: [
+        {
+          name: "g",
+          members: [
+            { machineId: "m1", projectId: "p1" },
+            { machineId: "m1", projectId: "p1" },
+            { machineId: "m1", projectId: "p2" },
+          ],
+        },
+      ],
     }),
     loadMachinesConfig,
   );
-  const g = cfg.projectGroup;
-  assert.ok(g);
+  const g = cfg.groups![0]!;
   assert.equal(g.members.length, 3);
   assert.equal(g.memberKeys.size, 2);
   assert.equal(g.memberMachineIds.size, 1);
+});
+
+// 9/ ★ 组间成员互斥（用户 2026-09-21 已裁）：同一 (machineId, projectId) 只能属一个组 ⇒ 配置期 fail-fast
+test("组间互斥负例：同一 (m1,p1) 出现在两组 → fail-fast（文案给两组下标 + 对策）", () => {
+  assert.throws(
+    () =>
+      withConfig(
+        twoMachinesConfig({
+          projectGroup: [
+            { name: "gA", members: [{ machineId: "m1", projectId: "p1" }] },
+            { name: "gB", members: [{ machineId: "m1", projectId: "p1" }] },
+          ],
+        }),
+        loadMachinesConfig,
+      ),
+    /\[config\] projectGroup 组间成员互斥：\{ machineId: "m1", projectId: "p1" \} 同时出现在 projectGroup\[0\] 与 projectGroup\[1\]（同一成员只能属于一个组，请从其中一组删除）/,
+  );
+});
+
+test("组间互斥负例：重复项落在两组的不同位置也须捕获（首组第 2 项 = 次组第 1 项）", () => {
+  assert.throws(
+    () =>
+      withConfig(
+        twoMachinesConfig({
+          projectGroup: [
+            {
+              name: "gA",
+              members: [
+                { machineId: "m2", projectId: "p9" },
+                { machineId: "m1", projectId: "p1" },
+              ],
+            },
+            { name: "gB", members: [{ machineId: "m1", projectId: "p1" }] },
+          ],
+        }),
+        loadMachinesConfig,
+      ),
+    /组间成员互斥[\s\S]*projectGroup\[0\][\s\S]*projectGroup\[1\]/,
+  );
+});
+
+test("组间互斥正例：三组分摊不同成员 → 全部通过、各组 selective=true、聚合 key 为并集（含同 projectId 不同 machineId）", () => {
+  const cfg = withConfig(
+    twoMachinesConfig({
+      projectGroup: [
+        { name: "gA", members: [{ machineId: "m1", projectId: "p1" }] },
+        { name: "gB", members: [{ machineId: "m1", projectId: "p2" }] },
+        { name: "gC", members: [{ machineId: "m2", projectId: "p1" }] },
+      ],
+    }),
+    loadMachinesConfig,
+  );
+  assert.equal(cfg.groups!.length, 3);
+  assert.ok(
+    cfg.groups!.every((g) => g.selective),
+    "配了组 ⇒ 每组恒 selective=true",
+  );
+  // (m1,p1) 与 (m2,p1) 是不同 key（同 projectId 不同 machineId ⇒ 不算跨组冲突）
+  assert.equal(cfg.projectGroup!.memberKeys.size, 3);
 });
 
 test("defaultProjectGroup：唯一「全量接纳」默认构造（段缺省态与缺省解析结果一致）", () => {
@@ -470,6 +708,32 @@ test("defaultProjectGroup：唯一「全量接纳」默认构造（段缺省态�
 });
 
 // ── v0.7.0 A1：协议常量 + launcherUrl/token + runner 段 ─────────────────────────
+
+// ★ 模板样例 ↔ schema 防漂移（v0.8.6 FIX-2 R-2）：把 config/config.json.default 的
+// `_projectGroupExample` 原样喂给 parseProjectGroups 断言被接受 —— 样例回退单组对象、
+// 组名非法、成员不在模板 machines[]、跨组重复等任一回归都会让本用例变红。
+test("config.json.default 的 _projectGroupExample 组数组被 parseProjectGroups 接受（machineId 取模板自身 machines[]）", () => {
+  const tplPath = join(appRootFromModule(import.meta.url), "config", "config.json.default");
+  const tpl = JSON.parse(readFileSync(tplPath, "utf8")) as {
+    _comment: string;
+    machines: { machineId: string }[];
+    _projectGroupExample: unknown;
+  };
+  assert.ok(tpl._comment.includes("组数组"), "_comment 必须是组数组口径（不得回退「单组」）");
+  assert.ok(
+    tpl._comment.includes("group_identity_required"),
+    "_comment 须含「配组后连接带组名首段」口径",
+  );
+  assert.ok(Array.isArray(tpl._projectGroupExample), "_projectGroupExample 必须是组数组");
+  assert.ok(tpl._projectGroupExample.length >= 2, "样例至少演示两个组");
+  const machineIds = new Set(tpl.machines.map((m) => m.machineId));
+  const groups = parseProjectGroups(tpl._projectGroupExample, machineIds);
+  assert.equal(groups.length, tpl._projectGroupExample.length);
+  assert.ok(
+    groups.every((g) => g.selective),
+    "配了组 ⇒ 每组恒 selective=true",
+  );
+});
 
 /** 捕获解析期 `console.warn`（断言「缺省/非法告警」与「合法不告警」） */
 function captureWarn<T>(fn: () => T): { value: T; warnings: string[] } {
@@ -492,8 +756,8 @@ function machineConfig(machine: Record<string, unknown>, extra: Record<string, u
 
 const RUNNER_DEFAULTS = { holdMs: 25000, heartbeatTimeoutMs: 60000 };
 
-test("协议常量（线协议 2.1）：PROTOCOL_VERSION=2.1 / SUPPORTED_PEER_PROTOCOL_MAJORS=[2]", () => {
-  assert.equal(PROTOCOL_VERSION, "2.1");
+test("协议常量（线协议 2.2）：PROTOCOL_VERSION=2.2 / SUPPORTED_PEER_PROTOCOL_MAJORS=[2]", () => {
+  assert.equal(PROTOCOL_VERSION, "2.2");
   assert.deepEqual([...SUPPORTED_PEER_PROTOCOL_MAJORS], [2]);
 });
 

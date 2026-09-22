@@ -19,6 +19,11 @@ import { existsSync, readFileSync } from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 import type { ProjectConfig } from "../types.js";
+import {
+  formatBackendProbe,
+  resolveBackendEntry,
+  type BackendEntryDeps,
+} from "../adapters/backend-entry.js";
 
 /** 读取 JSON 文件；不存在或解析失败返回 null（快照尽力而为，不抛出） */
 function readJsonIfExists(path: string): Record<string, unknown> | null {
@@ -117,7 +122,7 @@ export function resolveModelEndpoint(project: ProjectConfig): {
         endpoint: "opencode provider 配置",
       };
     }
-    case "qoder": {
+    case "qoder-cn": {
       return {
         model:
           fromAgentConfig !== null ? `${fromAgentConfig}（agentConfig）` : "qodercn 配置（ACP）",
@@ -132,11 +137,17 @@ export function resolveModelEndpoint(project: ProjectConfig): {
   }
 }
 
-/** 单次 Agent 启动的配置快照：配置层级 + endpoint / 模型 id */
+/** 单次 Agent 启动的配置快照：配置层级 + endpoint / 模型 id + 后端入口分层解析结果 */
 export interface AgentConfigSnapshot {
   hierarchy: string;
   model: string;
   endpoint: string;
+  /**
+   * 后端入口 `[backend]` 日志行正文（不含 `[backend]` 前缀，manager 打印时加）。
+   * 命中：`<projectId> kind=<kind> <层名> hit <绝对路径>`；
+   * 未命中：`<projectId> 解析失败，逐层清单：L0-explicit=miss(..) | ..`（清单入日志，不进 Error message）。
+   */
+  backend: string;
 }
 
 /**
@@ -158,7 +169,7 @@ function userConfigLayer(project: ProjectConfig): string {
       return "codex 用户级配置（~/.codex/config.toml，运行时始终读取）";
     case "opencode":
       return "opencode 用户级配置（全局配置与 workspace opencode.json，运行时读取）";
-    case "qoder":
+    case "qoder-cn":
       return "qodercn 用户级配置（~/.qoder-cn/，经 ACP 桥运行时读取）";
     default: {
       // 编译期安全网（改造文档 §2.3-4）：新增 kind ⇒ 此处 `project.agentKind` 不再是 never。
@@ -169,15 +180,43 @@ function userConfigLayer(project: ProjectConfig): string {
 }
 
 /**
+ * 后端入口分层解析的 `[backend]` 日志正文（改造文档 §2.3；REQ-v0.8.6-...-02 · B4）。
+ *
+ * 复用 `describeAgentConfig` 这一「每次拉起都打」的读点 ⇒ 自检期 / 派发期 / 复用期
+ * 经同一路径自动落 `launcher.log`，`self-check.ts` 零改动即携带该信息。
+ * 命中（有 `command`）只报命中层；未命中则把解析器已扫的**全层清单**渲染进日志
+ * （清单入日志、不进 Error message，规避 `singleLine()` 300 字符截断）。
+ */
+function describeBackend(
+  project: ProjectConfig,
+  deps?: BackendEntryDeps,
+): string {
+  const { command, probes } = resolveBackendEntry(project.agentKind, project.agentConfig, deps);
+  if (command !== undefined) {
+    const hit = probes.find((p) => p.status === "hit");
+    const layer = hit?.layer ?? "hit";
+    return `${project.projectId} kind=${project.agentKind} ${layer} hit ${command}`;
+  }
+  const clean = probes.map(formatBackendProbe).join(" | ");
+  return `${project.projectId} 解析失败，逐层清单：${clean}`;
+}
+
+/**
  * 汇总单次启动的配置面快照（manager.start 播报用）。
  *
  * v0.8.5 · M6：**去 `configPath` 入参**（`agents/` 产物退役 ⇒ 无产物路径可播报），
  * `userSettingsLoaded` 随段键推断一并退役 ⇒ 快照 = 平铺 `agentConfig` + 用户级配置层
  * + 模型 / endpoint（claude 的用户级层按文件存在性直读判定）。
+ * v0.8.6 · B4：追加 `backend` 段（后端入口分层解析结果，供 `[backend]` 日志行）。
+ * `deps` 仅供注入式单测造「命中 / 全 miss」两例；运行期缺省走真机 fs。
  */
-export function describeAgentConfig(project: ProjectConfig): AgentConfigSnapshot {
+export function describeAgentConfig(
+  project: ProjectConfig,
+  deps?: BackendEntryDeps,
+): AgentConfigSnapshot {
   return {
     hierarchy: `项目 agentConfig（平铺键）+ ${userConfigLayer(project)}`,
     ...resolveModelEndpoint(project),
+    backend: describeBackend(project, deps),
   };
 }

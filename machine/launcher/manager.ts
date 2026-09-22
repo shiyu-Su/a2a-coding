@@ -265,6 +265,12 @@ export class AgentManager {
   /** 空闲回收计时（M5·MC1：判据 = inflight==0 且静默 ≥ idleStopMs） */
   private readonly idle: IdleReaper;
   private readonly running = new Map<string, RunningAgent>();
+  /**
+   * 自检判定不可用的项目集（§2.4-⑤）：projectId → 不可用原因。
+   * 机器不因单项目不可用而退出，但被登记的项目此后 `ensure()` 直接抛 `AgentStartError`
+   * （运行期 dispatch 已把该异常转成任务 failed）。
+   */
+  private readonly unavailable = new Map<string, string>();
   /** 进行中的 ensure（防并发重复拉起同一项目） */
   private readonly pending = new Map<string, Promise<EnsureResult>>();
   /**
@@ -350,6 +356,15 @@ export class AgentManager {
     return project;
   }
 
+  /**
+   * 登记项目为不可用（§2.4-⑤，由 `launcher/index.ts` 在自检后逐项调用）。
+   * 此后对该项目的 `ensure()` 直接抛 `AgentStartError`（用户可见「该项目不可用 + 原因」）；
+   * 幂等：重复登记以最新原因覆盖。
+   */
+  markUnavailable(projectId: string, reason: string): void {
+    this.unavailable.set(projectId, reason);
+  }
+
   /** 配置 + 运行态拼接（内部聚合；入站 `GET /projects` 已于 v0.7.0 M5·MC1 退役） */
   listProjects(): ProjectStatus[] {
     return this.config.projects.map((project) => {
@@ -381,6 +396,13 @@ export class AgentManager {
    */
   async ensure(projectId: string): Promise<EnsureResult> {
     const project = this.getProject(projectId);
+
+    // 自检判定不可用的项目：直接抛既有形态的 AgentStartError（§2.4-⑤），
+    // 运行期 dispatch 会把该异常转成任务 failed（runner-exec.ts 既有路径）。
+    const unavailableReason = this.unavailable.get(projectId);
+    if (unavailableReason !== undefined) {
+      throw new AgentStartError(projectId, `自检判定不可用：${unavailableReason}`);
+    }
 
     const current = this.running.get(projectId);
     if (current !== undefined && !hasExited(current.child)) {
@@ -424,6 +446,9 @@ export class AgentManager {
     console.log(
       `[launcher] agent ${project.projectId} endpoint=${snapshot.endpoint}，model=${snapshot.model}`,
     );
+    // 后端入口分层解析结果（改造文档 §2.3 · B4）：命中报来源层，失败报逐层清单；
+    // 清单入日志、不进 Error message（适配器抛错文案只留摘要 +「详见 launcher.log [backend] 行」）。
+    console.log(`[backend] ${snapshot.backend}`);
 
 
     const spec = adapter.buildLaunch({

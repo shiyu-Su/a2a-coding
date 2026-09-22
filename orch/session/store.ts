@@ -312,10 +312,16 @@ export interface ListFeatureTasksOptions {
   limit?: number;
 }
 
-/** `listFeatures` 入参：可选状态过滤 / 条数上限 */
+/** `listFeatures` 入参：可选状态过滤 / 条数上限 / 归属组过滤 */
 export interface ListFeaturesOptions {
   state?: FeatureState;
   limit?: number;
+  /**
+   * 归属组过滤（v0.8.6 §2.3）：给定组名 ⇒ 仅返回 `owner_group = ownerGroup` 的 Feature
+   * （**NULL 无归属行天然被排除** = 已配组环境 fail-closed）；缺省（`undefined`）⇒ 全量
+   * （未配组环境的匿名入口 / web 运维视图）。
+   */
+  ownerGroup?: string;
 }
 
 /** `pruneTasks` 入参：保留策略阈值覆盖（缺省用环境变量 / 内置默认） */
@@ -355,11 +361,62 @@ export interface EventAppendInput {
   createdAt?: string;
 }
 
-/** `listEvents` 入参：游标与条数上限 */
+/**
+ * 事件的**组可见性范围**（v0.8.6 一桥多组 §2.4 案 B）：只用于**读**过滤，
+ * `events` 表**零 DDL、写路径零改动** —— 归属经 `feature_id` / `task_id` 反查得到，
+ * `owner_group` 的单一事实源始终留在 `features`（禁第二套归属登记）。
+ */
+export interface EventVisibilityScope {
+  /** 本组身份名：与 `features.owner_group` 精确匹配（Feature 级与节点级事件的归属源） */
+  ownerGroup: string;
+  /**
+   * 本组成员项目 id：覆盖**无 Feature 归属**的任务事件（`mode="inquiry"` 派发、
+   * 任务结算等只带 `task_id` 的事件）。项目 id 在机器清单内全局唯一
+   * （`locateProject` 的 `projectId → machine` 定位本身即单值语义），故此处只按项目判。
+   */
+  projectIds: readonly string[];
+}
+
+/** `listEvents` 入参：游标与条数上限（+ 可选组可见性范围） */
 export interface ListEventsOptions {
   /** 仅返回 `event_id > since` 的事件（缺省 0 = 从头） */
   since?: number;
   limit?: number;
+  /** 缺省 / `null` = **不过滤**：未配组环境的匿名入口 / web 运维视图（§2.7） */
+  scope?: EventVisibilityScope | null;
+}
+
+/**
+ * 案 B 的可见性谓词（`listEvents` 与 `latestEventId` **共用**，禁两套 SQL）：
+ *
+ * - **孤儿事件**（`feature_id` 与 `task_id` 皆 NULL，如 `runner.*`）⇒ **全体可见**
+ *   —— 机器级事件不属任何组；
+ * - **Feature 归属**（含同时带 `feature_id` 与 `task_id` 的节点事件）⇒ 经
+ *   `features.owner_group` 反查，**唯一归属源**；
+ * - **仅任务归属**（`feature_id` NULL 但带 `task_id`）⇒ 按本组成员项目；
+ * - 三者都不命中 ⇒ 他组事件 ⇒ 不可见。
+ *
+ * 返回的 `clause` 以 ` AND (...)` 形式拼接（`latestEventId` 侧配 `WHERE 1=1`），
+ * 参数顺序 = 拼接顺序（`ownerGroup` → `projectIds`）。
+ */
+function eventVisibilityPredicate(scope: EventVisibilityScope | null | undefined): {
+  clause: string;
+  params: string[];
+} {
+  if (scope === undefined || scope === null) return { clause: "", params: [] };
+  const projects =
+    scope.projectIds.length > 0
+      ? ` OR (feature_id IS NULL AND task_id IN (SELECT task_id FROM tasks WHERE project_id IN (` +
+        `${scope.projectIds.map(() => "?").join(",")})` +
+        `))`
+      : "";
+  return {
+    clause:
+      ` AND ((feature_id IS NULL AND task_id IS NULL)` +
+      ` OR feature_id IN (SELECT feature_id FROM features WHERE owner_group = ?)` +
+      `${projects})`,
+    params: [scope.ownerGroup, ...scope.projectIds],
+  };
 }
 
 function nowIso(): string {
@@ -466,7 +523,7 @@ const TASK_COLUMNS =
 /** features 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToFeature） */
 const FEATURE_COLUMNS =
   "feature_id, state, title, requirement, context_id, plan, decisions, contracts, " +
-  "created_at, updated_at";
+  "owner_group, created_at, updated_at";
 
 /** 解析 `dependencies` 列（JSON 数组字符串）；非法即数据损坏（fail-fast） */
 function readDependencies(row: Record<string, unknown>): string[] | null {
@@ -563,6 +620,8 @@ function rowToFeature(row: Record<string, unknown>): FeatureRecord {
     plan: readNullableString(row, "plan"),
     decisions: readNullableString(row, "decisions"),
     contracts: readNullableString(row, "contracts"),
+    // v0.8.6 §2.3 归属列：可空（NULL = 无归属，存量 / 未配组环境创建）；读侧不 fail-fast
+    ownerGroup: readNullableString(row, "owner_group"),
     createdAt: readString(row, "created_at"),
     updatedAt: readString(row, "updated_at"),
   };
@@ -707,6 +766,7 @@ CREATE TABLE IF NOT EXISTS features (
   state       TEXT NOT NULL,
   title       TEXT NOT NULL,
   requirement TEXT,
+  owner_group TEXT,
   created_at  TEXT NOT NULL,
   updated_at  TEXT NOT NULL
 )`;
@@ -875,6 +935,16 @@ export class SessionStore {
         // 列已存在
       }
     }
+    // v0.8.6 §2.3 迁移（REQ-v0.8.6-2026-09-21-01 · N4）：features 加归属列 `owner_group`
+    // （建 Feature 时的连接身份 / 组名）。**必可空、老行不回填**（NULL = 无归属：未配组环境创建的
+    // Feature 或配组改造前的存量行）；可见性口径 **fail-closed**（未配组全量可见、已配组对组身份不可见，
+    // 不猜默认组，§1.3 R-3 / G2）。读侧 `rowToFeature` 用 `readNullableString`（NULL 合法、不 fail-fast）。
+    // 纪律照既有：只加列、必可空、不复用既有列、**只在 ctor try-ALTER**（无 `PRAGMA user_version`、不引入 DDL 版本管理）。
+    try {
+      this.db.exec("ALTER TABLE features ADD COLUMN owner_group TEXT");
+    } catch {
+      // 列已存在
+    }
     // v0.4.1 迁移（REQ-v0.4.1-2026-09-16-01 §2.3）：主链收敛 ⇒ 前段三态已从枚举删除。
     // `features.state` **无 DB 约束**（见 FEATURES_DDL），非法值在**读取时**抛（`rowToFeature`）⇒
     // `scheduler.recover` 启动即抛（`/health` 永远 503）+ `tick` 停摆（波及所有 Feature）⇒ 必须归一。
@@ -954,6 +1024,8 @@ export class SessionStore {
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS idx_features_state_updated ON features(state, updated_at DESC)",
     );
+    // v0.8.6 §2.3：Feature 列表 / 事件收件箱案 B 过滤（`owner_group = ?`）的热路径索引
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_features_owner ON features(owner_group)");
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS idx_tasks_feature ON tasks(feature_id, updated_at DESC)",
     );
@@ -1797,8 +1869,8 @@ export class SessionStore {
     const updatedAt = rec.updatedAt ?? createdAt;
     this.db
       .prepare(
-        `INSERT INTO features (feature_id, state, title, requirement, context_id, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO features (feature_id, state, title, requirement, context_id, owner_group, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(feature_id) DO UPDATE SET
            state = excluded.state,
            title = excluded.title,
@@ -1812,6 +1884,9 @@ export class SessionStore {
         rec.title,
         rec.requirement ?? null,
         rec.contextId ?? null,
+        // 归属 = 建 Feature 时的连接身份；重跑（ON CONFLICT）**不改归属**（谁建谁见，owner 不可变），
+        // 故不出现在 DO UPDATE SET 中。NULL = 未配组环境 / 存量。
+        rec.ownerGroup ?? null,
         createdAt,
         updatedAt,
       );
@@ -1907,7 +1982,7 @@ export class SessionStore {
     return this.getFeature(featureId);
   }
 
-  /** 列出 Feature（updated_at 倒序；可选状态过滤；limit 默认 100，clamp 到 [1,1000]） */
+  /** 列出 Feature（updated_at 倒序；可选状态 / 归属组过滤；limit 默认 100，clamp 到 [1,1000]） */
   listFeatures(opts: ListFeaturesOptions = {}): FeatureRecord[] {
     const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
     const clauses: string[] = [];
@@ -1915,6 +1990,12 @@ export class SessionStore {
     if (opts.state !== undefined) {
       clauses.push("state = ?");
       params.push(opts.state);
+    }
+    // v0.8.6 §2.3 归属过滤：给定组名 ⇒ `owner_group = ?`（NULL 无归属行被排除 = fail-closed）；
+    // 缺省 ⇒ 不加此谓词（未配组环境匿名入口 / web 运维视图全量）。
+    if (opts.ownerGroup !== undefined) {
+      clauses.push("owner_group = ?");
+      params.push(opts.ownerGroup);
     }
     params.push(limit);
     const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")} ` : "";
@@ -1926,18 +2007,28 @@ export class SessionStore {
       .all(...params) as Array<Record<string, unknown>>;
     // v0.6.1 REQ-05 §2.5 白捡（C12）：触顶 ⇒ 事件 + 日志各一条（total 校验）
     const stateFilter = opts.state;
+    const ownerFilter = opts.ownerGroup;
     this.warnIfListTruncated(
-      `listFeatures:${stateFilter ?? "*"}:${limit}`,
+      `listFeatures:${stateFilter ?? "*"}:${ownerFilter ?? "*"}:${limit}`,
       "listFeatures",
       null,
       rows.length,
       limit,
       () => {
-        const row = (
-          stateFilter !== undefined
-            ? this.db.prepare("SELECT COUNT(*) AS n FROM features WHERE state = ?").get(stateFilter)
-            : this.db.prepare("SELECT COUNT(*) AS n FROM features").get()
-        ) as Record<string, unknown> | undefined;
+        const countClauses: string[] = [];
+        const countParams: Array<string | number> = [];
+        if (stateFilter !== undefined) {
+          countClauses.push("state = ?");
+          countParams.push(stateFilter);
+        }
+        if (ownerFilter !== undefined) {
+          countClauses.push("owner_group = ?");
+          countParams.push(ownerFilter);
+        }
+        const countWhere = countClauses.length > 0 ? `WHERE ${countClauses.join(" AND ")}` : "";
+        const row = this.db
+          .prepare(`SELECT COUNT(*) AS n FROM features ${countWhere}`)
+          .get(...countParams) as Record<string, unknown> | undefined;
         return Number(row?.["n"] ?? 0);
       },
     );
@@ -2038,20 +2129,35 @@ export class SessionStore {
     };
   }
 
-  /** 按游标列出事件（`event_id > since`，升序；limit 默认 100，clamp 到 [1,1000]） */
+  /**
+   * 按游标列出事件（`event_id > since`，升序；limit 默认 100，clamp 到 [1,1000]）。
+   * `opts.scope` 给定 ⇒ 按**案 B 谓词**过滤组可见性（缺省 = 不过滤，全量）。
+   */
   listEvents(opts: ListEventsOptions = {}): EventRecord[] {
     const since = Math.max(opts.since ?? 0, 0);
     const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
+    const visibility = eventVisibilityPredicate(opts.scope);
     const rows = this.db
-      .prepare("SELECT * FROM events WHERE event_id > ? ORDER BY event_id ASC LIMIT ?")
-      .all(since, limit) as Array<Record<string, unknown>>;
+      .prepare(
+        `SELECT * FROM events WHERE event_id > ?${visibility.clause}` +
+          ` ORDER BY event_id ASC LIMIT ?`,
+      )
+      .all(since, ...visibility.params, limit) as Array<Record<string, unknown>>;
     return rows.map(rowToEvent);
   }
 
-  /** 当前最大事件 id（空表返回 0）；用于游标回落 */
-  latestEventId(): number {
-    const row = this.db.prepare("SELECT COALESCE(MAX(event_id), 0) AS max_id FROM events").get() as
-      Record<string, unknown> | undefined;
+  /**
+   * 当前最大事件 id（空表 / **过滤后无可视事件**返回 0）；用于游标回落。
+   * `scope` 必须与同一次读口的 `listEvents` 同一谓词（否则「有新事件」判定会被他组事件
+   * 误触发 ⇒ `a2a_wait` 空转，§1.3 R-2 / §2.4(b)）。
+   */
+  latestEventId(scope?: EventVisibilityScope | null): number {
+    const visibility = eventVisibilityPredicate(scope);
+    const row = this.db
+      .prepare(
+        `SELECT COALESCE(MAX(event_id), 0) AS max_id FROM events WHERE 1=1${visibility.clause}`,
+      )
+      .get(...visibility.params) as Record<string, unknown> | undefined;
     if (row === undefined) return 0;
     return Number(row["max_id"]);
   }
@@ -2310,14 +2416,14 @@ export function appendEvent(rec: EventAppendInput): EventRecord {
   return getDefaultStore().appendEvent(rec);
 }
 
-/** 按游标列出事件（默认存储） */
+/** 按游标列出事件（默认存储；`opts.scope` = 案 B 组可见性过滤） */
 export function listEvents(opts?: ListEventsOptions): EventRecord[] {
   return getDefaultStore().listEvents(opts);
 }
 
-/** 当前最大事件 id（默认存储） */
-export function latestEventId(): number {
-  return getDefaultStore().latestEventId();
+/** 当前最大事件 id（默认存储；`scope` 给定 ⇒ 仅计本组可见事件） */
+export function latestEventId(scope?: EventVisibilityScope | null): number {
+  return getDefaultStore().latestEventId(scope);
 }
 
 /** 列出 Feature（默认存储） */

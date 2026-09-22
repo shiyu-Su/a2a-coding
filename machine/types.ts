@@ -14,8 +14,9 @@ import type { AgentKind } from "./agent-kinds.js";
  *      必填字段的取值集合扩展 minor+1。
  * v0.7.0：major 由 1.0 升到 2.0（删字段 / 改语义 / 加必填请求体的破坏性变更）。
  * v0.8.0：minor 升到 2.1（`projects[].agentKind` 必填字段取值集合扩展 +qoder，非破坏）。
+ * req03 硬切：minor 升到 2.2（`projects[].agentKind` 必填字段取值 `qoder` 更名为 `qoder-cn`）。
  */
-export const PROTOCOL_VERSION = "2.1";
+export const PROTOCOL_VERSION = "2.2";
 
 /**
  * 执行层 Agent 类型（决定执行层适配器与 CLI 参数）。
@@ -44,7 +45,8 @@ export interface ProjectConfig {
    * v0.8.5 · M4 起为**唯一**口径）。
    *
    * **具备平铺读点的键**（读者 = machine 代码 / 仓内 ACP 桥）：
-   * - `backendCmd` —— ACP **适配器入口**，**必填**（代码零硬编码缺省，未配置即 `buildLaunch` 抛错）：
+   * - `backendCmd` —— ACP 适配器入口，**可选覆盖**（v0.8.6 起缺省由 `adapters/backend-entry.ts`
+   *   四层链自动解析，见 REQ-v0.8.6-2026-09-21-02；写了则以显式值为准，可指向非标准位置的自建适配器）：
    *   脚本形态（`.js` / `.mjs` / `.cjs`）⇒ 适配器自动以 `process.execPath` + 脚本路径拉起；
    *   可执行体形态（`.exe`）⇒ 直调（形态归一见 `adapters/backend-command.ts`）；
    * - `model` —— 非必填，适配器读出后经 `--model` 透传给 ACP 桥（协议面 set，不校验、不映射）；

@@ -116,6 +116,52 @@ function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
 }
 
 // ---------------------------------------------------------------------------
+// 归属校验（v0.8.6 §2.3 / REQ-v0.8.6-2026-09-21-01 · N4）
+// ---------------------------------------------------------------------------
+
+/**
+ * Feature **五出口归属校验**（§2.3 / §1.3 R-3 / G2）：`identity` = 本次连接身份（组名）。
+ *
+ * - `identity === null`（无身份）⇒ **全量放行**，不校验归属 —— 未配组环境的匿名入口与
+ *   web 运维视图（§2.7「3300 非身份面」）皆走此路，零破坏；
+ * - `identity` 非空 ⇒ **Feature 谁建谁见**（§6.1-5）：
+ *   - `owner_group === identity` ⇒ 放行；
+ *   - `owner_group === null` ⇒ 拒绝，文案 A（**无归属 / 非本组可见对象**，配组环境
+ *     fail-closed，不猜默认组，§1.3 R-3 / G2）；
+ *   - `owner_group === 其它组名` ⇒ 拒绝，文案 B（**属另一项目组**，跨组操作归 v0.11.0）。
+ *
+ * 两类拒绝**错误码与文案不同**（供测试分别断言，§6.1-3 的 Feature 面对偶）；**不泄漏**他组组名
+ * （只说「属另一项目组」，§6.1-9）。**注**：组不是鉴权边界（§2.7），此处仅是视野隔离，非安全机制。
+ *
+ * **v0.8.6 req01 补正 R-1 起本函数导出**：`bridge/index.ts` 的 `registerFeatureNode` 挂载前置
+ * 复用**同一判据**（禁止第二套判据）—— 他组连接不得把本组项目挂进他组 Feature DAG。
+ */
+export function ownershipFailure(
+  feature: FeatureRecord,
+  identity: string | null,
+): FeatureToolFailure | null {
+  if (identity === null) return null;
+  if (feature.ownerGroup === identity) return null;
+  if (feature.ownerGroup === null) {
+    return {
+      ok: false,
+      code: "feature_unowned",
+      error:
+        `Feature ${feature.featureId} 无归属（owner_group 为空），不是本组「${identity}」的可见对象：` +
+        `已配组环境下，未配组时创建或配组改造前的存量 Feature 一律不可见（fail-closed，不猜默认组）。` +
+        `如需纳入本组，请用迁移脚本显式改归属（scripts/migrate-feature-owner.mjs）。`,
+    };
+  }
+  return {
+    ok: false,
+    code: "feature_not_owned",
+    error:
+      `Feature ${feature.featureId} 属另一项目组，不是本组「${identity}」的可见对象：` +
+      `Feature 谁建谁见（跨组操作本版不支持，归 v0.11.0）。`,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // create
 // ---------------------------------------------------------------------------
 
@@ -137,6 +183,8 @@ export interface FeatureCreateSuccess {
 
 export function handleFeatureCreate(
   args: FeatureCreateArgs,
+  /** 连接身份（组名）；`null` / 缺省 = 无身份 ⇒ 落 `owner_group = NULL`（未配组 / 存量语义） */
+  identity: string | null = null,
 ): FeatureCreateSuccess | FeatureToolFailure {
   const title = args.title.trim();
   if (title.length === 0) {
@@ -148,6 +196,8 @@ export function handleFeatureCreate(
     title,
     requirement: args.requirement ?? null,
     contextId: args.contextId ?? null,
+    // 入口打标：归属 = 本次连接身份（组名）；无身份 ⇒ NULL（无归属，fail-closed 存量语义）
+    ownerGroup: identity,
     // 主链起点 = 审批门停靠点（REQ-v0.4.1-2026-09-16-01 §2.3）：引擎只做需求实现，
     // 前段讨论 / 方案（Step 0/1）不走引擎；`waiting_approval → executing` 只能经 `a2a_feature_approve`
     state: "waiting_approval",
@@ -176,17 +226,26 @@ export interface FeatureStatusSuccess {
 
 export function handleFeatureStatus(
   args: FeatureStatusArgs,
+  identity: string | null = null,
 ): FeatureStatusSuccess | FeatureToolFailure {
   if (args.featureId !== undefined && args.featureId.length > 0) {
     const feature = getFeature(args.featureId);
     if (feature === null) {
       return { ok: false, code: "feature_not_found", error: `未知 Feature ${args.featureId}` };
     }
+    // 归属校验（谁建谁见）：非本组 ⇒ 拒绝（他组 Feature 不返回详情）
+    const denied = ownershipFailure(feature, identity);
+    if (denied !== null) return denied;
     const tasks = listFeatureTasks(feature.featureId, { limit: 1000 }).map(summarizeTask);
     const artifacts = listArtifactsByFeature(feature.featureId, 1000);
     return { ok: true, feature, tasks, artifacts };
   }
-  const features = listFeatures({ limit: 1000 }).map((f) => ({
+  // 列表路径：配组 ⇒ 只列本组 Feature（`owner_group = identity`，NULL 无归属被排除 = fail-closed）；
+  // 无身份 ⇒ 全量（未配组 / web 运维视图）。
+  const features = listFeatures({
+    limit: 1000,
+    ownerGroup: identity === null ? undefined : identity,
+  }).map((f) => ({
     ...f,
     taskCount: listFeatureTasks(f.featureId, { limit: 1000 }).length,
   }));
@@ -243,11 +302,15 @@ export interface FeatureAdvanceSuccess extends FeatureStateChangeSuccess {
 
 export function handleFeatureAdvance(
   args: FeatureAdvanceArgs,
+  identity: string | null = null,
 ): FeatureAdvanceSuccess | FeatureToolFailure {
   const feature = getFeature(args.featureId);
   if (feature === null) {
     return { ok: false, code: "feature_not_found", error: `未知 Feature ${args.featureId}` };
   }
+  // 归属校验（谁建谁见）：非本组 ⇒ 在任何写入之前拒绝（Feature 态与节点态零变更）
+  const denied = ownershipFailure(feature, identity);
+  if (denied !== null) return denied;
 
   // ---- 重派与解冻（§2.3 / N4）：**显式特例**，不得给 `TRANSITIONS` 加自环 ----------------------
   // `retryTaskIds` 是**派发语义操作**（重派指定失败节点 + 解冻其闭包外下游），不是状态流转
@@ -440,11 +503,15 @@ export interface FeatureApproveArgs {
 
 export function handleFeatureApprove(
   args: FeatureApproveArgs,
+  identity: string | null = null,
 ): FeatureStateChangeSuccess | FeatureToolFailure {
   const feature = getFeature(args.featureId);
   if (feature === null) {
     return { ok: false, code: "feature_not_found", error: `未知 Feature ${args.featureId}` };
   }
+  // 归属校验（谁建谁见）：非本组 ⇒ 拒绝（过审批门是操作，只能由归属组驱动）
+  const denied = ownershipFailure(feature, identity);
+  if (denied !== null) return denied;
   if (feature.state !== "waiting_approval") {
     return {
       ok: false,
@@ -471,11 +538,15 @@ export interface FeatureCancelArgs {
 
 export function handleFeatureCancel(
   args: FeatureCancelArgs,
+  identity: string | null = null,
 ): FeatureStateChangeSuccess | FeatureToolFailure {
   const feature = getFeature(args.featureId);
   if (feature === null) {
     return { ok: false, code: "feature_not_found", error: `未知 Feature ${args.featureId}` };
   }
+  // 归属校验（谁建谁见）：非本组 ⇒ 拒绝（取消只能由归属组驱动）
+  const denied = ownershipFailure(feature, identity);
+  if (denied !== null) return denied;
   if (isTerminalFeatureState(feature.state)) {
     return {
       ok: false,
