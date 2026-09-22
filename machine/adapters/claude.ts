@@ -8,6 +8,7 @@
  *     --port <a2aPort> --workspace <workspace> --project-id <projectId>
  *     --backend-cmd <归一后的命令> --backend-args <归一后的参数>   // 脚本形态 ⇒ node + 脚本路径；.exe ⇒ 直调
  *     [--model <agentConfig.model>]
+ *     [--session-timeout <agentConfig.sessionTimeoutMs>]
  *     [--system-prompt <agentConfig.systemPrompt> [--system-prompt-mode <append|replace>]]
  *     --risk <read|write|full> --mode <plan|acceptEdits|bypassPermissions>
  *     [--session-meta-json <full 档 _meta>]`
@@ -50,6 +51,7 @@ import type {
 import { appRootFromModule } from "../launcher/app-root.js";
 import {
   resolveAcpModel,
+  resolveSessionTimeoutMs,
   resolveSystemPrompt,
   resolveSystemPromptMode,
 } from "../launcher/agent-config.js";
@@ -90,6 +92,7 @@ export class ClaudeAdapter implements Adapter {
       CLAUDE_BACKEND_CMD_REQUIRED,
     );
     const model = resolveAcpModel(request.agentConfig);
+    const sessionTimeoutMs = resolveSessionTimeoutMs(request.agentConfig);
     // 平铺 systemPrompt(Mode)（v0.8.5 · N1）：自定义注入复用 resolveSystemPrompt / resolveSystemPromptMode。
     const systemPrompt = resolveSystemPrompt(request.agentConfig);
     const systemPromptMode = resolveSystemPromptMode(request.agentConfig);
@@ -113,6 +116,8 @@ export class ClaudeAdapter implements Adapter {
       // 模型透传（B14′）：原样值经桥落到 ACP session/set_config_option；
       // 未配 / 空串 ⇒ 不下发该旗标（零回退）。不参与后端 argv 拼装。
       ...(model !== undefined ? ["--model", model] : []),
+      // 会话超时透传（REQ-v0.8.7 M2）：平铺 sessionTimeoutMs ⇒ `--session-timeout <ms>`；未配 ⇒ 桥落缺省。
+      ...(sessionTimeoutMs !== undefined ? ["--session-timeout", String(sessionTimeoutMs)] : []),
       // 自定义注入（v0.8.5 · M4 / N1）：平铺 systemPrompt(Mode) ⇒ 桥 --system-prompt / --system-prompt-mode；
       // 未配 ⇒ 不下发该旗标（桥只用缺省 outcome 约定注入）。
       ...(systemPrompt !== undefined ? ["--system-prompt", systemPrompt] : []),

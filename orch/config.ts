@@ -221,26 +221,31 @@ function asPositiveMs(v: unknown, ctx: string): number {
  */
 const DEFAULT_RUNNER_HOLD_MS = 25000;
 const DEFAULT_RUNNER_HEARTBEAT_TIMEOUT_MS = 60000;
+/** v0.8.7 O2：孤儿墙钟判死缺省 30 min（恒 > machine 侧 dispatchTimeoutMs 上界 20 min，见 `types.ts#RunnerConfig`） */
+const DEFAULT_RUNNER_ORPHAN_TIMEOUT_MS = 1_800_000;
 
 /** `runner` 段缺省构造（段缺失 / 空段时使用） */
 export function defaultRunner(): RunnerConfig {
   return {
     holdMs: DEFAULT_RUNNER_HOLD_MS,
     heartbeatTimeoutMs: DEFAULT_RUNNER_HEARTBEAT_TIMEOUT_MS,
+    orphanTimeoutMs: DEFAULT_RUNNER_ORPHAN_TIMEOUT_MS,
   };
 }
 
 /**
  * 解析顶层 `runner` 段（v0.7.0 D2；段可选，缺省字段补默认值）。
  *
- * - **段缺失 / 空段** ⇒ 全缺省（`{ 25000, 60000 }`），旧 `config.json` 零改动可用；
- * - **段存在** ⇒ 结构校验：必须对象；`holdMs` / `heartbeatTimeoutMs` 若声明必须为
+ * - **段缺失 / 空段** ⇒ 全缺省（`{ 25000, 60000, 1800000 }`），旧 `config.json` 零改动可用；
+ * - **段存在** ⇒ 结构校验：必须对象；`holdMs` / `heartbeatTimeoutMs` / `orphanTimeoutMs`
+ *   （v0.8.7 O2 孤儿墙钟）若声明必须为
  *   正整数毫秒，非法**一律 fail-fast**（复用 `fail`，不静默降级）。
  */
 export function parseRunner(v: unknown): RunnerConfig {
   const r = asRecord(v, "runner");
   const holdRaw = r["holdMs"];
   const heartbeatRaw = r["heartbeatTimeoutMs"];
+  const orphanRaw = r["orphanTimeoutMs"];
   return {
     holdMs:
       holdRaw === undefined
@@ -250,6 +255,10 @@ export function parseRunner(v: unknown): RunnerConfig {
       heartbeatRaw === undefined
         ? DEFAULT_RUNNER_HEARTBEAT_TIMEOUT_MS
         : asPositiveMs(heartbeatRaw, "runner.heartbeatTimeoutMs"),
+    orphanTimeoutMs:
+      orphanRaw === undefined
+        ? DEFAULT_RUNNER_ORPHAN_TIMEOUT_MS
+        : asPositiveMs(orphanRaw, "runner.orphanTimeoutMs"),
   };
 }
 

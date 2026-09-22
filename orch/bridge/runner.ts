@@ -9,7 +9,7 @@
  * |---|---|---|
  * | `POST /runner/register` | 注册 / 刷新投影 | Bearer token（常量时间）→ machineId ∈ `machines[]` → `protocolVersion` 主版本 ∈ `SUPPORTED_PEER_PROTOCOL_MAJORS`；`upsertRunner` + `runnerProjectsReplace` + `runner.registered` 事件 |
  * | `POST /runner/connect` | 长轮询（poll 即心跳） | 同上鉴权；claim 前置 = **未配组 ⇒ 全放**，配了组 ⇒ `(machineId,projectId) ∈ 任一组 memberKeys` **且**任务归属该机器（= 本机注册过的项目）；命中 claim CAS 即下发 `dispatch`，另可下发 `stop` / `cancel-task`；空超时 = 心跳（204） |
- * | `POST /runner/result` | 结果回传（ack） | 同上鉴权 + **claim_token 校验**（比对落库领取令牌）→ `upsertTaskResult`（幂等键 `(machineId, taskId)`）→ 200 ack |
+ * | `POST /runner/result` | 结果回传（ack） | 同上鉴权 + **claim_token 校验**（比对落库领取令牌；**O4 补结算窄口**：无令牌且 `state=failed` ∧ 行 `working` ∧ `claimed_by=本机` ⇒ 受理，否则照旧 409）→ `upsertTaskResult`（幂等键 `(machineId, taskId)`）→ O3：本次胜出 `failed` 时按原生 `AcpError.kind` 映射写 `failure_kind` → 200 ack |
  *
  * 门闩与接入面（节点验收项）：
  * - **owner 门闩**：仅 core 租约 `owner` 的实例提供端点；
@@ -34,7 +34,8 @@
  *   `task.stale`），**统一经 `emitEvent` 落库（`appendEvent`）+ 唤醒收件箱（`signalEvents`）**；
  * - **心跳超期清算循环**（模块内 timer，`sweepIntervalMs` 可覆盖；`sweepStale()` 为确定性单测入口）：
  *   `lastHeartbeatAt` 静默 ≥ `runner.heartbeatTimeoutMs` ⇒ 逐个 `requeueStaleTask`（B2：已领取
- *   任务回收为 `queued` 并清 claim 三字段）+ `task.stale` 事件，随后降注册态 `offline` +
+ *   任务回收为 `queued` 并清 claim 令牌/时刻两字段，v0.8.7 O4 起保留 `claimed_by` 作补结算
+ *   行级绑定凭据）+ `task.stale` 事件，随后降注册态 `offline` +
  *   `runner.offline` 事件；**同 runner 回归照常 claim（复用同一 CAS）** 并在回线时发 `runner.online`。
  * - D8 纪律：心跳超期**只降注册态、不触发 stop**（不碰本机 agent；任务仅回收重排）。
  *
@@ -42,6 +43,15 @@
  * `queue_state='claimed'` 的行仍须可判、可回收（否则永久悬挂）。为此 `session/store.ts` 增补
  * 四个 A7 读/写口（`listRunners` / `getRunner` / `listClaimedTasks` / `markRunnerOffline`，
  * 均为**只读或单列写**、additive、不改既有列语义）——与 A3 增补两读口同一纪律。
+ *
+ * O2（v0.8.7 增补）：本模块同时是**孤儿墙钟清算**的事件生产方：
+ * - `sweepOrphanedTasks()` 挂**同一** `sweepIntervalMs` timer，**同 tick 先 `sweepStale` 后墙钟**
+ *   （心跳先命中者已 requeue 可复活，墙钟只收残量 ⇒ 两路竞争天然消解）；
+ * - 判据**任务驱动**（与注册态无关）：`queue_state ∈ {claimed,running} ∧ claimed_at <
+ *   now - runner.orphanTimeoutMs`（缺省 30 min）⇒ `failOrphanedTask` CAS 置
+ *   `failed` + `settled` + `failure_kind='infra'` + `task.orphaned` 事件；
+ * - ⚠️ **不清 claim 三字段**：§2.9 契约 3 要求墙钟判死后的迟到件仍过 token 比对、
+ *   落 `upsertTaskResult` 幂等口拿 200（否则 machine 侧 outbox `pending` 永不清）。
  */
 import { createHash, randomUUID, timingSafeEqual } from "node:crypto";
 import type { IncomingMessage, ServerResponse } from "node:http";
@@ -50,14 +60,17 @@ import type { CoreRole } from "../runtime/core-lease.js";
 import {
   appendEvent,
   claimTask,
+  failOrphanedTask,
   getQueuedTask,
   getRunner,
   listClaimedTasks,
+  listOrphanedTasks,
   listRunnerProjects,
   listRunners,
   markRunnerOffline,
   requeueStaleTask,
   runnerProjectsReplace,
+  setTaskFailureKind,
   touchRunnerHeartbeat,
   upsertRunner,
   upsertTaskResult,
@@ -75,6 +88,7 @@ import type {
 import type {
   AgentKind,
   EventRecord,
+  FailureKind,
   InputArtifactRef,
   MachineRef,
   MachinesConfig,
@@ -126,6 +140,8 @@ export const RUNNER_EVENT_OFFLINE = "runner.offline";
 export const RUNNER_EVENT_TASK_CLAIMED = "task.claimed";
 /** 事件 kind：悬挂领取被清算回收（`claimed`/`running` → `queued`；B2 requeue） */
 export const RUNNER_EVENT_TASK_STALE = "task.stale";
+/** 事件 kind：孤儿墙钟判死（`claimed`/`running` 超 `runner.orphanTimeoutMs` → `failed` + `settled`；v0.8.7 O2） */
+export const RUNNER_EVENT_TASK_ORPHANED = "task.orphaned";
 
 /** 请求体上限（防御性；超出 413，与回调端点同量级） */
 const RUNNER_MAX_BODY_BYTES = 1_048_576;
@@ -138,6 +154,62 @@ const TASK_STATES: readonly TaskState[] = [
   "input-required",
   "blocked",
 ];
+/**
+ * 已落终态集 —— **必须与 `upsertTaskResult` 的 `WHERE state NOT IN (...)` 同集合**
+ * （契约 3「首个终态胜出」在判据侧的镜像）。
+ */
+const SETTLED_TERMINAL_STATES: readonly TaskState[] = ["completed", "failed", "blocked"];
+
+// ---------------------------------------------------------------------------
+// 失败分类映射（v0.8.7 O3 · 改造文档 §2.3：**映射权归 orch**）
+// ---------------------------------------------------------------------------
+
+/**
+ * machine 侧原生 `AcpError.kind`（`machine/acp-bridge/acp/client.ts`）中属**载体类**的取值：
+ * `spawn` = 后端进程起不来，`closed` = 后端进程中途退出（二者都是「载体没了」的确定性信号）。
+ */
+const ACP_INFRA_ERROR_KINDS: readonly string[] = ["spawn", "closed"];
+
+/**
+ * 原生 `AcpError.kind` → `failureKind` 二分（**纯函数**；输入是 machine 上报的**原生事实**，
+ * machine 不得预映射，否则 vocabulary 变更要动两端）。
+ *
+ * - `spawn` / `closed` ⇒ `infra`；
+ * - `rpc` / `protocol` ⇒ `task`（协议 / 方言问题，重发无用）；
+ * - `timeout` ⇒ `task` —— 该 kind **语义歧义**（「排队 / 后端不可用」与「任务本身太长」都满窗，
+ *   分辨要 `chunkCount`），本版只落二分且**不引入计量判据** ⇒ 按「未知一律安全降级」处理；
+ *   误判 `infra` 会让上层去重试注定超时的长任务，故保守取 `task`。六类扩展归 v0.8.8。
+ * - **未知 / 缺失 ⇒ 安全降级 `task`**（v0.4.1 既有口径）。
+ */
+export function mapAcpErrorKindToFailureKind(acpErrorKind: unknown): FailureKind {
+  return typeof acpErrorKind === "string" && ACP_INFRA_ERROR_KINDS.includes(acpErrorKind)
+    ? "infra"
+    : "task";
+}
+
+/**
+ * 从回传体的 `diagnostics` 取原生 `acpErrorKind`（**宽容读取**，与 `handleResult` 的逐键白名单
+ * 读取同一纪律）：非对象 / 缺键 / 非字符串 ⇒ `undefined` ⇒ 交 {@link mapAcpErrorKindToFailureKind}
+ * 安全降级。machine 侧字段形状 = `{ diagnostics: { acpErrorKind?, elapsedMs, stage, ... } }`。
+ */
+export function readReportedAcpErrorKind(diagnostics: unknown): unknown {
+  if (typeof diagnostics !== "object" || diagnostics === null) return undefined;
+  return (diagnostics as Record<string, unknown>)["acpErrorKind"];
+}
+
+/**
+ * **补结算窄口的行级绑定判据**（v0.8.7 O4 限制②+④；纯函数）：
+ * 桥侧行 `state='working'`（未结算）∧ `claimed_by = 上报 machineId`（非空）。
+ *
+ * 为何 ④ 必须：`claimed_by` 是「谁领过 / 谁正持有」的**行级唯一凭据** —— 只按 ②
+ * （claimed/working 字面）放行时，他机的迟到补报可击穿「已被重领取」的重派执行
+ * （行被别机重领后 `state` 仍 `working`、令牌已换新，无令牌者本应 409）。
+ * 配合 O4 前置改动（`requeueStaleTask` 不再清 `claimed_by`）：心跳清算后的 `queued`
+ * 行仍留旧领取者 ⇒ 原机可补结算；被**他机重领** ⇒ `claimed_by` 已覆写 ⇒ 原机被拒。
+ */
+export function supplementalGateHolds(existing: QueuedTaskRecord, machineId: string): boolean {
+  return existing.state === "working" && existing.claimedBy !== null && existing.claimedBy === machineId;
+}
 
 // ---------------------------------------------------------------------------
 // 线协议载荷 / 命令类型
@@ -217,6 +289,12 @@ export interface RunnerStorePort {
   requeueStaleTask: (taskId: string, expectedClaimedBy?: string) => boolean;
   /** A7：心跳超期降注册态（只写 `state` 单列；D8 不触发 stop） */
   markRunnerOffline: (runnerId: string) => RunnerRecord | null;
+  /** O2：列出墙钟超期在飞任务（`claimed_at` 早于给定截止刻；只读） */
+  listOrphanedTasks: (claimedBefore: string) => QueuedTaskRecord[];
+  /** O2：墙钟判死 CAS（`claimed`/`running` → `failed`+`settled`+`failure_kind='infra'`；不清 claim 三字段） */
+  failOrphanedTask: (taskId: string) => boolean;
+  /** O3：失败分类写口（仅当行当前为 `failed` 才写；迟到 / 重复上报 ⇒ 零写入） */
+  setTaskFailureKind: (taskId: string, kind: FailureKind) => boolean;
 }
 
 /** 缺省存储端口：绑定 `session/store` 模块级默认单例 */
@@ -234,6 +312,9 @@ const defaultStorePort: RunnerStorePort = {
   listClaimedTasks,
   requeueStaleTask,
   markRunnerOffline,
+  listOrphanedTasks,
+  failOrphanedTask,
+  setTaskFailureKind,
 };
 
 /** 一次心跳超期清算的结果摘要（可观测 + 确定性单测断言用） */
@@ -242,6 +323,12 @@ export interface RunnerSweepResult {
   offlineRunners: string[];
   /** 本次被回收的悬挂任务本地 id（`claimed`/`running` → `queued`） */
   requeuedTasks: string[];
+}
+
+/** 一次孤儿墙钟清算的结果摘要（v0.8.7 O2；可观测 + 确定性单测断言用） */
+export interface RunnerOrphanSweepResult {
+  /** 本次被墙钟判死的任务本地 id（`claimed`/`running` → `failed` + `settled`） */
+  orphanedTasks: string[];
 }
 
 /** 清算循环缺省周期（配置不可读时的兜底；正常路径由 `runner.heartbeatTimeoutMs` 推导） */
@@ -296,6 +383,12 @@ export interface RunnerEndpointHandle {
    * 获得确定性。非 `http` 形态 / 非 `owner` ⇒ 空结果（不抢清算权，也不读库）。
    */
   sweepStale(): RunnerSweepResult;
+  /**
+   * 立即执行一次**孤儿墙钟清算**（v0.8.7 O2；同步、幂等）。同 timer 周期，**恒在
+   * `sweepStale()` 之后**（心跳先命中者走 requeue 可复活，墙钟只收残量）；单测可显式调用。
+   * 非 `owner` ⇒ 空结果（不读库）。
+   */
+  sweepOrphanedTasks(): RunnerOrphanSweepResult;
 }
 
 interface PendingControl {
@@ -355,6 +448,13 @@ class RunnerEndpoints implements RunnerEndpointHandle {
       } catch (err) {
         // 清算循环不得因单次异常停摆（下一周期照常）
         bridgeLog.error("a2a-runner", `心跳超期清算循环异常：${toMessage(err)}`);
+      }
+      try {
+        // O2：同 tick **先 stale 后墙钟** —— 心跳先命中者已 requeue 回 `queued`，
+        // 墙钟判据（`claimed`/`running`）自然不再命中 ⇒ 两路竞争消解
+        this.sweepOrphanedTasks();
+      } catch (err) {
+        bridgeLog.error("a2a-runner", `孤儿墙钟清算循环异常：${toMessage(err)}`);
       }
     }, this.resolveSweepInterval());
     // 后台维护计时器 unref：正常运行由 http listener 持住事件循环；单测 / 停机不被拖住
@@ -478,7 +578,8 @@ class RunnerEndpoints implements RunnerEndpointHandle {
    * 判决并清算超期 Runner（幂等；timer 周期调用，单测可直接调用）。
    *
    * 判据：注册态 `online` 且 `now - lastHeartbeatAt >= runner.heartbeatTimeoutMs`，则
-   * ① `requeueStaleTask`（B2：名下 `claimed`/`running` → `queued` + 清 claim 三字段）+ `task.stale`；
+   * ① `requeueStaleTask`（B2：名下 `claimed`/`running` → `queued` + 清 claim 令牌/时刻两字段，
+   * O4 起保留 `claimed_by`）+ `task.stale`；
    * ② `markRunnerOffline` + `runner.offline`（D8：只降态、不 stop）。
    * 门闩：非 `owner` ⇒ 空结果（不读库、不抢清算权）。
    */
@@ -577,6 +678,72 @@ class RunnerEndpoints implements RunnerEndpointHandle {
       });
     }
     return requeued;
+  }
+
+  // ------------------------------------------------------------------
+  // O2 孤儿墙钟清算（task.orphaned 的生产者；v0.8.7）
+  // ------------------------------------------------------------------
+
+  /**
+   * 判决并清算墙钟超期的在飞任务（幂等；timer 在 `sweepStale()` 之后同 tick 调用，单测可直接调用）。
+   *
+   * 判据（**任务驱动**，与注册态无关）：`queue_state ∈ {claimed, running}` ∧
+   * `claimed_at < now - runner.orphanTimeoutMs` ⇒ 逐条 CAS 置 `failed` + `settled` +
+   * `failure_kind='infra'`（**不清 claim 三字段** —— §2.9 契约 3：墙钟判死后的迟到件须仍能
+   * 通过 `/runner/result` 的 token 比对落幂等口）+ `task.orphaned` 事件。
+   * Feature 侧无需本模块动作：节点 `failed` 由调度器 tick 的**静止收敛**发 `feature.failure_report`。
+   * 门闩：非 `owner` ⇒ 空结果（不读库）。与心跳清算的分工：心跳管「机器死没死」→ requeue 可复活；
+   * 墙钟管「任务自己超没超」→ `failed` 记账交宿主（`advance(retryTaskIds)`）。
+   */
+  sweepOrphanedTasks(): RunnerOrphanSweepResult {
+    const result: RunnerOrphanSweepResult = { orphanedTasks: [] };
+    if (this.options.role() !== "owner") return result;
+    let timeoutMs: number;
+    try {
+      timeoutMs = this.options.config().runner.orphanTimeoutMs;
+    } catch (err) {
+      bridgeLog.error("a2a-runner", `孤儿墙钟清算读取配置失败：${toMessage(err)}`);
+      return result;
+    }
+    const now = this.now();
+    let orphans: QueuedTaskRecord[];
+    try {
+      orphans = this.store.listOrphanedTasks(new Date(now - timeoutMs).toISOString());
+    } catch (err) {
+      bridgeLog.error("a2a-runner", `孤儿墙钟清算读取在飞任务失败：${toMessage(err)}`);
+      return result;
+    }
+    for (const task of orphans) {
+      let hit: boolean;
+      try {
+        hit = this.store.failOrphanedTask(task.taskId);
+      } catch (err) {
+        bridgeLog.error("a2a-runner", `墙钟判死失败（taskId=${task.taskId}）：${toMessage(err)}`);
+        continue;
+      }
+      if (!hit) continue; // CAS 落空（迟到结果已落库 / 心跳已 requeue）⇒ 不产事件
+      result.orphanedTasks.push(task.taskId);
+      const elapsedMs = now - Date.parse(task.claimedAt ?? "");
+      this.emitEvent({
+        kind: RUNNER_EVENT_TASK_ORPHANED,
+        featureId: task.featureId,
+        taskId: task.taskId,
+        state: "failed",
+        payload: JSON.stringify({
+          machineId: task.claimedBy,
+          projectId: task.projectId,
+          featureId: task.featureId,
+          claimedAt: task.claimedAt,
+          elapsedMs,
+          timeoutMs,
+        }),
+      });
+      bridgeLog.warn(
+        "a2a-runner",
+        `任务墙钟判死：taskId=${task.taskId} machineId=${task.claimedBy ?? "?"}（领取后 ${elapsedMs}ms ≥ ${timeoutMs}ms）→ failed(infra)`,
+      );
+    }
+    return result;
   }
 
   /**
@@ -771,7 +938,7 @@ class RunnerEndpoints implements RunnerEndpointHandle {
   }
 
   // ------------------------------------------------------------------
-  // /runner/result（claim_token 校验 + 幂等落库 + ack）
+  // /runner/result（claim_token 校验 + O4 补结算窄口 + 幂等落库 + ack）
   // ------------------------------------------------------------------
 
   private async handleResult(req: IncomingMessage, res: ServerResponse): Promise<void> {
@@ -802,14 +969,31 @@ class RunnerEndpoints implements RunnerEndpointHandle {
       sendError(res, 400, RUNNER_ERR_BAD_REQUEST, "taskId 必须是非空字符串");
       return;
     }
-    const claimToken = asNonEmptyString(body["claimToken"]);
-    if (claimToken === null) {
-      sendError(res, 400, RUNNER_ERR_BAD_REQUEST, "claimToken 必须是非空字符串");
-      return;
-    }
     const stateRaw = body["state"];
     if (!isTaskState(stateRaw)) {
       sendError(res, 400, RUNNER_ERR_BAD_REQUEST, `state 非法（可选 ${TASK_STATES.join(" / ")}）`);
+      return;
+    }
+    // **补结算窄口**（v0.8.7 O4）：machine 启动时其进程内 outbox 已丢 claim 令牌，允许
+    // 「**无 claimToken 且 state=failed**」的迟到补报落账。窄口命中须同时满足四道限制：
+    // ① 只能置 failed（非 failed 仍走原强校验，缺令牌 409）；
+    // ② 桥侧行 state='working'（未结算）；
+    // ③ body machineId 与 Bearer 身份一致（authenticate 已把守）；
+    // ④ 行级绑定：claimed_by = 上报 machineId ∧（queue_state ∈ {queued,claimed} ∨
+    //    (running ∧ claimed_by = machineId)）—— 防**敌手机器的迟到补报击穿「已被重领取」的
+    //    重派执行**（行被别机重领后 state 仍 working、令牌已换新，无令牌者必须照旧 409，
+    //    窄口不得击穿既有保护）。
+    // 另加 ⑤ text 非空强校验（400）、⑥ bridgeLog.warn 审计行。不做限流（攻击面已被 ④ 有界）。
+    const claimToken = asNonEmptyString(body["claimToken"]);
+    const supplemental = claimToken === null && stateRaw === "failed";
+    if (supplemental) {
+      const reason = asNonEmptyString(body["text"]);
+      if (reason === null) {
+        sendError(res, 400, RUNNER_ERR_BAD_REQUEST, "无 claimToken 的补结算上报要求 text（失败原因）为非空字符串");
+        return;
+      }
+    } else if (claimToken === null) {
+      sendError(res, 400, RUNNER_ERR_BAD_REQUEST, "claimToken 必须是非空字符串");
       return;
     }
     const artifactsRes = parseArtifacts(body["artifacts"]);
@@ -822,14 +1006,38 @@ class RunnerEndpoints implements RunnerEndpointHandle {
       sendError(res, 404, RUNNER_ERR_TASK_NOT_FOUND, `未知任务 ${taskId}（本地任务存储无记录）`);
       return;
     }
-    if (existing.claimToken !== claimToken) {
+    let viaSupplementalGate = false;
+    if (claimToken !== null) {
+      if (existing.claimToken !== claimToken) {
+        // 令牌不符 ⇒ 唯一复活路径 = 补结算窄口（①②④）；不满足照旧 409
+        if (stateRaw === "failed" && supplementalGateHolds(existing, machineId)) {
+          viaSupplementalGate = true;
+        } else {
+          sendError(
+            res,
+            409,
+            RUNNER_ERR_CLAIM_TOKEN_MISMATCH,
+            `claim_token 不匹配（任务当前${existing.claimToken === null ? "未领取（已清算）" : "领取令牌不同"}；补结算须 state=failed 且行仍绑定本机领取）`,
+          );
+          return;
+        }
+      }
+    } else if (!supplementalGateHolds(existing, machineId)) {
       sendError(
         res,
         409,
         RUNNER_ERR_CLAIM_TOKEN_MISMATCH,
-        `claim_token 不匹配（任务当前${existing.claimToken === null ? "未领取（已清算）" : "领取令牌不同"}）`,
+        `无 claimToken 的补结算仅受理 failed 且行仍绑定本机领取（任务当前 state=${existing.state} queue_state=${existing.queueState} claimedBy=${existing.claimedBy ?? "null"}）`,
       );
       return;
+    }
+    if (viaSupplementalGate) {
+      const claimedMs = existing.claimedAt === null ? Number.NaN : Date.parse(existing.claimedAt);
+      const elapsedMs = Number.isFinite(claimedMs) ? this.now() - claimedMs : Number.NaN;
+      bridgeLog.warn(
+        "a2a-runner",
+        `Runner 补结算窄口受理（无 claimToken 的迟到 failed）：machineId=${machineId} taskId=${taskId} 距 claimed_at ${Number.isFinite(elapsedMs) ? `${elapsedMs}ms` : "未知"}`,
+      );
     }
     const stored = this.store.upsertTaskResult({
       machineId,
@@ -842,7 +1050,31 @@ class RunnerEndpoints implements RunnerEndpointHandle {
       featureId: existing.featureId,
       remoteTaskId: asNonEmptyString(body["remoteTaskId"]),
     });
+    // **失败分类写口**（v0.8.7 O3 · §2.3 写口 (i)）：把 machine 的原生 `AcpError.kind` 经
+    // orch 侧纯函数映射成 `{infra, task}` 落列。**判据**：本次上报**胜出**了 `failed` 终态
+    // —— 行此前非 `failed`（`existing.state !== "failed"`）才写 ⇒ 迟到 / 重复上报**不得改写**
+    // 既有分类（尤其不得把墙钟 O2 已置的 `infra` 覆盖掉），与 `upsertTaskResult`
+    // 「首个终态胜出」同语义。
+    if (stateRaw === "failed" && stored.state === "failed" && existing.state !== "failed") {
+      this.store.setTaskFailureKind(
+        taskId,
+        mapAcpErrorKindToFailureKind(readReportedAcpErrorKind(body["diagnostics"])),
+      );
+    }
+    // **契约 3 的可观测面**（v0.8.7 O5）：迟到 / 重复上报的终态与**已落终态不一致** ⇒ 只留 warn
+    // 痕迹（零写入由 `upsertTaskResult` 的 WHERE 保证）；**不改回执、不改落库**。
+    if (SETTLED_TERMINAL_STATES.includes(existing.state) && stateRaw !== existing.state) {
+      bridgeLog.warn(
+        "a2a-runner",
+        `Runner 迟到终态与已落终态不一致（首个终态胜出，零写入）：machineId=${machineId} taskId=${taskId} 上报态=${stateRaw} 现存态=${existing.state}`,
+      );
+    }
     bridgeLog.info("a2a-runner", `Runner 回传结果：machineId=${machineId} taskId=${taskId} state=${stored.state}`);
+    // **契约 3（迟到 / 重复终态 = 2xx-with-ignore）**：`upsertTaskResult` 的
+    // `WHERE state NOT IN ('completed','failed','blocked')` 使**重复 / 迟到终态整条 UPDATE
+    // 零写入**（首个终态胜出），故回执**必须恒为 200 + `ack:true`**（不一致时另 warn 留痕，见上）。
+    // **不得改成 4xx** —— machine 侧 outbox 对**任何非 2xx 一律保留待重试**，此处返回 4xx 会让
+    // 已落终态的迟到件**无限退避死循环**（永不清 `pending`）。
     sendOk(res, {
       ack: true,
       taskId,

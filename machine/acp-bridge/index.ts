@@ -16,7 +16,11 @@
  *       [--backend-args <JSON字符串数组>]
  *       [--system-prompt <text> --system-prompt-mode <append|replace>]
  *       [--model <value>] [--mode <modeId>] [--collaboration-mode <value>]
- *       [--session-meta-json <JSON对象>]`
+ *       [--session-meta-json <JSON对象>] [--session-timeout <ms>]`
+ *
+ * v0.8.7 · M1：`--session-timeout <ms>` = 会话执行超时毫秒数，**只校验「整数 > 0」**
+ * （上限护栏的单一源在 launcher 项目解析处，本模块零仓内依赖故不复制上限常量）；缺省 ⇒ 落
+ * `DEFAULT_SESSION_TIMEOUT_MS`。
  *
  * v0.8.5 · M1（模式 / 会话元信息通道，REQ-v0.8.5-2026-09-21-01）：`--mode`（adapter 按 risk 映射后的
  * **原样值**，桥**不做 kind→mode 映射**）与 `--collaboration-mode` 均原样透传、不校验（缺省 / 空串 ⇒ 不下发）；
@@ -91,6 +95,11 @@ export interface BridgeArgs {
    * 缺省 ⇒ 三路（new / load / resume）均不携带 `_meta` 键。
    */
   sessionMeta?: Record<string, unknown>;
+  /**
+   * `--session-timeout` 解析结果（会话执行超时毫秒数，v0.8.7 · M1）；缺省 ⇒ `undefined`
+   * ⇒ 由 {@link startBridge} 落 `deps.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS`。
+   */
+  sessionTimeoutMs?: number;
 }
 
 function requiredArg(map: ReadonlyMap<string, string>, key: string): string {
@@ -130,6 +139,7 @@ export function parseBridgeArgs(argv: readonly string[]): BridgeArgs {
   const sessionMeta = parseSessionMetaArg(map.get("session-meta-json"));
   const systemPrompt = parseModelArg(map.get("system-prompt"));
   const systemPromptMode = parseSystemPromptModeArg(map.get("system-prompt-mode"));
+  const sessionTimeoutMs = parseSessionTimeoutArg(map.get("session-timeout"));
   return {
     port,
     workspace: requiredArg(map, "workspace"),
@@ -143,7 +153,23 @@ export function parseBridgeArgs(argv: readonly string[]): BridgeArgs {
     ...(mode !== undefined ? { mode } : {}),
     ...(collaborationMode !== undefined ? { collaborationMode } : {}),
     ...(sessionMeta !== undefined ? { sessionMeta } : {}),
+    ...(sessionTimeoutMs !== undefined ? { sessionTimeoutMs } : {}),
   };
+}
+
+/**
+ * `--session-timeout` 解析（v0.8.7 · M1）：**只做「整数 > 0」宽松校验**（纪律同 `--port`），非法即抛。
+ * 上限（15 min）护栏**不在桥侧** —— `acp-bridge` 是零仓内依赖的叶模块，复制上限常量必漂移，
+ * 单一源在 launcher 的项目配置解析处。缺省 ⇒ `undefined`（⇒ 由 `startBridge` 落
+ * `deps.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS`）。
+ */
+export function parseSessionTimeoutArg(raw: string | undefined): number | undefined {
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error("--session-timeout 必须是正整数毫秒");
+  }
+  return value;
 }
 
 /**
@@ -252,7 +278,7 @@ export async function startBridge(args: BridgeArgs, deps: StartBridgeDeps = {}):
     client,
     cwd: args.workspace,
     sessions,
-    timeoutMs: deps.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS,
+    timeoutMs: args.sessionTimeoutMs ?? deps.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS,
     injection,
     ...(args.model !== undefined ? { model: args.model } : {}),
     ...(args.mode !== undefined ? { mode: args.mode } : {}),

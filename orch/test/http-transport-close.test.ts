@@ -28,7 +28,11 @@ import {
 } from "../bridge/transports/http.js";
 import type { HttpTransportHandle } from "../bridge/transports/http.js";
 import { RUNNER_CONNECT_PATH } from "../bridge/runner.js";
-import type { RunnerEndpointHandle, RunnerSweepResult } from "../bridge/runner.js";
+import type {
+  RunnerEndpointHandle,
+  RunnerOrphanSweepResult,
+  RunnerSweepResult,
+} from "../bridge/runner.js";
 import type { BridgeCore } from "../bridge/index.js";
 
 // ---------------------------------------------------------------------------
@@ -109,6 +113,7 @@ function hangingRunner(onHang: () => void): RunnerEndpointHandle {
     pendingConnects: () => 1,
     pendingControls: () => 0,
     sweepStale: (): RunnerSweepResult => ({ offlineRunners: [], requeuedTasks: [] }),
+    sweepOrphanedTasks: (): RunnerOrphanSweepResult => ({ orphanedTasks: [] }),
   };
 }
 

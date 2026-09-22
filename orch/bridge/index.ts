@@ -1230,8 +1230,9 @@ function registerFeatureNode(
  *
  * 派发前注入 Feature Context（plan/decisions/contracts）与已完成上游产物（`inputArtifacts`）；
  * 注入后的全文**先落库**（Runner 领取消息取自 `dispatch_message`，故必须刷新），再复用
- * `dispatchTask` **入队**（`queue_state=queued` + `dispatch_guard` 幂等占位，取代旧 C11
- * `markTaskDispatchStarted` 先占位后发）。
+ * `dispatchTask` **入队**（`queue_state=queued` + `dispatch_guard` 入队幂等占位）。
+ * ⚠️ C11 的「先占位后发」原语（`markTaskDispatchStarted` / `markTaskDispatched`）在 pull 模型下
+ * **生产零调用**（v0.8.7 已把注释翻正为遗留原语）；`started_at` 的现行写入点 = `claimTask`。
  *
  * 结果链：Runner 领取 → 本地执行 → `/runner/result` 回传 → `upsertTaskResult` 落终态；
  * **节点终态续推 DAG** 由 A5 本地看护接管（`dispatchTask` 未在同步预算内终态时启动；

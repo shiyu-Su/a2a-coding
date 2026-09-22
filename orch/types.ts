@@ -51,12 +51,12 @@ export type AgentKind = (typeof AGENT_KINDS)[number];
 export type TaskState = "working" | "completed" | "failed" | "input-required" | "blocked";
 
 /**
- * 任务失败分类（v0.4.1 超时与失败自动化；**v0.6.1 REQ-05 起语义休眠**）。
- * - `infra`：基础设施类失败（超时 / 中断 / 看护放弃 / 库锁 / 网络）⇒ 曾走「取证 → 条件重试」；
- * - `task`：任务本身失败 ⇒ 曾照旧传播 `blocked` → Feature `failed`（不重试）。
+ * 任务失败分类（v0.4.1 超时与失败自动化；v0.6.1 REQ-05 起语义休眠；**v0.8.7 O3 按二分恢复写入**）。
+ * - `infra`：基础设施 / 载体类失败（进程起不来 / 中途死 / 墙钟孤儿）；
+ * - `task`：任务自身失败（含协议方言、业务失败，以及**分类未知时的安全降级**）。
  *
- * ⚠️ 五层删除（分类器 `classifyFailure` + 写口 `markTaskFailureKind` 均删）后**不再产生新分类**；
- * 类型与 `tasks.failure_kind` 列一并保留（读侧兼容历史行、出参字段形状不变），但实际恒 `null`。
+ * v0.4.1 的「取证 → 条件重试」判据**不复活**（重派权仍归宿主）；本版只把**分类事实**接回来，
+ * v0.8.8 若要扩到六类，是**加取值**而非重定字段。
  */
 export type FailureKind = "infra" | "task";
 
@@ -234,10 +234,16 @@ export interface ProjectGroup {
  *   空超时即视为**心跳**（poll 即心跳，不引 WS/SSE）。
  * - `heartbeatTimeoutMs`：注册心跳判死阈值（缺省 `60000`）；超期只降注册态，
  *   **不得触发 stop**（D8；清算 = requeue，见 B2）。
+ * - `orphanTimeoutMs`：**孤儿墙钟判死阈值**（v0.8.7 O2；缺省 `1800000` = 30 min）。
+ *   判据 `queue_state ∈ {claimed, running} ∧ claimed_at < now - orphanTimeoutMs` ⇒
+ *   `sweepOrphanedTasks()` 置 `failed`（`failure_kind='infra'`）+ `task.orphaned` 事件。
+ *   ⚠️ 跨单元不变量（写死）：`orphanTimeoutMs > dispatchTimeoutMs`（machine 侧有 ≤15 min
+ *   上限护栏 + 300s margin ⇒ 恒 ≥1.5× 余量）；orch **不读 machine 配置**。
  */
 export interface RunnerConfig {
   holdMs: number;
   heartbeatTimeoutMs: number;
+  orphanTimeoutMs: number;
 }
 
 /** orch 侧：机器清单 */
@@ -247,7 +253,7 @@ export interface MachinesConfig {
   transport: TransportConfig;
   /** 网页端只读工作台（v0.5.0；配置缺省时解析为 `{ true, "127.0.0.1", 3300 }`） */
   web: WebConfig;
-  /** Runner 反向注册阈值（v0.7.0；配置缺省时解析为 `{ holdMs: 25000, heartbeatTimeoutMs: 60000 }`） */
+  /** Runner 阈值（v0.7.0；v0.8.7 O2 起含墙钟；配置缺省时解析为 `{ holdMs: 25000, heartbeatTimeoutMs: 60000, orphanTimeoutMs: 1800000 }`） */
   runner: RunnerConfig;
   /**
    * 静态项目组数组（v0.8.6 一桥多组 §2.1；`projectGroup` 段，**段缺省 / 未配任何组 ⇒ `[]` = 全量接纳**，
@@ -338,9 +344,16 @@ export interface TaskRecord {
    */
   createdAt: string | null;
   /**
-   * **首次开工时刻**（v0.5.0，UTC ISO 8601）。两个写入点：
-   * `createTask()` 且 `state === "working"`；`markTaskDispatched()` **仅当为 NULL 才填**。
-   * ⇒ 「只填一次」：重派 / 条件重试**不重置**起点。未开工（含 `input-required` 等）与老记录为 null。
+   * **首次开工时刻**（v0.5.0，UTC ISO 8601）。
+   *
+   * **唯一写入点**（v0.8.7 O3 起）= `claimTask()` —— Runner **首次领取**时以 `COALESCE` 填充，
+   * **登记时一律不填**（旧的 `createTask(state === "working")` 预填已摘除）⇒ 与「登记时刻」
+   * 彻底脱钩 ⇒ 「排队多久 / 真跑了多久」第一次分得开（改造文档 §2.4 用户裁 ⑧ 第 ① 层）。
+   * ⇒ 「只填一次」：重派 / 条件重试 / 心跳 requeue 后再领取**均不重置**起点。
+   * 未开工（排队中、`input-required`）与 v0.5.0 老记录为 null。
+   *
+   * ⚠️ 旧口径所指的两个写口（`markTaskDispatchStarted` / `markTaskDispatched`）在 pull 模型下
+   * **生产零调用**，已翻正为遗留原语。
    */
   startedAt: string | null;
   /**
@@ -361,8 +374,8 @@ export interface TaskRecord {
   /**
    * **派发占位（C11 幂等键，v0.6.1 REQ-05 §2.5 白捡；非 NULL = 「已发出」）**。
    *
-   * 写入点 = A2A `message/send` **之前**（`markTaskDispatchStarted`），值 = 占位时刻（UTC ISO 8601）；
-   * `remoteTaskId` 由 send 返回后回填。二者合起来表达「**已发出即有占位**」：
+   * **现行写入点**（v0.7.0 pull 起）= `enqueueTask()`（入队幂等占位，`COALESCE` 不刷新）；
+   * `remoteTaskId` 由 Runner 回传经 `upsertTaskResult()` 回填。二者合起来表达「**已发出即有占位**」：
    * - `dispatchGuard === null` ⇒ **必未发出**（崩溃点在此 ⇒ 重启可安全重派，无双派）；
    * - `dispatchGuard !== null` 且 `remoteTaskId === null` ⇒ **可能已发出、远端 id 未知**
    *   （崩溃点在此 ⇒ 重启保守判「已发出」，**不自动重派**，按 interrupted 收敛并交静止账单）；
@@ -386,10 +399,15 @@ export interface TaskRecord {
    */
   retryCount: number;
   /**
-   * 失败分类（v0.4.1；**v0.6.1 REQ-05 起语义休眠**）。
+   * 失败分类（v0.4.1 引入；v0.6.1 REQ-05 起随五层删除**停止写入**；**v0.8.7 O3 恢复写入**）。
    *
-   * ⚠️ 分类器（`classifyFailure`）与写口（`markTaskFailureKind`）随五层删除 ⇒ 该列不再被写入
-   * （读侧保留以兼容历史行）⇒ `a2a_feature_status` 出参 `failureKind` 恒 `null`（字段保留、语义休眠）。
+   * 现行两处写口（改造文档 §2.3）：
+   * - `/runner/result` 回传 ⇒ `setTaskFailureKind`（分类值 = orch 侧纯函数映射 machine 原生
+   *   `AcpError.kind`，**映射权归 orch**；`spawn`/`closed` ⇒ `infra`，其余（含未知 / 缺失）⇒ `task`）；
+   * - 孤儿墙钟判死 ⇒ `failOrphanedTask` 自置 `infra`（v0.8.7 O2）。
+   *
+   * ⚠️ **旧文本白名单分类器 `classifyFailure` 与旧写口 `markTaskFailureKind` 均不复活**
+   * （判据已升级为结构化 kind）；**派发失败路径（`scheduler.ts`）本版不写** ⇒ 该路径仍为 `null`。
    */
   failureKind: FailureKind | null;
   /**

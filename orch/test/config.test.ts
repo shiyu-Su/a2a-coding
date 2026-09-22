@@ -14,7 +14,7 @@
  * `memberKey` 单射性与集合去重、`defaultProjectGroup` 唯一默认构造、N1 过渡聚合视图 `projectGroup` = 各组并集。
  * 覆盖（v0.7.0 A1）：`launcherUrl` 必填→可选（缺省解析成功 + warn；存在非法 ⇒ warn + 忽略；
  * 存在合法 ⇒ 原样保留且不告警）、`machines[].token` 可选解析（存在须非空字符串）、
- * 顶层可选 `runner` 段（缺省 / 空段 / 部分缺省 ⇒ 25000 / 60000；非法结构 ⇒ fail-fast）、
+ * 顶层可选 `runner` 段（缺省 / 空段 / 部分缺省 ⇒ 25000 / 60000 / 1800000；非法结构 ⇒ fail-fast）、
  * 协议常量 `PROTOCOL_VERSION === "2.2"` 与 `SUPPORTED_PEER_PROTOCOL_MAJORS === [2]`。
  * 覆盖（v0.7.2 K6）：warn **文案级 once-per-process 去重** —— 同一坏配置重复解析 ⇒ 同文案仅
  * warn 一次（次数 = 1）、不同文案（缺省 / 非法 / 不同机器下标 / allowStdio）互不去重、
@@ -754,7 +754,7 @@ function machineConfig(machine: Record<string, unknown>, extra: Record<string, u
   return { machines: [machine], ...extra };
 }
 
-const RUNNER_DEFAULTS = { holdMs: 25000, heartbeatTimeoutMs: 60000 };
+const RUNNER_DEFAULTS = { holdMs: 25000, heartbeatTimeoutMs: 60000, orphanTimeoutMs: 1800000 };
 
 test("协议常量（线协议 2.2）：PROTOCOL_VERSION=2.2 / SUPPORTED_PEER_PROTOCOL_MAJORS=[2]", () => {
   assert.equal(PROTOCOL_VERSION, "2.2");
@@ -815,7 +815,7 @@ test("machines[].token 非法（空串 / 非字符串 / null）→ 结构化报�
   }
 });
 
-test("runner 缺省：无 runner 段 → { holdMs: 25000, heartbeatTimeoutMs: 60000 }", () => {
+test("runner 缺省：无 runner 段 → { holdMs: 25000, heartbeatTimeoutMs: 60000, orphanTimeoutMs: 1800000 }", () => {
   const cfg = withConfig(minimalConfig(), loadMachinesConfig);
   assert.deepEqual(cfg.runner, RUNNER_DEFAULTS);
 });
@@ -825,15 +825,19 @@ test("runner 空段：{} 视同缺省（旧配置零改动可用）", () => {
   assert.deepEqual(cfg.runner, RUNNER_DEFAULTS);
 });
 
-test("runner 部分缺省：仅声明 holdMs ⇒ heartbeatTimeoutMs 回退缺省；两者均声明 ⇒ 按声明取值", () => {
+test("runner 部分缺省：仅声明 holdMs ⇒ heartbeatTimeoutMs / orphanTimeoutMs 回退缺省；三者均声明 ⇒ 按声明取值", () => {
   const partial = withConfig(minimalConfig({ runner: { holdMs: 30000 } }), loadMachinesConfig);
-  assert.deepEqual(partial.runner, { holdMs: 30000, heartbeatTimeoutMs: 60000 });
+  assert.deepEqual(partial.runner, {
+    holdMs: 30000,
+    heartbeatTimeoutMs: 60000,
+    orphanTimeoutMs: 1800000,
+  });
 
   const full = withConfig(
-    minimalConfig({ runner: { holdMs: 10000, heartbeatTimeoutMs: 45000 } }),
+    minimalConfig({ runner: { holdMs: 10000, heartbeatTimeoutMs: 45000, orphanTimeoutMs: 90000 } }),
     loadMachinesConfig,
   );
-  assert.deepEqual(full.runner, { holdMs: 10000, heartbeatTimeoutMs: 45000 });
+  assert.deepEqual(full.runner, { holdMs: 10000, heartbeatTimeoutMs: 45000, orphanTimeoutMs: 90000 });
 });
 
 test("runner 段非对象（字符串 / 数字 / 数组 / null）→ 结构化报错", () => {
@@ -857,6 +861,12 @@ test("runner 阈值非法（0 / 负 / 小数 / 类型错）→ 结构化报错�
     assert.throws(
       () => withConfig(minimalConfig({ runner: { heartbeatTimeoutMs } }), loadMachinesConfig),
       /\[config\] runner\.heartbeatTimeoutMs 必须是正整数（毫秒，>=1）/,
+    );
+  }
+  for (const orphanTimeoutMs of bad) {
+    assert.throws(
+      () => withConfig(minimalConfig({ runner: { orphanTimeoutMs } }), loadMachinesConfig),
+      /\[config\] runner\.orphanTimeoutMs 必须是正整数（毫秒，>=1）/,
     );
   }
 });

@@ -3,7 +3,8 @@
  *
  * 覆盖节点门禁（「离线 → requeue → 回线 claim 复用同一 CAS + 事件留痕」）：
  * - **sweepStale 判定**：心跳静默 ≥ `runner.heartbeatTimeoutMs` ⇒ 该 Runner 名下 `claimed` 任务
- *   被 `requeueStaleTask` 回收为 `queued` + 清 claim 三字段，注册态降 `offline`；**幂等**（重跑零变更）；
+ *   被 `requeueStaleTask` 回收为 `queued` + 清 claim 令牌/时刻两字段（v0.8.7 O4 起保留
+ *   `claimed_by`），注册态降 `offline`；**幂等**（重跑零变更）；
  * - **事件留痕 + signalEvents**：`task.stale` / `runner.offline` / `runner.online` / `task.claimed`
  *   逐条落 `events` 表，且每次落库均触发注入的 `signalEvents`（收件箱唤醒）；
  * - **回线复用同一 CAS**：Runner 回归经 `/runner/connect`（poll 即心跳）照常 `claim` 同一条被回收的
@@ -89,7 +90,7 @@ function makeConfig(machines: MachineRef[], heartbeatTimeoutMs: number): Machine
     machines,
     transport: { mode: "http", http: { host: "127.0.0.1", port: 0, path: "/mcp" } },
     web: { enabled: false, host: "127.0.0.1", port: 0 },
-    runner: { holdMs: 50, heartbeatTimeoutMs },
+    runner: { holdMs: 50, heartbeatTimeoutMs, orphanTimeoutMs: 1_800_000 },
   };
 }
 
@@ -237,7 +238,7 @@ test("sweepStale：心跳超期 → requeue + runner.offline + task.stale（事�
   assert.deepEqual(result.requeuedTasks, ["t-sweep"]);
   const requeued = getQueuedTask("t-sweep");
   assert.equal(requeued?.queueState, "queued", "被回收为 queued");
-  assert.equal(requeued?.claimedBy, null);
+  assert.equal(requeued?.claimedBy, "m-sweep", "v0.8.7 O4：清算保留 claimed_by（补结算窄口凭据）");
   assert.equal(requeued?.claimToken, null);
   assert.equal(requeued?.claimedAt, null);
   assert.equal(getRunner("m-sweep")?.state, "offline", "注册态降 offline（D8：只降态）");

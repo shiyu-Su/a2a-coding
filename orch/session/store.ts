@@ -158,7 +158,7 @@ const RISK_LEVELS: readonly RiskLevel[] = ["read", "write", "full"];
 export interface TaskQueueColumns {
   /** 队列态（NULL 老数据已归一为 `settled`） */
   queueState: QueueState;
-  /** 领取者标识（落 `tasks.claimed_by`；未领取 / 已清算为 null） */
+  /** 领取者标识（落 `tasks.claimed_by`；未领取为 null；v0.8.7 O4 起清算后**保留**——补结算窄口的行级绑定凭据） */
   claimedBy: string | null;
   /** 本次领取的唯一令牌（`requeueStaleTask` 清算时清空） */
   claimToken: string | null;
@@ -1078,8 +1078,11 @@ export class SessionStore {
    * **v0.5.0 三时刻列**（网页端只读工作台展示耗时；口径见 `types.ts` 的 `TaskRecord`）：
    * - `created_at`：**登记时刻**，仅 INSERT 写；`ON CONFLICT` **不更新** ⇒ 首次为准
    *   （参照 `upsertSession` 保留首次 `created_at` 的先例）；
-   * - `started_at`：**首次开工时刻**，`state === "working"` 时填；冲突时 `COALESCE` 保留首次
-   *   —— 与 `markTaskDispatched`「仅 NULL 才填」同一纪律：重派 / 重试不重置起点；
+   * - `started_at`：**登记时一律不填**（v0.8.7 O3 摘除旧的 `state === "working"` 预填）——
+   *   「首次开工时刻」= **首次被领取时刻**，唯一生产写口是 {@link claimTask} 的 `COALESCE`。
+   *   预填若不摘除，则任何「登记即 working」的节点抵达 `claimTask` 时该列已非 NULL，
+   *   「接到首次领取」永不生效（列恒等于登记时刻，把排队整段算进耗时）。冲突时同样 `COALESCE`
+   *   保留首次 ⇒ upsert 不重置起点；
    * - `finished_at`：**完成时刻**，终态（`completed` / `failed` / `blocked`）时填；冲突时同样
    *   `COALESCE` 保留首次。**必须在 createTask 也写**：独立单任务走 `handleCall` 直接
    *   `createTask(state = 终态)`，**从不经过 CAS**（见 `bridge/index.ts` 的 handleCall）。
@@ -1087,9 +1090,11 @@ export class SessionStore {
   createTask(rec: TaskCreateInput): TaskRecord {
     const now = nowIso();
     const updatedAt = rec.updatedAt ?? now;
-    // 三时刻与本行首次落库同源（同一 `now`），避免毫秒级漂移
+    // 三时刻中落库的两列与本行首次落库同源（同一 `now`），避免毫秒级漂移
     const createdAt = now;
-    const startedAt = rec.state === "working" ? now : null;
+    // v0.8.7 O3（§2.4，宿主授权摘除 `working` 预填）：登记**不填**开工时刻
+    // ⇒ `claimTask` 是生产链路「首次开工」的唯一写口（排队 / 开工由此分得开）。
+    const startedAt: string | null = null;
     const finishedAt = isFinishedState(rec.state) ? now : null;
     const prompt =
       rec.prompt === undefined || rec.prompt === null ? null : truncatePrompt(rec.prompt);
@@ -1233,12 +1238,19 @@ export class SessionStore {
   }
 
   /**
-   * **C11 派发占位（先占位后发）**：在 A2A `message/send` **之前**写入「已发出」事实。
+   * **C11 派发占位原语（保留但生产未接）**：在 A2A `message/send` **之前**写入「已发出」事实。
    * 任务不存在时无效果，返回 null。
+   *
+   * ⚠️ **v0.8.7 口径翻正**：v0.7.0 连接模型反转为 pull 后，派发改由 {@link enqueueTask} /
+   * {@link claimTask} 承载（`queue_state` 五态 + `dispatch_guard` 降级为**入队幂等键**），
+   * 本方法**在生产链路零调用点**（仅 `test/n6-pickups.test.ts` 覆盖其语义）。**保留不删**：
+   * 它是「占位先于发送」这一崩溃窗口的原语表达，A2A `message/send` 直发（push）路径若重新
+   * 启用即由此承接；`recover()` 读的 `dispatch_guard` 现由 {@link enqueueTask} 写入。
    *
    * - `dispatch_guard` = 占位时刻（非 NULL = 已发起派发）；`remote_task_id` **保持 NULL**，
    *   由 {@link markTaskDispatched} 在 send 返回后回填；
    * - `started_at` 与占位同批写（`COALESCE`：仅首次填）—— 占位时刻即「首次开工」；
+   *   ⚠️ 生产未接 ⇒ **`started_at` 的实际写入点是 {@link claimTask}**（v0.8.7 O3）；
    * - **幂等**：`COALESCE(dispatch_guard, ?)` ⇒ 重复调用**不刷新**占位时刻（不产生新事实）。
    *
    * **事务粒度 / 锁**：单条 `UPDATE` 即原子（SQLite 单进程写，`DatabaseSync` 同步执行）；
@@ -1259,11 +1271,16 @@ export class SessionStore {
   }
 
   /**
-   * Feature 节点派发落库：回填远端 id，保持 state（working）以便看护接管。
+   * **push 遗留路径的派发落库（生产未接）**：回填远端 id，保持 state（working）以便看护接管。
    * 任务不存在时无效果，返回 null。
    *
+   * ⚠️ **v0.8.7 口径翻正**：pull 模型下远端 id 由 Runner 回传经 {@link upsertTaskResult} 回填，
+   * 本方法**在生产链路零调用点**（仅剩测试引用，如 `markTaskDispatched` 造 `remote_task_id`
+   * 的旧用例）⇒ 它是 A2A `message/send` 直发时代的遗留回填口，**不是** `started_at` 的现行写口。
+   *
    * v0.5.0：**`started_at` 写口（仅当 IS NULL 才填）** —— `COALESCE(started_at, ?)` 使
-   * 「首次派发」补时刻、而重派 / 重试**不重置起点**（幂等；与 `createTask` 的 `COALESCE` 同一纪律）。
+   * 「首次派发」补时刻、而重派 / 重试**不重置起点**（幂等；与 `createTask` 的 `COALESCE` 同一纪律）；
+   * v0.8.7 起该语义由 {@link claimTask} 承接（**现行唯一生产写入点**）。
    *
    * v0.6.1 REQ-05 §2.5 白捡（C11）：本方法 = **占位后的回填**（真实远端 id）——
    * **不清 `dispatch_guard`**（「已发出」是既成事实，清空点只在 `rearmTask` / `rearmForRetry`）。
@@ -1435,26 +1452,45 @@ export class SessionStore {
   }
 
   /**
-   * **项目忙**集合（v0.6.1 REQ-05 §2.5 / N5）：当前存在**在飞节点**的 `project_id` 集合。
+   * **项目忙谓词**（SQL `WHERE` 片段）= 忙集判据的**唯一事实源**，供 {@link listBusyProjectIds}
+   * 展开：`state = 'working' ∧ queue_state IN ('queued', 'claimed', 'running')`。
    *
-   * 判据 = `EXISTS(state = 'working' AND remote_task_id IS NOT NULL)`（`DISTINCT project_id`）。
+   * v0.8.7（REQ-v0.8.7-2026-09-22-01 O1）改活：pull 模型下 `remote_task_id` **已无生产写入点**
+   * （`markTaskDispatched` 仅剩测试引用）⇒ 旧口径 `remote_task_id IS NOT NULL` **恒空集**，
+   * 串行门只剩进程内 `reservedProjects`（批次 `finally` 即退场，跨 tick 完全不设防）。
+   * 忙集口径改由**本地队列态**承载（与 `isTaskWatched` 同口径）。
+   *
+   * **v0.8.10 读写分道（lane）在此扩展** —— 本版**不引入 lane / 复合键**：消费侧共三处按
+   * projectId 比对（`computeReadyNodes` 的 `busyProjects.has` / `claimed.has` / `claimed.add`），
+   * 元素一旦变为 `p#lane` 而漏改任一处 ⇒ 串行门**静默失效**；lane 恒单值时零收益。
+   */
+  private busyProjectPredicate(): string {
+    return "state = 'working' AND queue_state IN ('queued', 'claimed', 'running')";
+  }
+
+  /**
+   * **项目忙**集合（v0.6.1 REQ-05 §2.5 / N5；谓词见 {@link busyProjectPredicate}）：
+   * 当前**有未落定节点**的 `project_id` 集合（`DISTINCT project_id`）。
+   *
+   * ① **谓词含 `queued` 是刻意的**：节点已入队但尚未被领取，也算该项目「忙」——
+   *   「上一节点未落定 ⇒ 同项目后续节点不得先行」**就是串行的定义本身**，不是宽松误判。
+   * ② **sweep requeue（`claimed → queued`）后该行仍留在忙集 = 正确行为**（任务确实未落定，
+   *   只是换了个领取者）；将来读者不得把它当漏洞「修掉」（否则会重新引入同项目双派）。
+   * ③ **串行不变量完全由本谓词（orch 侧）持有**，**不依赖 machine 侧的领取纪律** ——
+   *   Runner 何时领取、领取几个不由 orch 约束，忙集只认落库事实。
    *
    * ⚠️ **不得复用 `listTasks`**：后者 `limit` clamp 到 `[1,100]` 且按 `updated_at DESC` 截断
    * ⇒ 任务多于 100 条时**静默漏**忙碌项目（串行虚设）。本查询是**集合投影**（无 limit、无排序），
    * 返回基数天然有界于项目数，不存在截断。
    *
-   * 「在飞」口径 = **派发在恋 ∨ 看护存活**（受 `A2A_REQUEST_TIMEOUT_MS` / 看护 `renew` +
-   * `maxConsecutiveFailures → abandoned` 约束）—— **事件性上界，非墙钟上界**（改造文档 §2.5
-   * 硬约束 2）；`working ∧ 丢看护` 的**悬挂态**兜底 = 桥重启 `recover()` 对账，不在本查询内。
-   *
-   * 本查询只覆盖**已落库**的在飞；「派发已发起但 `remote_task_id` 尚未回填」的窗口由调度器
-   * **进程内项目预留**补（`FeatureScheduler.reservedProjects`）——二者相并方为完整忙集。
+   * 本查询覆盖**已落库**的忙（`working ∧ 入队/领取/开工`）；「派发已发起但行尚未落库或队列态
+   * 尚未写入」的**进程内窗口**由调度器补（`FeatureScheduler.reservedProjects`）——二者相并方为
+   * 完整忙集。终态落库（`upsertTaskResult` 置 `settled`）⇒ 自动出集。
    */
   listBusyProjectIds(): Set<string> {
     const rows = this.db
       .prepare(
-        `SELECT DISTINCT project_id FROM tasks
-          WHERE state = 'working' AND remote_task_id IS NOT NULL`,
+        `SELECT DISTINCT project_id FROM tasks WHERE ${this.busyProjectPredicate()}`,
       )
       .all() as Array<Record<string, unknown>>;
     const ids = new Set<string>();
@@ -1718,6 +1754,13 @@ export class SessionStore {
    * - `projectIds` 缺省 = 不限项目；显式空数组 = 无可领取（返回 null，零 I/O）。
    * - `claimToken` 缺省由存储层生成（`randomUUID`；`idx_tasks_claim_token` 唯一索引兜底）。
    * - 无候选 / 全部被抢占 / 候选行消失 ⇒ 返回 null。
+   * - **v0.8.7 O3（取证面 §2.4）**：领取即**首次开工** ⇒ 同批补 `started_at`
+   *   （`COALESCE` 仅 NULL 才填）—— pull 模型下这才是「真的开始跑」的时刻。
+   *   `createTask()` 登记时**不再预填**（v0.8.7 O3 摘除旧的 `working` 预填）⇒ 本方法是
+   *   生产链路「首次开工时刻」的**唯一写口**；旧口径记的两个写入点
+   *   （{@link markTaskDispatchStarted} / {@link markTaskDispatched}）在 v0.7.0 反转为 pull
+   *   后**生产零调用**，已翻正为遗留原语。
+   *   `COALESCE` 保证**只填一次**：心跳 requeue 后再领取 / `rearmForRetry` 重派**不重置起点**。
    */
   claimTask(opts: ClaimTaskOptions): QueuedTaskRecord | null {
     if (opts.claimedBy.length === 0) {
@@ -1739,13 +1782,14 @@ export class SessionStore {
     const claimedAt = opts.claimedAt ?? nowIso();
     const update = this.db.prepare(
       `UPDATE tasks
-       SET queue_state = 'claimed', claimed_by = ?, claim_token = ?, claimed_at = ?, updated_at = ?
+       SET queue_state = 'claimed', claimed_by = ?, claim_token = ?, claimed_at = ?,
+           started_at = COALESCE(started_at, ?), updated_at = ?
        WHERE task_id = ? AND queue_state = 'queued'`,
     );
     for (const candidate of candidates) {
       const taskId = readString(candidate, "task_id");
       const claimToken = opts.claimToken ?? randomUUID();
-      const info = update.run(opts.claimedBy, claimToken, claimedAt, claimedAt, taskId);
+      const info = update.run(opts.claimedBy, claimToken, claimedAt, claimedAt, claimedAt, taskId);
       if (Number(info.changes) === 0) continue; // CAS 落空（已被抢占）⇒ 试下一候选
       const row = this.db
         .prepare(`SELECT ${QUEUE_TASK_COLUMNS} FROM tasks WHERE task_id = ?`)
@@ -1769,13 +1813,18 @@ export class SessionStore {
   }
 
   /**
-   * **清算悬挂领取**（B2）：`claimed` / `running` → `queued`，并清空 claim 三字段
-   * （`claimed_by` / `claim_token` / `claimed_at`）。用于 Runner 心跳超期 / 归零后回收其名下任务。
+   * **清算悬挂领取**（B2）：`claimed` / `running` → `queued`，清空 claim **令牌与时刻**两字段
+   * （`claim_token` / `claimed_at`）。用于 Runner 心跳超期 / 归零后回收其名下任务。
    *
    * - 条件 UPDATE：仅 `queue_state ∈ {claimed, running}` 命中（`settled` / `queued` / NULL 老行零写入）。
    * - `expectedClaimedBy` 给定 ⇒ 仅清算该领取者名下的任务（防误清他人）。
    * - `queued_at` 保留原值（缺省回填 now）⇒ 重领取沿用原 FIFO 位次。
    * - 返回是否发生迁移（false = 未命中，零写入）。
+   * - ⚠️ **v0.8.7 O4：不清 `claimed_by`**（只清 `claim_token` / `claimed_at`）—— 保留领取者
+   *   行级痕迹，供 `/runner/result` **补结算窄口**做绑定校验（machine 启动补报须证明
+   *   「该行仍绑定本机的历史领取」）。安全性：`listClaimedTasks` 按
+   *   `queue_state IN ('claimed','running')` 过滤 ⇒ `queued` 行留着旧 `claimed_by` 不进回收
+   *   路径；下次 `claimTask` 覆写；心跳清算的 CAS（`expectedClaimedBy`）照常落空 ⇒ 零涟漪。
    */
   requeueStaleTask(taskId: string, expectedClaimedBy?: string): boolean {
     const now = nowIso();
@@ -1785,11 +1834,76 @@ export class SessionStore {
     const info = this.db
       .prepare(
         `UPDATE tasks
-         SET queue_state = 'queued', claimed_by = NULL, claim_token = NULL, claimed_at = NULL,
+         SET queue_state = 'queued', claim_token = NULL, claimed_at = NULL,
              queued_at = COALESCE(queued_at, ?), updated_at = ?
          WHERE task_id = ? AND queue_state IN ('claimed', 'running')${claimedClause}`,
       )
       .run(...params);
+    return Number(info.changes) > 0;
+  }
+
+  /**
+   * 列出**墙钟超期**的在飞队列任务（`queue_state ∈ {claimed, running}` 且
+   * `claimed_at < claimedBefore`；**只读**；v0.8.7 O2 孤儿清算遍历入口）。
+   *
+   * `claimedBefore` = UTC ISO 8601 截止刻（调用方按 `now - orphanTimeoutMs` 推导）；
+   * ISO 串字典序即时间序，与 `claimed_at` 直接比较成立。`claimed_at IS NULL` 的行
+   * （未领取 / 老数据）**永不命中** —— 无领取时刻即无墙钟起点。按 `claimed_at` 升序。
+   */
+  listOrphanedTasks(claimedBefore: string): QueuedTaskRecord[] {
+    if (claimedBefore.length === 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT ${QUEUE_TASK_COLUMNS} FROM tasks
+          WHERE queue_state IN ('claimed', 'running') AND claimed_at IS NOT NULL AND claimed_at < ?
+          ORDER BY claimed_at ASC, updated_at ASC`,
+      )
+      .all(claimedBefore) as Array<Record<string, unknown>>;
+    return rows.map(rowToQueuedTask);
+  }
+
+  /**
+   * **墙钟判死**（v0.8.7 O2）：单语句 CAS `claimed`/`running` → `state='failed'` +
+   * `queue_state='settled'` + `failure_kind='infra'`（直写，不经结果回传口）。
+   *
+   * ⚠️ **不清 claim 三字段**（`claimed_by` / `claim_token` / `claimed_at` 保留）——
+   * §2.9 契约 3：墙钟判死后 machine 的**迟到件**须仍能通过 `/runner/result` 的
+   * claim_token 比对、落 `upsertTaskResult` 幂等口（首个终态胜出 ⇒ 零写入 + 200 ack），
+   * 否则 machine 侧 outbox `pending` 永不清除。
+   * - `finished_at` 仅首次填充（COALESCE，与 `upsertTaskResult` 同纪律）；**不动 `text`**。
+   * - 返回是否发生迁移（false = 未命中：已结算 / 已被心跳清算 requeue，零写入零事件）。
+   */
+  failOrphanedTask(taskId: string): boolean {
+    const now = nowIso();
+    const info = this.db
+      .prepare(
+        `UPDATE tasks
+         SET state = 'failed', queue_state = 'settled', failure_kind = 'infra',
+             finished_at = COALESCE(finished_at, ?), updated_at = ?
+         WHERE task_id = ? AND queue_state IN ('claimed', 'running')`,
+      )
+      .run(now, now, taskId);
+    return Number(info.changes) > 0;
+  }
+
+  /**
+   * **失败分类写口**（v0.8.7 O3，改造文档 §2.3 写口 (i)）：把 `failure_kind` 落为
+   * `{infra, task}` 二分。分类值由**调用方映射**给出（`bridge/runner.ts` 的纯函数，
+   * 输入 = machine 上报的原生 `AcpError.kind`）—— **映射权归 orch**，machine 不得预映射。
+   *
+   * `AND state = 'failed'` ⇒ **只在「本次上报胜出终态」时生效**（与 {@link upsertTaskResult}
+   * 的「首个终态胜出」同语义）：迟到 / 重复上报（行已终态、或已被墙钟判死为 `infra`）⇒
+   * **零写入**，故分类不会被后来的重复件改写。
+   *
+   * - 返回是否发生写入（false = 行不存在 / 该行非 `failed`）。
+   * - **不动 `updated_at`**：分类是既有终态行的附属标注，不代表一次状态推进。
+   * - 另一处写口 = 墙钟 sweep {@link failOrphanedTask}（自置 `infra`）；
+   *   **派发失败路径（`scheduler.ts`）本版不写**。
+   */
+  setTaskFailureKind(taskId: string, kind: FailureKind): boolean {
+    const info = this.db
+      .prepare(`UPDATE tasks SET failure_kind = ? WHERE task_id = ? AND state = 'failed'`)
+      .run(kind, taskId);
     return Number(info.changes) > 0;
   }
 
@@ -2266,7 +2380,7 @@ export function listFeatureTasks(featureId: string, opts?: ListFeatureTasksOptio
   return getDefaultStore().listFeatureTasks(featureId, opts);
 }
 
-/** 项目忙集合：存在在飞节点（`working ∧ remote_task_id IS NOT NULL`）的 projectId（默认存储） */
+/** 项目忙集合：存在未落定节点（`working ∧ queue_state IN ('queued','claimed','running')`）的 projectId（默认存储） */
 export function listBusyProjectIds(): Set<string> {
   return getDefaultStore().listBusyProjectIds();
 }
@@ -2354,9 +2468,24 @@ export function requeueStaleTask(taskId: string, expectedClaimedBy?: string): bo
   return getDefaultStore().requeueStaleTask(taskId, expectedClaimedBy);
 }
 
+/** 列出墙钟超期的在飞队列任务（默认存储；v0.8.7 O2 孤儿清算读口） */
+export function listOrphanedTasks(claimedBefore: string): QueuedTaskRecord[] {
+  return getDefaultStore().listOrphanedTasks(claimedBefore);
+}
+
+/** 墙钟判死：claimed/running → failed + settled + `failure_kind='infra'`（默认存储；v0.8.7 O2；不清 claim 三字段，契约 3） */
+export function failOrphanedTask(taskId: string): boolean {
+  return getDefaultStore().failOrphanedTask(taskId);
+}
+
 /** 结果回传幂等落库（默认存储） */
 export function upsertTaskResult(rec: TaskResultUpsertInput): QueuedTaskRecord {
   return getDefaultStore().upsertTaskResult(rec);
+}
+
+/** 失败分类写口（默认存储；v0.8.7 O3；仅当行当前为 `failed` 才写入） */
+export function setTaskFailureKind(taskId: string, kind: FailureKind): boolean {
+  return getDefaultStore().setTaskFailureKind(taskId, kind);
 }
 
 /** 创建/覆盖 Feature 记录（默认存储） */

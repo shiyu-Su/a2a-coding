@@ -44,9 +44,12 @@
  * - **就绪过滤（同 project 排队）**：`computeReadyNodes(nodes, inFlightNodes, busyProjects)` ——
  *   `projectId ∈ busy ⇒ 不 ready`，且**同批顺序认领**（同批内同 project 至多取一个）；
  * - **项目忙集** = 每 tick 一次的 DB 快照（`store.listBusyProjectIds()`：`state='working' ∧
- *   remote_task_id IS NOT NULL`）∪ **进程内项目预留**（`reservedProjects`：与 `dispatching` /
- *   `inFlightNodes` 同段同步置位、批次 `finally` 同段释放）⇒ 同 tick 多 Feature 并发进入时
- *   项目竞争失败者本批跳过、下 tick 重算（`tick()` 对 Feature 不 await，此段是串行成立的**唯一**保证）；
+ *   queue_state IN ('queued','claimed','running')`，v0.8.7 REQ-01 O1 改活；旧口径
+ *   `remote_task_id IS NOT NULL` 在 pull 模型下**恒空**）∪ **进程内项目预留**（`reservedProjects`：
+ *   与 `dispatching` / `inFlightNodes` 同段同步置位、批次 `finally` 同段释放）⇒ 同 tick 多 Feature
+ *   并发进入时项目竞争失败者本批跳过、下 tick 重算；
+ * - **串行不变量的承载者**：DB 谓词（含 `queued`）+ 本进程预留，**与 machine 侧领取纪律无关**
+ *   （v0.8.7 前跨 tick 段实际无人守，见 `store.listBusyProjectIds` 注释）；
  * - **不变量 I-N（静止期禁 ensure）**：静止 / `needs_input` ⇒ 本 Feature **零派发** ⇒ 不调
  *   `dispatchTask` ⇒ **不触 `ensure`**；且静止 ⇒ 无 `working` 在飞 ⇒ 无看护 ⇒ **无 `renew`**
  *   （第二条 ensure 通道）。**不新增状态位 / 子态判据**：`ready.length === 0` 的 `return` 即落点，
@@ -500,9 +503,13 @@ export class FeatureScheduler {
   private readonly inFlightNodes = new Set<string>();
   /**
    * **项目忙快照**（v0.6.1 REQ-05 §2.5 / N5）：本 **tick** 开始时取一次
-   * `listBusyProjectIds()` = `state='working' ∧ remote_task_id IS NOT NULL` 的 projectId 集合。
-   * 每 tick 一次、tick 内稳定（读侧零抖动）；**只覆盖已落库的在飞** —— 「派发已发起但
-   * `remote_task_id` 尚未回填」的窗口由 {@link reservedProjects} 补，二者相并为完整忙集。
+   * `listBusyProjectIds()` = `state='working' ∧ queue_state IN ('queued','claimed','running')`
+   * 的 projectId 集合（v0.8.7 REQ-01 O1 改活：旧口径 `remote_task_id IS NOT NULL` 在 pull 模型下
+   * 无生产写入点 ⇒ **恒空**，串行门只剩下面的进程内预留）。每 tick 一次、tick 内稳定（读侧零抖动）。
+   * 含 `queued` 是刻意的 —— 「上一节点未落定 ⇒ 同项目后续不得先行」即**串行的定义本身**；
+   * 悬挂领取被 sweep 清算回 `queued` 后**仍在忙集**亦为正确行为（任务确实未落定）。
+   * **只覆盖已落库的忙** —— 「派发已发起但队列态尚未落库」的窗口由 {@link reservedProjects} 补，
+   * 二者相并为完整忙集。
    */
   private busyProjectIds: ReadonlySet<string> = new Set();
   /**
@@ -512,6 +519,11 @@ export class FeatureScheduler {
    * `tick()` 对每个 `executing` Feature 都是 `void advanceFeature(...)`（**不 await**）⇒ 同一 tick
    * 内多个 Feature 会先后进入 `advanceExecuting`；只有进程内预留能让「项目竞争失败者本批跳过、
    * 下 tick 重算」成立，否则同 project 双派、「同 project 串行」形同虚设（改造文档 §2.5 硬约束 1）。
+   *
+   * **职责收窄（v0.8.7 REQ-01 O1）**：DB 忙集谓词改活后，本集合**只守「同 tick 多 Feature 并发进入」
+   * 的内存瞬间**（派发已发起、`queue_state` 尚未落库那一段）；**跨 tick 的串行不再靠它**（此前由
+   * 恒空的 DB 快照 + 本集合共同宣称覆盖，实际本集合在批次 `finally` 即退场 ⇒ 跨 tick 无守护）。
+   * 保留不动的理由：覆盖上面的窗口、成本零。
    */
   private readonly reservedProjects = new Set<string>();
   /** tick 守卫：按 Feature 粒度，长派发不互相阻塞 */

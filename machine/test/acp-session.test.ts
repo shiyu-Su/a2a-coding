@@ -4,13 +4,26 @@
  * 判据：new 成功 / resume 失败回退 new / update 流式拼接 / 超时 → failed / 后端中途退出 → failed。
  * fake 客户端经构造注入。
  *
+ * **v0.8.7 · M4** 追加：三处失败出口各带 `machine-diagnostics` artifact（字段齐全 + 取值口径）·
+ * `chunkCount` = 本轮实测 `agent_message_chunk` 数（thought / 窗外不计、不跨轮泄漏）·
+ * 正常完成路径不带 diagnostics · 与 launcher 摘除侧的字面量 / 解析契约。
+ *
  * 运行：`npm test`。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { readFileSync } from "node:fs";
 import { AcpError } from "../acp-bridge/acp/client.js";
-import { AcpSessionRunner, type AcpRequestClient } from "../acp-bridge/acp/session.js";
+import {
+  AcpSessionRunner,
+  DIAGNOSTICS_ARTIFACT_NAME,
+  type AcpRequestClient,
+} from "../acp-bridge/acp/session.js";
+import type { TaskExecutionResult } from "../acp-bridge/types.js";
+import {
+  DIAGNOSTICS_ARTIFACT_NAME as LAUNCHER_DIAGNOSTICS_ARTIFACT_NAME,
+  splitDiagnosticsArtifact,
+} from "../launcher/runner-exec.js";
 import { SessionMap, type SessionMapFs } from "../acp-bridge/session-map.js";
 import { A2A_OUTCOME_CONVENTION } from "../acp-bridge/outcome.js";
 
@@ -803,5 +816,222 @@ test("M4 翻向（v0.8.5 · M1）：会话内 set_config_option 的 configId 字
   for (const forbidden of ["effort", "reasoning_effort"]) {
     assert.ok(!src.includes(`configId: "${forbidden}`), `不得出现 configId=${forbidden}`);
   }
+});
+
+// ---------- REQ-v0.8.7-2026-09-22-01 · M4：桥侧诊断计量产出（machine-diagnostics artifact） ----------
+
+/** 结果里的 `machine-diagnostics` 载荷（无该 artifact ⇒ `null`）；顺带校验 v0.3 artifact 形状。 */
+function diagOf(result: TaskExecutionResult): Record<string, unknown> | null {
+  const artifacts = result.artifacts ?? [];
+  const marked = artifacts.filter((a) => a.name === DIAGNOSTICS_ARTIFACT_NAME);
+  assert.ok(marked.length <= 1, `diagnostics artifact 至多一条（实得 ${String(marked.length)}）`);
+  const artifact = marked[0];
+  if (artifact === undefined) return null;
+  assert.equal(typeof artifact.artifactId, "string", "artifact 须带 artifactId（v0.3 形状）");
+  assert.equal(artifact.parts.length, 1);
+  assert.equal(artifact.parts[0]?.kind, "text");
+  return JSON.parse(artifact.parts[0]?.text ?? "") as Record<string, unknown>;
+}
+
+/**
+ * 失败出口诊断的公共口径：四字段齐全（`elapsedMs` 随真实时钟浮动，只断言类型与非负），
+ * 返回其余三要素供逐字断言。
+ */
+function diagCore(diag: Record<string, unknown> | null): Record<string, unknown> {
+  assert.ok(diag !== null, "失败出口必须带 machine-diagnostics artifact");
+  assert.deepEqual(
+    Object.keys(diag).sort(),
+    ["acpErrorKind", "chunkCount", "elapsedMs", "stage"],
+    "四字段齐全",
+  );
+  assert.equal(typeof diag["elapsedMs"], "number");
+  assert.ok((diag["elapsedMs"] as number) >= 0);
+  return {
+    acpErrorKind: diag["acpErrorKind"],
+    stage: diag["stage"],
+    chunkCount: diag["chunkCount"],
+  };
+}
+
+test("M4 ① 会话建立失败 ⇒ diagnostics（stage=ensure · kind=AcpError.kind · 未进 prompt ⇒ elapsedMs/chunkCount=0）", async () => {
+  const client = new FakeClient();
+  client.responder = (method) => {
+    if (method === "session/new") throw new AcpError("spawn", "backend spawn failed");
+    return { stopReason: "end_turn" };
+  };
+
+  const result = await runner(client).execute(INPUT);
+
+  assert.equal(result.state, "failed");
+  assert.equal(result.text, "会话建立失败：backend spawn failed");
+  assert.deepEqual(diagCore(diagOf(result)), {
+    acpErrorKind: "spawn",
+    stage: "ensure",
+    chunkCount: 0,
+  });
+  assert.equal(diagOf(result)?.["elapsedMs"], 0, "① 未进入 prompt 段 ⇒ prompt 段耗时恒 0");
+  assert.ok(!client.calls.some((c) => c.method === "session/prompt"), "建立失败不得继续 prompt");
+});
+
+test("M4 ① 非结构化抛出（裸 Error，如 model fail-fast）⇒ acpErrorKind 归 error（不编造 ACP 类别）", async () => {
+  const client = new FakeClient();
+  client.responder = (method) => {
+    if (method === "session/new") throw new Error("model=provider/bad 设置失败");
+    return { stopReason: "end_turn" };
+  };
+
+  const result = await runner(client).execute(INPUT);
+
+  assert.equal(result.state, "failed");
+  assert.deepEqual(diagCore(diagOf(result)), { acpErrorKind: "error", stage: "ensure", chunkCount: 0 });
+});
+
+test("M4 ② prompt 失败 ⇒ diagnostics（stage=prompt · kind=closed）· 诊断不进结果文本", async () => {
+  const client = new FakeClient();
+  client.responder = (method) =>
+    method === "session/new"
+      ? { sessionId: "s1" }
+      : Promise.reject(new AcpError("closed", "backend exited"));
+
+  const result = await runner(client).execute(INPUT);
+
+  assert.equal(result.state, "failed");
+  assert.equal(result.text, "backend exited", "结果文本与现状逐字一致（诊断另轨 artifact）");
+  assert.ok(!(result.text ?? "").includes(DIAGNOSTICS_ARTIFACT_NAME), "结果文本不得含 artifact 名");
+  assert.deepEqual(diagCore(diagOf(result)), { acpErrorKind: "closed", stage: "prompt", chunkCount: 0 });
+});
+
+test("M4 ③ prompt 超时 ⇒ diagnostics（kind=timeout · elapsedMs 落在超时窗量级）", async () => {
+  const client = new FakeClient();
+  client.responder = (method) =>
+    method === "session/new" ? { sessionId: "s1" } : new Promise<never>(() => undefined);
+
+  const result = await runner(client, 50).execute(INPUT);
+
+  assert.equal(result.state, "failed");
+  assert.match(result.text ?? "", /任务超时/);
+  const diag = diagOf(result);
+  assert.deepEqual(diagCore(diag), { acpErrorKind: "timeout", stage: "prompt", chunkCount: 0 });
+  const elapsedMs = diag?.["elapsedMs"] as number;
+  assert.ok(
+    elapsedMs >= 40 && elapsedMs < 5_000,
+    `超时出口的 prompt 段 elapsedMs 须≈超时窗（实得 ${String(elapsedMs)}）`,
+  );
+});
+
+test("M4 chunkCount = 本轮已收 agent_message_chunk 数（thought chunk 不计）", async () => {
+  const client = new FakeClient();
+  client.responder = (method) => {
+    if (method === "session/new") return { sessionId: "s1" };
+    const emit = (sessionUpdate: string): void =>
+      client.emit("session/update", {
+        sessionId: "s1",
+        update: { sessionUpdate, content: { type: "text", text: "x" } },
+      });
+    emit("agent_thought_chunk");
+    emit("agent_message_chunk");
+    emit("agent_thought_chunk");
+    emit("agent_message_chunk");
+    emit("agent_message_chunk");
+    return Promise.reject(new AcpError("rpc", "prompt rejected"));
+  };
+
+  const result = await runner(client).execute(INPUT);
+
+  assert.deepEqual(diagCore(diagOf(result)), { acpErrorKind: "rpc", stage: "prompt", chunkCount: 3 });
+});
+
+test("M4 chunkCount 不跨轮泄漏：上一轮 completed 收窗后，本轮失败只计本轮 chunk", async () => {
+  const client = new FakeClient();
+  let failPrompt = false;
+  client.responder = (method) => {
+    if (method === "session/new") return { sessionId: "s1" };
+    const emitCount = failPrompt ? 1 : 5;
+    for (let i = 0; i < emitCount; i += 1) {
+      client.emit("session/update", {
+        sessionId: "s1",
+        update: {
+          sessionUpdate: "agent_message_chunk",
+          content: { type: "text", text: `c${String(i)}` },
+        },
+      });
+    }
+    if (failPrompt) return Promise.reject(new AcpError("rpc", "second turn failed"));
+    return { stopReason: "end_turn" };
+  };
+  const r = runner(client);
+
+  const turn1 = await r.execute(INPUT);
+  assert.equal(turn1.state, "completed");
+  assert.equal(turn1.artifacts, undefined, "正常完成路径不带 diagnostics");
+
+  failPrompt = true;
+  const turn2 = await r.execute({ ...INPUT, taskId: "t2", text: "again", messageId: "m2" });
+  assert.deepEqual(diagCore(diagOf(turn2)), { acpErrorKind: "rpc", stage: "prompt", chunkCount: 1 });
+});
+
+test("M4 正常终态不带 diagnostics：completed / canceled / input-required 三路 artifacts 均缺省", async () => {
+  const shapes: Array<[string, (client: FakeClient) => void]> = [
+    [
+      "completed",
+      (client) => {
+        client.responder = (method) =>
+          method === "session/new" ? { sessionId: "s1" } : { stopReason: "end_turn" };
+      },
+    ],
+    [
+      "canceled",
+      (client) => {
+        client.responder = (method) =>
+          method === "session/new" ? { sessionId: "s1" } : { stopReason: "cancelled" };
+      },
+    ],
+    [
+      "input-required",
+      (client) => {
+        client.responder = (method) => {
+          if (method === "session/new") return { sessionId: "s1" };
+          client.emit("session/update", {
+            sessionId: "s1",
+            update: {
+              sessionUpdate: "agent_message_chunk",
+              content: {
+                type: "text",
+                text: '要先确认环境。\n\n```a2a-outcome\n{"state":"input-required","question":"要先确认环境？"}\n```',
+              },
+            },
+          });
+          return { stopReason: "end_turn" };
+        };
+      },
+    ],
+  ];
+  for (const [name, setup] of shapes) {
+    const client = new FakeClient();
+    setup(client);
+    const result = await runner(client).execute({ ...INPUT, taskId: `t-${name}` });
+    assert.notEqual(result.state, "failed", `「${name}」场景不得误判为失败`);
+    assert.equal(result.artifacts, undefined, `「${name}」不得带 diagnostics（不得编造空数组）`);
+    assert.equal(diagOf(result), null, `「${name}」不得带 diagnostics`);
+  }
+});
+
+test("M4 契约：桥与 launcher 的 artifact 名字面量一致", () => {
+  assert.equal(DIAGNOSTICS_ARTIFACT_NAME, "machine-diagnostics");
+  assert.equal(DIAGNOSTICS_ARTIFACT_NAME, LAUNCHER_DIAGNOSTICS_ARTIFACT_NAME);
+});
+
+test("M4 契约：桥产出的 diagnostics 可被 launcher 摘除侧解出（elapsedMs / stage 作留痕宽容忽略）", async () => {
+  const client = new FakeClient();
+  client.responder = (method) =>
+    method === "session/new"
+      ? { sessionId: "s1" }
+      : Promise.reject(new AcpError("timeout", "prompt timed out"));
+
+  const result = await runner(client).execute(INPUT);
+  const split = splitDiagnosticsArtifact(result.artifacts ?? []);
+
+  assert.deepEqual(split.diagnostics, { acpErrorKind: "timeout", chunkCount: 0 });
+  assert.deepEqual(split.artifacts, [], "摘除后不剩余 ⇒ 无从混进 resultText");
 });
 

@@ -35,7 +35,11 @@ import {
   type RunnerOutbox,
 } from "./runner-exec.js";
 import { RunnerStateWriter } from "./runner-state.js";
-import type { SelfCheckFailure, SelfCheckResult } from "./self-check.js";
+import {
+  SELF_CHECK_LEDGER_PREFIX,
+  type SelfCheckFailure,
+  type SelfCheckResult,
+} from "./self-check.js";
 
 /** 长轮询客户端超时：服务端 hold ~25s，客户端 30s 兜底 */
 export const RUNNER_CONNECT_TIMEOUT_MS = 30_000;
@@ -157,20 +161,47 @@ export interface InFlightEntry {
   a2aTaskId?: string | null;
 }
 
+/** 台账可选依赖（v0.8.7 M5 在飞落盘） */
+export interface InFlightLedgerOptions {
+  /**
+   * 落盘回调注入：**无 writer 时零 IO**（缺省 = 纯内存，现状行为）。
+   * `add` 携条目回调 `(entry, taskId)`；`remove` 成功删除后回调 `(null, taskId)` 供清盘。
+   * 自检条目（`SELF_CHECK_LEDGER_PREFIX` 前缀）**一律不进回调** —— 自检经同一
+   * `manager.inFlight` 登记，若被持久化会在重启后被当孤儿上报 `failed`（假故障）。
+   */
+  persist?: (entry: InFlightEntry | null, taskId: string) => void;
+}
+
 /**
  * 在飞任务台账（内存 `Map<taskId, InFlightEntry>`）。
  * Phase A 提供数据结构与增删查；Phase B 起作为命令执行的计/清事实源
  * （`stop` 判据 = `size === 0`；`cancel-task` 经 `projectOf` / `get` 定位）。
+ * v0.8.7 M5 起可选落盘（见 {@link InFlightLedgerOptions.persist}）。
  */
 export class InFlightLedger {
   private readonly entries = new Map<string, InFlightEntry>();
+  private readonly persist: ((entry: InFlightEntry | null, taskId: string) => void) | undefined;
+
+  constructor(options: InFlightLedgerOptions = {}) {
+    this.persist = options.persist;
+  }
 
   add(entry: InFlightEntry): void {
     this.entries.set(entry.taskId, entry);
+    this.notifyPersist(entry, entry.taskId);
   }
 
   remove(taskId: string): boolean {
-    return this.entries.delete(taskId);
+    const deleted = this.entries.delete(taskId);
+    if (deleted) this.notifyPersist(null, taskId);
+    return deleted;
+  }
+
+  /** 落盘通知：writer 缺失或自检前缀 ⇒ 零 IO（自检条目永不落盘） */
+  private notifyPersist(entry: InFlightEntry | null, taskId: string): void {
+    if (this.persist === undefined) return;
+    if (taskId.startsWith(SELF_CHECK_LEDGER_PREFIX)) return;
+    this.persist(entry, taskId);
   }
 
   has(taskId: string): boolean {
@@ -290,7 +321,10 @@ export interface RunnerDeps {
    * 缺省 = 仅记日志的 stub。其 `start?()` / `stop?()` 随 Runner 生命周期调用。
    */
   outbox?: RunnerOutbox;
-  /** 单任务派发等待上限；缺省 {@link DEFAULT_DISPATCH_TIMEOUT_MS} */
+  /**
+   * 单任务派发等待预算的**显式覆盖**（缺省不给 ⇒ 按项目 `agentConfig.sessionTimeoutMs`
+   * 派生，见 `runner-exec.ts` 的 `dispatchBudgetMs` / `DEFAULT_DISPATCH_TIMEOUT_MS`，v0.8.7 · M3）。
+   */
   dispatchTimeoutMs?: number;
   /**
    * runner-state 落盘路径（`<machine 根>/.a2a/runner-state.json`，M6·MC2）。

@@ -33,6 +33,16 @@ Launcher 的**入站指挥端点已于 v2.0 退役**（连接模型反转为 pul
 
 **运行态落盘**：`.a2a/runner-state.json`（原子写；`scripts/reaper.mjs` 判活 Runner 的事实源）。新鲜度窗口 `N = max(2 × 30s, 90s) = 90s`（时钟回拨视为新鲜）；子进程账本 `.a2a/children/<pid>.json` 不变。
 
+## 传输层有界重发与启动补结算（v0.8.7）
+
+**① 传输层有界重发（首发早夭自愈，`launcher/runner-exec.ts`）**：dispatch 在**拿到终态之后**（`deliver` 之前）判定 —— `failureKind === "infra"` ∧ `diagnostics.acpErrorKind ∈ {spawn, closed}` ∧ `chunkCount === 0` ⇒ **`host.stop(projectId)` → 重新 `ensure` → 重新 `send`**，**每节点最多 1 次**（`MAX_TRANSPORT_ATTEMPTS = 1`）。另保留唯一窄场景的内部重投 = **send 相位连接级失败**（此时连终态都拿不到：`entry.a2aTaskId === null` + ECONNREFUSED / ECONNRESET / 桥进程已死）。**两形态由「是否拿到终态」互斥划分、共用同一计数 ⇒ 不会双触发**。**禁止重发**的相位 = **poll 相位**（只能续轮询，`tasks/get` 只读幂等）与**超时 / abort**（请求**可能已送达并在执行**）。硬闸 = 剩余预算 ≥ 60s（`RESEND_MIN_REMAINING_MS`）且不越该次 dispatch 的 `deadline`。留痕 = 日志 + `diagnostics.attempts`（**不落库** —— `retry_count` 是 Feature rearm 语义，不混用）。桥侧**零改动且不可见**：同 taskId、单次终态回传、**不产生第二次账单**。
+
+**⚠ 本版不自愈的一类**：**「后端接了活、一个字不吐直到满窗」** —— 超时路径**从不发 `session/cancel`** ⇒ 桥返回 failed 时后端那一轮**仍在跑**，同 `contextId` 重跑会与新桥的 `load` / `resume` 交织，不安全 ⇒ 只能靠 `sessionTimeoutMs` **加窗跑完**，或等**桥侧墙钟判死后由宿主重派**。
+
+**② 启动补结算（`launcher/reconcile-inflight.ts`）**：在飞任务在领取后**落盘** `.a2a/inflight/<taskId>.json`（原子写；**无 writer 注入时零 IO**）。冷启动时按「inflight 台账 **减去**子女账本中**在册且存活**的 pid 所属项目」判孤儿：仍有执行体者**跳过**（宁漏勿误杀）；自检条目（`SELF_CHECK_LEDGER_PREFIX`）一律排除（否则重启后自检条目会被当孤儿上报 = 假故障）；其余造 `state='failed'` **新结果**经 `outbox.deliver()` 上报（原因走 `text`，**不落 claimToken** —— 凭证随进程消亡是物理事实，桥侧补结算窄口允许「无令牌 + failed」，由**行级绑定**兜安全），成功后删除已消费的 inflight 条目。**调用时机 = `onListening` 内、`reconcileStartupLedger` 之后、register 成功之后**（口径：桥侧 `/runner/result` **无**「注册表存在性」检查 ⇒ register 顺序非硬要求）。**该路径不违反「boot 不补发」** —— 那条是**不回放既有 outbox 文件**，此处是造新结果。**失败只告警、绝不抛出、绝不阻断启动**（deliver 失败的条目保留文件，下次启动重试）。
+
+**两条路的分工（与 orch 墙钟的显式冗余）**：machine 管「**本机知道自己死过**」（冷启动那一刻的一次性事实，秒级结账）；orch 墙钟管「**看不到事实时的最终兜底**」（掉电 / 僵死 / 断网 / 机器还在跑但结果永不来，30 min）。竞争安全由桥侧 `(machineId, taskId)` upsert 幂等 + **首个终态胜出** CAS 保证。
+
 ## 服务启停
 
 ```bash
@@ -169,7 +179,9 @@ risk 恒经 `permission(risk)` **单一出口**下发（桥对 kind 无知、只
 ### 键位口径与自定义注入
 
 - **`agentConfig.<kind>` 段与配置通道整体退役**（v0.8.5）：`--config-file` / `--config-segment` / `writeAgentConfig` / `agents/` 产物全部退役 ⇒ 段内键（wrapper 族契约键、ACP 族段内 `model` 等）**不再被任何人消费**，写了无效、也不再告警。
-- 键位口径 = **自消费键顶层平铺**：`backendCmd`（**可选覆盖**，缺省走四层自动解析，见「后端命令」）· `model` · `systemPrompt` / `systemPromptMode`（自定义注入 ⇒ 桥 `--system-prompt` / `--system-prompt-mode`，缺省 `append`）。
+- 键位口径 = **自消费键顶层平铺**：`backendCmd`（**可选覆盖**，缺省走四层自动解析，见「后端命令」）· `model` · `systemPrompt` / `systemPromptMode`（自定义注入 ⇒ 桥 `--system-prompt` / `--system-prompt-mode`，缺省 `append`）· `sessionTimeoutMs`（v0.8.7 · 桥会话窗 ⇒ `--session-timeout <ms>`，缺省不写 = 桥落自身缺省值）。
+- **`sessionTimeoutMs` 上限护栏（v0.8.7 · M2）**：合法值 = 正整数且 **≤ 900000（15 min）**，超限 / 非法 ⇒ `loadMachineConfig` 加载期 fail-fast。上限的**单一源** = `launcher/agent-config.ts` 的 `SESSION_TIMEOUT_MS_CAP`（桥是零仓内依赖的叶模块，只宽松校验「整数 > 0」，不重复定义上限）；与 launcher dispatch deadline 是**成对常量**（恒须 `dispatch = session + margin`），且**无机器级全局 flag**（一个慢项目不应拉长全部项目的台账寿命）。
+- **launcher 侧派生（v0.8.7 · M3）**：Runner `dispatch` 的等待预算**按项目**取，纯函数 `dispatchBudgetMs(sessionTimeoutMs) = sessionTimeoutMs + DISPATCH_MARGIN_MS(300s)` ⇒ 桥窗一改，deadline 同值派生（不存在「只配桥侧、launcher 仍按 660s 掐断」的静默无效）；**未配** ⇒ `DEFAULT_DISPATCH_TIMEOUT_MS = 660_000`（行为同 v0.8.6）。结果附**机器可读字段**：`failureKind`（`infra` / `task`，由 launcher 的 `classifyFailure` 判定，映射与判据归 orch）+ `diagnostics`（桥内细分经现成 `artifacts` 通道上带 `name="machine-diagnostics"`，launcher `buildResult` **先摘除再取文本**后填入，剩余 artifacts 原样回传 ⇒ 不污染 resultText）。
 - **「保留」≠ 提供读点**：命名空间保留键清单见 `agent-kinds.ts` 的 `RESERVED_AGENT_CONFIG_FLAT_KEYS`。
 - **outcome 约定注入的唯一落点 = ACP 桥缺省**（单一源 `agent-outcome.ts`），不随项目配置覆盖。
 - **opencode serve 前置后端（sidecar）已随迁 ACP 退役**：桥直接 spawn 后端，无独立后端进程、无端口预分配。

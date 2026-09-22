@@ -8,7 +8,7 @@
  *      `EADDRINUSE` → 打印「已在运行」并 `exit(1)`，**不再进入自检**（根除双实例 a2a 撞车）。
  *   2. `'listening'` 后写 pidfile（`<machine 根>/.a2a/launcher.pid`）→ 清理过期包装器配置
  *      → **启动对账清理**（清上次硬杀留下的无主孤儿，防其占住 a2aPort 令自检 EADDRINUSE）
- *      → 启动自检。
+ *      → **启动补结算**（v0.8.7 M6：无执行体的在飞任务上报 failed）→ 启动自检。
  *   3. 就绪门：自检通过前 `GET /health` 报 `status:"starting"`；通过后 `status:"ok"`
  *      （入站业务路由已退役，就绪态仅由 `/health` 的 `status` 字段表达）。
  *   4. 自检**粒度按可否服务**（§2.4-⑤ 改判 · REQ-v0.8.6-2026-09-21-02 收口）：单项目失败
@@ -24,9 +24,10 @@ import { pruneStaleAgentConfigs } from "./agents-prune.js";
 import { appRootFromModule } from "./app-root.js";
 import { AgentManager, DEFAULT_IDLE_STOP_MS } from "./manager.js";
 import { errorMessage } from "./process.js";
+import { reconcileInflightOnStartup } from "./reconcile-inflight.js";
 import { reconcileStartupLedger } from "./reconcile.js";
 import { InFlightLedger, createRunner, type Runner } from "./runner.js";
-import { createFileOutbox, outboxDirOf } from "./runner-outbox.js";
+import { atomicWriteJson, createFileOutbox, outboxDirOf, type FileOutbox } from "./runner-outbox.js";
 import { RUNNER_STATE_FILENAME } from "./runner-state.js";
 import { runStartupSelfCheck, type SelfCheckResult } from "./self-check.js";
 import { createLauncherApp } from "./server.js";
@@ -36,15 +37,33 @@ const DEFAULT_MACHINE_CONFIG = join(appRootFromModule(import.meta.url), "config"
 
 const configPath = process.env["MACHINE_CONFIG"] ?? DEFAULT_MACHINE_CONFIG;
 const machine = loadMachineConfig(configPath);
+
+const appRoot = appRootFromModule(import.meta.url);
+/** 在飞台账落盘目录（v0.8.7 M5）：`.a2a/inflight/<taskId>.json`，补结算孤儿识别的数据源 */
+const INFLIGHT_DIR = join(appRoot, ".a2a", "inflight");
+
 /**
  * 本机在飞任务台账（v0.7.0 M5·MC1）：**单一实例**，同时注入 AgentManager（idleStop 判据
  * 数据源 + 自检登记口）与 Runner（命令族 dispatch 登记）。自检早于 Runner 启动，故台账须在
  * manager 之前创建。
+ * v0.8.7 M5：注入落盘 writer（原子写/清盘，best-effort —— 落盘失败不炸派发）；
+ * 自检条目（`self-check:` 前缀）由台账自身排除，永不落盘。
  */
-const inFlight = new InFlightLedger();
+const inFlight = new InFlightLedger({
+  persist: (entry, taskId) => {
+    const path = join(INFLIGHT_DIR, `${taskId}.json`);
+    try {
+      if (entry !== null) atomicWriteJson(path, entry);
+      else rmSync(path, { force: true });
+    } catch (err) {
+      console.error(
+        `[launcher] 在飞台账落盘失败（不影响运行）：taskId=${taskId} ${errorMessage(err)}`,
+      );
+    }
+  },
+});
 const manager = new AgentManager(machine, { inFlight });
 
-const appRoot = appRootFromModule(import.meta.url);
 /** 实例元数据（非锁）：供 REQ-01 status/stop 读取 pid */
 const PIDFILE_PATH = join(appRoot, ".a2a", "launcher.pid");
 
@@ -207,6 +226,26 @@ async function onListening(): Promise<void> {
     console.error(`[launcher] 启动对账清理异常（不阻断启动）：${errorMessage(err)}`);
   }
 
+  // 启动补结算（v0.8.7 · M6，台账链第二段）：上一进程遗留在 `.a2a/inflight/` 的在飞任务
+  // 若本机已无执行体（子女账本无该项目存活 pid）⇒ 造 state=failed 新结果入 outbox 结账
+  // （复用落盘 / Bearer / 退避 / ack，不违反「boot 不补发」—— 那条是不回放既有 outbox 文件）。
+  // 时序：必须在 `reconcileStartupLedger` 之后（对账刚更新子女账本）、自检 ensure 之前
+  // （自检新拉起的子进程会掩盖孤儿）。outbox 提前创建为单一实例，稍后随 Runner 启动投递循环
+  // （orch 已核：`/runner/result` 不检查注册表 ⇒ 上报不必挂 register 之后）。
+  let outbox: FileOutbox | null = null;
+  if (machine.launcher.bridge !== undefined) {
+    outbox = createFileOutbox({ dir: outboxDirOf(appRoot), bridge: machine.launcher.bridge });
+    try {
+      await reconcileInflightOnStartup({
+        inflightDir: INFLIGHT_DIR,
+        machineId: machine.machineId,
+        outbox,
+      });
+    } catch (err) {
+      console.error(`[launcher] 启动补结算异常（不阻断启动）：${errorMessage(err)}`);
+    }
+  }
+
   // 启动自检（缺省开）：端口已监听（互斥锁已生效）。
   // **粒度口径（§2.4-⑤ 改判 · REQ-v0.8.6-2026-09-21-02 收口）**：单项目失败一律项目级——
   // 逐项登记不可用、继续服务其余项目；`process.exit(1)` 只保留给**机器级故障 = 全部项目不可用**
@@ -259,18 +298,19 @@ async function onListening(): Promise<void> {
 
   // Runner 出站（v0.7.0 Phase A 影子注册 · 节点 MA1）：仅在自检通过后启动，
   // 保证注册载荷携带真实自检结论。`launcher.bridge` 缺省 = 不启动（零出站，现状行为）。
-  if (machine.launcher.bridge !== undefined) {
+  // M3·MB1：注入本机 AgentManager 作为命令执行宿主（ensure/stop/getProject），
+  // 命令族三类（dispatch/stop/cancel-task）由 Runner 出站循环落地。
+  // M4·MB2：注入文件 outbox（`.a2a/outbox/<taskId>.json` → POST /runner/result → ack 删）；
+  // M6（v0.8.7）：outbox 在补结算处提前创建（同一实例），投递循环随本 Runner 启停。
+  // M6·MC2：注入 runner-state 落盘路径（reaper 判活 Runner 的数据源）。
+  if (machine.launcher.bridge !== undefined && outbox !== null) {
     const bridge = machine.launcher.bridge;
-    // M3·MB1：注入本机 AgentManager 作为命令执行宿主（ensure/stop/getProject），
-    // 命令族三类（dispatch/stop/cancel-task）由 Runner 出站循环落地。
-    // M4·MB2：注入文件 outbox（`.a2a/outbox/<taskId>.json` → POST /runner/result → ack 删）。
-    // M6·MC2：注入 runner-state 落盘路径（reaper 判活 Runner 的数据源）。
     runner = createRunner(machine, selfCheck, {
       manager,
       // M5·MC1：与 manager 共享同一在飞台账（idleStop 判据可见 dispatch 的在飞任务）
       ledger: inFlight,
       runnerStatePath: join(appRoot, ".a2a", RUNNER_STATE_FILENAME),
-      outbox: createFileOutbox({ dir: outboxDirOf(appRoot), bridge }),
+      outbox,
     });
     if (runner !== null) {
       console.log(`[launcher] Runner 出站已启动：url=${bridge.url}`);

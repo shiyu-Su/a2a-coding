@@ -24,8 +24,10 @@
  * - **需求行** = `title`（主标识，**不以 UUID 作主标识**；UUID 仅作次要锚点，8 位前缀 + 悬浮全量）
  *   + **中文状态** + **进度**（展开后 `已完成/总数`，展开前 `—/taskCount` 占位）。
  * - **展开**（点需求行）= **懒加载** `GET /api/features/:featureId`，就地渲染其 **Task 行**：
- *   `projectId` / 中文状态 / `createdAt → finishedAt`（缺失显示「未知」）/ 耗时（`finished − started`，
- *   缺失显示「—」）/ prompt 摘要（截断）。
+ *   `projectId` / 中文状态 / `createdAt → startedAt → finishedAt`（缺失显示「未知」，
+ *   `startedAt` 未领取时合法为空 ⇒ 显示「—」）/ **排队**（`createdAt → startedAt`）/
+ *   **执行**（`startedAt → finishedAt`）—— 两段时长任一时刻缺失显示「—」，不按 0 计 /
+ *   prompt 摘要（截断）。
  *   **首屏只发 1 次 `GET /api/features`** —— 绝不为首屏发起 N 次详情请求；展开态与详情缓存
  *   **跨自动刷新保留**（否则每 15s 会被折叠一次）。
  * - **已移除**：手输 `projectId` 输入框 + 「查询任务」按钮（`GET /api/tasks` 路由**保留不变**，
@@ -209,6 +211,8 @@ export function renderIndexHtml(params: WebPageParams): string {
   function when(iso) { return iso ? new Date(iso).toLocaleString() : "-"; }
   /* 需求/任务时刻：缺值显示「未知」（与项目表沿用同一展示格式，不新增时区逻辑） */
   function stamp(iso) { return iso ? new Date(iso).toLocaleString() : "未知"; }
+  /* startedAt 缺值用「—」而非「未知」：已入队未领取的任务该列合法为 NULL */
+  function startedStamp(iso) { return iso ? new Date(iso).toLocaleString() : "—"; }
   function emptyRow(cols, text) { return '<tr><td colspan="' + cols + '" class="empty">' + text + "</td></tr>"; }
   function setNote(id, text) { q(id).textContent = text; }
   function setRows(id, html) { q(id).innerHTML = html; }
@@ -230,7 +234,8 @@ export function renderIndexHtml(params: WebPageParams): string {
     return Object.prototype.hasOwnProperty.call(map, key) ? map[key] : key;
   }
   function shortId(id) { return (typeof id === "string" && id.length > 8) ? id.slice(0, 8) : id; }
-  /* 耗时 = finished - started；任一缺失 / 非法 / 为负 ⇒ "—" */
+  /* 时长 = end - start（排队 = createdAt→startedAt / 执行 = startedAt→finishedAt）；
+     任一端缺失 / 非法 / 为负 ⇒ "—"（缺 startedAt 不得算成 0） */
   function duration(startedAt, finishedAt) {
     if (!startedAt || !finishedAt) return "—";
     var s = new Date(startedAt).getTime();
@@ -261,11 +266,12 @@ export function renderIndexHtml(params: WebPageParams): string {
   }
   function taskTable(tasks) {
     if (!tasks || tasks.length === 0) return '<p class="hint">（无任务）</p>';
-    return '<table class="sub"><thead><tr><th>projectId</th><th>状态</th><th>createdAt → finishedAt</th><th>耗时</th><th>prompt 摘要</th></tr></thead><tbody>' +
+    return '<table class="sub"><thead><tr><th>projectId</th><th>状态</th><th>createdAt → startedAt → finishedAt</th><th>排队</th><th>执行</th><th>prompt 摘要</th></tr></thead><tbody>' +
       tasks.map(function (t) {
         return "<tr><td>" + esc(t.projectId) +
           "</td><td>" + esc(label(TASK_STATE_LABELS, t.state)) +
-          "</td><td>" + esc(stamp(t.createdAt)) + " → " + esc(stamp(t.finishedAt)) +
+          "</td><td>" + esc(stamp(t.createdAt)) + " → " + esc(startedStamp(t.startedAt)) + " → " + esc(stamp(t.finishedAt)) +
+          "</td><td>" + esc(duration(t.createdAt, t.startedAt)) +
           "</td><td>" + esc(duration(t.startedAt, t.finishedAt)) +
           "</td><td>" + esc(truncate(t.prompt, 80)) + "</td></tr>";
       }).join("") + "</tbody></table>";

@@ -78,8 +78,9 @@ function trimTrailingSlash(url: string): string {
   return url.endsWith("/") ? url.slice(0, -1) : url;
 }
 
-/** 原子写 JSON：写同目录临时文件 → `rename` 覆盖（读者永不见半截 JSON），失败即抛出 */
-function atomicWriteJson(path: string, value: unknown): void {
+/** 原子写 JSON：写同目录临时文件 → `rename` 覆盖（读者永不见半截 JSON），失败即抛出。
+ * 导出口（v0.8.7 M5）：in-flight 台账落盘复用同一原子写语义。 */
+export function atomicWriteJson(path: string, value: unknown): void {
   const tmpPath = `${path}.tmp-${String(process.pid)}-${Date.now().toString(36)}`;
   try {
     mkdirSync(dirname(path), { recursive: true });

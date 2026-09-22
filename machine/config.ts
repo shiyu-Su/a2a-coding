@@ -1,5 +1,6 @@
 import { readFileSync } from "node:fs";
 import { AGENT_KINDS } from "./agent-kinds.js";
+import { SESSION_TIMEOUT_MS_CAP } from "./launcher/agent-config.js";
 import type { AgentKind, BridgeConfig, MachineConfig, ProjectConfig, RiskLevel } from "./types.js";
 
 function fail(msg: string): never {
@@ -76,6 +77,21 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
   if (agentConfig !== undefined) {
     // 包装器配置片段：必须是普通对象（非 null / 非数组）
     project.agentConfig = asRecord(agentConfig, `projects[${idx}].agentConfig`);
+    const sessionTimeoutMs = project.agentConfig["sessionTimeoutMs"];
+    if (sessionTimeoutMs !== undefined) {
+      // v0.8.7 · M2：session 超时上限护栏（加载期 fail-fast，单一源 = agent-config 的 CAP 常量）。
+      // 超限/非法若不在此拦截，会一路透传到桥 flag，拉长该项目台账寿命且与 dispatch deadline 脱钩。
+      if (
+        typeof sessionTimeoutMs !== "number" ||
+        !Number.isInteger(sessionTimeoutMs) ||
+        sessionTimeoutMs <= 0 ||
+        sessionTimeoutMs > SESSION_TIMEOUT_MS_CAP
+      ) {
+        fail(
+          `projects[${idx}].agentConfig.sessionTimeoutMs 必须是 1-${SESSION_TIMEOUT_MS_CAP} 的整数（毫秒，上限 15 min）`,
+        );
+      }
+    }
   }
   const risk = o["risk"];
   if (risk !== undefined) {

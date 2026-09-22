@@ -592,7 +592,8 @@ function isFinishedState(state: TaskState): boolean {
 test("v0.5.0 三时刻列：created_at 首次为准、started_at 仅 NULL 才填、finished_at 仅三终态写", () => {
   const store = newStore();
   try {
-    // ① createTask(working)：created_at / started_at 落库，finished_at 为 NULL
+    // ① createTask(working)：created_at 落库、finished_at 为 NULL；
+    //    started_at **登记一律不填**（v0.8.7 O3 摘除旧的 `working` 预填 ⇒ 开工 = 首次领取）
     const created = store.createTask({
       taskId: "t-moments",
       projectId: "p1",
@@ -601,10 +602,19 @@ test("v0.5.0 三时刻列：created_at 首次为准、started_at 仅 NULL 才填
     });
     assert.equal(typeof created.createdAt, "string", "working 登记应写 created_at");
     assert.equal(created.createdAt, created.updatedAt, "首次落库：created_at 与 updated_at 同源");
-    assert.equal(typeof created.startedAt, "string", "working 登记应写 started_at");
+    assert.equal(created.startedAt, null, "登记不填 started_at（唯一写口 = claimTask）");
     assert.equal(created.finishedAt, null, "working 不得写 finished_at");
 
-    // ② 同 id upsert：created_at / started_at **不被覆盖**（首次为准），updated_at 照常刷新
+    // ② 首次领取填 started_at；同 id upsert：created_at / started_at **不被覆盖**，
+    //    updated_at 照常刷新
+    const claimedAt = "2026-01-01T00:00:00.000Z";
+    assert.notEqual(store.enqueueTask("t-moments"), null);
+    assert.notEqual(
+      store.claimTask({ claimedBy: "m-1", claimToken: "ct-moments", claimedAt }),
+      null,
+      "入队后应可领取",
+    );
+    assert.equal(store.getTask("t-moments")?.startedAt, claimedAt, "claimTask 填开工时刻");
     const laterIso = "2030-01-01T00:00:00.000Z";
     const again = store.createTask({
       taskId: "t-moments",
@@ -615,18 +625,18 @@ test("v0.5.0 三时刻列：created_at 首次为准、started_at 仅 NULL 才填
     });
     assert.equal(again.updatedAt, laterIso, "updated_at 照常被 upsert 刷新");
     assert.equal(again.createdAt, created.createdAt, "upsert 不得覆盖 created_at（首次为准）");
-    assert.equal(again.startedAt, created.startedAt, "upsert 不得重置 started_at（首次开工为准）");
+    assert.equal(again.startedAt, claimedAt, "upsert 不得重置 started_at（首次开工为准）");
     assert.equal(again.finishedAt, null);
 
-    // ③ markTaskDispatched：**仅当 started_at IS NULL 才填**（幂等、不覆盖重派）
-    //    登记态非 working ⇒ started_at 为 NULL（如 input-required = 等澄清）
+    // ③ markTaskDispatched（**push 遗留原语**，生产未接）：**仅当 started_at IS NULL 才填**
+    //    （幂等、不覆盖重派）；现行写口见 ② 的 claimTask
     store.createTask({
       taskId: "t-idem",
       projectId: "p1",
       contextId: "c1",
       state: "input-required",
     });
-    assert.equal(store.getTask("t-idem")?.startedAt, null, "非 working 登记不写 started_at");
+    assert.equal(store.getTask("t-idem")?.startedAt, null, "未开工登记不写 started_at");
     const firstDispatch = store.markTaskDispatched("t-idem", "remote-A");
     assert.equal(typeof firstDispatch?.startedAt, "string", "首次派发补 started_at");
     const secondDispatch = store.markTaskDispatched("t-idem", "remote-B");
@@ -670,15 +680,20 @@ test("v0.5.0 三时刻列：created_at 首次为准、started_at 仅 NULL 才填
     assert.equal(store.compareAndSwapTaskState("t-cas2", "working", "input-required"), true);
     assert.equal(store.getTask("t-cas2")?.finishedAt, null, "input-required ≠ 已完成，不写");
 
-    // ⑥ rearmTask / rearmForRetry 清空 finished_at（回到"未完成"）
-    store.createTask({ taskId: "t-rearm", projectId: "p1", contextId: "c1", state: "completed" });
-    const beforeRearm = store.getTask("t-rearm");
+    // ⑥ rearmTask / rearmForRetry 清空 finished_at（回到"未完成"）、**保留 started_at**：
+    //    用 ② 已领取（started_at = claimedAt）的行转终态后再 rearm，锁住「不重置起点」
+    assert.equal(
+      store.compareAndSwapTaskState("t-moments", "working", "completed", null, "ok"),
+      true,
+      "CAS 转 completed 以便 rearm",
+    );
+    const beforeRearm = store.getTask("t-moments");
     assert.equal(typeof beforeRearm?.finishedAt, "string");
-    const rearmed = store.rearmTask("t-rearm", "resume");
+    const rearmed = store.rearmTask("t-moments", "resume");
     assert.equal(rearmed?.state, "working");
     assert.equal(rearmed?.finishedAt, null, "rearmTask 必须清 finished_at");
     assert.equal(rearmed?.createdAt, beforeRearm?.createdAt, "rearm 不改 created_at");
-    assert.equal(rearmed?.startedAt, beforeRearm?.startedAt, "rearm 不改 started_at（不重置起点）");
+    assert.equal(rearmed?.startedAt, claimedAt, "rearm 不改 started_at（不重置起点）");
 
     store.createTask({ taskId: "t-rearm2", projectId: "p1", contextId: "c1", state: "failed" });
     assert.equal(typeof store.getTask("t-rearm2")?.finishedAt, "string");
@@ -912,7 +927,7 @@ test("A2 队列：未入队不可领；projectIds 过滤；空集零 I/O；入�
   }
 });
 
-test("A2 requeueStaleTask：claimed→queued + 清 claim 三字段；按领取者过滤；非领取零写入", () => {
+test("A2 requeueStaleTask：claimed→queued + 清令牌/时刻两字段（O4 起保留 claimed_by）；按领取者过滤；非领取零写入", () => {
   const dbPath = tempDbPath("a2-requeue");
   const store = new SessionStore(dbPath);
   try {
@@ -924,7 +939,7 @@ test("A2 requeueStaleTask：claimed→queued + 清 claim 三字段；按领取�
 
     // 领取者不匹配 ⇒ 不清算（防误清他人）
     assert.equal(store.requeueStaleTask("q1", "other"), false);
-    // 正确领取者 ⇒ claimed→queued，清 claim 三字段
+    // 正确领取者 ⇒ claimed→queued，清 claim 令牌/时刻两字段
     assert.equal(store.requeueStaleTask("q1", "m1"), true);
 
     const raw = openStoreDatabase(dbPath);
@@ -935,9 +950,9 @@ test("A2 requeueStaleTask：claimed→queued + 清 claim 三字段；按领取�
         )
         .get() as Record<string, unknown>;
       assert.equal(row["queue_state"], "queued");
-      assert.equal(row["claimed_by"], null, "claim 三字段之一：claimed_by 清空");
-      assert.equal(row["claim_token"], null, "claim 三字段之二：claim_token 清空");
-      assert.equal(row["claimed_at"], null, "claim 三字段之三：claimed_at 清空");
+      assert.equal(row["claimed_by"], "m1", "v0.8.7 O4：清算保留 claimed_by（补结算窄口的行级绑定凭据）");
+      assert.equal(row["claim_token"], null, "claim_token 清空");
+      assert.equal(row["claimed_at"], null, "claimed_at 清空");
       assert.equal(row["queued_at"], queuedAt, "清算保留原 queued_at（FIFO 位次不变）");
     } finally {
       raw.close();

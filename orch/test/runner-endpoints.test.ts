@@ -13,7 +13,11 @@
  * - **hold 超时**：无命令时到点返回 204（心跳）；
  * - **owner 门闩**：follower ⇒ 503 `runner_not_owner`（stdio 已退役，接入面恒 http）；
  * - **register 落库 / 事件 / 宽容解析**：投影全量替换 + `runner.registered` 事件 + 未知字段忽略；
- * - **result claim_token 校验**：错令牌 ⇒ 409，正确 ⇒ 200 ack 且幂等。
+ * - **result claim_token 校验**：错令牌 ⇒ 409，正确 ⇒ 200 ack 且幂等；
+ * - **契约 3 硬用例（v0.8.7 O5）**：已 `completed` 行重投 `failed`（同 token）⇒ **200 + `ack:true`**
+ *   且 `state` / `artifacts` / `failure_kind` / `finished_at` / `updated_at` **零变化**（不得返回 4xx）；
+ * - **O4 补结算窄口（v0.8.7）**：无令牌 + failed + 行级绑定 ⇒ 受理；completed / 他机重领 /
+ *   未领取 ⇒ 拒；带令牌不匹配的常规上报仍 409（契约 2 不破）。
  *
  * 运行：`npm test`（先 `tsc` 构建，再 `node --test dist/test/`）。
  */
@@ -23,11 +27,13 @@ import { after, test } from "node:test";
 import assert from "node:assert/strict";
 import {
   close as closeStore,
+  claimTask,
   createTask,
   enqueueTask,
   getQueuedTask,
   listEvents,
   listRunnerProjects,
+  requeueStaleTask,
 } from "../session/store.js";
 import { memberKey } from "../config.js";
 import { startHttpTransport } from "../bridge/transports/http.js";
@@ -105,7 +111,7 @@ function makeConfig(opts: {
     machines: opts.machines,
     transport: { mode: "http", http: { host: "127.0.0.1", port: 0, path: "/mcp" } },
     web: { enabled: false, host: "127.0.0.1", port: 0 },
-    runner: { holdMs: opts.holdMs ?? 100, heartbeatTimeoutMs: 60_000 },
+    runner: { holdMs: opts.holdMs ?? 100, heartbeatTimeoutMs: 60_000, orphanTimeoutMs: 1_800_000 },
     ...(groups === undefined ? {} : { groups }),
   };
 }
@@ -668,6 +674,177 @@ test("result：claim_token 校验（错=409）；正确=200 ack 且重复上报�
   assert.equal(duplicateAck.state, "completed");
   assert.equal(duplicateAck.idempotent, true);
   assert.equal(getQueuedTask("t-res")?.text, "done");
+});
+
+// ---------------------------------------------------------------------------
+// /runner/result：契约 3（迟到 / 重复终态 = 2xx-with-ignore，v0.8.7 O5 硬用例）
+// ---------------------------------------------------------------------------
+
+test("契约 3 硬用例：对已 completed 行重投 failed（同 token）⇒ 200 + ack:true 且 state/artifacts/failure_kind 零变化", async () => {
+  const cfg = makeConfig({ machines: [machine("m-c3", "tok-c3")], holdMs: 60 });
+  const h = await startHarness(cfg);
+  await register(h.port, "m-c3", "tok-c3", [
+    { projectId: "p-c3", agentKind: "opencode", a2aPort: 3141 },
+  ]);
+  seedQueuedTask("t-c3", "p-c3", "ctx-c3", "job c3");
+
+  const dispatch = await post(h.port, RUNNER_CONNECT_PATH, { machineId: "m-c3" }, "tok-c3");
+  const claimToken = String((dataOf(dispatch) as DispatchShape).claimToken);
+  assert.ok(claimToken.length > 0);
+
+  const first = await post(
+    h.port,
+    RUNNER_RESULT_PATH,
+    {
+      machineId: "m-c3",
+      taskId: "t-c3",
+      claimToken,
+      projectId: "p-c3",
+      contextId: "ctx-c3",
+      state: "completed",
+      text: "done-first",
+      artifacts: [{ name: "a.txt", text: "A" }],
+    },
+    "tok-c3",
+  );
+  assert.equal(first.status, 200);
+  const before = getQueuedTask("t-c3");
+  assert.notEqual(before, null);
+  assert.equal(before?.state, "completed");
+  assert.equal(before?.failureKind, null, "completed 行本无失败分类");
+  const beforeArtifacts = before?.artifactsJson;
+  assert.ok(beforeArtifacts?.includes("a.txt"));
+
+  // 迟到 / 重复件：同 token 重投 failed，携**不同** text / artifacts，且带原生 infra 类
+  // `acpErrorKind`（若 O3 写口被误触发会落 `failure_kind='infra'`）
+  const late = await post(
+    h.port,
+    RUNNER_RESULT_PATH,
+    {
+      machineId: "m-c3",
+      taskId: "t-c3",
+      claimToken,
+      state: "failed",
+      text: "late-fail",
+      artifacts: [{ name: "b.txt", text: "B" }],
+      diagnostics: { acpErrorKind: "spawn", stage: "send" },
+    },
+    "tok-c3",
+  );
+  assert.equal(late.status, 200, `契约 3 要求 2xx-ignore（实际 ${late.status} ${late.text}）`);
+  const ack = dataOf(late) as { ack?: unknown; taskId?: unknown; state?: unknown; idempotent?: unknown };
+  assert.equal(ack.ack, true);
+  assert.equal(ack.taskId, "t-c3");
+  assert.equal(ack.state, "completed", "回执须回现存终态，不是上报态");
+  assert.equal(ack.idempotent, true);
+
+  const after = getQueuedTask("t-c3");
+  assert.equal(after?.state, "completed", "行态零变化");
+  assert.equal(after?.queueState, before?.queueState, "queue_state 零变化");
+  assert.equal(after?.text, "done-first", "text 零变化");
+  assert.equal(after?.artifactsJson, beforeArtifacts, "artifacts 零变化");
+  assert.equal(after?.failureKind, null, "failure_kind 零变化（O3 写口不得被迟到件触发）");
+  assert.equal(after?.finishedAt, before?.finishedAt, "finished_at 零变化（整条 UPDATE 零写入）");
+  assert.equal(after?.updatedAt, before?.updatedAt, "updated_at 零变化（整条 UPDATE 零写入）");
+});
+
+// ---------------------------------------------------------------------------
+// /runner/result：O4 补结算窄口（v0.8.7，四道限制 + ⑤⑥）
+// ---------------------------------------------------------------------------
+
+test("O4 补结算窄口：无令牌+failed+行级绑定=受理；completed/他机重领/未领取=拒；错令牌常规上报仍 409", async () => {
+  const cfg = makeConfig({ machines: [machine("m-o4", "tok-o4"), machine("m-o4-b", "tok-o4-b")], holdMs: 60 });
+  const h = await startHarness(cfg);
+  await register(h.port, "m-o4", "tok-o4", [
+    { projectId: "p-o4", agentKind: "opencode", a2aPort: 3121 },
+  ]);
+
+  // 用例①：原领取机被心跳清算（令牌已清、claimed_by 保留）后启动补报 failed ⇒ 受理
+  seedQueuedTask("t-o4-a", "p-o4", "ctx-o4", "job a");
+  const claimedA = claimTask({ claimedBy: "m-o4", projectIds: ["p-o4"] });
+  assert.equal(claimedA?.taskId, "t-o4-a");
+  assert.equal(requeueStaleTask("t-o4-a", "m-o4"), true, "清算应命中（claimed→queued）");
+  const lateOk = await post(
+    h.port,
+    RUNNER_RESULT_PATH,
+    { machineId: "m-o4", taskId: "t-o4-a", state: "failed", text: "backend died before restart" },
+    "tok-o4",
+  );
+  assert.equal(lateOk.status, 200, `无令牌+failed+绑定满足 ⇒ 窄口受理（实际 ${lateOk.status} ${lateOk.text}）`);
+  const lateAck = dataOf(lateOk) as { ack?: unknown; state?: unknown };
+  assert.equal(lateAck.ack, true);
+  assert.equal(lateAck.state, "failed");
+  const settledA = getQueuedTask("t-o4-a");
+  assert.equal(settledA?.state, "failed");
+  assert.equal(settledA?.queueState, "settled");
+  assert.equal(settledA?.text, "backend died before restart");
+
+  // 用例②：无令牌 + completed ⇒ 拒（窄口不得放宽 completed 路径）
+  seedQueuedTask("t-o4-b", "p-o4", "ctx-o4", "job b");
+  assert.notEqual(claimTask({ claimedBy: "m-o4", projectIds: ["p-o4"] }), null);
+  const noTokenCompleted = await post(
+    h.port,
+    RUNNER_RESULT_PATH,
+    { machineId: "m-o4", taskId: "t-o4-b", state: "completed", text: "sneaky success" },
+    "tok-o4",
+  );
+  assert.equal(noTokenCompleted.status, 400);
+  assert.equal(errorCodeOf(noTokenCompleted), "bad_request");
+  assert.equal(getQueuedTask("t-o4-b")?.state, "working", "completed 补报零写入");
+
+  // 用例③：清算后被他机重领 ⇒ claimed_by 覆写 ⇒ 原机迟到补报被拒（④ 防的洞）
+  seedQueuedTask("t-o4-c", "p-o4", "ctx-o4", "job c");
+  const claimedC = claimTask({ claimedBy: "m-o4", projectIds: ["p-o4"] });
+  assert.notEqual(claimedC?.claimToken, undefined);
+  assert.equal(requeueStaleTask("t-o4-c", "m-o4"), true);
+  const reclaimed = claimTask({ claimedBy: "m-o4-b", projectIds: ["p-o4"] });
+  assert.equal(reclaimed?.taskId, "t-o4-c", "他机应能重领取");
+  const hostileNoToken = await post(
+    h.port,
+    RUNNER_RESULT_PATH,
+    { machineId: "m-o4", taskId: "t-o4-c", state: "failed", text: "late report from original claimer" },
+    "tok-o4",
+  );
+  assert.equal(hostileNoToken.status, 409, `claimed_by ≠ 上报机 ⇒ 拒（实际 ${hostileNoToken.status}）`);
+  assert.equal(errorCodeOf(hostileNoToken), "claim_token_mismatch");
+  const hostileWithToken = await post(
+    h.port,
+    RUNNER_RESULT_PATH,
+    { machineId: "m-o4", taskId: "t-o4-c", claimToken: claimedC?.claimToken, state: "failed", text: "stale token" },
+    "tok-o4",
+  );
+  assert.equal(hostileWithToken.status, 409);
+  assert.equal(errorCodeOf(hostileWithToken), "claim_token_mismatch");
+  assert.equal(getQueuedTask("t-o4-c")?.state, "working", "重派执行不得被击穿");
+
+  // 用例④：带令牌但令牌不匹配的常规上报 ⇒ 仍 409 claim_token_mismatch（契约 2 不破）
+  const wrongToken = await post(
+    h.port,
+    RUNNER_RESULT_PATH,
+    { machineId: "m-o4", taskId: "t-o4-c", claimToken: "totally-wrong", state: "completed" },
+    "tok-o4",
+  );
+  assert.equal(wrongToken.status, 409);
+  assert.equal(errorCodeOf(wrongToken), "claim_token_mismatch");
+
+  // 附加：从未领取（claimed_by IS NULL）⇒ 窄口拒；无令牌 + failed 缺 text ⇒ 400（⑤）
+  seedQueuedTask("t-o4-d", "p-o4", "ctx-o4", "job d");
+  const neverClaimed = await post(
+    h.port,
+    RUNNER_RESULT_PATH,
+    { machineId: "m-o4", taskId: "t-o4-d", state: "failed", text: "no claim ever" },
+    "tok-o4",
+  );
+  assert.equal(neverClaimed.status, 409);
+  assert.equal(errorCodeOf(neverClaimed), "claim_token_mismatch");
+  const missingText = await post(
+    h.port,
+    RUNNER_RESULT_PATH,
+    { machineId: "m-o4", taskId: "t-o4-b", state: "failed" },
+    "tok-o4",
+  );
+  assert.equal(missingText.status, 400);
+  assert.equal(errorCodeOf(missingText), "bad_request");
 });
 
 // ---------------------------------------------------------------------------

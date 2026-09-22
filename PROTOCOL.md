@@ -87,7 +87,7 @@ Runner 长轮询（**poll 即心跳**）：携带 `machineId`，可携带本轮�
 
 Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持久化后回传**（持久化路径属机器本地实现，**非契约**）：**HTTP 2xx = ack ⇒ 删文件**；否则保留并退避重试（1s → 2s → 4s → … cap 30s，±20% jitter）。
 
-请求体：`{ machineId, taskId, claimToken, state, text?, artifacts?, projectId?, contextId?, remoteTaskId? }`
+请求体：`{ machineId, taskId, claimToken, state, text?, artifacts?, projectId?, contextId?, remoteTaskId?, failureKind?, diagnostics? }`
 
 | 字段 | 类型 | 必填 | 说明 |
 |------|------|------|------|
@@ -99,12 +99,18 @@ Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持�
 | `artifacts` | array \| string | 否 | 产物（数组或 JSON 字符串） |
 | `projectId` / `contextId` | string | 否 | 缺省沿用桥侧落库值 |
 | `remoteTaskId` | string | 否 | 远端任务句柄（观测用） |
+| `failureKind` | string | 否 | **机器侧失败大类**（`"infra"` \| `"task"`；**v0.8.7 新增**）：由 **Runner** 判定（它是唯一同时看得见 `ensure` / transport / 自有超时的位置），**仅 `state="failed"` 时有值**。**桥不消费该字段做判据**（映射归桥，见下「失败分类归属」）—— 其存在是给运维 / 观测读 |
+| `diagnostics` | object | 否 | **机器侧诊断**（**v0.8.7 新增**）：`{ acpErrorKind?, elapsedMs, chunkCount?, stage }`，`stage ∈ {"ensure","send","poll","wait"}`；`acpErrorKind ∈ {spawn, closed, timeout, rpc, protocol}`（桥内原生类别）。失败态必带；成功态仅在桥带了诊断时才带。**桥只读 `acpErrorKind` 用于失败分类映射**，其余键仅观测 |
 
 响应 200：`{ "result": "ok", "data": { "ack": true, "taskId": string, "state": string, "idempotent": boolean }, "error": null }`
 
 - `ack` = `true`；`idempotent` = `true` 表示本条回传与落库态相同（**首个终态胜出**，重复上报幂等）。
 
 **幂等键 `(machineId, taskId)`**：结果按此键 upsert；同一任务重复到达（断桥重连 / outbox 重投）不产生重复副作用。任务不存在于本机队列 ⇒ 404 `task_not_found`。
+
+**迟到 / 重复终态 = 2xx-with-ignore（契约，v0.8.7 起显式落档）**：终态**首个胜出**（`WHERE state NOT IN ('completed','failed','blocked')`）⇒ 迟到 / 重复的终态回传**整条零写入**，回执**恒为 200 + `ack:true`**（`idempotent` 回显是否同值）；与**已落终态不一致**时另记一条 warn 留痕。**不得改成 4xx** —— Runner 侧 outbox 对**任何非 2xx 一律保留待重试**，改成 4xx 会让已落终态的迟到件**无限退避死循环**（`pending` 永不清、`.outbox` 文件永留）。该幂等口**同时兜住**「桥侧墙钟判死后的迟到件」与「Runner 启动补结算件」两类。
+
+**失败分类归属（事实归 Runner、映射归桥）**：Runner 只报**原生事实**（`diagnostics.acpErrorKind`），**不得预映射**成 `{infra, task}`（否则 vocabulary 变更要动两端）；桥侧纯函数映射后落库 —— `spawn` / `closed` ⇒ `infra`，`rpc` / `protocol` / `timeout` 及缺键 ⇒ `task`（未知一律安全降级）。**全库两个写口**：本端点的映射写入，与桥侧墙钟判死时自置 `infra`；二者均遵守「**首个终态胜出**」——迟到 / 重复上报不得改写既有分类。
 
 ### 命令回执（acks）
 
@@ -125,12 +131,14 @@ Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持�
 | `payload_too_large` | 413 | 请求体超限（1 MiB） |
 | `method_not_allowed` | 405 | 端点仅 POST |
 | `task_not_found` | 404 | `/runner/result` 的 `taskId` 在本机队列无记录 |
-| `claim_token_mismatch` | 409 | 回传令牌 ≠ 落库领取令牌（陈旧 / 已清算领取） |
+| `claim_token_mismatch` | 409 | 回传令牌 ≠ 落库领取令牌（陈旧 / 已清算领取）。**Runner 收到 409 的语义 = 「任务已被回收、本机台账条目作废」⇒ 删条目、不无限重试**（此时任务已回队等重派，不是丢单）。**例外 = 补结算窄口（v0.8.7）**：`state="failed"` ∧ 行仍**绑定本机领取**（`claimed_by` = 上报 `machineId` ∧ 行 `state="working"`）⇒ **受理** —— 覆盖「无 `claimToken` 的启动补报」与「墙钟判死后的迟到件」两种；无令牌时 `text`（失败原因）**非空必填**，缺 ⇒ 400；命中时桥记 `warn` 审计行（machineId / taskId / 距 `claimed_at` 耗时）。**行级绑定即安全边界**：行若已被**他机重领** ⇒ `claimed_by` 已覆写 ⇒ 仍 409（窄口不得击穿既有保护）。窄口**只能置 `failed`**，不能置 `completed` |
 | `internal_error` | 500 | 未预期异常 |
 
-**准入校验链（`/runner/register` 顺序）**：Bearer 形态 → JSON body → `machineId` 非空 → `machineId ∈ machines[]`（403 `runner_not_allowed`）→ token 已配置且匹配（401 `runner_unauthorized`）→ `protocolVersion` 非空（400）→ 主版本 ∈ `SUPPORTED_PEER_PROTOCOL_MAJORS`（403 `protocol_version_mismatch`）→ `projects[]` 结构校验（400）。`/runner/connect` / `/runner/result` 复用前四步，后者再加 `claimToken` 比对（409）。
+**准入校验链（`/runner/register` 顺序）**：Bearer 形态 → JSON body → `machineId` 非空 → `machineId ∈ machines[]`（403 `runner_not_allowed`）→ token 已配置且匹配（401 `runner_unauthorized`）→ `protocolVersion` 非空（400）→ 主版本 ∈ `SUPPORTED_PEER_PROTOCOL_MAJORS`（403 `protocol_version_mismatch`）→ `projects[]` 结构校验（400）。`/runner/connect` / `/runner/result` 复用前四步，后者再加 `claimToken` 比对（409；**含 v0.8.7 补结算窄口例外**，见错误码族）。
 
 **未知字段忽略**：三个端点请求体一律**宽容解析** —— `capabilities` / `acks` / `selfCheck` 及任何未列字段均不导致 400、不落库、不进入判据；只有**已列入契约的必填字段**参与校验。加可选字段 → minor +1（见版本规则）。
+
+> **v0.8.7 新增的两个可选请求字段**（`failureKind` / `diagnostics`，见 `/runner/result`）：均**可选、且可被未升级对端忽略** ⇒ 双向兼容，故本版 `PROTOCOL_VERSION` **沿用 2.2、未升版**。**⚠ 与版本规则「加可选字段 → minor +1」条文的取舍尚未由用户裁决**（本版 Step 1 已裁「不动协议版本」，依据 = 可选键可忽略 + 历史可选字段未逐次升版）⇒ 该分歧**已登记待裁**（`planlog.md`「跨版本登记项」）。
 
 ## 版本规则
 

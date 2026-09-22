@@ -265,6 +265,26 @@ test("GET / → 层级视图「需求 → 任务」（§8 增补 #2）：无手�
   }
 });
 
+test("GET / → 任务子表时间列三段 + 耗时拆「排队 / 执行」两列（v0.8.7 增补轨 U1）", async () => {
+  const handle = await startWeb(fakeCore());
+  const page = await get(handle.port, "/");
+  assert.equal(page.status, 200);
+  assert.ok(
+    page.text.includes("<th>createdAt → startedAt → finishedAt</th>"),
+    "时间列表头应为三段（含 startedAt）",
+  );
+  assert.ok(page.text.includes("<th>排队</th>"), "应含「排队」列（createdAt → startedAt）");
+  assert.ok(page.text.includes("<th>执行</th>"), "应含「执行」列（startedAt → finishedAt）");
+  assert.equal(page.text.includes("<th>耗时</th>"), false, "原单列「耗时」应已被两列取代");
+  // startedAt 合法为 NULL（已入队未领取）⇒ 三段时刻与两列时长各有占位，不得渲染成空串/0
+  assert.match(page.text, /function startedStamp\(iso\) \{ return iso \?[\s\S]*: "—";/, "startedAt 缺值应占位「—」");
+  assert.match(
+    page.text,
+    /duration\(t\.createdAt, t\.startedAt\)[\s\S]*duration\(t\.startedAt, t\.finishedAt\)/,
+    "两列时长应分别以 startedAt 为界（缺失时 duration 返回「—」，不按 0 计）",
+  );
+});
+
 test("GET /api/projects → 白名单（剔除 workspace / agentConfig / risk / Runner 内部字段）+ 桥注册表快照语义", async () => {
   /** 故意夹带 Runner 内部字段：网页白名单必须剔除（防 vacuous：全文断言不含这些值） */
   const runnerWithInternals = {

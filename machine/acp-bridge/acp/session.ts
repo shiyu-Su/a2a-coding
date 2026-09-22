@@ -42,8 +42,16 @@
  * 缺省 / 空串 ⇒ **零请求**；失败 ⇒ **fail-fast**（日志 + 抛错，不静默回落）。`sessionMeta` 非空 ⇒
  * `session/new` / `load` / `resume` **三路统一携带 `_meta`**（否则复用会话拿不到 ⇒ full 档静默降级）。
  * 桥只收 adapter 的原样值，**不做 kind→mode 映射**。
+ *
+ * **失败诊断留痕（v0.8.7 · M4）**：三处失败出口（① 会话建立失败 ② prompt 失败 ③ prompt 超时）各在
+ * `TaskExecutionResult.artifacts` 追加一条 `name="machine-diagnostics"`（text = JSON）⇒ **零类型 /
+ * 零 wire 变更**；launcher `buildResult` 按名摘除 + 解析（见 {@link DIAGNOSTICS_ARTIFACT_NAME}）。
+ * 字段：`acpErrorKind`（`AcpError["kind"]`，非结构化抛出归 `error`）· `chunkCount`（本轮已收
+ * `agent_message_chunk` 数）· `elapsedMs`（**prompt 段**耗时；① 未进入 prompt ⇒ 0，三段耗时计量留
+ * 后续版本）· `stage`（`ensure` / `prompt` 落点）。正常完成路径不带该 artifact。
  */
 import { AcpError } from "./client.js";
+import { buildArtifacts } from "../artifacts.js";
 import type { TaskExecutionInput, TaskExecutionResult } from "../types.js";
 import { parseOutcome } from "../outcome.js";
 import { A2A_OUTCOME_CONVENTION } from "../outcome.js";
@@ -53,6 +61,16 @@ import type { SessionMap } from "../session-map.js";
 export const DEFAULT_SESSION_TIMEOUT_MS = 600_000;
 /** Runner 派发侧任务超时预算（对齐 launcher `runner-exec` 660s；本桥不自持，仅常量登记）。 */
 export const DEFAULT_TASK_TIMEOUT_MS = 660_000;
+
+/**
+ * 失败诊断留痕 artifact 名（v0.8.7 · M4）。消费方 = `launcher/runner-exec.ts` 的
+ * `DIAGNOSTICS_ARTIFACT_NAME`（deliver 前摘除 + 解析）—— 两侧同名是**线上传契约**，
+ * 由 `test/acp-session.test.ts` 断言二者字面量一致。
+ */
+export const DIAGNOSTICS_ARTIFACT_NAME = "machine-diagnostics";
+
+/** 诊断落点（v0.8.7 · M4）：桥内两处失败出口的阶段标识。 */
+type BridgeDiagStage = "ensure" | "prompt";
 
 /** 会话客户端最小面（`AcpClient` 结构满足；便于 fake 注入）。 */
 export interface AcpRequestClient {
@@ -125,6 +143,11 @@ function isMethodNotFound(err: unknown): boolean {
   return err instanceof AcpError && err.code === -32601;
 }
 
+/** 诊断用错误类别（v0.8.7 · M4）：结构化 `AcpError` 取其 `kind`；裸 Error / 未知抛出归 `error`。 */
+function errorKindOf(err: unknown): string {
+  return err instanceof AcpError ? err.kind : "error";
+}
+
 /**
  * `session/set_config_option` 响应的真值取位（F-a）：双方言实测顶层**无** `currentValue` 键，
  * 生效值嵌在 `result.configOptions[]` 内 `id === configId` 项的 `currentValue`。取不到 ⇒ undefined。
@@ -180,6 +203,11 @@ export class AcpSessionRunner {
    * 窗外到达的 agent_message_chunk（load/resume 回灌 backlog）不入本轮缓冲。
    */
   private readonly capturing = new Set<string>();
+  /**
+   * sessionId → 本轮捕获**开窗时刻**（ms）：与 `buffers.set` / `capturing.add` 同点写、
+   * `takeText` / `discardCapture` 同点清 —— 失败出口 `elapsedMs`（prompt 段）的计量来源（v0.8.7 · M4）。
+   */
+  private readonly captureOpenedAt = new Map<string, number>();
   /** sessionId → 窗内被 messageId 轮边界判据丢弃的历史重放 chunk 数（收窗时一行日志，供真机取证） */
   private readonly replayDropped = new Map<string, number>();
   /**
@@ -237,7 +265,12 @@ export class AcpSessionRunner {
     try {
       sessionId = await this.ensureSession(input.contextId);
     } catch (err) {
-      return { state: "failed", text: `会话建立失败：${messageOf(err)}` };
+      return this.withDiag({ state: "failed", text: `会话建立失败：${messageOf(err)}` }, {
+        kind: errorKindOf(err),
+        stage: "ensure",
+        elapsedMs: 0, // 未进入 prompt 段
+        chunkCount: 0, // 捕获窗未开
+      });
     }
     this.taskSessions.set(input.taskId, sessionId);
 
@@ -253,13 +286,22 @@ export class AcpSessionRunner {
       // 注意：不可在此清 replayMessageIds —— 其中的 id 正是本轮 ensureSession 的 load/resume 期登记的。
       this.buffers.set(sessionId, []);
       this.capturing.add(sessionId);
+      this.captureOpenedAt.set(sessionId, Date.now());
       promptResult = await this.requestWithTimeout("session/prompt", {
         sessionId,
         prompt: [{ type: "text", text: promptText }],
       });
     } catch (err) {
+      // 诊断计量须在清窗**之前**读（`discardCapture` 后缓冲与开窗时刻即失）
+      const openedAt = this.captureOpenedAt.get(sessionId);
+      const stats = {
+        kind: errorKindOf(err),
+        stage: "prompt" as const,
+        elapsedMs: openedAt === undefined ? 0 : Math.max(0, Date.now() - openedAt),
+        chunkCount: this.buffers.get(sessionId)?.length ?? 0,
+      };
       this.discardCapture(sessionId);
-      return this.failureResult(err);
+      return this.withDiag(this.failureResult(err), stats);
     }
     // prompted 置位时机 = 收到响应即置（含 end_turn / input-required / cancelled）
     if (firstTurn) {
@@ -312,6 +354,33 @@ export class AcpSessionRunner {
     return { state: "failed", text: messageOf(err) };
   }
 
+  /**
+   * 失败出口挂诊断留痕（v0.8.7 · M4）：经现成 `artifacts` 通道追加一条 {@link DIAGNOSTICS_ARTIFACT_NAME}
+   * （text = JSON）⇒ 零类型 / 零 wire 变更；launcher 侧摘除 + 解析。正常完成路径不调用本方法。
+   *
+   * ⚠ **chunkCount 只作留痕，绝不作自动重发判据**：`onNotification` 只计 `agent_message_chunk`、
+   * `agent_thought_chunk` 被忽略 ⇒ 思考型后端（codex / claude 长思考）可「有推进而 chunkCount=0」，
+   * 而一句「我先看一下」就让 chunkCount>0 —— **双向误判**。重发判据 = 相位 + 错误类型（M5）。
+   */
+  private withDiag(
+    result: TaskExecutionResult,
+    diag: { kind: string; stage: BridgeDiagStage; elapsedMs: number; chunkCount: number },
+  ): TaskExecutionResult {
+    const payload = JSON.stringify({
+      acpErrorKind: diag.kind,
+      stage: diag.stage,
+      elapsedMs: diag.elapsedMs,
+      chunkCount: diag.chunkCount,
+    });
+    return {
+      ...result,
+      artifacts: [
+        ...(result.artifacts ?? []),
+        ...buildArtifacts([{ name: DIAGNOSTICS_ARTIFACT_NAME, text: payload }]),
+      ],
+    };
+  }
+
   private onNotification(method: string, params: unknown): void {
     if (method !== "session/update" || !isRecord(params)) return;
     const sessionId = params["sessionId"];
@@ -348,6 +417,7 @@ export class AcpSessionRunner {
 
   private takeText(sessionId: string): string {
     this.capturing.delete(sessionId);
+    this.captureOpenedAt.delete(sessionId);
     this.replayMessageIds.delete(sessionId);
     const dropped = this.replayDropped.get(sessionId);
     if (dropped !== undefined) {
@@ -364,6 +434,7 @@ export class AcpSessionRunner {
   /** prompt 失败/超时路径：关窗并弃置半截缓冲，避免残窗把下轮 backlog 收进来。 */
   private discardCapture(sessionId: string): void {
     this.capturing.delete(sessionId);
+    this.captureOpenedAt.delete(sessionId);
     this.buffers.delete(sessionId);
     this.replayDropped.delete(sessionId);
     this.replayMessageIds.delete(sessionId);

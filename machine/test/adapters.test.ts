@@ -22,6 +22,7 @@ import { getAdapter } from "../adapters/index.js";
 import { appRootFromModule } from "../launcher/app-root.js";
 import { resolveBackendSpawn, SCRIPT_BACKEND_EXTS } from "../adapters/backend-command.js";
 import { BACKEND_LOOKUP_BY_KIND } from "../adapters/backend-entry.js";
+import { SESSION_TIMEOUT_MS_CAP } from "../launcher/agent-config.js";
 
 import type { AgentKind } from "../types.js";
 import type { LaunchRequest, LaunchSpec } from "../adapters/types.js";
@@ -222,7 +223,7 @@ test("claude buildLaunch（ACP 族）：拉起仓内桥进程 + 可执行体形�
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: CLAUDE_NODE_CMD, model: "sonnet" },
+    agentConfig: { backendCmd: CLAUDE_NODE_CMD, model: "sonnet", sessionTimeoutMs: 720000 },
   });
   assert.equal(spec.command, "node");
   assert.ok((spec.args[0] ?? "").endsWith(join("dist", "acp-bridge", "index.js")));
@@ -239,6 +240,9 @@ test("claude buildLaunch（ACP 族）：拉起仓内桥进程 + 可执行体形�
     "[]",
     "--model",
     "sonnet",
+    // v0.8.7 M2：--session-timeout 紧随 --model 下发；未配 sessionTimeoutMs ⇒ 无该旗标。
+    "--session-timeout",
+    "720000",
   ]);
 });
 
@@ -340,6 +344,7 @@ test("claude buildLaunch：未配平铺 model ⇒ argv 无 --model（零回退�
     agentConfig: { backendCmd: CLAUDE_NODE_CMD },
   });
   assert.ok(!spec.args.includes("--model"));
+  assert.ok(!spec.args.includes("--session-timeout"), "v0.8.7 M2：未配 sessionTimeoutMs ⇒ 零下发");
 });
 
 test("codex permission 三档映射逐字锁定（v0.8.5 M2：--risk + --mode [+ plan]）", () => {
@@ -457,11 +462,21 @@ function qoderCnBridgeArgs(agentConfig: Record<string, unknown> | undefined): st
 }
 
 test("qoder-cn 平铺 model 已配 ⇒ 下发 --model，值逐字 = 配置值（不再拼后端 argv）", () => {
-  assert.deepEqual(qoderCnBridgeArgs({ backendCmd: QODER_EXPLICIT, model: "provider/model-x" }), [
-    ...QODER_CN_NO_MODEL_BASELINE,
-    "--model",
-    "provider/model-x",
-  ]);
+  assert.deepEqual(
+    qoderCnBridgeArgs({
+      backendCmd: QODER_EXPLICIT,
+      model: "provider/model-x",
+      sessionTimeoutMs: 720000,
+    }),
+    [
+      ...QODER_CN_NO_MODEL_BASELINE,
+      "--model",
+      "provider/model-x",
+      // v0.8.7 M2：平铺 sessionTimeoutMs ⇒ `--session-timeout <ms>`，紧随 --model。
+      "--session-timeout",
+      "720000",
+    ],
+  );
 });
 
 test("qoder-cn 平铺 model 已配 + permissionArgs：--model 在 --backend-cmd 后、--risk 前", () => {
@@ -469,13 +484,15 @@ test("qoder-cn 平铺 model 已配 + permissionArgs：--model 在 --backend-cmd 
     projectId: "p1",
     workspace: "/ws/p1",
     a2aPort: 4100,
-    agentConfig: { backendCmd: QODER_EXPLICIT, model: "m1" },
+    agentConfig: { backendCmd: QODER_EXPLICIT, model: "m1", sessionTimeoutMs: 30000 },
     permissionArgs: getAdapter("qoder-cn").permission("read").args,
   });
   assert.deepEqual(spec.args.slice(1), [
     ...QODER_CN_NO_MODEL_BASELINE,
     "--model",
     "m1",
+    "--session-timeout",
+    "30000",
     "--risk",
     "read",
   ]);
@@ -487,6 +504,7 @@ test("qoder-cn model 未配 ⇒ 不下发 --model（argv 逐字 = 基线，桥�
   const args = qoderCnBridgeArgs({ backendCmd: QODER_EXPLICIT });
   assert.deepEqual(args, QODER_CN_NO_MODEL_BASELINE);
   assert.ok(!args.includes("--model"));
+  assert.ok(!args.includes("--session-timeout"), "未配 sessionTimeoutMs ⇒ argv 逐字含负向锚");
   assert.equal(
     args[args.indexOf("--backend-args") + 1],
     '["--acp"]',
@@ -1115,4 +1133,56 @@ test("平铺 systemPrompt(Mode) 读点 = 4 家（opencode/qoder-cn/codex/claude�
   }
   const backendSrc = readFileSync(join(root, "adapters", "backend-command.ts"), "utf8");
   assert.ok(!backendSrc.includes("resolveSystemPrompt"), "backend-command 不得耦合 systemPrompt");
+});
+
+// ---------- REQ-v0.8.7-2026-09-22-01 · M2：平铺 sessionTimeoutMs ⇒ 桥 `--session-timeout <ms>` ----------
+
+test("M2 接线锚：sessionTimeoutMs 读点 + 下发 = 4 家（opencode/qoder-cn/codex/claude）", () => {
+  const root = appRootFromModule(import.meta.url);
+  for (const kind of ["opencode", "qoder-cn", "codex", "claude"]) {
+    const src = readFileSync(join(root, "adapters", `${kind}.ts`), "utf8");
+    assert.ok(
+      src.includes("resolveSessionTimeoutMs(request.agentConfig)"),
+      `${kind} 应读平铺 sessionTimeoutMs`,
+    );
+    assert.ok(src.includes('"--session-timeout"'), `${kind} 应下发 --session-timeout`);
+  }
+});
+
+test("M2 逐字锚：4 家已配 ⇒ --session-timeout <ms> 恰在 permissionArgs 前；未配 ⇒ 零下发", () => {
+  const cases: Array<{ kind: AgentKind; agentConfig: Record<string, unknown> }> = [
+    { kind: "qoder-cn", agentConfig: { backendCmd: QODER_EXPLICIT, sessionTimeoutMs: 300000 } },
+    { kind: "opencode", agentConfig: { backendCmd: OPENCODE_EXE, sessionTimeoutMs: 300000 } },
+    {
+      kind: "codex",
+      agentConfig: { backendCmd: CODEX_BACKEND_CMD_SAMPLE, sessionTimeoutMs: 300000 },
+    },
+    { kind: "claude", agentConfig: { backendCmd: CLAUDE_NODE_CMD, sessionTimeoutMs: 300000 } },
+  ];
+  for (const { kind, agentConfig } of cases) {
+    const adapter = getAdapter(kind);
+    const perm = adapter.permission("write").args;
+    const withTimeout = adapter
+      .buildLaunch({ ...BARE_REQUEST, agentConfig, permissionArgs: perm })
+      .args.slice(1);
+    const i = withTimeout.indexOf("--session-timeout");
+    assert.ok(i >= 0, `${kind}：已配 ⇒ 应下发 --session-timeout`);
+    assert.equal(withTimeout[i + 1], "300000");
+    assert.deepEqual(withTimeout.slice(i + 2), perm, `${kind}：--session-timeout 恰在 permissionArgs 前`);
+    const without = adapter.buildLaunch({
+      ...BARE_REQUEST,
+      agentConfig: { ...agentConfig, sessionTimeoutMs: undefined },
+    }).args.slice(1);
+    assert.ok(!without.includes("--session-timeout"), `${kind}：未配 ⇒ 不下发旗标（桥落缺省）`);
+  }
+});
+
+test("M2 值形态：数字 ms 原样十进制字符串下发（上限 900000 边界值可透传）", () => {
+  const args = getAdapter("qoder-cn")
+    .buildLaunch({
+      ...BARE_REQUEST,
+      agentConfig: { backendCmd: QODER_EXPLICIT, sessionTimeoutMs: SESSION_TIMEOUT_MS_CAP },
+    })
+    .args.slice(1);
+  assert.equal(args[args.indexOf("--session-timeout") + 1], "900000");
 });

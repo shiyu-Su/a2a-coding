@@ -11,6 +11,7 @@
  *     --port <a2aPort> --workspace <workspace> --project-id <projectId>
  *     --backend-cmd <归一后的命令> --backend-args <归一后的参数>   // 脚本形态 ⇒ node + 脚本路径；.exe ⇒ 直调
  *     [--model <agentConfig.model>]
+ *     [--session-timeout <agentConfig.sessionTimeoutMs>]
  *     [--system-prompt <agentConfig.systemPrompt> [--system-prompt-mode <append|replace>]]
  *     --risk <read|write|full>`
  *
@@ -43,6 +44,7 @@ import type {
 import { appRootFromModule } from "../launcher/app-root.js";
 import {
   resolveAcpModel,
+  resolveSessionTimeoutMs,
   resolveSystemPrompt,
   resolveSystemPromptMode,
 } from "../launcher/agent-config.js";
@@ -72,6 +74,7 @@ export class QoderCnAdapter implements Adapter {
       QODER_CN_BACKEND_CMD_REQUIRED,
     );
     const model = resolveAcpModel(request.agentConfig);
+    const sessionTimeoutMs = resolveSessionTimeoutMs(request.agentConfig);
     const systemPrompt = resolveSystemPrompt(request.agentConfig);
     const systemPromptMode = resolveSystemPromptMode(request.agentConfig);
     // 后端启动形态归一（与三家同构）：qoder 真身是 `.exe` / 无扩展名 ⇒ 恒等（直调 + `--acp`），
@@ -96,6 +99,8 @@ export class QoderCnAdapter implements Adapter {
       // `session/set_config_option` 设置；未配/非法 ⇒ 不下发该旗标（桥不发 set 请求，逐字回到现状）。
       // 本适配器不参与后端 argv 拼装、不做 name↔modelId 映射。
       ...(model !== undefined ? ["--model", model] : []),
+      // 会话超时透传（REQ-v0.8.7 M2）：平铺 sessionTimeoutMs ⇒ `--session-timeout <ms>`；未配 ⇒ 桥落缺省。
+      ...(sessionTimeoutMs !== undefined ? ["--session-timeout", String(sessionTimeoutMs)] : []),
       // 自定义注入（v0.8.5 · M4）：段与配置通道退役 ⇒ 走平铺键 + 桥 flag。
       ...(systemPrompt !== undefined ? ["--system-prompt", systemPrompt] : []),
       ...(systemPromptMode !== undefined ? ["--system-prompt-mode", systemPromptMode] : []),

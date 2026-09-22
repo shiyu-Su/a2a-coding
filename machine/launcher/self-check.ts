@@ -39,7 +39,7 @@ const POLL_INTERVAL_MS = 1_000;
  * 自检任务在本机在飞台账中的 taskId 前缀（M5·MC1）：自检经 `manager.inFlight` 登记，
  * 使 idleStop 判据在自检执行期间看到在飞任务而不回收 agent（替代旧 re-ensure 续约）。
  */
-const SELF_CHECK_LEDGER_PREFIX = "self-check:";
+export const SELF_CHECK_LEDGER_PREFIX = "self-check:";
 
 /**
  * 失败根因分类（REQ-v0.8.6-2026-09-21-02 · §2.4-⑥ F-e）：

@@ -70,7 +70,7 @@ function makeConfig(machineId: string, token: string): MachinesConfig {
     machines: [{ machineId, launcherUrl: "", token }],
     transport: { mode: "http", http: { host: "127.0.0.1", port: 0, path: "/mcp" } },
     web: { enabled: false, host: "127.0.0.1", port: 0 },
-    runner: { holdMs: 60, heartbeatTimeoutMs: 60_000 },
+    runner: { holdMs: 60, heartbeatTimeoutMs: 60_000, orphanTimeoutMs: 1_800_000 },
   };
 }
 

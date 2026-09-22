@@ -72,3 +72,29 @@ export function resolveSystemPromptMode(
   const value = agentConfig?.["systemPromptMode"];
   return value === "append" || value === "replace" ? value : undefined;
 }
+
+/**
+ * `agentConfig.sessionTimeoutMs` 的加载期上限（REQ-v0.8.7-2026-09-22-01 · M2）：
+ * **15 min = 900_000 ms**，超限 ⇒ `loadMachineConfig` fail-fast。
+ *
+ * 上限的**单一源**在此（machine 侧）—— 桥是零仓内依赖的叶模块，只宽松校验「整数 > 0」，
+ * 两处各定义常量必漂移。取 15 min 的理由：桥 session 窗与 launcher dispatch deadline 是
+ * **成对常量**（恒须 `dispatch = session + margin`）；`requestWithTimeout` 对桥内**所有**
+ * 请求用同一超时 ⇒ 会话建立段最坏 ≈ 6×，15 min + margin ⇒ 最坏窗口仍在 orch 墙钟之下。
+ */
+export const SESSION_TIMEOUT_MS_CAP = 900_000;
+
+/**
+ * 从项目 agentConfig 解析**平铺** `agentConfig.sessionTimeoutMs`（v0.8.7 · M2），
+ * 由 adapter 经桥 `--session-timeout <ms>` 透传（四 ACP kind 同轨）。
+ *
+ * 取值合法性由**加载期**把守（`../config.ts` `parseProject`：非正整数或超
+ * {@link SESSION_TIMEOUT_MS_CAP} ⇒ fail-fast）；本读取器只管「缺键 / 非数字 → `undefined`」
+ * （⇒ adapter 不下发该旗标，桥落自身缺省 `DEFAULT_SESSION_TIMEOUT_MS`）。
+ */
+export function resolveSessionTimeoutMs(
+  agentConfig: Record<string, unknown> | undefined,
+): number | undefined {
+  const value = agentConfig?.["sessionTimeoutMs"];
+  return typeof value === "number" ? value : undefined;
+}
