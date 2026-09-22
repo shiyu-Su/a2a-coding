@@ -29,7 +29,7 @@ import type {
   TaskRecord,
   TaskState,
 } from "../types.js";
-import { AGENT_KINDS } from "../types.js";
+import { AGENT_KINDS, FAILURE_KINDS, ORPHAN_FAILURE_KIND } from "../types.js";
 
 /**
  * 默认数据库文件：锚定 orch 单元根（`<orch>/data/sessions.sqlite`），**非 cwd 相对**，
@@ -105,13 +105,25 @@ export const FEATURE_STATE_VALUES: readonly FeatureState[] = FEATURE_STATES;
  */
 const RETIRED_FEATURE_STATES: readonly string[] = ["discussing", "analyzing", "planning"];
 
-/** 失败分类清单（v0.4.1；含校验用，落库值只能是这两者） */
-const FAILURE_KINDS: readonly FailureKind[] = ["infra", "task"];
+/**
+ * 失败分类清单 = `types.ts` 的 `FAILURE_KINDS`（**六类闭集**，事实源 `PROTOCOL.md` 2.3 条文；
+ * v0.8.8 O1 起**不在此另立清单**）。落库值只能是这六者；旧二分 `infra` / `task` 与任何脏值
+ * 在**读侧**按 `readFailureKind` 兜底，不再抛错。
+ */
 
 /** 事件 kind：任务结算（completed / failed / input-required） */
 export const EVENT_TASK_SETTLED = "task.settled";
 /** 事件 kind：任务被失败传播阻塞（blocked） */
 export const EVENT_TASK_BLOCKED = "task.blocked";
+/**
+ * 事件 kind：machine 侧**续跑**留痕（v0.8.8 O3 · 改造文档 §2.2）。
+ *
+ * **派生事件**（非状态流转）：命名对齐 `task.claimed` / `task.settled`，**仅当本次结果回传的
+ * `diagnostics.continueAttempts > 0` 时**由 {@link SessionStore.upsertTaskResult} 在既有结果写口
+ * 顺带发出 —— 不新增端点、不新增写口。续跑**不动 `retry_count`**（正交双口径），事件面是它
+ * 唯一的可查痕迹。
+ */
+export const EVENT_TASK_CONTINUED = "task.continued";
 /** 事件 kind：Feature 状态流转 */
 export const EVENT_FEATURE_STATE = "feature.state";
 /**
@@ -262,6 +274,12 @@ export interface TaskResultUpsertInput {
   text?: string | null;
   featureId?: string | null;
   remoteTaskId?: string | null;
+  /**
+   * machine 回传体 `diagnostics` 的**宽 JSON 原文**（v0.8.8 O3 · §2.5 落库口径）：
+   * 由 {@link SessionStore.upsertTaskResult} 序列化后落 `tasks.diagnostics_json`，
+   * 并据其 `continueAttempts` 派生 `task.continued` 事件。**不落派生布尔、不丢原料**。
+   */
+  diagnostics?: unknown;
   /** 上报 / 结算时刻（缺省 now；重复上报时**不覆盖**已结算行） */
   updatedAt?: string;
 }
@@ -482,14 +500,154 @@ function readInteger(row: Record<string, unknown>, key: string): number {
   return v;
 }
 
-/** 解析 `failure_kind` 列（可空；非法值 = 数据损坏，fail-fast） */
+/**
+ * 解析 `failure_kind` 列（可空）。
+ *
+ * **v0.8.8 O1：非法值 ⇒ 兜底 + warn，不再 fail-fast**。口径来自改造文档 §2.1「读侧安全」：
+ * 二分时代（v0.8.7）写入的 `infra` / `task` 自 2.3 起非法，而存量行由 §2.1 的**迁移脚本**
+ * 置 NULL —— 迁移前若桥先启动，读侧撞旧枚举会**每次启动即抛**（`rowToTask` 在列表读路径上，
+ * 一处脏值 ⇒ `recover` / trace / feature_status 全停）。故读侧放宽为落安全类 `business`
+ * （「不可重试」侧）并 warn 留原值，供事后区分「真 business」与「兜底 business」。
+ *
+ * ⚠️ 与 `/runner/result` 的**入站**兜底互补、不可互替：那条接住混跑期在途载荷，本条守住存量库行。
+ */
 function readFailureKind(row: Record<string, unknown>): FailureKind | null {
   const raw = readNullableString(row, "failure_kind");
   if (raw === null) return null;
-  if (!isFailureKind(raw)) {
-    throw new Error(`[session-store] 列 failure_kind 数据损坏：非法分类 ${raw}`);
+  return coerceStoredFailureKind(raw);
+}
+
+/** 库中原样存着但已不合 2.3 六类闭集的取值 ⇒ 兜底 `business` + warn 留原值（可重入，无副作用） */
+function coerceStoredFailureKind(raw: string): FailureKind {
+  if (isFailureKind(raw)) return raw;
+  console.error(
+    `[session-store] 列 failure_kind 非法值（2.3 前旧值 / 脏行）⇒ 兜底落 business（failure_kind_fallback=${raw}），请执行 §2.1 存量迁移`,
+  );
+  return "business";
+}
+
+/**
+ * `diagnostics` 宽 JSON 列的**字符上限**（v0.8.8 O3）：机侧请求体上限 1 MiB（`runner.ts` 的
+ * `RUNNER_MAX_BODY_BYTES`），而正常 diagnostics 只有数 KB（计量键 + 后端错误 `data` 摘要）⇒
+ * 超上限只可能是后端回显了巨量文本。此处**只防无界落库**（每任务一行 × 保留期），
+ * 不做「安全截断」—— 截一半会把 JSON 截成非法、派生事件也随之失效，反而更糟。
+ */
+const DIAGNOSTICS_JSON_MAX_CHARS = 32_000;
+
+/**
+ * 把回传体的 `diagnostics` 序列化为**宽 JSON 原文**（v0.8.8 O3 · §2.5 落库口径）。
+ *
+ * - 非对象 / 缺键 ⇒ NULL（机侧「判不出不报」的既有语义，不猜内容）；
+ * - 数组 ⇒ 原样序列化（异常形状也是机侧事实的一部分，读侧自行判断）；
+ * - `JSON.stringify` 抛错（入站是 `unknown`，理论上可含循环引用）⇒ 落 NULL，
+ *   **不得让一次结果回传因诊断形状而崩掉结算**；
+ * - 超上限 ⇒ 整列留 NULL + `console.error` 留痕（异常兜底路径；正常量级永不命中）。
+ */
+function serializeDiagnostics(diagnostics: unknown): string | null {
+  if (typeof diagnostics !== "object" || diagnostics === null) return null;
+  let json: string | undefined;
+  try {
+    json = JSON.stringify(diagnostics);
+  } catch {
+    console.error("[session-store] diagnostics 无法序列化 ⇒ 本列留空（不影响结果落库）");
+    return null;
   }
-  return raw;
+  if (typeof json !== "string") return null;
+  if (json.length <= DIAGNOSTICS_JSON_MAX_CHARS) return json;
+  console.error(
+    `[session-store] diagnostics 超宽（${json.length} > ${DIAGNOSTICS_JSON_MAX_CHARS} 字符）⇒ 本列留空（防无界落库）`,
+  );
+  return null;
+}
+
+/** 读 `diagnostics_json` 列（可空；NULL = 未上报 / 存量老行） */
+function readDiagnosticsJson(row: Record<string, unknown>): string | null {
+  return readNullableString(row, "diagnostics_json");
+}
+
+/** 诊断键的宽容读取：仅「有限非负数」算数值事实，其余（缺键 / 脏值）⇒ 不报该键 */
+function diagNumber(obj: Record<string, unknown>, key: string): number | undefined {
+  const v = obj[key];
+  return typeof v === "number" && Number.isFinite(v) && v >= 0 ? v : undefined;
+}
+
+/** 诊断键的宽容读取：仅非空字符串算事实（`timeoutScope` / `continueTrigger`） */
+function diagString(obj: Record<string, unknown>, key: string): string | undefined {
+  const v = obj[key];
+  return typeof v === "string" && v.length > 0 ? v : undefined;
+}
+
+/** 诊断键的宽容读取：仅布尔算事实（`sessionResumed` / `workspaceTouched`） */
+function diagBoolean(obj: Record<string, unknown>, key: string): boolean | undefined {
+  return typeof obj[key] === "boolean" ? (obj[key] as boolean) : undefined;
+}
+
+/**
+ * 从落库的宽 JSON **反查 `continueAttempts`**（派生事件与 `task.settled.continueAttempts` 的
+ * 唯一口径源）。列 NULL / JSON 非法 / 键缺失或非有限数 ⇒ `0`（保守：不发续跑事件）。
+ */
+function readContinueAttempts(diagnosticsJson: string | null): number {
+  return readDiagnosticsObject(diagnosticsJson).continueAttempts;
+}
+
+/** 宽 JSON 的读侧解析（派生事件用；**只读口径**，不改写原文） */
+function readDiagnosticsObject(diagnosticsJson: string | null): {
+  continueAttempts: number;
+  obj: Record<string, unknown> | null;
+} {
+  if (diagnosticsJson === null) return { continueAttempts: 0, obj: null };
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(diagnosticsJson);
+  } catch {
+    return { continueAttempts: 0, obj: null };
+  }
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) {
+    return { continueAttempts: 0, obj: null };
+  }
+  const obj = parsed as Record<string, unknown>;
+  return { continueAttempts: diagNumber(obj, "continueAttempts") ?? 0, obj };
+}
+
+/**
+ * `task.continued` 的 payload（改造文档 §2.2 键清单）。**逐键显式读**（§2.5 不对称纪律：
+ * orch 消费新键必须逐键读，不得建在「对端一定带了」上）⇒ 机侧缺报的键**省略**而不是填 0/false
+ * （填了就是把「未知」谎报成「没有」）。
+ *
+ * `remainingMs` 同此口径：它是 launcher 侧续跑闸的输入（`ContinueGateSignals.remainingMs`），
+ * M2 的 `RunnerTaskDiagnostics` 尚无该键 ⇒ 机侧一旦在 diagnostics 下带出（「只加键不 breaking」
+ * 伞下），本事件自动开始携带。
+ */
+function continuedEventPayload(params: {
+  taskId: string;
+  machineId: string;
+  projectId: string;
+  obj: Record<string, unknown>;
+  continueAttempts: number;
+}): Record<string, unknown> {
+  const payload: Record<string, unknown> = {
+    taskId: params.taskId,
+    machineId: params.machineId,
+    projectId: params.projectId,
+    continueAttempts: params.continueAttempts,
+  };
+  for (const key of ["continueTrigger", "timeoutScope"] as const) {
+    const v = diagString(params.obj, key);
+    if (v !== undefined) payload[key] = v;
+  }
+  for (const key of [
+    "partialChars",
+    "updateCount",
+    "firstChunkElapsedMs",
+    "remainingMs",
+    "partialTailChars",
+  ] as const) {
+    const v = diagNumber(params.obj, key);
+    if (v !== undefined) payload[key] = v;
+  }
+  const resumed = diagBoolean(params.obj, "sessionResumed");
+  if (resumed !== undefined) payload.sessionResumed = resumed;
+  return payload;
 }
 
 function rowToSession(row: Record<string, unknown>): SessionRecord {
@@ -517,7 +675,7 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
 const TASK_COLUMNS =
   "task_id, project_id, context_id, state, artifacts_json, text, prompt, " +
   "feature_id, dependencies, input_artifacts, remote_task_id, dispatch_guard, dispatch_message, updated_at, " +
-  "retry_count, failure_kind, " +
+  "retry_count, failure_kind, diagnostics_json, " +
   "created_at, started_at, finished_at";
 
 /** features 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToFeature） */
@@ -599,6 +757,8 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     dispatchMessage: readNullableString(row, "dispatch_message"),
     retryCount: readInteger(row, "retry_count"),
     failureKind: readFailureKind(row),
+    // v0.8.8 O3：machine 上报的 diagnostics 宽 JSON 原文（NULL = 未上报 / 存量老行）
+    diagnosticsJson: readDiagnosticsJson(row),
     // v0.6.1 REQ-05：三列休眠 —— 不进 SELECT，恒取中性值（字段保留以维持 TaskRecord 形状）
     exhausted: false,
     notBefore: null,
@@ -924,6 +1084,15 @@ export class SessionStore {
     // 纪律：只加列、必可空、不复用既有列、读侧 `readNullableString`、**只在 ctor try-ALTER**。
     try {
       this.db.exec("ALTER TABLE tasks ADD COLUMN dispatch_guard TEXT");
+    } catch {
+      // 列已存在
+    }
+    // v0.8.8 O3 迁移（§2.5 落库口径）：tasks 加 `diagnostics` **宽 JSON 原文列** ——
+    // machine 上报的执行计量（分段耗时 / `timeoutScope` / `acpErrorCode` / `continueAttempts` …）
+    // 原样落库，供续跑派生事件与后续版本（v0.8.10 排队可见面）复用；**只落派生布尔即视为返工**。
+    // 纪律照既有：只加列、必可空、不复用既有列、读侧 `readNullableString`、**只在 ctor try-ALTER**。
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN diagnostics_json TEXT");
     } catch {
       // 列已存在
     }
@@ -1498,6 +1667,41 @@ export class SessionStore {
     return ids;
   }
 
+  /**
+   * **项目忙任务明细**（v0.8.8 §2.10(c) Trace 面；**只读**）：{@link listBusyProjectIds}
+   * 同一谓词（`busyProjectPredicate()` = 忙集判据唯一事实源）下的**行级**展开 ——
+   * 回答「谁占着这个项目」（`claimed_by` = 占位机）。**跨 Feature、全项目集**（谓词本就无
+   * `feature_id` 条件：项目串行是全局事实，占用者可能是别的 Feature 的节点）。
+   * 按 `created_at` 升序（同项目串行的先来者在前）。
+   */
+  listBusyTasksForProject(projectId: string): QueuedTaskRecord[] {
+    if (projectId.length === 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT ${QUEUE_TASK_COLUMNS} FROM tasks
+         WHERE project_id = ? AND ${this.busyProjectPredicate()}
+         ORDER BY created_at ASC, queued_at ASC`,
+      )
+      .all(projectId) as Array<Record<string, unknown>>;
+    return rows.map(rowToQueuedTask);
+  }
+
+  /**
+   * **排队先于 `createdAt` 的 `queued` 任务数**（v0.8.8 §2.10(c) Trace 面；**只读**）：
+   * `queue_state = 'queued' ∧ created_at < ?`。ISO 串字典序即时间序，与 `created_at` 直接
+   * 比较成立；`created_at` 为 NULL 的老行不计。同毫秒并列**不区分**（严格 `<`，位次是估计量）。
+   */
+  countQueuedBefore(createdAt: string): number {
+    if (createdAt.length === 0) return 0;
+    const row = this.db
+      .prepare(
+        `SELECT COUNT(*) AS n FROM tasks
+         WHERE queue_state = 'queued' AND created_at IS NOT NULL AND created_at < ?`,
+      )
+      .get(createdAt) as Record<string, unknown> | undefined;
+    return Number(row?.["n"] ?? 0);
+  }
+
   // ------------------------------------------------------------------
   // v0.7.0 A2：Runner 注册表（运行态投影，启动不清空）
   // ------------------------------------------------------------------
@@ -1863,8 +2067,13 @@ export class SessionStore {
   }
 
   /**
-   * **墙钟判死**（v0.8.7 O2）：单语句 CAS `claimed`/`running` → `state='failed'` +
-   * `queue_state='settled'` + `failure_kind='infra'`（直写，不经结果回传口）。
+   * **墙钟判死**（v0.8.7 O2；v0.8.8 O1 改判取值）：单语句 CAS `claimed`/`running` →
+   * `state='failed'` + `queue_state='settled'` + `failure_kind = ORPHAN_FAILURE_KIND`
+   * （= **`runner`**，直写，不经结果回传口）。
+   *
+   * ⚠️ **取值不得用 `timeout`**：墙钟判死的任务**不可续跑**（执行体已不在机上），而 `timeout` 是
+   * 场景 C 续跑的靶（`timeoutScope="acp-prompt"` + 有实质产出 ⇒ machine 自动续跑一次）——
+   * 写成 `timeout` 会让 trace 把「人已走了」显示成「本可续跑」。v0.8.7 的 `infra` 直写随二分废止。
    *
    * ⚠️ **不清 claim 三字段**（`claimed_by` / `claim_token` / `claimed_at` 保留）——
    * §2.9 契约 3：墙钟判死后 machine 的**迟到件**须仍能通过 `/runner/result` 的
@@ -1878,26 +2087,27 @@ export class SessionStore {
     const info = this.db
       .prepare(
         `UPDATE tasks
-         SET state = 'failed', queue_state = 'settled', failure_kind = 'infra',
+         SET state = 'failed', queue_state = 'settled', failure_kind = ?,
              finished_at = COALESCE(finished_at, ?), updated_at = ?
          WHERE task_id = ? AND queue_state IN ('claimed', 'running')`,
       )
-      .run(now, now, taskId);
+      .run(ORPHAN_FAILURE_KIND, now, now, taskId);
     return Number(info.changes) > 0;
   }
 
   /**
    * **失败分类写口**（v0.8.7 O3，改造文档 §2.3 写口 (i)）：把 `failure_kind` 落为
-   * `{infra, task}` 二分。分类值由**调用方映射**给出（`bridge/runner.ts` 的纯函数，
-   * 输入 = machine 上报的原生 `AcpError.kind`）—— **映射权归 orch**，machine 不得预映射。
+   * **六类闭集**之一（清单见 `types.ts` 的 `FAILURE_KINDS`；v0.8.8 O1 硬切，取代旧二分 `{infra, task}`）。
+   * 分类值由**调用方**给出 = machine 上报的 `failureKind`（**事实源**），仅在其不合闭集时
+   * 才走 `bridge/runner.ts` 的**兜底映射**（**不是** orch 二次分类，改造文档 §3.3）。
    *
    * `AND state = 'failed'` ⇒ **只在「本次上报胜出终态」时生效**（与 {@link upsertTaskResult}
-   * 的「首个终态胜出」同语义）：迟到 / 重复上报（行已终态、或已被墙钟判死为 `infra`）⇒
+   * 的「首个终态胜出」同语义）：迟到 / 重复上报（行已终态、或已被墙钟判死为 `runner`）⇒
    * **零写入**，故分类不会被后来的重复件改写。
    *
    * - 返回是否发生写入（false = 行不存在 / 该行非 `failed`）。
    * - **不动 `updated_at`**：分类是既有终态行的附属标注，不代表一次状态推进。
-   * - 另一处写口 = 墙钟 sweep {@link failOrphanedTask}（自置 `infra`）；
+   * - 另一处写口 = 墙钟 sweep {@link failOrphanedTask}（自置 `runner`）；
    *   **派发失败路径（`scheduler.ts`）本版不写**。
    */
   setTaskFailureKind(taskId: string, kind: FailureKind): boolean {
@@ -1917,6 +2127,17 @@ export class SessionStore {
    * - 任务不存在 ⇒ 直接 INSERT 一行（`queue_state = 'settled'`，`created_at = 上报时刻`）。
    * - 只写 `state` / artifacts / text / remote_task_id 与 `finished_at`（首次）/ `updated_at`；
    *   **不动** `dependencies` / `dispatch_message` / `retry_count` 等既有编排列。
+   *
+   * v0.8.8 O2（§2.6）：本次写入胜出且新态为终态（`isFinishedState`）⇒ 补发结算事件
+   * （kind 映射沿用 `updateTaskState` 三分支：`blocked → task.blocked`，其余终态 → `task.settled`）；
+   * 迟到 / 重复上报被「首个终态胜出」WHERE 挡成零写入 ⇒ 零事件（幂等）。
+   *
+   * v0.8.8 O3（§2.2 / §2.5）：同一写口顺带落 `diagnostics_json`（宽 JSON **原文**）并派生
+   * **`task.continued`** 事件 —— 落列与发事件都只在「**本次上报胜出首个终态**」时发生
+   * （与 `setTaskFailureKind` 的分类写口同一道门 ⇒ 迟到件既不改分类也不改诊断、不重发事件；
+   * 非终态的 `working` / `input-required` 进度更新照常刷新诊断）。派生判据只看
+   * `continueAttempts > 0`，**与该结果是否终态无关**（续跑后转 `input-required` 同样留痕；
+   * 不发 `feature.failure_report` —— 续跑未收敛）。
    */
   upsertTaskResult(rec: TaskResultUpsertInput): QueuedTaskRecord {
     if (rec.machineId.length === 0 || rec.taskId.length === 0) {
@@ -1927,17 +2148,31 @@ export class SessionStore {
     }
     const now = rec.updatedAt ?? nowIso();
     const finishedAt = isFinishedState(rec.state) ? now : null;
-    this.db
+    // 结算前读记账列（本方法不动这三列，先读保证 payload 取「结算时点」值）：
+    // `retry_count` = `attempt` 口径；`failure_kind` 的分类写口（`setTaskFailureKind`）
+    // 晚于本调用点 ⇒ 未分类时键省略；`state` 供「首个终态胜出」门判据。
+    const pre = this.db
+      .prepare(`SELECT state, retry_count, failure_kind FROM tasks WHERE task_id = ?`)
+      .get(rec.taskId) as
+      | { state: string; retry_count: number | null; failure_kind: string | null }
+      | undefined;
+    // 「首个终态胜出」门（与 `bridge/runner.ts` 写分类的同一条门）：行此前非终态 ⇒ 本次写入胜出；
+    // UPDATE 侧 WHERE 已保证迟到件零写入，这里另挡「迟到件携带的 diagnostics」不改写既有账。
+    const firstSettle = pre === undefined || !isFinishedState(pre.state as TaskState);
+    const diagnosticsJson = serializeDiagnostics(rec.diagnostics);
+    const info = this.db
       .prepare(
         `INSERT INTO tasks
            (task_id, project_id, context_id, state, artifacts_json, text, feature_id, remote_task_id,
+            diagnostics_json,
             updated_at, created_at, started_at, finished_at, queue_state)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'settled')
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'settled')
          ON CONFLICT(task_id) DO UPDATE SET
            state = excluded.state,
            artifacts_json = COALESCE(excluded.artifacts_json, artifacts_json),
            text = COALESCE(excluded.text, text),
            remote_task_id = COALESCE(excluded.remote_task_id, remote_task_id),
+           diagnostics_json = COALESCE(excluded.diagnostics_json, diagnostics_json),
            queue_state = 'settled',
            updated_at = excluded.updated_at,
            finished_at = COALESCE(finished_at, excluded.finished_at)
@@ -1952,6 +2187,7 @@ export class SessionStore {
         rec.text ?? null,
         rec.featureId ?? null,
         rec.remoteTaskId ?? null,
+        firstSettle ? diagnosticsJson : null,
         now,
         now,
         rec.state === "working" ? now : null,
@@ -1963,7 +2199,54 @@ export class SessionStore {
     if (row === undefined) {
       throw new Error(`[session-store] upsertTaskResult 后未能读回记录：${rec.taskId}`);
     }
-    return rowToQueuedTask(row);
+    const stored = rowToQueuedTask(row);
+    // changes>0 =「本次上报确有胜出写入」（迟到 / 重复 ⇒ 零写入 ⇒ 零事件，与 ack 幂等同语义）。
+    const written = Number(info.changes) > 0;
+    // 双门：`written` =「本次上报胜出终态」；isFinishedState = working 进度更新不发结算事件。
+    if (written && isFinishedState(stored.state)) {
+      const kind = stored.state === "blocked" ? EVENT_TASK_BLOCKED : EVENT_TASK_SETTLED;
+      const payload: Record<string, unknown> = {
+        taskId: stored.taskId,
+        state: stored.state,
+        attempt: pre?.retry_count ?? 0,
+        // 续跑口径 = 本次落库的 diagnostics 原文（O3 起有数据源；机侧未带 ⇒ 0，与 O2 口径一致）
+        continueAttempts: readContinueAttempts(stored.diagnosticsJson ?? null),
+        machineId: rec.machineId,
+      };
+      if (pre?.failure_kind != null) {
+        // 与 `rowToTask` 同一读侧口径：存量旧值 ⇒ 兜底 + warn（账单不得带出闭集外的取值）
+        payload.failureKind = coerceStoredFailureKind(pre.failure_kind);
+      }
+      this.appendEvent({
+        featureId: stored.featureId,
+        taskId: stored.taskId,
+        kind,
+        state: stored.state,
+        payload: JSON.stringify(payload),
+      });
+    }
+    // **`task.continued` 派生事件**（§2.2）：仅在 diagnostics 带出 `continueAttempts > 0` 时发，
+    // 一次胜出上报 ⇒ 至多一条（重复 / 迟到件被 `written` 挡）。**不发** `feature.failure_report`
+    // （那是调度器在「失败收敛静止」时的账单，续跑不产出收敛）。
+    const continued = readDiagnosticsObject(stored.diagnosticsJson ?? null);
+    if (written && continued.continueAttempts > 0 && continued.obj !== null) {
+      this.appendEvent({
+        featureId: stored.featureId,
+        taskId: stored.taskId,
+        kind: EVENT_TASK_CONTINUED,
+        state: stored.state,
+        payload: JSON.stringify(
+          continuedEventPayload({
+            taskId: stored.taskId,
+            machineId: rec.machineId,
+            projectId: stored.projectId,
+            obj: continued.obj,
+            continueAttempts: continued.continueAttempts,
+          }),
+        ),
+      });
+    }
+    return stored;
   }
 
   // ------------------------------------------------------------------
@@ -2385,6 +2668,16 @@ export function listBusyProjectIds(): Set<string> {
   return getDefaultStore().listBusyProjectIds();
 }
 
+/** 项目忙任务明细（同 `listBusyProjectIds` 谓词的行级展开；v0.8.8 Trace 面；默认存储；只读） */
+export function listBusyTasksForProject(projectId: string): QueuedTaskRecord[] {
+  return getDefaultStore().listBusyTasksForProject(projectId);
+}
+
+/** 排队先于 `createdAt` 的 `queued` 任务数（v0.8.8 Trace 面位次原料；默认存储；只读） */
+export function countQueuedBefore(createdAt: string): number {
+  return getDefaultStore().countQueuedBefore(createdAt);
+}
+
 /** C11 派发占位：A2A send 前写入「已发出」事实（默认存储） */
 export function markTaskDispatchStarted(taskId: string): TaskRecord | null {
   return getDefaultStore().markTaskDispatchStarted(taskId);
@@ -2473,7 +2766,7 @@ export function listOrphanedTasks(claimedBefore: string): QueuedTaskRecord[] {
   return getDefaultStore().listOrphanedTasks(claimedBefore);
 }
 
-/** 墙钟判死：claimed/running → failed + settled + `failure_kind='infra'`（默认存储；v0.8.7 O2；不清 claim 三字段，契约 3） */
+/** 墙钟判死：claimed/running → failed + settled + `failure_kind='runner'`（不可续跑的载体侧事实；默认存储；v0.8.7 O2 建口、v0.8.8 O1 改判取值；不清 claim 三字段，契约 3） */
 export function failOrphanedTask(taskId: string): boolean {
   return getDefaultStore().failOrphanedTask(taskId);
 }

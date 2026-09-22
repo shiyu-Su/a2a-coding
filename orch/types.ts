@@ -17,8 +17,10 @@
  * （实际强制来自 `agentKind` 闭集拒绝，版本握手只校验主版本）。
  * v0.8.x（req03 硬切）：agentKind 取值 `qoder` 更名为 `qoder-cn`，字段 / 形状不变但**取值集合变更、
  * 旧值 `qoder` 不再合法** ⇒ minor bump `2.1 → 2.2`（同由 `agentKind` 闭集拒绝强制，握手只校验主版本）。
+ * v0.8.8（O1 硬切）：`failureKind` 取值集合由二分 `{infra, task}` 换为六类闭集（成员移除 = 单向不兼容）
+ * ⇒ minor bump `2.2 → 2.3`（须两侧同升；握手仍只校验主版本）。
  */
-export const PROTOCOL_VERSION = "2.2";
+export const PROTOCOL_VERSION = "2.3";
 
 /**
  * 桥可支持的对端（Runner）主版本清单。主版本升级时按 PROTOCOL.md 维护流程
@@ -51,14 +53,47 @@ export type AgentKind = (typeof AGENT_KINDS)[number];
 export type TaskState = "working" | "completed" | "failed" | "input-required" | "blocked";
 
 /**
- * 任务失败分类（v0.4.1 超时与失败自动化；v0.6.1 REQ-05 起语义休眠；**v0.8.7 O3 按二分恢复写入**）。
- * - `infra`：基础设施 / 载体类失败（进程起不来 / 中途死 / 墙钟孤儿）；
- * - `task`：任务自身失败（含协议方言、业务失败，以及**分类未知时的安全降级**）。
+ * 任务失败分类**六类闭集**（v0.4.1 引入；v0.6.1 REQ-05 起休眠；v0.8.7 O3 按二分恢复；
+ * **v0.8.8 O1 硬切为六类**）。
  *
- * v0.4.1 的「取证 → 条件重试」判据**不复活**（重派权仍归宿主）；本版只把**分类事实**接回来，
- * v0.8.8 若要扩到六类，是**加取值**而非重定字段。
+ * ⚠️ **事实源 = `PROTOCOL.md` `/runner/result`「失败分类」条文（2.3 起）**：本清单是协议的
+ * 镜像，**orch 不主动扩展** —— 闭集成员变更（增 / 更名 / 移除）必须先改 `PROTOCOL.md` 并
+ * **两侧同升**（取值集合成员移除 = 单向不兼容），再同步到这里。
+ *
+ * - `agent`：后端 agent 本身起不来 / 不认（spawn 失败 / 进程中途退出 / 后端 `rpc`·`protocol` 语义拒绝）；
+ * - `transport`：launcher ↔ 编排桥的 HTTP 传输层失败（`send` / `poll` 阶段）；
+ * - `runner`：**载体侧事实**（launcher deadline 抛错 / `ensure` 抛错 / 启动补结算与墙钟孤儿）；
+ * - `model_queue`：疑似模型侧排队 / 配额限流 —— **machine 恒不产出**，只由 orch 侧启发式**标注**；
+ * - `timeout`：满窗，**必带子键** `diagnostics.timeoutScope`（`acp-prompt` / `runner-deadline` 分家）；
+ * - `business`：后端正常收敛但业务失败 —— 亦是**安全兜底类**（落在「不可重试」侧）。
+ *
+ * 旧二分 `{infra, task}` 自 2.3 起**不再是合法取值**，但**接收端必须宽容**（混跑窗口内未升级的
+ * 2.2 machine 仍原样上报）⇒ 一律兜底落 `business` + warn 留原值，见 `bridge/runner.ts`。
+ * 自动重试的闭集白名单只有 `timeout × timeoutScope="acp-prompt" × 有实质产出` 一条（在 machine 侧执行）。
  */
-export type FailureKind = "infra" | "task";
+export const FAILURE_KINDS = [
+  "agent",
+  "transport",
+  "runner",
+  "model_queue",
+  "timeout",
+  "business",
+] as const;
+
+/** 失败分类（由 `FAILURE_KINDS` 派生；勿另立第二份清单） */
+export type FailureKind = (typeof FAILURE_KINDS)[number];
+
+/**
+ * **墙钟判死**（孤儿清算）直写的分类（v0.8.8 O1）。
+ *
+ * 口径：领取后超 `runner.orphanTimeoutMs` 无回传 ⇒ **执行体已不在机上**，属**载体侧事实**，
+ * 与 machine 侧「启动补结算孤儿」同类（协议条文 / 改造文档 §2.3 均定档 `runner`）。
+ *
+ * ⚠️ **不得取 `timeout`**：`timeout` 是场景 C 续跑的靶（`timeoutScope="acp-prompt"` + 有实质产出
+ * ⇒ machine 可自动续跑一次），墙钟判死的任务**不可续跑** —— 若直写 `timeout`，trace 会把
+ * 「人已走了」显示成「本可续跑」。v0.8.7 的 `infra` 直写口径随二分一并废止。
+ */
+export const ORPHAN_FAILURE_KIND: FailureKind = "runner";
 
 /**
  * Feature 状态（v0.3.0；v0.4.1 REQ-04 收敛为 6 态主链）。
@@ -236,7 +271,7 @@ export interface ProjectGroup {
  *   **不得触发 stop**（D8；清算 = requeue，见 B2）。
  * - `orphanTimeoutMs`：**孤儿墙钟判死阈值**（v0.8.7 O2；缺省 `1800000` = 30 min）。
  *   判据 `queue_state ∈ {claimed, running} ∧ claimed_at < now - orphanTimeoutMs` ⇒
- *   `sweepOrphanedTasks()` 置 `failed`（`failure_kind='infra'`）+ `task.orphaned` 事件。
+ *   `sweepOrphanedTasks()` 置 `failed`（`failure_kind='runner'` = 不可续跑的载体侧事实）+ `task.orphaned` 事件。
  *   ⚠️ 跨单元不变量（写死）：`orphanTimeoutMs > dispatchTimeoutMs`（machine 侧有 ≤15 min
  *   上限护栏 + 300s margin ⇒ 恒 ≥1.5× 余量）；orch **不读 machine 配置**。
  */
@@ -399,17 +434,35 @@ export interface TaskRecord {
    */
   retryCount: number;
   /**
-   * 失败分类（v0.4.1 引入；v0.6.1 REQ-05 起随五层删除**停止写入**；**v0.8.7 O3 恢复写入**）。
+   * 失败分类（v0.4.1 引入；v0.6.1 REQ-05 起随五层删除**停止写入**；v0.8.7 O3 恢复写入；
+   * **v0.8.8 O1 起取值为六类闭集**，见 {@link FAILURE_KINDS}）。
    *
-   * 现行两处写口（改造文档 §2.3）：
-   * - `/runner/result` 回传 ⇒ `setTaskFailureKind`（分类值 = orch 侧纯函数映射 machine 原生
-   *   `AcpError.kind`，**映射权归 orch**；`spawn`/`closed` ⇒ `infra`，其余（含未知 / 缺失）⇒ `task`）；
-   * - 孤儿墙钟判死 ⇒ `failOrphanedTask` 自置 `infra`（v0.8.7 O2）。
+   * 现行两处写口（改造文档 §2.1）：
+   * - `/runner/result` 回传 ⇒ `setTaskFailureKind`（**分类事实源 = machine 上报的 `failureKind`**，
+   *   orch 只做**闭集校验 + 落库**；未上报合格六类值时才落兜底：缺键 ⇒ 由原生 `AcpError.kind`
+   *   经 `mapAcpErrorKindToFailureKind` 取安全值（`spawn`/`closed` ⇒ `agent`），旧值 / 未知值 ⇒
+   *   `business`；两条兜底路径均 warn 留原值）；
+   * - 孤儿墙钟判死 ⇒ `failOrphanedTask` 自置 `runner`（载体侧事实、**不可续跑**；v0.8.7 的
+   *   `infra` 直写口径废止）。
    *
    * ⚠️ **旧文本白名单分类器 `classifyFailure` 与旧写口 `markTaskFailureKind` 均不复活**
-   * （判据已升级为结构化 kind）；**派发失败路径（`scheduler.ts`）本版不写** ⇒ 该路径仍为 `null`。
+   * （判据已升级为结构化 kind）；**派发失败路径（`scheduler.ts`）不写** ⇒ 该路径仍为 `null`。
    */
   failureKind: FailureKind | null;
+  /**
+   * **machine 上报的 `diagnostics` 宽 JSON 原文**（v0.8.8 O3 · 改造文档 §2.2 / §2.5 落库口径）。
+   *
+   * 唯一写口 = `upsertTaskResult()`（`/runner/result` 结果落库路径，COALESCE ⇒ 迟到件不覆写）。
+   * **原样序列化落库、不压成派生布尔**：排队可见面与限流（v0.8.10）要在这些原料上叠判据
+   * （`firstChunkElapsedMs` / `promptElapsedMs` / `bridgeEnsureElapsedMs` / `timeoutScope` /
+   * `acpErrorCode` / `acpErrorData` / `partialChars` / `updateCount` / `sessionResumed` /
+   * `continueAttempts` / `continueTrigger` / `partialTailChars` / `workspaceTouched` /
+   * `touchedFileCount`），只落布尔 = 把原料丢掉（§2.5「返工红线」）。
+   *
+   * NULL = 机侧未带 diagnostics / 升级前的存量行。**不落 `retry_count`**：续跑与宿主重派是
+   * 正交两口径（§2.2），本列只承载机侧事实原文。
+   */
+  diagnosticsJson?: string | null;
   /**
    * **休眠列（自 REQ-05 起）** —— 中性化标记（v0.4.1 的「失败节点已被取证流接管」）。
    *
@@ -459,7 +512,7 @@ export interface EventRecord {
   eventId: number;
   featureId: string | null;
   taskId: string | null;
-  /** `task.settled` / `task.blocked` / `feature.state` */
+  /** `task.settled` / `task.blocked` / `task.continued` / `feature.state` */
   kind: string;
   /** 变化后的状态串（可空） */
   state: string | null;

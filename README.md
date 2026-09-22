@@ -1,6 +1,6 @@
 # a2a-coding
 
-> 基于 A2A 的分布式 Code Agent 协作：以 orch Agent 为统一入口，按「项目」组织 Code Agent，三端均支持（OpenCode / Codex / Claude Code），让需求讨论留在 orch、执行交给各项目自己的 Agent。
+> 基于 A2A 的分布式 Code Agent 协作：以 orch Agent 为统一入口，按「项目」组织 Code Agent，三端均支持（OpenCode / Codex / Claude Code），让需求讨论留在 orch、执行交给各项目自己的 Agent。（当前版本 v0.8.8；Runner ⇄ Bridge 线协议 2.3）
 
 <!-- badges 待补充：仓库暂无 LICENSE 文件、无 CI 状态、无发布版本，可在此补充 License / Build Status / Version 徽章 -->
 
@@ -616,7 +616,7 @@ Launcher 被硬杀（`taskkill /F`、崩溃、断电）时，它拉起的项目 
 
 - **单实例与启动顺序**：Launcher **先 `listen` 端口再自检**，端口绑定即单实例互斥锁，重复启动的第二实例在 `listen` 阶段即 `EADDRINUSE` 退出，不进入自检，从根上杜绝双实例撞 a2a 端口。`'listening'` 后写 pidfile `<machine 根>/.a2a/launcher.pid`（JSON `{ pid, port, host, startedAt }`，UTC ISO-8601，供启停脚本读取，非锁，陈旧无害），优雅退出 / fail-fast / `process exit` 均删除。
 - **就绪门**：自检通过前 `GET /health` 仍 `200` 但报 `status:"starting"`，业务路由（`/projects*`）返回 `503`；通过后 `status:"ok"`。
-- **线协议版本化（Bridge ⇄ Launcher）**：Launcher 在 `GET /health` 自报 `protocolVersion`（`"major.minor"`，单一事实源见 [PROTOCOL.md](PROTOCOL.md)）；桥首触一台机器（首个 `/projects` / `ensure` 前）先握手校验，机器主版本不在桥侧可支持清单（`SUPPORTED_PEER_PROTOCOL_MAJORS`）内即拒绝派发并给出升级指引。成功校验进程内缓存（后续调用不再握手）；失败不缓存负项，机器升级后下一轮调用自动恢复，无需重启桥。版本规则：加可选字段 → minor+1；删字段 / 改语义 / 加必填请求体 → major+1。
+- **线协议版本化（Bridge ⇄ Launcher）**：当前线协议 **2.3**（v0.8.8；2.3 变更 = `failureKind` 取值升为六类闭集 `agent` / `transport` / `runner` / `model_queue` / `timeout` / `business`，旧值 `infra` / `task` 非法但接收端兜底不丢单）。Launcher 在 `GET /health` 自报 `protocolVersion`（`"major.minor"`，单一事实源见 [PROTOCOL.md](PROTOCOL.md)）；桥首触一台机器（首个 `/projects` / `ensure` 前）先握手校验，机器主版本不在桥侧可支持清单（`SUPPORTED_PEER_PROTOCOL_MAJORS`）内即拒绝派发并给出升级指引。成功校验进程内缓存（后续调用不再握手）；失败不缓存负项，机器升级后下一轮调用自动恢复，无需重启桥。版本规则：加可选字段 → minor+1；删字段 / 改语义 / 加必填请求体 → major+1。
 - **启动自检**（缺省开，`launcher.startupCheck=false` 跳过）：先 `listen` 端口，随后对本机全部项目逐个 `ensure` 拉起 → 经 A2A 发送一条真实最小任务 → 校验任务完成且响应非空 → `stop` 回收。全部通过才放行业务路由；任一失败即打印项目 / 阶段 / 原因，关闭端口 → 回收子进程 → 删 pidfile → 退出（非零）。每个项目消耗一次极小模型调用，自检与真实任务同链路，能暴露认证 / 模型 / provider 缺配。
 - **配置快照**：每次拉起 Agent 时，Launcher 日志会打印该项目的配置获取层级（项目 `agentConfig` / 用户级配置文件路径）+ endpoint / 模型 id（值标注来源 `agentConfig` / `env` / 用户配置），便于核对实际生效的模型与网关。
 - **任务执行日志（三端统一）**：任一端真实任务（orch 派发或自检触发）在 Launcher 日志中可见统一三段观测：`[a2a-task] start taskId=… contextId=… promptLen=…` → `[a2a-task] end taskId=… contextId=… state=completed|failed|canceled responseChars=… durationMs=…`（failed 行附单行截断 `error=`）→ 自检路径另有 `[self-check] <projectId> 通过：taskId=… contextId=… state=… responseChars=… durationMs=…`。三端格式逐字段一致，`grep "\[a2a-task\]"` 可直接对齐观测。

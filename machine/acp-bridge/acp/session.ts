@@ -3,6 +3,7 @@
  *
  * 语义（依 P1 探针实测方言）：
  * - 会话保证：`session/load` → 失败回退 `session/resume` → 再失败 `session/new`；成功映射落 `SessionMap`；
+ *   阶梯的**实际落点**经 `sessionResumed` 回标（v0.8.8 · M1，见下「失败诊断留痕」）；
  * - `session/prompt` params `{ sessionId, prompt:[{type:"text",text}] }`；
  *   **注入 = 每 session 首轮 prompt 前缀**（v0.8.1 · M2）：内容 = 缺省 a2a-outcome 约定
  *   + config 段 `systemPrompt`（append=追加缺省之后 / replace=替换缺省；无 config 仅约定）；
@@ -43,14 +44,28 @@
  * `session/new` / `load` / `resume` **三路统一携带 `_meta`**（否则复用会话拿不到 ⇒ full 档静默降级）。
  * 桥只收 adapter 的原样值，**不做 kind→mode 映射**。
  *
- * **失败诊断留痕（v0.8.7 · M4）**：三处失败出口（① 会话建立失败 ② prompt 失败 ③ prompt 超时）各在
- * `TaskExecutionResult.artifacts` 追加一条 `name="machine-diagnostics"`（text = JSON）⇒ **零类型 /
- * 零 wire 变更**；launcher `buildResult` 按名摘除 + 解析（见 {@link DIAGNOSTICS_ARTIFACT_NAME}）。
- * 字段：`acpErrorKind`（`AcpError["kind"]`，非结构化抛出归 `error`）· `chunkCount`（本轮已收
- * `agent_message_chunk` 数）· `elapsedMs`（**prompt 段**耗时；① 未进入 prompt ⇒ 0，三段耗时计量留
- * 后续版本）· `stage`（`ensure` / `prompt` 落点）。正常完成路径不带该 artifact。
+ * **失败诊断留痕（v0.8.7 · M4 → v0.8.8 · M1 扩）**：三处失败出口（① 会话建立失败 ② prompt 失败
+ * ③ prompt 超时）各在 `TaskExecutionResult.artifacts` 追加一条 `name="machine-diagnostics"`（text = JSON）
+ * ⇒ **零类型 / 零 wire 变更**；launcher `buildResult` 按名摘除 + 解析（见 {@link DIAGNOSTICS_ARTIFACT_NAME}）。
+ *
+ * 载荷键（v0.8.8 · M1 计量补全 + 取证面；改造文档 §2.5 / §2.3.1）：
+ * - **恒定七键**：`acpErrorKind`（`AcpError["kind"]`，非结构化抛出归 `error`）· `stage`（`ensure` / `prompt`
+ *   落点）· `promptElapsedMs`（**prompt 段**耗时，改名自 `elapsedMs`，避开与 launcher 侧同名异义的
+ *   `elapsedMs`；① 未进入 prompt ⇒ 0）· `bridgeEnsureElapsedMs`（会话建立段耗时）· `chunkCount`（本轮
+ *   入缓冲 `agent_message_chunk` 数）· `partialChars`（本轮累计字符数，「确有产出」主判据原料）·
+ *   `updateCount`（本轮**任意** `session/update` 计数，含 thought / tool_call = 「有推进」原料）；
+ * - **条件五键**（事实缺失即**不报该键**，不编造 0 / false）：`firstChunkElapsedMs`（首 chunk 距开窗；
+ *   无 chunk ⇒ 缺键，「满窗零产出」的证据）· `sessionResumed`（`load → resume → new` 阶梯实际是否续接
+ *   成功；`false` = **续跑退化成重跑**，本机制最大隐性风险，必须上报）· `acpErrorCode` / `acpErrorData`
+ *   （后端错误对象的 `code` 与 `data` **宽 JSON 原文** —— opencode 把细节只写进 `data`，丢掉它等于把
+ *   错误压成「Invalid params」四个字）· `partialTail` / `partialTailChars`（半截产出**取出再弃**前先快照、
+ *   截断至 {@link DIAGNOSTICS_PARTIAL_TAIL_MAX_CHARS} 经本通道带回 launcher —— 进程会被杀，桥内存态必失效）。
+ *
+ * ⚠ launcher 侧 `parseBridgeDiagnostics` 是**逐键白名单**：未放行的键会被**静默忽略**（改造文档 §2.5
+ * 「只加键不 breaking」）。M1 计量键与取证键的放行已由 M2 同步，契约由 `test/acp-session.test.ts`
+ * 的「M4 契约 / M1↔M2 契约」两例锚住（白名单再收窄时该二例失败）。正常完成路径不带该 artifact。
  */
-import { AcpError } from "./client.js";
+import { AcpError, wideJson } from "./client.js";
 import { buildArtifacts } from "../artifacts.js";
 import type { TaskExecutionInput, TaskExecutionResult } from "../types.js";
 import { parseOutcome } from "../outcome.js";
@@ -69,8 +84,67 @@ export const DEFAULT_TASK_TIMEOUT_MS = 660_000;
  */
 export const DIAGNOSTICS_ARTIFACT_NAME = "machine-diagnostics";
 
+/**
+ * 半截产出随 diagnostics 带回 launcher 的尾部上限（字符）。**护的是 `/runner/result` 的 1 MiB
+ * 请求体上限**（UTF-8 最坏 4 字节/字符 ⇒ 4k 字符 ≤ 16 KB）；与 launcher 侧续跑判据的
+ * `CONTINUE_TAIL_MAX_CHARS`（M2）取同一数值，桥先截 ⇒ 桥是唯一持有该文本的地方。
+ */
+export const DIAGNOSTICS_PARTIAL_TAIL_MAX_CHARS = 4_000;
+
+/** diagnostics 载荷里 `acpErrorData` 宽 JSON 原文的上限（字符）。 */
+const DIAGNOSTICS_DATA_MAX_CHARS = 2_000;
+
+/** 人读文本（结果文本 / 日志）里的 `data` 摘要上限（字符）—— 比诊断载荷短，避免文本被淹。 */
+const REASON_DATA_MAX_CHARS = 300;
+
 /** 诊断落点（v0.8.7 · M4）：桥内两处失败出口的阶段标识。 */
 type BridgeDiagStage = "ensure" | "prompt";
+
+/**
+ * `withDiag` 的入参（v0.8.8 · M1）：三项计数与两段耗时**恒报**（无事实即 0，含义明确）；
+ * 可选键（`firstChunkElapsedMs` / `sessionResumed` / `partialTail`）**事实缺失 ⇒ 不报**
+ * （0 / false 与「没发生」是两回事，下游判据靠前者会误判）；`acpErrorCode` / `acpErrorData`
+ * 由 `err` 派生，同样「无即不报」。
+ */
+interface BridgeDiag {
+  err: unknown;
+  stage: BridgeDiagStage;
+  promptElapsedMs: number;
+  bridgeEnsureElapsedMs: number;
+  chunkCount: number;
+  partialChars: number;
+  updateCount: number;
+  firstChunkElapsedMs?: number;
+  sessionResumed?: boolean;
+  partialTail?: string;
+}
+
+/**
+ * 本轮捕获窗（v0.8.8 · M1）：把此前分散在 `buffers` / `capturing` / `captureOpenedAt` /
+ * `replayDropped` 四张并行 map 里的**同一份本轮状态**收成一处，避免跨表漂移与计量口径不一致。
+ * 生命周期 = `session/prompt` 写出前置入（M9 捕获窗）、`takeText` / `discardCapture` 移除。
+ */
+interface CaptureWindow {
+  /** 本轮保留的 `agent_message_chunk` 文本（历史重放已在入缓冲前排除） */
+  readonly chunks: string[];
+  /** 开窗时刻（ms）—— `promptElapsedMs` / `firstChunkElapsedMs` 的锚点 */
+  readonly openedAt: number;
+  /** 首个入缓冲的 chunk 时刻（ms）；**缺 = 本轮一个 message chunk 都没来过**（「满窗零产出」的证据） */
+  firstChunkAt?: number;
+  /** 本轮入缓冲 chunk 的累计字符数（「确有产出」主判据原料） */
+  partialChars: number;
+  /** 本轮**任意** `session/update` 计数（含 thought / tool_call = 「有推进」原料） */
+  updateCount: number;
+  /** 窗内被 messageId 轮边界判据丢弃的历史重放 chunk 数（收窗时一行日志，供真机取证） */
+  replayDropped: number;
+}
+
+/** 会话建立结果（v0.8.8 · M1 回标：`load → resume → new` 阶梯的实际落点）。 */
+interface EstablishedSession {
+  sessionId: string;
+  /** `load` / `resume` 任一真成功 = true；回落 `session/new` ⇒ false（**续跑退化成重跑**，必须上报） */
+  sessionResumed: boolean;
+}
 
 /** 会话客户端最小面（`AcpClient` 结构满足；便于 fake 注入）。 */
 export interface AcpRequestClient {
@@ -132,10 +206,33 @@ function messageOf(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
 }
 
-/** 失败原因串 = 后端原文 + 可选 `（code=…）`（与 `applyModel` 的拼装逐字同形；v0.8.5 · M1）。 */
+/** 后端错误对象的 `code`（非 `AcpError` / 无 code ⇒ `undefined`，**不编造**）。 */
+function errorCodeOf(err: unknown): number | undefined {
+  return err instanceof AcpError && err.code !== undefined ? err.code : undefined;
+}
+
+/**
+ * 后端错误对象的 `data` 宽 JSON 原文（截断到 `maxChars`；无 `data` ⇒ `undefined`，**不编造**）。
+ * **方言不对称**（双样本取证）：opencode 把细节只写进 `data`、qoder-cn 写进 `message`
+ * ⇒ 两侧都得留（改造文档 §2.5 第 12 键）。
+ */
+function errorDataOf(err: unknown, maxChars: number): string | undefined {
+  const data = err instanceof AcpError ? err.data : undefined;
+  return data === undefined ? undefined : wideJson(data, maxChars);
+}
+
+/**
+ * 失败原因串 = `message` + `（code=…）` + `〔data=…〕`（v0.8.8 · M1 取证面）。
+ * 三处消费：`applyModel` / `applyMode` / `applyCollaborationMode` 的 fail-fast 文本、
+ * `failureResult` 的结果文本、会话建立失败的结果文本 —— 此前 `failureResult` 连 `code` 都不拼，
+ * 是「配额 / 限流到底有没有报错」这个问题答不上来的直接原因。
+ */
 function reasonOf(err: unknown): string {
-  const code = err instanceof AcpError && err.code !== undefined ? `（code=${String(err.code)}）` : "";
-  return `${messageOf(err)}${code}`;
+  const code = errorCodeOf(err);
+  const data = errorDataOf(err, REASON_DATA_MAX_CHARS);
+  return `${messageOf(err)}${code === undefined ? "" : `（code=${String(code)}）`}${
+    data === undefined ? "" : `〔data=${data}〕`
+  }`;
 }
 
 /** 后端未实现该方法（JSON-RPC `-32601` Method not found）—— **仅此错误**允许回落。 */
@@ -196,20 +293,12 @@ export class AcpSessionRunner {
   /** 会话建立期 `_meta`（`undefined` ⇒ 三路均不携带）。 */
   private readonly sessionMeta: Record<string, unknown> | undefined;
   private readonly logger: (message: string) => void;
-  /** sessionId → 已累积的 agent message chunks */
-  private readonly buffers = new Map<string, string[]>();
   /**
-   * 本轮捕获窗（sessionId 集合）：仅 `session/prompt` 写出前置入、`takeText`/失败路径移除。
-   * 窗外到达的 agent_message_chunk（load/resume 回灌 backlog）不入本轮缓冲。
+   * sessionId → 本轮捕获窗（v0.8.8 · M1）：**开窗即存在、收窗即删** ⇒ 「有窗」等价于旧
+   * `capturing.has(...)`；窗内一次性收齐本轮的 chunk 文本与三原料计数（旧 `buffers` /
+   * `capturing` / `captureOpenedAt` / `replayDropped` 四张并行 map 的合并落点）。
    */
-  private readonly capturing = new Set<string>();
-  /**
-   * sessionId → 本轮捕获**开窗时刻**（ms）：与 `buffers.set` / `capturing.add` 同点写、
-   * `takeText` / `discardCapture` 同点清 —— 失败出口 `elapsedMs`（prompt 段）的计量来源（v0.8.7 · M4）。
-   */
-  private readonly captureOpenedAt = new Map<string, number>();
-  /** sessionId → 窗内被 messageId 轮边界判据丢弃的历史重放 chunk 数（收窗时一行日志，供真机取证） */
-  private readonly replayDropped = new Map<string, number>();
+  private readonly captures = new Map<string, CaptureWindow>();
   /**
    * sessionId → 重放 messageId 集合（M9-c）：捕获窗外（`session/load|resume` 回灌期）出现过的
    * 每个 messageId。窗内 chunk 的 id 命中本集合 ⇒ 判为历史重放；未命中 ⇒ 判为本轮实时消息的新 id。
@@ -261,17 +350,25 @@ export class AcpSessionRunner {
 
   /** 执行一个任务（B1 `TaskExecutor.execute` 语义）。 */
   async execute(input: TaskExecutionInput): Promise<TaskExecutionResult> {
-    let sessionId: string;
+    const ensureStartedAt = Date.now();
+    let session: EstablishedSession;
     try {
-      sessionId = await this.ensureSession(input.contextId);
+      session = await this.ensureSession(input.contextId);
     } catch (err) {
-      return this.withDiag({ state: "failed", text: `会话建立失败：${messageOf(err)}` }, {
-        kind: errorKindOf(err),
+      // 建立失败：捕获窗未开 ⇒ 三项计数记 0，`sessionResumed` / `firstChunkElapsedMs` **不报**
+      //（无事实不编造，报 0 会被下游当成「有推进但零字符」）
+      return this.withDiag({ state: "failed", text: `会话建立失败：${reasonOf(err)}` }, {
+        err,
         stage: "ensure",
-        elapsedMs: 0, // 未进入 prompt 段
-        chunkCount: 0, // 捕获窗未开
+        promptElapsedMs: 0, // 未进入 prompt 段
+        bridgeEnsureElapsedMs: Math.max(0, Date.now() - ensureStartedAt),
+        chunkCount: 0,
+        partialChars: 0,
+        updateCount: 0,
       });
     }
+    const { sessionId, sessionResumed } = session;
+    const bridgeEnsureElapsedMs = Math.max(0, Date.now() - ensureStartedAt);
     this.taskSessions.set(input.taskId, sessionId);
 
     const firstTurn = this.isFirstTurn(input.contextId);
@@ -284,24 +381,40 @@ export class AcpSessionRunner {
       // M9 捕获窗：prompt 写出前才清缓冲并开窗（窗外 backlog 直接丢弃，但其 messageId 已登记）。
       // 探针实测回灌尾部与本窗开启毫秒级交叠 ⇒ 窗内另按 M9-c 重放 id 集合二次过滤。
       // 注意：不可在此清 replayMessageIds —— 其中的 id 正是本轮 ensureSession 的 load/resume 期登记的。
-      this.buffers.set(sessionId, []);
-      this.capturing.add(sessionId);
-      this.captureOpenedAt.set(sessionId, Date.now());
+      this.captures.set(sessionId, {
+        chunks: [],
+        openedAt: Date.now(),
+        partialChars: 0,
+        updateCount: 0,
+        replayDropped: 0,
+      });
       promptResult = await this.requestWithTimeout("session/prompt", {
         sessionId,
         prompt: [{ type: "text", text: promptText }],
       });
     } catch (err) {
-      // 诊断计量须在清窗**之前**读（`discardCapture` 后缓冲与开窗时刻即失）
-      const openedAt = this.captureOpenedAt.get(sessionId);
-      const stats = {
-        kind: errorKindOf(err),
-        stage: "prompt" as const,
-        elapsedMs: openedAt === undefined ? 0 : Math.max(0, Date.now() - openedAt),
-        chunkCount: this.buffers.get(sessionId)?.length ?? 0,
+      // 计量与半截尾部快照须在 `discardCapture` **之前**取：失败后进程可能被杀 ⇒ 桥内存态必失效，
+      // 尾部只能经 diagnostics 通道带回 launcher（M3 用它拼续跑 prompt）
+      const win = this.captures.get(sessionId);
+      const produced = win === undefined ? "" : win.chunks.join("");
+      const diag: BridgeDiag = {
+        err,
+        stage: "prompt",
+        promptElapsedMs: win === undefined ? 0 : Math.max(0, Date.now() - win.openedAt),
+        bridgeEnsureElapsedMs,
+        chunkCount: win === undefined ? 0 : win.chunks.length,
+        partialChars: win === undefined ? 0 : win.partialChars,
+        updateCount: win === undefined ? 0 : win.updateCount,
+        firstChunkElapsedMs:
+          win === undefined || win.firstChunkAt === undefined
+            ? undefined
+            : Math.max(0, win.firstChunkAt - win.openedAt),
+        sessionResumed,
+        partialTail:
+          produced.length === 0 ? undefined : produced.slice(-DIAGNOSTICS_PARTIAL_TAIL_MAX_CHARS),
       };
       this.discardCapture(sessionId);
-      return this.withDiag(this.failureResult(err), stats);
+      return this.withDiag(this.failureResult(err), diag);
     }
     // prompted 置位时机 = 收到响应即置（含 end_turn / input-required / cancelled）
     if (firstTurn) {
@@ -351,26 +464,37 @@ export class AcpSessionRunner {
     if (err instanceof AcpError && err.kind === "timeout") {
       return { state: "failed", text: `任务超时（ACP session/prompt 超过 ${String(this.timeoutMs)}ms）` };
     }
-    return { state: "failed", text: messageOf(err) };
+    // v0.8.8 · M1 取证面：此前本出口连 `code` 都不拼（与 `reasonOf` 不同形）⇒ 后端带码错误
+    // （配额 / 限流 / Invalid params + `data`）在结果文本里被压成一句话，事后无从取证
+    return { state: "failed", text: reasonOf(err) };
   }
 
   /**
-   * 失败出口挂诊断留痕（v0.8.7 · M4）：经现成 `artifacts` 通道追加一条 {@link DIAGNOSTICS_ARTIFACT_NAME}
-   * （text = JSON）⇒ 零类型 / 零 wire 变更；launcher 侧摘除 + 解析。正常完成路径不调用本方法。
+   * 失败出口挂诊断留痕（v0.8.7 · M4 → v0.8.8 · M1 扩键）：经现成 `artifacts` 通道追加一条
+   * {@link DIAGNOSTICS_ARTIFACT_NAME}（text = JSON）⇒ 零类型 / 零 wire 变更；launcher 侧摘除 + 解析。
+   * 正常完成路径不调用本方法。值为 `undefined` 的键由 `JSON.stringify` 自然**省略** ⇒
+   * 「没报」与「报了 0」在载荷上可区分。
    *
-   * ⚠ **chunkCount 只作留痕，绝不作自动重发判据**：`onNotification` 只计 `agent_message_chunk`、
+   * ⚠ **`chunkCount` 只作留痕，绝不作自动重发判据**：它只计 `agent_message_chunk`、
    * `agent_thought_chunk` 被忽略 ⇒ 思考型后端（codex / claude 长思考）可「有推进而 chunkCount=0」，
-   * 而一句「我先看一下」就让 chunkCount>0 —— **双向误判**。重发判据 = 相位 + 错误类型（M5）。
+   * 而一句「我先看一下」就让 chunkCount>0 —— **双向误判**。判「有推进」用 `updateCount`、
+   * 判「有实质产出」用 `partialChars`（改造文档 §2.4 续跑判据）。
    */
-  private withDiag(
-    result: TaskExecutionResult,
-    diag: { kind: string; stage: BridgeDiagStage; elapsedMs: number; chunkCount: number },
-  ): TaskExecutionResult {
+  private withDiag(result: TaskExecutionResult, diag: BridgeDiag): TaskExecutionResult {
     const payload = JSON.stringify({
-      acpErrorKind: diag.kind,
+      acpErrorKind: errorKindOf(diag.err),
       stage: diag.stage,
-      elapsedMs: diag.elapsedMs,
+      promptElapsedMs: diag.promptElapsedMs,
+      bridgeEnsureElapsedMs: diag.bridgeEnsureElapsedMs,
       chunkCount: diag.chunkCount,
+      partialChars: diag.partialChars,
+      updateCount: diag.updateCount,
+      firstChunkElapsedMs: diag.firstChunkElapsedMs,
+      sessionResumed: diag.sessionResumed,
+      acpErrorCode: errorCodeOf(diag.err),
+      acpErrorData: errorDataOf(diag.err, DIAGNOSTICS_DATA_MAX_CHARS),
+      partialTail: diag.partialTail,
+      partialTailChars: diag.partialTail?.length,
     });
     return {
       ...result,
@@ -386,13 +510,16 @@ export class AcpSessionRunner {
     const sessionId = params["sessionId"];
     const update = params["update"];
     if (typeof sessionId !== "string" || !isRecord(update)) return;
+    // 本轮任意 session/update 都算「有推进」（含 thought / tool_call / plan）—— 窗内才计
+    const win = this.captures.get(sessionId);
+    if (win !== undefined) win.updateCount += 1;
     // P1 探针：仅 agent_message_chunk 计入回复（agent_thought_chunk 为思考，忽略）
     if (update["sessionUpdate"] !== "agent_message_chunk") return;
     const content = update["content"];
     if (!isRecord(content)) return;
     const text = content["text"];
     if (typeof text !== "string") return;
-    if (!this.capturing.has(sessionId)) {
+    if (win === undefined) {
       // 窗外 = load/resume 回灌 backlog，不入本轮缓冲；其 messageId 登记为重放 id（M9-c）
       const replayId = messageIdOf(update);
       if (replayId !== undefined) {
@@ -408,57 +535,72 @@ export class AcpSessionRunner {
     const id = messageIdOf(update);
     if (id !== undefined && this.replayMessageIds.get(sessionId)?.has(id) === true) {
       // M9-c 轮边界：该 id 在捕获窗外已出现过 = 历史消息重放的尾部，排除出本轮文本
-      this.replayDropped.set(sessionId, (this.replayDropped.get(sessionId) ?? 0) + 1);
+      win.replayDropped += 1;
       return;
     }
-    const buffer = this.buffers.get(sessionId);
-    if (buffer !== undefined) buffer.push(text);
+    if (win.firstChunkAt === undefined) win.firstChunkAt = Date.now();
+    win.partialChars += text.length;
+    win.chunks.push(text);
   }
 
   private takeText(sessionId: string): string {
-    this.capturing.delete(sessionId);
-    this.captureOpenedAt.delete(sessionId);
+    const win = this.captures.get(sessionId);
+    this.captures.delete(sessionId);
     this.replayMessageIds.delete(sessionId);
-    const dropped = this.replayDropped.get(sessionId);
-    if (dropped !== undefined) {
+    if (win === undefined) return "";
+    if (win.replayDropped > 0) {
       this.logger(
-        `[acp-session] 本轮丢弃历史重放 chunk ${String(dropped)} 条（sessionId=${sessionId}）`,
+        `[acp-session] 本轮丢弃历史重放 chunk ${String(win.replayDropped)} 条（sessionId=${sessionId}）`,
       );
-      this.replayDropped.delete(sessionId);
     }
-    const chunks = this.buffers.get(sessionId);
-    this.buffers.delete(sessionId);
-    return chunks === undefined ? "" : chunks.join("");
+    return win.chunks.join("");
   }
 
-  /** prompt 失败/超时路径：关窗并弃置半截缓冲，避免残窗把下轮 backlog 收进来。 */
+  /**
+   * prompt 失败/超时路径：关窗并弃置半截缓冲，避免残窗把下轮 backlog 收进来。
+   * **调用方必须在调用前取走尾部与计量**（v0.8.8 · M1「取出再弃」）—— 窗一关即失。
+   */
   private discardCapture(sessionId: string): void {
-    this.capturing.delete(sessionId);
-    this.captureOpenedAt.delete(sessionId);
-    this.buffers.delete(sessionId);
-    this.replayDropped.delete(sessionId);
+    this.captures.delete(sessionId);
     this.replayMessageIds.delete(sessionId);
   }
 
   /**
    * 会话保证：load → resume → new；**三条路径成功后**统一依次走一次 {@link applyModel} /
    * {@link applyMode} / {@link applyCollaborationMode}（恢复路径同样下发，不假设后端跨会话保持）。
+   *
+   * **回标 `sessionResumed`（v0.8.8 · M1）**：`load` / `resume` 任一真成功 ⇒ true；两级都失败回落
+   * `session/new` ⇒ false = **续跑退化成重跑**（本机制最大隐性风险，日志 + 诊断双留痕）。
    */
-  private async ensureSession(contextId: string): Promise<string> {
+  private async ensureSession(contextId: string): Promise<EstablishedSession> {
     const cached = this.sessions?.get(contextId) ?? null;
     let sessionId: string | null = null;
+    let sessionResumed = false;
     if (cached !== null) {
-      if (await this.tryReuse("session/load", cached)) sessionId = cached;
-      else if (await this.tryReuse("session/resume", cached)) sessionId = cached;
+      if (await this.tryReuse("session/load", cached)) {
+        sessionId = cached;
+        sessionResumed = true;
+      } else if (await this.tryReuse("session/resume", cached)) {
+        sessionId = cached;
+        sessionResumed = true;
+      }
     }
     if (sessionId === null) {
+      if (cached !== null) {
+        this.logger(
+          `[acp-session] load/resume 双失败 ⇒ 回落 session/new（contextId=${contextId} 旧 sessionId=${cached}）：续接退化为重跑`,
+        );
+      }
       sessionId = await this.newSession();
       this.sessions?.set(contextId, sessionId);
     }
+    this.logger(
+      `[acp-session] 会话建立完成（contextId=${contextId} sessionId=${sessionId} sessionResumed=${String(sessionResumed)}）`,
+    );
     await this.applyModel(sessionId);
     await this.applyMode(sessionId);
     await this.applyCollaborationMode(sessionId);
-    return sessionId;
+    return { sessionId, sessionResumed };
   }
 
   /**
@@ -477,8 +619,7 @@ export class AcpSessionRunner {
         value: this.model,
       });
     } catch (err) {
-      const code = err instanceof AcpError && err.code !== undefined ? `（code=${String(err.code)}）` : "";
-      const reason = `${messageOf(err)}${code}`;
+      const reason = reasonOf(err);
       this.logger(`[acp-session] model=${this.model} 设置失败（${reason}）`);
       throw new Error(`model=${this.model} 设置失败：${reason}`);
     }

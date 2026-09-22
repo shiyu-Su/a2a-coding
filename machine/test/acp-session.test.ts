@@ -8,6 +8,12 @@
  * `chunkCount` = 本轮实测 `agent_message_chunk` 数（thought / 窗外不计、不跨轮泄漏）·
  * 正常完成路径不带 diagnostics · 与 launcher 摘除侧的字面量 / 解析契约。
  *
+ * **v0.8.8 · M1** 追加：三原料计量（`partialChars` / `updateCount` / `firstChunkElapsedMs`，
+ * 事实缺失即**不报该键**）· `elapsedMs` → `promptElapsedMs` 改名 · 两段耗时（含 `bridgeEnsureElapsedMs`）·
+ * 取证面 `acpErrorCode` / `acpErrorData`（**`data` 必须真的出现在产物里**）· 半截产出「取出再弃」
+ * （尾部快照 + 4000 字符截断 + 取后仍弃窗）· `sessionResumed` 三路回标（回落 new ⇒ false + 日志）·
+ * `reasonOf` 单一实现（applyModel 侧不得逐字复制）· launcher 白名单**尚未放行**新键（M2 依赖，留证据）。
+ *
  * 运行：`npm test`。
  */
 import { test } from "node:test";
@@ -17,6 +23,7 @@ import { AcpError } from "../acp-bridge/acp/client.js";
 import {
   AcpSessionRunner,
   DIAGNOSTICS_ARTIFACT_NAME,
+  DIAGNOSTICS_PARTIAL_TAIL_MAX_CHARS,
   type AcpRequestClient,
 } from "../acp-bridge/acp/session.js";
 import type { TaskExecutionResult } from "../acp-bridge/types.js";
@@ -819,7 +826,6 @@ test("M4 翻向（v0.8.5 · M1）：会话内 set_config_option 的 configId 字
 });
 
 // ---------- REQ-v0.8.7-2026-09-22-01 · M4：桥侧诊断计量产出（machine-diagnostics artifact） ----------
-
 /** 结果里的 `machine-diagnostics` 载荷（无该 artifact ⇒ `null`）；顺带校验 v0.3 artifact 形状。 */
 function diagOf(result: TaskExecutionResult): Record<string, unknown> | null {
   const artifacts = result.artifacts ?? [];
@@ -834,18 +840,35 @@ function diagOf(result: TaskExecutionResult): Record<string, unknown> | null {
 }
 
 /**
- * 失败出口诊断的公共口径：四字段齐全（`elapsedMs` 随真实时钟浮动，只断言类型与非负），
- * 返回其余三要素供逐字断言。
+ * 失败出口诊断的**恒定七键**（v0.8.8 · M1）：三原料 + 两段耗时 + kind/stage。
+ * 可选键（`firstChunkElapsedMs` / `sessionResumed` / `acpErrorCode` / `acpErrorData` /
+ * `partialTail` / `partialTailChars`）事实缺失即不报，故不在此列。
+ */
+const DIAG_CORE_KEYS = [
+  "acpErrorKind",
+  "bridgeEnsureElapsedMs",
+  "chunkCount",
+  "partialChars",
+  "promptElapsedMs",
+  "stage",
+  "updateCount",
+];
+
+/**
+ * 失败出口诊断的公共口径：恒定七键齐全（两段耗时随真实时钟浮动，只断言类型与非负）·
+ * **`elapsedMs` 不得再出现**（v0.8.8 · M1 改名 `promptElapsedMs`，避开与 launcher 侧同名异义）·
+ * 返回 kind/stage/chunkCount 供逐字断言（v0.8.7 口径不变）。
  */
 function diagCore(diag: Record<string, unknown> | null): Record<string, unknown> {
   assert.ok(diag !== null, "失败出口必须带 machine-diagnostics artifact");
-  assert.deepEqual(
-    Object.keys(diag).sort(),
-    ["acpErrorKind", "chunkCount", "elapsedMs", "stage"],
-    "四字段齐全",
-  );
-  assert.equal(typeof diag["elapsedMs"], "number");
-  assert.ok((diag["elapsedMs"] as number) >= 0);
+  for (const key of DIAG_CORE_KEYS) {
+    assert.ok(key in diag, `恒定键 ${key} 必须存在（实得键 ${Object.keys(diag).join(",")}）`);
+  }
+  assert.ok(!("elapsedMs" in diag), "prompt 段耗时已改名 promptElapsedMs，不得再有 launcher 同义键 elapsedMs");
+  for (const key of ["promptElapsedMs", "bridgeEnsureElapsedMs"]) {
+    assert.equal(typeof diag[key], "number", `${key} 须为数字`);
+    assert.ok((diag[key] as number) >= 0, `${key} 须非负`);
+  }
   return {
     acpErrorKind: diag["acpErrorKind"],
     stage: diag["stage"],
@@ -869,7 +892,7 @@ test("M4 ① 会话建立失败 ⇒ diagnostics（stage=ensure · kind=AcpError.
     stage: "ensure",
     chunkCount: 0,
   });
-  assert.equal(diagOf(result)?.["elapsedMs"], 0, "① 未进入 prompt 段 ⇒ prompt 段耗时恒 0");
+  assert.equal(diagOf(result)?.["promptElapsedMs"], 0, "① 未进入 prompt 段 ⇒ prompt 段耗时恒 0");
   assert.ok(!client.calls.some((c) => c.method === "session/prompt"), "建立失败不得继续 prompt");
 });
 
@@ -901,7 +924,7 @@ test("M4 ② prompt 失败 ⇒ diagnostics（stage=prompt · kind=closed）· �
   assert.deepEqual(diagCore(diagOf(result)), { acpErrorKind: "closed", stage: "prompt", chunkCount: 0 });
 });
 
-test("M4 ③ prompt 超时 ⇒ diagnostics（kind=timeout · elapsedMs 落在超时窗量级）", async () => {
+test("M4 ③ prompt 超时 ⇒ diagnostics（kind=timeout · promptElapsedMs 落在超时窗量级）", async () => {
   const client = new FakeClient();
   client.responder = (method) =>
     method === "session/new" ? { sessionId: "s1" } : new Promise<never>(() => undefined);
@@ -912,10 +935,10 @@ test("M4 ③ prompt 超时 ⇒ diagnostics（kind=timeout · elapsedMs 落在超
   assert.match(result.text ?? "", /任务超时/);
   const diag = diagOf(result);
   assert.deepEqual(diagCore(diag), { acpErrorKind: "timeout", stage: "prompt", chunkCount: 0 });
-  const elapsedMs = diag?.["elapsedMs"] as number;
+  const promptElapsedMs = diag?.["promptElapsedMs"] as number;
   assert.ok(
-    elapsedMs >= 40 && elapsedMs < 5_000,
-    `超时出口的 prompt 段 elapsedMs 须≈超时窗（实得 ${String(elapsedMs)}）`,
+    promptElapsedMs >= 40 && promptElapsedMs < 5_000,
+    `超时出口的 prompt 段耗时须≈超时窗（实得 ${String(promptElapsedMs)}）`,
   );
 });
 
@@ -1021,7 +1044,44 @@ test("M4 契约：桥与 launcher 的 artifact 名字面量一致", () => {
   assert.equal(DIAGNOSTICS_ARTIFACT_NAME, LAUNCHER_DIAGNOSTICS_ARTIFACT_NAME);
 });
 
-test("M4 契约：桥产出的 diagnostics 可被 launcher 摘除侧解出（elapsedMs / stage 作留痕宽容忽略）", async () => {
+/**
+ * 桥 artifact → launcher 摘除侧的契约校验器（v0.8.8 · M1 写入 / M2 放行）：
+ * 1. **透传值逐键一致**（launcher 白名单不得改写取值）；
+ * 2. **M1 计量键必须已在白名单内**（否则「桥写了、launcher 丢了」= 取证链断在机内）；
+ * 3. launcher 自测键（`elapsedMs` / `stage`）不由桥透传 —— 桥侧 `stage` 只作留痕。
+ */
+function assertDiagPassthrough(
+  result: TaskExecutionResult,
+  mustPass: readonly string[],
+): Record<string, unknown> {
+  const diag = diagOf(result);
+  assert.ok(diag !== null, "失败出口必须带 machine-diagnostics artifact");
+  const split = splitDiagnosticsArtifact(result.artifacts ?? []);
+  const passed = (split.diagnostics ?? {}) as Record<string, unknown>;
+  for (const key of Object.keys(passed)) {
+    assert.deepEqual(passed[key], diag[key], `透传键 ${key} 的值与桥侧不一致`);
+  }
+  for (const key of mustPass) {
+    assert.ok(key in diag, `桥侧未写 ${key}（M1 职责）`);
+    assert.ok(key in passed, `${key} 未透传 ⇒ launcher 白名单仍缺该键（M2 职责）`);
+  }
+  assert.ok(!("stage" in passed), "launcher 不采桥侧 stage（自测派发相位覆盖）");
+  assert.ok(!("elapsedMs" in passed), "launcher 不采桥侧 elapsedMs（自测派发总耗时）");
+  return passed;
+}
+
+/** 桥侧写入、launcher 白名单必须放行的 M1 计量键（`partialTail` 正文另论，见 M1 契约用例）。 */
+const M1_PASSTHROUGH_KEYS = [
+  "acpErrorKind",
+  "chunkCount",
+  "partialChars",
+  "updateCount",
+  "promptElapsedMs",
+  "bridgeEnsureElapsedMs",
+  "sessionResumed",
+] as const;
+
+test("M4 契约：桥产出的 diagnostics 可被 launcher 摘除侧解出（M1 计量键逐键透传）", async () => {
   const client = new FakeClient();
   client.responder = (method) =>
     method === "session/new"
@@ -1029,9 +1089,298 @@ test("M4 契约：桥产出的 diagnostics 可被 launcher 摘除侧解出（ela
       : Promise.reject(new AcpError("timeout", "prompt timed out"));
 
   const result = await runner(client).execute(INPUT);
-  const split = splitDiagnosticsArtifact(result.artifacts ?? []);
+  const passed = assertDiagPassthrough(result, M1_PASSTHROUGH_KEYS);
 
-  assert.deepEqual(split.diagnostics, { acpErrorKind: "timeout", chunkCount: 0 });
-  assert.deepEqual(split.artifacts, [], "摘除后不剩余 ⇒ 无从混进 resultText");
+  assert.equal(passed["acpErrorKind"], "timeout");
+  assert.equal(passed["chunkCount"], 0);
+  assert.equal(passed["sessionResumed"], false, "session/new 建立的会话 ⇒ 非续接");
+  assert.deepEqual(splitDiagnosticsArtifact(result.artifacts ?? []).artifacts, [], "摘除后不剩余 ⇒ 无从混进 resultText");
+});
+
+// ---------- REQ-v0.8.8-2026-09-22-01 · M1：计量补全 + 半截尾部 + sessionResumed 回标 + 取证面 ----------
+
+/** 建一个「session/new 成功 + prompt 由 setup 决定」的 fake。 */
+function failingPrompt(client: FakeClient, err: () => unknown, onPrompt?: () => void): void {
+  client.responder = (method) => {
+    if (method === "session/new") return { sessionId: "s1" };
+    if (method === "session/prompt") {
+      onPrompt?.();
+      return Promise.reject(err());
+    }
+    return {};
+  };
+}
+
+test("M1 三原料：partialChars / updateCount / firstChunkElapsedMs 按本轮实测计数", async () => {
+  const client = new FakeClient();
+  const emit = (sessionUpdate: string, text: string): void =>
+    client.emit("session/update", {
+      sessionId: "s1",
+      update: { sessionUpdate, content: { type: "text", text } },
+    });
+  failingPrompt(client, () => new AcpError("rpc", "prompt rejected"), () => {
+    emit("agent_thought_chunk", "思考思考"); // 不计 chunk/partialChars，计 updateCount
+    emit("tool_call", "");                   // 同上（「有推进」原料）
+    emit("agent_message_chunk", "Hello, ");   // 7
+    emit("agent_message_chunk", "world");     // 5
+    emit("plan", "");                         // 计 updateCount
+  });
+
+  const diag = diagOf(await runner(client).execute(INPUT));
+  assert.ok(diag !== null);
+  assert.equal(diag["chunkCount"], 2, "只计 agent_message_chunk");
+  assert.equal(diag["partialChars"], 12, "partialChars = 本轮入缓冲字符累计");
+  assert.equal(diag["updateCount"], 5, "updateCount = 本轮任意 session/update（含 thought/tool_call/plan）");
+  assert.equal(typeof diag["firstChunkElapsedMs"], "number", "有 chunk ⇒ firstChunkElapsedMs 必须报");
+  assert.ok((diag["firstChunkElapsedMs"] as number) >= 0);
+});
+
+test("M1 满窗零产出 ⇒ firstChunkElapsedMs 不报（「没发生」不得写成 0）· 三原料归 0", async () => {
+  const client = new FakeClient();
+  failingPrompt(client, () => new AcpError("timeout", "no output"));
+
+  const diag = diagOf(await runner(client).execute(INPUT));
+  assert.ok(diag !== null);
+  assert.ok(!("firstChunkElapsedMs" in diag), "零 chunk ⇒ 缺键（排队证据的键形态）");
+  assert.equal(diag["partialChars"], 0);
+  assert.equal(diag["updateCount"], 0);
+  assert.ok(!("partialTail" in diag), "零产出 ⇒ 无半截尾部键");
+});
+
+test("M1 取证面：acpErrorCode / acpErrorData 进 diagnostics 且 data 原文可见（opencode 方言）", async () => {
+  const client = new FakeClient();
+  failingPrompt(
+    client,
+    () =>
+      new AcpError("rpc", "Invalid params", {
+        code: -32602,
+        data: { _errors: { model: ["unknown model: gpt-9"] } },
+      }),
+  );
+
+  const result = await runner(client).execute(INPUT);
+  const diag = diagOf(result);
+  assert.ok(diag !== null);
+  assert.equal(diag["acpErrorCode"], -32602, "code 必须作独立键进产物（不再只混在文本里）");
+  assert.equal(typeof diag["acpErrorData"], "string", "data 必须以宽 JSON 原文进产物");
+  assert.ok(
+    (diag["acpErrorData"] as string).includes("unknown model"),
+    `data 细节不得被压成「Invalid params」四个字（实得 ${String(diag["acpErrorData"])}）`,
+  );
+  assert.match(result.text ?? "", /code=-32602/, "failureResult 文本补 code");
+  assert.match(result.text ?? "", /unknown model/, "failureResult 文本补 data 摘要");
+});
+
+test("M1 取证面：无 code / 无 data 的错误 ⇒ 两键不报（不编造）", async () => {
+  const client = new FakeClient();
+  failingPrompt(client, () => new AcpError("closed", "backend exited"));
+
+  const diag = diagOf(await runner(client).execute(INPUT));
+  assert.ok(diag !== null);
+  assert.ok(!("acpErrorCode" in diag), "无 code ⇒ 不报（0 是合法 code，不可当缺省）");
+  assert.ok(!("acpErrorData" in diag), "无 data ⇒ 不报");
+});
+
+test("M1 取证面：acpErrorData 宽 JSON 超上限时截断留标记（护 /runner/result 1 MiB 请求体）", async () => {
+  const client = new FakeClient();
+  const blob = "x".repeat(9_000);
+  failingPrompt(client, () => new AcpError("rpc", "Invalid params", { code: -32602, data: { blob } }));
+
+  const diag = diagOf(await runner(client).execute(INPUT));
+  const data = diag?.["acpErrorData"] as string;
+  assert.ok(data.length < 2_500, `data 须被截断（实得 ${String(data.length)}）`);
+  assert.match(data, /…\(\+\d+\)$/, "截断须留痕，不得静默砍尾");
+});
+
+test("M1 半截产出「取出再弃」：尾部快照进 diagnostics 且截到上限", async () => {
+  const client = new FakeClient();
+  const long = `${"h".repeat(9_000)}TAIL-MARKER`;
+  failingPrompt(client, () => new AcpError("timeout", "prompt window full"), () => {
+    client.emit("session/update", {
+      sessionId: "s1",
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: long } },
+    });
+  });
+
+  const diag = diagOf(await runner(client).execute(INPUT));
+  assert.ok(diag !== null);
+  const tail = diag["partialTail"] as string;
+  assert.equal(tail.length, DIAGNOSTICS_PARTIAL_TAIL_MAX_CHARS, "尾部须截断至上限");
+  assert.equal(diag["partialTailChars"], DIAGNOSTICS_PARTIAL_TAIL_MAX_CHARS);
+  assert.equal(tail, long.slice(-DIAGNOSTICS_PARTIAL_TAIL_MAX_CHARS), "保的是**尾部**（续跑起点），不是头部");
+  assert.equal(diag["partialChars"], long.length, "partialChars 报的是全长，不受尾部截断影响");
+});
+
+test("M1 半截产出短于一屏 ⇒ 原样带回（不截不丢）", async () => {
+  const client = new FakeClient();
+  failingPrompt(client, () => new AcpError("rpc", "boom"), () => {
+    client.emit("session/update", {
+      sessionId: "s1",
+      update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "半截话" } },
+    });
+  });
+
+  const diag = diagOf(await runner(client).execute(INPUT));
+  assert.equal(diag?.["partialTail"], "半截话");
+  assert.equal(diag?.["partialTailChars"], 3);
+});
+
+test("M1 半截取走后窗仍须弃：下一轮不受残窗污染", async () => {
+  const client = new FakeClient();
+  let fail = true;
+  client.responder = (method) => {
+    if (method === "session/new") return { sessionId: "s1" };
+    if (method === "session/prompt" && fail) {
+      client.emit("session/update", {
+        sessionId: "s1",
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "残段" } },
+      });
+      return Promise.reject(new AcpError("rpc", "turn 1 failed"));
+    }
+    return { stopReason: "end_turn" };
+  };
+  const r = runner(client);
+
+  const turn1 = await r.execute(INPUT);
+  assert.equal(turn1.state, "failed");
+  assert.equal(diagOf(turn1)?.["partialTail"], "残段");
+
+  fail = false;
+  const turn2 = await r.execute({ ...INPUT, taskId: "t2", text: "again", messageId: "m2" });
+  assert.equal(turn2.state, "completed");
+  assert.equal(turn2.text, "", "残段不得漏进下一轮（discardCapture 仍须执行）");
+});
+
+test("M1 sessionResumed 回标：load 真成功 ⇒ true", async () => {
+  const client = new FakeClient();
+  const sessions = new SessionMap({ projectId: "p1", baseDir: "/m", fs: new MemoryFs() });
+  sessions.set("ctx", "cached-sess");
+  client.responder = (method) => {
+    if (method === "session/load") return {};
+    if (method === "session/prompt") return Promise.reject(new AcpError("rpc", "boom"));
+    throw new AcpError("protocol", `不应调用 ${method}（load 已成功）`);
+  };
+
+  const diag = diagOf(await runner(client, 1000, sessions).execute(INPUT));
+  assert.equal(diag?.["sessionResumed"], true, "load 成功 ⇒ 续接真发生");
+  assert.ok(!client.calls.some((c) => c.method === "session/new"), "load 成功不得再 new");
+});
+
+test("M1 sessionResumed 回标：load+resume 双失败回落 new ⇒ false + 日志留痕（续跑退化成重跑）", async () => {
+  const client = new FakeClient();
+  const sessions = new SessionMap({ projectId: "p1", baseDir: "/m", fs: new MemoryFs() });
+  sessions.set("ctx", "cached-sess");
+  const logs: string[] = [];
+  client.responder = (method) => {
+    if (method === "session/load" || method === "session/resume") throw new AcpError("rpc", "no such session");
+    if (method === "session/new") return { sessionId: "fresh-sess" };
+    return Promise.reject(new AcpError("rpc", "boom"));
+  };
+
+  const result = await new AcpSessionRunner({
+    client,
+    cwd: "/ws",
+    timeoutMs: 1000,
+    sessions,
+    logger: (m) => logs.push(m),
+  }).execute(INPUT);
+
+  const diag = diagOf(result);
+  assert.equal(diag?.["sessionResumed"], false, "回落 session/new ⇒ 续接未发生，必须上报");
+  assert.ok(diag?.["stage"] === "prompt");
+  assert.ok(
+    logs.some((line) => line.includes("回落 session/new")),
+    `回落事实须进日志（实得 ${logs.join(" | ")}）`,
+  );
+});
+
+test("M1 sessionResumed 回标：首轮无缓存会话 ⇒ false；建立失败 ⇒ 不报该键", async () => {
+  const client = new FakeClient();
+  failingPrompt(client, () => new AcpError("rpc", "boom"));
+  const diag = diagOf(await runner(client).execute(INPUT));
+  assert.equal(diag?.["sessionResumed"], false, "无 SessionMap ⇒ 每次 new，续接未发生");
+
+  const client2 = new FakeClient();
+  client2.responder = (method) => {
+    if (method === "session/new") throw new AcpError("spawn", "backend spawn failed");
+    return {};
+  };
+  const diag2 = diagOf(await runner(client2).execute(INPUT));
+  assert.ok(diag2 !== null);
+  assert.ok(!("sessionResumed" in diag2), "会话都没建成 ⇒ 续接与否无事实，不报（不得编造 false）");
+});
+
+test("M1 窗外 update 不计入本轮计数（load 回灌的 backlog 不是「本轮推进」）", async () => {
+  const client = new FakeClient();
+  const sessions = new SessionMap({ projectId: "p1", baseDir: "/m", fs: new MemoryFs() });
+  sessions.set("ctx", "cached-sess");
+  client.responder = (method) => {
+    if (method === "session/load") {
+      for (let i = 0; i < 4; i += 1) {
+        client.emit("session/update", {
+          sessionId: "cached-sess",
+          update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: `backlog${String(i)}` } },
+        });
+      }
+      return {};
+    }
+    if (method === "session/prompt") {
+      client.emit("session/update", {
+        sessionId: "cached-sess",
+        update: { sessionUpdate: "agent_thought_chunk", content: { type: "text", text: "想" } },
+      });
+      return Promise.reject(new AcpError("rpc", "boom"));
+    }
+    return {};
+  };
+
+  const diag = diagOf(await runner(client, 1000, sessions).execute(INPUT));
+  assert.equal(diag?.["updateCount"], 1, "只计窗内那 1 次 update（回灌 4 次不计）");
+  assert.equal(diag?.["partialChars"], 0, "回灌 backlog 不入本轮 ⇒ partialChars 0");
+});
+
+test("M1 取证面：reasonOf 单一实现（applyModel 侧不得再逐字复制拼装）", () => {
+  const src = readFileSync(
+    // 运行时 = dist/test/*.js，源码在 machine 根（../../）
+    new URL("../../acp-bridge/acp/session.ts", import.meta.url),
+    "utf8",
+  );
+  assert.equal(
+    src.split("（code=${String(err.code)}）").length - 1,
+    0,
+    "code 拼装只允许在 reasonOf 内（消除逐字复制是 §2.3.1 第 2 条的要求）",
+  );
+  assert.equal(src.split("reasonOf(err)").length - 1 >= 3, true, "reasonOf 须被三处以上消费");
+});
+
+test("M1↔M2 契约：取证键（code / data / partialTailChars）经 launcher 白名单落到 launcher 侧", async () => {
+  const client = new FakeClient();
+  failingPrompt(
+    client,
+    () => new AcpError("rpc", "Invalid params", { code: -32602, data: { _errors: { model: ["bad"] } } }),
+    () => {
+      client.emit("session/update", {
+        sessionId: "s1",
+        update: { sessionUpdate: "agent_message_chunk", content: { type: "text", text: "有产出" } },
+      });
+    },
+  );
+
+  const result = await runner(client).execute(INPUT);
+  // `acpErrorData` 是 §2.3.1 第 4 条的关键：不落到 launcher 侧则 opencode 系错误永远只剩「Invalid params」
+  const passed = assertDiagPassthrough(result, [
+    ...M1_PASSTHROUGH_KEYS,
+    "acpErrorCode",
+    "acpErrorData",
+    "partialChars",
+    "partialTailChars",
+  ]);
+
+  assert.equal(passed["acpErrorCode"], -32602);
+  assert.equal(typeof passed["acpErrorData"], "string");
+  assert.match(passed["acpErrorData"] as string, /_errors/);
+  assert.equal(passed["partialTailChars"], 3);
+  // 半截尾部**正文**（`partialTail`）按 launcher 白名单口径**不透传**（只留字符数）：
+  // 正文在桥侧 artifact 与本文件的 diagOf 断言中已证；续跑判据用 partialChars/updateCount，M3 无需正文。
 });
 

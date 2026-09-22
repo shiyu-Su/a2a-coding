@@ -15,8 +15,12 @@ import type { AgentKind } from "./agent-kinds.js";
  * v0.7.0：major 由 1.0 升到 2.0（删字段 / 改语义 / 加必填请求体的破坏性变更）。
  * v0.8.0：minor 升到 2.1（`projects[].agentKind` 必填字段取值集合扩展 +qoder，非破坏）。
  * req03 硬切：minor 升到 2.2（`projects[].agentKind` 必填字段取值 `qoder` 更名为 `qoder-cn`）。
+ * v0.8.8：minor 升到 2.3（`failureKind` 必填字段取值集合**成员移除** —— 六类闭集硬切：旧值
+ *      `infra` / `task` 自 2.3 起非法，但仍可被接收 ⇒ 接收端兜底落 `business` 并 warn 留原值
+ *      ⇒ 与上述两次「扩展 / 更名」不同，本次是**单方不兼容**，orch 与 machine **两侧同升**
+ *      （混跑期未升级侧上报的旧值只会被兜底归类，不会被拒收）。
  */
-export const PROTOCOL_VERSION = "2.2";
+export const PROTOCOL_VERSION = "2.3";
 
 /**
  * 执行层 Agent 类型（决定执行层适配器与 CLI 参数）。

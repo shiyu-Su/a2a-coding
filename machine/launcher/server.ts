@@ -1,17 +1,19 @@
 /**
  * Launcher HTTP 接口（本机常驻）：
- *   GET  /health     健康检查（自报线协议版本 + 就绪态 + Runner 注册态 `bridge` 段，见 PROTOCOL.md）
+ *   GET  /health     健康检查（自报线协议版本 + 就绪态 + Runner 注册态 `bridge` 段 + 本机降级面 `degraded` 段，见 PROTOCOL.md）
  *   POST /shutdown   优雅停止（可选，`launcher.shutdownEndpoint=true` 时注册）
  *
  * **入站指挥端点已退役（v0.7.0 M5·MC1）**：`/projects`、`/projects/:projectId/ensure`、
  * `/projects/:projectId/stop` 一律命中 404。连接模型反转为 pull 后，项目生命周期由 Runner
  * 出站命令族（dispatch / stop / cancel-task，见 `runner-exec.ts`）驱动，不再经本机 HTTP 入站。
- * 保留面只有 loopback 只读 `/health`（M2·MA2 additive 的 `bridge` 段）与 v0.6.2 冻结的
+ * 保留面只有 loopback 只读 `/health`（M2·MA2 additive 的 `bridge` 段、v0.8.8 M4 additive 的
+ * `degraded` 段）与 v0.6.2 冻结的
  * `/shutdown`；`/health` 的 `status` 在自检通过前仍为 `"starting"`（供启动探测），就绪后 `"ok"`。
  */
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import { PROTOCOL_VERSION, type ApiError } from "../types.js";
 import { errorMessage } from "./process.js";
+import type { SelfCheckCause, SelfCheckFailure } from "./self-check.js";
 
 /** loopback 源地址白名单（IPv4 / IPv6 / IPv4-mapped） */
 const LOOPBACK_ADDRESSES = new Set(["127.0.0.1", "::1", "::ffff:127.0.0.1"]);
@@ -29,6 +31,74 @@ export interface BridgeHealthStatus {
   lastError: string | null;
 }
 
+/** `GET /health` 的 `degraded.selfCheckFailedProjects[]` 条目（复用自检的结构化结论与根因分类） */
+export interface DegradedSelfCheckFailure {
+  projectId: string;
+  stage: SelfCheckFailure["stage"];
+  cause?: SelfCheckCause;
+}
+
+/**
+ * `GET /health` 的 `degraded` 段（v0.8.8 · 节点 M4，改造文档 §2.9）：本机降级面快照。
+ *
+ * **只反映本机 loopback 运维事实，到不了 orch**（注册载荷不扩字段、push 通道 v0.8.3 已退役）
+ * ⇒ 与 orch 侧 `degraded[]` 是两个互不相通的面（C4），排查时两处分别查。
+ *
+ * **判读口径**：未启用 bridge 的机器，`runnerLoopAlive` / `outboxLoopAlive` 恒 `false`
+ * 属「未启用」而非「已降级」（与 `bridge.registered` 同处判读），降级判据看
+ * `selfCheckSkipped` / `selfCheckFailedProjects` / `unavailableProjectIds` / `outboxPendingCount`。
+ */
+export interface DegradedStatus {
+  /** `launcher.startupCheck === false` —— 自检被跳过，`ok`/`status` 不足以证明「自检通过」 */
+  selfCheckSkipped: boolean;
+  selfCheckFailedProjects: DegradedSelfCheckFailure[];
+  /** `manager` 登记的不可用项目集（此后 `ensure()` 直接抛 `AgentStartError`） */
+  unavailableProjectIds: string[];
+  outboxLoopAlive: boolean;
+  outboxPendingCount: number;
+  runnerLoopAlive: boolean;
+  inFlightCount: number;
+}
+
+/** `buildDegradedStatus` 的原料：全部为各组件的只读现值，装配点不做加工 */
+export interface DegradedInputs {
+  /** 原始配置值（`launcher.startupCheck`），缺省 `undefined` = 自检开启 */
+  startupCheck?: boolean;
+  selfCheckFailures: readonly SelfCheckFailure[];
+  unavailableProjectIds: readonly string[];
+  outboxLoopAlive: boolean;
+  outboxPendingCount: number;
+  runnerLoopAlive: boolean;
+  inFlightCount: number;
+}
+
+/** 组装 `degraded` 段（纯函数）：负向用例的可测点，尤其「跳过自检不得伪装成自检通过」 */
+export function buildDegradedStatus(inputs: DegradedInputs): DegradedStatus {
+  return {
+    selfCheckSkipped: inputs.startupCheck === false,
+    selfCheckFailedProjects: inputs.selfCheckFailures.map((failure) => ({
+      projectId: failure.projectId,
+      stage: failure.stage,
+      ...(failure.cause !== undefined ? { cause: failure.cause } : {}),
+    })),
+    unavailableProjectIds: [...inputs.unavailableProjectIds],
+    outboxLoopAlive: inputs.outboxLoopAlive,
+    outboxPendingCount: inputs.outboxPendingCount,
+    runnerLoopAlive: inputs.runnerLoopAlive,
+    inFlightCount: inputs.inFlightCount,
+  };
+}
+
+/** 未装配读点时的恒定原料（无降级基线；`buildDegradedStatus` 每次产出新对象，不共享可变引用） */
+const IDLE_DEGRADED: DegradedInputs = {
+  selfCheckFailures: [],
+  unavailableProjectIds: [],
+  outboxLoopAlive: false,
+  outboxPendingCount: 0,
+  runnerLoopAlive: false,
+  inFlightCount: 0,
+};
+
 export interface LauncherAppOptions {
   /** 就绪门：自检通过前返回 false ⇒ `/health` 报 `status:"starting"`；缺省恒 true */
   isReady?: () => boolean;
@@ -37,6 +107,11 @@ export interface LauncherAppOptions {
    * `registered` 恒 false。只读、无副作用，允许每次请求调用。
    */
   getBridgeStatus?: () => BridgeHealthStatus;
+  /**
+   * `/health` 的 `degraded` 段读点（v0.8.8 · M4）。缺省 = 无降级基线。
+   * 只读、无副作用，允许每次请求调用（纪律同 `getBridgeStatus`）。
+   */
+  getDegraded?: () => DegradedStatus;
   /** 是否注册 `POST /shutdown`（配置 `launcher.shutdownEndpoint`，缺省 false） */
   shutdownEndpoint?: boolean;
   /** `POST /shutdown` 可选 Bearer 令牌；缺省不校验 */
@@ -62,6 +137,8 @@ export function createLauncherApp(options: LauncherAppOptions = {}): Express {
   const getBridgeStatus =
     options.getBridgeStatus ??
     ((): BridgeHealthStatus => ({ registered: false, lastHeartbeatAt: null, lastError: null }));
+  const getDegraded =
+    options.getDegraded ?? ((): DegradedStatus => buildDegradedStatus(IDLE_DEGRADED));
   const app = express();
   app.use(express.json());
 
@@ -71,6 +148,7 @@ export function createLauncherApp(options: LauncherAppOptions = {}): Express {
       protocolVersion: PROTOCOL_VERSION,
       status: isReady() ? "ok" : "starting",
       bridge: getBridgeStatus(),
+      degraded: getDegraded(),
     });
   });
 

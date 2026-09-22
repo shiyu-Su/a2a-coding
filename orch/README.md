@@ -1,6 +1,6 @@
 # orch 单元（MCP 薄桥）
 
-> orch 侧的 MCP 薄桥：连接模型已反转为 **pull**（线协议 2.2）—— 执行机 Launcher 升格为 **Runner**，主动出站连桥（`/runner/register` → `/runner/connect` 长轮询拉命令 → `/runner/result` 回传结果）；桥只做「项目 → 机器」解析、任务入队 / claim 与结果落库，任务态与会话映射落本机 SQLite，再由执行机侧拉起仓内 ACP 桥驱动底层 CLI。启停一律经 `scripts/bridgectl.mjs`（纯 Node ESM、零第三方依赖、无需构建），入口 `dist/bridge/index.js`。
+> orch 侧的 MCP 薄桥：连接模型已反转为 **pull**（线协议 2.3）—— 执行机 Launcher 升格为 **Runner**，主动出站连桥（`/runner/register` → `/runner/connect` 长轮询拉命令 → `/runner/result` 回传结果）；桥只做「项目 → 机器」解析、任务入队 / claim 与结果落库，任务态与会话映射落本机 SQLite，再由执行机侧拉起仓内 ACP 桥驱动底层 CLI。启停一律经 `scripts/bridgectl.mjs`（纯 Node ESM、零第三方依赖、无需构建），入口 `dist/bridge/index.js`。
 
 ## 整体形态
 
@@ -50,7 +50,7 @@ Runner（machine，出站）                        Bridge（orch，http transpo
 - **命令族三类**：`dispatch`（派发任务）/ `stop`（停本机**单个项目** Agent）/ `cancel-task`（取消在飞任务）；三类载荷一律携 `commandId`（桥侧 uuid，回执原样带回），`stop` / `cancel-task` 另携 `projectId`；控制命令优先于 claim 下发。
 - **结果回传**：Runner 先落盘 outbox 再回传，**2xx = ack ⇒ 删文件**；桥按 `(machineId, taskId)` 幂等落库（首个终态胜出）；`stop` / `cancel-task` 的回执随下一轮 `connect` 的 `acks[]` 带回（观测通道）。
 - **调度语义**：`a2a_call(mode="execute")` 登记 Feature DAG 节点后**入队**（不直接拨机器），由 Runner 领取；`mode="inquiry"` 同样经队列、`wake` 后尽快下发；无 Runner 在线照常入队、不拒绝（成员 / 配置错仍同步零 I/O fail-fast）。
-- 契约全文见 [PROTOCOL.md](../PROTOCOL.md)（Runner ⇄ Bridge 线协议契约 2.2）。
+- 契约全文见 [PROTOCOL.md](../PROTOCOL.md)（Runner ⇄ Bridge 线协议契约 2.3）。
 
 ## 服务启停
 
@@ -78,7 +78,7 @@ npm run bridge:logs      # 输出日志全文（支持 --lines N / --follow）
 
 - 机器清单 `machines[]`：每项 `machineId` + 可选 `launcherUrl`（出站指挥通道已退役，仅作观测 / 兼容占位）+ `token`（Runner 出站 Bearer，须与 machine 侧 `launcher.bridge.token` 一致）；顶层可选 `runner { holdMs, heartbeatTimeoutMs, orphanTimeoutMs }`（缺省 `25000` / `60000` / `1800000`）。
   - `holdMs` = `/runner/connect` 长轮询挂起上限（空超时即心跳）；`heartbeatTimeoutMs` = 注册心跳判死阈值（超期只降在线态、不触发 stop）。两者均为正整数毫秒，非法解析期 fail-fast。
-  - **`orphanTimeoutMs`（v0.8.7 新增 · 孤儿墙钟出口）** = 在飞任务的**墙钟判死**阈值：`queue_state ∈ {claimed, running}` 且 `claimed_at` 早于 `now - orphanTimeoutMs` ⇒ 桥把该任务置 `failed` + `queue_state='settled'` + `failure_kind='infra'`，并发 **`task.orphaned`** 事件（payload 含 `machineId` / `projectId` / `featureId` / `claimedAt` / `elapsedMs` / `timeoutMs`）⇒ Feature 静止收敛发失败账单 ⇒ 宿主 `advance(retryTaskIds)` 重派。**与心跳清算分工不同**：心跳管「**机器死没死**」⇒ 回 `queued`（可复活）；墙钟管「**任务自己超没超**」⇒ `failed` 记账交宿主。二者挂同一 `sweepIntervalMs` timer、**同 tick 先 `sweepStale` 后墙钟**（心跳先命中者走 requeue，墙钟只收残量 ⇒ 两路竞争天然消解）。**跨单元不变量：`orphanTimeoutMs` > 机器侧 `dispatchTimeoutMs`（= `sessionTimeoutMs` + 300s margin）** —— 缺省 30 min 对 machine 侧 15 min 上限恒有 ≥1.5× 余量 ⇒ **orch 不读 machine 配置**（避免跨单元配置耦合）。
+  - **`orphanTimeoutMs`（v0.8.7 新增 · 孤儿墙钟出口）** = 在飞任务的**墙钟判死**阈值：`queue_state ∈ {claimed, running}` 且 `claimed_at` 早于 `now - orphanTimeoutMs` ⇒ 桥把该任务置 `failed` + `queue_state='settled'` + `failure_kind='runner'`（v0.8.8 O1：六类闭集的「不可续跑」子类，取代二分时代的 `infra`），并发 **`task.orphaned`** 事件（payload 含 `machineId` / `projectId` / `featureId` / `claimedAt` / `elapsedMs` / `timeoutMs`）⇒ Feature 静止收敛发失败账单 ⇒ 宿主 `advance(retryTaskIds)` 重派。**与心跳清算分工不同**：心跳管「**机器死没死**」⇒ 回 `queued`（可复活）；墙钟管「**任务自己超没超**」⇒ `failed` 记账交宿主。二者挂同一 `sweepIntervalMs` timer、**同 tick 先 `sweepStale` 后墙钟**（心跳先命中者走 requeue，墙钟只收残量 ⇒ 两路竞争天然消解）。**跨单元不变量：`orphanTimeoutMs` > 机器侧 `dispatchTimeoutMs`（= `sessionTimeoutMs` + 300s margin）** —— 缺省 30 min 对 machine 侧 15 min 上限恒有 ≥1.5× 余量 ⇒ **orch 不读 machine 配置**（避免跨单元配置耦合）。
 - 顶层可选 `projectGroup`：**组数组** `[{ name, members[] }]`，形状与语义见「连接身份与可见性」；缺省（不写该键）= 无组 = 全量接纳。
 
 ## 启停与就绪语义（统一口径锚点）

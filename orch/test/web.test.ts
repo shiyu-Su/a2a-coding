@@ -265,7 +265,7 @@ test("GET / → 层级视图「需求 → 任务」（§8 增补 #2）：无手�
   }
 });
 
-test("GET / → 任务子表时间列三段 + 耗时拆「排队 / 执行」两列（v0.8.7 增补轨 U1）", async () => {
+test("GET / → 任务子表时间列三段 + 耗时拆「排队 / 执行」两列 + 重派/失败类两列（v0.8.7 U1 / v0.8.8 O6）", async () => {
   const handle = await startWeb(fakeCore());
   const page = await get(handle.port, "/");
   assert.equal(page.status, 200);
@@ -273,16 +273,26 @@ test("GET / → 任务子表时间列三段 + 耗时拆「排队 / 执行」两�
     page.text.includes("<th>createdAt → startedAt → finishedAt</th>"),
     "时间列表头应为三段（含 startedAt）",
   );
-  assert.ok(page.text.includes("<th>排队</th>"), "应含「排队」列（createdAt → startedAt）");
+  assert.ok(page.text.includes("<th>排队</th>"), "应含「排队」列");
   assert.ok(page.text.includes("<th>执行</th>"), "应含「执行」列（startedAt → finishedAt）");
+  assert.ok(page.text.includes("<th>重派</th>"), "应含「重派」列（retryCount，O6）");
+  assert.ok(page.text.includes("<th>失败类</th>"), "应含「失败类」列（failureKind，O6）");
   assert.equal(page.text.includes("<th>耗时</th>"), false, "原单列「耗时」应已被两列取代");
   // startedAt 合法为 NULL（已入队未领取）⇒ 三段时刻与两列时长各有占位，不得渲染成空串/0
   assert.match(page.text, /function startedStamp\(iso\) \{ return iso \?[\s\S]*: "—";/, "startedAt 缺值应占位「—」");
+  // O6：排队列改用真源（queuedAt → claimedAt），不再用 createdAt → startedAt 近似；执行列仍以 startedAt 为界
   assert.match(
     page.text,
-    /duration\(t\.createdAt, t\.startedAt\)[\s\S]*duration\(t\.startedAt, t\.finishedAt\)/,
-    "两列时长应分别以 startedAt 为界（缺失时 duration 返回「—」，不按 0 计）",
+    /duration\(t\.queuedAt, t\.claimedAt\)[\s\S]*duration\(t\.startedAt, t\.finishedAt\)/,
+    "两列时长应分别取真源（排队 = queuedAt→claimedAt / 执行 = startedAt→finishedAt；缺失时 duration 返回「—」，不按 0 计）",
   );
+  assert.equal(
+    page.text.includes("duration(t.createdAt, t.startedAt)"),
+    false,
+    "排队列不得再用 createdAt → startedAt 近似（O6 改真源）",
+  );
+  assert.match(page.text, /t\.retryCount/, "任务行应渲染 retryCount");
+  assert.match(page.text, /t\.failureKind/, "任务行应渲染 failureKind");
 });
 
 test("GET /api/projects → 白名单（剔除 workspace / agentConfig / risk / Runner 内部字段）+ 桥注册表快照语义", async () => {

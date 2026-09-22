@@ -16,13 +16,19 @@
  *                          解冻闭包**外**的 `blocked` 下游，**不改 Feature 态**
  * - `handleFeatureApprove` 审批门：`waiting_approval → executing`
  * - `handleFeatureCancel`  任意非终态 → `cancelled`
+ *
+ * 另含 **trace 只读投影**（v0.8.8 §2.10(c)，非 MCP 工具）：`handleFeatureTrace` 回答
+ * 「这个 Feature 为什么还没完成」（在等谁 / 排队位次），纯读不落库，供工作台端点复用。
  */
 import { randomUUID } from "node:crypto";
 import {
   appendEvent,
+  countQueuedBefore,
   createFeature,
   getFeature,
+  getQueuedTask,
   listArtifactsByFeature,
+  listBusyTasksForProject,
   listFeatureTasks,
   listFeatures,
   rearmForRetry,
@@ -32,7 +38,7 @@ import {
   updateTaskState,
 } from "../session/store.js";
 import { planResume } from "./scheduler.js";
-import type { FeatureContextPatch } from "../session/store.js";
+import type { FeatureContextPatch, QueueState, QueuedTaskRecord } from "../session/store.js";
 import {
   allowedTransitions,
   canTransition,
@@ -85,8 +91,10 @@ export interface FeatureTaskSummary {
    * 失败分类（v0.4.1 §4.1.13 可观测；`null` = 未失败 / 未分类）。
    * **只增字段**，既有字段语义不变。
    *
-   * ⚠️ v0.6.1 REQ-05：失败分类器与写口已随「删五层」整块删除 ⇒ **本字段语义休眠（恒 `null`）**。
-   * 字段**保留**（出参形状不变、web 零改动），但**不得**再据它判断失败类型。
+   * ✅ v0.8.7 起本字段已有**真实值**（不再是 v0.6.1「删五层」后的语义休眠恒 `null`）：
+   * 写口 = `setTaskFailureKind`（仅当行当前为 `failed` 才写入）与 `failOrphanedTask`（孤儿补结算落
+   * `runner`）；v0.8.8 起任务失败在账面携带六类闭集 `failureKind`（事实源 = `PROTOCOL.md`），
+   * 可据此判断失败类型（网页工作台已渲染该列，O6）。
    */
   failureKind: FailureKind | null;
   /**
@@ -561,4 +569,181 @@ export function handleFeatureCancel(
     from: feature.state,
     state: updated === null ? "cancelled" : updated.state,
   };
+}
+
+// ---------------------------------------------------------------------------
+// trace（v0.8.8 §2.10(c)：只读查询「在等谁 / 排队位次」；不落库、不触发调度）
+// ---------------------------------------------------------------------------
+
+/**
+ * 「这个 Feature 为什么还没完成」的**只读投影**（REQ-v0.8.8-2026-09-22-01 §2.10(c) · O7）。
+ *
+ * 纯计算（store 只读 + 现成判据），**不落库、不加写口、不改调度器行为**；
+ * 出参为**独立新增只读面**（不改既有工具出参形状），供工作台 trace 端点与后续
+ * 「排队可见面 / 限流」复用同一 helper。
+ *
+ * 口径：
+ * - 只输出**非终态节点**（`working` / `input-required`；`completed` / `failed` / `blocked` 不出）；
+ * - **项目忙判定走队列态**（`state='working' ∧ queue_state IN ('queued','claimed','running')`，
+ *   经 `listBusyTasksForProject` = `listBusyProjectIds` 同一谓词的行级展开）——
+ *   **不走 `remote_task_id`**（pull 模型下该列在飞期间恒 NULL，用了永远判「不忙」）；
+ *   占用者可跨 Feature（项目串行是全局事实）。调度器**进程内** `reservedProjects` 只守
+ *   「入队未落库」的同 tick 窗口（毫秒级），本查询覆盖不到，口径上按已落库事实回答；
+ * - `blockedOn` = **直接依赖**中未达 `completed` 者（含 failed/blocked 上游）；
+ * - `position` = 全局 FIFO 位次估计：`queue_state='queued' ∧ created_at < 我` 计数 +1
+ *   （仅对「已入队待领」或「就绪未入队」的 `working` 节点给出；ISO 同毫秒并列不区分）。
+ */
+export function handleFeatureTrace(
+  args: FeatureTraceArgs,
+  identity: string | null = null,
+): FeatureTraceSuccess | FeatureToolFailure {
+  const feature = getFeature(args.featureId);
+  if (feature === null) {
+    return { ok: false, code: "feature_not_found", error: `未知 Feature ${args.featureId}` };
+  }
+  // 归属校验（谁建谁见）：与其它出口同一判据；无身份（web 运维面）⇒ 全量放行
+  const denied = ownershipFailure(feature, identity);
+  if (denied !== null) return denied;
+
+  const nodes = listFeatureTasks(feature.featureId, { limit: 1000 });
+  const byId = new Map(nodes.map((n) => [n.taskId, n]));
+  /** 读缓存：同项目忙明细 / 同登记时刻的位次各查一次（节点数上限 1000，纯读、量小） */
+  const busyByProject = new Map<string, QueuedTaskRecord[]>();
+  const aheadByCreatedAt = new Map<string, number>();
+
+  const traced: FeatureTraceNode[] = [];
+  for (const n of nodes) {
+    if (n.state !== "working" && n.state !== "input-required") continue;
+    const q = getQueuedTask(n.taskId);
+    // 仅在队时报告队列态；NULL（未入队）与 `working ∧ settled` 残留（重排后待再派）一律归 null
+    const queueState: QueueState | null =
+      n.state === "working" && q !== null && q.queueState !== "settled" ? q.queueState : null;
+
+    const blockedOn = (n.dependencies ?? []).filter((id) => byId.get(id)?.state !== "completed");
+
+    let busyTasks = busyByProject.get(n.projectId);
+    if (busyTasks === undefined) {
+      busyTasks = listBusyTasksForProject(n.projectId);
+      busyByProject.set(n.projectId, busyTasks);
+    }
+    const others = busyTasks.filter((t) => t.taskId !== n.taskId);
+    // 占位者优先取在飞（claimed/running，携带 claimed_by = 占位机）；否则取最早入队者
+    const occupier =
+      others.find((t) => t.queueState === "claimed" || t.queueState === "running") ??
+      others[0] ??
+      null;
+    const projectBusy: FeatureTraceProjectBusy = {
+      busy: occupier !== null,
+      taskId: occupier?.taskId ?? null,
+      machineId: occupier?.claimedBy ?? null,
+    };
+
+    let position: number | null = null;
+    if (n.state === "working" && n.createdAt !== null && (queueState === "queued" || queueState === null)) {
+      let ahead = aheadByCreatedAt.get(n.createdAt);
+      if (ahead === undefined) {
+        ahead = countQueuedBefore(n.createdAt);
+        aheadByCreatedAt.set(n.createdAt, ahead);
+      }
+      position = ahead + 1;
+    }
+
+    traced.push({
+      taskId: n.taskId,
+      projectId: n.projectId,
+      state: n.state,
+      queueState,
+      waitReason: waitReasonOf(feature, n.state, queueState, blockedOn, projectBusy),
+      blockedOn,
+      projectBusy,
+      position,
+      waitedSince: waitedSinceOf(n, q, queueState),
+    });
+  }
+  return { ok: true, featureId: feature.featureId, featureState: feature.state, nodes: traced };
+}
+
+export interface FeatureTraceArgs {
+  featureId: string;
+}
+
+/** 节点「为何未完成」（闭集；排队可见面 / 限流后续在此之上叠加） */
+export type FeatureWaitReason =
+  /** `input-required`：等用户澄清 */
+  | "awaiting_user"
+  /** 在飞（claimed/running）：等远端执行结果回传 */
+  | "running_remote"
+  /** 已入队：等 Runner 领取 */
+  | "queued"
+  /** 直接依赖未 completed（含上游 failed/blocked） */
+  | "upstream_dependencies"
+  /** Feature 不在 `executing`：调度器不派发（waiting_approval / 主链后段 / 静止期外的停留） */
+  | "feature_not_executing"
+  /** 依赖已满足但同项目被占（项目串行门） */
+  | "project_busy"
+  /** 就绪且项目空闲：等调度器 tick 的派发窗口 */
+  | "ready_pending_dispatch";
+
+/** 项目占用（串行门）视图：bool + 占位节点 + 占位机 */
+export interface FeatureTraceProjectBusy {
+  busy: boolean;
+  /** 占用项目的节点 id（`working ∧ queue_state 忙` 的他节点，可跨 Feature）；无占用 ⇒ null */
+  taskId: string | null;
+  /** 占位机（占用节点的 `claimed_by`）；占用者已入队未被领取 ⇒ null */
+  machineId: string | null;
+}
+
+/** trace 单节点视图（仅非终态节点） */
+export interface FeatureTraceNode {
+  taskId: string;
+  projectId: string;
+  state: TaskRecord["state"];
+  /** 队列态；null = 不在队（未入队 / 重排后待再派 / input-required） */
+  queueState: QueueState | null;
+  waitReason: FeatureWaitReason;
+  /** 未 completed 的直接依赖 id（与真实依赖一致；含 failed/blocked 上游） */
+  blockedOn: string[];
+  projectBusy: FeatureTraceProjectBusy;
+  /** 全局 FIFO 位次估计（1 起）；不适用（在飞 / `created_at` 未知）⇒ null */
+  position: number | null;
+  /** 等待起点（在飞 = 领取时刻；排队 = 入队时刻；未入队 = 登记时刻；待澄清 = 最后更新时刻） */
+  waitedSince: string | null;
+}
+
+export interface FeatureTraceSuccess {
+  ok: true;
+  featureId: string;
+  featureState: FeatureState;
+  nodes: FeatureTraceNode[];
+}
+
+/** `waitReason` 判定（优先级自上而下；与 `computeReadyNodes` 的判据族一致但面向解释） */
+function waitReasonOf(
+  feature: FeatureRecord,
+  state: TaskRecord["state"],
+  queueState: QueueState | null,
+  blockedOn: readonly string[],
+  projectBusy: FeatureTraceProjectBusy,
+): FeatureWaitReason {
+  if (state === "input-required") return "awaiting_user";
+  if (queueState === "claimed" || queueState === "running") return "running_remote";
+  if (queueState === "queued") return "queued";
+  if (blockedOn.length > 0) return "upstream_dependencies";
+  if (feature.state !== "executing") return "feature_not_executing";
+  if (projectBusy.busy) return "project_busy";
+  return "ready_pending_dispatch";
+}
+
+/** 等待起点（按队列态选取对应时刻列；老记录时刻列为 null 时逐级回退） */
+function waitedSinceOf(
+  node: TaskRecord,
+  q: QueuedTaskRecord | null,
+  queueState: QueueState | null,
+): string | null {
+  if (node.state === "input-required") return node.updatedAt;
+  if (queueState === "claimed" || queueState === "running") {
+    return q?.claimedAt ?? node.startedAt ?? node.createdAt;
+  }
+  if (queueState === "queued") return q?.queuedAt ?? node.createdAt;
+  return node.createdAt;
 }

@@ -3,7 +3,7 @@
  *
  * 覆盖（改造文档 §2.2 / §4 L1）：
  * - **墙钟超期**：`queue_state ∈ {claimed,running} ∧ claimed_at < now - orphanTimeoutMs` ⇒
- *   `sweepOrphanedTasks()` 置 `state='failed'` ∧ `queue_state='settled'` ∧ `failure_kind='infra'`，
+ *   `sweepOrphanedTasks()` 置 `state='failed'` ∧ `queue_state='settled'` ∧ `failure_kind='runner'`，
  *   `task.orphaned` **恰一条**；重复 sweep 幂等（零重复产出）。
  * - **未超时不误杀**（负例）：领取未达阈值 ⇒ 零写入零事件。
  * - **同 tick 先 stale 后墙钟**：心跳先命中者走 requeue（可复活），墙钟不收 ⇒ 无 `task.orphaned`。
@@ -186,10 +186,10 @@ function failureReports(featureId: string): EventRecord[] {
 }
 
 // ---------------------------------------------------------------------------
-// ① 墙钟超期：failed + settled + infra + task.orphaned 恰一条（幂等 / 契约 3）
+// ① 墙钟超期：failed + settled + runner + task.orphaned 恰一条（幂等 / 契约 3）
 // ---------------------------------------------------------------------------
 
-test("墙钟超期 → failed+settled+failure_kind='infra' + task.orphaned 恰一条；重复 sweep 幂等", () => {
+test("墙钟超期 → failed+settled+failure_kind='runner' + task.orphaned 恰一条；重复 sweep 幂等", () => {
   const cfg = makeConfig([machine("m-o2-a", "tok-o2-a")], 60_000);
   const handle = sweep({ config: () => cfg });
   seedClaimedTask({
@@ -206,7 +206,7 @@ test("墙钟超期 → failed+settled+failure_kind='infra' + task.orphaned 恰�
   const row = getQueuedTask("o2-t-a");
   assert.equal(row?.state, "failed");
   assert.equal(row?.queueState, "settled");
-  assert.equal(row?.failureKind, "infra");
+  assert.equal(row?.failureKind, "runner", "墙钟判死落「不可续跑」子类（v0.8.8 O1）");
   assert.ok(row?.finishedAt, "终态 ⇒ finished_at 首填");
   // 契约 3 前提：claim 三字段**不清**（迟到件仍可过 token 比对）
   assert.equal(row?.claimToken, "ct-o2-a");
@@ -270,7 +270,7 @@ test("契约 3：墙钟判死后的迟到回传仍过 token 比对 ⇒ 200 ack�
 
   const row = getQueuedTask("o2-t-b");
   assert.equal(row?.state, "failed");
-  assert.equal(row?.failureKind, "infra", "迟到件不得改写失败分类");
+  assert.equal(row?.failureKind, "runner", "迟到件不得改写失败分类");
   assert.equal(row?.text, null, "迟到件零写入（text 不被覆盖）");
 });
 

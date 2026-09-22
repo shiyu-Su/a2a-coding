@@ -1,8 +1,8 @@
-# PROTOCOL — Runner ⇄ Bridge 线协议契约（2.2）
+# PROTOCOL — Runner ⇄ Bridge 线协议契约（2.3）
 
 本文件是 machine（Launcher 升格为 **Runner**，出站方）与 orch（**Bridge**，入站承载方）之间 HTTP 线协议的**单一事实源**。v0.7.0 起连接模型整体反转为 **pull**：**Runner 主动出站连桥**，桥不再向机器发起业务调用。线协议类型与版本常量在两侧各自声明（`orch/types.ts` / `machine/types.ts`），以本文件 + 契约测试（`.omo/skills/regression-test/tests/test-protocol-version.js`）保持一致；修改协议时**先改本文件**，再同步两侧实现。
 
-- 当前版本：**2.2**（两侧同名常量 `PROTOCOL_VERSION`）
+- 当前版本：**2.3**（两侧同名常量 `PROTOCOL_VERSION`）
 - 主笔归属：**orch 主笔、machine 审阅**（仓根唯一单写面）。
 - 适用范围：仅 Runner ⇄ Bridge HTTP（`/runner/*`，挂载于桥的常驻 HTTP transport、复用 MCP 端口，不引第二接入面）。Runner ⇄ 本地 A2A 端点走标准 A2A 协议（自带版本）；MCP 工具面（`a2a_*` 工具出入参）不属本契约。约束：两部署单元自包含、无跨单元 import —— 因此协议以「文档 + 契约测试」对齐，不做共享 schema 包。
 
@@ -99,8 +99,8 @@ Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持�
 | `artifacts` | array \| string | 否 | 产物（数组或 JSON 字符串） |
 | `projectId` / `contextId` | string | 否 | 缺省沿用桥侧落库值 |
 | `remoteTaskId` | string | 否 | 远端任务句柄（观测用） |
-| `failureKind` | string | 否 | **机器侧失败大类**（`"infra"` \| `"task"`；**v0.8.7 新增**）：由 **Runner** 判定（它是唯一同时看得见 `ensure` / transport / 自有超时的位置），**仅 `state="failed"` 时有值**。**桥不消费该字段做判据**（映射归桥，见下「失败分类归属」）—— 其存在是给运维 / 观测读 |
-| `diagnostics` | object | 否 | **机器侧诊断**（**v0.8.7 新增**）：`{ acpErrorKind?, elapsedMs, chunkCount?, stage }`，`stage ∈ {"ensure","send","poll","wait"}`；`acpErrorKind ∈ {spawn, closed, timeout, rpc, protocol}`（桥内原生类别）。失败态必带；成功态仅在桥带了诊断时才带。**桥只读 `acpErrorKind` 用于失败分类映射**，其余键仅观测 |
+| `failureKind` | string | 否 | **机器侧失败大类**（**2.3 起六类闭集**：`"agent"` \| `"transport"` \| `"runner"` \| `"model_queue"` \| `"timeout"` \| `"business"`；v0.8.7 新增字段、v0.8.8 硬切取值集合）：由 **Runner** 判定（它是唯一同时看得见 `ensure` / transport / 自有超时的位置），**仅 `state="failed"` 时有值**；`timeout` 类**必带子键** `diagnostics.timeoutScope`。判不出 ⇒ **不报该键**（字段本有可选语义）。**旧值 `"infra"` / `"task"` 自 2.3 起非法但仍可被接收**（接收端兜底口径见下「失败分类」）。**桥不消费该字段做自动重试判据**（重试执行在 machine，orch 只登记策略白名单）—— 其存在是给桥记账、运维 / 观测读 |
+| `diagnostics` | object | 否 | **机器侧诊断**（**v0.8.7 新增**）：`{ acpErrorKind?, elapsedMs, chunkCount?, stage }`，`stage ∈ {"ensure","send","poll","wait"}`；`acpErrorKind ∈ {spawn, closed, timeout, rpc, protocol}`（桥内原生类别）。失败态必带；成功态仅在桥带了诊断时才带。**桥只读 `acpErrorKind` 用于失败分类映射**，其余键仅观测。v0.8.8 起该对象内的新增键（`timeoutScope` / `continueAttempts` / `acpErrorCode` / `acpErrorData` / `partialChars` / `updateCount` / `firstChunkElapsedMs` 等）**全部在「未知字段忽略」伞下，不单独触发版本变更** |
 
 响应 200：`{ "result": "ok", "data": { "ack": true, "taskId": string, "state": string, "idempotent": boolean }, "error": null }`
 
@@ -110,7 +110,20 @@ Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持�
 
 **迟到 / 重复终态 = 2xx-with-ignore（契约，v0.8.7 起显式落档）**：终态**首个胜出**（`WHERE state NOT IN ('completed','failed','blocked')`）⇒ 迟到 / 重复的终态回传**整条零写入**，回执**恒为 200 + `ack:true`**（`idempotent` 回显是否同值）；与**已落终态不一致**时另记一条 warn 留痕。**不得改成 4xx** —— Runner 侧 outbox 对**任何非 2xx 一律保留待重试**，改成 4xx 会让已落终态的迟到件**无限退避死循环**（`pending` 永不清、`.outbox` 文件永留）。该幂等口**同时兜住**「桥侧墙钟判死后的迟到件」与「Runner 启动补结算件」两类。
 
-**失败分类归属（事实归 Runner、映射归桥）**：Runner 只报**原生事实**（`diagnostics.acpErrorKind`），**不得预映射**成 `{infra, task}`（否则 vocabulary 变更要动两端）；桥侧纯函数映射后落库 —— `spawn` / `closed` ⇒ `infra`，`rpc` / `protocol` / `timeout` 及缺键 ⇒ `task`（未知一律安全降级）。**全库两个写口**：本端点的映射写入，与桥侧墙钟判死时自置 `infra`；二者均遵守「**首个终态胜出**」——迟到 / 重复上报不得改写既有分类。
+**失败分类（事实归 Runner、闭集校验与记账归桥，2.3 起六类）**：Runner 只报**原生事实**（`diagnostics.acpErrorKind` 及下表信号来源），**不得预映射**成六类之外的自造 vocabulary（否则取值集合变更要动两端）；分类权在 machine（**报得出才报、判不出不报 `failureKind` 键**），桥侧做**闭集校验 + 落库**，并保留一个**兜底映射**（`mapAcpErrorKindToFailureKind` 改值域后；**唯一触发条件 = machine 未上报合格六类值**，不是并行分类器）。**machine 原生信号 → 六类的对应（清单）**：
+
+| 六类 | machine 侧原生信号（判定来源） |
+|---|---|
+| `agent` | `acpErrorKind ∈ {spawn, closed}`（后端进程拉起即败）；后端 `rpc` / `protocol` **明确拒绝**（**是后端语义拒绝，不是 transport**） |
+| `transport` | **仅 launcher↔桥 HTTP 层失败**：传输标记 + 连接级失败判据 + 阶段 `stage ∈ {send, poll}` |
+| `runner` | launcher `deadline` 耗尽 / `ensure` 失败 / **启动补结算孤儿**（本机已无执行体 = 载体侧事实；补结算上报路径本版起必须带值，否则六类在该路径缺角） |
+| `model_queue` | **machine 恒不产出**（ACP 层无队列概念、无独立信号）—— 只能由桥侧跨任务视野**启发式推论**且**显式标注为启发式**；原料 = `updateCount` / `partialChars` / `firstChunkElapsedMs` / `acpErrorCode(+Data)` |
+| `timeout` | `acpErrorKind="timeout"` ⇒ **子键 `timeoutScope="acp-prompt"`**（桥 prompt 满窗）；launcher `timedOut` ⇒ **子键 `timeoutScope="runner-deadline"`** —— 两条路径同归本类、**靠子键分家**（否则 timeout 会在 `runner` 与 `timeout` 两处被重复认领） |
+| `business` | 后端正常收尾 ∧ 输出含失败结论块（`a2a-outcome` 约定）= 原 `"task"` 的直系继承 |
+
+**兜底口径（入站方向，硬契约）**：`/runner/result` 对 `failureKind` **不做整包 400 拒收** —— **缺键 / 旧值 `"infra"` / `"task"` / 未知值** ⇒ 一律落**安全兜底类 `business`**（「不可重试」侧），并**记一条 warn 且必须带上原值**（如 `failure_kind_fallback=<infra>`，供事后区分「真 business」与「兜底 business」）。理由：版本握手只校验主版本 ⇒ 2.2 机器 + 2.3 桥**必然存在混跑窗口**，若对旧值硬拒 = 混跑窗口内旧机任务全部结不了账 = **丢单**。**⚠ 入站宽容与存量库行读侧安全（非法值 ⇒ 兜底 + warn 的读侧放宽 + 存量迁移置 NULL）互补、不可互替**。`business` 不标 `model_queue` 之外的自动动作：`model_queue` 在策略表登记为**不自动重试**（后端还在排队，重跑还得排），只做可见面标注。
+
+**全库两个写口**：本端点的闭集写入，与桥侧**孤儿墙钟**判死时自置（**2.3 起直写六类中的「不可续跑」子类**，v0.8.7 的 `infra` 直写口径废止；**不得与 `timeoutScope="acp-prompt"` 的 Timeout 混淆** —— 后者是「本可续跑」的症状面）；二者均遵守「**首个终态胜出**」——迟到 / 重复上报不得改写既有分类。
 
 ### 命令回执（acks）
 
@@ -138,12 +151,14 @@ Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持�
 
 **未知字段忽略**：三个端点请求体一律**宽容解析** —— `capabilities` / `acks` / `selfCheck` 及任何未列字段均不导致 400、不落库、不进入判据；只有**已列入契约的必填字段**参与校验。加可选字段 → minor +1（见版本规则）。
 
-> **v0.8.7 新增的两个可选请求字段**（`failureKind` / `diagnostics`，见 `/runner/result`）：均**可选、且可被未升级对端忽略** ⇒ 双向兼容，故本版 `PROTOCOL_VERSION` **沿用 2.2、未升版**。**⚠ 与版本规则「加可选字段 → minor +1」条文的取舍尚未由用户裁决**（本版 Step 1 已裁「不动协议版本」，依据 = 可选键可忽略 + 历史可选字段未逐次升版）⇒ 该分歧**已登记待裁**（`planlog.md`「跨版本登记项」）。
+> **v0.8.7 新增的两个可选请求字段**（`failureKind` / `diagnostics`，见 `/runner/result`）：当时**沿用 2.2、未升版**，与版本规则「加可选字段 → minor +1」条文的取舍曾登记待裁（`planlog.md`「跨版本登记项」）。**v0.8.8（2.3）已裁**：**仅新增可忽略的可选字段本身不触发升版**；2.2 → 2.3 的实际触发器是 **`failureKind` 取值集合成员移除**（`infra` / `task` → 六类闭集）—— 属**取值集合变更**且**单向不兼容**，按版本规则须**两侧同升**（见演进记录表 2.3 行）。
+
+> **`diagnostics` 内部加键**（v0.8.8 计量键等）：在「未知字段忽略」伞下，**不单独触发版本变更**；触发 2.3 的只有 `failureKind` 取值集合变更。
 
 ## 版本规则
 
 - **加可选字段**（请求或响应）→ minor +1，主版本不变，旧对端可忽略；
-- **变更必填字段的取值集合**（**新增 / 更名 / 移除成员**，如 `agentKind` 的成员增减或改名）→ minor +1，主版本不变；旧对端仅在未使用变更取值时兼容；
+- **变更必填字段的取值集合**（**新增 / 更名 / 移除成员**，如 `agentKind` 的成员增减或改名、`failureKind` 的合法取值集合更替（2.3：`{infra, task}` → 六类闭集））→ minor +1，主版本不变；旧对端仅在未使用变更取值时兼容；
   - ⚠ **更名与移除是「单向不兼容」**：变更后的取值对未升级对端会被拒，旧取值对已升级对端同样被拒；且拒绝发生在**整包项目级**（`projects[]` 结构校验失败 ⇒ 该 Runner 上报的**全部项目**一起被 `400 bad_request` 拒、该机对桥不可见），**不是只拒那一个项目**。
   - ⇒ 因此**版本号本身不构成兼容窗口**（`/runner/register` 的版本握手只校验**主版本**，枚举取值集合由闭集校验强制）⇒ **更名 / 移除必须由部署侧在同一切换窗口内完成（两侧同升）**，并**在本节下方演进记录表新增一行**登记；**不得跨版本混跑**（旧机与新机同时在线时，必有一侧整包被拒）。
 - **删字段 / 改字段语义 / 加必填请求体或必填参数** → major +1；
@@ -173,3 +188,4 @@ v0.7.0 发版即**硬切**：连接模型由 push（Bridge → Launcher 入站�
 | 2.0（v0.7.0） | **pull 模型**（Runner → Bridge 出站）：`/runner/register`、`/runner/connect`（长轮询 hold 缺省 25s + wake）、`/runner/result`（ack）；命令族三类 dispatch / stop / cancel-task；幂等键 `(machineId, taskId)`；`capabilities` 可扩展 + 未知字段忽略；错误码族 `runner_not_allowed` / `runner_unauthorized` / `runner_not_owner` / `project_not_a_member`；**1.0 端点与握手硬切退役（本版发版时）**；machine 本地 `/health` 明示为**机器本地内部接口、非契约面** | 是（major） | Runner ≥ 2.0（携 `protocolVersion`，主版本 ∈ `[2]`）；Bridge ≥ 2.0（`SUPPORTED_PEER_PROTOCOL_MAJORS = [2]`，拒 1.0） |
 | 2.1（v0.8.0） | agentKind 取值集合扩展（+qoder）；实际强制来自 agentKind 闭集拒绝，版本握手只校验主版本（SUPPORTED_PEER_PROTOCOL_MAJORS=[2]） | 否（minor） | 使用 qoder 的 Runner 要求 Bridge ≥ 2.1（旧 Bridge 对 qoder 注册以 400 bad_request 拒绝） |
 | 2.2（v0.8.6） | agentKind 取值集合**更名**：`qoder` → `qoder-cn`（**旧值不再合法**）；实际强制来自 agentKind 闭集拒绝，版本握手只校验主版本（SUPPORTED_PEER_PROTOCOL_MAJORS=[2]） | 否（minor，沿 2.1 先例：取值集合变更 + 单向不兼容） | 使用 `qoder-cn` 的 Runner 要求 Bridge ≥ 2.2；**旧值 `qoder` 本版起于两侧均非法**（旧 Bridge 对新值同样 400 拒整包） |
+| 2.3（v0.8.8） | `failureKind` 合法取值 → **六类闭集** `agent` / `transport` / `runner` / `model_queue` / `timeout` / `business`；**旧值 `infra` / `task` 自 2.3 起非法但仍可被接收**（接收端兜底为 `business` 并 warn 留原值，见 `/runner/result`「失败分类」）；`timeout` 必带子键 `diagnostics.timeoutScope`（`acp-prompt` / `runner-deadline`）；`diagnostics` 新增计量键均在「未知字段忽略」伞下、不单独触发版本变更 | 否（minor；但**取值集合成员移除 ⇒ 单方不兼容 ⇒ 两侧须同升**——握手只校验主版本，旧值靠接收端兜底而非握手挡） | Runner ≥ 2.3 上报六类（未升级 2.2 Runner 上报 `infra`/`task` 被兜底为 `business` + warn 留原值，混跑期账面口径见改造文档 §6-9）；Bridge ≥ 2.3 闭集校验 + 兜底落库 |

@@ -33,7 +33,8 @@
  *   ⇒ 根除「本地 blocked 与看护 CAS completed 打架」的写侧冲突面）；
  * - **业务失败不判死整单**：`notifyTaskSettled` 的 `failed` 分支与 `advanceExecuting` 的派发失败
  *   分支都改为「**只传播、不 `failFeature`**」，`failFeature` 收窄为 `validateDag` 失败 + 显式取消；
- *   `recover()` 只把在飞节点置 `failed`，**不再 `failFeature`**；
+ *   `recover()` 只把在飞节点置 `failed`，**不再 `failFeature`**（v0.8.8 O4 起：派发窗口节点也不再
+ *   启动即置 `failed`，保留 `working` 交补结算 —— 见 {@link FeatureScheduler.recover}）；
  * - **静止收敛（零动作 + 一次事件）**：`advanceExecuting` 在 `computeReadyNodes` 之后、`ready` 为空
  *   且「全部节点非 `working` ∧ 无在飞 ∧ 批门闩未持 ∧ 存在 failed/blocked」时，保持 `executing`
  *   静止并发一条 `feature.failure_report`（进程内 signature 去重，集合变化自然重新武装）；
@@ -82,12 +83,14 @@ export const FEATURE_ABANDONED_TEXT =
   "任务后台看护连续失败超限（abandoned），任务状态未知；请重新发起或重试。";
 
 /**
- * **C11 派发窗口中断**时写入的结果文本（v0.6.1 REQ-05 §2.5 白捡）。
+ * **C11 派发窗口中断**时的结果文案（v0.6.1 REQ-05 §2.5 白捡）。
  *
  * 语义 = 「占位已写（可能已发出）、远端任务 id 未回填」：崩溃点落在 `message/send`
- * **前写占位 → send 返回后回填**之间。恢复**保守判「已发出」** ⇒ **不自动重派**（防同节点双派）；
- * 按 interrupted 收敛为 `failed` 后交失败静止叙事（`feature.failure_report`）→ 宿主机核实后
- * 以 `retryTaskIds` 显式重派（`rearmForRetry` 清占位 ⇒ **不永久不派**）。
+ * **前写占位 → send 返回后回填**之间。占位非 NULL 即「可能已发出」⇒ **不自动重派**（防同节点双派）。
+ *
+ * ⚠️ **v0.8.8 O4 起 `recover()` 不再在启动时把派发窗口节点置 `failed`**（保留 `working` 交补结算，
+ * 见 {@link FeatureScheduler.recover}），故此文案**已退出生产写侧**，仅作显式核实/重派流程
+ * （`rearmForRetry` 前后）与测试构造用的备用文案保留（出参语义不变）。
  */
 export const FEATURE_DISPATCH_WINDOW_TEXT =
   "任务在派发窗口中断（占位已写、远端任务 id 未回填），可能已在远端发出；为避免重复派发未自动重派，请核实后重试或取消。";
@@ -683,10 +686,11 @@ export class FeatureScheduler {
    *   **Feature 不再置 `failed`**（v0.6.1 REQ-05 §2.1 / N3）—— 留给**静止收敛**叙事：
    *   下一 tick（此处显式 `kick`）由 `advanceExecuting` 判静止并发 `feature.failure_report`，
    *   由宿主持账单经 `retryTaskIds` 重派或显式取消；
-   * - **C11 派发窗口**（v0.6.1 REQ-05 §2.5 白捡）：`working` 且 `remoteTaskId === null` 但
-   *   **占位已写**（`dispatchGuard !== null`）的节点 —— 崩溃点在「send 前占位 → 回填」之间，
-   *   保守判「可能已发出」⇒ 不自动重派（防双派），按 {@link FEATURE_DISPATCH_WINDOW_TEXT}
-   *   收敛为 `failed`，同样交静止收敛发账单（不「永久不派」：rearm 清占位后可重派）；
+   * - **C11 派发窗口**（v0.6.1 REQ-05 §2.5；**v0.8.8 O4 起不再启动即置 failed**）：`working` 且
+   *   `remoteTaskId === null` 但**占位已写**（`dispatchGuard !== null`）的节点 —— 崩溃点在「send 前
+   *   占位 → 回填」之间。**保留 `working`**：交 machine 重连后的**补结算回填终态**（占位仍在 ⇒ 首 tick
+   *   不重派、不双派），真失败由孤儿**墙钟出口**（30 min）兜底。此前在此置 `failed` 会**抢先扼杀补结算窗口**
+   *   （machine 迟到的终态被 `WHERE state NOT IN terminal` 吞掉）；失败账单时点因此**后移**（见下方实现注释）；
    * - `waiting_approval` / `needs_input` / `integrating` / `testing` / `reviewing` 保持挂起；
    * - 其余非终态（discussing/analyzing/planning）保持。
    *
@@ -708,11 +712,17 @@ export class FeatureScheduler {
         (n) => n.remoteTaskId !== null && n.state === "working",
       );
       /**
-       * **C11 派发窗口**（v0.6.1 REQ-05 §2.5 白捡）：占位已写（`dispatchGuard !== null`）、
-       * 远端 id 未回填（`remoteTaskId === null`）且仍 `working` ⇒ 崩溃点落在
-       * 「send 前占位 → send 返回后回填」之间。**保守判「可能已发出」**：不自动重派
-       * （防同节点双派），按 {@link FEATURE_DISPATCH_WINDOW_TEXT} 收敛为 `failed` 交静止收敛发账单；
-       * 宿主核实后 `retryTaskIds` 重派（`rearmForRetry` 清占位 ⇒ 不「永久不派」）。
+       * **C11 派发窗口**：占位已写（`dispatchGuard !== null`）、远端 id 未回填
+       * （`remoteTaskId === null`）且仍 `working` ⇒ 崩溃点落在「send 前占位 → send 返回后回填」之间。
+       *
+       * **v0.8.8 O4：启动不再误杀** —— 本类节点**不再在 `recover()` 内被置 `failed`**。原因：
+       * `recover()` 跑在 `/health` 就绪**之前**，早于 machine 重连后的补结算窗口。若在此抢先置
+       * `failed`，machine 随后送来的**补结算迟到件**会被 `upsertTaskResult` 的
+       * `WHERE state NOT IN ('completed','failed','blocked')` 挡成零写入 —— **启动收敛扼杀了补结算**。
+       * 现改为**保留 `working`**：占位仍在 ⇒ 首 tick `computeReadyNodes` 排除（不双派），交 machine
+       * 重连后的**补结算回填终态**；真失败由孤儿的**墙钟出口**（30 min `failOrphanedTask`）兜底。
+       * 因此**失败账单（`feature.failure_report`）的时点从「启动即刻」后移到「补结算 / 墙钟」之后**
+       * —— 这是刻意的取舍（宁可账单晚到，不可误杀补结算），后人勿再改回启动即置 `failed`。
        */
       const dispatchWindow = nodes.filter(
         (n) => n.dispatchGuard !== null && n.remoteTaskId === null && n.state === "working",
@@ -724,22 +734,21 @@ export class FeatureScheduler {
         updateTaskState(node.taskId, "failed", node.artifactsJson, FEATURE_INTERRUPTED_TEXT);
         summary.interruptedTasks += 1;
       }
-      for (const node of dispatchWindow) {
-        updateTaskState(node.taskId, "failed", node.artifactsJson, FEATURE_DISPATCH_WINDOW_TEXT);
-        summary.interruptedTasks += 1;
+      if (dispatchWindow.length > 0) {
+        bridgeLog.warn(
+          "a2a-feature",
+          `Feature ${feature.featureId} 重建恢复：在飞 ${inFlight.length} 个按 interrupted 置 failed；派发窗口 ${dispatchWindow.length} 个保留 working（v0.8.8 O4：不启动即置 failed，交 machine 补结算回填，真失败由墙钟兜底）；Feature 保持 executing`,
+          {
+            site: "recover",
+            featureId: feature.featureId,
+            interrupted: inFlight.length,
+            dispatchWindow: dispatchWindow.length,
+          },
+        );
       }
-      bridgeLog.warn(
-        "a2a-feature",
-        `Feature ${feature.featureId} 重建恢复：在飞 ${inFlight.length} 个按 interrupted、派发窗口 ${dispatchWindow.length} 个按 dispatch-window 置 failed；Feature 保持 executing（交静止收敛）`,
-        {
-          site: "recover",
-          featureId: feature.featureId,
-          interrupted: inFlight.length,
-          dispatchWindow: dispatchWindow.length,
-        },
-      );
-      // 不 failFeature：立刻驱动一次 tick，让静止收敛在同一启动窗口内发账单。
-      this.kick();
+      // 不 failFeature：仅在确有在飞节点被置 failed 时驱动一次 tick，让静止收敛发账单。
+      // 派发窗口节点保留 working ⇒ 不构成失败，不在此触发账单（见上 O4 说明）。
+      if (inFlight.length > 0) this.kick();
     }
     return summary;
   }
@@ -976,7 +985,9 @@ export class FeatureScheduler {
    * 零动作），写一条 {@link EVENT_FAILURE_REPORT}（`events.state = null`：态没变）。
    * 去重见 {@link failureReportSignatures}（signature 不变即不重发）。
    * 载荷口径：`contextId` = **`TaskRecord.contextId`**（节点会话，供同 ctx 续推重派）、
-   * `text` = 节点 `text`（可 `null`）、`blockedSet` = 冻结集（sorted）。
+   * `text` = 节点 `text`（可 `null`）、`blockedSet` = 冻结集（sorted）、
+   * `failureKind` = 节点 `failureKind`（**v0.8.8 O10**：取既有读口的行值，**未在 scheduler 内分类**；
+   * 未分类 ⇒ 键保留、值为 `null`，便于宿主区分「未分类」与「字段缺失」）。
    */
   private reportFailureAtRest(feature: FeatureRecord, nodes: readonly TaskRecord[]): void {
     const failed = nodes.filter((n) => n.state === "failed");
@@ -1003,6 +1014,7 @@ export class FeatureScheduler {
           projectId: n.projectId,
           text: n.text,
           contextId: n.contextId,
+          failureKind: n.failureKind ?? null,
         })),
         blockedSet: blockedIds,
       }),

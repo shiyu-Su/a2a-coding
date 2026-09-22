@@ -503,6 +503,15 @@ export class Runner {
   }
 
   /**
+   * 出站循环是否存活（`start()` 后 true、`stop()` 后 false）。
+   * v0.8.8 · M4 供 `/health` 的 `degraded` 段：区别于 `bridge.registered` ——
+   * 循环在跑但注册未成（退避中）时，本值为 true 而 `registered` 为 false。
+   */
+  get loopAlive(): boolean {
+    return this.running;
+  }
+
+  /**
    * 供 Launcher `/health` 读取的注册态快照（M2·MA2 读点）。
    * 纯只读：不回写 state、不发起请求，可任意频次调用。
    */

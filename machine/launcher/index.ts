@@ -11,6 +11,8 @@
  *      → **启动补结算**（v0.8.7 M6：无执行体的在飞任务上报 failed）→ 启动自检。
  *   3. 就绪门：自检通过前 `GET /health` 报 `status:"starting"`；通过后 `status:"ok"`
  *      （入站业务路由已退役，就绪态仅由 `/health` 的 `status` 字段表达）。
+ *      v0.8.8 · M4 起 `/health` 另携 `degraded` 段（本机降级面：跳过自检 / 自检失败项目 /
+ *      不可用项目集 / outbox 与出站循环存活 / 在飞数）；`status` 的取值口径不变。
  *   4. 自检**粒度按可否服务**（§2.4-⑤ 改判 · REQ-v0.8.6-2026-09-21-02 收口）：单项目失败
  *      → 逐项登记 `manager.unavailable` 后继续服务其余项目（`ready=true` 只要至少一项可用）；
  *      **机器级故障 = 全部项目不可用**，仅此一种才关端口 → 回收子进程 → 删 pidfile → `exit(1)`。
@@ -27,10 +29,15 @@ import { errorMessage } from "./process.js";
 import { reconcileInflightOnStartup } from "./reconcile-inflight.js";
 import { reconcileStartupLedger } from "./reconcile.js";
 import { InFlightLedger, createRunner, type Runner } from "./runner.js";
-import { atomicWriteJson, createFileOutbox, outboxDirOf, type FileOutbox } from "./runner-outbox.js";
+import {
+  atomicWriteJson,
+  createFileOutbox,
+  outboxDirOf,
+  type FileOutbox,
+} from "./runner-outbox.js";
 import { RUNNER_STATE_FILENAME } from "./runner-state.js";
 import { runStartupSelfCheck, type SelfCheckResult } from "./self-check.js";
-import { createLauncherApp } from "./server.js";
+import { buildDegradedStatus, createLauncherApp } from "./server.js";
 
 /** 缺省机器配置：源码运行与构建运行均以 machine 单元根（含 package.json）为基准解析 */
 const DEFAULT_MACHINE_CONFIG = join(appRootFromModule(import.meta.url), "config", "config.json");
@@ -79,6 +86,13 @@ let ready = false;
 let runner: Runner | null = null;
 /** 本实例是否成功写入 pidfile（避免误删其它实例的文件） */
 let pidfileWritten = false;
+/** 结果回传 outbox（v0.8.7 M6 单实例：启动补结算与 Runner 共用；未配置 bridge 时恒 null） */
+let outbox: FileOutbox | null = null;
+/**
+ * 启动自检结论。v0.8.8 · M4 起提到模块作用域，供 `/health` 的 `degraded` 段读点跨函数取用；
+ * 对象身份不变，`onListening()` 内就地写入自检结果字段。
+ */
+const selfCheck: SelfCheckResult = { ok: true, failures: [], unavailable: [] };
 
 const app = createLauncherApp({
   isReady: () => ready,
@@ -86,6 +100,18 @@ const app = createLauncherApp({
   // 时才存在；为 null（未启用 / 尚未启动）即视为恒未注册。
   getBridgeStatus: () =>
     runner?.healthSnapshot() ?? { registered: false, lastHeartbeatAt: null, lastError: null },
+  // `/health` 的 degraded 段读点（v0.8.8 · M4）：只读汇总本机降级面（纯本机运维面，
+  // 不经注册载荷外传 —— 与 orch 侧 degraded[] 互不相通）。
+  getDegraded: () =>
+    buildDegradedStatus({
+      startupCheck: machine.launcher.startupCheck,
+      selfCheckFailures: selfCheck.failures,
+      unavailableProjectIds: manager.unavailableProjectIds(),
+      outboxLoopAlive: outbox?.loopAlive ?? false,
+      outboxPendingCount: outbox?.pendingCount ?? 0,
+      runnerLoopAlive: runner?.loopAlive ?? false,
+      inFlightCount: inFlight.size,
+    }),
   shutdownEndpoint: machine.launcher.shutdownEndpoint === true,
   ...(machine.launcher.shutdownToken !== undefined
     ? { shutdownToken: machine.launcher.shutdownToken }
@@ -232,7 +258,6 @@ async function onListening(): Promise<void> {
   // 时序：必须在 `reconcileStartupLedger` 之后（对账刚更新子女账本）、自检 ensure 之前
   // （自检新拉起的子进程会掩盖孤儿）。outbox 提前创建为单一实例，稍后随 Runner 启动投递循环
   // （orch 已核：`/runner/result` 不检查注册表 ⇒ 上报不必挂 register 之后）。
-  let outbox: FileOutbox | null = null;
   if (machine.launcher.bridge !== undefined) {
     outbox = createFileOutbox({ dir: outboxDirOf(appRoot), bridge: machine.launcher.bridge });
     try {
@@ -250,7 +275,6 @@ async function onListening(): Promise<void> {
   // **粒度口径（§2.4-⑤ 改判 · REQ-v0.8.6-2026-09-21-02 收口）**：单项目失败一律项目级——
   // 逐项登记不可用、继续服务其余项目；`process.exit(1)` 只保留给**机器级故障 = 全部项目不可用**
   // （真机 2026-09-22：包装器进程提前退出等项目级 ensure 故障曾被误判机器级，致 7/8 可用仍整机退出）。
-  const selfCheck: SelfCheckResult = { ok: true, failures: [], unavailable: [] };
   if (machine.launcher.startupCheck ?? true) {
     const result = await runStartupSelfCheck(manager, machine);
     selfCheck.ok = result.ok;

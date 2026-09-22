@@ -27,6 +27,7 @@ import { getQueuedTask } from "../session/store.js";
 import type { QueueState, QueuedTaskRecord } from "../session/store.js";
 import type { TaskState } from "../types.js";
 import { bridgeLog } from "./bridge-log.js";
+import type { DegradationSink } from "./index.js";
 
 /** 连续 poll 失败上限：达到后放弃看护（防永久性故障导致无限空转） */
 export const WATCHER_MAX_CONSECUTIVE_FAILURES = 30;
@@ -104,12 +105,35 @@ const watching = new Set<string>();
  */
 let watcherEnabled = true;
 
-/** 设置 owner 门闩（lifecycle 按 core 租约 role 调用） */
-export function setTaskWatcherEnabled(enabled: boolean): void {
-  watcherEnabled = enabled;
+/**
+ * 看护门闩降级键（v0.8.8 O5；`/health` `degraded[]` 的 watcher 停用位）。
+ * 此前注释承诺「门闩状态供 `/health`」但从未接线，现经 `degradationSink` 落地。
+ */
+export const TASK_WATCHER_DEGRADED_KEY = "task-watcher.disabled";
+
+/** 降级登记表 sink（装配点由 index 注入一次；未注入 ⇒ 门闩变更不外报，保持旧行为） */
+let degradationSink: DegradationSink | null = null;
+
+/** 注入降级登记表 sink（`bridge/index.ts` 常驻 http 启动时调用） */
+export function setTaskWatcherDegradationSink(sink: DegradationSink): void {
+  degradationSink = sink;
 }
 
-/** 当前门闩状态（供 /health / 单测断言） */
+/** 设置 owner 门闩（lifecycle 按 core 租约 role 调用；O5 起同步登记 /health 降级位） */
+export function setTaskWatcherEnabled(enabled: boolean): void {
+  watcherEnabled = enabled;
+  if (degradationSink === null) return;
+  if (enabled) {
+    degradationSink.clear(TASK_WATCHER_DEGRADED_KEY);
+  } else {
+    degradationSink.mark(
+      TASK_WATCHER_DEGRADED_KEY,
+      "看护 owner 门闩停用（当前非 core 租约持有者 / follower）",
+    );
+  }
+}
+
+/** 当前门闩状态（供 /health 降级位 / 单测断言） */
 export function isTaskWatcherEnabled(): boolean {
   return watcherEnabled;
 }

@@ -14,9 +14,10 @@
  * | `/` | — | 内联 HTML 页面（`bridge/web/html.ts`，零前端工具链） |
  * | `/api/projects` | `core.projects()`（= `handleProjects`） | **字段白名单** + 快照语义（来源 / 观测时间） |
  * | `/api/features` | `core.featureStatus({})`（= `handleFeatureStatus`） | 列出全部 Feature（含 taskCount） |
- * | `/api/features/:featureId` | `core.featureStatus({ featureId })` | 单 Feature + 任务摘要（**含三时刻**，渲染层派生）+ 产物；未知 → 404 |
+ * | `/api/features/:featureId` | `core.featureStatus({ featureId })` | 单 Feature + 任务摘要（**含三时刻 + 队列四字段**，渲染层派生）+ 产物；未知 → 404 |
+ * | `/api/features/:featureId/trace` | `handleFeatureTrace`（store 只读投影；v0.8.8 §2.10(c)） | Trace 面：非终态节点「在等谁 / 排队位次」；未知 → 404 |
  * | `/api/tasks?project=&state=&limit=` | `core.tasks(...)`（= `handleTasks`） | `project` 必填（缺 → 400） |
- * | `/api/tasks/:taskId` | `store.getTask`（本地库只读） | 单任务详情（见下「已知偏离」） |
+ * | `/api/tasks/:taskId` | `store.getQueuedTask`（本地库只读） | 单任务详情（含三时刻 + 队列四字段；见下「已知偏离」） |
  * | `/api/events?since=&limit=` | `store.listEvents({ since, limit })` | **直连 store**；游标由前端传参 |
  *
  * ## 硬约束：读事件**绝不移动宿主收件箱游标**
@@ -55,7 +56,7 @@
  *
  * ## 已知偏离（相对派发说明）
  *
- * `/api/tasks/:taskId` 走 `store.getTask`（本地只读）而**非** `handleTasks`：
+ * `/api/tasks/:taskId` 走 `store.getQueuedTask`（本地只读队列视角，含队列四字段）而**非** `handleTasks`：
  * `handleTasks` 是**按 projectId 列表**的语义（且 `limit` 上限 100），拿不到「按 taskId 精确取一条」，
  * 只能「先查库拿 projectId → 列表 → 再筛」——既多一次副作用（`pruneTasks` + 跨机探测），
  * 又可能因超出 `limit` 而误判 404。故详情页走本地库精确读（零副作用），列表页仍复用 `handleTasks`。
@@ -63,11 +64,13 @@
  */
 import { createServer as createHttpServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
-import { getTask, listEvents } from "../../session/store.js";
+import { getQueuedTask, listEvents } from "../../session/store.js";
+import type { QueueState, QueuedTaskRecord } from "../../session/store.js";
 import type { EventRecord, ProjectStatus, TaskRecord, TaskState } from "../../types.js";
 import { bridgeLog } from "../bridge-log.js";
 import { renderIndexHtml } from "../web/html.js";
 import type { WebReadiness } from "../web/html.js";
+import { handleFeatureTrace } from "../feature-tools.js";
 import type { FeatureTaskSummary } from "../feature-tools.js";
 import type { BridgeCore } from "../index.js";
 import { isLoopbackHostOrAddress } from "./http.js";
@@ -158,11 +161,33 @@ export interface TaskDetailView {
   remoteTaskId: string | null;
   retryCount: number;
   failureKind: TaskRecord["failureKind"];
+  /** 队列态（`tasks.queue_state`，NULL 老行已归一为 `settled`；无记录 → null） */
+  queueState: QueueState | null;
+  /** 领取时刻（`tasks.claimed_at`；未领取 → null） */
+  claimedAt: string | null;
+  /** 入队时刻（`tasks.queued_at`；FIFO 领取序；未入队 → null） */
+  queuedAt: string | null;
+  /** 领取者标识（`tasks.claimed_by`；未领取 → null） */
+  claimedBy: string | null;
   createdAt: string | null;
   startedAt: string | null;
   finishedAt: string | null;
   updatedAt: string;
 }
+
+/**
+ * 单 Feature 详情的 Task 行视图 = `FeatureTaskSummary` ∪ 三时刻 ∪ 队列四字段
+ * （渲染层就地派生，只增字段；MCP `feature_status` 出参不受影响）。
+ */
+export type FeatureTaskView = FeatureTaskSummary & {
+  createdAt: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  queueState: QueueState | null;
+  claimedAt: string | null;
+  queuedAt: string | null;
+  claimedBy: string | null;
+};
 
 // ---------------------------------------------------------------------------
 // 启动入口
@@ -293,10 +318,12 @@ type WebRoute =
   | { kind: "page" }
   | { kind: "projects" }
   | { kind: "features"; featureId: string | null }
+  | { kind: "featureTrace"; featureId: string }
   | { kind: "tasks"; taskId: string | null }
   | { kind: "events" };
 
 const FEATURES_PREFIX = "/api/features/";
+const TRACE_SUFFIX = "/trace";
 const TASKS_PREFIX = "/api/tasks/";
 
 function matchRoute(path: string): WebRoute | null {
@@ -305,7 +332,13 @@ function matchRoute(path: string): WebRoute | null {
   if (path === "/api/features") return { kind: "features", featureId: null };
   if (path.startsWith(FEATURES_PREFIX)) {
     const raw = path.slice(FEATURES_PREFIX.length);
-    return raw.length > 0 && !raw.includes("/") ? { kind: "features", featureId: raw } : null;
+    if (raw.length > 0 && !raw.includes("/")) return { kind: "features", featureId: raw };
+    // `/api/features/:featureId/trace`（v0.8.8 §2.10(c)）：仅认这一段二级子路径，其余仍 404
+    if (raw.endsWith(TRACE_SUFFIX)) {
+      const fid = raw.slice(0, raw.length - TRACE_SUFFIX.length);
+      if (fid.length > 0 && !fid.includes("/")) return { kind: "featureTrace", featureId: fid };
+    }
+    return null;
   }
   if (path === "/api/tasks") return { kind: "tasks", taskId: null };
   if (path.startsWith(TASKS_PREFIX)) {
@@ -361,6 +394,15 @@ async function handleRequest(
         return;
       }
       sendFeatures(res, options, featureId);
+      return;
+    }
+    case "featureTrace": {
+      const featureId = decodePathSegment(route.featureId);
+      if (featureId === null) {
+        respondJson(res, 400, failure("bad_path_segment", "featureId 不是合法的 URI 片段"));
+        return;
+      }
+      sendFeatureTrace(res, featureId);
       return;
     }
     case "tasks": {
@@ -460,9 +502,11 @@ function toProjectView(project: {
 /**
  * `GET /api/features[/:featureId]`：复用 `handleFeatureStatus`（出参原样透出，不做白名单）。
  *
- * **单 Feature 详情**额外给每个 Task 摘要补**三时刻**（`createdAt` / `startedAt` / `finishedAt`）——
- * 页面（§8 增补 #2）要用它显示「`createdAt → finishedAt`」与「耗时」，而 `FeatureTaskSummary`
- * 不含这三列。补法是**渲染层就地派生**（`getTask`，本地只读），
+ * **单 Feature 详情**额外给每个 Task 摘要补**三时刻**（`createdAt` / `startedAt` / `finishedAt`）
+ * 与**队列四字段**（`queueState` / `claimedAt` / `queuedAt` / `claimedBy`）——
+ * 页面（§8 增补 #2 / v0.8.8 O6）要用时刻显示「`createdAt → finishedAt`」与「耗时」，用队列四字段
+ * 显示真实「排队」区间（`queuedAt → claimedAt`），而 `FeatureTaskSummary` 不含这七列。补法是
+ * **渲染层就地派生**（`getQueuedTask`，本地只读、store 零改动），
  * **不改** `FeatureTaskSummary` / `handleFeatureStatus` / MCP 工具面；列表分支（`/api/features`）
  * **出参与行为完全不变**。
  */
@@ -484,18 +528,36 @@ function sendFeatures(
 }
 
 /**
- * 单 Feature 详情里 Task 行补三时刻（v0.5.0 §8 增补 #2「进度 / 耗时」）。
- * 本地无该记录（理论不该发生）⇒ 三值一律 `null`（页面显示「未知 / —」），**不吞不造**。
+ * `GET /api/features/:featureId/trace`：Trace 面只读投影（v0.8.8 §2.10(c)，O7）——
+ * 回答「这个 Feature 为什么还没完成」（非终态节点的 在等谁 / 队列态 / 项目占用 / 排队位次）。
+ * **复用 `handleFeatureTrace` helper**（纯读、不落库、不触发调度），不写第二套判据；
+ * 网页 = 非身份面（§2.7）⇒ identity 传 `null`（全量放行）。未知 Feature → 404。
  */
-function withFeatureTaskTimings(
-  task: FeatureTaskSummary,
-): FeatureTaskSummary & { createdAt: string | null; startedAt: string | null; finishedAt: string | null } {
-  const record = getTask(task.taskId);
+function sendFeatureTrace(res: ServerResponse, featureId: string): void {
+  const outcome = handleFeatureTrace({ featureId }, null);
+  if (!outcome.ok) {
+    respondJson(res, outcome.code === "feature_not_found" ? 404 : 500, outcome);
+    return;
+  }
+  respondJson(res, 200, outcome);
+}
+
+/**
+ * 单 Feature 详情里 Task 行补三时刻（v0.5.0 §8 增补 #2「进度 / 耗时」）
+ * + 队列四字段（v0.8.8 O6：页面「排队」列改用真源 `queuedAt → claimedAt`）。
+ * 本地无该记录（理论不该发生）⇒ 时刻与队列字段一律 `null`（页面显示「未知 / —」），**不吞不造**。
+ */
+function withFeatureTaskTimings(task: FeatureTaskSummary): FeatureTaskView {
+  const record = getQueuedTask(task.taskId);
   return {
     ...task,
     createdAt: record?.createdAt ?? null,
     startedAt: record?.startedAt ?? null,
     finishedAt: record?.finishedAt ?? null,
+    queueState: record?.queueState ?? null,
+    claimedAt: record?.claimedAt ?? null,
+    queuedAt: record?.queuedAt ?? null,
+    claimedBy: record?.claimedBy ?? null,
   };
 }
 
@@ -546,7 +608,7 @@ async function sendTasks(
  * **不** 走 `handleTasks`（其为按项目列表语义，见文件头「已知偏离」）。
  */
 function sendTaskDetail(res: ServerResponse, taskId: string): void {
-  const record = getTask(taskId);
+  const record = getQueuedTask(taskId);
   if (record === null) {
     respondJson(res, 404, failure("task_not_found", `未知任务 ${taskId}（本地任务存储无记录）`));
     return;
@@ -554,7 +616,7 @@ function sendTaskDetail(res: ServerResponse, taskId: string): void {
   respondJson(res, 200, { ok: true, task: toTaskDetailView(record) });
 }
 
-function toTaskDetailView(record: TaskRecord): TaskDetailView {
+function toTaskDetailView(record: QueuedTaskRecord): TaskDetailView {
   return {
     taskId: record.taskId,
     projectId: record.projectId,
@@ -567,6 +629,10 @@ function toTaskDetailView(record: TaskRecord): TaskDetailView {
     remoteTaskId: record.remoteTaskId,
     retryCount: record.retryCount,
     failureKind: record.failureKind,
+    queueState: record.queueState,
+    claimedAt: record.claimedAt,
+    queuedAt: record.queuedAt,
+    claimedBy: record.claimedBy,
     createdAt: record.createdAt,
     startedAt: record.startedAt,
     finishedAt: record.finishedAt,

@@ -14,6 +14,8 @@
  * **上报复用 `outbox.deliver()`**：造 `state='failed'` **新结果**入 pending（落盘 / Bearer /
  * 退避 / ack 零新代码），原因走 `text`；**不落 claimToken**（凭证随进程消亡是物理事实，
  * 桥侧窄口 A2 允许「无 token 且 failed」，契约 ④ 行级绑定兜安全）。
+ * **v0.8.8 · M2**：该 failed 结果必带 `failureKind="runner"`（PROTOCOL 2.3 六类在补结算
+ * 路径的定档取值）+ 最小 `diagnostics`（`elapsedMs` = 上一进程已飞时长）。
  * **⚠ 这不违反「boot 不补发」** —— 那条是**不回放既有 outbox 文件**，此处是造新结果。
  *
  * **字段口径**：`contextId` 置空串 —— M5 在飞台账（`InFlightEntry`）不落 contextId，
@@ -32,7 +34,12 @@ import { join } from "node:path";
 import { childLedgerDir } from "./manager.js";
 import { errorMessage } from "./process.js";
 import { isPidAlive } from "./reconcile.js";
-import type { RunnerOutbox, RunnerTaskResult } from "./runner-exec.js";
+import {
+  RECONCILE_FAILURE_KIND,
+  type RunnerFailureStage,
+  type RunnerOutbox,
+  type RunnerTaskResult,
+} from "./runner-exec.js";
 import { SELF_CHECK_LEDGER_PREFIX } from "./self-check.js";
 
 /** inflight 目录名（相对 machine 单元根：`<machine 根>/.a2a/inflight`，与 M5 落盘一致） */
@@ -234,12 +241,23 @@ export async function reconcileInflightOnStartup(
   summary.skipped = plan.skipped.length;
 
   for (const record of plan.orphans) {
+    const startedAtMs = Date.parse(record.startedAt);
+    const elapsedMs = Number.isFinite(startedAtMs)
+      ? Math.max(0, now().getTime() - startedAtMs)
+      : 0;
     const result: RunnerTaskResult = {
       taskId: record.taskId,
       machineId: options.machineId,
       projectId: record.projectId,
       contextId: "",
       state: "failed",
+      // v0.8.8 · M2：补结算路径必带六类值（定档 `runner` = 本机已无执行体，载体侧事实），
+      // 否则六类在该路径缺角；elapsedMs = 孤儿在上一进程里已飞的时长（读不出 ⇒ 0）
+      failureKind: RECONCILE_FAILURE_KIND,
+      diagnostics: {
+        elapsedMs,
+        stage: "wait" satisfies RunnerFailureStage,
+      },
       text: `${INFLIGHT_RECONCILE_FAILURE_TEXT}（startedAt=${record.startedAt || "未知"}）`,
       artifacts: [],
       finishedAt: now().toISOString(),

@@ -2,6 +2,57 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.8.8] - 2026-09-22
+
+> 主题：**执行可靠性 II：失败可见与策略**（单需求 · `REQ-v0.8.8-2026-09-22-01`；用户 2026-09-22 Step 3「验收通过」）。**四件事一次收口**：**① 失败分类由「两值桶」变六类闭集** —— `{infra, task}` 里 `task` 是**兜底桶**（`timeout`/`rpc`/`protocol` 全落进去），且两单元对 `timeout` 的定义**互相矛盾**（machine ⇒ `infra` / orch ⇒ `task`，而 orch **根本不读** machine 上报的那个值）⇒ 新闭集 `{agent, transport, runner, model_queue, timeout, business}`（+ `timeoutScope` 子键），线协议 `2.2 → 2.3`。**② 判死的任务第一次能说清「为什么死」** —— 补齐 `task.settled` 终态事件（pull 模型下普通任务的事件足迹原只剩 `task.claimed`）+ 六类真机样本 + 失败账单带 `failureKind`。**③ 超时不再必然丢活** —— 场景 C 续跑（同 `contextId` 续接，用户裁 ①(b)「按类自动重试」的第一个显式场景：**600s 超时 ∧ 确有输出 ⇒ 任务太大 ⇒ 可重试**）。**④ 降级不再静默** —— 坏配置曾让 orch 三条保护**静默失效**而 `/health` 照旧 200 `ok`。同版补齐 **v0.8.7 顺延 5 项里的 4 项**（孤儿墙钟 / 启动补结算 / `--session-timeout` 成对 / `failure_kind` 落库）+ 投影层 `claimedAt` / `queuedAt`。改造文档：`doc/v0.8.8/失败可见与策略-改造文档.md`（**final**；边界 R1→R2→R3 三轮收敛 + Step 2/Step 3 两条实现级增补）。
+
+### Changed
+
+- **失败分类硬切六类**（orch · §2.1）：`FailureKind` 改 **`{agent, transport, runner, model_queue, timeout, business}`**，闭集**派生自 `PROTOCOL.md`**（唯一事实源）；orch 的**自映射角色被删除**，改为「**校验 + 落库**」。**兜底宽容（D2）**：缺键 / 旧值 `infra`·`task` / 未知值 ⇒ 桥**不崩、不整包拒**，落**安全类 + warn**（warn 带原值 `failure_kind_fallback=<infra>`，否则事后无法区分「真 business」与「兜底 business」）；`coerceStoredFailureKind` 放宽。**硬切不保别名**（无归一谓词、无旧键兼容）。**唯一显式冗余 = 兜底映射**（`mapAcpErrorKindToFailureKind`，并存理由仅「混跑窗口内未升级的 2.2 machine 可能上报缺键或旧值」，登记为「兜底，非并行分类」）。
+- **machine 判据映射（事实归 machine、映射权归协议）**（machine · §2.3）：`classifyFailure` 改值域为六类 + **判不出即不报键**（不加第 7 值）；新增 **`timeoutScope ∈ {acp-prompt, runner-deadline}`** 子键。**machine 只报原生事实、不建第二张「kind→六类」映射表**。**`model_queue` 本版 machine 恒不产出**（无独立信号：ACP 层无队列概念、后端静默时什么都不说）⇒ 它今天只是「协议里合法的取值」，**不是「会被产出的取值」**（启发式判定挪 v0.8.10，与排队可见面同版）。
+- **`recover()` 修法**（orch · §2.7）：桥重启**不再把派发窗口内的在飞节点直接置 `failed`** —— 改造前那一支会**抢先扼杀**随后 `reconcile-inflight` 的启动补结算窗口。改后保留 `working`，交**补结算 / 孤儿墙钟**两条既有路径结账。
+- **墙钟判死改判非续跑子类**（orch · §2.1-9）：`failure_kind = runner`（**不是 `timeout`**）—— 「载体已经走了」不该在账面上显示成「本可续跑」。
+- **`PROTOCOL.md` 升 2.3**（§2.11）：演进表新增行（含「**旧值非法但可接收**」）+ 六类取值集合写入条文；两侧 `PROTOCOL_VERSION` 常量**同升**（orch `types.ts` / machine `types.ts` / `orch/README.md` 三处，v0.8.7 那次的「三处同升漏两侧常量」教训已按单元拆节点落）。
+
+### Added
+
+- **场景 C 续跑 = 「续跑 ≠ 重派」**（machine · §2.4，本版主战场）：判据 = `state=failed ∧ timeoutScope="acp-prompt" ∧ continueAttempts=0 ∧ roundsSinceStart<MAX_DISPATCH_ROUNDS(2) ∧ (partialChars≥200 ∨ updateCount≥5) ∧ remaining()≥CONTINUE_MIN_REMAINING_MS(180s)`；机制 = **`host.stop → ensure → 同 `contextId` `session/load` 续跑** + 半截产出**拼进 prompt**（注入消毒 + 尾部上限 4000 字符）+ `sessionResumed` 回标。**`deadline` 从不延长**（`--session-timeout` 成对语义零改动）。**续跑不动 `retry_count`** —— 正交双计数器：`attempt`（宿主重派）vs `continueAttempts`（machine 续跑）；orch **零新写口、不新增端点**（`/runner/retry-request` 提案已撤回）。
+- **`task.settled` 终态事件补齐**（orch · §2.6）：`upsertTaskResult` 在「**首个终态胜出**」时发一条（门 = `changes>0 ∧ isFinishedState`），payload 含 `attempt`（= `retry_count`）/ `continueAttempts` / `machineId`；**`working` 更新不发**、重复/迟到上报**不重发**（幂等）。根因 = pull 模型下结果直接 UPSERT、不 `appendEvent` ⇒ 「靠事件流等普通任务收尾」原本不可行。
+- **`task.continued` 派生事件 + `diagnostics` 宽 JSON 原文列**（orch · §2.5/§2.6）：`continueAttempts>0` 时发 `task.continued`；`diagnostics` 以**宽 JSON 原文**落库（**13 键**，为 v0.8.10 留返工红线）。
+- **降级可见（两面，互不相通）**：orch 侧新 **`DegradationRegistry` + `GET /health degraded[]`**，先接管三条**静默失效**的保护 —— 心跳超期清算（`runner.heartbeat-sweep`）/ **孤儿墙钟清算**（`runner.orphan-sweep`，v0.8.7 刚落的那条）/ 领取超期判据（`claim.stale-criterion`），坏配置当场可见（每条带**精确原因**）而非「服务还活着 = 配置没问题」；machine 侧**只改自身 `/health`**（`degraded.selfCheckSkipped` 等）—— **不动注册载荷顶层字段**（`startupCheck=false` 不再伪装成「自检通过」）。两面按 C4 **互不相通**。
+- **执行轨迹 Trace**（orch · §2.10）：**(a)** 页面渲染 `retryCount` / `failureKind` 两列 · **(b)** 投影补 **`claimedAt` / `queuedAt`**（v0.8.7 顺延项坐实）· **(c)** 只读查询 `GET /api/features/:id/trace`（答「在等谁 / 排队位次」，**不落库**）。
+- **machine 计量补全 + 上报 schema（13 键）**（machine · §2.5）：新增 `firstChunkElapsedMs` / `partialChars` / `updateCount` / `promptElapsedMs` / `bridgeEnsureElapsedMs` / `sessionResumed` / `continueAttempts` / `continueTrigger` / `partialTailChars` / `acpErrorCode` / **`acpErrorData`** / `workspaceTouched` / `touchedFileCount`。**`AcpError.data` 必留** —— **方言不对称**：qoder-cn 把细节写进 `message`、**opencode 只写进 `data`**（message 仅 `Invalid params`）⇒ 只留文本则 opencode 的错误永远只有四个字、判不出来。
+- **取证面四处（让证据活下来）**（machine · §2.3.1）：① `client.ts` 迟到响应分支 `return` 前保留 `error.code/message/data` ② `reasonOf` 扩成 `message +（code=…）+ data 摘要` ③ `failureResult` 补 `code`（此前**连 code 都不拼**，最大缺口）④ `withDiag` payload 加 `code`/`data` 并同步放行 launcher 白名单（否则桥写了 launcher 也丢）。**动因是一条历史取证**：86,554 行日志里两条 600s 零输出样本的 `failed` 行后**紧跟 `[acp] 收到未知 id 的响应：4`**（id=4 即 `session/prompt`，全日志 31 次皆如此）⇒ **响应其实回来了、payload 被丢**（超时回调先 `pending.delete(id)` 再抛 ⇒ 迟到响应落进「未知 id」分支、一字不留）⇒ 用户「配额该有报错」的假设**方向正确，但取证面自己吃掉了证据**。
+- **只读工作树指纹**（machine · §2.3.2）：`git --no-optional-locks status --porcelain` + `rev-parse HEAD`（起止各一次，**零写入 / 不动 HEAD**），**必须按 project 子目录前缀过滤**（从子目录跑仍输出全仓改动）。定位 = **单向排除 + 重发安全闸**，主判据仍是执行面信号。**用户提议的「每任务前 `git commit`」不采纳** —— 三 project 是同一 monorepo 子目录、**共用唯一 `.git`/index**，而纯只读任务跑满窗与排队零输出在「工作树有无改动」上**完全同相**（无分辨力，且只读任务正是超时高发户）；自动 commit 还会摧毁「相对 HEAD 的 diff」复核链 + 并发抢 `index.lock` + 卷走对方半成品。
+- **存量迁移脚本**：`orch/scripts/migrate-failure-kind-sixclass.mjs`（四值存量置 NULL，**缺省 dry-run**、`--apply` 才写、可重入）。
+- **单测**：orch `test/o1-sixclass.test.ts` · `o3b-diagnostics-continued.test.ts` · `o5-degradation-visibility.test.ts` · `o7-feature-trace.test.ts` · `migrate-failure-kind-sixclass.test.mjs`；machine `test/health-degraded.test.ts`。
+- **回归用例**：`.omo` 新增 **`test-v0.8.8-failure-visible.js`**，`TESTCASES.md` 新增 **TC21**；`test-v0.8.4-key-layout.js` / `test-v0.8.5-codex-claude-acp.js` 的 machine 版本 pin 随发版翻向 0.8.8。
+- **`scripts/watch-feature-loud.mjs`（宿主面，Step 3 现场化的工具）**：既有 `watch-feature.mjs` 的 `failure-at-rest(10)` 要求「**静止**且有失败」⇒ 600s 超时型失败出现时其它节点仍在飞 ⇒ **永远不退 10**、只能等窗口耗尽退 20（宿主因此收不到「有失败」信号）⇒ 新脚本改为「**失败即叫**」：相对入场基线出现 `failed` 即打印失败清单并退 **30**（其余退出码兼容 `0/10/11/12/13/20/1`）。
+- **宿主纪律**：`CLAUDE.md` / `AGENTS.md` 新增**失败处置纪律**（策略表怎么用：`timeout × acp-prompt` 可重试 · `runner-deadline` 不可 · `model_queue` 只标注不自动动作）。
+
+### Removed
+
+- **`{infra, task}` 二分及其自映射角色**（orch）：不再自行映射 `acpErrorKind`，改「校验 + 落库」；无别名表、无归一谓词（硬切）。
+- **`startupCheck=false` 的不可区分性**（machine）：自检被跳过时 `/health` 不再与「自检通过」同形。
+
+### 门禁与真机
+
+- **单元门禁（发版前重跑实测）**：orch `typecheck` **0** / `lint` **0** / `npm test` **332（331 pass / 0 fail / 1 平台跳过）**；machine `typecheck` **0** / `lint` **0** / `npm test` **422 / 422 · 0 失败**。
+- **宿主回归**：**1289 / 1289 零失败**（`reports/v0.8.8/regression-report.json`；v0.8.7 为 1220 —— 差额 = 本版新增 **TC21** + 若干反转/新增断言）。
+- **真机（Step 3 · 2026-09-22，用户重启 + 三次配置窗口，宿主全程自取证据、无一项靠转述）** —— 本版核心三机制全过：**① 场景 C 续跑正例 ✓✓**（`task.continued`：`continueAttempts:1` · `continueTrigger:"acp-prompt-timeout"` · `timeoutScope:"acp-prompt"` · `partialChars:9317` · `updateCount:1677` · `firstChunkElapsedMs:10535` · **`sessionResumed:true`** ⇒ **同 ctx 续接真的成功、未退化成重跑**；同任务 `task.settled` = `attempt:0` + `continueAttempts:1` ⇒ 正交双口径成立）· **② 场景 C 负例 ✓✓**（未配窗项目：寿命 **603.1s** 判 `failed`、`continueAttempts:0`、**全程无 `task.continued`**）· **③ 降级可见（负向 + 恢复）✓✓**（故意写坏类型 ⇒ `degraded[]` 当场出现**三条带精确原因**、`status` 仍 `ok`；改回 ⇒ **归零**）。另 **孤儿墙钟出口 ✓✓**（`task.orphaned`，`elapsedMs 309461 ≥ timeoutMs 300000`，`failureKind=runner`）· **启动补结算 ✓✓**（在飞时重启 Launcher ⇒ `task.stale → runner.offline → task.settled(failed) → runner.online`，**text 自解释**）· **`recover()` 不误杀 ✓✓**（桥重启前后均 `working`、事件面零新增，且该任务**活着跑完**）· **换 kind 会话回落 ✓✓**（`session/load` 带旧 uuid ⇒ `-32603` ⇒ `session/resume` 缺 `cwd` ⇒ `-32602` ⇒ 回落 `session/new`、`sessionResumed:false`）· 协议 2.3 注册 ✓ · O6 投影四字段（真实值 `queuedAt → claimedAt` 排队 **75ms**）✓ · O7 trace 路由 ✓ · **`task.settled` 两种终态各落一条** ✓ · **六类真机样本 `business` / `runner` / `timeout`** + 账单带 `failureKind` ✓ · 工作台两列 ✓。**v0.8.7 顺延 5 项 ⇒ 4 项已验**（仅剩「有界重发」：只在 `spawn`/`closed` 早夭触发、**不可控**）。
+- **执行期实况（本版自身的观测样本）**：**9 次 600s 超时**（`M1` `M2` `M3` `O1` `O3` `O5` `O7` `M5` `D2`，全部靠 `retryTaskIds` 重派收口、**无节点需第二次重派**；`D2` 四次才过）· **2 次 `needs_input`**（门禁归属 / 收口裁决）· **四轮补正轨**（② 协议三处同升漏两侧常量 · ② `O6` 产出未落地 · ③ 版本 pin 提前翻 · ④ 账单 payload 未落地）。
+
+### 未覆盖（登记，不计通过）
+
+- **`model_queue` 本版无任何代码产出该值**（machine 恒不产出 + orch 启发式**也未实现**）⇒ 它只是「协议里合法的取值」；判定形态与排队可见面**一起归 v0.8.10**。
+- **「配额耗尽会不会报错」的真实样本未取到**：取证面四处已就位，但两家后端**始终没等到**一次真触发（历史取证结论 = **既不能证实也不能证伪**）⇒ 先攒样本，攒够后把 (a) 半升级为确定性判据。
+- **续跑轮上下文完整性未验**：`session/load` 回灌的历史**是否含那半条未完成的 assistant message** · 超时后**延迟到达的 chunk 是否污染 `replayMessageIds`**（两条原标「Step 2 前置核实」，始终没做）。
+- **`agent` / `transport` 两类无真机样本**（下游是载体早夭、与「有界重发」同源、不可控）；**混跑兜底未真机**（需一台旧版本机器；**过渡期口径**：2.2 机上报的载体侧失败在账面上呈 `business`，与真 `business` 靠 warn 原值区分）。
+- **设计上不验**：续跑**无 mid-flight 实时面**（`task.continued` 只能在终态回传后派生）· 未配 `sessionTimeoutMs` 的项目**场景 C 结构性不触发**（**不算 bug**：缺省 margin 仅 60s < 180s 闸）· 续跑任务若**被墙钟判死**则续跑痕迹不入事件流。
+- **三处小缺陷（Step 3 只报不修）**：① 降级 `degraded[].since` **不粘滞**（持续降级期间随 sweep tick 前跳 ⇒ 丢「持续多久」；**静态复核结论被真机推翻**）② 墙钟判死的任务 `text` 为**空**（⇒ 账单 `failed[].text` 会是 `null`）③ `session/resume` 请求**缺 `cwd`** ⇒ 在 opencode 上必然 `-32602`、该级形同虚设。
+- **执行期新观察待专项核实**：失败文本**「重复两遍」不是超时专有**（业务失败同为 `任务失败\n任务失败`）⇒ 原「两层超时各出一句」假设被削弱，更像**文本拼接路径重复 append**。
+- **L3 跨机 × 跨 kind 单 Feature 端到端**仍未覆盖（v0.8.7 顺延项）：新线索 = 事件流出现过 `mac-dev` 的 Runner ⇒ 它**连着这个桥、只是不在组**，加进 `projectGroup` 即可验。
+
 ## [v0.8.7] - 2026-09-22
 
 > 主题：**执行可靠性 I：任务不丢**（单需求 · `REQ-v0.8.7-2026-09-22-01`；用户 2026-09-22 裁「真机验证通过，其余未覆盖项实施 v0.8.8 时来验收」）。**三个病根一次收口**：**① 同 project 串行门修复** —— 忙集判据断链（SQL 用 `remote_task_id`，而 pull 模型下 Feature 节点该列**全程 NULL** ⇒ 忙集**恒空集**，只余 30s 批次的 `reservedProjects` ⇒ 实际语义退化为「**同批互斥、跨批不设防**」；真机实证三条同项目节点并发在飞 541 s）· **② 载体消失后的结账** —— 新增**孤儿墙钟出口**（`runner.orphanTimeoutMs`，缺省 30 min）与 **Runner 启动补结算**两条**显式冗余**路径 · **③ 传输层有界重发** —— 首发早夭自愈，每节点**最多 1 次**。同版另落：**`failureKind` 二分（`{infra, task}`）** · **`--session-timeout` 可配（成对常量）** · **取证面 `started_at` 接首次领取** · **3300 工作台任务表加 `startedAt` 并把「耗时」拆成「排队 / 执行」**。改造文档：`doc/v0.8.7/任务不丢与串行门修复-改造文档.md`（**final**；边界 R1→R3 三轮收敛 + Step 2/Step 3 两条实现级增补）。
@@ -180,7 +231,7 @@
 ### 未覆盖（登记，不计通过）
 
 - **POSIX 未真机**（本需求为单机代码层拆除，跨端为结构级）。
-- **「旧键宽容」常驻窗口变体未做**（以等效真机代替）；`orch/config/config.json` 残留 `provisioning` 键不碰（观察项）。
+- **「旧键宽容」常驻窗口变体未做**（以等效真机代替）；`orch/config/config.json` 残留 `provisioning` 键不碰（观察项）。**✅ 该观察项已结（2026-09-22，v0.8.8 验收后清理）**：五标识符（`provisioning`/`worktreeRoot`/`integrationBranch`/`featureIsolation`/`contractFreeze`）经只读取证确认为**死配置**（orch / machine / flow / 仓根**全部源码零读点**、`MachinesConfig` 类型无该字段、解析器对未知顶层键静默忽略）⇒ **该键已从 `orch/config/config.json` 删除**（32 → 24 行，`JSON.parse` 通过、未重启、`/health` 仍 `ok`/`degraded:[]`）⇒ 连续三版绕开的旧账至此清零。
 - **33,859 条历史 push 载荷发送方未溯源**（推断 `a2a-opencode` 包装器，v0.8.1 已退役）；wrapper 族「再声明 `agentCard.pushNotifications`」场景不验。
 - **历史 `push.received` 事件行保留不动**（只读历史，`events` 表无 kind 白名单约束）。
 

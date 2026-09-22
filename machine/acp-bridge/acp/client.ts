@@ -96,6 +96,40 @@ function parseInbound(raw: unknown): AcpInbound | null {
   return null;
 }
 
+/** 迟到响应日志里 payload 的字符上限（「留证据」与「不炸日志」之间的取值）。 */
+export const LATE_PAYLOAD_MAX_CHARS = 2_000;
+
+/**
+ * 宽 JSON 原文：`JSON.stringify` 无结果（`undefined` / BigInt）或抛错（循环引用）时回落
+ * `String(value)`；超 `maxChars` 截断并标 `…(+N)`。**永不抛错**。
+ *
+ * **导出**：`session.ts` 的 `acpErrorData` 诊断键复用同一实现（勿两处字面量漂移）。
+ */
+export function wideJson(value: unknown, maxChars: number = LATE_PAYLOAD_MAX_CHARS): string {
+  let text: string;
+  try {
+    const json = JSON.stringify(value);
+    text = json === undefined ? String(value) : json;
+  } catch {
+    text = String(value);
+  }
+  if (text.length <= maxChars) return text;
+  return `${text.slice(0, maxChars)}…(+${String(text.length - maxChars)})`;
+}
+
+/**
+ * 迟到响应（请求侧已超时并 `pending.delete` 后才回来的那件）的 payload 摘要 ——
+ * `error` 三要素优先，否则 `result` 摘要。这是**唯一能捕获「满窗之后才回来的排队 / 限流错误」**
+ * 的现场（v0.8.8 · M1 取证面）。
+ */
+function latePayloadText(result: unknown, error: JsonRpcErrorObject | undefined): string {
+  if (error !== undefined) {
+    const data = error.data === undefined ? "" : ` data=${wideJson(error.data)}`;
+    return `error code=${String(error.code)} message=${error.message}${data}`;
+  }
+  return `result=${wideJson(result)}`;
+}
+
 /** NDJSON JSON-RPC 客户端（单个后端进程）。 */
 export class AcpClient {
   private readonly child: AcpChildProcess;
@@ -273,7 +307,11 @@ export class AcpClient {
     if (id === null) return;
     const pending = this.pending.get(id);
     if (pending === undefined) {
-      this.logger(`[acp] 收到未知 id 的响应：${String(id)}`);
+      // 迟到响应留痕（v0.8.8 · M1 取证面）：超时时 `pending.delete` 已发生 ⇒ 响应回来只能落这里。
+      // 历史取证（launcher.log 31/31 次皆紧跟某条 failed）证明 payload 一字不留 = 排队证据被吃掉。
+      this.logger(
+        `[acp] 收到未知 id 的响应（迟到件，payload 留痕）：${String(id)} ${latePayloadText(result, error)}`,
+      );
       return;
     }
     this.pending.delete(id);

@@ -79,6 +79,7 @@ import {
 import { bridgeLog } from "./bridge-log.js";
 import {
   isTaskWatched,
+  setTaskWatcherDegradationSink,
   startTaskWatcher,
   WATCHER_MAX_CONSECUTIVE_FAILURES,
   type WatchedTaskView,
@@ -734,14 +735,71 @@ function isSettledView(task: WatchedTaskView): boolean {
   );
 }
 
+// ---------------------------------------------------------------------------
+// 降级可见（v0.8.8 O5）—— 进程内「最近观测态」登记表
+//
+// 三处保护性降级 catch（领取超期判据 / 心跳超期清算 / 孤儿墙钟清算）今天只打日志、
+// 保护功能静默失效；本登记表把这些「静默」聚合成可观测快照，经 /health 的 `degraded[]`
+// 出口。语义：粘滞「最近一次观测」—— `mark` 记录首次观测时刻（`since`），重复 `mark` 只
+// 更新 `reason` 不改 `since`；`clear` 在成功 tick 时移除该项。**纯观测**，不改变任何降级
+// 行为（catch 的返回值语义原样保留）。
+// ---------------------------------------------------------------------------
+
+/** /health `degraded[]` 的单项（`since` = 首次观测的 epoch ms） */
+export interface DegradedItem {
+  key: string;
+  reason: string;
+  since: number;
+}
+
+/**
+ * 降级登记所需的最小 sink 视图（注入 runner / task-watcher，避免跨模块 value 环引用；
+ * `DegradationRegistry` 结构上满足之）。
+ */
+export interface DegradationSink {
+  mark(key: string, reason: string): void;
+  clear(key: string): void;
+}
+
+/** 进程内降级登记表：粘滞最近观测态（见上节注释） */
+export class DegradationRegistry implements DegradationSink {
+  private readonly entries = new Map<string, DegradedItem>();
+
+  mark(key: string, reason: string): void {
+    const existing = this.entries.get(key);
+    if (existing !== undefined) {
+      existing.reason = reason; // 粘滞：since 保持首次观测时刻
+      return;
+    }
+    this.entries.set(key, { key, reason, since: Date.now() });
+  }
+
+  clear(key: string): void {
+    this.entries.delete(key);
+  }
+
+  /** 当前降级快照（浅拷贝，出口给 /health；无降级 ⇒ 空数组） */
+  snapshot(): DegradedItem[] {
+    return [...this.entries.values()].map((e) => ({ ...e }));
+  }
+}
+
+/** 桥进程内单例登记表（装配点注入 runner / task-watcher，并经 /health getter 出口） */
+const degradations = new DegradationRegistry();
+
+/** 领取超期判据降级键（index 侧自用；另两键在 runner.ts，watcher 键在 task-watcher.ts） */
+const DEGRADED_CLAIM_STALE = "claim.stale-criterion";
+
 /**
  * 领取是否已超期（B2 判据）：`claimedBy` 对应 Runner 注册行的 `last_heartbeat_at` 静默
  * ≥ `runner.heartbeatTimeoutMs` ⇒ 超期（O7 清算应回收）。
  * 无注册行 / 配置不可读 / 时间戳非法 ⇒ **保守判「未超期」**（不主动回收，交 O7 周期清算兜底）。
+ * O5：读取失败（catch）⇒ 登记降级；本轮读取成功 ⇒ 清除降级（判据健康）。返回值语义不变。
  */
 function isClaimHeartbeatStale(task: WatchedTaskView): boolean {
   if (task.claimedBy === null) return false;
   try {
+    degradations.clear(DEGRADED_CLAIM_STALE); // 先按健康；任一读取抛错将在 catch 重新标降级
     const runner = getRunner(task.claimedBy);
     if (runner === null) return false;
     const heartbeat = Date.parse(runner.lastHeartbeatAt);
@@ -749,6 +807,7 @@ function isClaimHeartbeatStale(task: WatchedTaskView): boolean {
     const timeoutMs = loadMachinesConfig(MACHINES_CONFIG_PATH).runner.heartbeatTimeoutMs;
     return Date.now() - heartbeat >= timeoutMs;
   } catch (err) {
+    degradations.mark(DEGRADED_CLAIM_STALE, `领取超期判据读取失败：${toMessage(err)}`);
     bridgeLog.warn("a2a-bridge", `领取超期判据读取失败（task=${task.taskId}）：${toMessage(err)}`);
     return false;
   }
@@ -2089,7 +2148,11 @@ async function startHttpBridge(): Promise<void> {
     config: () => loadMachinesConfig(MACHINES_CONFIG_PATH),
     // A7 接线：Runner 事件（registered/online/offline/claimed/stale）落库后立即唤醒 a2a_wait 订阅者
     signalEvents,
+    // O5：心跳超期清算 / 孤儿墙钟清算的静默降级登记到进程内登记表
+    degradation: degradations,
   });
+  // O5：看护 owner 门闩接入登记表（follower 停用 ⇒ /health `degraded[]` 增一项）
+  setTaskWatcherDegradationSink(degradations);
   const handle = await startHttpTransport({
     core: coreFor(null), // 兜底视图（匿名/全量）；生产请求路径走 coreFor(identity)
     coreFor,
@@ -2102,6 +2165,8 @@ async function startHttpBridge(): Promise<void> {
     version: BRIDGE_VERSION,
     onShutdown: shutdown,
     runner: runnerEndpoints,
+    // O5：/health 出参增加降级快照（只加键，status/role/version 语义不变）
+    degraded: () => degradations.snapshot(),
   });
   activeHttp = handle;
   const readiness: RuntimeReadiness = runtime.start();

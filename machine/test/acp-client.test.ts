@@ -4,12 +4,16 @@
  * 判据：initialize 握手成功/失败、通知路由、服务端请求路由、请求超时、后端崩溃 → 结构化错误。
  * fake stdio（PassThrough）经构造注入；NDJSON framing 断言。
  *
+ * **v0.8.8 · M1 取证面 a** 追加：**迟到响应**（超时后回来的那件）落「未知 id」分支时，
+ * `error.code` / `message` / `data`（或 `result` 摘要）**必须进日志** —— 历史取证里
+ * 「600s 零输出」的 failed 行后紧跟 `收到未知 id 的响应：4`，payload 一字未留 ⇒ 排队证据被吃掉。
+ *
  * 运行：`npm test`。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { PassThrough } from "node:stream";
-import { AcpClient, AcpError } from "../acp-bridge/acp/client.js";
+import { AcpClient, AcpError, wideJson } from "../acp-bridge/acp/client.js";
 import type { AcpChildProcess, AcpSpawn } from "../acp-bridge/acp/types.js";
 
 /** 假子进程：stdin 收集客户端写出，stdout 供注入入站消息。 */
@@ -61,9 +65,15 @@ class FakeChild implements AcpChildProcess {
   }
 }
 
-function makeClient(fake: FakeChild, requestTimeoutMs = 300): AcpClient {
+function makeClient(fake: FakeChild, requestTimeoutMs = 300, logger?: (message: string) => void): AcpClient {
   const spawn: AcpSpawn = () => fake;
-  return new AcpClient({ command: "qodercn", spawn, requestTimeoutMs, env: {} });
+  return new AcpClient({
+    command: "qodercn",
+    spawn,
+    requestTimeoutMs,
+    env: {},
+    ...(logger !== undefined ? { logger } : {}),
+  });
 }
 
 function hasId(id: unknown): (r: Record<string, unknown>) => boolean {
@@ -161,3 +171,59 @@ async function waitFor(predicate: () => boolean): Promise<void> {
   }
   throw new Error("waitFor 超时");
 }
+
+// ---------- REQ-v0.8.8-2026-09-22-01 · M1 取证面 a：迟到响应的 payload 必须留痕 ----------
+
+/**
+ * 历史取证（改造文档 §2.3.1）：两条「600s 零输出」的 failed 行后 1–2 行紧跟
+ * `[acp] 收到未知 id 的响应：4`（= `session/prompt`）—— **响回来了，但 payload 一字未留**，
+ * 于是「配额 / 限流到底有没有报错」既不能证实也不能证伪。本组用例锁定 payload 进日志。
+ */
+test("M1 迟到响应（error 形）：code / message / data 全部进日志", async () => {
+  const fake = new FakeChild();
+  const logs: string[] = [];
+  const client = makeClient(fake, 30, (m) => logs.push(m));
+  fake.responder = () => null; // 先不回应答 ⇒ 让请求超时
+  await assert.rejects(() => client.request("session/prompt", {}, 30));
+
+  const id = fake.requests[0]?.["id"];
+  fake.push({
+    jsonrpc: "2.0",
+    id,
+    error: { code: -32005, message: "quota exceeded", data: { retryAfterMs: 60000 } },
+  });
+  await waitFor(() => logs.some((m) => m.includes("迟到件")));
+
+  const line = logs.find((m) => m.includes("迟到件")) ?? "";
+  assert.match(line, /-32005/, "code 必须留");
+  assert.match(line, /quota exceeded/, "message 必须留");
+  assert.match(line, /retryAfterMs/, "data 必须留（opencode 方言把细节只写在 data）");
+  await client.close();
+});
+
+test("M1 迟到响应（result 形）：result 摘要进日志", async () => {
+  const fake = new FakeChild();
+  const logs: string[] = [];
+  const client = makeClient(fake, 30, (m) => logs.push(m));
+  fake.responder = () => null;
+  await assert.rejects(() => client.request("session/prompt", {}, 30));
+
+  const id = fake.requests[0]?.["id"];
+  fake.push({ jsonrpc: "2.0", id, result: { stopReason: "refusal", why: "queued" } });
+  await waitFor(() => logs.some((m) => m.includes("迟到件")));
+
+  const line = logs.find((m) => m.includes("迟到件")) ?? "";
+  assert.match(line, /stopReason/, "result 摘要必须留（迟到的是结果也是证据）");
+  assert.match(line, /queued/);
+  await client.close();
+});
+
+test("M1 取证面 helper：wideJson 截断留痕、不可序列化值回落 String（永不抛错）", () => {
+  assert.equal(wideJson({ a: 1 }), '{"a":1}');
+  assert.equal(wideJson([1, 2, 3], 4), "[1,2…(+3)", "截断须留痕（+N = 被砍掉的字符数）");
+  assert.equal(wideJson(undefined), "undefined", "JSON.stringify 无结果 ⇒ 回落 String，不得产出空串");
+  assert.equal(wideJson(BigInt(7)), "7", "BigInt 直喂 JSON.stringify 会抛 ⇒ 必须走回落路径");
+  const circular: Record<string, unknown> = {};
+  circular["self"] = circular;
+  assert.match(wideJson(circular), /^\[object Object\]$/, "循环引用 JSON.stringify 抛 ⇒ 回落 String 不抛");
+});

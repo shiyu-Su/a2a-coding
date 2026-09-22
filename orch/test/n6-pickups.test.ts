@@ -4,8 +4,9 @@
  * 覆盖（对应改造文档 §4.1 判据 V10 + 本期白捡表）：
  * - **C11 派发崩溃窗口**（3 组真值 + 重派出口）：按「崩溃点 × 恢复动作」真值表逐行断言 ——
  *   - **C0 派发前**（无占位、无远端）⇒ `recover` 不误判，节点保持待派发、**可安全重派**（必未发出）；
- *   - **C1 占位已写、send 未回填**（有占位、无远端）⇒ 保守判「可能已发出」：`recover` 按
- *     `FEATURE_DISPATCH_WINDOW_TEXT` 收敛为 `failed`（**不自动重派**，防双派），交静止收敛；
+ *   - **C1 占位已写、send 未回填**（有占位、无远端）⇒ 保守判「可能已发出」**不自动重派**（防双派）；
+ *     **v0.8.8 O4**：`recover` **不再启动即置 `failed`**，保留 `working` 交 machine 重连后的补结算
+ *     回填终态（真失败由孤儿墙钟兜底），故启动**不发**失败账单；
  *   - **C2 回填后**（有占位、有远端）⇒ 既有 `FEATURE_INTERRUPTED_TEXT` 路径不变；
  *   - **rearm 出口**：`rearmForRetry` 清占位 ⇒ 重派可再就绪（**不永久不派**）。
  * - **A5-5 反查**：`resolveTaskLookup` 先按本地 id（远端调用用 `remoteTaskId`），MISS 时经
@@ -41,6 +42,7 @@ import {
   rearmForRetry,
   SessionStore,
   updateTaskState,
+  upsertTaskResult,
 } from "../session/store.js";
 import {
   FEATURE_DISPATCH_WINDOW_TEXT,
@@ -89,7 +91,7 @@ test("N6 · C11-C0（派发前崩溃）：无占位无远端 ⇒ 不误判，可
   assert.equal(dispatched, 1, "崩溃点在占位之前 ⇒ 必未发出 ⇒ 重启可安全重派（不双派）");
 });
 
-test("N6 · C11-C1（占位已写、send 未回填）：保守判已发出 ⇒ 不重派 + 交静止账单", async () => {
+test("N6 · C11-C1（占位已写、send 未回填）：v0.8.8 O4 启动不误杀 ⇒ 保留 working 交补结算", async () => {
   close();
   createFeature({ featureId: "f-c1", title: "C1", state: "executing" });
   createTask({
@@ -111,14 +113,9 @@ test("N6 · C11-C1（占位已写、send 未回填）：保守判已发出 ⇒ �
   });
 
   const summary = scheduler.recover();
-  assert.equal(summary.interruptedTasks, 1, "派发窗口节点按 interrupted 收敛");
-  assert.equal(getTask("n-c1")?.state, "failed", "置 failed（交静止收敛）");
-  assert.equal(
-    getTask("n-c1")?.text,
-    FEATURE_DISPATCH_WINDOW_TEXT,
-    "用「派发窗口」专用文案（可区分 C1 与 C2）",
-  );
-  assert.notEqual(getTask("n-c1")?.dispatchGuard, null, "占位保留（「已发出」是既成事实）");
+  assert.equal(summary.interruptedTasks, 0, "O4：派发窗口节点不再启动即收敛为 failed");
+  assert.equal(getTask("n-c1")?.state, "working", "保留 working（交 machine 重连后的补结算回填）");
+  assert.notEqual(getTask("n-c1")?.dispatchGuard, null, "占位保留（防首 tick 双派）");
 
   scheduler.kick();
   await flush();
@@ -126,8 +123,59 @@ test("N6 · C11-C1（占位已写、send 未回填）：保守判已发出 ⇒ �
   const reports = listEvents({ since: 0 }).filter(
     (e) => e.kind === "feature.failure_report",
   );
-  assert.equal(reports.length, 1, "交静止收敛：恰好一条 failure_report");
-  assert.equal(getFeature("f-c1")?.state, "executing", "业务失败不判死整单");
+  assert.equal(reports.length, 0, "O4：无 failed 节点 ⇒ 启动不发失败账单（时点后移到补结算/墙钟）");
+  assert.equal(getFeature("f-c1")?.state, "executing", "Feature 保持 executing");
+});
+
+test("N6 · O4-①：重启无 machine 回传时，派发窗口节点保持 working、不产 failed 与失败账单", async () => {
+  close();
+  createFeature({ featureId: "f-o4a", title: "O4-①", state: "executing" });
+  createTask({
+    taskId: "n-o4a",
+    projectId: "p1",
+    contextId: "c-o4a",
+    state: "working",
+    featureId: "f-o4a",
+  });
+  markTaskDispatchStarted("n-o4a"); // 占位已写、远端未回填 = 派发窗口
+
+  const scheduler = new FeatureScheduler({ dispatch: async () => ({ ok: true }) });
+  const summary = scheduler.recover();
+
+  assert.equal(summary.interruptedTasks, 0, "派发窗口节点不计入 interrupted");
+  assert.equal(getTask("n-o4a")?.state, "working", "无补结算到达时仍保持 working（不启动误杀）");
+  const settled = listEvents({ since: 0 }).filter(
+    (e) => e.kind === "feature.failure_report",
+  );
+  assert.equal(settled.length, 0, "不产生失败账单");
+});
+
+test("N6 · O4-②：保留 working 后，machine 迟到的补结算能正常落终态（不被抢先占位拒绝）", async () => {
+  close();
+  createFeature({ featureId: "f-o4b", title: "O4-②", state: "executing" });
+  createTask({
+    taskId: "n-o4b",
+    projectId: "p1",
+    contextId: "c-o4b",
+    state: "working",
+    featureId: "f-o4b",
+  });
+  markTaskDispatchStarted("n-o4b");
+
+  const scheduler = new FeatureScheduler({ dispatch: async () => ({ ok: true }) });
+  scheduler.recover(); // O4：保留 working
+  assert.equal(getTask("n-o4b")?.state, "working", "recover 后仍在补结算窗口内");
+
+  // machine 重连后补结算迟到件到达 ⇒ 应正常落终态
+  upsertTaskResult({
+    machineId: "m-1",
+    taskId: "n-o4b",
+    projectId: "p1",
+    contextId: "c-o4b",
+    state: "completed",
+    featureId: "f-o4b",
+  });
+  assert.equal(getTask("n-o4b")?.state, "completed", "补结算不被抢先占位的 WHERE 拒绝");
 });
 
 test("N6 · C11-C2（回填后崩溃）：既有 interrupted 恢复路径不变", async () => {

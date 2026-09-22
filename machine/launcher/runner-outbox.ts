@@ -32,11 +32,7 @@ import {
   type FetchLike,
   type RunnerLogger,
 } from "./runner.js";
-import type {
-  RunnerOutbox,
-  RunnerResultCredential,
-  RunnerTaskResult,
-} from "./runner-exec.js";
+import type { RunnerOutbox, RunnerResultCredential, RunnerTaskResult } from "./runner-exec.js";
 
 /** outbox 目录名（相对 machine 单元根：`<machine 根>/.a2a/outbox`） */
 export const OUTBOX_DIRNAME = "outbox";
@@ -164,6 +160,11 @@ export class FileOutbox implements RunnerOutbox {
   /** 最近一次投递失败原因（成功 / 未发生为 null） */
   get lastErrorText(): string | null {
     return this.lastError;
+  }
+
+  /** 投递循环是否存活（`start()` 后 true、`stop()` 后 false；v0.8.8 · M4 供 `/health` 观测） */
+  get loopAlive(): boolean {
+    return !this.stopped;
   }
 
   /**
@@ -316,23 +317,24 @@ export class FileOutbox implements RunnerOutbox {
     const timeoutSignal = AbortSignal.timeout(OUTBOX_POST_TIMEOUT_MS);
     const combined =
       signal === undefined ? timeoutSignal : AbortSignal.any([timeoutSignal, signal]);
-    const res = await this.fetchFn(
-      `${trimTrailingSlash(this.bridge.url)}${RUNNER_RESULT_PATH}`,
-      {
-        method: "POST",
-        headers: {
-          "content-type": "application/json",
-          accept: "application/json",
-          authorization: `Bearer ${this.bridge.token}`,
-        },
-        body: JSON.stringify(body),
-        signal: combined,
+    const res = await this.fetchFn(`${trimTrailingSlash(this.bridge.url)}${RUNNER_RESULT_PATH}`, {
+      method: "POST",
+      headers: {
+        "content-type": "application/json",
+        accept: "application/json",
+        authorization: `Bearer ${this.bridge.token}`,
       },
-    );
+      body: JSON.stringify(body),
+      signal: combined,
+    });
     // 排空响应体（连接复用）；读失败不影响 ack 判定
     await res.text().catch(() => "");
     if (!res.ok) {
-      throw new RunnerHttpError(res.status, `http_${res.status}`, `结果回传失败：HTTP ${res.status}`);
+      throw new RunnerHttpError(
+        res.status,
+        `http_${res.status}`,
+        `结果回传失败：HTTP ${res.status}`,
+      );
     }
   }
 }

@@ -408,16 +408,24 @@ test("v0.4.1 迁移：旧库补列幂等、老行取默认值、新列可回读�
     }
 
     // ③ 列仍在库中（schema 不挖）；`failure_kind` 仍可读写，**休眠三列不再被读出**
+    //    v0.8.8 O1：写入的 `'infra'` 是 2.3 前的旧值 ⇒ 读侧兜底落 `business` + 告警留痕
+    //    （存量清洗归 §2.1 迁移脚本 = O8；在此之前读侧不得 fail-fast）
     const raw = openStoreDatabase(dbPath);
     raw.exec("UPDATE tasks SET exhausted = 1, not_before = '2030-01-01T00:00:00.000Z', failure_kind = 'infra' WHERE task_id = 'legacy-1'");
     raw.close();
     const store2 = new SessionStore(dbPath);
     try {
-      const row = store2.getTask("legacy-1");
+      const warns: string[] = [];
+      const row = captureConsoleError(() => store2.getTask("legacy-1"), warns);
       // 休眠列即便在库中被置位也不被读回（读侧恒中性值 ⇒ 「停止读写」可机械核验）
       assert.equal(row?.exhausted, false, "exhausted 休眠列：读侧恒 false（旧值不再可读）");
       assert.equal(row?.notBefore, null, "not_before 休眠列：读侧恒 null");
-      assert.equal(row?.failureKind, "infra", "failure_kind 仍可读（只停写，不停读）");
+      assert.equal(row?.failureKind, "business", "旧值读侧兜底落安全类（不抛、不拒读）");
+      assert.match(
+        warns.join("\n"),
+        /failure_kind_fallback=infra/,
+        "兜底必须有原值留痕（区分「真 business」与「兜底 business」）",
+      );
       assert.equal(row?.state, "completed", "列搬动不得改写 state");
     } finally {
       store2.close();
@@ -1041,6 +1049,130 @@ test("A2 upsertTaskResult：按 (machineId,taskId) 幂等、首个终态胜出�
     assert.equal(created.state, "input-required");
     assert.equal(created.queueState, "settled");
     assert.equal(created.finishedAt, null);
+  } finally {
+    store.close();
+  }
+});
+
+test("O2 upsertTaskResult 结算事件补发：终态恰一条 / working 不发 / 重复迟到不重发 / attempt=重派数", () => {
+  const store = newStore();
+  try {
+    store.createTask({
+      taskId: "t1",
+      projectId: "p1",
+      contextId: "c1",
+      state: "working",
+      featureId: "f1",
+    });
+    store.createTask({ taskId: "t2", projectId: "p1", contextId: "c2", state: "working" });
+    store.createTask({ taskId: "t3", projectId: "p1", contextId: "c3", state: "working" });
+
+    // ② working 进度上报：changes>0 但非终态 ⇒ 不发结算事件
+    store.upsertTaskResult({
+      machineId: "m1",
+      taskId: "t2",
+      projectId: "p1",
+      contextId: "c2",
+      state: "working",
+      text: "progress",
+    });
+    assert.equal(store.listEvents().length, 0, "working 更新不得发结算事件");
+
+    // ① pull 上报终态 ⇒ 恰一条 task.settled；featureId 归属沿用；payload 键口径
+    store.upsertTaskResult({
+      machineId: "m1",
+      taskId: "t1",
+      projectId: "p1",
+      contextId: "c1",
+      state: "completed",
+      text: "ok",
+    });
+    const settled = store.listEvents().filter((e) => e.kind === EVENT_TASK_SETTLED);
+    assert.equal(settled.length, 1);
+    assert.equal(settled[0]?.taskId, "t1");
+    assert.equal(settled[0]?.featureId, "f1");
+    assert.equal(settled[0]?.state, "completed");
+    assert.deepEqual(
+      JSON.parse(String(settled[0]?.payload)) as Record<string, unknown>,
+      { taskId: "t1", state: "completed", attempt: 0, continueAttempts: 0, machineId: "m1" },
+      "未分类时 failureKind 键省略",
+    );
+
+    // ③ 重复上报 + 迟到的不同终态 ⇒ 零写入 ⇒ 不重发（首个终态胜出不变）
+    store.upsertTaskResult({
+      machineId: "m1",
+      taskId: "t1",
+      projectId: "p1",
+      contextId: "c1",
+      state: "completed",
+      text: "ok",
+    });
+    store.upsertTaskResult({
+      machineId: "m1",
+      taskId: "t1",
+      projectId: "p1",
+      contextId: "c1",
+      state: "failed",
+      text: "late",
+    });
+    assert.equal(
+      store.listEvents().filter((e) => e.kind === EVENT_TASK_SETTLED).length,
+      1,
+      "重复 / 迟到上报不得重发事件",
+    );
+
+    // kind 映射沿用 updateTaskState 三分支：blocked → task.blocked（不计入 settled）
+    store.upsertTaskResult({
+      machineId: "m1",
+      taskId: "t3",
+      projectId: "p1",
+      contextId: "c3",
+      state: "blocked",
+    });
+    const blocked = store.listEvents().filter((e) => e.kind === EVENT_TASK_BLOCKED);
+    assert.equal(blocked.length, 1);
+    assert.equal(blocked[0]?.taskId, "t3");
+    assert.equal(blocked[0]?.featureId, null);
+    assert.equal(
+      store.listEvents().filter((e) => e.kind === EVENT_TASK_SETTLED).length,
+      1,
+      "blocked 不得发 task.settled",
+    );
+
+    // attempt = 结算时该行 retry_count（仅宿主重派口径）：fail → 分类 → rearm(=1) → 再结算
+    store.createTask({ taskId: "t4", projectId: "p1", contextId: "c4", state: "working" });
+    store.upsertTaskResult({
+      machineId: "m1",
+      taskId: "t4",
+      projectId: "p1",
+      contextId: "c4",
+      state: "failed",
+    });
+    assert.equal(store.setTaskFailureKind("t4", "runner"), true);
+    assert.equal(store.rearmForRetry("t4", "retry msg"), true);
+    store.upsertTaskResult({
+      machineId: "m1",
+      taskId: "t4",
+      projectId: "p1",
+      contextId: "c4",
+      state: "completed",
+    });
+    const t4Events = store
+      .listEvents()
+      .filter((e) => e.kind === EVENT_TASK_SETTLED && e.taskId === "t4");
+    assert.equal(t4Events.length, 2, "两次胜出终态各发一条（episode 独立）");
+    assert.deepEqual(
+      JSON.parse(String(t4Events[1]?.payload)) as Record<string, unknown>,
+      {
+        taskId: "t4",
+        state: "completed",
+        attempt: 1,
+        continueAttempts: 0,
+        machineId: "m1",
+        failureKind: "runner",
+      },
+      "重派后 attempt=1；既有分类随 payload.failureKind 带出",
+    );
   } finally {
     store.close();
   }

@@ -24,6 +24,7 @@ import {
   type InflightRecord,
 } from "../launcher/reconcile-inflight.js";
 import { FileOutbox } from "../launcher/runner-outbox.js";
+import { RECONCILE_FAILURE_KIND } from "../launcher/runner-exec.js";
 import { SELF_CHECK_LEDGER_PREFIX } from "../launcher/self-check.js";
 import type { RunnerLogger } from "../launcher/runner.js";
 import type { BridgeConfig } from "../types.js";
@@ -156,6 +157,12 @@ test("硬用例 ①：桥 200 {ack,ignored} ⇒ outbox 文件已删、pendingCou
       assert.equal("claimToken" in body, false, "不落 claimToken（A2 窄口）");
       assert.equal(body["finishedAt"], NOW_ISO);
       assert.deepEqual(body["artifacts"], []);
+      // v0.8.8 · M2：补结算路径必带六类值（定档 runner），否则六类在该路径缺角
+      assert.equal(body["failureKind"], RECONCILE_FAILURE_KIND);
+      assert.equal(body["failureKind"], "runner");
+      const diag = body["diagnostics"] as { elapsedMs?: number; stage?: string };
+      assert.equal(diag.elapsedMs, 3_600_000, "elapsedMs = 上一进程已飞时长（01:00→02:00）");
+      assert.equal(diag.stage, "wait");
     }
   } finally {
     for (const d of [inflightDir, childrenDir, outboxDir]) rmSync(d, { recursive: true, force: true });

@@ -715,8 +715,8 @@ test("契约 3 硬用例：对已 completed 行重投 failed（同 token）⇒ 2
   const beforeArtifacts = before?.artifactsJson;
   assert.ok(beforeArtifacts?.includes("a.txt"));
 
-  // 迟到 / 重复件：同 token 重投 failed，携**不同** text / artifacts，且带原生 infra 类
-  // `acpErrorKind`（若 O3 写口被误触发会落 `failure_kind='infra'`）
+  // 迟到 / 重复件：同 token 重投 failed，携**不同** text / artifacts，且带可映射到
+  // `agent` 的原生 `acpErrorKind`（若写口被误触发会落非 null 分类）
   const late = await post(
     h.port,
     RUNNER_RESULT_PATH,

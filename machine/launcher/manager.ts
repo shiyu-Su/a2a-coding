@@ -365,6 +365,14 @@ export class AgentManager {
     this.unavailable.set(projectId, reason);
   }
 
+  /**
+   * 已登记不可用的项目 id 集（只读快照，v0.8.8 · M4：供 `/health` 的 `degraded` 段）。
+   * 纯读、无副作用，可任意频次调用。
+   */
+  unavailableProjectIds(): string[] {
+    return [...this.unavailable.keys()];
+  }
+
   /** 配置 + 运行态拼接（内部聚合；入站 `GET /projects` 已于 v0.7.0 M5·MC1 退役） */
   listProjects(): ProjectStatus[] {
     return this.config.projects.map((project) => {
@@ -449,7 +457,6 @@ export class AgentManager {
     // 后端入口分层解析结果（改造文档 §2.3 · B4）：命中报来源层，失败报逐层清单；
     // 清单入日志、不进 Error message（适配器抛错文案只留摘要 +「详见 launcher.log [backend] 行」）。
     console.log(`[backend] ${snapshot.backend}`);
-
 
     const spec = adapter.buildLaunch({
       projectId: project.projectId,

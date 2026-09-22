@@ -13,7 +13,9 @@
  * - **A5-2**：看护 `persist` 异常与 `poll` 异常分离分类（`persist` 失败不走 abandoned、
  *   终态仍调 `onSettled`；`poll` 失败仍按上限走 abandoned）；
  * - **episode 去重（v0.6.2 REQ-01）**：签名含 `${taskId}:${retryCount}` ⇒ 同节点重派后再失败
- *   必发新一条；同静止期（`retryCount` + 集合不变）严格不重发；`rearmTask`（needs_input）不自增。
+ *   必发新一条；同静止期（`retryCount` + 集合不变）严格不重发；`rearmTask`（needs_input）不自增；
+ * - **账单带失败类（v0.8.8 O10）**：`failed[].failureKind` = 行 `failure_kind` 读口取值；
+ *   未分类 ⇒ **键保留、值为 `null`**（宿主读账单即得失败类，无需二次查询）。
  *
  * 独立成文件（不与 `scheduler.test.ts` 混写）：N3 的验收断言与后续「测试重写」节点的改动面解耦，
  * 便于逐节点核验时单独跑。
@@ -30,6 +32,7 @@ import {
   getFeature,
   getTask,
   listEvents,
+  setTaskFailureKind,
   updateTaskState,
 } from "../session/store.js";
 import { EVENT_FAILURE_REPORT, FeatureScheduler, propagateBlocked } from "../bridge/scheduler.js";
@@ -40,7 +43,7 @@ import {
   startTaskWatcher,
   type WatchedTaskView,
 } from "../bridge/task-watcher.js";
-import type { EventRecord, TaskRecord, TaskState } from "../types.js";
+import type { EventRecord, FailureKind, TaskRecord, TaskState } from "../types.js";
 
 process.env["SESSION_DB"] = ":memory:";
 
@@ -150,7 +153,13 @@ test("N3 · V3 静止收敛：ready=0 且有失败 ⇒ Feature 保持 executing 
   const first = reports[0];
   assert.equal(first?.state, null, "Feature 态未变 ⇒ events.state 必须为 null");
   const payload = JSON.parse(first?.payload ?? "{}") as {
-    failed: { taskId: string; projectId: string; text: string | null; contextId: string }[];
+    failed: {
+      taskId: string;
+      projectId: string;
+      text: string | null;
+      contextId: string;
+      failureKind: FailureKind | null;
+    }[];
     blockedSet: string[];
   };
   assert.deepEqual(
@@ -160,6 +169,11 @@ test("N3 · V3 静止收敛：ready=0 且有失败 ⇒ Feature 保持 executing 
   assert.equal(payload.failed[0]?.projectId, "pa");
   assert.equal(payload.failed[0]?.contextId, "ca", "contextId 取 TaskRecord.contextId（节点会话）");
   assert.equal(payload.failed[0]?.text, "boom");
+  assert.ok(
+    "failureKind" in (payload.failed[0] ?? {}),
+    "O10：未分类（行值 NULL）时 failureKind 键仍须在（区分「未分类」与「字段缺失」）",
+  );
+  assert.equal(payload.failed[0]?.failureKind, null, "O10：行值 NULL ⇒ 值为 null（不是 undefined）");
   assert.deepEqual(payload.blockedSet, ["B"]);
 
   // 重复 tick：signature 不变 ⇒ 不重发
@@ -382,7 +396,13 @@ test("N3 · A5-2：poll 连续失败仍按上限走 abandoned（分类未被放�
 // 既有 `N3` 用例（1–6 节）保持原判据，未放宽 / 未删除。
 
 interface FailureReportPayload {
-  failed: { taskId: string; projectId: string; text: string | null; contextId: string }[];
+  failed: {
+    taskId: string;
+    projectId: string;
+    text: string | null;
+    contextId: string;
+    failureKind: FailureKind | null;
+  }[];
   blockedSet: string[];
 }
 
@@ -664,4 +684,58 @@ test("N3-v0.6.2 · 边界回归：retryCount 与集合皆不变 ⇒ 严格不重
     "集合不变（B 仍 blocked）",
   );
   assert.equal(getTask("B")?.state, "blocked");
+});
+
+// ---------------------------------------------------------------------------
+// 8. v0.8.8 O10：失败账单带 `failureKind`（宿主读账单即得失败类，无需二次查询）
+// ---------------------------------------------------------------------------
+// 口径：值 = **该任务行 `failure_kind` 的既有读口取值**（分类事实源 = machine 上报 +
+// `setTaskFailureKind` 校验落库），scheduler **不做二次分类**；行值 NULL ⇒ **键保留、值为 `null`**。
+
+test("N3-O10 · 账单 failed[].failureKind = 行真实取值；未分类行键在且值为 null", async () => {
+  close();
+  createFeature({ featureId: "f-fk", title: "failureKind", state: "executing" });
+  createTask({
+    taskId: "A",
+    projectId: "p1",
+    contextId: "ca",
+    state: "working",
+    featureId: "f-fk",
+    dispatchMessage: "do A",
+  });
+  createTask({
+    taskId: "B",
+    projectId: "p1",
+    contextId: "cb",
+    state: "working",
+    featureId: "f-fk",
+    dispatchMessage: "do B",
+  });
+  updateTaskState("A", "failed", null, "boom-A");
+  updateTaskState("B", "failed", null, "boom-B");
+  // 经既有写口落分类（A = 六类值；B 保持未分类 = NULL）
+  assert.equal(setTaskFailureKind("A", "timeout"), true, "写口应在 `failed` 行生效");
+
+  const scheduler = new FeatureScheduler({ dispatch: async () => ({ ok: true }) });
+  scheduler.kick();
+  await flush();
+
+  const reports = failureReports("f-fk");
+  assert.equal(reports.length, 1, "静止收敛恰好 1 条");
+  const failed = reportPayload(reports[0]).failed;
+  assert.deepEqual(failed.map((f) => f.taskId).slice().sort(), ["A", "B"]);
+
+  const a = failed.find((f) => f.taskId === "A");
+  assert.ok(a && "failureKind" in a, "A：failed[] 每项必须带 failureKind 键");
+  assert.equal(a?.failureKind, "timeout", "A：值 = 该任务行 failure_kind 的真实取值");
+  assert.equal(a?.failureKind, getTask("A")?.failureKind, "A：与读口一致（未在 scheduler 内二次分类）");
+
+  const b = failed.find((f) => f.taskId === "B");
+  assert.ok(b && "failureKind" in b, "B：行值 NULL 时键仍须在（可区分「未分类」与「字段缺失」）");
+  assert.equal(b?.failureKind, null, "B：值为 null（不是 undefined）");
+
+  // 其余键口径不变（O10 只增键）
+  assert.deepEqual(reportPayload(reports[0]).blockedSet, [], "blockedSet 保持原样");
+  assert.equal(b?.text, "boom-B", "text 保持原样");
+  assert.equal(b?.contextId, "cb", "contextId 保持原样");
 });

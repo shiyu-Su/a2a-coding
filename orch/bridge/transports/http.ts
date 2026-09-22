@@ -12,7 +12,8 @@
  *   **URL 首段 = 连接身份（组名）**，其余须**恰好等于** `options.path`；`path === options.path`
  *   ⇒ 无身份。身份经 `coreFor(identity)` 装配每请求内核视图；**配了组而未带身份 ⇒ 403**
  *   `group_identity_required`（fail-closed，判据由 `identityRequired` 注入；未配组全量接纳照旧）。
- * - `GET /health`：`{ status, role, version }`；`role` 取自 core 租约（`owner` / `follower`）。
+ * - `GET /health`：`{ status, role, version, degraded }`；`role` 取自 core 租约（`owner` / `follower`）。
+ *   `degraded` 为进程内降级快照（v0.8.8 O5；每项 `{ key, reason, since }`，无降级 ⇒ 空数组）。
  *   就绪信号**晚于** lifecycle 的 `recover()`：未就绪返回 503 + `status="starting"`。
  * - `POST /shutdown`：**仅 loopback 来源**（Windows 无可靠 SIGTERM，优雅停机走此端点，§2.5）；
  *   先回 200 再触发停机，非 loopback → 403。
@@ -29,7 +30,7 @@ import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { StreamableHTTPServerTransport } from "@modelcontextprotocol/sdk/server/streamableHttp.js";
 import type { CoreRole } from "../../runtime/core-lease.js";
 import { bridgeLog } from "../bridge-log.js";
-import type { BridgeCore } from "../index.js";
+import type { BridgeCore, DegradedItem } from "../index.js";
 import { createServer } from "../register-tools.js";
 import type { RunnerEndpointHandle } from "../runner.js";
 
@@ -95,6 +96,11 @@ export interface HttpTransportOptions {
   role: () => CoreRole;
   /** 桥版本（`/health` 报出） */
   version: string;
+  /**
+   * 降级快照 getter（v0.8.8 O5）：`/health` 出参 `degraded[]` 的数据源，每项
+   * `{ key, reason, since }`。缺省（未注入）⇒ 空数组。**只加键、不改 `status` 语义**。
+   */
+  degraded?: () => DegradedItem[];
   /** 触发优雅停机（`POST /shutdown` 命中 loopback 时；响应已发出后调用） */
   onShutdown: () => void;
   /**
@@ -259,6 +265,8 @@ async function handleRequest(
       status: ready ? "ok" : "starting",
       role: options.role(),
       version: options.version,
+      // O5：降级快照（只加键；status 语义不变；未注入 ⇒ 空数组）
+      degraded: options.degraded?.() ?? [],
     });
     return;
   }
