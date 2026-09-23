@@ -323,7 +323,7 @@ export interface RunnerDeps {
   outbox?: RunnerOutbox;
   /**
    * 单任务派发等待预算的**显式覆盖**（缺省不给 ⇒ 按项目 `agentConfig.sessionTimeoutMs`
-   * 派生，见 `runner-exec.ts` 的 `dispatchBudgetMs` / `DEFAULT_DISPATCH_TIMEOUT_MS`，v0.8.7 · M3）。
+   * 与续跑余量派生，见 `runner-exec.ts` 的 `dispatchBudgetMs`，v0.8.9 需求2 · M1）。
    */
   dispatchTimeoutMs?: number;
   /**

@@ -19,6 +19,11 @@ import assert from "node:assert/strict";
 import type { A2AFetch } from "../launcher/a2a-client.js";
 import { InFlightLedger, Runner, type RunnerLogger } from "../launcher/runner.js";
 import {
+  SESSION_TIMEOUT_MS_CAP,
+  effectiveSessionTimeoutMs,
+} from "../launcher/agent-config.js";
+import { DEFAULT_SESSION_TIMEOUT_MS } from "../acp-bridge/acp/session.js";
+import {
   CONTINUE_MARKER_END,
   CONTINUE_MIN_PARTIAL_CHARS,
   CONTINUE_MIN_REMAINING_MS,
@@ -27,7 +32,7 @@ import {
   CONTINUE_TAIL_MARKER,
   CONTINUE_TAIL_MAX_CHARS,
   CONTINUE_TRIGGER_ACP_PROMPT_TIMEOUT,
-  DEFAULT_DISPATCH_TIMEOUT_MS,
+  DEFAULT_CONTINUE_MARGIN_MS,
   DIAGNOSTICS_ARTIFACT_NAME,
   DISPATCH_MARGIN_MS,
   MAX_CONTINUE_ATTEMPTS,
@@ -614,11 +619,32 @@ function sessionProject(sessionTimeoutMs: number | undefined): ProjectConfig {
   };
 }
 
-test("M3 dispatchBudgetMs：恒 dispatch = session + margin（margin 300s）；未配 ⇒ 660s 缺省", () => {
+/**
+ * v0.8.9 需求2 · 续跑 fixture：直接给 `agentConfig` 平铺键（`sessionTimeoutMs` / `continueMarginMs`）。
+ * **不配 `continueMarginMs` ⇒ `em = 0` = 无续跑资格**（缺省关闭），故凡期望「发生续跑」的用例都必须显式开额度。
+ */
+function marginProject(agentConfig: Record<string, unknown>): ProjectConfig {
+  return { ...PROJECT, agentConfig };
+}
+
+test("M1 dispatchBudgetMs 三段公式：窗 + 结构余量 300s + min(续跑余量, 窗)；em 缺省 0 ⇒ 退化为两段（未配窗统一 900s）", () => {
   assert.equal(DISPATCH_MARGIN_MS, 300_000);
-  assert.equal(dispatchBudgetMs(900_000), 900_000 + 300_000);
-  assert.equal(dispatchBudgetMs(60_000), 360_000);
-  assert.equal(dispatchBudgetMs(undefined), DEFAULT_DISPATCH_TIMEOUT_MS);
+  assert.equal(DEFAULT_CONTINUE_MARGIN_MS, 0);
+  // —— 两段（em=0）：与 v0.8.8 同值，「配不配窗」不再决定续跑资格，只决定第三段有无
+  assert.equal(dispatchBudgetMs(60_000, 0), 360_000);
+  assert.equal(
+    dispatchBudgetMs(effectiveSessionTimeoutMs({}), DEFAULT_CONTINUE_MARGIN_MS),
+    DEFAULT_SESSION_TIMEOUT_MS + DISPATCH_MARGIN_MS,
+  ); // 未配窗 ⇒ 生效窗 = 桥缺省 600s ⇒ 总框 900s（旧 660s 定值退役）
+  // —— 三段：em 是**独立追加**的额度，且**按生效窗封顶**（min(em, W)）
+  assert.equal(dispatchBudgetMs(600_000, 300_000), 600_000 + 300_000 + 300_000);
+  assert.equal(dispatchBudgetMs(60_000, 300_000), 60_000 + 300_000 + 60_000);
+  assert.equal(dispatchBudgetMs(600_000, 900_000), 600_000 + 300_000 + 600_000);
+  // —— 最坏总框（窗取加载期上限）：1500s < orch 孤儿墙钟 1800s ⇒ 加载期免组合校验的依据
+  assert.equal(
+    dispatchBudgetMs(SESSION_TIMEOUT_MS_CAP, SESSION_TIMEOUT_MS_CAP),
+    SESSION_TIMEOUT_MS_CAP * 2 + DISPATCH_MARGIN_MS,
+  );
 });
 
 test("M2 classifyFailure 六类逐类映射锚：agent / transport / runner / timeout（双 scope）/ business；判不出 ⇒ null（不报键）", () => {
@@ -858,13 +884,13 @@ test("M3 无 diagnostics artifact 的成功结果 ⇒ 不编造 diagnostics 键"
   assert.equal("diagnostics" in result, false);
 });
 
-test("M3 真链路（假时钟）：桥窗 900s ⇒ launcher 预算同值派生 1200s，等到 700s 后的终态（防「只配桥侧静默无效」）", async () => {
+test("M3 真链路（假时钟）：桥窗 600s（加载期上限）⇒ launcher 预算同值派生 900s，等到 700s 后的终态（防「只配桥侧静默无效」）", async () => {
   const calls: HostCalls = { ensured: [], stopped: [] };
   const clock = fakeClock();
   const cap = captureOutbox();
   const { fetchFn } = bridgedFetch(clock, 700_000, taskResult("a2a-1", "completed", "late ok"));
   const exec = makeExecutor({
-    host: makeHost(calls, sessionProject(900_000)),
+    host: makeHost(calls, sessionProject(SESSION_TIMEOUT_MS_CAP)),
     ledger: new InFlightLedger(),
     outbox: cap.outbox,
     fetch: fetchFn,
@@ -882,7 +908,7 @@ test("M3 真链路（假时钟）：桥窗 900s ⇒ launcher 预算同值派生 
 
   const result = await cap.wait();
   assert.equal(clock.elapsedMs(), 700_000); // 跑过旧 660s 定值仍未掐 ⇒ 预算按项目派生
-  assert.equal(result.state, "completed"); // 旧定值 660s 下这里会是「Runner 等待超时」
+  assert.equal(result.state, "completed"); // 旧定值 660s 下这里会是「Runner 等待超时」；em 未配 ⇒ 两段 900s 仍容得下 700s
   assert.ok(result.text.includes("late ok"));
   assert.equal(result.failureKind, undefined);
   assert.equal(result.diagnostics, undefined); // 桥上没带 diagnostics ⇒ 不编造
@@ -1520,15 +1546,25 @@ test("M3 常量六项：续跑一次性 / 总轮数安全网 / 剩余预算闸 /
   assert.equal(CONTINUE_TRIGGER_ACP_PROMPT_TIMEOUT, "acp-prompt-timeout");
 });
 
+test("v0.8.9 常量面三处：CAP 收到 600s（10 min）· 续跑余量缺省 0（关闭）· 结构余量语义收窄为独立一段", () => {
+  // 加载期窗上限 15 min → **10 min**：使最坏总框 1500s 恒 < orch 孤儿墙钟 1800s（免组合校验的依据）
+  assert.equal(SESSION_TIMEOUT_MS_CAP, 600_000);
+  // 续跑资格改由**独立键**决定（缺省 0 = 不配就不续跑），不再由结构余量 implicit 提供
+  assert.equal(DEFAULT_CONTINUE_MARGIN_MS, 0);
+  // 结构余量语义**收窄**为「非 prompt 段」一项：数值不变，但不再兼任「续跑入场券」
+  assert.equal(DISPATCH_MARGIN_MS, 300_000);
+});
+
 // ---- 判据逐条件锚（纯函数 · §2.4 表达式，含三处「必须排除」）----
 
-/** canContinueNow 全通过的基线（结果面以外的四条件恰好各达标一次） */
+/** canContinueNow 全通过的基线（结果面以外的条件恰好各达标一次；`em` 取地板同值 ⇒ 同时压 `max(180s, em)` 的取等边界） */
 const OK_GATE = {
   continueAttempts: 0,
   roundsSinceStart: 1,
   partialChars: CONTINUE_MIN_PARTIAL_CHARS,
   updateCount: 0,
   remainingMs: CONTINUE_MIN_REMAINING_MS,
+  effectiveMarginMs: CONTINUE_MIN_REMAINING_MS,
 };
 
 test("M3 canContinueNow：基线放行；计数 / 桥自报 / 轮数 / 无产出 / 剩余预算 逐项翻转为否", () => {
@@ -1549,6 +1585,21 @@ test("M3 canContinueNow：基线放行；计数 / 桥自报 / 轮数 / 无产出
     canContinueNow({ ...OK_GATE, remainingMs: CONTINUE_MIN_REMAINING_MS - 1 }),
     false,
   );
+});
+
+test("v0.8.9 额度准入：em 缺省（undefined）/ 0 ⇒ 一律不续跑，即使其余条件全达标", () => {
+  assert.equal(canContinueNow({ ...OK_GATE, effectiveMarginMs: undefined }), false);
+  assert.equal(canContinueNow({ ...OK_GATE, effectiveMarginMs: 0 }), false);
+  assert.equal(canContinueNow({ ...OK_GATE, effectiveMarginMs: 1 }), true); // 有额度即入场（1ms 也是 opt-in）
+});
+
+test("v0.8.9 预算地板 = max(180s, em)：em 高于地板时以 em 为准（防「窗大 ⇒ 续跑吃掉结构余量」）", () => {
+  const em = 300_000;
+  // 其余条件全达标，仅剩余预算落在 [180s, em) 区间 ⇒ 被地板否
+  assert.equal(canContinueNow({ ...OK_GATE, effectiveMarginMs: em, remainingMs: em - 1 }), false);
+  assert.equal(canContinueNow({ ...OK_GATE, effectiveMarginMs: em, remainingMs: em }), true);
+  // 反证：同 remainingMs 下若无 em（地板回落 180s）本可放行 ⇒ 证明否决项确为 em 抬高的地板
+  assert.equal(canContinueNow({ ...OK_GATE, effectiveMarginMs: 0, remainingMs: em - 1 }), false);
 });
 
 test("M3 canContinueNow 产出门槛 = 判据 A ∨ 判据 B（弃用 chunkCount）：单侧达标即放行、边界取等", () => {
@@ -1604,6 +1655,7 @@ const OK_GATE2 = {
   continueAttempts: 0,
   roundsSinceStart: 1,
   remainingMs: CONTINUE_MIN_REMAINING_MS,
+  effectiveMarginMs: CONTINUE_MIN_REMAINING_MS,
 };
 
 test("M3 shouldContinueOn 总闸：acp-prompt 满窗+有产出+有余量 ⇒ 放行；三前置与预算逐项排除", () => {
@@ -1645,6 +1697,17 @@ test("M3 shouldContinueOn 总闸：acp-prompt 满窗+有产出+有余量 ⇒ 放
   );
   // 桥自报已续跑 ⇒ 第二信号排除（防跨轮递归）
   assert.equal(shouldContinueOn({ ...OK_SIG, continueAttempts: 1 }, OK_GATE2), false);
+  // v0.8.9 额度准入：结果面全命中但**未开续跑余量**（缺省 em=0）⇒ 总闸不放行
+  assert.equal(shouldContinueOn(OK_SIG, { ...OK_GATE2, effectiveMarginMs: 0 }), false);
+  // v0.8.9 预算地板：remaining 落在 [180s, em) ⇒ 被 em 抬高的地板否（非 180s 地板）
+  assert.equal(
+    shouldContinueOn(OK_SIG, {
+      ...OK_GATE2,
+      effectiveMarginMs: 300_000,
+      remainingMs: CONTINUE_MIN_REMAINING_MS + 1,
+    }),
+    false,
+  );
 });
 
 // ---- ③ 尾部截断与 a2a-outcome 中和（纯函数）----
@@ -1707,7 +1770,7 @@ test("M3 真链路：满窗有产出 ⇒ 续跑一次并成功（prompt 换续�
     ]),
   ]);
   const exec = makeExecutor({
-    host: makeHost(calls, sessionProject(600_000)),
+    host: makeHost(calls, marginProject({ sessionTimeoutMs: 600_000, continueMarginMs: 300_000 })),
     ledger: new InFlightLedger(),
     outbox: cap.outbox,
     fetch: script.fetchFn,
@@ -1756,10 +1819,12 @@ test("M3 真链路 runner-deadline ⇒ 不续跑（派发窗满，无产出证�
   const calls: HostCalls = { ensured: [], stopped: [] };
   const cap = captureOutbox();
   const clock = fakeClock();
-  // 桥窗 60s ⇒ 预算 360s；桥永不收敛到终态，由 launcher 判 runner-deadline 满窗
-  const { fetchFn } = bridgedFetch(clock, 400_000, taskResult("a2a-1", "completed", "never"));
+  // 桥窗 60s + em 60s ⇒ 预算 420s；桥到 500s 才收敛（> 预算）⇒ 由 launcher 判 runner-deadline 满窗
+  const { fetchFn } = bridgedFetch(clock, 500_000, taskResult("a2a-1", "completed", "never"));
   const exec = makeExecutor({
-    host: makeHost(calls, sessionProject(60_000)),
+    // ★ v0.8.9：必须**显式开续跑额度** —— em=0 时总闸在「额度准入」就否掉，本例将绿在错的否决项上，
+    //   不再检验「runner-deadline 排除续跑」这一命题（该否决在 `shouldContinueOn` 的 scope 前置里）。
+    host: makeHost(calls, marginProject({ sessionTimeoutMs: 60_000, continueMarginMs: 60_000 })),
     ledger: new InFlightLedger(),
     outbox: cap.outbox,
     fetch: fetchFn,
@@ -1779,6 +1844,8 @@ test("M3 真链路 runner-deadline ⇒ 不续跑（派发窗满，无产出证�
   assert.equal(result.diagnostics?.timeoutScope, "runner-deadline"); // 必须排除续跑
   assert.equal(result.diagnostics?.continueAttempts, undefined); // 无续跑留痕
   assert.deepEqual(calls.stopped, []); // 未触发 stop→ensure 续跑动作
+  // 额度确已开（预算含 em 段 60s+300s+60s=420s）⇒ 本例的唯一否决项只能是 timeoutScope，不是「未配额度」
+  assert.equal(result.diagnostics?.elapsedMs, 420_000);
 });
 
 test("M3 真链路 无实质产出 ⇒ 不续跑（满窗但 partialChars/updateCount 双不足，疑似排队）", async () => {
@@ -1790,7 +1857,8 @@ test("M3 真链路 无实质产出 ⇒ 不续跑（满窗但 partialChars/update
     ]),
   ]);
   const exec = makeExecutor({
-    host: makeHost(calls, sessionProject(600_000)),
+    // ★ 同 runner-deadline 负例：开额度（em=300s，且 remaining 远高于地板）⇒ 唯一否决项回落到「产出门槛」
+    host: makeHost(calls, marginProject({ sessionTimeoutMs: 600_000, continueMarginMs: 300_000 })),
     ledger: new InFlightLedger(),
     outbox: cap.outbox,
     fetch: script.fetchFn,
@@ -1809,7 +1877,7 @@ test("M3 真链路 无实质产出 ⇒ 不续跑（满窗但 partialChars/update
   assert.equal(result.diagnostics?.continueAttempts, undefined);
 });
 
-test("M3 真链路 剩余预算不足 ⇒ 不续跑（命中判据但 remaining < 180s，白烧一轮不放行）", async () => {
+test("M3 真链路 剩余预算不足 ⇒ 不续跑（命中判据但 remaining < max(180s, em)，白烧一轮不放行）", async () => {
   const calls: HostCalls = { ensured: [], stopped: [] };
   const cap = captureOutbox();
   const script = capturingSend([
@@ -1818,11 +1886,13 @@ test("M3 真链路 剩余预算不足 ⇒ 不续跑（命中判据但 remaining 
     ]),
   ]);
   const exec = makeExecutor({
-    host: makeHost(calls),
+    // ★ 开额度（em=300s）⇒ 否决不再来自「未 opt-in」；remaining 被下面的覆盖值压到 100s，
+    //   同时低于 180s 地板与 em ⇒ 被检的那道「剩余预算」闸重新成为唯一否决项。
+    host: makeHost(calls, marginProject({ sessionTimeoutMs: 600_000, continueMarginMs: 300_000 })),
     ledger: new InFlightLedger(),
     outbox: cap.outbox,
     fetch: script.fetchFn,
-    dispatchTimeoutMs: 100_000, // 固定假钟 ⇒ remaining()=100s < 180s ⇒ 续跑预算闸关
+    dispatchTimeoutMs: 100_000, // 固定假钟 ⇒ remaining()=100s < max(180s, em=300s) ⇒ 续跑预算闸关
   });
   await exec.handle({
     type: "dispatch",
@@ -1848,7 +1918,8 @@ test("M3 组合锚：续跑轮内再满窗 ⇒ 不再续跑（rounds 封顶，co
   ]);
   const script = capturingSend([timeoutStep]); // 每一发都报满窗有产出
   const exec = makeExecutor({
-    host: makeHost(calls, sessionProject(600_000)),
+    // 必须开额度，否则轮 1 就被「em=0 无资格」否掉 ⇒ 测不到轮数安全网（calls 会停在 1）
+    host: makeHost(calls, marginProject({ sessionTimeoutMs: 600_000, continueMarginMs: 300_000 })),
     ledger: new InFlightLedger(),
     outbox: cap.outbox,
     fetch: script.fetchFn,
@@ -1877,7 +1948,8 @@ test("M3 组合锚：传输重发 × 续跑不叠成多轮（round1 早夭重发
     ]),
   ]);
   const exec = makeExecutor({
-    host: makeHost(calls, sessionProject(600_000)),
+    // 同上：轮 2 的续跑候选必须真「有资格」，才能证明拦住它的是总轮数安全网而不是缺省 em=0
+    host: makeHost(calls, marginProject({ sessionTimeoutMs: 600_000, continueMarginMs: 300_000 })),
     ledger: new InFlightLedger(),
     outbox: cap.outbox,
     fetch: script.fetchFn,
@@ -1894,4 +1966,388 @@ test("M3 组合锚：传输重发 × 续跑不叠成多轮（round1 早夭重发
   assert.equal(result.state, "failed");
   assert.equal(result.diagnostics?.attempts, 1); // 传输重发留痕
   assert.equal(result.diagnostics?.continueAttempts, undefined); // 被安全网拦下、未续跑
+});
+
+// ---------- REQ-v0.8.9-2026-09-23-01 · M6：三封 E2E（轮级 deadline 收紧的行为证据）----------
+
+/**
+ * 三封共同的 fixture：桥窗 `W = 600s`（= 加载期上限，**> em ⇒ 桥侧自己不收口**，只能由 launcher 掐）
+ * + 续跑额度 `continueMarginMs = 300s` ⇒ 总框 `600 + 300 + 300 = 1200s`。
+ */
+const SEAL_WINDOW_MS = 600_000;
+const SEAL_MARGIN_MS = 300_000;
+/** 轮 1 的桥收敛时点（假时钟）：取**非零** ⇒ 「轮 2 死亡时点」必须按轮 2 起算度量，相对量不会被总量掩盖 */
+const SEAL_ROUND1_TERMINAL_MS = 200_000;
+
+/**
+ * 三封共用的假桥：**轮 1** = `message/send` 返 working，假时钟推到 `SEAL_ROUND1_TERMINAL_MS`
+ * 才由 `tasks/get` 报 `acp-prompt` 满窗 + 实质产出（续跑原料齐备）；**轮 2（续跑轮）** 由
+ * `round2` 决定：`"complete"` = 该 send 直接 completed，`"hang"` = 永不收敛（⇒ launcher 自掐）。
+ * 记录每次 `message/send` 的假时钟读数，供「轮 2 起算时点」断言。
+ */
+function sealBridge(
+  round2: "complete" | "hang",
+  clock: { elapsedMs: () => number },
+): { fetchFn: A2AFetch; sendAtMs: () => number[] } {
+  const working = taskResult("a2a-1", "working", "");
+  const promptTimeout = taskResult("a2a-1", "failed", "会话满窗", [
+    diagnosticsArtifact({
+      acpErrorKind: "timeout",
+      partialChars: 800,
+      updateCount: 12,
+      partialTail: "半截",
+    }),
+  ]);
+  const sendAt: number[] = [];
+  let round = 0;
+  const fetchFn: A2AFetch = async (_url, init) => {
+    const req = JSON.parse(String(init.body)) as { method: string };
+    if (req.method === "message/send") {
+      round += 1;
+      sendAt.push(clock.elapsedMs());
+      return rpcResult(
+        round >= 2 && round2 === "complete" ? taskResult("a2a-1", "completed", "续后完成") : working,
+      );
+    }
+    if (req.method === "tasks/get") {
+      if (round >= 2) return rpcResult(working); // 续跑轮永不收敛
+      return rpcResult(clock.elapsedMs() >= SEAL_ROUND1_TERMINAL_MS ? promptTimeout : working);
+    }
+    throw new Error(`未预期方法：${req.method}`);
+  };
+  return { fetchFn, sendAtMs: () => sendAt };
+}
+
+/** 跑一次三封场景（假时钟只在 sleep 前进）：返回终态 + 每发 send 的时点 + warn 留痕 */
+async function runSeal(round2: "complete" | "hang"): Promise<{
+  result: RunnerTaskResult;
+  elapsedMs: () => number;
+  sends: number[];
+  warns: string[];
+}> {
+  const calls: HostCalls = { ensured: [], stopped: [] };
+  const clock = fakeClock();
+  const cap = captureOutbox();
+  const logger = warnCollector();
+  const bridge = sealBridge(round2, clock);
+  const exec = makeExecutor({
+    host: makeHost(
+      calls,
+      marginProject({ sessionTimeoutMs: SEAL_WINDOW_MS, continueMarginMs: SEAL_MARGIN_MS }),
+    ),
+    ledger: new InFlightLedger(),
+    outbox: cap.outbox,
+    fetch: bridge.fetchFn,
+    now: clock.now,
+    sleep: clock.sleep,
+    pollIntervalMs: 1_000,
+    logger: logger.logger,
+  });
+  await exec.handle({
+    type: "dispatch",
+    taskId: `t-seal-${round2}`,
+    projectId: "alpha",
+    contextId: "ctx",
+    payload: "hi",
+  });
+  const result = await cap.wait();
+  return { result, elapsedMs: clock.elapsedMs, sends: bridge.sendAtMs(), warns: logger.warns };
+}
+
+test("M6 封① 额度内完成：轮 2 于 now+em 前 completed ⇒ 两发 · continueAttempts=1 · 无 runner-deadline", async () => {
+  const { result, elapsedMs, sends } = await runSeal("complete");
+  const round2Start = sends[1] ?? Number.NaN;
+  assert.equal(sends.length, 2); // 首发 + 一次续跑
+  assert.equal(round2Start, SEAL_ROUND1_TERMINAL_MS); // 轮 2 自该时点起算（额度以此为原点）
+  assert.equal(result.state, "completed");
+  assert.ok(result.text.includes("续后完成"));
+  assert.equal(result.diagnostics?.continueAttempts, 1);
+  assert.equal(result.diagnostics?.timeoutScope, undefined); // ★ 全程未出现 runner-deadline
+  assert.ok(
+    elapsedMs() <= round2Start + SEAL_MARGIN_MS,
+    `轮 2 在额度内收敛：elapsed=${String(elapsedMs())} ≤ ${String(round2Start + SEAL_MARGIN_MS)}`,
+  );
+});
+
+test("M6 封② em 满窗：桥窗 W>em 不收口 ⇒ launcher 轮级自掐 timeout×runner-deadline 且 rounds=2 封顶", async () => {
+  const { result, sends } = await runSeal("hang");
+  assert.equal(sends.length, 2); // ★ 无第三轮：总轮数安全网封顶
+  assert.equal(result.state, "failed");
+  assert.equal(result.failureKind, "timeout");
+  assert.equal(result.diagnostics?.timeoutScope, "runner-deadline"); // 自掐落点归 launcher 侧
+  assert.equal(result.diagnostics?.continueAttempts, 1); // 续跑确实发生（不是「没续跑所以两轮」）
+  assert.equal(result.diagnostics?.attempts, 0); // 续跑与传输重发正交：本例无重发
+});
+
+test("M6 封③ 反封（关键）：轮 2 死亡时点 = 轮 2 起算 + em（非 em+300s）⇒ 结构余量未被续跑挪用", async () => {
+  const { result, elapsedMs, sends, warns } = await runSeal("hang");
+  const round2Start = sends[1] ?? Number.NaN;
+  const diedAt = elapsedMs();
+  const emConsumedByRound2 = diedAt - round2Start;
+  assert.equal(round2Start, SEAL_ROUND1_TERMINAL_MS); // 轮 2 起算点非 0 ⇒ 下面都是相对量
+
+  // ★ 核心：续跑轮恰好消费 em，一分不多
+  assert.equal(emConsumedByRound2, SEAL_MARGIN_MS);
+  // ★ 反封：若那 300s 结构余量被续跑挪用，轮 2 会晚一个结构余量才死
+  assert.notEqual(emConsumedByRound2, SEAL_MARGIN_MS + DISPATCH_MARGIN_MS);
+  // ★ 反封：若无轮级收紧，本轮一路跑到总框末端才死（= 本需求要证伪的反例）
+  assert.notEqual(diedAt, SEAL_WINDOW_MS + DISPATCH_MARGIN_MS + SEAL_MARGIN_MS);
+  // 总框上界：整次派发不超过「窗 + 结构余量 + em」
+  assert.ok(
+    (result.diagnostics?.elapsedMs ?? Number.POSITIVE_INFINITY) <=
+      SEAL_WINDOW_MS + DISPATCH_MARGIN_MS + SEAL_MARGIN_MS,
+    `总框上界：elapsedMs=${String(result.diagnostics?.elapsedMs)}`,
+  );
+  // 执法留痕：续跑 warn 的 remaining 已按收紧后的额度报（= em，不是 em+300s）
+  assert.ok(
+    warns.some(
+      (m) => m.includes("场景 C 续跑") && m.includes(`remaining=${String(SEAL_MARGIN_MS)}ms`),
+    ),
+    `收紧后的续跑轮额度可见：${warns.join(" | ")}`,
+  );
+});
+
+// ---------- REQ-v0.8.9-2026-09-23-01 · M4：白名单放行 + business 守卫 + 成功轮文本纯净 ----------
+
+/** 成功轮桥载荷（v0.8.9 起**成功也挂 diagnostics**；`partialTail` 是失败路径原料，此处故意带上以验剥离）。 */
+const M4_SUCCESS_DIAG: Record<string, unknown> = {
+  stage: "success",
+  promptElapsedMs: 4200,
+  bridgeEnsureElapsedMs: 300,
+  chunkCount: 5,
+  partialChars: 640,
+  updateCount: 11,
+  turn: 2,
+  sessionReused: true,
+  promptChars: 1800,
+  injectedChars: 0,
+  resultChars: 640,
+  blockCount: 1,
+  replayDropped: 0,
+  partialTail: "上一轮的半截原文（消费即弃，绝不上带）",
+  partialTailChars: 18,
+};
+
+/** M4 放行的会话层键（事实源 = 桥 `withDiag` 的 M2 键表）。 */
+const M4_PASSTHROUGH_KEYS = [
+  "turn",
+  "sessionReused",
+  "promptChars",
+  "injectedChars",
+  "resultChars",
+  "blockCount",
+  "replayDropped",
+  "outcomeAmbiguous",
+  "ambiguousReason",
+  "sessionMapSize",
+  "sessionMapOldestAgeDays",
+] as const;
+
+test("M4 白名单放行：会话层 11 键逐键透传（含 false / 0 / 年龄 0 天等合法零值）", () => {
+  const d = splitDiagnosticsArtifact([
+    diagnosticsArtifact({
+      turn: 3,
+      sessionReused: false,
+      promptChars: 1800,
+      injectedChars: 0,
+      resultChars: 640,
+      blockCount: 2,
+      replayDropped: 7,
+      outcomeAmbiguous: true,
+      ambiguousReason: "continue-multi-block",
+      sessionMapSize: 2,
+      sessionMapOldestAgeDays: 0,
+      stage: "success", // launcher 自测键：不采桥值
+      unknownKey: "drop-me",
+    }),
+  ]).diagnostics as BridgeDiagnostics;
+
+  assert.deepEqual(d, {
+    turn: 3,
+    sessionReused: false,
+    promptChars: 1800,
+    injectedChars: 0,
+    resultChars: 640,
+    blockCount: 2,
+    replayDropped: 7,
+    outcomeAmbiguous: true,
+    ambiguousReason: "continue-multi-block",
+    sessionMapSize: 2,
+    sessionMapOldestAgeDays: 0,
+  });
+  assert.equal("stage" in d, false, "不采桥侧 stage（launcher 自测派发相位覆盖）");
+  assert.equal("unknownKey" in d, false);
+});
+
+test("M4 白名单负向：类型不符 / 空串 / 负数 ⇒ 逐键丢弃（不抛、不整包丢）", () => {
+  const d = splitDiagnosticsArtifact([
+    diagnosticsArtifact({
+      turn: "3", // 非数字
+      sessionReused: "yes", // 非布尔
+      promptChars: -1, // 负数
+      injectedChars: 1.5, // 非整数
+      resultChars: null,
+      blockCount: {},
+      replayDropped: [],
+      outcomeAmbiguous: 1, // 非布尔（真值不等于 true）
+      ambiguousReason: "", // 空串 ⇒ 丢
+      sessionMapSize: Number.NaN,
+      sessionMapOldestAgeDays: Number.POSITIVE_INFINITY,
+      chunkCount: 4, // 既有键不受影响 ⇒ 证明是逐键丢弃
+    }),
+  ]).diagnostics as BridgeDiagnostics;
+
+  assert.deepEqual(d, { chunkCount: 4 });
+  for (const key of M4_PASSTHROUGH_KEYS) {
+    assert.ok(!(key in d), `${key} 类型不符必须丢弃`);
+  }
+});
+
+test("M4 business 守卫：outcomeAmbiguous ⇒ 不判 business；无标志 / false ⇒ 照判（单参调用向后兼容）", () => {
+  const failed = '结论：\n```a2a-outcome\n{"state":"failed","reason":"依赖缺失"}\n```';
+  assert.equal(containsFailedOutcomeBlock(failed), true, "不传桥标志 ⇒ 行为同 v0.8.8");
+  assert.equal(containsFailedOutcomeBlock(failed, null), true);
+  assert.equal(containsFailedOutcomeBlock(failed, {}), true);
+  assert.equal(containsFailedOutcomeBlock(failed, { outcomeAmbiguous: false }), true);
+  assert.equal(containsFailedOutcomeBlock(failed, { outcomeAmbiguous: true }), false);
+});
+
+test("M4 真链路：failed + 失败结论块 + 桥标 ambiguous ⇒ **不报 business**（退回账面 state；无标志时仍报）", async () => {
+  const text = '结论：\n```a2a-outcome\n{"state":"failed","reason":"依赖缺失"}\n```';
+
+  const guarded = await deliverOnceFor(
+    taskResult("a2a-1", "failed", text, [
+      diagnosticsArtifact({
+        outcomeAmbiguous: true,
+        ambiguousReason: "cross-turn-message-id",
+        blockCount: 2,
+        chunkCount: 3,
+      }),
+    ]),
+  );
+  assert.equal(guarded.state, "failed", "账面 state 不变（守卫只影响 kind，不改任务态）");
+  assert.equal("failureKind" in guarded, false, "business 被守卫拦下 ⇒ 判不出 ⇒ 不报键");
+  assert.equal(guarded.diagnostics?.outcomeAmbiguous, true, "标志本身照原样上带，供 orch 反查");
+  assert.equal(guarded.diagnostics?.ambiguousReason, "cross-turn-message-id");
+
+  const control = await deliverOnceFor(
+    taskResult("a2a-1", "failed", text, [diagnosticsArtifact({ blockCount: 1, chunkCount: 3 })]),
+  );
+  assert.equal(control.failureKind, "business", "对照组：无 ambiguous 标志 ⇒ 判据不变（守卫非全局降级）");
+});
+
+test("CE-3 真链路：窗内互斥双块 + 桥标 multi-block ⇒ **不判 business**（账面 state 仍按末块）", async () => {
+  // 改造文档 §1「与 v0.8.8 的耦合 1」+ §4-验收 4 的 CE-3：launcher 用自己复制的
+  // `OUTCOME_BLOCK_RE` 扫块（不 import 桥），末块 = `failed` ⇒ 无守卫时会判 business；
+  // 桥标歧义 ⇒ **不据此判**（宁可漏判，也不把 completed 误打成不可自动重试的 business）。
+  const text =
+    '先问一句。\n```a2a-outcome\n{"state":"input-required","question":"要哪个环境？"}\n```\n' +
+    '做不到。\n```a2a-outcome\n{"state":"failed","reason":"依赖缺失"}\n```';
+
+  const guarded = await deliverOnceFor(
+    taskResult("a2a-1", "failed", text, [
+      diagnosticsArtifact({ outcomeAmbiguous: true, ambiguousReason: "multi-block", blockCount: 2 }),
+    ]),
+  );
+  assert.equal(guarded.state, "failed", "state 由末块决定（主规则逐字不动）");
+  assert.equal("failureKind" in guarded, false, "multi-block ⇒ business 被守卫拦下 ⇒ 不报键");
+  assert.equal(guarded.diagnostics?.outcomeAmbiguous, true, "标志与诱因照原样上带供 orch 反查");
+  assert.equal(guarded.diagnostics?.ambiguousReason, "multi-block");
+  assert.equal(guarded.diagnostics?.blockCount, 2);
+
+  const control = await deliverOnceFor(
+    taskResult("a2a-1", "failed", text, [diagnosticsArtifact({ blockCount: 2 })]),
+  );
+  assert.equal(control.failureKind, "business", "对照组：同文无歧义标志 ⇒ 判据不变（守卫非全局降级）");
+});
+
+/** 成功轮一次派发：桥带全会话层键 + partialTail，返回落 outbox 的回传结果。 */
+async function deliverSuccessRound(
+  artifacts: unknown[],
+  text: string,
+): Promise<RunnerTaskResult> {
+  const cap = captureOutbox();
+  const exec = makeExecutor({
+    host: makeHost({ ensured: [], stopped: [] }),
+    ledger: new InFlightLedger(),
+    outbox: cap.outbox,
+    fetch: async () => rpcResult(taskResult("a2a-1", "completed", text, artifacts)),
+    runGit: throwingGit,
+  });
+  await exec.handle({
+    type: "dispatch",
+    taskId: `t-s${Math.random().toString(36).slice(2)}`,
+    projectId: "alpha",
+    contextId: "ctx",
+    payload: "hi",
+  });
+  return cap.wait();
+}
+
+/** artifact 列表的 text part 总数（AC-S1「part 数与改前一致」的计量口径）。 */
+function textPartCount(artifacts: unknown[]): number {
+  let n = 0;
+  for (const artifact of artifacts) {
+    const parts = (artifact as { parts?: unknown[] }).parts;
+    for (const part of parts ?? []) {
+      if ((part as { kind?: string }).kind === "text") n += 1;
+    }
+  }
+  return n;
+}
+
+test("AC-S1 守护自检：成功轮结果文本纯净 ⇒ 不含 machine-diagnostics / 任何 diagnostics 键名，artifacts 无诊断条目、文本 part 数不变", async () => {
+  const response = {
+    artifactId: "a1",
+    name: "response",
+    parts: [{ kind: "text", text: "实现完成，门禁全绿。" }, { kind: "text", text: "附：见 diff" }],
+  };
+  const note = { artifactId: "a2", name: "note", parts: [{ kind: "text", text: "二段说明" }] };
+  const before = [response, note]; // 改前（无诊断 artifact）的账面形状
+
+  const result = await deliverSuccessRound([...before, diagnosticsArtifact(M4_SUCCESS_DIAG)], "完成");
+
+  assert.equal(result.state, "completed");
+  assert.equal("failureKind" in result, false);
+  assert.equal(
+    result.artifacts.some((a) => (a as { name?: string }).name === DIAGNOSTICS_ARTIFACT_NAME),
+    false,
+    "result.artifacts 中不得有 name=machine-diagnostics 条目",
+  );
+  assert.deepEqual(result.artifacts, before, "剩余 artifacts 原样、保序");
+  assert.equal(textPartCount(result.artifacts), textPartCount(before), "文本 part 数与改前一致");
+  assert.equal(textPartCount(result.artifacts), 3);
+
+  const haystack = `${result.text}\n${JSON.stringify(result.artifacts)}`;
+  assert.ok(!haystack.includes(DIAGNOSTICS_ARTIFACT_NAME), "结果面不得含 machine-diagnostics 字面");
+  for (const key of [...Object.keys(M4_SUCCESS_DIAG), ...M4_PASSTHROUGH_KEYS]) {
+    assert.ok(!haystack.includes(key), `结果面不得含 diagnostics 键名 ${key}`);
+  }
+  assert.ok(!result.text.includes("promptElapsedMs"), "文本不得含 promptElapsedMs");
+  assert.ok(!result.text.includes("chunkCount"), "文本不得含 chunkCount");
+  assert.ok(!result.text.includes("partialTail"), "文本不得含 partialTail");
+  assert.ok(!result.text.includes(M4_SUCCESS_DIAG["partialTail"] as string), "半截原文绝不得出现在结果文本");
+  assert.ok(result.text.includes("完成"), "正文本身照常回传");
+});
+
+test("AC-S2：成功轮 diagnostics 存在且含 turn / promptChars / resultChars；partialTail 不出现（投影剥离仍生效）", async () => {
+  const result = await deliverSuccessRound(
+    [diagnosticsArtifact(M4_SUCCESS_DIAG)],
+    "完成",
+  );
+
+  const d = result.diagnostics;
+  assert.ok(d !== undefined, "桥上带了 diagnostics ⇒ 成功轮必有");
+  assert.equal(d.turn, 2);
+  assert.equal(d.sessionReused, true);
+  assert.equal(d.promptChars, 1800);
+  assert.equal(d.injectedChars, 0);
+  assert.equal(d.resultChars, 640);
+  assert.equal(d.blockCount, 1);
+  assert.equal(d.replayDropped, 0);
+  assert.equal("outcomeAmbiguous" in d, false, "桥未报（false ⇒ 不报）⇒ launcher 不编造");
+  assert.equal("partialTail" in d, false, "partialTail 不上带 orch（投影剥离）");
+  assert.equal(d.partialTailChars, 18, "只留长度键");
+  assert.equal(d.elapsedMs, 0, "launcher 自测键不由桥覆盖");
+  assert.equal(d.stage, "send", "stage 取 launcher 落点，不采桥的 success");
 });

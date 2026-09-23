@@ -2,6 +2,47 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.8.9] - 2026-09-23
+
+> 主题：**执行可靠性 III：上下文**（**两条需求同版交付** —— ① `REQ-v0.8.9-2026-09-22-01`「会话复用与上下文治理」· ② `REQ-v0.8.9-2026-09-23-01`「续跑余量独立配置」；两条 Step 3 均由用户验收通过，验收账见各自改造文档）。**需求 1 的问题定义在 Step 0 被实测推翻并收窄**：生产里**没有长会话**（同一锚点 60 条 / 54 个 `contextId`：**48 个只跑 1 轮、0 个 ≥3 轮**）⇒ **不做上下文截断 / 摘要**，改建四件：**① 派发消息不再递归膨胀**（实测同一节点 500 字 → **7261 字**、`<feature-context>` 叠 3 层）· **② 复用 / 轮次 / 消息体积只读可见面**（此前四张面全不可查）· **③ 轮边界判据加固**（历史回灌的结论块可能被当成本轮结论）· **④ 会话映射保留边界**（只增不减 ⇒ 7 天 / 500 条 + 让删除方法有调用点）。**需求 2 把「自动续跑」的资格与额度从窗配置里拆出来**：`continueMarginMs` **独立成键、缺省 0 = 不续跑**（改显式 opt-in），派发预算改**三段公式**，续跑轮额度**只吃 `em`、不吃 300s 结构余量**（由**轮级 deadline 收紧**执法），并把窗上限由 15 min 收严到 10 min 以免击穿 orch 孤儿墙钟。**协议零变更**（`PROTOCOL_VERSION` 仍 **2.3** —— 两条需求都是本机策略 / 本机可见面，不动线上契约）。
+
+### Changed
+
+- **派发消息不再重复包裹**（orch ①-a + machine ①-b）：orch 侧把**未渲染 base** 与**渲染结果**分列 —— `dispatch_message` 只存 base，渲染快照另落 `dispatch_rendered`（**覆盖写**）；machine 侧首轮注入加 `injectedAt` 守卫 ⇒ **重派不再二次注入**。真机 3 连派：`baseChars`/`renderedChars`/`wrappedChars(=133)` 三次逐字不变、`injectedChars` **582 → 0 → 0**；库内对照历史行（3 层 / 7261 字）⇒ 归零。
+- **续跑余量独立成键**（machine）：`agentConfig.continueMarginMs`（平铺自消费键 · **非负整数** · **上限 = 本项目生效会话窗** · **缺省 0 = 不续跑**）；派发预算改**三段公式** `总框 = 生效窗 + 结构余量(DISPATCH_MARGIN_MS = 300_000) + min(续跑余量, 生效窗)`，`生效窗 = 显式 sessionTimeoutMs ?? 桥缺省 600_000` ⇒ **未配窗项目也走同一公式**（消除「配不配窗 ⇒ 续跑资格不同」的隐式耦合）。
+- **续跑轮额度 = `em`（独立额度 + 轮级 deadline 收紧）**（machine）：进续跑轮前 `deadline = Math.min(deadline, now + em)`（**只收紧、不延长**）—— 桥的 `--session-timeout` 只带窗值、不知 `em`，不收紧则续跑轮会吃掉 300s 结构余量。闸新增准入 **`em > 0`**，地板改为 **`remaining ≥ max(180_000, em)`**。
+- **窗上限护栏收严**（machine）：`SESSION_TIMEOUT_MS_CAP` **900_000 → 600_000**（10 min）—— 最坏总框 = 600 + 300 + 600 = **1500s（25 min）** < orch 孤儿墙钟 30 min ⇒ **免组合校验**；代价 = 单轮不再能跑到 12–15 分钟。**超限 / 非法 ⇒ 加载期 `fail-fast`（拒绝，不是截断）**。
+- **轮边界判据加固**（machine）：跨轮归档保留（历史回灌的结论块不再被当本轮结论）；判据仍单点，但**不确定就显式暴露**（`outcomeAmbiguous`）。
+- **会话映射保留边界**（machine）：`sessionRetentionDays`（缺省 7）/ `sessionRetentionMax`（缺省 500）+ LRU 淘汰，并**让 `SessionMap.delete()` 有调用点**。
+- **宿主口径文档**（仓根）：`AGENTS.md` ↔ `CLAUDE.md` 的「失败处置纪律」§2 按新口径重写（续跑资格 = `continueMarginMs > 0`、与配没配窗解耦；「660s」字样退役；跨单元硬约束三数 600_000 / 1500s / 1800s）。
+
+### Added
+
+- **复用 / 轮次 / 消息体积可见面**（machine 上送 + orch 投影）：`turn` / `sessionReused` / `sessionResumed` / `injectedChars` / `resultChars` / `blockCount` / `replayDropped` / `outcomeAmbiguous` / `sessionMapSize` / `sessionMapOldestAgeDays` / `partialChars` 等，orch 侧另有 `baseChars` / `renderedChars` / `wrappedChars` / `attempts`。
+- **`config-snapshot` 播报两键**（machine）：启动时逐项目打印 `sessionTimeoutMs=… continueMarginMs=…`（含「缺省」标注与出处）—— 补上「配了窗但日志看不到」的盲区。
+- **`continueMarginMs` 加载期校验 + 新用例**（machine）：非负整数 + **≤ 生效窗**，超限 ⇒ 拒，文案带窗数值与出处（`test/config-continue-margin.test.ts`、`test/config-session-retention.test.ts`、`test/acp-session-retention.test.ts`）。
+
+### Removed
+
+- **`DEFAULT_DISPATCH_TIMEOUT_MS = 660_000`**（machine）：退役 —— 隐式耦合的落地处（未配窗项目的总框不再自成一档）。
+- **桥侧死常量 `DEFAULT_TASK_TIMEOUT_MS = 660_000`**（machine）：零消费方 ⇒ 直接删。
+- **`orch/config.ts` 对已删符号名 `dispatchTimeoutMs` 的引用**（收口轨 `560a0dde`）：改写为「机器侧最坏总框上界」口径。
+
+### 门禁与真机
+
+- **单元门禁（发版前重跑实测）**：machine `typecheck` **0** / `npm test` **501 / 501 · 0 失败**；orch `typecheck` **0** / `npm test` **342（341 pass / 0 fail / 1 平台跳过）**。
+- **宿主回归**：**1298 / 1298 零失败**（`reports/v0.8.9/regression-report.json`）。**与 v0.8.8 的 1296 差额 = +2，已核实为**：本版**两条需求** ⇒ `doc/v0.8.9/` 目录锚 + **两份**改造文档各自的 TC10 锚（含字面 `final` 行）；版本锚与两条 pin 为**改名**（0.8.8⇒0.8.9）**非增减**。
+- **真机（Step 3 · 2026-09-23；用户重启桥 + Launcher 并**新建 `test` 项目**供验收；宿主全程自取证据）** —— **需求 1**：①-a ✓✓（3 连派 `wrappedChars` 恒定 + 库内 before/after）· ①-b ✓（首轮 `injectedChars=582` → 后两轮 **0**）· ② ✓（键面在真机出参里）· ④ ✓（`sessionMapSize=272` / `oldestAgeDays=3`）· **场景 C 正例 ✓✓**；③ 部分（以离线用例为准）。**需求 2**：**三段公式**（未配窗 `900000` / `test` `1000000`）· **续跑额度 = `em`**（`em=600000` ⇒ 日志 `remaining=600000ms`；`em=100000` ⇒ `remaining=99999ms`）· **轮级 deadline 收紧 ⇒ 300s 结构余量未被挪用**（总耗时 **1203s** 而公式总框 **1500s**）· **`em=0` 准入执法**（负例满窗剩 ≈300s ≥ 180s 闸却**不续跑**：603.3s / `acp-prompt`）· **续跑真接回同一会话**（`sessionResumed=true` + 同 `sessionId`）· **超限被拒**（用户亲手验两条：`> 600000` ⇒ `Error: [config] …` + **Launcher 不启动**）· 快照两键播报 ✓ · 两种结局（被收紧 deadline 砍断 / 额度内完成）各现一次 ✓。
+
+### 未覆盖（登记，不计通过）
+
+- **需求 2**：`em < 180s`（**设计上不验**：会触发但意义有限 —— 地板只闸剩余预算、不闸额度下限）· 多轮续跑（设计禁止 `MAX_CONTINUE_ATTEMPTS = 1`）· 「传输重发 × 续跑」组合（`MAX_DISPATCH_ROUNDS = 2` 防 4 轮，需组合条件、不可控）· 闸的三条防御路径（`dispatchTimeoutOverride` / 时钟回拨 / `ensure` 超长吃掉结构余量）。
+- **需求 1**：`CE-4` 已知不可判 · `CE-2` 真机现实性 · `parseOutcomeFromGroups` 机制就绪**未接线** · `lastBlockIndex` 不上账面 · 受控排队实验 · **长会话未证实也未证伪**（重启条件 = 出现 ≥5 轮的真实节点且失败率显著高于首轮）· `sealed_settle` 事件语义待核。
+- **两处新登记的「失败可见面」缺口（属 v0.8.8 面、本版刻意不顺手修）**：**①「事件先于分类」** —— orch 落 `failureKind` 在发出 `task.settled` **之后**（读的是结算前的值）⇒ 某行**首次**失败的事件 payload 必然读不到类型（实测 7 条 failed settle 仅 1 条带）；**② 续跑闸「拒绝路径零日志」** —— `dispatchAction` 返回 `null` 时静默 `break`、只有放行分支才打印 ⇒ 「为什么没续跑」无法从日志直读。
+- **沿袭的老项**：传输层**有界重发**（只在 `spawn`/`closed` 早夭触发、不可控 —— 9 万行日志至今 **0 触发**）· `agent` / `transport` 六类真机样本 · `model_queue` 本版无代码产出 · L3 跨机 × 跨 kind（`mac-dev` 入组即可）· 混跑兜底（需旧版本机）。
+- **两处只报不修的小缺陷（v0.8.8 遗留面）**：降级 `degraded[].since` **不粘滞**（持续降级期间随 sweep tick 前跳）· 墙钟判死任务 `text` 为空（⇒ 账单 `failed[].text` 会是 `null`）。
+- **一条新观测（非缺陷）**：续跑日志行里的 `sessionResumed` 是**触发续跑那一轮**的值 ⇒ 易误读（宿主据此错判过一次，已改正）· **一条待清的口径漂移**：`orch/config/config.json.default` 仍写孤儿墙钟置 `failure_kind=infra`（该取值自协议 2.3 起非法、现行 = `runner`）⇒ 随下一轮 orch 口径收口一并清。
+
 ## [v0.8.8] - 2026-09-22
 
 > 主题：**执行可靠性 II：失败可见与策略**（单需求 · `REQ-v0.8.8-2026-09-22-01`；用户 2026-09-22 Step 3「验收通过」）。**四件事一次收口**：**① 失败分类由「两值桶」变六类闭集** —— `{infra, task}` 里 `task` 是**兜底桶**（`timeout`/`rpc`/`protocol` 全落进去），且两单元对 `timeout` 的定义**互相矛盾**（machine ⇒ `infra` / orch ⇒ `task`，而 orch **根本不读** machine 上报的那个值）⇒ 新闭集 `{agent, transport, runner, model_queue, timeout, business}`（+ `timeoutScope` 子键），线协议 `2.2 → 2.3`。**② 判死的任务第一次能说清「为什么死」** —— 补齐 `task.settled` 终态事件（pull 模型下普通任务的事件足迹原只剩 `task.claimed`）+ 六类真机样本 + 失败账单带 `failureKind`。**③ 超时不再必然丢活** —— 场景 C 续跑（同 `contextId` 续接，用户裁 ①(b)「按类自动重试」的第一个显式场景：**600s 超时 ∧ 确有输出 ⇒ 任务太大 ⇒ 可重试**）。**④ 降级不再静默** —— 坏配置曾让 orch 三条保护**静默失效**而 `/health` 照旧 200 `ok`。同版补齐 **v0.8.7 顺延 5 项里的 4 项**（孤儿墙钟 / 启动补结算 / `--session-timeout` 成对 / `failure_kind` 落库）+ 投影层 `claimedAt` / `queuedAt`。改造文档：`doc/v0.8.8/失败可见与策略-改造文档.md`（**final**；边界 R1→R2→R3 三轮收敛 + Step 2/Step 3 两条实现级增补）。

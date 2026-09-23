@@ -16,7 +16,12 @@
  *       [--backend-args <JSON字符串数组>]
  *       [--system-prompt <text> --system-prompt-mode <append|replace>]
  *       [--model <value>] [--mode <modeId>] [--collaboration-mode <value>]
- *       [--session-meta-json <JSON对象>] [--session-timeout <ms>]`
+ *       [--session-meta-json <JSON对象>] [--session-timeout <ms>]
+ *       [--session-retention-days <n>] [--session-retention-max <n>]`
+ *
+ * v0.8.9 · M5：`--session-retention-days` / `--session-retention-max` = `SessionMap` 保留边界
+ * （条目 TTL 天数 / 单项目条数上限），**只校验「整数 > 0」**（纪律同 `--session-timeout`）；
+ * 缺省 ⇒ 桥落 `SessionMap` 自身缺省（7 天 / 500 条）。与 `--session-timeout` 语义完全独立。
  *
  * v0.8.7 · M1：`--session-timeout <ms>` = 会话执行超时毫秒数，**只校验「整数 > 0」**
  * （上限护栏的单一源在 launcher 项目解析处，本模块零仓内依赖故不复制上限常量）；缺省 ⇒ 落
@@ -100,6 +105,13 @@ export interface BridgeArgs {
    * ⇒ 由 {@link startBridge} 落 `deps.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS`。
    */
   sessionTimeoutMs?: number;
+  /**
+   * `--session-retention-days` 解析结果（SessionMap 条目保留天数，v0.8.9 · M5）；
+   * 缺省 ⇒ `undefined` ⇒ `SessionMap` 落自身缺省 7 天。与 `sessionTimeoutMs` 语义独立。
+   */
+  sessionRetentionDays?: number;
+  /** `--session-retention-max` 解析结果（单项目映射条数上限，v0.8.9 · M5）；缺省 ⇒ `undefined` ⇒ 落缺省 500。 */
+  sessionRetentionMax?: number;
 }
 
 function requiredArg(map: ReadonlyMap<string, string>, key: string): string {
@@ -140,6 +152,8 @@ export function parseBridgeArgs(argv: readonly string[]): BridgeArgs {
   const systemPrompt = parseModelArg(map.get("system-prompt"));
   const systemPromptMode = parseSystemPromptModeArg(map.get("system-prompt-mode"));
   const sessionTimeoutMs = parseSessionTimeoutArg(map.get("session-timeout"));
+  const sessionRetentionDays = parseSessionRetentionArg(map.get("session-retention-days"), "--session-retention-days");
+  const sessionRetentionMax = parseSessionRetentionArg(map.get("session-retention-max"), "--session-retention-max");
   return {
     port,
     workspace: requiredArg(map, "workspace"),
@@ -154,6 +168,8 @@ export function parseBridgeArgs(argv: readonly string[]): BridgeArgs {
     ...(collaborationMode !== undefined ? { collaborationMode } : {}),
     ...(sessionMeta !== undefined ? { sessionMeta } : {}),
     ...(sessionTimeoutMs !== undefined ? { sessionTimeoutMs } : {}),
+    ...(sessionRetentionDays !== undefined ? { sessionRetentionDays } : {}),
+    ...(sessionRetentionMax !== undefined ? { sessionRetentionMax } : {}),
   };
 }
 
@@ -168,6 +184,23 @@ export function parseSessionTimeoutArg(raw: string | undefined): number | undefi
   const value = Number(raw);
   if (!Number.isInteger(value) || value <= 0) {
     throw new Error("--session-timeout 必须是正整数毫秒");
+  }
+  return value;
+}
+
+/**
+ * `--session-retention-days` / `--session-retention-max` 共用解析（v0.8.9 · M5）：
+ * **只做「整数 > 0」宽松校验**（纪律同 {@link parseSessionTimeoutArg}），非法即抛；
+ * 加载期上限护栏归 launcher `config.ts`（本模块零仓内依赖，不复制校验表）。
+ */
+export function parseSessionRetentionArg(
+  raw: string | undefined,
+  flag: "--session-retention-days" | "--session-retention-max",
+): number | undefined {
+  if (raw === undefined) return undefined;
+  const value = Number(raw);
+  if (!Number.isInteger(value) || value <= 0) {
+    throw new Error(`${flag} 必须是正整数`);
   }
   return value;
 }
@@ -273,7 +306,14 @@ export async function startBridge(args: BridgeArgs, deps: StartBridgeDeps = {}):
     ...(args.systemPrompt !== undefined ? { systemPrompt: args.systemPrompt } : {}),
     ...(args.systemPromptMode !== undefined ? { systemPromptMode: args.systemPromptMode } : {}),
   };
-  const sessions = new SessionMap({ projectId: args.projectId, baseDir: args.workspace, logger });
+  const sessions = new SessionMap({
+    projectId: args.projectId,
+    baseDir: args.workspace,
+    logger,
+    // 保留边界透传（v0.8.9 · M5）：未配 ⇒ undefined ⇒ SessionMap 落自身缺省（7d / 500 条）。
+    ...(args.sessionRetentionDays !== undefined ? { retentionDays: args.sessionRetentionDays } : {}),
+    ...(args.sessionRetentionMax !== undefined ? { retentionMax: args.sessionRetentionMax } : {}),
+  });
   const runner = new AcpSessionRunner({
     client,
     cwd: args.workspace,

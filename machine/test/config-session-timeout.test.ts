@@ -2,7 +2,8 @@
  * `machine/config.ts` 加载期 `agentConfig.sessionTimeoutMs` 上限护栏
  * （REQ-v0.8.7-2026-09-22-01 · M2）。
  *
- * 判据：上限单一源 = `launcher/agent-config.ts` 的 `SESSION_TIMEOUT_MS_CAP`（= 900_000，15 min）；
+ * 判据：上限单一源 = `launcher/agent-config.ts` 的 `SESSION_TIMEOUT_MS_CAP`（= 600_000，10 min，
+ * v0.8.9 需求2 起；收严理由 = 最坏总框 1500s 恒 < orch 孤儿墙钟 1800s）；
  * `parseProject` 对**已写的**该键 fail-fast（非正整数 / 非整数 / 超上限 ⇒ 抛），未写 ⇒ 正常通过
  * （缺省由桥落 `DEFAULT_SESSION_TIMEOUT_MS`）。桥侧只宽松校验「整数 > 0」，**不重复定义上限**。
  *
@@ -38,8 +39,8 @@ function withAgentConfig(agentConfig: unknown, run: (path: string) => void): voi
   }
 }
 
-test("config：sessionTimeoutMs 上限常量 = 900000（15 min，成对常量口径见常量注释）", () => {
-  assert.equal(SESSION_TIMEOUT_MS_CAP, 900_000);
+test("config：sessionTimeoutMs 上限常量 = 600000（10 min，v0.8.9 需求2 · M1 由 15 min 收严；依据见常量注释）", () => {
+  assert.equal(SESSION_TIMEOUT_MS_CAP, 600_000);
 });
 
 test("config：未写 sessionTimeoutMs ⇒ 正常加载（缺省由桥落 DEFAULT）", () => {

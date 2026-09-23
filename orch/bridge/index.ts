@@ -102,6 +102,7 @@ import {
   handleFeatureCreate,
   handleFeatureStatus,
   ownershipFailure,
+  projectTaskVisibility,
   type FeatureAdvanceArgs,
   type FeatureAdvanceSuccess,
   type FeatureApproveArgs,
@@ -112,6 +113,7 @@ import {
   type FeatureStatusArgs,
   type FeatureStatusSuccess,
   type FeatureToolFailure,
+  type TaskDiagnosticsView,
 } from "./feature-tools.js";
 import {
   startHttpTransport,
@@ -1172,6 +1174,10 @@ function renderFeatureContext(feature: FeatureRecord): string | null {
 /**
  * 组合节点派发消息：Feature Context + 上游产物输入段（若有）+ 原派发消息。
  * 无任何注入内容时与原消息逐字一致（保证既有行为不变）。
+ *
+ * v0.8.9 O2：`base` 只读**未渲染的原始消息**（`dispatch_message` 经本节点起不再被渲染结果
+ * 回写，恒为干净 base；`?? prompt` 为历史行兜底）⇒ 渲染只发生在本函数返回值，
+ * 由调用方落 `dispatch_rendered` 快照列，反复派发不叠加外壳。
  */
 function buildNodeDispatchMessage(node: TaskRecord, feature: FeatureRecord | null): string {
   const base = node.dispatchMessage ?? node.prompt ?? "";
@@ -1288,8 +1294,10 @@ function registerFeatureNode(
  * 调度器注入的节点派发（v0.7.0 A4：**经队列派发**）。
  *
  * 派发前注入 Feature Context（plan/decisions/contracts）与已完成上游产物（`inputArtifacts`）；
- * 注入后的全文**先落库**（Runner 领取消息取自 `dispatch_message`，故必须刷新），再复用
- * `dispatchTask` **入队**（`queue_state=queued` + `dispatch_guard` 入队幂等占位）。
+ * v0.8.9 O2：注入后的全文**只落 `dispatch_rendered` 渲染快照**（Runner 领取消息取自
+ * `dispatch_rendered ?? dispatch_message`），**绝不回写 `dispatch_message`** —— 后者恒为
+ * 未渲染 base（澄清可追加、重派可原样重放，外壳永不累积）。落库后复用 `dispatchTask`
+ * **入队**（`queue_state=queued` + `dispatch_guard` 入队幂等占位）。
  * ⚠️ C11 的「先占位后发」原语（`markTaskDispatchStarted` / `markTaskDispatched`）在 pull 模型下
  * **生产零调用**（v0.8.7 已把注释翻正为遗留原语）；`started_at` 的现行写入点 = `claimTask`。
  *
@@ -1306,7 +1314,8 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
   }
   const feature = getFeature(featureId);
   const message = buildNodeDispatchMessage(node, feature);
-  // 刷新节点待派发全文（注入 Feature Context / 上游产物；Runner 领取即用此文本）
+  // v0.8.9 O2：渲染结果只写 `dispatchRendered`（本轮下发快照，Runner 领取即用）；
+  // `dispatchMessage` 原样回写 = 未渲染 base 保持不变（防「反复派发 ⇒ 外壳叠加」）
   createTask({
     taskId: node.taskId,
     projectId: node.projectId,
@@ -1319,7 +1328,8 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
     dependencies: node.dependencies,
     inputArtifacts: node.inputArtifacts,
     remoteTaskId: node.remoteTaskId,
-    dispatchMessage: message,
+    dispatchMessage: node.dispatchMessage,
+    dispatchRendered: message,
   });
 
   const sent = await dispatchTask({
@@ -1365,6 +1375,15 @@ interface TaskStatusSuccess {
   text: string;
   artifacts: ArtifactSummary[];
   updatedAt: string;
+  /**
+   * ② 只读投影（v0.8.9 O3 · 改造文档 §2.3）：与 `a2a_feature_status` 的 tasks 行**同一实现**
+   * （{@link projectTaskVisibility}）—— 体积 / 触达 4 键 + machine diagnostics 透传。
+   */
+  baseChars: number;
+  renderedChars: number;
+  wrappedChars: number;
+  attempts: number;
+  diagnostics: TaskDiagnosticsView;
 }
 
 type TaskStatusOutcome = TaskStatusSuccess | (Failure & { task?: TaskRecord });
@@ -1375,6 +1394,9 @@ type TaskStatusOutcome = TaskStatusSuccess | (Failure & { task?: TaskRecord });
  * pull 模型下任务态由 Runner `/runner/result` 回传经 `upsertTaskResult` 落库，桥侧无远端可查；
  * 任务尚未回传时返回其**当前本地态**（通常 `working`），由宿主按句柄轮询至终态。
  * 仍保留成员前置（非成员任务 ⇒ `project_not_a_member`，零 I/O）。
+ *
+ * v0.8.9 O3：成功分支**additive** 增 ② 只读投影（`baseChars` / `renderedChars` /
+ * `wrappedChars` / `attempts` + `diagnostics` 透传），与 `a2a_feature_status` 的 tasks 行同源。
  */
 async function handleTaskStatus(
   taskId: string,
@@ -1409,6 +1431,8 @@ async function handleTaskStatus(
     text: record.text ?? textFromArchivedArtifacts(record.artifactsJson),
     artifacts: parseArchivedArtifacts(record.artifactsJson),
     updatedAt: record.updatedAt,
+    // ② 投影与 `a2a_feature_status` 同源同值（同一函数、零第二套口径）
+    ...projectTaskVisibility(record),
   };
 }
 

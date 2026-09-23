@@ -314,8 +314,16 @@ export interface TaskCreateInput {
   inputArtifacts?: InputArtifactRef[] | null;
   /** 远端 A2A 任务 id（Feature 节点派发后回填；缺省 null） */
   remoteTaskId?: string | null;
-  /** Feature 排队节点待派发消息全文（v0.3.0；缺省 null） */
+  /**
+   * Feature 排队节点**未渲染 base**（v0.3.0；缺省 null）——v0.8.9 O2 起派发渲染结果
+   * 只落 `dispatchRendered`，本字段恒干净、可原样重放。
+   */
   dispatchMessage?: string | null;
+  /**
+   * 本次派发的渲染快照（v0.8.9 O1，落 `tasks.dispatch_rendered`；缺省 null）。
+   * 写口在 O2 接入（`dispatchFeatureNode` 只写本字段、不回写 `dispatchMessage`）。
+   */
+  dispatchRendered?: string | null;
 }
 
 /** `listTasks` 入参：按项目（可选状态）取最近任务 */
@@ -674,7 +682,7 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
  */
 const TASK_COLUMNS =
   "task_id, project_id, context_id, state, artifacts_json, text, prompt, " +
-  "feature_id, dependencies, input_artifacts, remote_task_id, dispatch_guard, dispatch_message, updated_at, " +
+  "feature_id, dependencies, input_artifacts, remote_task_id, dispatch_guard, dispatch_message, dispatch_rendered, updated_at, " +
   "retry_count, failure_kind, diagnostics_json, " +
   "created_at, started_at, finished_at";
 
@@ -755,6 +763,8 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     // C11 派发占位（非 NULL = 已发出）：老记录 / 独立单任务为 NULL
     dispatchGuard: readNullableString(row, "dispatch_guard"),
     dispatchMessage: readNullableString(row, "dispatch_message"),
+    // v0.8.9 O1：渲染快照列（NULL = 历史行 / 未渲染 ⇒ 读侧走 `?? dispatchMessage` 兜底）
+    dispatchRendered: readNullableString(row, "dispatch_rendered"),
     retryCount: readInteger(row, "retry_count"),
     failureKind: readFailureKind(row),
     // v0.8.8 O3：machine 上报的 diagnostics 宽 JSON 原文（NULL = 未上报 / 存量老行）
@@ -1096,6 +1106,16 @@ export class SessionStore {
     } catch {
       // 列已存在
     }
+    // v0.8.9 O1 迁移（§2 纯丙 · O-①a）：tasks 加 `dispatch_rendered` **渲染快照列** ——
+    // 每次派发实际下发全文（含外壳）的落库副本，与 `dispatch_message`（未渲染 base）分离，
+    // 使「同一 base 反复派发 ⇒ 外壳叠加」可观测、可在 O2 消除。
+    // **只加列、必可空、老行不回填**（NULL ⇒ 读侧 `?? dispatchMessage` 兜底、行为逐字不变）；
+    // 覆盖写、不复用既有列、读侧 `readNullableString`、**只在 ctor try-ALTER**。
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN dispatch_rendered TEXT");
+    } catch {
+      // 列已存在
+    }
     // v0.4.0 迁移：features 加 Feature Context 列（context_id / plan / decisions / contracts）
     for (const column of ["context_id TEXT", "plan TEXT", "decisions TEXT", "contracts TEXT"]) {
       try {
@@ -1279,9 +1299,9 @@ export class SessionStore {
       .prepare(
         `INSERT INTO tasks
            (task_id, project_id, context_id, state, artifacts_json, text, prompt,
-            feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, updated_at,
+            feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, dispatch_rendered, updated_at,
             created_at, started_at, finished_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(task_id) DO UPDATE SET
            project_id = excluded.project_id,
            context_id = excluded.context_id,
@@ -1294,6 +1314,7 @@ export class SessionStore {
            input_artifacts = excluded.input_artifacts,
            remote_task_id = excluded.remote_task_id,
            dispatch_message = excluded.dispatch_message,
+           dispatch_rendered = excluded.dispatch_rendered,
            updated_at = excluded.updated_at,
            started_at = COALESCE(started_at, excluded.started_at),
            finished_at = COALESCE(excluded.finished_at, finished_at)`,
@@ -1311,6 +1332,7 @@ export class SessionStore {
         inputArtifacts,
         rec.remoteTaskId ?? null,
         rec.dispatchMessage ?? null,
+        rec.dispatchRendered ?? null,
         updatedAt,
         createdAt,
         startedAt,

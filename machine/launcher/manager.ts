@@ -454,6 +454,10 @@ export class AgentManager {
     console.log(
       `[launcher] agent ${project.projectId} endpoint=${snapshot.endpoint}，model=${snapshot.model}`,
     );
+    // 保留边界快照播报（v0.8.9 · M5）：orch 经 launcher.log 可见该机各项目的 SessionMap 保留策略。
+    console.log(`[launcher] agent ${project.projectId} ${snapshot.sessionRetention}`);
+    // 会话窗 / 续跑余量快照播报（v0.8.9 需求2 · M3）：两键生效值与出处，「开没开续跑」进日志。
+    console.log(`[launcher] agent ${project.projectId} ${snapshot.sessionWindow}`);
     // 后端入口分层解析结果（改造文档 §2.3 · B4）：命中报来源层，失败报逐层清单；
     // 清单入日志、不进 Error message（适配器抛错文案只留摘要 +「详见 launcher.log [backend] 行」）。
     console.log(`[backend] ${snapshot.backend}`);

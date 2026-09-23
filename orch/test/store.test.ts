@@ -1330,3 +1330,85 @@ test("owner_group 列幂等迁移：老库（无该列）以新代码打开后�
     cleanupDb(dbPath);
   }
 });
+
+// ---------------------------------------------------------------------------
+// v0.8.9 O1 · O-①a：tasks.dispatch_rendered 渲染快照列（加列 + 读写贯通）
+// ---------------------------------------------------------------------------
+
+test("v0.8.9 O1：dispatch_rendered 可写可读、不写为 NULL、领取路径同列可读（含老库幂等补列）", () => {
+  const dbPath = join(
+    tmpdir(),
+    `orch-dispatch-rendered-${process.pid}-${Math.random().toString(36).slice(2)}.sqlite`,
+  );
+  try {
+    // 造「无 dispatch_rendered 列」的老库（模拟 v0.8.8 及以前的库）⇒ 新代码打开自动补列
+    const legacy = openStoreDatabase(dbPath);
+    legacy.exec(
+      `CREATE TABLE tasks (
+         task_id        TEXT PRIMARY KEY,
+         project_id     TEXT NOT NULL,
+         context_id     TEXT NOT NULL,
+         state          TEXT NOT NULL,
+         artifacts_json TEXT,
+         text           TEXT,
+         prompt         TEXT,
+         updated_at     TEXT NOT NULL
+       )`,
+    );
+    legacy.close();
+
+    const store = new SessionStore(dbPath);
+    try {
+      // 写入 ⇒ 读回（getTask 走 `TASK_COLUMNS` + `rowToTask`）
+      store.createTask({
+        taskId: "dr-1",
+        projectId: "p1",
+        contextId: "c1",
+        state: "working",
+        dispatchMessage: "base 原文",
+        dispatchRendered: "<feature-context>…</feature-context>\nbase 原文",
+      });
+      const written = store.getTask("dr-1");
+      assert.equal(
+        written?.dispatchRendered,
+        "<feature-context>…</feature-context>\nbase 原文",
+        "写入后须原样读回（不是布尔、不是摘要）",
+      );
+      assert.equal(written?.dispatchMessage, "base 原文", "base 列不受渲染快照影响");
+
+      // 不写 ⇒ NULL（历史行 / 独立单任务口径 ⇒ 领取侧 `?? dispatchMessage` 兜底的依据）
+      store.createTask({ taskId: "dr-2", projectId: "p1", contextId: "c2", state: "working" });
+      assert.equal(store.getTask("dr-2")?.dispatchRendered, null, "缺省不写 ⇒ NULL");
+
+      // 领取路径（claimTask 的 SELECT 列表）必须含新列：漏改即白改
+      store.enqueueTask("dr-1");
+      const claimed = store.claimTask({ claimedBy: "m1" });
+      assert.equal(claimed?.taskId, "dr-1");
+      assert.equal(
+        claimed?.dispatchRendered,
+        "<feature-context>…</feature-context>\nbase 原文",
+        "claimTask 返回的 QueuedTaskRecord 须带 dispatch_rendered",
+      );
+
+      // upsert（ON CONFLICT）覆盖写：同 task 二次登记携新快照 ⇒ 取新值
+      store.createTask({
+        taskId: "dr-1",
+        projectId: "p1",
+        contextId: "c1",
+        state: "working",
+        dispatchMessage: "base 原文",
+        dispatchRendered: "第二次渲染快照",
+      });
+      assert.equal(store.getTask("dr-1")?.dispatchRendered, "第二次渲染快照", "快照覆盖写");
+    } finally {
+      store.close();
+    }
+
+    // 幂等：列已存在时再开一次不抛（ctor try-ALTER 命中 catch）
+    const again = new SessionStore(dbPath);
+    assert.equal(again.getTask("dr-1")?.dispatchRendered, "第二次渲染快照");
+    again.close();
+  } finally {
+    cleanupDb(dbPath);
+  }
+});

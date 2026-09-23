@@ -272,8 +272,9 @@ export interface ProjectGroup {
  * - `orphanTimeoutMs`：**孤儿墙钟判死阈值**（v0.8.7 O2；缺省 `1800000` = 30 min）。
  *   判据 `queue_state ∈ {claimed, running} ∧ claimed_at < now - orphanTimeoutMs` ⇒
  *   `sweepOrphanedTasks()` 置 `failed`（`failure_kind='runner'` = 不可续跑的载体侧事实）+ `task.orphaned` 事件。
- *   ⚠️ 跨单元不变量（写死）：`orphanTimeoutMs > dispatchTimeoutMs`（machine 侧有 ≤15 min
- *   上限护栏 + 300s margin ⇒ 恒 ≥1.5× 余量）；orch **不读 machine 配置**。
+ *   ⚠️ 跨单元不变量（写死）：`orphanTimeoutMs`（缺省 1800s）> machine 最坏总框
+ *   （= 窗上限 600s + 结构余量 300s + `min(续跑余量, 窗)` ≤ 600s ⇒ 1500s），边际 300s；
+ *   orch **不读 machine 配置**。
  */
 export interface RunnerConfig {
   holdMs: number;
@@ -420,8 +421,24 @@ export interface TaskRecord {
    * 回填**不清**（「已发出」是既成事实）。老记录 / 独立单任务为 NULL。
    */
   dispatchGuard: string | null;
-  /** Feature 排队节点的待派发消息全文；派发后保留（作为可重派依据） */
+  /**
+   * Feature 排队节点的**未渲染 base**（原始消息 + 历次澄清追加）。
+   * v0.8.9 O2 起派发渲染结果**不再回写本列**（只落 `dispatchRendered` 快照），
+   * 本列恒干净可重放；派发后保留（作为可重派依据）。
+   */
   dispatchMessage: string | null;
+  /**
+   * **本次派发的渲染快照**（v0.8.9 O1 加列，落 `tasks.dispatch_rendered`；**覆盖写**）。
+   *
+   * 与 `dispatchMessage` 的分工（改造文档 §2 纯丙）：`dispatch_message` = **未渲染的 base**
+   * （原始消息 + 历次澄清追加，唯一事实源、不再被渲染结果回写污染）；`dispatch_rendered` =
+   * **每轮派发实际下发的全文**（含 `<feature-context>` 等外壳）。二者分离后「同一 base 反复
+   * 派发 ⇒ 外壳层层叠加」才可观测、可消除。
+   *
+   * **本列由 O2 接上写口**（`dispatchFeatureNode` 渲染结果只写本列、永不回写 base）；
+   * NULL = 历史行 / 未渲染 ⇒ 领取侧走 `?? dispatchMessage` 兜底，行为与 v0.8.8 逐字一致。
+   */
+  dispatchRendered?: string | null;
   /**
    * **重派代次**（v0.4.1 的「条件重试已用次数」；**v0.6.1 REQ-05 起门禁语义删除、降级为记账**）。
    *

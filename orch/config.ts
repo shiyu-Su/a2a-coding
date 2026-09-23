@@ -221,7 +221,7 @@ function asPositiveMs(v: unknown, ctx: string): number {
  */
 const DEFAULT_RUNNER_HOLD_MS = 25000;
 const DEFAULT_RUNNER_HEARTBEAT_TIMEOUT_MS = 60000;
-/** v0.8.7 O2：孤儿墙钟判死缺省 30 min（恒 > machine 侧 dispatchTimeoutMs 上界 20 min，见 `types.ts#RunnerConfig`） */
+/** v0.8.7 O2：孤儿墙钟判死缺省 30 min（恒 > 机器侧最坏总框上界 25 min（1500s）= 窗上限 600s + 结构余量 300s + min(续跑余量, 窗) ≤ 600s，见 `types.ts#RunnerConfig`） */
 const DEFAULT_RUNNER_ORPHAN_TIMEOUT_MS = 1_800_000;
 
 /** `runner` 段缺省构造（段缺失 / 空段时使用） */

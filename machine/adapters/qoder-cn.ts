@@ -12,6 +12,7 @@
  *     --backend-cmd <归一后的命令> --backend-args <归一后的参数>   // 脚本形态 ⇒ node + 脚本路径；.exe ⇒ 直调
  *     [--model <agentConfig.model>]
  *     [--session-timeout <agentConfig.sessionTimeoutMs>]
+ *     [--session-retention-days <agentConfig.sessionRetentionDays>] [--session-retention-max <agentConfig.sessionRetentionMax>]
  *     [--system-prompt <agentConfig.systemPrompt> [--system-prompt-mode <append|replace>]]
  *     --risk <read|write|full>`
  *
@@ -44,6 +45,8 @@ import type {
 import { appRootFromModule } from "../launcher/app-root.js";
 import {
   resolveAcpModel,
+  resolveSessionRetentionDays,
+  resolveSessionRetentionMax,
   resolveSessionTimeoutMs,
   resolveSystemPrompt,
   resolveSystemPromptMode,
@@ -75,6 +78,8 @@ export class QoderCnAdapter implements Adapter {
     );
     const model = resolveAcpModel(request.agentConfig);
     const sessionTimeoutMs = resolveSessionTimeoutMs(request.agentConfig);
+    const sessionRetentionDays = resolveSessionRetentionDays(request.agentConfig);
+    const sessionRetentionMax = resolveSessionRetentionMax(request.agentConfig);
     const systemPrompt = resolveSystemPrompt(request.agentConfig);
     const systemPromptMode = resolveSystemPromptMode(request.agentConfig);
     // 后端启动形态归一（与三家同构）：qoder 真身是 `.exe` / 无扩展名 ⇒ 恒等（直调 + `--acp`），
@@ -101,6 +106,9 @@ export class QoderCnAdapter implements Adapter {
       ...(model !== undefined ? ["--model", model] : []),
       // 会话超时透传（REQ-v0.8.7 M2）：平铺 sessionTimeoutMs ⇒ `--session-timeout <ms>`；未配 ⇒ 桥落缺省。
       ...(sessionTimeoutMs !== undefined ? ["--session-timeout", String(sessionTimeoutMs)] : []),
+      // 保留边界透传（v0.8.9 · M5）：平铺两键 ⇒ 桥 `--session-retention-days/-max <n>`；未配 ⇒ 桥落缺省（7d/500）。
+      ...(sessionRetentionDays !== undefined ? ["--session-retention-days", String(sessionRetentionDays)] : []),
+      ...(sessionRetentionMax !== undefined ? ["--session-retention-max", String(sessionRetentionMax)] : []),
       // 自定义注入（v0.8.5 · M4）：段与配置通道退役 ⇒ 走平铺键 + 桥 flag。
       ...(systemPrompt !== undefined ? ["--system-prompt", systemPrompt] : []),
       ...(systemPromptMode !== undefined ? ["--system-prompt-mode", systemPromptMode] : []),

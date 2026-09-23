@@ -384,6 +384,8 @@ test("成员拒绝：非成员项目不 claim（心跳）；显式请求非成�
   assert.equal(command.command, "dispatch");
   assert.equal(command.taskId, "t-in");
   assert.equal(command.projectId, "p-in");
+  // v0.8.9 O2 兜底：种子行未写 `dispatch_rendered`（NULL）⇒ 领取文本 = `dispatch_message`，与改前逐字一致
+  assert.equal(command.message, "claim me", "rendered=NULL ⇒ 领取文本走 dispatch_message 兜底");
 
   // 非白名单机器的 connect 亦 403 runner_not_allowed
   const ghost = await post(h.port, RUNNER_CONNECT_PATH, { machineId: "m-ghost2" }, "tok-member");

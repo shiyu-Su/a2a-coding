@@ -19,6 +19,10 @@
  *
  * 另含 **trace 只读投影**（v0.8.8 §2.10(c)，非 MCP 工具）：`handleFeatureTrace` 回答
  * 「这个 Feature 为什么还没完成」（在等谁 / 排队位次），纯读不落库，供工作台端点复用。
+ *
+ * 另含 **② 可见面只读投影**（v0.8.9 §2.3，非 MCP 工具）：`projectTaskVisibility` =
+ * 「派发包裹体积 + 触达次数 + machine diagnostics 透传」的**唯一实现**，
+ * 由 `summarizeTask`（`a2a_feature_status`）与 `handleTaskStatus`（`a2a_task_status`）共用。
  */
 import { randomUUID } from "node:crypto";
 import {
@@ -105,6 +109,148 @@ export interface FeatureTaskSummary {
    * **不得**据此判断「重试是否用尽（N=1 门槛已随条件重试删除）」或「是否已重试过」。
    */
   retryCount: number;
+  /** ② 体积 / 触达 / machine 事实只读投影（v0.8.9 O3；见 {@link projectTaskVisibility}） */
+  baseChars: number;
+  renderedChars: number;
+  wrappedChars: number;
+  attempts: number;
+  diagnostics: TaskDiagnosticsView;
+}
+
+/**
+ * ② 可见面里**从 machine 透传**的那一半（改造文档 §2.3 键表；**逐键原样、不合并、不改写**）。
+ *
+ * **缺键 = machine 没报**，与本视图「报了 0」**严格可区分**（⇒ 本接口全部字段可选，
+ * 未命中类型的键**省略**，不得补 `0` / `false` —— 补值就是把「未知」谎报成「没有」，
+ * 同 `store.ts` 的 `continuedEventPayload` 口径）。
+ *
+ * `turn` 是**轮次唯一主口径**且**只从 diagnostics 取**：orch **不得**用「同 `contextId`
+ * 任务条数」反推（首轮超时未置 `prompted` ⇒ 计数会 +1，§1 表第 6 条已实测否证）。
+ */
+export interface TaskDiagnosticsView {
+  /** 该 `contextId` 的第几轮（桥内单调；**透传**，orch 不计算） */
+  turn?: number;
+  /** 会话映射命中（与 `sessionResumed` **不等价**） */
+  sessionReused?: boolean;
+  /** `load|resume` 真成功 */
+  sessionResumed?: boolean;
+  /** 本轮实际写出 `session/prompt` 的字符数 */
+  promptChars?: number;
+  /** 其中注入部分（首轮 > 0、次轮应恒 0 —— ①-b 的机器可判定证据） */
+  injectedChars?: number;
+  /** 本轮累积字符（成功轮也报） */
+  resultChars?: number;
+  /** 失败轮的已捕获字符量。与 `resultChars` **各自原样保留**：择一只发生在呈现层 */
+  partialChars?: number;
+  /** 本轮结构有效 outcome 块数 */
+  blockCount?: number;
+  /** 末块位置 */
+  lastBlockIndex?: number;
+  /** 被过滤掉的历史重放 chunk 条数 */
+  replayDropped?: number;
+  /** outcome 不确定标志（machine 侧 false 时不报该键） */
+  outcomeAmbiguous?: boolean;
+  /** 不确定原因（闭集：`multi-block` / `replay-leak` / `cross-turn-message-id`，续跑轮带 `continue-` 前缀） */
+  ambiguousReason?: string;
+  /** **machine 自报**的续跑轮数 —— `attempts` 的加数之一，随投影带出使 `attempts` 可核算 */
+  continueAttempts?: number;
+  /** 桥内会话映射规模（该桥首个任务时搭车带出，v0.8.9 · ④ 可见面） */
+  sessionMapSize?: number;
+  /** 会话映射最老条目年龄（天）；**空映射时 machine 不报该键** ⇒ 缺键 ≠ 0 */
+  sessionMapOldestAgeDays?: number;
+}
+
+/** {@link projectTaskVisibility} 的输入：只读投影所需的四个列（其余字段不消费） */
+export type TaskVisibilitySource = Pick<
+  TaskRecord,
+  "dispatchMessage" | "dispatchRendered" | "retryCount" | "diagnosticsJson"
+>;
+
+/**
+ * ② 的 **orch 侧只读投影**（改造文档 §2.3「orch 侧（投影，只增出参字段、零写口）」）。
+ *
+ * 两个出口共用本函数（`summarizeTask` = `a2a_feature_status` 的 tasks 行 /
+ * `handleTaskStatus` = `a2a_task_status`），**投影口径只有一处实现**。
+ *
+ * - `baseChars` = `dispatch_message`（未渲染 base）字符数；**NULL ⇒ 0**（独立单任务无 base 可测）；
+ * - `renderedChars` = `dispatch_rendered`（本轮实际下发快照）字符数；
+ *   **NULL ⇒ 回退显示 `baseChars`**（领取侧 `?? dispatch_message` 兜底 ⇒ 下发的就是 base）；
+ * - `wrappedChars` = `renderedChars − baseChars` = 本次派发加出去的外壳体积
+ *   （**①-a「去重可证」指标**：修复后应恒等于一层壳、**不随派发次数增长**）；
+ * - `attempts` = `retry_count`（宿主重派）+ `diagnostics.continueAttempts`（machine 续跑）
+ *   = 本节点被**触达**的总次数。**刻意不叫 `turn`**：`turn` 是 machine 的 ACP 轮次事实，
+ *   二者口径不同、并存异名（§1 表第 6 条 / §3.3 防撞名）。
+ *
+ * 计长口径 = `String#length`（UTF-16 code unit），与 machine 侧 `promptChars` 等体积键一致。
+ */
+export function projectTaskVisibility(rec: TaskVisibilitySource): {
+  baseChars: number;
+  renderedChars: number;
+  wrappedChars: number;
+  attempts: number;
+  diagnostics: TaskDiagnosticsView;
+} {
+  const baseChars = rec.dispatchMessage?.length ?? 0;
+  const renderedChars = rec.dispatchRendered?.length ?? baseChars;
+  const diagnostics = projectDiagnostics(rec.diagnosticsJson ?? null);
+  return {
+    baseChars,
+    renderedChars,
+    wrappedChars: renderedChars - baseChars,
+    attempts: (rec.retryCount ?? 0) + (diagnostics.continueAttempts ?? 0),
+    diagnostics,
+  };
+}
+
+const DIAG_NUMBER_KEYS = [
+  "turn",
+  "promptChars",
+  "injectedChars",
+  "resultChars",
+  "partialChars",
+  "blockCount",
+  "lastBlockIndex",
+  "replayDropped",
+  "continueAttempts",
+  "sessionMapSize",
+  "sessionMapOldestAgeDays",
+] as const;
+
+const DIAG_STRING_KEYS = ["ambiguousReason"] as const;
+const DIAG_BOOLEAN_KEYS = ["sessionReused", "sessionResumed", "outcomeAmbiguous"] as const;
+
+/** `diagnostics_json` 原文 → ② 透传视图（NULL / 非法 JSON / 非对象 ⇒ 空视图，不报错） */
+function projectDiagnostics(diagnosticsJson: string | null): TaskDiagnosticsView {
+  const view: TaskDiagnosticsView = {};
+  const obj = parseDiagnosticsObject(diagnosticsJson);
+  if (obj === null) return view;
+  // 宽容读取：类型不符（脏值）等同「没报」⇒ 省略该键（同 `store.ts` 的 `diag*` 三件套）
+  for (const key of DIAG_NUMBER_KEYS) {
+    const v = obj[key];
+    if (typeof v === "number" && Number.isFinite(v) && v >= 0) view[key] = v;
+  }
+  for (const key of DIAG_STRING_KEYS) {
+    const v = obj[key];
+    if (typeof v === "string" && v.length > 0) view[key] = v;
+  }
+  for (const key of DIAG_BOOLEAN_KEYS) {
+    const v = obj[key];
+    if (typeof v === "boolean") view[key] = v;
+  }
+  return view;
+}
+
+/** 落库宽 JSON 的读侧解析（只读；非法形状 ⇒ `null`） */
+function parseDiagnosticsObject(diagnosticsJson: string | null): Record<string, unknown> | null {
+  if (diagnosticsJson === null) return null;
+  try {
+    const parsed: unknown = JSON.parse(diagnosticsJson);
+    return typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)
+      ? (parsed as Record<string, unknown>)
+      : null;
+  } catch {
+    return null;
+  }
 }
 
 function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
@@ -120,6 +266,8 @@ function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
     // 缺失 / 未设时给 `null` / `0`：**不得省略字段、不得 `undefined`**（老记录 / 部分对象也要有确定值）
     failureKind: rec.failureKind ?? null,
     retryCount: rec.retryCount ?? 0,
+    // ② 只读投影（v0.8.9 O3）：派生 4 键恒有值，`diagnostics` 内 machine 键**没报即省略**
+    ...projectTaskVisibility(rec),
   };
 }
 

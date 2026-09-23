@@ -15,8 +15,9 @@
  *
  * v0.8.7 · 节点 M3（REQ-v0.8.7-2026-09-22-01）本模块承担三件：
  * - **按项目 deadline**：等待预算由项目平铺 `agentConfig.sessionTimeoutMs` 派生
- *   （{@link dispatchBudgetMs}，恒 `dispatch = session + margin`）—— 防「只配桥侧会话窗、
- *   launcher 仍按 660s 掐断」的静默无效；
+ *   （{@link dispatchBudgetMs}，v0.8.9 需求2 起为三段公式
+ *   `总框 = 生效窗 + 结构余量(DISPATCH_MARGIN_MS) + min(续跑余量, 生效窗)`）——
+ *   防「只配桥侧会话窗、launcher 掐断预算与窗不匹配」的静默无效；
  * - **机器可读失败字段**：{@link RunnerTaskResult.failureKind}（{@link classifyFailure} 判定，
  *   launcher 是唯一同时看得见 `ensure` / transport / 自有超时的位置）+ `diagnostics`
  *   （桥内细分经现成 `artifacts` 通道上带，见下）；
@@ -64,21 +65,22 @@ import {
   type A2ATaskView,
 } from "./a2a-client.js";
 import { agentEndpoint } from "./manager.js";
-import { resolveSessionTimeoutMs } from "./agent-config.js";
+import { effectiveSessionTimeoutMs, resolveContinueMarginMs } from "./agent-config.js";
 import { errorMessage } from "./process.js";
 import type { InFlightEntry, InFlightLedger, RunnerLogger } from "./runner.js";
 
 /**
- * 单任务派发等待上限**缺省值**（660s = 桥缺省会话窗 600s + 60s）：
- * **仅**用于项目**未配** `agentConfig.sessionTimeoutMs` 时（行为与 v0.8.6 一致，零回归）。
- * 配了 ⇒ 走 {@link dispatchBudgetMs} 按项目派生。
+ * 自动续跑的**缺省余量**（v0.8.9 需求2 · M1）：`0` = 不续跑。
+ * 项目不显式配 `agentConfig.continueMarginMs` ⇒ 派发预算只有「生效窗 + 结构余量」，
+ * 续跑闸门拿不到任何余量可消费 ⇒ 天然不触发（**资格与"是否显式配窗"解耦**）。
  */
-export const DEFAULT_DISPATCH_TIMEOUT_MS = 660_000;
+export const DEFAULT_CONTINUE_MARGIN_MS = 0;
 
 /**
- * 派发预算在桥会话窗之上的**余量**（v0.8.7 · M3）：5 min。
- * 取值理由见改造文档 §1.1 #7：非 prompt 段每步各享一个桥缺省超时（最坏 ≈ 6×600s），
- * 原 660s = 600+60 属侥幸；上限 15 min + 300 s ⇒ 最坏 20 min，仍在 orch 墙钟 30 min 之下。
+ * 派发预算中**非 prompt 段**的结构余量（v0.8.7 · M3）：5 min。
+ * 覆盖会话建立 / 停止 / 取消等 prompt 之外的往返（每步各享一个桥缺省超时，最坏 ≈ 6×）。
+ * v0.8.9 需求2 起语义**收窄**为此一项：续跑余量另立 `continueMarginMs` 键，
+ * 本常量不再兼任「续跑入场券」。
  */
 export const DISPATCH_MARGIN_MS = 300_000;
 
@@ -171,6 +173,13 @@ export interface ContinueGateSignals {
   updateCount: number;
   /** `deadline - now`（**不延长**，续跑只消费剩余预算） */
   remainingMs: number;
+  /**
+   * 本次派发的**续跑额度** `em = min(continueMarginMs, 生效窗)`（= {@link dispatchBudgetMs} 第三段）。
+   * **准入条件**：`em > 0` 才有续跑资格（缺省 0 = 关闭 ⇒ 自然不续跑）；同时作为
+   * {@link CONTINUE_MIN_REMAINING_MS} 地板的**取大者**（防御不走公式的派发框）。
+   * 调用方缺报 ⇒ 0（保守向：不续跑）。
+   */
+  effectiveMarginMs?: number;
 }
 
 /**
@@ -180,11 +189,13 @@ export interface ContinueGateSignals {
  */
 export function canContinueNow(s: ContinueGateSignals): boolean {
   const used = Math.max(s.continueAttempts, s.reportedContinueAttempts ?? 0);
+  const em = s.effectiveMarginMs ?? 0;
   return (
+    em > 0 &&
     used < MAX_CONTINUE_ATTEMPTS &&
     s.roundsSinceStart < MAX_DISPATCH_ROUNDS &&
     (s.partialChars >= CONTINUE_MIN_PARTIAL_CHARS || s.updateCount >= CONTINUE_MIN_UPDATE_COUNT) &&
-    s.remainingMs >= CONTINUE_MIN_REMAINING_MS
+    s.remainingMs >= Math.max(CONTINUE_MIN_REMAINING_MS, em)
   );
 }
 
@@ -202,7 +213,7 @@ export interface ContinueOutcomeSignals {
 /**
  * **续跑总闸**（M3 · 改造文档 §2.4 完整表达式）：
  * `state=failed` ∧ `failureKind="timeout"` ∧ `timeoutScope="acp-prompt"` ∧
- * {@link canContinueNow}（续跑计数 / 轮数 / 产出门槛 / 剩余预算）。
+ * {@link canContinueNow}（**额度准入 `em > 0`** / 续跑计数 / 轮数 / 产出门槛 / 剩余预算）。
  * `timeoutScope` 条件**不得放宽** —— `runner-deadline` 无任何产出证据、后端那一轮可能仍在跑，
  * 续跑会与其交织（v0.8.7 M5 同一边界）。续跑轮再满窗 ⇒ 本地计数 + 桥自报 + 轮数三重排除，不递归。
  */
@@ -219,6 +230,7 @@ export function shouldContinueOn(
     partialChars: sig.partialChars ?? 0,
     updateCount: sig.updateCount ?? 0,
     remainingMs: gate.remainingMs,
+    effectiveMarginMs: gate.effectiveMarginMs,
   });
 }
 
@@ -351,7 +363,8 @@ export const RECONCILE_FAILURE_KIND: RunnerFailureKind = "runner";
 export type RunnerFailureStage = "ensure" | "send" | "poll" | "wait";
 
 /**
- * 结果诊断（v0.8.7 · M3 起 + v0.8.8 · M2 计量补键，改造文档 §2.5 十三键）：
+ * 结果诊断（v0.8.7 · M3 起 + v0.8.8 · M2 计量补键，改造文档 §2.5 十三键；v0.8.9 · M4 再加
+ * 会话层 11 键，见下方分节）：
  * launcher 自有事实（`elapsedMs` / `stage` / `timeoutScope` / 工作树指纹）+ 桥内事实
  * （`acpErrorKind(+Code/+Data)` / `chunkCount` / 各计量键，经 `machine-diagnostics`
  * artifact 上带；桥未带 ⇒ 键缺省）。桥键的透传白名单见 {@link parseBridgeDiagnostics}
@@ -404,6 +417,29 @@ export interface RunnerTaskDiagnostics {
    * `diagnostics`，**不落库**（不写 Feature 的 `retry_count`）。
    */
   attempts?: number;
+  // ---------- v0.8.9 · M4：M2 会话层键上带 orch（键名与 {@link BridgeDiagnostics} 同形）----------
+  /** 本轮轮次序号（桥内按 contextId 单调） */
+  turn?: number;
+  /** **映射命中**（有旧 sessionId 可接）；与 `sessionResumed`=「续接真成功」分家 */
+  sessionReused?: boolean;
+  /** 本轮写出的 prompt 全长 */
+  promptChars?: number;
+  /** 其中注入部分的长度（首轮 >0、次轮恒 0） */
+  injectedChars?: number;
+  /** 本轮结果文本长度（**成功轮也报**，与只作续跑判据的 `partialChars` 同值不同用途） */
+  resultChars?: number;
+  /** 本轮**结构有效**的 outcome 块数 */
+  blockCount?: number;
+  /** 本轮被丢弃的跨轮重放 chunk 数 */
+  replayDropped?: number;
+  /** outcome 不确定标志（true 才报；本侧 `business` 守卫据此退回账面 state） */
+  outcomeAmbiguous?: boolean;
+  /** 不确定诱因（闭集，见 {@link BridgeDiagnostics.ambiguousReason}） */
+  ambiguousReason?: string;
+  /** 桥启动加载到的 sessionMap 条数（只随桥的首个任务一次） */
+  sessionMapSize?: number;
+  /** 其中最旧条目的年龄（天，向下取整） */
+  sessionMapOldestAgeDays?: number;
 }
 
 /** 任务结果（M4 落盘 `.a2a/outbox/<taskId>.json` 的载荷形状） */
@@ -574,17 +610,20 @@ export function mapTaskState(state: string, timedOut: boolean): RunnerTaskState 
 }
 
 /**
- * 派发等待预算 = **桥会话窗 + 余量**（v0.8.7 · M3 成对联动，改造文档 §2.6）。
+ * 派发等待预算（v0.8.9 需求2 · M1 三段式，改造文档 §2.6）：
  *
- * `sessionTimeoutMs` = 项目平铺 `agentConfig.sessionTimeoutMs`（与 adapter 下发给桥的
- * `--session-timeout` **同一个值**）⇒ 桥窗一改，launcher 的 deadline **同值派生**，
- * 不存在「只配桥侧、launcher 仍按 660s 掐断」的静默无效。
- * 未配 ⇒ {@link DEFAULT_DISPATCH_TIMEOUT_MS}（桥落自身缺省 600s，行为同 v0.8.6）。
+ * `总框 = 生效窗 + 结构余量(DISPATCH_MARGIN_MS) + min(续跑余量, 生效窗)`
+ *
+ * - `effectiveWindowMs` = 项目**生效**会话窗（显式 `sessionTimeoutMs` ?? 桥缺省），
+ *   与 adapter 下发给桥的 `--session-timeout` **同一个值** ⇒ 桥窗一改，launcher 的 deadline
+ *   **同值派生**，不存在「只配桥侧、launcher 仍按缺省掐断」的静默无效；
+ * - `effectiveMarginMs` = `agentConfig.continueMarginMs`（缺省 {@link DEFAULT_CONTINUE_MARGIN_MS}
+ *   = 0 ⇒ 不追加，行为与不续跑一致）；
+ * - 续跑余量**按窗封顶**（`min`）：余量比窗还大无意义（续跑跑不完第二轮），封顶后最坏总框
+ *   可控（见 `SESSION_TIMEOUT_MS_CAP` 注释：1500s < orch 孤儿墙钟 30 min ⇒ 免组合校验）。
  */
-export function dispatchBudgetMs(sessionTimeoutMs: number | undefined): number {
-  return sessionTimeoutMs === undefined
-    ? DEFAULT_DISPATCH_TIMEOUT_MS
-    : sessionTimeoutMs + DISPATCH_MARGIN_MS;
+export function dispatchBudgetMs(effectiveWindowMs: number, effectiveMarginMs: number): number {
+  return effectiveWindowMs + DISPATCH_MARGIN_MS + Math.min(effectiveMarginMs, effectiveWindowMs);
 }
 
 /** {@link classifyFailure} 的输入信号（全部是 launcher 看得见的事实，不猜自由文本） */
@@ -677,6 +716,32 @@ export interface BridgeDiagnostics {
    * launcher 消费后**不上带 orch**，回传 schema 只有长度键 `partialTailChars`，见 §2.4/§2.5）
    */
   partialTail?: string;
+  // ---------- v0.8.9 · M4：放行 M2 会话层键（桥已写、白名单不放行 = 取证链断在机内）----------
+  /** 本轮轮次序号（桥内按 contextId 单调） */
+  turn?: number;
+  /** **映射命中**（ctx 在 SessionMap 里有旧 sessionId 可接）；与 `sessionResumed`=「load/resume 真成功」分家 */
+  sessionReused?: boolean;
+  /** 本轮写出的 prompt 全长 */
+  promptChars?: number;
+  /** 其中注入部分的长度（首轮 >0、次轮恒 0 = 注入是否发生的机器可判定证据） */
+  injectedChars?: number;
+  /** 本轮结果文本长度（= `partialChars`，**成功轮也报**） */
+  resultChars?: number;
+  /** 本轮**结构有效**的 outcome 块数（≥2 = multi-block 判据的原料） */
+  blockCount?: number;
+  /** 本轮被丢弃的跨轮重放 chunk 数（replay-leak 判据的原料） */
+  replayDropped?: number;
+  /**
+   * outcome **不确定**标志（桥侧三判据任一命中 ⇒ true；false ⇒ 桥不报该键）。
+   * launcher 只读不改写，且是本侧 `business` 守卫的唯一输入（见 {@link containsFailedOutcomeBlock}）。
+   */
+  outcomeAmbiguous?: boolean;
+  /** 不确定诱因（闭集，事实源 = `acp-bridge/acp/session.ts`；续跑轮带 `continue-` 前缀） */
+  ambiguousReason?: string;
+  /** 桥启动加载到的映射条数（可见面，只随桥的**首个**任务一次） */
+  sessionMapSize?: number;
+  /** 其中最旧条目的年龄（天，向下取整；空映射 ⇒ 桥不报） */
+  sessionMapOldestAgeDays?: number;
 }
 
 function artifactName(artifact: unknown): string | null {
@@ -706,7 +771,8 @@ function strOf(value: unknown): string | undefined {
 }
 
 /**
- * JSON 文本 → 桥 diagnostics（**白名单**，v0.8.8 · M2 与 {@link BridgeDiagnostics} 同步扩）：
+ * JSON 文本 → 桥 diagnostics（**白名单**，v0.8.8 · M2 与 {@link BridgeDiagnostics} 同步扩；
+ * v0.8.9 · M4 放行 M2 会话层键）：
  * 未知键 / 类型不符 ⇒ 相应键丢弃（宽容，不抛）。`acpErrorCode` 是 JSON number ⇒ 有限数即收
  * （JSON-RPC 错误码可为负）；`acpErrorData` 收**原文字符串**（桥侧已 JSON.stringify；
  * 宽容起见对对象/数组值也就地字符串化）。
@@ -753,6 +819,27 @@ function parseBridgeDiagnostics(text: string): BridgeDiagnostics | null {
   if (partialTail !== undefined) out.partialTail = partialTail;
   const partialTailChars = uintOf(o["partialTailChars"]);
   if (partialTailChars !== undefined) out.partialTailChars = partialTailChars;
+  // ---- v0.8.9 · M4：放行 M2 会话层键（口径同上：类型不符 ⇒ 丢键，不抛）----
+  const turn = uintOf(o["turn"]);
+  if (turn !== undefined) out.turn = turn;
+  if (typeof o["sessionReused"] === "boolean") out.sessionReused = o["sessionReused"];
+  const promptChars = uintOf(o["promptChars"]);
+  if (promptChars !== undefined) out.promptChars = promptChars;
+  const injectedChars = uintOf(o["injectedChars"]);
+  if (injectedChars !== undefined) out.injectedChars = injectedChars;
+  const resultChars = uintOf(o["resultChars"]);
+  if (resultChars !== undefined) out.resultChars = resultChars;
+  const blockCount = uintOf(o["blockCount"]);
+  if (blockCount !== undefined) out.blockCount = blockCount;
+  const replayDropped = uintOf(o["replayDropped"]);
+  if (replayDropped !== undefined) out.replayDropped = replayDropped;
+  if (typeof o["outcomeAmbiguous"] === "boolean") out.outcomeAmbiguous = o["outcomeAmbiguous"];
+  const ambiguousReason = strOf(o["ambiguousReason"]);
+  if (ambiguousReason !== undefined) out.ambiguousReason = ambiguousReason;
+  const sessionMapSize = uintOf(o["sessionMapSize"]);
+  if (sessionMapSize !== undefined) out.sessionMapSize = sessionMapSize;
+  const sessionMapOldestAgeDays = uintOf(o["sessionMapOldestAgeDays"]);
+  if (sessionMapOldestAgeDays !== undefined) out.sessionMapOldestAgeDays = sessionMapOldestAgeDays;
   return out;
 }
 
@@ -804,8 +891,18 @@ const OUTCOME_BLOCK_RE = /```a2a-outcome[ \t]*\r?\n([\s\S]*?)\r?\n```/g;
  * 输出是否含**有效的失败结论块**（```` ```a2a-outcome {"state":"failed",...}``` ````）：
  * `business` 判据（PROTOCOL 2.3 = 旧 `"task"` 的直系继承）。与桥 `parseOutcome` 同口径：
  * 多块取**最后一块**；JSON 非法 / 非对象 / 未知 state ⇒ 不算（解析问题不误判为业务失败）。
+ *
+ * **不确定守卫（v0.8.9 · M4）**：桥标 `outcomeAmbiguous` ⇒ **不据此判 business**，退回账面
+ * `state`（kind 判不出 ⇒ 不报键）。理由：命中的块可能是**上一轮**或**跨轮重放**的残块
+ * （multi-block / replay-leak / cross-turn-message-id），据此定的业务结论不可信；而
+ * `business` **不在自动重试闭集**内 —— 误判的代价（任务被冻结等宿主改方案）高于漏判
+ * （宿主按无 kind 的失败照常裁决）。标志只读，launcher 不复算判据。
  */
-export function containsFailedOutcomeBlock(text: string): boolean {
+export function containsFailedOutcomeBlock(
+  text: string,
+  bridge?: Pick<BridgeDiagnostics, "outcomeAmbiguous"> | null,
+): boolean {
+  if (bridge?.outcomeAmbiguous === true) return false;
   let last: string | undefined;
   for (const m of text.matchAll(OUTCOME_BLOCK_RE)) last = m[1];
   if (last === undefined) return false;
@@ -1068,7 +1165,7 @@ export class RunnerCommandExecutor {
    */
   private async executeDispatch(command: DispatchCommand, entry: InFlightEntry): Promise<void> {
     const trace: DispatchTrace = { startedAtMs: this.now().getTime(), stage: "ensure" };
-    const deadline = trace.startedAtMs + this.budgetFor(command.projectId);
+    let deadline = trace.startedAtMs + this.budgetFor(command.projectId);
     const remaining = (): number => deadline - this.now().getTime();
     let attempts = 0;
     let continueAttempts = 0;
@@ -1106,6 +1203,13 @@ export class RunnerCommandExecutor {
           );
         } else {
           continueAttempts += 1;
+          // ★ **额度执法**（v0.8.9 需求2 · M2）：进入续跑轮的 deadline 收紧到 `now + em` ——
+          //   桥只带窗值、不知 em，不收紧则该轮独占 `300s 结构余量 + em`（违反「独立额度」）。
+          //   只**收紧**不延长；同一 `this.now()` 时钟（与上面 deadline 派生同函数）。
+          deadline = Math.min(
+            deadline,
+            this.now().getTime() + this.continueMarginFor(command.projectId),
+          );
           const diag = outcome.result.diagnostics;
           const rawTail = outcome.partialTail ?? "";
           this.logger.warn(
@@ -1169,6 +1273,7 @@ export class RunnerCommandExecutor {
         continueAttempts,
         roundsSinceStart: rounds,
         remainingMs,
+        effectiveMarginMs: this.continueMarginFor(outcome.result.projectId),
       });
       if (!go && rounds >= MAX_DISPATCH_ROUNDS) {
         this.logger.warn(
@@ -1341,13 +1446,34 @@ export class RunnerCommandExecutor {
   }
 
   /**
-   * 本次派发的等待预算：显式覆盖 > 按项目派生（`agentConfig.sessionTimeoutMs` + 余量）。
-   * `getProject` 抛错（未知项目）不在此兜 —— 冒到 `executeDispatch` 的 catch，
-   * 归 `stage="ensure"` 的 runner 失败。
+   * 本次派发的等待预算：显式覆盖 > 按项目派生（生效窗 + 结构余量 + 续跑余量，见
+   * {@link dispatchBudgetMs}）。`getProject` 抛错（未知项目）不在此兜 —— 冒到
+   * `executeDispatch` 的 catch，归 `stage="ensure"` 的 runner 失败。
    */
   private budgetFor(projectId: string): number {
     if (this.dispatchTimeoutOverride !== undefined) return this.dispatchTimeoutOverride;
-    return dispatchBudgetMs(resolveSessionTimeoutMs(this.host.getProject(projectId).agentConfig));
+    const agentConfig = this.host.getProject(projectId).agentConfig;
+    const effectiveWindowMs = effectiveSessionTimeoutMs(agentConfig);
+    const effectiveMarginMs = resolveContinueMarginMs(agentConfig) ?? DEFAULT_CONTINUE_MARGIN_MS;
+    return dispatchBudgetMs(effectiveWindowMs, effectiveMarginMs);
+  }
+
+  /**
+   * 本项目的**续跑额度** `em = min(continueMarginMs, 生效窗)` —— {@link dispatchBudgetMs}
+   * 第三段的同一取值（缺省 {@link DEFAULT_CONTINUE_MARGIN_MS} = 0 ⇒ 无续跑资格）。
+   *
+   * 存在的理由 = **额度执法**：桥的 `--session-timeout` 只带**窗值**、不知 `em`，故
+   * `em` 必须在 launcher 侧被消费（{@link canContinueNow} 准入 + `executeDispatch` 的
+   * 轮级 deadline 收紧），否则续跑轮会吃掉 {@link DISPATCH_MARGIN_MS} 结构余量。
+   * 只在**续跑候选轮**读取（`dispatchAction` / `executeDispatch` 各一次），故不新增
+   * 「未知项目」的抛错面（该轮必已 `ensure` 成功）。
+   */
+  private continueMarginFor(projectId: string): number {
+    const agentConfig = this.host.getProject(projectId).agentConfig;
+    return Math.min(
+      resolveContinueMarginMs(agentConfig) ?? DEFAULT_CONTINUE_MARGIN_MS,
+      effectiveSessionTimeoutMs(agentConfig),
+    );
   }
 
   /** 发送 message/send（blocking=false）并轮询 tasks/get 至终态 / 超时 */
@@ -1434,6 +1560,7 @@ export class RunnerCommandExecutor {
       !timedOut &&
       containsFailedOutcomeBlock(
         outcomeScanText(view.text, view.statusText, split.artifacts),
+        bridge,
       );
     const kind = classifyFailure({
       timedOut,

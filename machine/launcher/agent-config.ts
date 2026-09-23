@@ -12,6 +12,9 @@
 // `A2A_OUTCOME_CONVENTION` re-export **保留**：既有 import 站点（adapters/*、测试）零改动。
 export { A2A_OUTCOME_CONVENTION } from "../agent-outcome.js";
 
+// 桥会话窗缺省的**单一源**（v0.8.9 需求2 · M1）：launcher 侧不重复定义该常量。
+import { DEFAULT_SESSION_TIMEOUT_MS } from "../acp-bridge/acp/session.js";
+
 /**
  * 从项目 agentConfig 解析 **ACP 族**后端命令：读**顶层平铺键** `agentConfig.backendCmd`。
  *
@@ -74,15 +77,15 @@ export function resolveSystemPromptMode(
 }
 
 /**
- * `agentConfig.sessionTimeoutMs` 的加载期上限（REQ-v0.8.7-2026-09-22-01 · M2）：
- * **15 min = 900_000 ms**，超限 ⇒ `loadMachineConfig` fail-fast。
+ * `agentConfig.sessionTimeoutMs` 的加载期上限（REQ-v0.8.7-2026-09-22-01 · M2；
+ * REQ-v0.8.9 需求2 · M1 由 15 min 收严到 **10 min = 600_000 ms**），超限 ⇒ `loadMachineConfig` fail-fast。
  *
  * 上限的**单一源**在此（machine 侧）—— 桥是零仓内依赖的叶模块，只宽松校验「整数 > 0」，
- * 两处各定义常量必漂移。取 15 min 的理由：桥 session 窗与 launcher dispatch deadline 是
- * **成对常量**（恒须 `dispatch = session + margin`）；`requestWithTimeout` 对桥内**所有**
- * 请求用同一超时 ⇒ 会话建立段最坏 ≈ 6×，15 min + margin ⇒ 最坏窗口仍在 orch 墙钟之下。
+ * 两处各定义常量必漂移。取 10 min 的理由：最坏总框 = `600s(窗) + 300s(结构余量) + 600s(余量按窗封顶)`
+ * = **1500s(25 min)** ≤ 安全线、且 < orch 孤儿墙钟 30 min ⇒ **免组合校验**（无需在加载期再校
+ * 「窗 + 余量」的合计）。
  */
-export const SESSION_TIMEOUT_MS_CAP = 900_000;
+export const SESSION_TIMEOUT_MS_CAP = 600_000;
 
 /**
  * 从项目 agentConfig 解析**平铺** `agentConfig.sessionTimeoutMs`（v0.8.7 · M2），
@@ -96,5 +99,62 @@ export function resolveSessionTimeoutMs(
   agentConfig: Record<string, unknown> | undefined,
 ): number | undefined {
   const value = agentConfig?.["sessionTimeoutMs"];
+  return typeof value === "number" ? value : undefined;
+}
+
+/**
+ * 从项目 agentConfig 解析**平铺** `agentConfig.continueMarginMs`（v0.8.9 需求2 · M1）：
+ * 自动续跑的**余量**（在「生效窗 + 结构余量」之上再追加的派发预算），由 launcher 侧
+ * `dispatchBudgetMs` 消费（不进桥旗标，桥不知道派发预算）。
+ *
+ * **缺省 0 = 不续跑**（缺省值归 `runner-exec.ts` `DEFAULT_CONTINUE_MARGIN_MS`，此处不落地缺省）。
+ * 取值合法性由**加载期**把守（`../config.ts` `parseProject`）；本读取器只管「缺键 / 非数字 →
+ * `undefined`」。
+ */
+export function resolveContinueMarginMs(
+  agentConfig: Record<string, unknown> | undefined,
+): number | undefined {
+  const value = agentConfig?.["continueMarginMs"];
+  return typeof value === "number" ? value : undefined;
+}
+
+/**
+ * 项目**生效**的桥会话窗（v0.8.9 需求2 · M1）：显式 `agentConfig.sessionTimeoutMs`
+ * ?? 桥缺省 {@link DEFAULT_SESSION_TIMEOUT_MS}。
+ *
+ * 存在的意义 = 消掉「配不配 `sessionTimeoutMs` ⇒ 续跑资格不同」的隐式耦合：预算/闸门一律
+ * 走本函数取生效窗，**单一源**是桥常量（launcher 侧不得另写字面量，先例：
+ * `config-snapshot.ts` 从 `../acp-bridge/session-map.js` 引缺省常量）。
+ */
+export function effectiveSessionTimeoutMs(
+  agentConfig: Record<string, unknown> | undefined,
+): number {
+  return resolveSessionTimeoutMs(agentConfig) ?? DEFAULT_SESSION_TIMEOUT_MS;
+}
+
+/**
+ * 从项目 agentConfig 解析**平铺** `agentConfig.sessionRetentionDays`（v0.8.9 · M5），
+ * 由 adapter 经桥 `--session-retention-days <n>` 透传（SessionMap 条目保留天数）。
+ *
+ * **与 `sessionTimeoutMs` 语义完全独立**（一个管映射留存、一个管会话执行窗），互不派生。
+ * 取值合法性由**加载期**把守（`../config.ts` `parseProject`：非正整数 ⇒ fail-fast）；
+ * 本读取器只管「缺键 / 非数字 → `undefined`」（⇒ adapter 不下发该旗标，桥落自身缺省 7 天）。
+ */
+export function resolveSessionRetentionDays(
+  agentConfig: Record<string, unknown> | undefined,
+): number | undefined {
+  const value = agentConfig?.["sessionRetentionDays"];
+  return typeof value === "number" ? value : undefined;
+}
+
+/**
+ * 从项目 agentConfig 解析**平铺** `agentConfig.sessionRetentionMax`（v0.8.9 · M5），
+ * 由 adapter 经桥 `--session-retention-max <n>` 透传（单项目映射条数上限）。
+ * 口径同 {@link resolveSessionRetentionDays}（缺省 ⇒ 桥落自身缺省 500 条）。
+ */
+export function resolveSessionRetentionMax(
+  agentConfig: Record<string, unknown> | undefined,
+): number | undefined {
+  const value = agentConfig?.["sessionRetentionMax"];
   return typeof value === "number" ? value : undefined;
 }

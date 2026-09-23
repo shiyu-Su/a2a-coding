@@ -324,6 +324,43 @@ test("backend 段 · L0 显式路径不存在 ⇒ rejected-missing 且不回落�
   assert.doesNotMatch(snapshot.backend, /L1-local|L2-npm-global|L3-path/, "显式被拒 ⇒ 不扫后续层、不静默回落");
 });
 
+// ---- sessionRetention 段（REQ-v0.8.9-2026-09-23-01 · M5：保留策略进快照上报）----
+
+test("sessionRetention 段 · 不配 ⇒ 缺省值标注（7 / 500，出处=缺省）", () => {
+  withScrubbedEnv(() =>
+    withFakeHome(() => {
+      for (const kind of KINDS) {
+        const snapshot = describeAgentConfig(project(kind));
+        assert.equal(
+          snapshot.sessionRetention,
+          "sessionRetentionDays=7（缺省） sessionRetentionMax=500（缺省）",
+          `${kind}：未配应播报缺省边界`,
+        );
+      }
+    }),
+  );
+});
+
+test("sessionRetention 段 · 显式配 ⇒ 生效值标注出处（agentConfig），两键独立", () => {
+  withScrubbedEnv(() =>
+    withFakeHome(() => {
+      const both = describeAgentConfig(
+        project("qoder-cn", { sessionRetentionDays: 14, sessionRetentionMax: 200 }),
+      );
+      assert.equal(
+        both.sessionRetention,
+        "sessionRetentionDays=14（agentConfig） sessionRetentionMax=200（agentConfig）",
+      );
+      const onlyDays = describeAgentConfig(project("codex", { sessionRetentionDays: 1 }));
+      assert.equal(
+        onlyDays.sessionRetention,
+        "sessionRetentionDays=1（agentConfig） sessionRetentionMax=500（缺省）",
+        "只配一键 ⇒ 另一键仍报缺省（互不派生）",
+      );
+    }),
+  );
+});
+
 const CATALOG_URL = new URL("../../config/model-catalog.json", import.meta.url);
 
 test("model-catalog：JSON 合法，codex / claude 两段与既有段同形且键集齐备", () => {

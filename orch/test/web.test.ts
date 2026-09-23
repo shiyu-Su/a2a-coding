@@ -26,6 +26,7 @@ import type { Server } from "node:http";
 import { appendEvent, createFeature, createTask, latestEventId } from "../session/store.js";
 import type { ProjectStatus } from "../types.js";
 import { renderIndexHtml } from "../bridge/web/html.js";
+import { projectTaskVisibility } from "../bridge/feature-tools.js";
 import { startWebTransport } from "../bridge/transports/web.js";
 import type { WebCore, WebTransportHandle, WebTransportOptions } from "../bridge/transports/web.js";
 
@@ -94,6 +95,20 @@ interface CoreOverrides {
  */
 function defaultGroupView(): { name: string | null; selective: boolean; memberMachines: string[] } {
   return { name: null, selective: false, memberMachines: [] };
+}
+
+/**
+ * ② 只读投影（v0.8.9 O3）在 fake 行上的**空形状**：`FeatureTaskSummary` 自本期起必带
+ * `baseChars`/`renderedChars`/`wrappedChars`/`attempts`/`diagnostics` 五字段 —— 桩里没有
+ * 派发列可投影，故直接调真函数喂空输入（**不手写常量**，避免契约漂移时桩仍绿）。
+ */
+function emptyVisibilityView() {
+  return projectTaskVisibility({
+    dispatchMessage: null,
+    dispatchRendered: null,
+    retryCount: 0,
+    diagnosticsJson: null,
+  });
 }
 
 /** 最小内核桩：只实现网页接面用到的三件事（`BridgeCore` 结构兼容） */
@@ -432,6 +447,7 @@ test("GET /api/features/:featureId → 详情 Task 行补三时刻（渲染层�
                 updatedAt: "2026-09-16T02:00:00Z",
                 failureKind: null,
                 retryCount: 0,
+                ...emptyVisibilityView(),
               },
               {
                 taskId: "t-web-no-record",
@@ -444,6 +460,7 @@ test("GET /api/features/:featureId → 详情 Task 行补三时刻（渲染层�
                 updatedAt: "2026-09-16T02:00:00Z",
                 failureKind: null,
                 retryCount: 0,
+                ...emptyVisibilityView(),
               },
             ],
             artifacts: [],

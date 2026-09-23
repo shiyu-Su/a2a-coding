@@ -1,6 +1,9 @@
 import { readFileSync } from "node:fs";
 import { AGENT_KINDS } from "./agent-kinds.js";
-import { SESSION_TIMEOUT_MS_CAP } from "./launcher/agent-config.js";
+import {
+  effectiveSessionTimeoutMs,
+  SESSION_TIMEOUT_MS_CAP,
+} from "./launcher/agent-config.js";
 import type { AgentKind, BridgeConfig, MachineConfig, ProjectConfig, RiskLevel } from "./types.js";
 
 function fail(msg: string): never {
@@ -88,8 +91,41 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
         sessionTimeoutMs > SESSION_TIMEOUT_MS_CAP
       ) {
         fail(
-          `projects[${idx}].agentConfig.sessionTimeoutMs 必须是 1-${SESSION_TIMEOUT_MS_CAP} 的整数（毫秒，上限 15 min）`,
+          `projects[${idx}].agentConfig.sessionTimeoutMs 必须是 1-${SESSION_TIMEOUT_MS_CAP} 的整数（毫秒，上限 10 min）`,
         );
+      }
+    }
+    // v0.8.9 需求2 · M3：续跑余量键（非负整数，0 合法 = 显式关闭）。
+    // 上限不是全局 CAP，而是**本项目生效窗**（M1 的 effectiveSessionTimeoutMs：显式窗 ?? 桥缺省）
+    // —— 余量封顶于窗，保证「续跑轮额度 = min(余量, 生效窗)」不因配置组合越出预算公式。
+    const continueMarginMs = project.agentConfig["continueMarginMs"];
+    if (continueMarginMs !== undefined) {
+      if (
+        typeof continueMarginMs !== "number" ||
+        !Number.isInteger(continueMarginMs) ||
+        continueMarginMs < 0
+      ) {
+        fail(
+          `projects[${idx}].agentConfig.continueMarginMs 必须是非负整数（毫秒，0 = 关闭续跑）`,
+        );
+      }
+      const windowMs = effectiveSessionTimeoutMs(project.agentConfig);
+      const windowSource =
+        project.agentConfig["sessionTimeoutMs"] === undefined
+          ? "桥缺省"
+          : "agentConfig.sessionTimeoutMs";
+      if (continueMarginMs > windowMs) {
+        fail(
+          `projects[${idx}].agentConfig.continueMarginMs 必须是 0-${String(windowMs)} 的整数（毫秒，上限 = 生效会话窗 ${String(windowMs)}，出处=${windowSource}）`,
+        );
+      }
+    }
+    // v0.8.9 · M5：SessionMap 保留边界两键（正整数即可，无上限语义；与 sessionTimeoutMs 独立）。
+    for (const key of ["sessionRetentionDays", "sessionRetentionMax"] as const) {
+      const value = project.agentConfig[key];
+      if (value === undefined) continue;
+      if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+        fail(`projects[${idx}].agentConfig.${key} 必须是正整数`);
       }
     }
   }

@@ -24,6 +24,17 @@ import {
   resolveBackendEntry,
   type BackendEntryDeps,
 } from "../adapters/backend-entry.js";
+import {
+  resolveContinueMarginMs,
+  resolveSessionRetentionDays,
+  resolveSessionRetentionMax,
+  resolveSessionTimeoutMs,
+} from "./agent-config.js";
+import {
+  DEFAULT_SESSION_RETENTION_DAYS,
+  DEFAULT_SESSION_RETENTION_MAX,
+} from "../acp-bridge/session-map.js";
+import { DEFAULT_SESSION_TIMEOUT_MS } from "../acp-bridge/acp/session.js";
 
 /** 读取 JSON 文件；不存在或解析失败返回 null（快照尽力而为，不抛出） */
 function readJsonIfExists(path: string): Record<string, unknown> | null {
@@ -137,11 +148,58 @@ export function resolveModelEndpoint(project: ProjectConfig): {
   }
 }
 
+/**
+ * SessionMap 保留边界播报（v0.8.9 · M5）：值标注出处（agentConfig / 缺省），
+ * 与派发通路（adapter ⇒ 桥 flag）同一读点（`resolveSessionRetention*`），口径不分叉。
+ */
+function describeSessionRetention(project: ProjectConfig): string {
+  const days = resolveSessionRetentionDays(project.agentConfig);
+  const max = resolveSessionRetentionMax(project.agentConfig);
+  const daysText =
+    days !== undefined
+      ? `${String(days)}（agentConfig）`
+      : `${String(DEFAULT_SESSION_RETENTION_DAYS)}（缺省）`;
+  const maxText =
+    max !== undefined
+      ? `${String(max)}（agentConfig）`
+      : `${String(DEFAULT_SESSION_RETENTION_MAX)}（缺省）`;
+  return `sessionRetentionDays=${daysText} sessionRetentionMax=${maxText}`;
+}
+
+/**
+ * 会话窗 / 续跑余量播报（v0.8.9 需求2 · M3）：值标注出处（agentConfig / 缺省），
+ * 与派发通路同一读点（`resolveSessionTimeoutMs` / `resolveContinueMarginMs`），口径不分叉。
+ * 补上「配了窗但日志看不到」的盲区，并把「续跑开没开」变成可观测运维事实。
+ *
+ * 余量缺省写作字面 0：其单一源是 `runner-exec.ts` 的 `DEFAULT_CONTINUE_MARGIN_MS`（缺省关闭），
+ * 播报模块不引执行引擎（避免把整张派发依赖图拉进快照面）。
+ */
+function describeSessionWindow(project: ProjectConfig): string {
+  const timeout = resolveSessionTimeoutMs(project.agentConfig);
+  const margin = resolveContinueMarginMs(project.agentConfig);
+  const timeoutText =
+    timeout !== undefined
+      ? `${String(timeout)}（agentConfig）`
+      : `${String(DEFAULT_SESSION_TIMEOUT_MS)}（缺省）`;
+  const marginText = margin !== undefined ? `${String(margin)}（agentConfig）` : "0（缺省）";
+  return `sessionTimeoutMs=${timeoutText} continueMarginMs=${marginText}`;
+}
+
 /** 单次 Agent 启动的配置快照：配置层级 + endpoint / 模型 id + 后端入口分层解析结果 */
 export interface AgentConfigSnapshot {
   hierarchy: string;
   model: string;
   endpoint: string;
+  /**
+   * SessionMap 保留边界（v0.8.9 · M5）：`sessionRetentionDays=… sessionRetentionMax=…`，
+   * 值标注出处（agentConfig / 缺省）—— orch 据此可见「这台机该配了什么保留策略」。
+   */
+  sessionRetention: string;
+  /**
+   * 会话窗与续跑余量（v0.8.9 需求2 · M3）：`sessionTimeoutMs=… continueMarginMs=…`，
+   * 值标注出处（agentConfig / 缺省）—— 「这台机开没开续跑」的运维查表面。
+   */
+  sessionWindow: string;
   /**
    * 后端入口 `[backend]` 日志行正文（不含 `[backend]` 前缀，manager 打印时加）。
    * 命中：`<projectId> kind=<kind> <层名> hit <绝对路径>`；
@@ -217,6 +275,8 @@ export function describeAgentConfig(
   return {
     hierarchy: `项目 agentConfig（平铺键）+ ${userConfigLayer(project)}`,
     ...resolveModelEndpoint(project),
+    sessionRetention: describeSessionRetention(project),
+    sessionWindow: describeSessionWindow(project),
     backend: describeBackend(project, deps),
   };
 }

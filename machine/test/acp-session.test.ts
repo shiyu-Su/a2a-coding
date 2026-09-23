@@ -14,6 +14,20 @@
  * （尾部快照 + 4000 字符截断 + 取后仍弃窗）· `sessionResumed` 三路回标（回落 new ⇒ false + 日志）·
  * `reasonOf` 单一实现（applyModel 侧不得逐字复制）· launcher 白名单**尚未放行**新键（M2 依赖，留证据）。
  *
+ * **v0.8.9 · M2** 追加：捕获窗按 `messageId` 分组（串接与旧 `chunks` 逐字等价）· 跨轮归档
+ * （`lastMessageIds`）判重放 + 安全阀（本轮无其它保留内容时不丢）· 出窗计量 `replayDropped` /
+ * `blockCount` · 不确定三判据（`multi-block` / `replay-leak` / `cross-turn-message-id`，续跑轮加
+ * `continue-` 前缀，**只置标志、不改 state**）· ①-b 注入判定改读 `injectedAt`（ensure 失败 /
+ * 零输出失败不写前计数）· 成功轮也挂 diagnostics（`stage=success` + 体积键 `turn` / `promptChars` /
+ * `injectedChars` / `resultChars`）· 无 `SessionMap` 降级路径同扩归档与轮次 · 轮次序号取位于会话
+ * 建立**之后**（回落 new 不把死会话轮次算进第一轮）。
+ *
+ * **v0.8.9 · M6** 收口：M9 八例逐例重审（仅第 7 例语义受 ② 账面化影响 ⇒ 断言从「查日志」升级为
+ * 「查 diagnostics + 日志双锚」）· §4 验收锚 CE-1～CE-4（CE-2 同框钉住「本轮有无其它保留内容」这条
+ * 分水岭）· ①-b 两条守卫链（ensure 失败 / prompt 段零输出失败 ⇒ 不写 `injectedAt` ⇒ 重派照旧注入
+ * ⇒ 成功次轮 `injectedChars=0`）· §2.3 键名契约全键面收口（宿主 2026-09-23 裁定：`lastBlockIndex`
+ * **不上账面、不进 orch 投影**；`parseOutcomeFromGroups` **机制就绪、未接线** —— 见该两例注释，未擅自改生产代码）。
+ *
  * 运行：`npm test`。
  */
 import { test } from "node:test";
@@ -22,12 +36,14 @@ import { readFileSync } from "node:fs";
 import { AcpError } from "../acp-bridge/acp/client.js";
 import {
   AcpSessionRunner,
+  CONTINUE_TURN_PROMPT_MARKER,
   DIAGNOSTICS_ARTIFACT_NAME,
   DIAGNOSTICS_PARTIAL_TAIL_MAX_CHARS,
   type AcpRequestClient,
 } from "../acp-bridge/acp/session.js";
 import type { TaskExecutionResult } from "../acp-bridge/types.js";
 import {
+  CONTINUE_TAIL_MARKER as LAUNCHER_CONTINUE_TAIL_MARKER,
   DIAGNOSTICS_ARTIFACT_NAME as LAUNCHER_DIAGNOSTICS_ARTIFACT_NAME,
   splitDiagnosticsArtifact,
 } from "../launcher/runner-exec.js";
@@ -445,7 +461,9 @@ test("M9-b/c 不误伤：本轮无 id 实时块自带的 input-required 仍被�
   assert.equal(result.text, "需要拍板。");
 });
 
-test("M9-b/c 观测：窗内丢弃的历史重放条数经 logger 留痕（真机闭环取证用）", async () => {
+test("M9-b/c 观测：窗内丢弃的历史重放条数上账面（diagnostics `replayDropped`）+ 日志留痕", async () => {
+  // v0.8.9 · M6（M9 八例重审第 7 例）：`replayDropped` 已由「只落日志」升为**账面键**（§2.3），
+  // 故本例主断言改查 diagnostics；日志锚保留（真机取证仍看桥日志，两者不得互相替代）。
   const client = new FakeClient();
   const logs: string[] = [];
   const sessions = cachedSessions();
@@ -474,6 +492,14 @@ test("M9-b/c 观测：窗内丢弃的历史重放条数经 logger 留痕（真�
   assert.ok(
     logs.some((l) => l.includes("丢弃历史重放 chunk 1 条")),
     logs.join("\n"),
+  );
+  const diag = diagOf(result);
+  assert.ok(diag !== null, "成功轮须带 diagnostics（② 可见面的前置）");
+  assert.equal(diag["replayDropped"], 1, "丢弃条数须上账面，不再只落日志");
+  assert.equal(diag["blockCount"], 0, "本轮保留文本零块 ⇒ 判据 ii 不成立");
+  assert.ok(
+    !("outcomeAmbiguous" in diag),
+    "replay-leak 需 `blockCount ≥ 1`；本轮零块 ⇒ 不误报歧义",
   );
 });
 
@@ -986,14 +1012,14 @@ test("M4 chunkCount 不跨轮泄漏：上一轮 completed 收窗后，本轮失�
 
   const turn1 = await r.execute(INPUT);
   assert.equal(turn1.state, "completed");
-  assert.equal(turn1.artifacts, undefined, "正常完成路径不带 diagnostics");
+  assert.equal(turn1.artifacts?.length, 1, "v0.8.9 · M2：成功轮也挂 diagnostics（一条，不多挂）");
 
   failPrompt = true;
   const turn2 = await r.execute({ ...INPUT, taskId: "t2", text: "again", messageId: "m2" });
   assert.deepEqual(diagCore(diagOf(turn2)), { acpErrorKind: "rpc", stage: "prompt", chunkCount: 1 });
 });
 
-test("M4 正常终态不带 diagnostics：completed / canceled / input-required 三路 artifacts 均缺省", async () => {
+test("M2 正常终态也带 diagnostics（stage=success）· 三路 state 齐 · 结果文本零污染", async () => {
   const shapes: Array<[string, (client: FakeClient) => void]> = [
     [
       "completed",
@@ -1034,8 +1060,18 @@ test("M4 正常终态不带 diagnostics：completed / canceled / input-required 
     setup(client);
     const result = await runner(client).execute({ ...INPUT, taskId: `t-${name}` });
     assert.notEqual(result.state, "failed", `「${name}」场景不得误判为失败`);
-    assert.equal(result.artifacts, undefined, `「${name}」不得带 diagnostics（不得编造空数组）`);
-    assert.equal(diagOf(result), null, `「${name}」不得带 diagnostics`);
+    const diag = diagOf(result);
+    assert.ok(diag !== null, `「${name}」成功出口须带 diagnostics（② 可见面的前置）`);
+    assert.equal(diag["stage"], "success", `「${name}」落点须为 success`);
+    // AC-S1：诊断走 artifact 另轨，结果文本一个字都不许被污染
+    const text = result.text ?? "";
+    assert.ok(!text.includes(DIAGNOSTICS_ARTIFACT_NAME), `「${name}」结果文本不得含 artifact 名`);
+    for (const key of ["promptElapsedMs", "chunkCount", "partialTail", "turn", "promptChars"]) {
+      assert.ok(!text.includes(key), `「${name}」结果文本不得含 diagnostics 键名 ${key}`);
+    }
+    const split = splitDiagnosticsArtifact(result.artifacts ?? []);
+    assert.deepEqual(split.artifacts, [], `「${name}」摘除 diagnostics 后不得剩余 artifact`);
+    assert.ok(split.diagnostics !== null, `「${name}」diagnostics 须可被 launcher 侧解出`);
   }
 });
 
@@ -1294,6 +1330,54 @@ test("M1 sessionResumed 回标：load+resume 双失败回落 new ⇒ false + 日
   );
 });
 
+/** 记录 `delete()` 调用序的映射（v0.8.9 · M1：双失败处须显式作废旧条目）。 */
+class DeleteSpyMap extends SessionMap {
+  readonly deleted: string[] = [];
+
+  override delete(contextId: string): void {
+    this.deleted.push(contextId);
+    super.delete(contextId);
+  }
+}
+
+test("M1-v0.8.9 load+resume 双失败回落 new ⇒ 先 delete 旧条目，新会话不继承死会话状态", async () => {
+  const client = new FakeClient();
+  const sessions = new DeleteSpyMap({ projectId: "p1", baseDir: "/m", fs: new MemoryFs() });
+  sessions.set("ctx", "cached-sess");
+  sessions.bumpTurn("ctx");
+  sessions.bumpTurn("ctx");
+  sessions.markPrompted("ctx");
+  const logs: string[] = [];
+  client.responder = (method) => {
+    if (method === "session/load" || method === "session/resume") throw new Error("no such session");
+    if (method === "session/new") return { sessionId: "fresh-sess" };
+    return { stopReason: "end_turn" };
+  };
+
+  const result = await new AcpSessionRunner({
+    client,
+    cwd: "/ws",
+    timeoutMs: 1000,
+    sessions,
+    logger: (m) => logs.push(m),
+  }).execute(INPUT);
+
+  assert.equal(result.state, "completed");
+  assert.deepEqual(sessions.deleted, ["ctx"], "回落 new 前必须 delete(contextId)");
+  assert.equal(sessions.get("ctx"), "fresh-sess");
+  assert.equal(diagOf(result)?.["turn"], 1, "轮次序号在会话建立**之后**取：回落 new 的第一轮就是 1（不是死会话的 3）");
+  const entry = sessions.getEntry("ctx");
+  assert.equal(
+    entry?.turn,
+    1,
+    "死会话的轮次（建前已 bump 两次 = 2）不得并入新会话：delete 已清 ⇒ 1 是本轮成功出口的 +1，不是 3",
+  );
+  assert.ok(
+    logs.some((line) => line.includes("warn") && line.includes("cached-sess")),
+    `作废留痕须含旧 sessionId（实得 ${logs.join(" | ")}）`,
+  );
+});
+
 test("M1 sessionResumed 回标：首轮无缓存会话 ⇒ false；建立失败 ⇒ 不报该键", async () => {
   const client = new FakeClient();
   failingPrompt(client, () => new AcpError("rpc", "boom"));
@@ -1353,7 +1437,7 @@ test("M1 取证面：reasonOf 单一实现（applyModel 侧不得再逐字复制
   assert.equal(src.split("reasonOf(err)").length - 1 >= 3, true, "reasonOf 须被三处以上消费");
 });
 
-test("M1↔M2 契约：取证键（code / data / partialTailChars）经 launcher 白名单落到 launcher 侧", async () => {
+test("M1↔M2 契约：取证键（code / data / partialTailChars）+ M2 会话层键经 launcher 白名单落到 launcher 侧", async () => {
   const client = new FakeClient();
   failingPrompt(
     client,
@@ -1368,19 +1452,746 @@ test("M1↔M2 契约：取证键（code / data / partialTailChars）经 launcher
 
   const result = await runner(client).execute(INPUT);
   // `acpErrorData` 是 §2.3.1 第 4 条的关键：不落到 launcher 侧则 opencode 系错误永远只剩「Invalid params」
+  // M2 会话层键（v0.8.9 · M4 放行）：`sessionReused` 要求有 SessionMap，本例 `runner(client)` 无映射 ⇒ 不入列
   const passed = assertDiagPassthrough(result, [
     ...M1_PASSTHROUGH_KEYS,
     "acpErrorCode",
     "acpErrorData",
     "partialChars",
     "partialTailChars",
+    ...M2_BRIDGE_KEYS.filter((key) => key !== "sessionReused"),
   ]);
 
   assert.equal(passed["acpErrorCode"], -32602);
   assert.equal(typeof passed["acpErrorData"], "string");
   assert.match(passed["acpErrorData"] as string, /_errors/);
   assert.equal(passed["partialTailChars"], 3);
-  // 半截尾部**正文**（`partialTail`）按 launcher 白名单口径**不透传**（只留字符数）：
-  // 正文在桥侧 artifact 与本文件的 diagOf 断言中已证；续跑判据用 partialChars/updateCount，M3 无需正文。
+  assert.equal(passed["turn"], 1, "M4 放行：轮次序号落到 launcher");
+  assert.equal(passed["resultChars"], 3, "M4 放行：成功/失败轮都报的结果长度键");
+  // 半截尾部**正文**（`partialTail`）由白名单收进 `BridgeDiagnostics`（M3 续跑要读），
+  // 但在回传投影 `bridgeForReport` 处**剥离** ⇒ 绝不上带 orch（只留 `partialTailChars`）。
 });
 
+
+// ---------- REQ-v0.8.9-2026-09-23-01 · M2：会话层（分组 / 跨轮归档 / 注入判定 / 成功轮计量）----------
+
+/** 带 `SessionMap` 的实例（`ctx → s1` 已就绪，走 `session/load` 复用路径）。 */
+function runnerWith(
+  client: FakeClient,
+  sessions: SessionMap,
+  extra: Partial<ConstructorParameters<typeof AcpSessionRunner>[0]> = {},
+  logs?: string[],
+): AcpSessionRunner {
+  return new AcpSessionRunner({
+    client,
+    cwd: "/ws",
+    timeoutMs: 1000,
+    sessions,
+    ...(logs === undefined ? {} : { logger: (m: string): void => void logs.push(m) }),
+    ...extra,
+  });
+}
+
+test("M2 分组：同 id 连续成组、id 再现另起一组 ⇒ 本轮文本 = 各组按到达序串接（与旧 chunks 逐字等价）", async () => {
+  const client = new FakeClient();
+  const { prompt } = inFlightPrompt(client);
+  const p = runner(client).execute(INPUT);
+  await settle();
+
+  emitChunk(client, "A1", "msg-a");
+  emitChunk(client, "A2", "msg-a"); // 同 id 续写一组
+  emitChunk(client, "B1", "msg-b"); // 换 id ⇒ 新组
+  emitChunk(client, "A3", "msg-a"); // id 再现 ⇒ 再新起一组（**不得把 A3 并回第一组 = 文本重排**）
+  prompt.resolve({ stopReason: "end_turn" });
+
+  const result = await p;
+  assert.equal(result.text, "A1A2B1A3", "分组后串接必须与改动前逐字一致");
+  const diag = diagOf(result);
+  assert.equal(diag?.["chunkCount"], 4);
+  assert.equal(diag?.["resultChars"], 8, "resultChars = 本轮累积字符（成功轮也报）");
+  assert.equal(diag?.["blockCount"], 0);
+});
+
+test("M2 分组末块：块分散在多个 messageGroup ⇒ blockCount 跨组累计，state 仍走主规则（末块）", async () => {
+  const client = new FakeClient();
+  const { prompt } = inFlightPrompt(client);
+  const p = runner(client).execute(INPUT);
+  await settle();
+
+  emitChunk(client, `第一段。${block("input-required", "question", "历史问题")}`, "msg-a");
+  emitChunk(client, `第二段。${block("failed", "reason", "本轮原因")}`, "msg-b");
+  prompt.resolve({ stopReason: "end_turn" });
+
+  const result = await p;
+  // 主规则逐字不动：多块取末块 ⇒ failed（不是第一块的 input-required）
+  assert.equal(result.state, "failed");
+  assert.equal(result.reason, "本轮原因");
+  assert.equal(result.text, "第一段。\n\n第二段。", "块体移除、正文顺序不变（块前的 `\\n\\n` 是 parseOutcome 既有口径，M2 不改）");
+  const diag = diagOf(result);
+  assert.equal(diag?.["blockCount"], 2, "blockCount = 本轮结构有效块数（跨组累计）");
+  assert.equal(diag?.["outcomeAmbiguous"], true);
+  assert.equal(diag?.["ambiguousReason"], "multi-block");
+});
+
+test("M2 跨轮归档判重放：回灌尾部跨过 load 响应（窗外未登记）⇒ 次轮按历轮活块 id 丢弃 + 不误判 input-required", async () => {
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  const r = runnerWith(client, sessions);
+  const turn1Load = deferred<unknown>();
+  const prompt1 = deferred<{ stopReason: string }>();
+  client.responder = (method) => {
+    if (method === "session/load") return turn1Load.promise;
+    if (method === "session/prompt") return prompt1.promise;
+    return {};
+  };
+
+  const first = r.execute(INPUT);
+  await settle();
+  turn1Load.resolve({});
+  await settle();
+  // 首轮活块：带 id，含一个 completed 块
+  emitChunk(client, `自检 OK。${block("completed", "note", "ok")}`, "msg-live-1");
+  prompt1.resolve({ stopReason: "end_turn" });
+  assert.equal((await first).state, "completed");
+  assert.deepEqual(sessions.getEntry("ctx")?.lastMessageIds, ["msg-live-1"], "活块 id 须入归档");
+
+  // 次轮：load 立即返回（窗外无回灌）⇒ 上一轮那条消息的**重放**此刻才到（跨过 load 响应的空洞）
+  const turn2 = deferred<{ stopReason: string }>();
+  client.responder = (method) => {
+    if (method === "session/load") return {};
+    if (method === "session/prompt") return turn2.promise;
+    return {};
+  };
+  const second = r.execute({ ...INPUT, taskId: "t2", text: "next", messageId: "m2" });
+  await settle();
+  emitChunk(client, "本轮结论。", "msg-live-2"); // 本轮活块（新 id）
+  emitChunk(client, `上一轮遗留：${block("input-required", "question", "该用哪个环境？")}`, "msg-live-1");
+  turn2.resolve({ stopReason: "end_turn" });
+
+  const result = await second;
+  assert.equal(result.state, "completed", "重放块不得再决定 state（v0.8.1 当年死循环的口径保持）");
+  assert.equal(result.text, "本轮结论。");
+  const diag = diagOf(result);
+  assert.equal(diag?.["replayDropped"], 1, "归档命中丢弃须上账面（不再只落日志）");
+  assert.equal(diag?.["outcomeAmbiguous"], true);
+  assert.equal(diag?.["ambiguousReason"], "cross-turn-message-id");
+  assert.equal(diag?.["turn"], 2, "turn = 桥内该 ctx 的第几轮");
+});
+
+test("M2 归档安全阀：归档命中但本轮尚无其它保留内容 ⇒ 不丢（丢空 = M9-b 老错），只留痕", async () => {
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  sessions.recordMessageId("ctx", "msg-old");
+  const r = runnerWith(client, sessions);
+  const { load, prompt } = loadBackbone(client);
+  const p = r.execute(INPUT);
+  await settle();
+  load.resolve({});
+  await settle();
+
+  emitChunk(client, `整轮只有这一条（id 在归档里）：${block("completed", "note", "ok")}`, "msg-old");
+  prompt.resolve({ stopReason: "end_turn" });
+
+  const result = await p;
+  assert.equal(result.state, "completed");
+  assert.notEqual(result.text, "", "安全阀：无其它保留内容时不得整轮丢空");
+  const diag = diagOf(result);
+  assert.equal(diag?.["replayDropped"], 0);
+  assert.equal(diag?.["outcomeAmbiguous"], true);
+  assert.equal(diag?.["ambiguousReason"], "cross-turn-message-id");
+});
+
+test("M2 判据 ii（replay-leak）：窗外登记 id 丢弃过且本轮仍有有效块 ⇒ 只置标志、state 不变", async () => {
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  const { load, prompt } = loadBackbone(client);
+  const p = runnerWith(client, sessions).execute(INPUT);
+  await settle();
+
+  emitChunk(client, `上一轮：${block("input-required", "question", "历史问题")}`, "hist-1");
+  load.resolve({});
+  await settle();
+
+  emitChunk(client, `尾部：${block("input-required", "question", "历史问题")}`, "hist-1"); // M9-c 丢弃
+  emitChunk(client, `本轮。${block("completed", "note", "ok")}`); // 无 id ⇒ 保留
+  prompt.resolve({ stopReason: "end_turn" });
+
+  const result = await p;
+  assert.equal(result.state, "completed");
+  const diag = diagOf(result);
+  assert.equal(diag?.["replayDropped"], 1);
+  assert.equal(diag?.["blockCount"], 1);
+  assert.equal(diag?.["ambiguousReason"], "replay-leak");
+});
+
+test("M2 续跑轮独立取值：prompt 含续跑锚 ⇒ ambiguousReason 走 continue- 前缀 + 自报 continueAttempts", async () => {
+  const client = new FakeClient();
+  const { prompt } = inFlightPrompt(client);
+  const p = runner(client).execute({
+    ...INPUT,
+    text: `做这件事\n【续跑】残段仅作续跑起点 <<<partial-output-resume>>> tail-begin`,
+  });
+  await settle();
+
+  emitChunk(client, `一段。${block("completed", "note", "a")}`, "msg-a");
+  emitChunk(client, `二段。${block("completed", "note", "b")}`, "msg-b");
+  prompt.resolve({ stopReason: "end_turn" });
+
+  const result = await p;
+  assert.equal(result.state, "completed", "判「不确定」不得改 state（只暴露、不动作）");
+  const diag = diagOf(result);
+  assert.equal(diag?.["blockCount"], 2);
+  assert.equal(diag?.["ambiguousReason"], "continue-multi-block", "续跑轮用独立取值，与常规轮分账");
+  assert.equal(diag?.["continueAttempts"], 1, "续跑轮自报（launcher 的跨轮防递归第二信号）");
+
+  // 反例：常规轮（无锚）同载荷 ⇒ 不带前缀、不自报 continueAttempts
+  const client2 = new FakeClient();
+  const inflight2 = inFlightPrompt(client2);
+  const p2 = runner(client2).execute(INPUT);
+  await settle();
+  emitChunk(client2, `一段。${block("completed", "note", "a")}`, "msg-a");
+  emitChunk(client2, `二段。${block("completed", "note", "b")}`, "msg-b");
+  inflight2.prompt.resolve({ stopReason: "end_turn" });
+  const diag2 = diagOf(await p2);
+  assert.equal(diag2?.["ambiguousReason"], "multi-block");
+  assert.ok(!("continueAttempts" in diag2), "常规轮不报该键（缺省 = 0，不占账面）");
+});
+
+test("M2 契约：桥侧续跑轮锚与 launcher 的残段标记字面量一致", () => {
+  assert.equal(CONTINUE_TURN_PROMPT_MARKER, LAUNCHER_CONTINUE_TAIL_MARKER);
+});
+
+/** 依次取 fake 收到的各次 `session/prompt` 正文（注入判定断言用）。 */
+function promptTexts(client: FakeClient): string[] {
+  return client.calls.flatMap((call) => {
+    if (call.method !== "session/prompt") return [];
+    const params = call.params as { prompt?: Array<{ text?: unknown }> };
+    return [String(params.prompt?.[0]?.text ?? "")];
+  });
+}
+
+test("M2 ①-b 守卫（ensure 失败不写）：会话建立失败 ⇒ prompt 从未写出 ⇒ injectedAt 不推进 ⇒ 重派照旧注入", async () => {
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  client.responder = (method) => {
+    if (method === "session/load") return {};
+    if (method === "session/set_config_option") throw new AcpError("rpc", "unknown model: gpt-9");
+    return {};
+  };
+
+  const result = await runnerWith(client, sessions, { model: "gpt-9" }).execute(INPUT);
+  assert.equal(result.state, "failed");
+  const diag = diagOf(result);
+  assert.ok(diag !== null);
+  assert.equal(diag["stage"], "ensure", "相位 = 建立期（守卫的第一判据）");
+  assert.equal(diag["promptChars"], undefined, "prompt 未写出 ⇒ 体积键不报（不编造）");
+  assert.equal(
+    client.calls.filter((call) => call.method === "session/prompt").length,
+    0,
+    "守卫的事实面：本轮一条 prompt 都没发出",
+  );
+  assert.equal(sessions.getEntry("ctx")?.injectedAt, undefined, "ensure 失败绝不写注入前计数");
+  assert.equal(sessions.isInjected("ctx"), false, "重派必须仍按首轮（漏注入比重复注入更坏）");
+});
+
+test("M2 ①-b 守卫（零输出重发不写 / 有产出失败则写）：注入判据从 prompted 换成「曾发出过」", async () => {
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  const r = runnerWith(client, sessions);
+
+  // ① 满窗零产出（未到达后端 / 疑似排队）⇒ 不写前计数
+  failingPrompt(client, () => new AcpError("timeout", "no output"));
+  await r.execute(INPUT);
+  assert.equal(sessions.isInjected("ctx"), false, "零输出失败 ⇒ 不写 injectedAt");
+  assert.equal(sessions.getEntry("ctx")?.prompted, false, "prompted 语义保留不动（未收到响应）");
+
+  // ② 该类重派：照旧注入约定
+  await r.execute({ ...INPUT, taskId: "t2", text: "retry", messageId: "m2" });
+  const texts = promptTexts(client);
+  assert.equal(texts.length, 2);
+  assert.ok(texts[0]?.startsWith(A2A_OUTCOME_CONVENTION), "首轮注入（现状不变）");
+  assert.ok(
+    texts[1]?.startsWith(A2A_OUTCOME_CONVENTION),
+    "零输出重派仍按首轮 ⇒ 第二次 prompt 必须带约定（守卫生效）",
+  );
+
+  // ③ 到达后端且有产出的失败 ⇒ 约定已被消费 ⇒ 写前计数
+  failingPrompt(client, () => new AcpError("closed", "backend died"), () => {
+    emitChunk(client, "已经写了一段正文", "msg-live");
+  });
+  await r.execute({ ...INPUT, taskId: "t3", text: "again", messageId: "m3" });
+  assert.equal(
+    sessions.isInjected("ctx"),
+    true,
+    "prompt 段失败但有推进 ⇒ 记为「曾发出过 prompt」",
+  );
+
+  // ④ 次轮不再重复注入
+  client.responder = (method) =>
+    method === "session/prompt" ? { stopReason: "end_turn" } : { sessionId: "s1" };
+  await r.execute({ ...INPUT, taskId: "t4", text: "next", messageId: "m4" });
+  const fourth = promptTexts(client)[3] ?? "";
+  assert.ok(
+    !fourth.includes(A2A_OUTCOME_CONVENTION),
+    "①-b 的目的：首轮超时/失败的重派不重复烧一遍约定",
+  );
+  assert.ok(fourth.includes("next"), "正文本身照旧送达");
+  assert.equal(sessions.isPrompted("ctx"), true, "收到响应 ⇒ prompted 置位（既有语义）");
+});
+
+test("M2 成功轮也挂 diagnostics：stage=success + 体积键（turn / promptChars / injectedChars / resultChars）· 失败面键不报", async () => {
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  const r = runnerWith(client, sessions);
+
+  const first = loadBackbone(client);
+  const p1 = r.execute({ ...INPUT, text: "做这个" });
+  await settle();
+  first.load.resolve({});
+  await settle();
+  emitChunk(client, "结论", "m-1");
+  first.prompt.resolve({ stopReason: "end_turn" });
+  const d1 = diagOf(await p1);
+  assert.ok(d1 !== null, "成功轮必须挂一次 diagnostics");
+  assert.equal(d1["stage"], "success");
+  assert.equal(d1["turn"], 1, "turn = 桥内该 ctx 的第 1 轮");
+  assert.equal(d1["injectedChars"], A2A_OUTCOME_CONVENTION.length + 7, "注入 = 约定 + `\\n\\n---\\n\\n`");
+  assert.equal(d1["promptChars"], (d1["injectedChars"] as number) + 3, "promptChars = 注入 + 正文");
+  assert.equal(d1["resultChars"], 2, "resultChars = 本轮累积正文");
+  for (const key of [
+    "acpErrorKind",
+    "acpErrorCode",
+    "acpErrorData",
+    "partialTail",
+    "partialTailChars",
+    "outcomeAmbiguous",
+    "ambiguousReason",
+  ]) {
+    assert.ok(!(key in d1), `成功轮不报 ${key}（无事实 ⇒ 缺键，不写 null / 不编造）`);
+  }
+
+  const second = loadBackbone(client);
+  const p2 = r.execute({ ...INPUT, taskId: "t2", text: "再来", messageId: "m2" });
+  await settle();
+  second.load.resolve({});
+  await settle();
+  emitChunk(client, "又一结论", "m-9");
+  second.prompt.resolve({ stopReason: "end_turn" });
+  const d2 = diagOf(await p2);
+  assert.ok(d2 !== null);
+  assert.equal(d2["turn"], 2, "成功出口 bumpTurn ⇒ 次轮序号递增");
+  assert.equal(d2["injectedChars"], 0, "次轮无注入 ⇒ 报 0（「没注入」是事实，与「没报」不同）");
+  assert.equal(d2["promptChars"], 2);
+});
+
+test("M2 无 SessionMap 降级路径：内存归档 + 轮次同扩（易漏点，判据与持久化路径一致）", async () => {
+  const client = new FakeClient();
+  const r = runner(client); // 无 sessions ⇒ 走 promptedInMemory / 内存归档
+
+  const b1 = inFlightPrompt(client);
+  const p1 = r.execute(INPUT);
+  await settle();
+  emitChunk(client, "首轮结论。", "msg-1");
+  b1.prompt.resolve({ stopReason: "end_turn" });
+  const d1 = diagOf(await p1);
+  assert.ok(d1 !== null);
+  assert.equal(d1["turn"], 1);
+  assert.ok(!("sessionReused" in d1), "无映射 ⇒ 无「命中」这件事，键不报（不编造 false）");
+
+  const b2 = inFlightPrompt(client);
+  const p2 = r.execute({ ...INPUT, taskId: "t2", text: "next", messageId: "m2" });
+  await settle();
+  emitChunk(client, "本轮正文。", "msg-2");
+  emitChunk(client, "上一轮重放尾巴", "msg-1"); // 命中内存归档 ⇒ 丢
+  b2.prompt.resolve({ stopReason: "end_turn" });
+  const result2 = await p2;
+  assert.equal(result2.text, "本轮正文。", "无 SessionMap 时归档判重放必须同样生效");
+  const d2 = diagOf(result2);
+  assert.ok(d2 !== null);
+  assert.equal(d2["turn"], 2);
+  assert.equal(d2["replayDropped"], 1);
+  assert.equal(d2["ambiguousReason"], "cross-turn-message-id");
+  assert.ok(!("sessionMapSize" in d2), "无 SessionMap ⇒ 映射规模无事实，两键不报");
+});
+
+test("M2 ④ 可见面：sessionMapSize / sessionMapOldestAgeDays 只随桥的首个任务带出一次", async () => {
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  sessions.set("other", "s9");
+  client.responder = (method) =>
+    method === "session/prompt" ? { stopReason: "end_turn" } : { sessionId: "s1" };
+  const r = runnerWith(client, sessions);
+
+  const d1 = diagOf(await r.execute(INPUT));
+  assert.ok(d1 !== null);
+  assert.equal(d1["sessionMapSize"], 2, "启动加载后的映射条数");
+  assert.equal(d1["sessionMapOldestAgeDays"], 0, "刚写入 ⇒ 年龄 0 天（floor）");
+
+  const d2 = diagOf(await r.execute({ ...INPUT, taskId: "t2", text: "next", messageId: "m2" }));
+  assert.ok(d2 !== null);
+  assert.ok(!("sessionMapSize" in d2), "只带一次（摊到每轮是噪声）");
+  assert.ok(!("sessionMapOldestAgeDays" in d2));
+});
+
+/** M2 在桥侧新增、待 launcher 白名单放行（放行 = M4 职责）的键。 */
+const M2_BRIDGE_KEYS = [
+  "turn",
+  "sessionReused",
+  "promptChars",
+  "injectedChars",
+  "resultChars",
+  "blockCount",
+  "replayDropped",
+] as const;
+
+test("M2↔M4 契约：M2 新键已在桥侧载荷内；launcher 侧未放行者被丢、放行者不改值（不得改写取值）", async () => {
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  failingPrompt(client, () => new AcpError("rpc", "boom"), () => {
+    emitChunk(client, `一段。${block("completed", "note", "a")}`, "msg-a");
+    emitChunk(client, `二段。${block("completed", "note", "b")}`, "msg-b");
+  });
+
+  const result = await runnerWith(client, sessions).execute(INPUT);
+  const diag = diagOf(result);
+  assert.ok(diag !== null);
+  for (const key of M2_BRIDGE_KEYS) {
+    assert.ok(key in diag, `桥侧未写 ${key}（M2 职责）`);
+  }
+  assert.equal(diag["blockCount"], 2);
+  assert.equal(diag["outcomeAmbiguous"], true, "判据 (i)：多块 ⇒ 只置标志");
+  assert.equal(diag["ambiguousReason"], "multi-block");
+
+  const split = splitDiagnosticsArtifact(result.artifacts ?? []);
+  const passed = (split.diagnostics ?? {}) as Record<string, unknown>;
+  for (const [key, value] of Object.entries(passed)) {
+    assert.deepEqual(value, diag[key], `透传键 ${key} 的值被 launcher 侧改写`);
+  }
+  assert.deepEqual(split.artifacts, [], "诊断 artifact 摘除后不剩余 ⇒ 无从混进 resultText（AC-S1）");
+  // ---- M4 已放行：翻向「每个 M2 键都在 passed 内」（同 M1 契约用例的 assertDiagPassthrough 写法）----
+  for (const key of M2_BRIDGE_KEYS) {
+    assert.ok(key in passed, `${key} 未透传 ⇒ launcher 白名单仍缺该键（M4 职责）`);
+  }
+  assert.ok("outcomeAmbiguous" in passed, "outcomeAmbiguous 未透传 ⇒ M4 的 business 守卫拿不到标志");
+  assert.ok("ambiguousReason" in passed, "ambiguousReason 未透传 ⇒ 歧义诱因留在机内、orch 无从反查");
+  for (const key of Object.keys(diag)) {
+    // 白名单不得漏键：桥写的每个键都须落 launcher，唯一例外 = `stage`（launcher 自测派发相位覆盖）。
+    // `partialTail` **是**收进 BridgeDiagnostics 的（M3 续跑 prompt 的原料）；它的剥离发生在
+    // 回传投影 `bridgeForReport`（见 runner-exec 的 AC-S2 用例），不在白名单这一层。
+    if (key === "stage") continue;
+    assert.ok(key in passed, `${key} 在桥侧载荷内但被白名单丢弃 ⇒ M4 漏放行`);
+  }
+  assert.deepEqual(
+    Object.keys(diag)
+      .filter((key) => key !== "stage")
+      .sort(),
+    Object.keys(passed).sort(),
+    "桥写键集（除 stage）⇔ launcher 放行键集必须相等",
+  );
+});
+
+// ---------- REQ-v0.8.9-2026-09-22-01 · M6：回归套件收口（CE-1～CE-4 · ①-b · ② 键名契约）----------
+// 本段只做**收口**：把改造文档 §4 的验收条目逐条落成可执行锚，不改任何既有语义。
+// 与 M2 已有用例的关系 = 「验收命名」而非重复实现：CE-2 / CE-3 的桥侧机制在 M2 段已各自有例，
+// 此处按**验收口径**（CE-x 编号 + 分水岭同框）补锚，并在② 键名契约上把 §2.3 全键面钉死。
+
+test("CE-1（既有锚仍绿）窗外登记 id 的尾部落窗内 + 本轮无 id 活块 ⇒ 本轮文本只含活块", async () => {
+  // §2.4 判据 ii 的账面形态：文本纯净（只含活块）+ 丢弃条数上账面 + 歧义可见。
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  const { load, prompt } = loadBackbone(client);
+  const p = runnerWith(client, sessions).execute(INPUT);
+  await settle();
+
+  emitChunk(client, `上一轮：${block("input-required", "question", "历史问题")}`, "hist-1"); // 窗外登记
+  load.resolve({});
+  await settle();
+
+  emitChunk(client, `尾部：${block("input-required", "question", "历史问题")}`, "hist-1"); // 窗内 ⇒ 丢弃
+  emitChunk(client, `本轮结论。${block("completed", "note", "ok")}`); // 无 id ⇒ 活块
+  prompt.resolve({ stopReason: "end_turn" });
+
+  const result = await p;
+  assert.equal(result.state, "completed", "重放的 input-required 块不得决定 state");
+  assert.equal(result.text, "本轮结论。", "本轮文本只含活块（块体按主规则移除）");
+  const diag = diagOf(result);
+  assert.ok(diag !== null);
+  assert.equal(diag["replayDropped"], 1);
+  assert.equal(diag["blockCount"], 1, "blockCount 只计**保留下来**的块");
+  assert.equal(diag["outcomeAmbiguous"], true, "判据 ii：有丢弃且有有效块 ⇒ 显式暴露");
+  assert.equal(diag["ambiguousReason"], "replay-leak");
+});
+
+test("CE-2（当年死循环的最小构造）归档 id 尾部跨过 load 响应才入窗 ⇒ 分水岭 = 本轮有无其它保留内容", async () => {
+  // ── 分支 ①：本轮另有活块 ⇒ 归档命中**丢弃** ⇒ 自愈（completed，不再续派）。
+  const healedClient = new FakeClient();
+  const healedSessions = cachedSessions();
+  healedSessions.recordMessageId("ctx", "m1"); // 上一轮以 input-required 结束并归档 m1
+  const healed = loadBackbone(healedClient);
+  const healedP = runnerWith(healedClient, healedSessions).execute(INPUT);
+  await settle();
+  healed.load.resolve({}); // 窗外零回灌 ⇒ M9-c 集合未登记 m1（补 R-a 空洞的正主）
+  await settle();
+  emitChunk(healedClient, "本轮结论。"); // 无 id 活块 ⇒ 先建立「本轮已有保留内容」
+  emitChunk(healedClient, `上一轮遗留：${block("input-required", "question", "该用哪个环境？")}`, "m1");
+  healed.prompt.resolve({ stopReason: "end_turn" });
+
+  const healedResult = await healedP;
+  assert.equal(healedResult.state, "completed", "分支 ①：判重放并丢弃 ⇒ 死循环已切断");
+  assert.equal(healedResult.text, "本轮结论。");
+  const healedDiag = diagOf(healedResult);
+  assert.ok(healedDiag !== null);
+  assert.equal(healedDiag["replayDropped"], 1);
+  assert.equal(healedDiag["outcomeAmbiguous"], true);
+  assert.equal(healedDiag["ambiguousReason"], "cross-turn-message-id");
+
+  // ── 分支 ②：本轮**零活块**（只有归档 id 的回灌尾部）⇒ M2 安全阀不丢（丢空 = M9-b 老错，R-Ⅱ）。
+  //   口径（**宿主 2026-09-23 裁决：取 §2.7 R-Ⅱ，非 §4-4 期望**）：R-Ⅱ 安全阀防的是「把本轮
+  //   **唯一**内容丢空」——那正是 v0.8.1 M9-b 犯过的错，「归档命中 ⇒ 丢弃」不得凌驾它。故本版
+  //   **接受**「零活块分支下死循环不自愈（仍 `input-required`），但账面必带
+  //   `outcomeAmbiguous` + `cross-turn-message-id` = **可发现而非静默**」。改造文档 §4-4 由宿主
+  //   同步修订（实施级偏离 +1 版）。**断言不改**，钉的是裁定后的现状。
+  const valveClient = new FakeClient();
+  const valveSessions = cachedSessions();
+  valveSessions.recordMessageId("ctx", "m1");
+  const valve = loadBackbone(valveClient);
+  const valveP = runnerWith(valveClient, valveSessions).execute(INPUT);
+  await settle();
+  valve.load.resolve({});
+  await settle();
+  emitChunk(valveClient, `上一轮遗留：${block("input-required", "question", "该用哪个环境？")}`, "m1");
+  valve.prompt.resolve({ stopReason: "end_turn" });
+
+  const valveResult = await valveP;
+  assert.equal(valveResult.state, "input-required", "分支 ②：安全阀保留内容 ⇒ 不丢空");
+  assert.equal(valveResult.question, "该用哪个环境？");
+  const valveDiag = diagOf(valveResult);
+  assert.ok(valveDiag !== null);
+  assert.equal(valveDiag["replayDropped"], 0, "未丢弃 ⇒ 账面为 0（与分支 ① 的分水岭可见）");
+  assert.equal(valveDiag["outcomeAmbiguous"], true, "命中归档必须留痕（即便走安全阀）");
+  assert.equal(valveDiag["ambiguousReason"], "cross-turn-message-id");
+});
+
+test("CE-3 窗内两个状态互斥的有效块 ⇒ blockCount=2 + multi-block + state 按末块（主规则不动）", async () => {
+  const client = new FakeClient();
+  const { prompt } = inFlightPrompt(client);
+  const p = runner(client).execute(INPUT);
+  await settle();
+
+  emitChunk(client, `先问一句。${block("input-required", "question", "要哪个环境？")}`, "msg-a");
+  emitChunk(client, `做不到。${block("failed", "reason", "依赖缺失")}`, "msg-b");
+  prompt.resolve({ stopReason: "end_turn" });
+
+  const result = await p;
+  assert.equal(result.state, "failed", "末块规则逐字不动（互斥时以最后一个块为准）");
+  assert.equal(result.reason, "依赖缺失");
+  assert.equal(result.text, "先问一句。\n\n做不到。", "两个块体都被移除，正文顺序不变");
+  const diag = diagOf(result);
+  assert.ok(diag !== null);
+  assert.equal(diag["blockCount"], 2);
+  assert.equal(diag["outcomeAmbiguous"], true);
+  assert.equal(diag["ambiguousReason"], "multi-block", "判据 i 优先级最高");
+  assert.equal(diag["replayDropped"], 0, "本轮无重放 ⇒ 与 replay-leak 分账");
+  // `business 不判` 属 launcher 侧消费（§1 耦合 1），锚在 `test/runner-exec.test.ts` 的 CE-3 真链路例。
+});
+
+test("CE-4（已知不可判）活块与回灌块均无 messageId ⇒ machine 无判据依据 ⇒ 不报 ambiguous（诚实）", async () => {
+  // qodercn 方言的**反面**：连回灌块都不带 id ⇒ 归档 / 窗外登记两条判据同时失去输入。
+  // 期望「不静默」**不成立**（没有任何可区分重放与实时的信号），本例只钉住「不假装判得出」。
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  const { load, prompt } = loadBackbone(client);
+  const p = runnerWith(client, sessions).execute(INPUT);
+  await settle();
+
+  emitChunk(client, `窗外无 id 回灌：${block("input-required", "question", "窗外历史问题")}`);
+  load.resolve({}); // 窗外无 id ⇒ 不进 replayMessageIds（登记这条判据也失效）
+  await settle();
+
+  emitChunk(client, `上一轮遗留：${block("input-required", "question", "历史问题")}`); // 窗内回灌尾部
+  emitChunk(client, "本轮结论。"); // 无 id 活块
+  prompt.resolve({ stopReason: "end_turn" });
+
+  const result = await p;
+  assert.equal(
+    result.state,
+    "input-required",
+    "已知不可判：无 id ⇒ 重放块无从识别，仍会决定 state（机器不自愈）",
+  );
+  const diag = diagOf(result);
+  assert.ok(diag !== null);
+  assert.equal(diag["replayDropped"], 0, "窗外那条被静默丢弃但账面为 0 —— 判据零依据的直接证据");
+  assert.ok(!("outcomeAmbiguous" in diag), "无依据时不得编造歧义标志（诚实口径）");
+  assert.ok(!("ambiguousReason" in diag));
+});
+
+test("①-b 守卫链（ensure 失败）：不写 injectedAt ⇒ 重派照旧注入 ⇒ 成功后的次轮 injectedChars=0", async () => {
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  client.responder = (method) => {
+    if (method === "session/load") return {};
+    if (method === "session/set_config_option") throw new AcpError("rpc", "unknown model: gpt-9");
+    return {};
+  };
+  const r = runnerWith(client, sessions, { model: "gpt-9" });
+
+  const first = await r.execute(INPUT);
+  assert.equal(first.state, "failed");
+  assert.equal(diagOf(first)?.["stage"], "ensure", "prompt 从未写出");
+  assert.equal(
+    client.calls.filter((call) => call.method === "session/prompt").length,
+    0,
+    "本派发零 prompt ⇒ 无注入可言",
+  );
+  assert.equal(sessions.getEntry("ctx")?.injectedAt, undefined, "ensure 失败不写 injectedAt");
+
+  // 重派（建立恢复）⇒ 必须仍按首轮注入，否则约定永久缺失（漏注入比重复注入更坏）
+  client.responder = (method) => (method === "session/prompt" ? { stopReason: "end_turn" } : {});
+  const retry = await r.execute({ ...INPUT, taskId: "t2", text: "retry", messageId: "m2" });
+  const retryDiag = diagOf(retry);
+  assert.ok(retryDiag !== null);
+  assert.equal(retryDiag["injectedChars"], A2A_OUTCOME_CONVENTION.length + 7, "重派照旧注入约定");
+  assert.ok(promptTexts(client)[0]?.startsWith(A2A_OUTCOME_CONVENTION));
+
+  // 正常成功后 ⇒ 次轮不再注入（①-b 的机器可判定证据 = injectedChars 恒 0）
+  const next = await r.execute({ ...INPUT, taskId: "t3", text: "next", messageId: "m3" });
+  const nextDiag = diagOf(next);
+  assert.ok(nextDiag !== null);
+  assert.equal(nextDiag["injectedChars"], 0, "次轮 injectedChars === 0");
+  assert.ok(!promptTexts(client)[1]?.includes(A2A_OUTCOME_CONVENTION), "次轮正文不含约定");
+  assert.equal(diagOf(retry)?.["turn"], 1, "ensure 失败轮不 bump ⇒ 首次成功的 prompt 仍是第 1 轮");
+  assert.equal(nextDiag["turn"], 2, "turn 只在成功出口推进（本轮 = 第 2 轮）");
+});
+
+test("①-b 守卫链（prompt 阶段零输出失败 = 节点单里「transport 类」的桥侧等价）：不写 injectedAt ⇒ 重派照旧注入 ⇒ 只烧一次约定", async () => {
+  // 口径注（M6 复核发现）：`AcpError["kind"]` 闭集 = spawn/closed/timeout/rpc/protocol，**无** `transport`
+  // —— transport 是 launcher 侧 HTTP 传输层类别（send/poll），到不了桥。改造文档 §2.2 守卫里的
+  // 「transport 零输出类」在桥侧的等价类 = **prompt 段失败且零推进**（closed / spawn / protocol + 零输出）。
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  const r = runnerWith(client, sessions);
+  failingPrompt(client, () => new AcpError("closed", "backend not reachable")); // 未到达后端，零产出
+
+  const first = await r.execute(INPUT);
+  assert.equal(first.state, "failed");
+  const firstDiag = diagOf(first);
+  assert.ok(firstDiag !== null);
+  assert.equal(firstDiag["acpErrorKind"], "closed");
+  assert.equal(firstDiag["stage"], "prompt", "落点在 prompt（守卫第 2 判据的前半）");
+  assert.equal(firstDiag["injectedChars"], A2A_OUTCOME_CONVENTION.length + 7, "本轮确实注入了");
+  assert.equal(firstDiag["partialChars"], 0);
+  assert.equal(firstDiag["updateCount"], 0, "零 update ⇒ 无推进证据");
+  assert.equal(
+    sessions.getEntry("ctx")?.injectedAt,
+    undefined,
+    "「不写」即无需回滚：prompt 未到达后端 ⇒ 绝不记为已注入",
+  );
+  assert.equal(sessions.isInjected("ctx"), false);
+
+  // 重派 ⇒ 照旧注入
+  client.responder = (method) => (method === "session/prompt" ? { stopReason: "end_turn" } : {});
+  const retry = await r.execute({ ...INPUT, taskId: "t2", text: "retry", messageId: "m2" });
+  assert.equal(diagOf(retry)?.["injectedChars"], A2A_OUTCOME_CONVENTION.length + 7, "重派仍注入");
+  assert.equal(sessions.isInjected("ctx"), true, "有响应的重派 ⇒ 前计数落账");
+
+  const third = await r.execute({ ...INPUT, taskId: "t3", text: "next", messageId: "m3" });
+  assert.equal(diagOf(third)?.["injectedChars"], 0, "整条链只烧一次约定");
+  assert.equal(promptTexts(client).filter((t) => t.startsWith(A2A_OUTCOME_CONVENTION)).length, 2);
+});
+
+/**
+ * 改造文档 §2.3「machine 产键」表**全键面**（字面量与文档逐字一致 = 验收 9）。
+ * **宿主 2026-09-23 裁定**：`lastBlockIndex` 从线上键面**删除** —— `parseOutcome` 的函数出参保留，
+ * 但**不上账面、不进 orch 投影**（没有消费者就不过线）。故它不在本清单内，由下例作**负向锚**钉住。
+ */
+const SPEC_2_3_KEYS = [
+  "turn",
+  "sessionReused",
+  "sessionResumed",
+  "promptChars",
+  "injectedChars",
+  "resultChars",
+  "blockCount",
+  "replayDropped",
+  "outcomeAmbiguous",
+  "ambiguousReason",
+  "sessionMapSize",
+  "sessionMapOldestAgeDays",
+] as const;
+
+test("② 键名契约收口：§2.3 键面经桥载荷 → launcher 白名单逐键落地（漏键 / 改写取值即失败）", async () => {
+  const client = new FakeClient();
+  const sessions = cachedSessions();
+  sessions.recordMessageId("ctx", "msg-a");
+  const { load, prompt } = loadBackbone(client);
+  const p = runnerWith(client, sessions).execute(INPUT);
+  await settle();
+  load.resolve({});
+  await settle();
+  emitChunk(client, `本轮正文。${block("completed", "note", "ok")}`, "msg-live-1");
+  emitChunk(client, block("input-required", "question", "历史问题"), "msg-a"); // 归档命中 ⇒ 丢弃
+  prompt.resolve({ stopReason: "end_turn" });
+
+  const result = await p;
+  const diag = diagOf(result);
+  assert.ok(diag !== null);
+  assert.equal(diag["outcomeAmbiguous"], true, "本例须让歧义两键也进载荷（否则契约测不全）");
+
+  // 桥侧：§2.3 每键都必须在载荷里（缺键 = M2 漏产，orch 无从投影）
+  const missingOnBridge = SPEC_2_3_KEYS.filter((key) => !(key in diag));
+  assert.deepEqual(
+    missingOnBridge,
+    [],
+    "§2.3 键面与桥载荷零差额（宿主 2026-09-23 裁定 `lastBlockIndex` 不上账面后，不得再有未登记缺口）",
+  );
+  assert.ok(!("lastBlockIndex" in diag), "裁定口径：`lastBlockIndex` 不过线（桥侧不产）");
+
+  // launcher 侧：值逐键不改写 + 除 `stage` 外不漏放行
+  const passed = assertDiagPassthrough(result, [
+    "turn",
+    "sessionReused",
+    "sessionResumed",
+    "promptChars",
+    "injectedChars",
+    "resultChars",
+    "blockCount",
+    "replayDropped",
+    "outcomeAmbiguous",
+    "ambiguousReason",
+    "sessionMapSize",
+    "sessionMapOldestAgeDays",
+  ]);
+  assert.deepEqual(
+    SPEC_2_3_KEYS.filter((key) => !(key in passed)),
+    [],
+    "§2.3 键面全量经 launcher 白名单放行（宿主裁定 `lastBlockIndex` 不上账面 ⇒ 不得有未放行键）",
+  );
+  assert.ok(!("lastBlockIndex" in passed), "裁定口径：`lastBlockIndex` 不进 orch 投影");
+  assert.equal(diag["replayDropped"], 1);
+  assert.equal(diag["blockCount"], 1);
+});
+
+test("② 口径锚（宿主 2026-09-23 裁定）：lastBlockIndex 不上账面 · parseOutcomeFromGroups 机制就绪未接线", () => {
+  // 本例是**口径登记锚**（不是缺陷上报，缺陷已按裁定收敛）：源码面钉住两条裁定后的现状，
+  // 谁将来悄悄改线（把 lastBlockIndex 塞进载荷 / 把分组入口接进判据路径）都会先红在这里。
+  const sessionSrc = readFileSync(
+    // 运行时 = dist/test/*.js，源码在 machine 根（../../）
+    new URL("../../acp-bridge/acp/session.ts", import.meta.url),
+    "utf8",
+  );
+
+  // 裁定 1：`lastBlockIndex` **不上账面、不进 orch 投影**（§2.3 键面已删该键）——
+  //         `parseOutcome` 的函数出参保留无妨，没有消费者就不过线。
+  assert.ok(sessionSrc.includes("blockCount: diag.blockCount"), "桥写 blockCount（账面保留键）");
+  assert.ok(
+    !sessionSrc.includes("lastBlockIndex"),
+    "裁定：桥侧不产 lastBlockIndex（若将来要过线，须先由宿主恢复 §2.3 该键 + launcher 白名单同步）",
+  );
+
+  // 裁定 3：**机制就绪、未接线**（宿主 2026-09-23 裁定）——今日 run-length 分组与全文拼接
+  //         **逐字等价**（等价性锚在 acp-outcome 的「chunk 打散不改变结果」），接线要动**最高风险的
+  //         判据路径**而收益为零；其真值场景（R-a「回灌尾部跨过 load 响应」）**尚无真机取证**
+  //         ⇒ 登记为未覆盖项，待真机取证证实 R-a 现实存在后再接线。
+  assert.ok(!sessionSrc.includes("parseOutcomeFromGroups("), "登记：M3 的分组入口尚无消费方");
+  assert.ok(sessionSrc.includes("parseOutcome(text)"), "现状：桥仍走全文口径末块");
+});

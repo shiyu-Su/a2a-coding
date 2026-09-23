@@ -1177,12 +1177,71 @@ test("M2 逐字锚：4 家已配 ⇒ --session-timeout <ms> 恰在 permissionArg
   }
 });
 
-test("M2 值形态：数字 ms 原样十进制字符串下发（上限 900000 边界值可透传）", () => {
+test("M2 值形态：数字 ms 原样十进制字符串下发（上限 600000 边界值可透传）", () => {
   const args = getAdapter("qoder-cn")
     .buildLaunch({
       ...BARE_REQUEST,
       agentConfig: { backendCmd: QODER_EXPLICIT, sessionTimeoutMs: SESSION_TIMEOUT_MS_CAP },
     })
     .args.slice(1);
-  assert.equal(args[args.indexOf("--session-timeout") + 1], "900000");
+  assert.equal(args[args.indexOf("--session-timeout") + 1], "600000");
+});
+
+// ---------- REQ-v0.8.9-2026-09-23-01 · M5：平铺 sessionRetentionDays/Max ⇒ 桥 `--session-retention-*` ----------
+
+test("M5 接线锚：两读点 + 两下发 = 4 家（opencode/qoder-cn/codex/claude）", () => {
+  const root = appRootFromModule(import.meta.url);
+  for (const kind of ["opencode", "qoder-cn", "codex", "claude"]) {
+    const src = readFileSync(join(root, "adapters", `${kind}.ts`), "utf8");
+    assert.ok(
+      src.includes("resolveSessionRetentionDays(request.agentConfig)"),
+      `${kind} 应读平铺 sessionRetentionDays`,
+    );
+    assert.ok(
+      src.includes("resolveSessionRetentionMax(request.agentConfig)"),
+      `${kind} 应读平铺 sessionRetentionMax`,
+    );
+    assert.ok(src.includes('"--session-retention-days"'), `${kind} 应下发 --session-retention-days`);
+    assert.ok(src.includes('"--session-retention-max"'), `${kind} 应下发 --session-retention-max`);
+  }
+});
+
+test("M5 逐字锚：4 家已配 ⇒ 两旗标紧随 --session-timeout 且整段恰在 permissionArgs 前；未配 ⇒ 零下发", () => {
+  const cases: Array<{ kind: AgentKind; agentConfig: Record<string, unknown> }> = [
+    { kind: "qoder-cn", agentConfig: { backendCmd: QODER_EXPLICIT, sessionRetentionDays: 14, sessionRetentionMax: 200 } },
+    { kind: "opencode", agentConfig: { backendCmd: OPENCODE_EXE, sessionRetentionDays: 14, sessionRetentionMax: 200 } },
+    { kind: "codex", agentConfig: { backendCmd: CODEX_BACKEND_CMD_SAMPLE, sessionRetentionDays: 14, sessionRetentionMax: 200 } },
+    { kind: "claude", agentConfig: { backendCmd: CLAUDE_NODE_CMD, sessionRetentionDays: 14, sessionRetentionMax: 200 } },
+  ];
+  for (const { kind, agentConfig } of cases) {
+    const adapter = getAdapter(kind);
+    const perm = adapter.permission("write").args;
+    const withRetention = adapter
+      .buildLaunch({ ...BARE_REQUEST, agentConfig, permissionArgs: perm })
+      .args.slice(1);
+    const i = withRetention.indexOf("--session-retention-days");
+    assert.ok(i >= 0, `${kind}：已配 ⇒ 应下发 --session-retention-days`);
+    assert.deepEqual(
+      withRetention.slice(i),
+      ["--session-retention-days", "14", "--session-retention-max", "200", ...perm],
+      `${kind}：两旗标取值与位置`,
+    );
+    const without = adapter.buildLaunch({
+      ...BARE_REQUEST,
+      agentConfig: { ...agentConfig, sessionRetentionDays: undefined, sessionRetentionMax: undefined },
+    }).args.slice(1);
+    assert.ok(!without.includes("--session-retention-days"), `${kind}：未配 ⇒ 不下发（桥落缺省 7d）`);
+    assert.ok(!without.includes("--session-retention-max"), `${kind}：未配 ⇒ 不下发（桥落缺省 500）`);
+  }
+});
+
+test("M5 独立性锚：只配 retention 两键 ⇒ 不产出 --session-timeout（与超时窗互不派生）", () => {
+  const args = getAdapter("qoder-cn")
+    .buildLaunch({
+      ...BARE_REQUEST,
+      agentConfig: { backendCmd: QODER_EXPLICIT, sessionRetentionDays: 3, sessionRetentionMax: 50 },
+    })
+    .args.slice(1);
+  assert.ok(!args.includes("--session-timeout"), "retention 不得派生 sessionTimeoutMs 下发");
+  assert.ok(args.includes("--session-retention-days"));
 });

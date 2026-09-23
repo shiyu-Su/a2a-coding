@@ -1554,7 +1554,9 @@ function toDispatchCommand(rec: QueuedTaskRecord): RunnerDispatchCommand {
     projectId: rec.projectId,
     contextId: rec.contextId,
     commandId: randomUUID(),
-    message: rec.dispatchMessage ?? rec.prompt ?? "",
+    // v0.8.9 O2：优先取本轮渲染快照；`?? dispatchMessage` = 历史行兜底
+    // （`dispatch_rendered` 为 NULL 时与改前逐字一致）
+    message: rec.dispatchRendered ?? rec.dispatchMessage ?? rec.prompt ?? "",
     claimToken: rec.claimToken ?? "",
     featureId: rec.featureId,
     dependencies: rec.dependencies ?? [],
