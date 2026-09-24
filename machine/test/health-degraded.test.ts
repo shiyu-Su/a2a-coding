@@ -21,6 +21,7 @@ import { AgentManager } from "../launcher/manager.js";
 import { Runner, type RunnerLogger } from "../launcher/runner.js";
 import { createFileOutbox } from "../launcher/runner-outbox.js";
 import type { SelfCheckFailure } from "../launcher/self-check.js";
+import { StopEventLedger } from "../launcher/stop-ledger.js";
 import {
   buildDegradedStatus,
   createLauncherApp,
@@ -63,6 +64,12 @@ const CLEAN: DegradedStatus = {
   outboxPendingCount: 0,
   runnerLoopAlive: false,
   inFlightCount: 0,
+  /** v0.8.10 · M-N4：取消超时未静默的项目集（未装配读点 ⇒ 无观察） */
+  cancelUnsupported: [],
+  /** v0.8.10 增补轨 · A1：三键恒在，空态 = {} / {} / null（不得省略键） */
+  inFlightByProject: {},
+  queuedByProject: {},
+  lastCancelQuietMs: null,
 };
 
 /** 组装 `degraded` 原料的测试基线：只覆盖被断言的那一维，其余取「无降级」现值 */
@@ -134,8 +141,84 @@ test("buildDegradedStatus：自检失败项复用结构化结论，只出 {proje
   ]);
 });
 
-test("/health：未装配 degraded 读点 → 基线无假阳性，既有字段逐不变（additive）", async () => {
-  const body = await fetchHealth({});
+test("buildDegradedStatus：取消超时未静默的项目 ⇒ 落 degraded.cancelUnsupported（v0.8.10 · M-N4 ②）", () => {
+  // 无观察 = 空数组（**不是**「已全部静默」，静默者由 config-snapshot 播报承载）
+  assert.deepEqual(buildDegradedStatus(inputs({})).cancelUnsupported, []);
+  assert.deepEqual(
+    buildDegradedStatus(inputs({ cancelUnsupported: ["alpha"] })).cancelUnsupported,
+    ["alpha"],
+  );
+});
+
+test("/health：degraded 经 HTTP 面带出 cancelUnsupported（读点 = 停事件账）", async () => {
+  const body = await fetchHealth({
+    getDegraded: () => buildDegradedStatus(inputs({ cancelUnsupported: ["alpha"] })),
+  });
+
+  assert.deepEqual(body.degraded.cancelUnsupported, ["alpha"]);
+});
+
+test("buildDegradedStatus：A1 三键恒在 —— 空态给 {} / {} / null，不省略键", () => {
+  const degraded = buildDegradedStatus(inputs({}));
+
+  assert.ok("inFlightByProject" in degraded);
+  assert.ok("queuedByProject" in degraded);
+  assert.ok("lastCancelQuietMs" in degraded);
+  assert.deepEqual(degraded.inFlightByProject, {});
+  assert.deepEqual(degraded.queuedByProject, {});
+  assert.equal(degraded.lastCancelQuietMs, null);
+});
+
+test("buildDegradedStatus：闸快照与取消往返耗时原样透出（装配点不做加工）", () => {
+  const degraded = buildDegradedStatus(
+    inputs({
+      gate: {
+        inFlightByProject: { p: { write: 1, read: 2 } },
+        queuedByProject: { p: { write: 3, read: 0, oldestWaitedMs: 4_200 } },
+      },
+      lastCancelQuietMs: 1_234,
+    }),
+  );
+
+  assert.deepEqual(degraded.inFlightByProject, { p: { write: 1, read: 2 } });
+  assert.deepEqual(degraded.queuedByProject, { p: { write: 3, read: 0, oldestWaitedMs: 4_200 } });
+  assert.equal(degraded.lastCancelQuietMs, 1_234);
+});
+
+test("/health：degraded 经 HTTP 面带出档位两键与 lastCancelQuietMs（v0.8.10 增补轨 · A1）", async () => {
+  const body = await fetchHealth({
+    getDegraded: () =>
+      buildDegradedStatus(
+        inputs({
+          gate: {
+            inFlightByProject: { p: { write: 1, read: 0 } },
+            queuedByProject: {},
+          },
+          lastCancelQuietMs: 77,
+        }),
+      ),
+  });
+
+  assert.deepEqual(body.degraded.inFlightByProject, { p: { write: 1, read: 0 } });
+  assert.deepEqual(body.degraded.queuedByProject, {});
+  assert.equal(body.degraded.lastCancelQuietMs, 77);
+});
+
+test("StopEventLedger.lastCancelQuiesceMsOverall：无观察 null；后发全局覆盖（lastCancelQuietMs 数据源）", () => {
+  const ledger = new StopEventLedger();
+  assert.equal(ledger.lastCancelQuiesceMsOverall(), null);
+
+  ledger.noteCancelQuiesce("alpha", 1_234.6);
+  assert.equal(ledger.lastCancelQuiesceMsOverall(), 1_235);
+
+  ledger.noteCancelQuiesce("beta", 80);
+  assert.equal(ledger.lastCancelQuiesceMsOverall(), 80);
+  // 按项目口径不受影响（config-snapshot 播报仍读每项目值）
+  assert.equal(ledger.lastCancelQuiesceMs("alpha"), 1_235);
+  assert.equal(ledger.lastCancelQuiesceMs("beta"), 80);
+});
+
+test("/health：未装配 degraded 读点 → 基线无假阳性，既有字段逐不变（additive）", async () => {  const body = await fetchHealth({});
 
   assert.deepEqual(body.degraded, CLEAN);
   assert.deepEqual(

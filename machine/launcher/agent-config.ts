@@ -133,6 +133,49 @@ export function effectiveSessionTimeoutMs(
 }
 
 /**
+ * 两把并发闸的缺省上限（v0.8.10 · M-N5）：**写 1 / 读 1** ⇒ 一个键都不配时，
+ * 同项目同档一次只跑一个，与 v0.8.9（orch 写忙集已把同项目串行）的实况一致。
+ */
+export const DEFAULT_MAX_CONCURRENT_WRITES = 1;
+export const DEFAULT_MAX_CONCURRENT_READS = 1;
+
+/**
+ * 从项目 agentConfig 解析**平铺** `agentConfig.maxConcurrentWrites`（v0.8.10 · M-N5）：
+ * 同 project **写档**的并发上限。合法性由加载期把守（`../config.ts` `parseProject`：
+ * 非正整数 ⇒ fail-fast）；本读取器只管「缺键 / 非数字 → `undefined`」。
+ */
+export function resolveMaxConcurrentWrites(
+  agentConfig: Record<string, unknown> | undefined,
+): number | undefined {
+  const value = agentConfig?.["maxConcurrentWrites"];
+  return typeof value === "number" ? value : undefined;
+}
+
+/**
+ * 从项目 agentConfig 解析**平铺** `agentConfig.maxConcurrentReads`（v0.8.10 · M-N5）：
+ * 同 project **读档**的并发上限（配 ≥2 才真并行）。口径同 {@link resolveMaxConcurrentWrites}。
+ */
+export function resolveMaxConcurrentReads(
+  agentConfig: Record<string, unknown> | undefined,
+): number | undefined {
+  const value = agentConfig?.["maxConcurrentReads"];
+  return typeof value === "number" ? value : undefined;
+}
+
+/**
+ * 项目**生效**的两把闸上限（v0.8.10 · M-N5）：缺键落 1/1。
+ * 两档**互相独立**（读不占写位、写不占读位），**按 project 计**、与项目组正交。
+ */
+export function effectiveGateLimits(
+  agentConfig: Record<string, unknown> | undefined,
+): { write: number; read: number } {
+  return {
+    write: resolveMaxConcurrentWrites(agentConfig) ?? DEFAULT_MAX_CONCURRENT_WRITES,
+    read: resolveMaxConcurrentReads(agentConfig) ?? DEFAULT_MAX_CONCURRENT_READS,
+  };
+}
+
+/**
  * 从项目 agentConfig 解析**平铺** `agentConfig.sessionRetentionDays`（v0.8.9 · M5），
  * 由 adapter 经桥 `--session-retention-days <n>` 透传（SessionMap 条目保留天数）。
  *

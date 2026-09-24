@@ -128,6 +128,15 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
         fail(`projects[${idx}].agentConfig.${key} 必须是正整数`);
       }
     }
+    // v0.8.10 · M-N5：两把并发闸的上限（正整数；缺省 1/1 由 agent-config 落，此处不写缺省）。
+    // 0 / 负数 / 非整数若不在此拦截，闸会「永远排不到」或「计数语义失真」⇒ 加载期 fail-fast。
+    for (const key of ["maxConcurrentWrites", "maxConcurrentReads"] as const) {
+      const value = project.agentConfig[key];
+      if (value === undefined) continue;
+      if (typeof value !== "number" || !Number.isInteger(value) || value <= 0) {
+        fail(`projects[${idx}].agentConfig.${key} 必须是正整数（缺省 1 = 同项目同档串行）`);
+      }
+    }
   }
   const risk = o["risk"];
   if (risk !== undefined) {

@@ -26,10 +26,11 @@ import type {
   InputArtifactRef,
   RiskLevel,
   SessionRecord,
+  TaskLane,
   TaskRecord,
   TaskState,
 } from "../types.js";
-import { AGENT_KINDS, FAILURE_KINDS, ORPHAN_FAILURE_KIND } from "../types.js";
+import { AGENT_KINDS, FAILURE_KINDS, ORPHAN_FAILURE_KIND, TASK_LANES } from "../types.js";
 
 /**
  * 默认数据库文件：锚定 orch 单元根（`<orch>/data/sessions.sqlite`），**非 cwd 相对**，
@@ -324,6 +325,14 @@ export interface TaskCreateInput {
    * 写口在 O2 接入（`dispatchFeatureNode` 只写本字段、不回写 `dispatchMessage`）。
    */
   dispatchRendered?: string | null;
+  /**
+   * **并发档**（v0.8.10 O-N1，落 `tasks.lane`；缺省 `undefined` = 落库 NULL ⇒ 读侧按 `write` 解释）。
+   *
+   * ⚠️ **ON CONFLICT 走 `COALESCE(excluded.lane, lane)`**（保留首次声明）：本字段**缺省不是 `write`
+   * 而是 NULL**，正是为了「**不带档的重登记不会把 read 降成 write**」——若缺省直接写 `'write'`，
+   * 任何一次未带 `lane` 的 upsert（重派 / 补登记）都会静默改档。要显式改档必须**显式传值**。
+   */
+  lane?: TaskLane | null;
 }
 
 /** `listTasks` 入参：按项目（可选状态）取最近任务 */
@@ -456,6 +465,20 @@ function isAgentKind(v: string): v is AgentKind {
 function isTaskState(v: string): v is TaskState {
   return (TASK_STATES as readonly string[]).includes(v);
 }
+
+function isTaskLane(v: string): v is TaskLane {
+  return (TASK_LANES as readonly string[]).includes(v);
+}
+
+/**
+ * **写档 SQL 片段**（v0.8.10 O-N1；忙集谓词与 `claimTask` 写优先排序**共用同一片段**）。
+ *
+ * ⚠️ **`lane IS NULL` 必须算写档**（与 `readLane` 的读侧归一同口径）：
+ * 存量行经迁移归一后仍可能有 NULL（`upsertTaskResult` 为未知任务建行时不带档、
+ * 以及归一语句之后落的老版本写入路径）—— 一旦把 NULL 当只读，等于**静默放宽串行门**；
+ * 一旦在排序里漏掉 NULL，**迁移前的存量行整体沉底**（永远领不到）。
+ */
+const WRITE_LANE_SQL = "(lane IS NULL OR lane = 'write')";
 
 /** 该任务态是否算「已完成」（`finished_at` 的唯一写入判据；口径见 `FINISHED_TASK_STATES`） */
 function isFinishedState(state: TaskState): boolean {
@@ -679,9 +702,12 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
  * v0.6.1 REQ-05：`exhausted` / `not_before` / `last_poll_at` **三列自本期起为休眠列** ——
  * 列仍在库中（`schema 不挖`），但**不再出现在 SELECT**；`rowToTask` 以固定中性值（`false` / `null`）
  * 填充对应字段，故这三条历史值不会被任何代码读到。
+ *
+ * v0.8.10 O-N1：加 `lane`（并发档）。**列只加在迁移段、不进 `TASKS_DDL`**（照 v0.6.1 起既有纪律：
+ * `dispatch_guard` / `diagnostics_json` / `dispatch_rendered` 三列同此），老库升级路径不变。
  */
 const TASK_COLUMNS =
-  "task_id, project_id, context_id, state, artifacts_json, text, prompt, " +
+  "task_id, project_id, context_id, state, lane, artifacts_json, text, prompt, " +
   "feature_id, dependencies, input_artifacts, remote_task_id, dispatch_guard, dispatch_message, dispatch_rendered, updated_at, " +
   "retry_count, failure_kind, diagnostics_json, " +
   "created_at, started_at, finished_at";
@@ -747,6 +773,7 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     projectId: readString(row, "project_id"),
     contextId: readString(row, "context_id"),
     state,
+    lane: readLane(row),
     artifactsJson: readNullableString(row, "artifacts_json"),
     text: readNullableString(row, "text"),
     prompt: readNullableString(row, "prompt"),
@@ -838,7 +865,21 @@ function readQueueState(row: Record<string, unknown>): QueueState {
   return raw;
 }
 
-/** `tasks` 队列视角全列清单（SELECT 单一事实源；含队列五列） */
+/**
+ * 解析 `lane` 列（v0.8.10 O-N1）：**NULL 归一为 `write`**（保守档 = 与 v0.8.9 及以前逐字一致的
+ * 串行行为；**反方向归一 = 静默放宽串行门**，见 `TASK_LANES` 注记）；
+ * 非 NULL 但非法值 = 数据损坏（fail-fast，与其余列同纪律）。
+ */
+function readLane(row: Record<string, unknown>): TaskLane {
+  const raw = readNullableString(row, "lane");
+  if (raw === null) return "write";
+  if (!isTaskLane(raw)) {
+    throw new Error(`[session-store] 列 lane 数据损坏：非法值 ${raw}`);
+  }
+  return raw;
+}
+
+/** `tasks` 队列视角全列清单（SELECT 单一事实源；含队列五列；`lane` 随 `TASK_COLUMNS` 一并进入） */
 const QUEUE_TASK_COLUMNS = `${TASK_COLUMNS}, queue_state, claimed_by, claim_token, claimed_at, queued_at`;
 
 function rowToQueuedTask(row: Record<string, unknown>): QueuedTaskRecord {
@@ -1179,7 +1220,8 @@ export class SessionStore {
     // 纪律：**前向、逐段、各段自幂等**（`CREATE ... IF NOT EXISTS` / try-ALTER）⇒ 重复启动
     // 零副作用（连续两跑库状态一致）；**注册表不启动清空**（不清 `runners` / `runner_projects`，
     // 重启后投影仍在）。段落划分（顺序固定）：
-    //   段 1：`tasks` 队列五列；段 2：`runners` 表；段 3：`runner_projects` 表；段 4：队列 / 注册表索引。
+    //   段 1：`tasks` 队列五列；段 1b：`tasks.lane`（v0.8.10 O-N1，含存量归一）；
+    //   段 2：`runners` 表；段 3：`runner_projects` 表；段 4：队列 / 注册表索引。
     // 段 1：`tasks` 队列列。老行一律留 NULL（`queue_state` NULL ⇒ 读侧视为 `settled`，**不回填**）。
     for (const column of [
       "queue_state TEXT",
@@ -1194,6 +1236,23 @@ export class SessionStore {
         // 列已存在（幂等）
       }
     }
+    // 段 1b（v0.8.10 O-N1 · REQ-v0.8.10-2026-09-23-01 §2.2 / §4-A1）：`tasks.lane` 并发档列。
+    // 口径 = **缺省写档**（保守、向后兼容：不读该列时行为与 v0.8.9 逐字一致）。
+    //
+    // ⚠️ **存量行必须归一为 `write`** —— 本段与 `queue_state` 一族**相反**：那五列老行留 NULL 是
+    // 「不在队列中」的正确语义；此处 NULL 若按只读解释 ⇒ **存量行整体退出忙集 = 静默放宽串行门**
+    // （同 project 双派双写）。归一之后 NULL 只可能来自**未升版的老代码写入**，SQL 侧仍须按写档算
+    // （见 `WRITE_LANE_SQL`）。
+    //
+    // 纪律照既有：只加列、必可空、不复用既有列、读侧 `readLane`、**只在 ctor try-ALTER**；
+    // 归一语句**幂等**（`WHERE lane IS NULL` ⇒ 二次启动零行命中）、**不改 `updated_at`**
+    // （归一不是活动，避免存量任务顶到列表首位）、**不写事件**（迁移非运行期状态变更）。
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN lane TEXT");
+    } catch {
+      // 列已存在（幂等）
+    }
+    this.db.exec("UPDATE tasks SET lane = 'write' WHERE lane IS NULL");
     // 段 2 / 段 3：注册表两张（运行态投影；IF NOT EXISTS = 幂等）
     this.db.exec(RUNNERS_DDL);
     this.db.exec(RUNNER_PROJECTS_DDL);
@@ -1298,14 +1357,15 @@ export class SessionStore {
     this.db
       .prepare(
         `INSERT INTO tasks
-           (task_id, project_id, context_id, state, artifacts_json, text, prompt,
+           (task_id, project_id, context_id, state, lane, artifacts_json, text, prompt,
             feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, dispatch_rendered, updated_at,
             created_at, started_at, finished_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(task_id) DO UPDATE SET
            project_id = excluded.project_id,
            context_id = excluded.context_id,
            state = excluded.state,
+           lane = COALESCE(excluded.lane, lane),
            artifacts_json = excluded.artifacts_json,
            text = excluded.text,
            prompt = excluded.prompt,
@@ -1324,6 +1384,7 @@ export class SessionStore {
         rec.projectId,
         rec.contextId,
         rec.state,
+        rec.lane ?? null,
         rec.artifactsJson ?? null,
         rec.text ?? null,
         prompt,
@@ -1644,19 +1705,42 @@ export class SessionStore {
 
   /**
    * **项目忙谓词**（SQL `WHERE` 片段）= 忙集判据的**唯一事实源**，供 {@link listBusyProjectIds}
-   * 展开：`state = 'working' ∧ queue_state IN ('queued', 'claimed', 'running')`。
+   * 展开：`state = 'working' ∧ queue_state IN ('queued', 'claimed', 'running') ∧ 写档`。
    *
    * v0.8.7（REQ-v0.8.7-2026-09-22-01 O1）改活：pull 模型下 `remote_task_id` **已无生产写入点**
    * （`markTaskDispatched` 仅剩测试引用）⇒ 旧口径 `remote_task_id IS NOT NULL` **恒空集**，
    * 串行门只剩进程内 `reservedProjects`（批次 `finally` 即退场，跨 tick 完全不设防）。
    * 忙集口径改由**本地队列态**承载（与 `isTaskWatched` 同口径）。
    *
-   * **v0.8.10 读写分道（lane）在此扩展** —— 本版**不引入 lane / 复合键**：消费侧共三处按
-   * projectId 比对（`computeReadyNodes` 的 `busyProjects.has` / `claimed.has` / `claimed.add`），
-   * 元素一旦变为 `p#lane` 而漏改任一处 ⇒ 串行门**静默失效**；lane 恒单值时零收益。
+   * ★ **v0.8.10 O-N1（REQ-v0.8.10-2026-09-23-01 §2.2）读写分道在此兑现**（v0.8.10 前该处预留位）：
+   * 末段 `AND (lane IS NULL OR lane = 'write')` ⇒ **只读节点退出忙集** —— 语义是
+   * 「**读不挡写、也不挡读**」（只读节点在飞不再把项目挂上门），**不是**「写不挡读」：
+   * 写节点在飞 ⇒ 项目仍忙 ⇒ 同 project 的读写节点一律等（本版刻意不放开）。
+   *
+   * - **改这里即改门**：`bridge/scheduler.ts` 本版**零改动** —— 忙集每 tick 由本谓词的 DB 快照
+   *   算出，谓词一放宽门自动放宽；进程内补口 `reservedProjects` 只登记 orch 派发过的节点（= 写档），
+   *   无需改形。
+   * - **NULL 必须算写档**（见 `WRITE_LANE_SQL` 注记）：漏掉 `lane IS NULL` 会让**未升版老代码写入的
+   *   行**被当成只读 ⇒ 串行门静默失效（同 project 双写）。
+   * - **消费侧只按 projectId 比对**（`computeReadyNodes` 的 `busyProjects.has` / `claimed.has` /
+   *   `claimed.add`）—— 本谓词**不得**改成返回 `p#lane` 复合键：三处比对漏改任一处即门静默失效。
+   *   档位信息只由 `lane` 列承载，忙集仍是**项目粒度**的布尔集合。
    */
   private busyProjectPredicate(): string {
-    return "state = 'working' AND queue_state IN ('queued', 'claimed', 'running')";
+    return `${this.unsettledQueuePredicate()} AND ${WRITE_LANE_SQL}`;
+  }
+
+  /**
+   * **未落定队列谓词**（**不含档位**）：`state = 'working' ∧ queue_state IN ('queued','claimed','running')`
+   * = 「这一行还没结账」。
+   *
+   * ★ v0.8.10 O-N3 抽出：写档忙集（{@link busyProjectPredicate} = 本谓词 ∧ 写档）与只读档占位面
+   * （{@link listReadLaneTasksForProject} = 本谓词 ∧ 只读档）**共用这半判据** —— 二者只差档位条件。
+   * 排他**不在此**（由 `busyProjectPredicate` 叠加 `WRITE_LANE_SQL` 完成）⇒ **只读节点在飞时本谓词仍命中**
+   * ⇒ trace 的 `readOccupants` 才有料可报（U9：谓词一旦排除 read，占位面必须另有一处能看见他们）。
+   */
+  private unsettledQueuePredicate(): string {
+    return `state = 'working' AND queue_state IN ('queued', 'claimed', 'running')`;
   }
 
   /**
@@ -1709,18 +1793,62 @@ export class SessionStore {
   }
 
   /**
-   * **排队先于 `createdAt` 的 `queued` 任务数**（v0.8.8 §2.10(c) Trace 面；**只读**）：
-   * `queue_state = 'queued' ∧ created_at < ?`。ISO 串字典序即时间序，与 `created_at` 直接
-   * 比较成立；`created_at` 为 NULL 的老行不计。同毫秒并列**不区分**（严格 `<`，位次是估计量）。
+   * **只读档占位明细**（v0.8.10 O-N3 · REQ-v0.8.10-2026-09-23-01 §2.3 / U9；**只读**）：
+   * 同项目**未落定的只读行**（{@link unsettledQueuePredicate} ∧ `lane = 'read'`）的行级展开。
+   *
+   * ★ **为什么必须有这一面**（U9 跨侧不变量，与 `busyProjectPredicate` 的档位排除**同节点交付**）：
+   * 写忙集自 v0.8.10 起排除只读档 ⇒ 一个长跑 `read` 会让 trace 的 `projectBusy` 报 `busy=false`
+   * 而节点依旧没开工（machine 侧同 project 读并发闸 `maxConcurrentReads` 缺省 1）⇒ 宿主看到
+   * 「没被写门挡住、却没开工」的**假空洞**。本查询就是那片被忙集"让开"的占用面，
+   * 供 trace 的 `readOccupants[]` / `waitReason='read_lane_running'` 作答。
+   *
+   * - **`lane = 'read'` 是精确匹配**（与写侧两处判据相反）：NULL 归一为**写**档 ⇒ 只读档**只有显式声明**
+   *   才存在，漏掉 `NULL` 是**刻意**的（写成 `(lane IS NULL OR lane='read')` 会把存量行当成占位者）。
+   * - **跨 Feature、全项目集内该项目**：只读占位者可能是别的 Feature 的节点，也可能是散活行
+   *   （`feature_id IS NULL`，如 `mode="inquiry"` ⇒ O-N4 起恒只读档）。
+   * - 按 `queued_at` 升序（与 `claimTask` 的第二键同向 = 同档内的实际领取先后）。
    */
-  countQueuedBefore(createdAt: string): number {
-    if (createdAt.length === 0) return 0;
+  listReadLaneTasksForProject(projectId: string): QueuedTaskRecord[] {
+    if (projectId.length === 0) return [];
+    const rows = this.db
+      .prepare(
+        `SELECT ${QUEUE_TASK_COLUMNS} FROM tasks
+         WHERE project_id = ? AND ${this.unsettledQueuePredicate()} AND lane = 'read'
+         ORDER BY queued_at ASC, updated_at ASC`,
+      )
+      .all(projectId) as Array<Record<string, unknown>>;
+    return rows.map(rowToQueuedTask);
+  }
+
+  /**
+   * **排队先于 `queuedAt` 的 `queued` 任务数**（v0.8.8 §2.10(c) / **v0.8.10 O-N3 改键** ·
+   * Trace 面位次原料；**只读**）：`queue_state = 'queued' ∧ queued_at < ?`。
+   *
+   * ★ **排序键 = `queued_at`（入队时刻），不再是 `created_at`（登记时刻）** —— 与
+   *   {@link claimTask} 的实领序**同源**（该排序第一键是档位、第二键正是 `queued_at`）。
+   *   v0.8.8 用 `created_at` 是**两套时钟**：Feature 节点登记（`createTask`）与入队
+   *   （`enqueueTask`，= 调度器判定就绪之后）可相隔很久 ⇒ 位次与实际领取次序**系统性偏离**
+   *   （表现为"说在第 3、实际下一个就轮到我"）。改键后该偏差消除。
+   *
+   * - ISO 串字典序即时间序，与 `queued_at` 直接比较成立；`queued_at` 为 NULL 的行**不计**
+   *   （未入队 ⇒ 根本不在领取队列里，不是"排在谁前面"）。
+   * - **`queuedAt` 为 `null` / 空串（二者同义）= 不设上界**（「此刻入队会排在所有在队者之后」）：供 trace 给
+   *   **就绪但尚未入队**的节点一个投影位次 —— 这类行没有自己的 `queued_at`，拿登记时刻去比
+   *   正是 v0.8.8 的旧错。同毫秒并列**不区分**（严格 `<`）。
+   * - **残余口径 = 档位优先序，与 §2.2 的「写优先」同源、不可由本计数消除**：`claimTask` 第一键是
+   *   **写档优先**、第二键才是 `queued_at`，而本计数是**跨档位的纯 FIFO** ⇒
+   *   对**写档**节点，排在其前的**只读**行并不真的挡它 ⇒ 报出的位次**偏大**（实际更早轮到）；
+   *   对**只读**节点，晚入队的写档仍领在其前 ⇒ 报出的位次**偏小**。两者都是**保守方向相反**的
+   *   解释量，读账时按档位取方向，不得当成实领序号。
+   */
+  countQueuedBefore(queuedAt: string | null): number {
+    const bounded = queuedAt !== null && queuedAt.length > 0;
     const row = this.db
       .prepare(
         `SELECT COUNT(*) AS n FROM tasks
-         WHERE queue_state = 'queued' AND created_at IS NOT NULL AND created_at < ?`,
+         WHERE queue_state = 'queued' AND queued_at IS NOT NULL${bounded ? " AND queued_at < ?" : ""}`,
       )
-      .get(createdAt) as Record<string, unknown> | undefined;
+      .get(...(bounded ? [queuedAt] : [])) as Record<string, unknown> | undefined;
     return Number(row?.["n"] ?? 0);
   }
 
@@ -1973,9 +2101,29 @@ export class SessionStore {
   /**
    * **领取任务**（CAS：`WHERE queue_state = 'queued'`）。
    *
-   * 先从队列按 `queued_at` 升序（FIFO）取候选，再对候选逐条执行条件 UPDATE —— 当前态仍为
-   * `queued` 才置 `claimed`（写 `claimed_by` / 唯一 `claim_token` / `claimed_at`）⇒ 并发下
+   * 先从队列取候选，再对候选逐条执行条件 UPDATE —— 当前态仍为 `queued` 才置 `claimed`
+   * （写 `claimed_by` / 唯一 `claim_token` / `claimed_at`）⇒ 并发下
    * **同一任务至多被一个领取者拿到**（CAS 落空者自动试下一候选，绝不覆盖）。
+   *
+   * ★ **候选排序 = 写优先 + 同档 FIFO**（v0.8.10 O-N1 §2.2 H3 / D9）：
+   * `ORDER BY (lane IS NULL OR lane='write') DESC, queued_at ASC, updated_at ASC`。
+   * 为什么必须在**领取序**上补这一刀（忙集放宽不解决它）：读写分道后 read 节点可以与写节点同时
+   * 在队，若仍是跨 lane 全局 FIFO，**早入队的 read 会顶掉晚入队的 write** —— 写节点最坏等完
+   * 一整轮 read 窗。旧版本不出事，是因为 read 只在项目无写忙时才入队 ⇒ read **不可能**排在
+   * write 前面被领（隐患 H3 被串行掩盖，见改造文档 §1.2）。
+   *
+   * ⚠️ **三点随附口径**：
+   * 1. **`NULL` 必须算写档**（同 `busyProjectPredicate`，共用 `WRITE_LANE_SQL`）—— 写成
+   *    `lane = 'write'` 会让**迁移前的存量行 / 未升版老代码写入的行整体沉底**（排在所有 read 之后，
+   *    永远领不到）。
+   * 2. **写优先不是绝对序、是候选窗内序**：候选集仍是 `LIMIT 50`。本排序的第一键把**所有写档**
+   *    排在**所有只读档**之前 ⇒ 「50 个更早的 read 挤掉一个 write」**在本排序下不会发生**；
+   *    真正的上界是**同档内**超出候选窗（≥50 个更早的**同档**行把本行挤出本窗 ⇒ 下一轮才领到）。
+   *    **缺省不放宽 `LIMIT`**（放宽只是把上界推远，不改变「候选窗内序」这一性质），该上界
+   *    **登记为已知**（改造文档 §2.1 措辞按本条校正）。
+   * 3. **`rearm*`（重派 / 重发）不改 `lane`** —— `rearmTask` / `rearmForRetry` 只重置队列态与
+   *    记账列，**不产生「重派后变写档」**（也不产生反向的降档）；档位只在**登记时**由
+   *    `createTask({ lane })` 决定，重放的是同一个逻辑任务 ⇒ 沿用原档。
    *
    * - `projectIds` 缺省 = 不限项目；显式空数组 = 无可领取（返回 null，零 I/O）。
    * - `claimToken` 缺省由存储层生成（`randomUUID`；`idx_tasks_claim_token` 唯一索引兜底）。
@@ -2001,7 +2149,7 @@ export class SessionStore {
     const candidates = this.db
       .prepare(
         `SELECT task_id FROM tasks WHERE queue_state = 'queued'${projectClause}
-         ORDER BY queued_at ASC, updated_at ASC LIMIT 50`,
+         ORDER BY ${WRITE_LANE_SQL} DESC, queued_at ASC, updated_at ASC LIMIT 50`,
       )
       .all(...(projectIds === undefined ? [] : [...projectIds])) as Array<Record<string, unknown>>;
     if (candidates.length === 0) return null;
@@ -2695,9 +2843,14 @@ export function listBusyTasksForProject(projectId: string): QueuedTaskRecord[] {
   return getDefaultStore().listBusyTasksForProject(projectId);
 }
 
-/** 排队先于 `createdAt` 的 `queued` 任务数（v0.8.8 Trace 面位次原料；默认存储；只读） */
-export function countQueuedBefore(createdAt: string): number {
-  return getDefaultStore().countQueuedBefore(createdAt);
+/** 项目**只读档**占位明细（写忙集排除 read 后的补位面；v0.8.10 Trace 面；默认存储；只读） */
+export function listReadLaneTasksForProject(projectId: string): QueuedTaskRecord[] {
+  return getDefaultStore().listReadLaneTasksForProject(projectId);
+}
+
+/** 排队先于 `queuedAt`（入队时刻；`null` = 不设上界 = 全部在队数）的 `queued` 任务数（v0.8.10 Trace 位次原料；默认存储；只读） */
+export function countQueuedBefore(queuedAt: string | null): number {
+  return getDefaultStore().countQueuedBefore(queuedAt);
 }
 
 /** C11 派发占位：A2A send 前写入「已发出」事实（默认存储） */

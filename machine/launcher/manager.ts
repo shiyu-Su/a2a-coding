@@ -17,6 +17,7 @@ import type {
 import { appRootFromModule } from "./app-root.js";
 import { describeAgentConfig } from "./config-snapshot.js";
 import { waitForPort } from "./ports.js";
+import { StopEventLedger, type StopCause, type StopEvent } from "./stop-ledger.js";
 import {
   errorMessage,
   hasExited,
@@ -72,11 +73,15 @@ export class AgentStartError extends Error {
  */
 export interface InFlightLedgerLike {
   readonly size: number;
+  /** 按项目在飞计数（v0.8.10 · M-N1）；缺省 = 未提供 ⇒ 调用方回落 `size`（全机口径） */
+  countFor?(projectId: string): number;
   add(entry: {
     taskId: string;
     projectId: string;
     startedAt: string;
     a2aTaskId?: string | null;
+    readOnly?: boolean;
+    admittedAt?: string;
   }): void;
   remove(taskId: string): boolean;
   has(taskId: string): boolean;
@@ -96,6 +101,12 @@ export interface AgentManagerDeps {
    * 生产由 `launcher/index.ts` 创建**单一实例**并同时注入本管理器与 Runner（共享）。
    */
   inFlight?: InFlightLedgerLike;
+  /**
+   * 进程内停事件账（v0.8.10 · M-N4）：`stop()` 往这里盖「停因 + 当时的按项目在飞快照」，
+   * `runner-exec` 结算在飞任务时回读 ⇒ 被连坐的任务在 `diagnostics` 里能指认「谁杀了这一轮」。
+   * 缺省 = 自建（单测 / 未接线）；**不落盘**（连坐是进程内事实）。
+   */
+  stopEvents?: StopEventLedger;
 }
 
 interface RunningAgent {
@@ -103,6 +114,15 @@ interface RunningAgent {
   child: ChildProcess;
   endpoint: string;
   startedAt: string;
+}
+
+/**
+ * {@link AgentManager.stop} 的归因入参（v0.8.10 · M-N4）：只有**带停因**的停止才进停事件账。
+ * `causeTaskId` = 肇事任务（触发这次停止的归属者，**不是被停者** —— 改造文档 §3.2 U8）。
+ */
+export interface StopOptions {
+  cause?: StopCause;
+  causeTaskId?: string;
 }
 
 /** A2A 端点约定：本机回环 + 项目 a2aPort */
@@ -146,12 +166,13 @@ export function removeChildLedgerEntry(pid: number): void {
 }
 
 /**
- * 空闲回收判据（纯函数，v0.7.0 · M5·MC1 新口径）：
+ * 空闲回收判据（纯函数，v0.7.0 · M5·MC1 新口径；v0.8.10 · M-N1 起按项目计数）：
  * `inflight == 0 && (now - lastActivity) >= idleStopMs` ⇒ 可本地 stop。
  *
  * **忽略 bridge 可达性**：桥心跳失败只降 Runner 注册态字段（`registered` / `lastError`），
  * 不进入本判据（本函数甚至不接收该输入）⇒ 心跳失败**绝不**触发 stop。
  * `idleStopMs <= 0` = 禁用空闲回收；`inFlightCount > 0` = 有在飞任务 ⇒ 恒 false。
+ * `inFlightCount` 传**该项目自己的**在飞数（非全机）⇒ A 空闲即回收，即使 B 在忙（U2 行为变化）。
  */
 export function isIdleStopDue(opts: {
   inFlightCount: number;
@@ -172,8 +193,8 @@ export interface IdleTimerHandle {
 export interface IdleReaperOptions {
   /** 有效空闲回收时长（ms）；`<=0` = 禁用（不排任何计时） */
   idleStopMs: number;
-  /** 本机当前在飞任务数（数据源 = `InFlightLedger.size`） */
-  inFlightCount: () => number;
+  /** 在飞任务数（v0.8.10 · M-N1 起按项目回调：数据源 = `InFlightLedger.countFor(projectId)`） */
+  inFlightCount: (projectId: string) => number;
   /** 判据成立时的本地回收动作（由调用方执行 `stop`） */
   onIdle: (projectId: string) => void;
   /** 时钟（ms epoch；缺省 `Date.now`；单测注入假时钟） */
@@ -236,7 +257,7 @@ export class IdleReaper {
       if (this.entries.get(projectId) !== entry) return;
       entry.handle = null;
       const due = isIdleStopDue({
-        inFlightCount: this.options.inFlightCount(),
+        inFlightCount: this.options.inFlightCount(projectId),
         lastActivityMs: entry.lastActivityMs,
         nowMs: this.now(),
         idleStopMs: idleMs,
@@ -262,6 +283,11 @@ export class AgentManager {
   private readonly config: MachineConfig;
   /** 本机在飞任务台账（M5·MC1：与 Runner 共享同一实例；自检经此登记） */
   readonly inFlight: InFlightLedgerLike;
+  /**
+   * 进程内停事件账（v0.8.10 · M-N4）：`stop()` 写、`runner-exec` 读（归因五键）、
+   * `start()` 读（`cancelQuiesceMs` 播报）、`/health` 读（`cancelUnsupported`）。
+   */
+  private readonly stopEvents: StopEventLedger;
   /** 空闲回收计时（M5·MC1：判据 = inflight==0 且静默 ≥ idleStopMs） */
   private readonly idle: IdleReaper;
   private readonly running = new Map<string, RunningAgent>();
@@ -285,15 +311,36 @@ export class AgentManager {
   constructor(config: MachineConfig, deps: AgentManagerDeps = {}) {
     this.config = config;
     this.inFlight = deps.inFlight ?? EMPTY_IN_FLIGHT;
+    this.stopEvents = deps.stopEvents ?? new StopEventLedger();
     this.idle = new IdleReaper({
       idleStopMs: this.effectiveIdleStopMs(),
-      inFlightCount: () => this.inFlight.size,
+      // v0.8.10 · M-N1：按项目在飞计数（旧台账无 `countFor` ⇒ 回落全机 `size`，行为同旧版）
+      inFlightCount: (projectId) =>
+        this.inFlight.countFor?.(projectId) ?? this.inFlight.size,
       onIdle: (projectId) => {
-        void this.stop(projectId).catch((err: unknown) => {
+        // 停因 = `idle-reap`（v0.8.10 · M-N4）：连坐到的在飞任务据此在账面上指认回收方
+        void this.stop(projectId, { cause: "idle-reap" }).catch((err: unknown) => {
           console.error(`[launcher] agent ${projectId} 空闲回收失败：${errorMessage(err)}`);
         });
       },
     });
+  }
+
+  /**
+   * 进程内停事件账（v0.8.10 · M-N4 读点）：`runner-exec` 经 `RunnerExecHost` 取同一实例
+   * （读 = 按项目 + 时间窗命中停因；写 = 取消观察面 `cancelQuiesceMs` / `cancelUnsupported`）。
+   * 只读、无副作用。
+   */
+  stopEventLedger(): StopEventLedger {
+    return this.stopEvents;
+  }
+
+  /**
+   * 超时未静默（后端不认 `session/cancel`）的项目集（v0.8.10 · M-N4，供 `/health degraded`）。
+   * 与 diagnostics 的 `cancelUnsupported` **同名不同面**（沿用既有先例，不新造别名）。
+   */
+  cancelUnsupportedProjectIds(): string[] {
+    return this.stopEvents.cancelUnsupportedProjectIds();
   }
 
   /**
@@ -449,7 +496,12 @@ export class AgentManager {
 
     // 启动配置快照（每次拉起都打）：配置获取层级 + endpoint / 模型 id（配置面解析，观测用）。
     // v0.8.5 · M4：包装器配置产物（`agents/`）随段与配置通道退役 ⇒ 不再生成、无 configPath。
-    const snapshot = describeAgentConfig(project);
+    // v0.8.10 · M-N4：`cancelQuiesceMs` 取停事件账的取消往返值（无该值 ⇒ `undefined` ⇒ 播报省略该键）
+    const snapshot = describeAgentConfig(
+      project,
+      undefined,
+      this.stopEvents.lastCancelQuiesceMs(project.projectId),
+    );
     console.log(`[launcher] agent ${project.projectId} 配置层级：${snapshot.hierarchy}`);
     console.log(
       `[launcher] agent ${project.projectId} endpoint=${snapshot.endpoint}，model=${snapshot.model}`,
@@ -457,7 +509,12 @@ export class AgentManager {
     // 保留边界快照播报（v0.8.9 · M5）：orch 经 launcher.log 可见该机各项目的 SessionMap 保留策略。
     console.log(`[launcher] agent ${project.projectId} ${snapshot.sessionRetention}`);
     // 会话窗 / 续跑余量快照播报（v0.8.9 需求2 · M3）：两键生效值与出处，「开没开续跑」进日志。
+    // v0.8.10 · M-N4：同处追报该项目的取消往返耗时（本机 tasks/cancel → tasks/get 到桥台账转
+    // 终态；不反映后端是否真的停止计算。无往返 ⇒ 省略该键）。
     console.log(`[launcher] agent ${project.projectId} ${snapshot.sessionWindow}`);
+    // 并发闸上限快照播报（v0.8.10 · M-N5）：两把闸生效上限与出处，「这台机配了多少」进日志
+    // （此前该二键无任何回显面，只能靠并发行为反推）。
+    console.log(`[launcher] agent ${project.projectId} ${snapshot.gateLimits}`);
     // 后端入口分层解析结果（改造文档 §2.3 · B4）：命中报来源层，失败报逐层清单；
     // 清单入日志、不进 Error message（适配器抛错文案只留摘要 +「详见 launcher.log [backend] 行」）。
     console.log(`[backend] ${snapshot.backend}`);
@@ -556,8 +613,14 @@ export class AgentManager {
     return { projectId: project.projectId, endpoint, started: true };
   }
 
-  /** 停止项目 Agent；未运行时返回 stopped=false */
-  async stop(projectId: string): Promise<StopResult> {
+  /**
+   * 停止项目 Agent；未运行时返回 stopped=false。
+   *
+   * `opts.cause`（v0.8.10 · M-N4）= 停因：**给出即往进程内停事件账盖一条**
+   * 「停因 + 当时的按项目在飞快照」，供随后结算的在飞任务落 `diagnostics.stopCause`；
+   * **不给 ⇒ 不记账**（如自检收尾的 best-effort 回收 —— 那不是连坐，记了反而污染归因）。
+   */
+  async stop(projectId: string, opts?: StopOptions): Promise<StopResult> {
     this.getProject(projectId);
     this.idle.clear(projectId);
 
@@ -567,10 +630,31 @@ export class AgentManager {
       return { projectId, stopped: false };
     }
 
+    if (opts?.cause !== undefined) {
+      const event = this.stopEvents.recordStop({
+        projectId,
+        cause: opts.cause,
+        ...(opts.causeTaskId !== undefined ? { causeTaskId: opts.causeTaskId } : {}),
+        inflightAtStop: this.inFlight.countFor?.(projectId) ?? this.inFlight.size,
+      });
+      this.logStopEvent(event);
+    }
+
     this.running.delete(projectId);
     await terminateChild(entry.child);
     console.log(`[launcher] agent ${projectId} 已停止`);
     return { projectId, stopped: true };
+  }
+
+  /** 停事件落账播报（v0.8.10 · M-N4）：`inflightAtStop > 0` 即一次潜在连坐，日志先留证 */
+  private logStopEvent(event: StopEvent): void {
+    const collateral =
+      event.inflightAtStop > 0 ? ` ⚠ 停当时该项目在飞 ${String(event.inflightAtStop)} 个` : "";
+    console.log(
+      `[launcher] agent ${event.projectId} 停事件入账：cause=${event.cause}` +
+        `${event.causeTaskId !== undefined ? ` causeTaskId=${event.causeTaskId}` : ""}` +
+        ` inflightAtStop=${String(event.inflightAtStop)}${collateral}`,
+    );
   }
 
   /**

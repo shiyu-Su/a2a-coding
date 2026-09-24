@@ -169,6 +169,45 @@ test("硬用例 ①：桥 200 {ack,ignored} ⇒ outbox 文件已删、pendingCou
   }
 });
 
+test("落盘 schema 宽容（v0.8.10 · M-N1）：旧文件缺 readOnly/admittedAt 按写处理、新字段未消费不抛，两者均正常补结算", async () => {
+  const inflightDir = tmpDir("infl-tol");
+  const childrenDir = tmpDir("child-tol");
+  const outboxDir = tmpDir("outbox-tol");
+  try {
+    // 旧格式：无 readOnly / admittedAt 两键 ⇒ 按写处理，补结算路径不得抛
+    writeJson(join(inflightDir, "t-old.json"), {
+      taskId: "t-old",
+      projectId: "alpha",
+      startedAt: "2026-09-22T01:00:00.000Z",
+      a2aTaskId: null,
+    });
+    // 新格式：带两键 ⇒ 本版本只落盘不消费，读取侧照常出记录
+    writeJson(join(inflightDir, "t-new.json"), {
+      taskId: "t-new",
+      projectId: "beta",
+      startedAt: "2026-09-22T01:00:00.000Z",
+      a2aTaskId: null,
+      readOnly: true,
+      admittedAt: "2026-09-22T00:59:00.000Z",
+    });
+
+    const outbox = makeOutbox(outboxDir, async () => ignoredOk());
+    const summary = await reconcileInflightOnStartup({
+      inflightDir,
+      machineId: MACHINE_ID,
+      outbox,
+      childrenDir,
+      isAlive: () => false,
+      now: () => new Date(NOW_ISO),
+      logger: SILENT,
+    });
+    assert.deepEqual(summary, { reported: 2, skipped: 0, failed: 0, degraded: false });
+    assert.deepEqual(readdirSync(inflightDir), [], "两种格式都已消费删除");
+  } finally {
+    for (const d of [inflightDir, childrenDir, outboxDir]) rmSync(d, { recursive: true, force: true });
+  }
+});
+
 test("执行体在册跳过：存活 pid 所属项目的在飞条目不上报、文件保留", async () => {
   const inflightDir = tmpDir("infl");
   const childrenDir = tmpDir("child");

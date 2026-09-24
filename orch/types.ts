@@ -53,6 +53,21 @@ export type AgentKind = (typeof AGENT_KINDS)[number];
 export type TaskState = "working" | "completed" | "failed" | "input-required" | "blocked";
 
 /**
+ * 任务并发档（v0.8.10 O-N1，落 `tasks.lane`）。
+ *
+ * - `write`：**写档** = 参与「同 project 串行门」的唯一档位（缺省档，向后兼容）；
+ * - `read`：**只读档** = 退出写忙集 ⇒ 不再挡写、也不再被彼此的在队挡（读不挡写）。
+ *
+ * ⚠️ **落库 NULL 一律按 `write` 解释**（存量行 / 未带档的建行路径）—— 反过来（NULL 当只读）
+ * 等于静默放宽串行门。SQL 侧两处判据（忙集谓词 / `claimTask` 写优先排序）都写成
+ * `(lane IS NULL OR lane = 'write')`，**不得简化成 `lane = 'write'`**。
+ */
+export const TASK_LANES = ["read", "write"] as const;
+
+/** 任务并发档（由 `TASK_LANES` 派生；勿另立第二份清单） */
+export type TaskLane = (typeof TASK_LANES)[number];
+
+/**
  * 任务失败分类**六类闭集**（v0.4.1 引入；v0.6.1 REQ-05 起休眠；v0.8.7 O3 按二分恢复；
  * **v0.8.8 O1 硬切为六类**）。
  *
@@ -149,7 +164,7 @@ export interface FeatureCreateInput {
   contextId?: string | null;
   /**
    * 归属组（v0.8.6 §2.3）：建 Feature 时的连接身份（组名）；`null` / 缺省 = 无归属
-   * （未配组环境的匿名入口）。落 `features.owner_group`，Feature 五出口的可见性/可操作性据此判定。
+   * （未配组环境的匿名入口）。落 `features.owner_group`，Feature 六出口的可见性/可操作性据此判定。
    */
   ownerGroup?: string | null;
   /** 缺省 `waiting_approval`（主链起点 / 审批门停靠点） */
@@ -368,6 +383,26 @@ export interface TaskRecord {
   projectId: string;
   contextId: string;
   state: TaskState;
+  /**
+   * **并发档**（v0.8.10 O-N1，落 `tasks.lane`；取值见 {@link TASK_LANES}）。
+   *
+   * 声明形态：MCP 入参 `readOnly`（O-N4）→ 落库本列 → 透传 machine（`DispatchCommand.readOnly?`）。
+   * **读侧不存在 NULL**：列里的 NULL 一律归一为 `write`（保守、向后兼容，见 `TASK_LANES` 注记）。
+   *
+   * ★ **三条跨侧事实**（读账 / 排查「为什么没并行」时缺一不可，勿在本列语义里合并它们）：
+   * 1. **领取次序（写优先）= orch 的 `claimTask`** —— 候选排序把写档整体排在只读档之前
+   *    （否则早入队的 read 会顶掉晚入队的 write）。**这只决定「谁先被领」，不决定「谁在挡谁」**。
+   * 2. **实际并发 = machine 的闸**（`maxConcurrentWrites` / `maxConcurrentReads`，缺省 1/1）——
+   *    orch 侧**不做第二道闸**（真资源只在 machine 可见；orch 侧闸对不经调度器的散活天然有洞）。
+   *    ⇒ **两个时钟不得相加**：orch 领取队列的等待 ≠ machine 本机闸内等待。
+   * 3. **同批认领布尔本版刻意不改**（`computeReadyNodes` 的 `claimed: Set<projectId>`）——
+   *    同一 tick 同 project 至多放行一个节点（含两个 read）。这是**防洪泛的特性**，不是缺陷；
+   *    放开它 = 一次 tick 内同 project 并发起多个后端会话，属下一版议题。
+   *
+   * ⚠️ **忙集（挡人面）只看写档**：只读节点在飞 ⇒ 项目**不算忙**；写节点在飞 ⇒ 项目忙 ⇒
+   *    同 project 的读写节点都等（本版**不**放开「写挡读」）。
+   */
+  lane: TaskLane;
   artifactsJson: string | null;
   /** 任务结果纯文本（成功 = artifacts 文本；失败 = status.message 错误原因）；旧记录可能为 null */
   text: string | null;

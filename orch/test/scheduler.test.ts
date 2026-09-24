@@ -63,6 +63,8 @@ function task(
     projectId: "p1",
     contextId: "c1",
     state,
+    // v0.8.10 O-N1：并发档；纯函数构造取缺省档（写 = 参与串行门），需要只读经 `over` 覆盖
+    lane: "write",
     artifactsJson: null,
     text: null,
     prompt: null,

@@ -1,5 +1,5 @@
 /**
- * MCP Feature 工具组（v0.3.0，5 个）。
+ * MCP Feature 工具组（v0.3.0 起 5 个；v0.8.10 O-N3 加只读 trace = 6 个）。
  *
  * 纯数据层处理器：只依赖 `session/store.ts`、`feature/state-machine.ts` 与 `./scheduler.js` 的
  * **纯函数**（`planResume` = 重派 / 解冻计划，无副作用、不触发调度），
@@ -16,9 +16,9 @@
  *                          解冻闭包**外**的 `blocked` 下游，**不改 Feature 态**
  * - `handleFeatureApprove` 审批门：`waiting_approval → executing`
  * - `handleFeatureCancel`  任意非终态 → `cancelled`
- *
- * 另含 **trace 只读投影**（v0.8.8 §2.10(c)，非 MCP 工具）：`handleFeatureTrace` 回答
- * 「这个 Feature 为什么还没完成」（在等谁 / 排队位次），纯读不落库，供工作台端点复用。
+ * - `handleFeatureTrace`   **只读**投影「这个 Feature 为什么还没完成」（在等谁 / 排队位次 / 占位档）；
+ *                          **v0.8.10 O-N3 起挂成 MCP 工具 `a2a_feature_trace`**（Feature 工具组 5→6），
+ *                          与工作台端点 `/api/features/:id/trace` 复用**同一实现**（两出口零第二套判据）
  *
  * 另含 **② 可见面只读投影**（v0.8.9 §2.3，非 MCP 工具）：`projectTaskVisibility` =
  * 「派发包裹体积 + 触达次数 + machine diagnostics 透传」的**唯一实现**，
@@ -35,6 +35,7 @@ import {
   listBusyTasksForProject,
   listFeatureTasks,
   listFeatures,
+  listReadLaneTasksForProject,
   rearmForRetry,
   rearmTask,
   updateFeatureContext,
@@ -43,6 +44,7 @@ import {
 } from "../session/store.js";
 import { planResume } from "./scheduler.js";
 import type { FeatureContextPatch, QueueState, QueuedTaskRecord } from "../session/store.js";
+import type { TaskLane } from "../types.js";
 import {
   allowedTransitions,
   canTransition,
@@ -85,6 +87,15 @@ export interface FeatureTaskSummary {
   taskId: string;
   projectId: string;
   state: TaskRecord["state"];
+  /**
+   * **并发档**（v0.8.10 O-N3 additive；来源 `tasks.lane`，见 {@link TaskLane}）：
+   * `write` = 参与同 project 串行门（缺省档），`read` = 只读档（**退出写忙集** ⇒ 不挡写、不被写挡）。
+   *
+   * 读账口径：`read` 且**迟迟不开工**时，**先看 trace 的 `readOccupants`**（machine 侧同 project
+   * 读并发闸 `maxConcurrentReads` 缺省 1）而非 `projectBusy` —— 后者按设计只反映**写门**。
+   * 存量行 / 未带档登记 = `write`（NULL 已在读侧归一，**不存在第三个值**）。
+   */
+  lane: TaskLane;
   prompt: string | null;
   remoteTaskId: string | null;
   dependencies: string[] | null;
@@ -158,6 +169,19 @@ export interface TaskDiagnosticsView {
   sessionMapSize?: number;
   /** 会话映射最老条目年龄（天）；**空映射时 machine 不报该键** ⇒ 缺键 ≠ 0 */
   sessionMapOldestAgeDays?: number;
+  /**
+   * **停轮归因：谁杀的**（v0.8.10 · M-N4 五键之一，闭集 `idle-reap` / `continue` / `resend` /
+   * `stop-command`）；machine 未报 ⇒ 本键省略。
+   */
+  stopCause?: string;
+  /** **肇事任务 id**（触发 stop 的归属者，**不是被停者清单**，口径 U8） */
+  stopCauseTaskId?: string;
+  /** 派发收尾的**幽灵轮取消**（B16′）是否生效的账面证据；machine 判不出时不报 ⇒ 缺键 ≠ false */
+  ghostRoundCancelled?: boolean;
+  /** 取消 → 静默的耗时（ms，真机判据 R1）；**未走取消路径时 machine 不报** ⇒ 缺键 ≠ 0 */
+  cancelQuiesceMs?: number;
+  /** 后端不认 `session/cancel`（与 machine `/health` 同键名）；缺键 = machine 没报，**不等于「支持」** */
+  cancelUnsupported?: boolean;
 }
 
 /** {@link projectTaskVisibility} 的输入：只读投影所需的四个列（其余字段不消费） */
@@ -202,6 +226,15 @@ export function projectTaskVisibility(rec: TaskVisibilitySource): {
   };
 }
 
+/**
+ * `diagnostics` 透传白名单（**machine 侧键表的镜像**，两侧必须同步）。
+ *
+ * ★ v0.8.10 O-N3（REQ-v0.8.10-2026-09-23-01 §2.4 / A9）：machine 新增的**归因五键**
+ * （`stopCause` / `stopCauseTaskId` / `ghostRoundCancelled` / `cancelQuiesceMs` / `cancelUnsupported`）
+ * **必须在此列出** —— 本视图是**显式白名单**，未列入的键**从 MCP 出参里消失**而 **DB 原文仍在**，
+ * 是「库里查得到、宿主看不到」最难查的一类落差（v0.8.9 踩过同一个坑）。
+ * 新增键的同时**必须同步** {@link TaskDiagnosticsView} 的字段声明（否则 TS 侧读不到）。
+ */
 const DIAG_NUMBER_KEYS = [
   "turn",
   "promptChars",
@@ -214,10 +247,17 @@ const DIAG_NUMBER_KEYS = [
   "continueAttempts",
   "sessionMapSize",
   "sessionMapOldestAgeDays",
+  "cancelQuiesceMs",
 ] as const;
 
-const DIAG_STRING_KEYS = ["ambiguousReason"] as const;
-const DIAG_BOOLEAN_KEYS = ["sessionReused", "sessionResumed", "outcomeAmbiguous"] as const;
+const DIAG_STRING_KEYS = ["ambiguousReason", "stopCause", "stopCauseTaskId"] as const;
+const DIAG_BOOLEAN_KEYS = [
+  "sessionReused",
+  "sessionResumed",
+  "outcomeAmbiguous",
+  "ghostRoundCancelled",
+  "cancelUnsupported",
+] as const;
 
 /** `diagnostics_json` 原文 → ② 透传视图（NULL / 非法 JSON / 非对象 ⇒ 空视图，不报错） */
 function projectDiagnostics(diagnosticsJson: string | null): TaskDiagnosticsView {
@@ -258,6 +298,8 @@ function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
     taskId: rec.taskId,
     projectId: rec.projectId,
     state: rec.state,
+    // 并发档恒有值（读侧 NULL 已归一 write）：**不得省略字段**
+    lane: rec.lane,
     prompt: rec.prompt,
     remoteTaskId: rec.remoteTaskId,
     dependencies: rec.dependencies,
@@ -276,7 +318,7 @@ function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
 // ---------------------------------------------------------------------------
 
 /**
- * Feature **五出口归属校验**（§2.3 / §1.3 R-3 / G2）：`identity` = 本次连接身份（组名）。
+ * Feature **六出口归属校验**（§2.3 / §1.3 R-3 / G2）：`identity` = 本次连接身份（组名）。
  *
  * - `identity === null`（无身份）⇒ **全量放行**，不校验归属 —— 未配组环境的匿名入口与
  *   web 运维视图（§2.7「3300 非身份面」）皆走此路，零破坏；
@@ -720,26 +762,33 @@ export function handleFeatureCancel(
 }
 
 // ---------------------------------------------------------------------------
-// trace（v0.8.8 §2.10(c)：只读查询「在等谁 / 排队位次」；不落库、不触发调度）
+// trace（v0.8.8 §2.10(c) 只读查询；v0.8.10 O-N3 起同时是 MCP 工具 `a2a_feature_trace`）
 // ---------------------------------------------------------------------------
 
 /**
- * 「这个 Feature 为什么还没完成」的**只读投影**（REQ-v0.8.8-2026-09-22-01 §2.10(c) · O7）。
+ * 「这个 Feature 为什么还没完成」的**只读投影**（REQ-v0.8.8-2026-09-22-01 §2.10(c) · O7；
+ * **REQ-v0.8.10-2026-09-23-01 O-N3 扩档位可见面并挂成 MCP 只读工具**）。
  *
  * 纯计算（store 只读 + 现成判据），**不落库、不加写口、不改调度器行为**；
- * 出参为**独立新增只读面**（不改既有工具出参形状），供工作台 trace 端点与后续
- * 「排队可见面 / 限流」复用同一 helper。
+ * 出参为**独立新增只读面**（不改既有工具出参形状）。两个出口复用**本实现**、不写第二套判据：
+ * MCP `a2a_feature_trace`（按连接身份做归属校验）与工作台 `GET /api/features/:id/trace`（无身份）。
  *
  * 口径：
  * - 只输出**非终态节点**（`working` / `input-required`；`completed` / `failed` / `blocked` 不出）；
- * - **项目忙判定走队列态**（`state='working' ∧ queue_state IN ('queued','claimed','running')`，
+ * - **项目忙判定走队列态**（`state='working' ∧ queue_state IN ('queued','claimed','running') ∧ 写档`，
  *   经 `listBusyTasksForProject` = `listBusyProjectIds` 同一谓词的行级展开）——
  *   **不走 `remote_task_id`**（pull 模型下该列在飞期间恒 NULL，用了永远判「不忙」）；
  *   占用者可跨 Feature（项目串行是全局事实）。调度器**进程内** `reservedProjects` 只守
  *   「入队未落库」的同 tick 窗口（毫秒级），本查询覆盖不到，口径上按已落库事实回答；
+ * - ★ **`projectBusy` 只反映写门**（v0.8.10 起谓词排除只读档）⇒ 「被长跑 read 占着 machine 读闸」
+ *   这一格由 **`readOccupants[]`** 补答，`waitReason='read_lane_running'` 标记该情形
+ *   （否则「写门没挡、却没开工」= **假空洞**，跨侧不变量 U9）；
  * - `blockedOn` = **直接依赖**中未达 `completed` 者（含 failed/blocked 上游）；
- * - `position` = 全局 FIFO 位次估计：`queue_state='queued' ∧ created_at < 我` 计数 +1
- *   （仅对「已入队待领」或「就绪未入队」的 `working` 节点给出；ISO 同毫秒并列不区分）。
+ * - `position` = **与实领序同键**的 FIFO 位次：`queue_state='queued' ∧ queued_at < 我的入队时刻` 计数 +1。
+ *   v0.8.8 用 `created_at`（登记时刻）与 `claimTask` 的 `queued_at`（入队时刻）**两套时钟** ⇒ 位次
+ *   系统性偏离实领序；O-N3 改键后**同源**（不再是"估计量"）。**未入队**（就绪待派）节点没有
+ *   `queued_at` ⇒ 按「不设上界」投影 = 「此刻入队会排在所有在队者之后」。
+ *   唯一残余偏差 = `claimTask` 的**写优先**第一键（跨档纯 FIFO 计数消除不了，见 `countQueuedBefore` 注记）。
  */
 export function handleFeatureTrace(
   args: FeatureTraceArgs,
@@ -755,9 +804,12 @@ export function handleFeatureTrace(
 
   const nodes = listFeatureTasks(feature.featureId, { limit: 1000 });
   const byId = new Map(nodes.map((n) => [n.taskId, n]));
-  /** 读缓存：同项目忙明细 / 同登记时刻的位次各查一次（节点数上限 1000，纯读、量小） */
+  /** 读缓存：同项目写档忙明细 / 同项目只读档占位 / 同一位次上界的计数各查一次（节点上限 1000，纯读、量小） */
   const busyByProject = new Map<string, QueuedTaskRecord[]>();
-  const aheadByCreatedAt = new Map<string, number>();
+  const readLaneByProject = new Map<string, QueuedTaskRecord[]>();
+  /** 位次缓存键：入队时刻；`NO_QUEUED_AT` = 未入队（不设上界）那一档 */
+  const NO_QUEUED_AT = "";
+  const aheadByUpperBound = new Map<string, number>();
 
   const traced: FeatureTraceNode[] = [];
   for (const n of nodes) {
@@ -786,12 +838,31 @@ export function handleFeatureTrace(
       machineId: occupier?.claimedBy ?? null,
     };
 
+    // ★ 只读档占位面（写忙集 O-N1 起排除 read ⇒ 这一格不能空着，否则假空洞 = U9）
+    let readLaneTasks = readLaneByProject.get(n.projectId);
+    if (readLaneTasks === undefined) {
+      readLaneTasks = listReadLaneTasksForProject(n.projectId);
+      readLaneByProject.set(n.projectId, readLaneTasks);
+    }
+    const readOccupants: FeatureTraceReadOccupant[] = readLaneTasks
+      .filter((t) => t.taskId !== n.taskId)
+      .map((t) => ({
+        taskId: t.taskId,
+        featureId: t.featureId,
+        queueState: t.queueState,
+        machineId: t.claimedBy,
+        queuedAt: t.queuedAt,
+      }));
+
     let position: number | null = null;
-    if (n.state === "working" && n.createdAt !== null && (queueState === "queued" || queueState === null)) {
-      let ahead = aheadByCreatedAt.get(n.createdAt);
+    if (n.state === "working" && (queueState === "queued" || queueState === null)) {
+      // 上界 = 自己的入队时刻（与 `claimTask` 实领序同键）；未入队 ⇒ 不设上界（此刻入队即在队尾）
+      const upperBound = queueState === "queued" ? (q?.queuedAt ?? null) : null;
+      const cacheKey = upperBound ?? NO_QUEUED_AT;
+      let ahead = aheadByUpperBound.get(cacheKey);
       if (ahead === undefined) {
-        ahead = countQueuedBefore(n.createdAt);
-        aheadByCreatedAt.set(n.createdAt, ahead);
+        ahead = countQueuedBefore(upperBound);
+        aheadByUpperBound.set(cacheKey, ahead);
       }
       position = ahead + 1;
     }
@@ -800,10 +871,19 @@ export function handleFeatureTrace(
       taskId: n.taskId,
       projectId: n.projectId,
       state: n.state,
+      lane: n.lane,
       queueState,
-      waitReason: waitReasonOf(feature, n.state, queueState, blockedOn, projectBusy),
+      waitReason: waitReasonOf(
+        feature,
+        n.state,
+        queueState,
+        blockedOn,
+        projectBusy,
+        readOccupants.length > 0,
+      ),
       blockedOn,
       projectBusy,
+      readOccupants,
       position,
       waitedSince: waitedSinceOf(n, q, queueState),
     });
@@ -815,7 +895,14 @@ export interface FeatureTraceArgs {
   featureId: string;
 }
 
-/** 节点「为何未完成」（闭集；排队可见面 / 限流后续在此之上叠加） */
+/**
+ * 节点「为何未完成」（闭集；排队可见面 / 限流后续在此之上叠加）。
+ *
+ * ★ v0.8.10 O-N3 起为**八值**（末位 `read_lane_running` 是读写分道后补上的一格）：
+ * 写忙集（`busyProjectPredicate`）排除只读档 ⇒ 光看 `project_busy` 会把「被长跑 read 占着
+ * machine 读闸」读成「没人挡、却没开工」的**假空洞**，故必须有一个显式类别 + `readOccupants[]` 明细
+ * （跨侧不变量 U9：谓词改动与本档**同节点交付**）。
+ */
 export type FeatureWaitReason =
   /** `input-required`：等用户澄清 */
   | "awaiting_user"
@@ -827,18 +914,44 @@ export type FeatureWaitReason =
   | "upstream_dependencies"
   /** Feature 不在 `executing`：调度器不派发（waiting_approval / 主链后段 / 静止期外的停留） */
   | "feature_not_executing"
-  /** 依赖已满足但同项目被占（项目串行门） */
+  /** 依赖已满足但同项目被**写档**占（项目串行门） */
   | "project_busy"
-  /** 就绪且项目空闲：等调度器 tick 的派发窗口 */
+  /**
+   * 依赖已满足、写门不挡，但同项目有**未落定的只读档**行在占位（v0.8.10 O-N3）。
+   *
+   * 挡人的不是 orch 的门（只读档不入写忙集），而是 machine 侧同 project 读并发闸
+   * （`maxConcurrentReads`，缺省 1）⇒ **两个时钟不得相加**（口径 U6）：本值只说明
+   * 「同项目有 read 未落定」，不推断对方还要跑多久。明细见 `readOccupants[]`。
+   */
+  | "read_lane_running"
+  /** 就绪且项目空闲（写门、只读档均无占用）：等调度器 tick 的派发窗口 */
   | "ready_pending_dispatch";
 
 /** 项目占用（串行门）视图：bool + 占位节点 + 占位机 */
 export interface FeatureTraceProjectBusy {
   busy: boolean;
-  /** 占用项目的节点 id（`working ∧ queue_state 忙` 的他节点，可跨 Feature）；无占用 ⇒ null */
+  /** 占用项目的节点 id（`working ∧ queue_state 忙 ∧ 写档` 的他节点，可跨 Feature）；无占用 ⇒ null */
   taskId: string | null;
   /** 占位机（占用节点的 `claimed_by`）；占用者已入队未被领取 ⇒ null */
   machineId: string | null;
+}
+
+/**
+ * **只读档占位**（v0.8.10 O-N3；`lane='read' ∧ 未落定` 的他节点，可跨 Feature / 散活）。
+ *
+ * 与 {@link FeatureTraceProjectBusy} 的分工：后者 = **orch 写门**的事实（谁能挡派发），
+ * 本视图 = **被写门让开的那片占用面**（不挡 orch 派发、但会占住 machine 侧该项目的执行位）。
+ */
+export interface FeatureTraceReadOccupant {
+  taskId: string;
+  /** 占位节点归属的 Feature；`null` = 散活行（不经调度器、无 Feature 归属） */
+  featureId: string | null;
+  /** 占位行的队列态（`queued` = 已入队未被领取；`claimed` / `running` = 已在机上执行） */
+  queueState: QueueState;
+  /** 占位机（`claimed_by`）；已入队未被领取 ⇒ null */
+  machineId: string | null;
+  /** 该行的入队时刻（「等了多久」的原料）；未入队的老行 ⇒ null */
+  queuedAt: string | null;
 }
 
 /** trace 单节点视图（仅非终态节点） */
@@ -846,13 +959,23 @@ export interface FeatureTraceNode {
   taskId: string;
   projectId: string;
   state: TaskRecord["state"];
+  /** **并发档**（v0.8.10 O-N3 additive；`read` = 只读档，不参与写忙集） */
+  lane: TaskLane;
   /** 队列态；null = 不在队（未入队 / 重排后待再派 / input-required） */
   queueState: QueueState | null;
   waitReason: FeatureWaitReason;
   /** 未 completed 的直接依赖 id（与真实依赖一致；含 failed/blocked 上游） */
   blockedOn: string[];
   projectBusy: FeatureTraceProjectBusy;
-  /** 全局 FIFO 位次估计（1 起）；不适用（在飞 / `created_at` 未知）⇒ null */
+  /**
+   * 同项目**只读档**占位明细（不含自己；空数组 = 无只读占位）。
+   * `projectBusy.busy === false` 而本数组非空 ⇒ 即 `waitReason='read_lane_running'` 那一格。
+   */
+  readOccupants: FeatureTraceReadOccupant[];
+  /**
+   * FIFO 位次（1 起）；不适用（在飞 / 待澄清）⇒ null。
+   * **与 `claimTask` 实领序同键**（`queued_at`，v0.8.10 O-N3）；未入队节点 = 「此刻入队」的投影位次。
+   */
   position: number | null;
   /** 等待起点（在飞 = 领取时刻；排队 = 入队时刻；未入队 = 登记时刻；待澄清 = 最后更新时刻） */
   waitedSince: string | null;
@@ -872,6 +995,7 @@ function waitReasonOf(
   queueState: QueueState | null,
   blockedOn: readonly string[],
   projectBusy: FeatureTraceProjectBusy,
+  hasReadLaneOccupant: boolean,
 ): FeatureWaitReason {
   if (state === "input-required") return "awaiting_user";
   if (queueState === "claimed" || queueState === "running") return "running_remote";
@@ -879,6 +1003,8 @@ function waitReasonOf(
   if (blockedOn.length > 0) return "upstream_dependencies";
   if (feature.state !== "executing") return "feature_not_executing";
   if (projectBusy.busy) return "project_busy";
+  // 写门不挡却没开工 ⇒ 先看是不是只读档占着 machine 的读位（v0.8.10 O-N3，消「假空洞」）
+  if (hasReadLaneOccupant) return "read_lane_running";
   return "ready_pending_dispatch";
 }
 

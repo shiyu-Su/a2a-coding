@@ -28,6 +28,12 @@
  * ⇒ 成功次轮 `injectedChars=0`）· §2.3 键名契约全键面收口（宿主 2026-09-23 裁定：`lastBlockIndex`
  * **不上账面、不进 orch 投影**；`parseOutcomeFromGroups` **机制就绪、未接线** —— 见该两例注释，未擅自改生产代码）。
  *
+ * **v0.8.10 · M-N2** 追加：捕获台账换键 `sessionId → taskId`（同 session 两轮不串 · 并发两 task 各记各窗）·
+ * **dead 窗**语义（cancel / 被放弃 ⇒ 窗冻结，其 chunk 一律丢弃并计数）· 残段 id 登记与哨兵键
+ * `staleChunkCount`（恒报，`0` = 「没有残段漏进来」的正向证据；经 launcher 白名单透传）·
+ * `discardCapture` **照旧删窗**（不 park dead 窗；失败轮不登记残段 id ⇒ 其尾巴改走 M9-c 通道）·
+ * 结构锚（窗键 = taskId、通知侧两级路由）。
+ *
  * 运行：`npm test`。
  */
 import { test } from "node:test";
@@ -1280,11 +1286,17 @@ test("M1 半截取走后窗仍须弃：下一轮不受残窗污染", async () =>
   const turn1 = await r.execute(INPUT);
   assert.equal(turn1.state, "failed");
   assert.equal(diagOf(turn1)?.["partialTail"], "残段");
+  // v0.8.10 · M-N2：失败轮走 `discardCapture`（**删窗**），**不**判 dead、**不**登记残段 id
+  // —— 半截产出取完即弃，该轮的台账不留任何活格（续跑轮的尾巴另有通道，见 M-N2 ③）。
+  assert.equal(diagOf(turn1)?.["staleChunkCount"], 0, "失败轮的窗是被删掉的，不是被判死的 ⇒ 残段通道未介入");
 
   fail = false;
   const turn2 = await r.execute({ ...INPUT, taskId: "t2", text: "again", messageId: "m2" });
   assert.equal(turn2.state, "completed");
   assert.equal(turn2.text, "", "残段不得漏进下一轮（discardCapture 仍须执行）");
+  const d2 = diagOf(turn2);
+  assert.equal(d2?.["chunkCount"], 0, "下一轮自己的窗是空的（旧窗既不残留也不 park 成 dead 窗）");
+  assert.equal(d2?.["staleChunkCount"], 0, "本轮无残段可挡 ⇒ 哨兵为 0 = 「没有东西漏进来」的正向证据");
 });
 
 test("M1 sessionResumed 回标：load 真成功 ⇒ true", async () => {
@@ -2194,4 +2206,223 @@ test("② 口径锚（宿主 2026-09-23 裁定）：lastBlockIndex 不上账面 
   //         ⇒ 登记为未覆盖项，待真机取证证实 R-a 现实存在后再接线。
   assert.ok(!sessionSrc.includes("parseOutcomeFromGroups("), "登记：M3 的分组入口尚无消费方");
   assert.ok(sessionSrc.includes("parseOutcome(text)"), "现状：桥仍走全文口径末块");
+});
+
+// ---------- v0.8.10 · M-N2：捕获台账换键（sessionId → taskId）+ dead 窗 + staleChunkCount ----------
+// 本段测的是**记录本本身**：同一 `sessionId` 上先后/并存的多个 task 各记各窗，被判死的窗不再
+// 产文本，被挡下的残段一律计数（哨兵键 `staleChunkCount`）。换键是 M-N3（定向取消）与只读真并行的地基。
+
+/** 在**指定** sessionId 上发一条 chunk（M-N2 的并发用例需要同一时刻并存的两条会话交错发送）。 */
+function emitOn(client: FakeClient, sessionId: string, text: string, messageId?: string): void {
+  client.emit("session/update", {
+    sessionId,
+    update: {
+      sessionUpdate: "agent_message_chunk",
+      ...(messageId !== undefined ? { messageId } : {}),
+      content: { type: "text", text },
+    },
+  });
+}
+
+/** 一条在飞 `session/prompt` 的手动闸门（可 resolve 也可 reject）。 */
+interface PromptGate {
+  promise: Promise<{ stopReason: string }>;
+  resolve: (value: { stopReason: string }) => void;
+  reject: (err: unknown) => void;
+}
+
+/** 多条 `session/prompt` 依调用序各给一个闸门（并发任务的骨架）。 */
+function multiPrompt(
+  client: FakeClient,
+  sessionIdFor: (params: unknown) => string = () => "s1",
+): { prompts: PromptGate[] } {
+  const prompts: PromptGate[] = [];
+  client.responder = (method, params) => {
+    if (method === "session/new") return { sessionId: sessionIdFor(params) };
+    if (method === "session/prompt") {
+      let resolve: (value: { stopReason: string }) => void = () => undefined;
+      let reject: (err: unknown) => void = () => undefined;
+      const promise = new Promise<{ stopReason: string }>((res, rej) => {
+        resolve = res;
+        reject = rej;
+      });
+      prompts.push({ promise, resolve, reject });
+      return promise;
+    }
+    return {};
+  };
+  return { prompts };
+}
+
+test("M-N2 ① 同一 sessionId 的两轮不串：旧轮窗判 dead、其尾巴被挡并计入 staleChunkCount", async () => {
+  const client = new FakeClient();
+  const { prompts } = multiPrompt(client);
+  const r = runner(client);
+
+  const first = r.execute({ ...INPUT, taskId: "t1", text: "第一轮" });
+  await settle();
+  emitOn(client, "s1", "第一轮的正文", "msg-1"); // 落进 t1 的窗
+
+  // 同 session 上再起一轮 ⇒ 开窗前先把上一轮的窗判 dead（等待已放弃、后端还在跑 = 幽灵轮）
+  const second = r.execute({ ...INPUT, taskId: "t2", text: "第二轮", messageId: "m2" });
+  await settle();
+  emitOn(client, "s1", "第一轮的尾巴（幽灵）", "msg-1"); // 同 id ⇒ 进不了新窗
+  emitOn(client, "s1", "第二轮的正文", "msg-2");
+  prompts[0]?.resolve({ stopReason: "end_turn" });
+  prompts[1]?.resolve({ stopReason: "end_turn" });
+
+  const firstResult = await first;
+  const secondResult = await second;
+  assert.equal(firstResult.text, "第一轮的正文", "旧轮文本冻结在判 dead 时刻");
+  assert.equal(secondResult.text, "第二轮的正文", "旧轮的尾巴不得漏进新轮");
+
+  const d1 = diagOf(firstResult);
+  const d2 = diagOf(secondResult);
+  assert.ok(d1 !== null && d2 !== null);
+  assert.equal(d1["chunkCount"], 1, "判 dead 后旧窗不再收 chunk");
+  assert.equal(d1["partialChars"], 6);
+  assert.equal(d1["staleChunkCount"], 0, "旧轮自己没被残段打扰（它的尾巴是被新轮挡下的）");
+  assert.equal(d2["chunkCount"], 1, "新窗只收自己那条");
+  assert.equal(d2["replayDropped"], 0, "残段走 staleChunkCount 分账，不并入历史重放");
+  assert.equal(d2["staleChunkCount"], 1, "哨兵：有一条残段试图漏进本轮，已挡");
+  assert.equal(d2["blockCount"], 0);
+});
+
+test("M-N2 ② 并发两 taskId 各记各窗：后一轮的开/收不得覆盖或抹掉在飞轮的窗", async () => {
+  // 旧口径（`sessionId` 单值键）下：t2 开窗会把 t1 的窗**整格覆盖**，t2 收窗再把它删掉
+  // ⇒ t1 收窗时拿到 `undefined`，结果文本被清空。换键后各记各窗，此例即回归锚。
+  const client = new FakeClient();
+  const { prompts } = multiPrompt(client);
+  const r = runner(client);
+
+  const first = r.execute({ ...INPUT, taskId: "t1", text: "第一轮" });
+  await settle();
+  emitOn(client, "s1", "第一轮的正文", "msg-1");
+
+  const second = r.execute({ ...INPUT, taskId: "t2", text: "第二轮", messageId: "m2" });
+  await settle();
+  emitOn(client, "s1", "第二轮的正文", "msg-2");
+  prompts[1]?.resolve({ stopReason: "end_turn" });
+  const secondResult = await second; // t2 先收窗（注销活跃指针）
+  assert.equal(secondResult.text, "第二轮的正文");
+
+  // t1 仍在飞：它判 dead 之后到达的尾巴落窗外（无指针）⇒ 只登记重放 id，不进任何窗
+  emitOn(client, "s1", "第一轮的尾巴", "msg-1");
+  prompts[0]?.resolve({ stopReason: "end_turn" });
+  const firstResult = await first;
+
+  const d1 = diagOf(firstResult);
+  assert.ok(d1 !== null);
+  assert.equal(firstResult.text, "第一轮的正文", "t1 的窗没被 t2 覆盖/删除 ⇒ 自己收到的东西还在");
+  assert.equal(d1["chunkCount"], 1, "判 dead 之后的尾巴不计入 t1");
+  assert.equal(d1["partialChars"], 6);
+  assert.equal(d1["staleChunkCount"], 0);
+  assert.equal(d1["turn"], 1, "两窗各持自己的轮次序号快照（开窗时取，不互相覆盖）");
+});
+
+test("M-N2 ③ discardCapture 照旧删窗：失败轮不 park dead 窗，其残段走 M9-c 通道而非残段通道", async () => {
+  const client = new FakeClient();
+  const { prompts } = multiPrompt(client);
+  const r = runner(client);
+
+  const first = r.execute({ ...INPUT, taskId: "t1", text: "第一轮" });
+  await settle();
+  emitOn(client, "s1", "第一轮的半截", "msg-1");
+  prompts[0]?.reject(new AcpError("rpc", "boom")); // 失败 ⇒ discardCapture（删窗 + 注销指针）
+  const firstResult = await first;
+  assert.equal(firstResult.state, "failed");
+  assert.equal(diagOf(firstResult)?.["partialTail"], "第一轮的半截");
+
+  // 弃窗后后端还在跑：这条尾巴既无窗可进（证明窗被删、不是被 park 成 dead），也不该被登记成残段
+  emitOn(client, "s1", "第一轮的尾巴", "msg-1");
+
+  const second = r.execute({ ...INPUT, taskId: "t2", text: "第二轮", messageId: "m2" });
+  await settle();
+  emitOn(client, "s1", "第二轮的正文", "msg-2");
+  emitOn(client, "s1", "第一轮的尾巴再抖一次", "msg-1"); // 窗外登记过的 id ⇒ M9-c 丢弃
+  prompts[1]?.resolve({ stopReason: "end_turn" });
+  const secondResult = await second;
+  const d2 = diagOf(secondResult);
+  assert.ok(d2 !== null);
+  assert.equal(secondResult.text, "第二轮的正文", "失败轮的尾巴同样漏不进下一轮");
+  assert.equal(d2["replayDropped"], 1, "失败轮走的是 M9-c 重放通道（窗外登记 id）");
+  assert.equal(d2["staleChunkCount"], 0, "失败轮**不**登记残段 id：续跑轮合法接着写同一条消息，判残段会丢空整轮");
+});
+
+test("M-N2 ④ cancel 即判 dead：窗冻结，取消后才到的 chunk 一律丢弃并计数", async () => {
+  // 「有实质产出」的判据原料是 `partialChars` —— 已取消的任务若还在涨它，就会被误判成可续跑。
+  const client = new FakeClient();
+  const { prompts } = multiPrompt(client);
+  const r = runner(client, 60_000);
+  const p = r.execute(INPUT);
+  await settle();
+  emitOn(client, "s1", "前半段", "msg-1");
+  await r.cancel("t1");
+  emitOn(client, "s1", "取消后才吐的尾巴一", "msg-1");
+  emitOn(client, "s1", "取消后才吐的尾巴二", "msg-1");
+  prompts[0]?.resolve({ stopReason: "cancelled" });
+
+  const result = await p;
+  const diag = diagOf(result);
+  assert.ok(diag !== null);
+  assert.equal(result.state, "canceled");
+  assert.equal(result.text, "前半段", "判 dead 后的 chunk 不进本轮文本");
+  assert.equal(diag["chunkCount"], 1);
+  assert.equal(diag["partialChars"], 3, "partialChars 冻结在判 dead 时刻");
+  assert.equal(diag["staleChunkCount"], 2, "dead 窗的 chunk 一律丢弃并计数");
+});
+
+test("M-N2 ⑤ 结构锚：捕获窗的键 = taskId（sessionId 不再作窗键）· 弃窗只删不 park", () => {
+  const src = readFileSync(
+    // 运行时 = dist/test/*.js，源码在 machine 根（../../）
+    new URL("../../acp-bridge/acp/session.ts", import.meta.url),
+    "utf8",
+  );
+  assert.ok(src.includes("this.captures.set(input.taskId,"), "开窗键 = taskId");
+  assert.ok(!src.includes("this.captures.set(sessionId"), "sessionId 不再是窗的键");
+  assert.ok(src.includes("this.captures.get(input.taskId)"), "失败路径按 taskId 取回自己的窗");
+  assert.ok(src.includes("private readonly activeTaskOf = new Map<string, string>();"), "两级路由指针存在");
+  assert.ok(src.includes("this.routeCapture(sessionId)"), "通知侧走两级路由");
+
+  const discard = src.slice(src.indexOf("private discardCapture("), src.indexOf("private discardCapture(") + 700);
+  assert.match(discard, /this\.captures\.delete\(taskId\)/, "discardCapture 仍删窗");
+  assert.ok(!discard.includes("markCaptureDead"), "弃窗路径不 park dead 窗（留窗 = 重现「尾巴漏进下一轮」）");
+});
+
+test("M-N2 ⑥ staleChunkCount 上账面且经 launcher 白名单透传（恒报，0 也算证据）", async () => {
+  const client = new FakeClient();
+  client.responder = (method) => (method === "session/new" ? { sessionId: "s1" } : { stopReason: "end_turn" });
+  const result = await runner(client).execute(INPUT);
+  const diag = diagOf(result);
+  assert.ok(diag !== null);
+  assert.equal(diag["staleChunkCount"], 0, "干净一轮也须报 0（缺键与报 0 是两回事）");
+  const passed = assertDiagPassthrough(result, ["staleChunkCount"]);
+  assert.equal(passed["staleChunkCount"], 0, "launcher 白名单漏放行 ⇒ 哨兵停在机内，取证链断");
+});
+
+// ---------- REQ-v0.8.10-2026-09-24-01 · M-N3：桥侧自取消（prompt 满窗出口）----------
+
+test("M-N3 桥自取消：prompt 满窗出口发 session/cancel + 结果标 abandoned（后端那轮不再白烧）", async () => {
+  const client = new FakeClient();
+  failingPrompt(client, () => new AcpError("timeout", "session/prompt 超过 1000ms"));
+
+  const result = await runner(client).execute(INPUT);
+  assert.equal(result.state, "failed");
+  // `abandoned` = 台账「终态支路」的唯一输入：没有它，launcher 迟到的 tasks/cancel 会被终态跳过
+  assert.equal(result.abandoned, true);
+  assert.deepEqual(
+    client.notifies.filter((n) => n.method === "session/cancel").map((n) => n.params),
+    [{ sessionId: "s1" }],
+    "满窗即尽力通知后端取消那一轮（只走控制通道）",
+  );
+});
+
+test("M-N3 桥自取消（负向）：非满窗的 prompt 失败既不 notify 也不标 abandoned", async () => {
+  const client = new FakeClient();
+  failingPrompt(client, () => new AcpError("rpc", "prompt rejected"));
+
+  const result = await runner(client).execute(INPUT);
+  assert.equal(result.state, "failed");
+  assert.equal(result.abandoned, undefined, "后端语义拒绝 ≠ 放弃（该轮已自然收敛，无幽灵可言）");
+  assert.equal(client.notifies.filter((n) => n.method === "session/cancel").length, 0);
 });

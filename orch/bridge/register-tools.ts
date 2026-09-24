@@ -115,6 +115,12 @@ export const a2aCallSchema = {
     .describe(
       '本节点引用的上游产物（仅 mode="execute" 生效）：{producerTaskId, name} 或 {artifactId}；派发时解析并注入完成的上游产物内容/引用',
     ),
+  readOnly: z
+    .boolean()
+    .optional()
+    .describe(
+      'true = 声明本节点为**只读**（落 `tasks.lane=read`，machine 按只读档放行）；缺省 / false = 按写档（保守）',
+    ),
 };
 
 /** 准入判定结果：通过 → `{ ok: true }`；拒绝 → 结构化错误（桥转 `errorResult`） */
@@ -156,9 +162,12 @@ export function validateCallMode(args: {
 }
 
 /**
- * 把全部工具（泛型 7 + Feature 工具组 5）注册进给定 server。
+ * 把全部工具（泛型 7 + Feature 工具组 6，v0.8.10 O-N3 起）注册进给定 server。
  *
- * **工具名 / 描述 / 入参 schema 与原实现逐字一致**；静态注册、不发 `tools/list_changed`（零重连）。
+ * **既有工具名 / 描述 / 入参 schema 与原实现逐字一致**；静态注册、不发 `tools/list_changed`（零重连）。
+ * 新增的 `a2a_feature_trace` 是**只读**出口（v0.8.10 O-N3）：复用 `feature-tools.ts` 的
+ * `handleFeatureTrace`，与工作台端点同一实现 —— **工作台不得成为第二编排入口**，故排队可见面
+ * 必须挂进 MCP 面（也**不新增第 8 个泛型工具**：它是 Feature 级查询，归属 Feature 工具组）。
  */
 export function registerTools(server: McpServer, core: BridgeCore): void {
   server.registerTool(
@@ -215,6 +224,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
         "向目标项目派发一轮任务：解析项目→机器，**任务入队**（Runner 反向注册后经 `/runner/connect` 领取并在目标机本地执行），返回文本结果 + artifacts。传入相同 contextId 可续接上下文；返回 contextId 便于继续追问。wait=false 时立即返回句柄（全异步，不进入同步等待）。" +
         `**mode 必填（无缺省）**：mode="execute" = 执行型派发，**必带 featureId**，任务作为 Feature DAG 节点登记（不立即派发），由调度器按 dependencies 串行自动派发（可挂载态 = ${MOUNTABLE_FEATURE_STATES.join(" / ")}）；mode="inquiry" = 只读询问 / 核实（Step 0/1 用），**不得带 featureId**，经队列立即下发。` +
         "**即时性说明**：任务入队后桥经 `/runner/connect` 的 wake 信号**尽力立即下发**；目标机 Runner 未连接时，照常入队（**不拒绝**），最长等其下一轮轮询周期（约 `runner.holdMs`，默认 25s）被领取。" +
+        "**只读声明**：`readOnly=true` 标记节点为只读档（machine 侧只读闸内放行、不占写忙集）；缺省 / false = 按写档（保守）。inquiry 恒为只读档，无需声明。" +
         "**仅项目组成员可派发**：非成员 ⇒ 返回 `project_not_a_member`（零出站请求即失败）。",
       inputSchema: a2aCallSchema,
     },
@@ -239,6 +249,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
             featureId,
             args.dependencies ?? [],
             args.inputs,
+            args.readOnly,
           );
           return outcome.ok ? textResult(outcome) : errorResult(outcome);
         }
@@ -483,6 +494,31 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     async (args) => {
       try {
         const outcome = core.featureCancel({ featureId: args.featureId });
+        return outcome.ok ? textResult(outcome) : errorResult(outcome);
+      } catch (err) {
+        return internalError(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "a2a_feature_trace",
+    {
+      description:
+        "**只读**：回答「这个 Feature 为什么还没完成」——逐非终态节点给出" +
+        "`waitReason`（闭集：awaiting_user / running_remote / queued / upstream_dependencies / feature_not_executing / project_busy / read_lane_running / ready_pending_dispatch）" +
+        "· `position`（排队位次，**与实领序同键** = `queued_at`；未入队 = 「此刻入队会排第几」的投影）" +
+        "· `waitedSince`（等待起点）· `projectBusy`（**写门**占用者 + 占位机，可跨 Feature）· `lane`（并发档）。" +
+        "**读写分道口径（v0.8.10）**：`projectBusy` 只反映写门 ⇒ 写门没挡却没开工时看 `readOccupants[]`" +
+        "（同项目未落定的只读档占位；`waitReason='read_lane_running'`）—— 实际挡人的是 machine 侧同 project 读并发闸，" +
+        "**两个时钟不得相加**（orch 领取队列的等待 ≠ machine 闸内等待）。纯读：不落库、不触发调度。",
+      inputSchema: {
+        featureId: z.string().min(1).describe("Feature ID"),
+      },
+    },
+    async (args) => {
+      try {
+        const outcome = core.featureTrace({ featureId: args.featureId });
         return outcome.ok ? textResult(outcome) : errorResult(outcome);
       } catch (err) {
         return internalError(err);

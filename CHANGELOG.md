@@ -2,6 +2,49 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.8.10] - 2026-09-24
+
+> 主题：**执行可靠性 IV：并发与容量**（单需求 `REQ-v0.8.10-2026-09-23-01`；用户 2026-09-24 Step 3「通过」，改造文档 final）。**把「同 project 串行」拆成「写串行 + 读不挡人」，并给并发补上闸门与排队可见面**，同时修掉「只读并行一放开就会立刻引爆」的三处既有隐患。三件事：**① 并发语义定稿**（「场景 × 可否并行」矩阵落 `flow/spec/引擎映射.md` §4.1 + 宿主两份纪律）· **② 同 project 内节点读写分道**（只读档退出写忙集 + `claimTask` 写优先）· **③ 排队可见面 + 两把并发闸**（machine 侧 `maxConcurrentWrites` / `maxConcurrentReads`，缺省 **1/1**）。**三处隐患一次修掉**：**H1 连坐**（续跑/重发曾 `stop` 整个 project 的桥 ⇒ 同 project 在飞任务全遭殃；实证 = 4 个只读任务在续跑触发后数秒内 `failureKind=transport`）· **H2 回收失效**（空闲回收判据用**全机**在飞数 ⇒ 只读并行常态化后桥进程只增不减）· **H3 领取越队**（跨 lane 全局 FIFO ⇒ 早入队的 read 顶掉晚入队的 write、write 最坏等一整轮读窗）。**用户追加深补 B16′**：一趟派发结束时主动取消「仍在烧的那一轮」，不再任其白烧。**协议零变更**（`PROTOCOL_VERSION` 仍 **2.3** —— `readOnly` 走可选字段、归因走既有 `diagnostics` 自由 JSON，未升级对端忽略即按写档）。
+
+### Changed
+
+- **忙集只算写档 ⇒「读不挡写、读不挡读」**（orch）：`busyProjectPredicate` = `unsettledQueuePredicate ∧ WRITE_LANE_SQL`（`lane IS NULL OR lane = 'write'`，**NULL 归写档**）。**「写挡读」刻意保留**（写档在飞 ⇒ 项目仍忙 ⇒ 同 project 读写节点一律等）—— 与改造文档 §4.1 判据 A2 一致。
+- **`claimTask` 候选排序 = 写优先**（orch）：`ORDER BY (lane IS NULL OR lane='write') DESC, queued_at ASC, updated_at ASC LIMIT 50` ⇒ 修 H3；口径为**候选窗内序、非绝对序**。
+- **续跑 / 重发改「定向取消」**（machine）：`cancelRound`（`tasks/cancel` → 有界轮询至桥台账转终态，`CANCEL_TIMEOUT_MS = 10_000`）+ `ensure` 幂等复用同桥，**不再 `stop` 桥** ⇒ 修 H1；静默未达成 ⇒ **(C) 降级**（不 stop、不续跑、保持 failed 交宿主）。
+- **★ B16′ 收尾取消**（machine）：一趟派发结束（**含「判定不续跑」路径**）在 `buildResult` + `outbox.deliver()` **之后**发一次有界 `tasks/cancel`（三条硬约束：只走控制通道 / 不改 record state / 排在 deliver 之后）；桥侧 `registry.cancel()` 加**终态支路**（`state ∈ 终态 ∧ 该轮标 abandoned ⇒ 仍 notify、state 不变`）—— 不补这条，「续跑后超时」场景拿不到取消。
+- **空闲回收判据改按项目**（machine）：三处 `stop` 判据从全机 `size` 改为 `ledger.countFor(projectId)`（`isIdleStopDue` / 注入点 / `handleStop` 拒收）⇒ 修 H2。**行为改变**：**某项目空闲即被回收、即使别的项目在忙**（今天不会）。
+- **捕获窗换键 `sessionId → taskId`**（machine 桥）：并发（尤其同 `sessionId` 复用）下按 sessionId 单值键会**互相覆盖捕获窗** —— 这是只读并行与「定向取消后续跑」的共同前置；取消后到达的 chunk 落 dead 窗并计数（哨兵 `staleChunkCount`，纯取证、不参与判据）。
+- **`/health degraded` 补齐四键**（machine）：`inFlightByProject` / `queuedByProject{write,read,oldestWaitedMs}` / `lastCancelQuietMs` / `cancelUnsupported` —— **四键恒在**（无在飞 / 无排队 ⇒ `{}`，无取消往返实测 ⇒ `null`；**不得省略键**）。
+- **两把闸上限进 `config-snapshot` 播报**（machine）：启动时逐项目打印 `并发闸：写上限=…（agentConfig|缺省） 读上限=…（agentConfig|缺省）`（出处按「键配没配」判定，显式配 `1` 与缺省回落 `1` 可区分）—— 此前该二键**无任何回显面**，生效值只能靠并发行为反推。
+- **口径更正：`cancelQuiesceMs` 不是「取消到静默」**（machine）：它量的是**取消往返**（本机 loopback `tasks/cancel` → `tasks/get` 到**桥台账转终态**的墙钟差，实测 **2–5ms**），**不反映后端是否真的停止计算**（桥侧 `session/cancel` 是 fire-and-forget、台账就地置终态）⇒ 播报文案、注释与 `machine/README.md` 全部改准，并写明「后端是否真停」当前**没有面承载**。
+
+### Added
+
+- **`readOnly` 声明链**：`a2a_call(readOnly=true)` → `tasks.lane='read'`（缺省 / 非 `true` ⇒ 按 write）→ `DispatchCommand.readOnly`；**inquiry 恒为 read 档**。**只读是「声明」不是「强制」**（引擎看不见任务动哪些文件）。
+- **新 MCP 只读工具 `a2a_feature_trace`**（Feature 工具组 5 → 6）：逐**非终态**节点给出 `waitReason`（**八值闭集**，含新增 `read_lane_running`）/ `position`（与实领序同键 = `queued_at`）/ `waitedSince` / `lane` / `projectBusy{taskId,machineId}`（**只反映写门**）/ `readOccupants[]` ⇒ 排队四问（在排队吗 / 等了多久 / 前面几个 / 被谁挡）首次可查。
+- **归因五键 + 哨兵**（既有 `diagnostics` blob 内，不动 `failureKind` 六类闭集）：`stopCause` / `stopCauseTaskId` / `ghostRoundCancelled` / `cancelQuiesceMs` / `cancelUnsupported` + `staleChunkCount`；`handleCancel` 成功路径补一行 info 日志（取消从此可自证）。
+- **规范与宿主纪律**：`flow/spec/引擎映射.md` §4.1 新增「**并发语义矩阵（v0.8.10）**」子块（四边矩阵 · 三条不变量 · 两把闸 · 声明机制 · 两个时钟不得相加 · 真机实测脚注）+ §5 工具面 5 → 6；`AGENTS.md` / `CLAUDE.md` 各新增「**并发语义与派发纪律（v0.8.10）**」章（六条）。
+- **本版新增测试**：`machine/test/gate-concurrency.test.ts` · `machine/test/runner-exec-attribution.test.ts` · `orch/test/o-n4-lane-declaration.test.ts` · 根回归新套件 `test-v0.8.10-concurrency.js`（TC22）。
+
+### Removed
+
+- 无退役面。（**结清两版旧账**：`orch/config/config.json.default` 的 `failure_kind=infra` 改为 `runner` —— 该取值自协议 2.3 起非法，v0.8.8 / v0.8.9 两次登记后随本版清掉。）
+
+### 门禁与真机
+
+- **单元门禁（发版前重跑实测）**：machine `typecheck` **0** / `lint` **0** / `npm test` **546 / 546 · 0 失败**；orch `typecheck` **0** / `lint` **0** / `npm test` **361（360 pass / 0 fail / 1 平台跳过）**。
+- **宿主回归**：**1332 / 1332 零失败**（`reports/v0.8.10/regression-report.json`；新增 TC22）。**与 v0.8.9 的 1299 差额 = +33，已用 `results[].name` 集合差核实**：**+41**（TC22 的 34 条 + v0.8.10 改造文档 3 条锚 + 版本锚 3 条 + 「三处 package.json version 一致」1 条）**− 8**（v0.8.9 旧文档锚 5 条 + 旧版本锚 3 条）＝ **+33**。
+- **真机（Step 3 · 2026-09-24；桥与 Launcher 均重启、`dist` 与 `src` 同步；全程宿主自取证据）**：**读不挡写 ✓**（4 个只读在飞时写节点仍被领）· **读不挡读 ✓** · **写挡读（刻意）✓** · **写互斥 ✓** · **H1 续跑不再停桥 ✓✓**（续跑窗口内 `launcher.log` 零 stop、桥进程跨满窗存活；账单 `continueAttempts=1` / `cancelQuiesceMs` / `ghostRoundCancelled=true`）· **captures 换键 + dead 窗计数 ✓**（日志「捕获窗判 dead（cancelled）… 已收 N 条冻结」）· **排队四问 + `read_lane_running` ✓** · **两把闸 ✓**（缺省 1/1；配 `maxConcurrentReads=2` 后**读席=2 真并行**：同刻最多 2 个带标记忙等子进程、第三个等席；`/health inFlightCount` 1→2→3 ⇒ 机器闸排队在 orch 侧不可见 = U6 口径）+ **R2 目标场景（两读并行不串扰）收口**（`blockCount` 全 0、无 multi-block）· **U2 按项目回收 ✓**（`flow` 空即被收、`test` 忙照跑）· **U3 四后端全认 `session/cancel` ✓✓**（qoder-cn / opencode / claude / codex；后端侧独立证据 = 带标记忙等子进程在取消后 6–36s 死而非跑到自然结束 + 后端会话账本在取消时刻写入后静默）· **件① 落地并逐字核原文 ✓** · **增补轨可见面补齐 + 重启验证 3/3 ✓**（`/health` 四键齐 · 闸上限播报七条 · `cancelQuiesceMs` 口径）。
+
+### 未覆盖（登记，不计通过）
+
+- **结构性不可验（3 项）**：① `(C) 降级` 分支（需一个**无视 `session/cancel` 的后端**才能触发，现网四后端全认）② 缺省态与 v0.8.9 的**逐项对照**（无旧版本机可并行对照；且「除 U2 外缺省行为一致」这句本身不准确 —— 读写分道即缺省可见变化）③ **跨机 L3**（需把 `mac-dev` 加进 `projectGroup`）。
+- **两键本版结构性不产出**：`stopCause` / `stopCauseTaskId` —— 两个停因生产者（`idle-reap` / `stop-command`）的**前置条件本身就是「该项目在飞 = 0」**，与归因要求的「任务在飞行中跨越停事件」互斥；跨进程重启也产不出（停事件账**进程内**、孤儿补结算链不读该账）；`stopCauseTaskId` 连生产者都没有 ⇒ **五键实际可达仅 3 个**。**这不是缺陷，是「停桥连坐被结构性消灭」的副产品**（详见改造文档 §9.5）。
+- **R1 判据本身是空的**：`quiet` / `cancelQuiesceMs` / `cancelUnsupported` 三键量的全是**桥自己的登记簿**（`cancelUnsupported` 的置位条件还结构性不可达）⇒「后端那一轮是否真的停了」**没有任何面承载**（已改口径 + 另立未排期条目「真静默观测面」）。
+- **`staleChunkCount` 无面可读**（不落任何本机产物、也不在 orch 投影键集内）⇒ R2 的「哨兵 = 0」判据已改判为**日志判据**。
+- **沿袭老项**：`transport` 类仍无真机样本 · `model_queue` 至今无任何代码产出它 · 有界重发（触发不可控）· 混跑兜底（需旧版本机）· `degraded[].since` 不粘滞 · 墙钟判死 `text` 为空 · `session/resume` 缺 `cwd`。
+- **本版新登记**：① `[acp-session-map] 落盘失败：EPERM … rename 'test_claude.json.tmp-…'`（取消与结算之间偶发，影响面未判）② **两把闸上限此前无回显面**（本版已补播报）③ **`npm run format:check` 既有基线不通过**（machine 侧 59 个文件 prettier 风格漂移，**与本版无关、非本版引入**，建议单独登记）④ **一条自查纪律违规**：件① 的 `flow/spec/引擎映射.md` 改动与一次探针清理是**以 `inquiry`（只读档）派发却做了文件写入**（结果正确、档位声明与行为不符 —— 正是本版要治的「声明失真」那一类；下不为例）。
+
 ## [v0.8.9] - 2026-09-23
 
 > 主题：**执行可靠性 III：上下文**（**两条需求同版交付** —— ① `REQ-v0.8.9-2026-09-22-01`「会话复用与上下文治理」· ② `REQ-v0.8.9-2026-09-23-01`「续跑余量独立配置」；两条 Step 3 均由用户验收通过，验收账见各自改造文档）。**需求 1 的问题定义在 Step 0 被实测推翻并收窄**：生产里**没有长会话**（同一锚点 60 条 / 54 个 `contextId`：**48 个只跑 1 轮、0 个 ≥3 轮**）⇒ **不做上下文截断 / 摘要**，改建四件：**① 派发消息不再递归膨胀**（实测同一节点 500 字 → **7261 字**、`<feature-context>` 叠 3 层）· **② 复用 / 轮次 / 消息体积只读可见面**（此前四张面全不可查）· **③ 轮边界判据加固**（历史回灌的结论块可能被当成本轮结论）· **④ 会话映射保留边界**（只增不减 ⇒ 7 天 / 500 条 + 让删除方法有调用点）。**需求 2 把「自动续跑」的资格与额度从窗配置里拆出来**：`continueMarginMs` **独立成键、缺省 0 = 不续跑**（改显式 opt-in），派发预算改**三段公式**，续跑轮额度**只吃 `em`、不吃 300s 结构余量**（由**轮级 deadline 收紧**执法），并把窗上限由 15 min 收严到 10 min 以免击穿 orch 孤儿墙钟。**协议零变更**（`PROTOCOL_VERSION` 仍 **2.3** —— 两条需求都是本机策略 / 本机可见面，不动线上契约）。

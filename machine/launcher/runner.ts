@@ -30,6 +30,7 @@ import {
   RunnerCommandExecutor,
   createLoggingOutbox,
   parseRunnerCommand,
+  type DispatchGateSnapshot,
   type RunnerCommandAck,
   type RunnerExecHost,
   type RunnerOutbox,
@@ -159,6 +160,16 @@ export interface InFlightEntry {
    * `null` = 尚未取得句柄（send 在途 / Message 直返），cancel-task 据此判定可否取消。
    */
   a2aTaskId?: string | null;
+  /**
+   * 只读节点标志（v0.8.10 · M-N1 预留 ⇒ **M-N5 起消费**：决定该任务占读档还是写档）。
+   * 落盘宽容：旧文件无该键 ⇒ 读取侧按写处理（undefined 等价 false）。
+   */
+  readOnly?: boolean;
+  /**
+   * 准入时刻（UTC ISO 8601；区别于 `startedAt` = 命令领取时刻）。
+   * v0.8.10 · M-N5 起 = **过闸放行时刻**（排队时两者之差即排队时长）；旧文件无该键 ⇒ 不报、不抛。
+   */
+  admittedAt?: string;
 }
 
 /** 台账可选依赖（v0.8.7 M5 在飞落盘） */
@@ -214,6 +225,15 @@ export class InFlightLedger {
 
   projectOf(taskId: string): string | null {
     return this.entries.get(taskId)?.projectId ?? null;
+  }
+
+  /** 按项目在飞计数（v0.8.10 · M-N1）：idleStop / stop 拒收判据的项目级数据源 */
+  countFor(projectId: string): number {
+    let n = 0;
+    for (const entry of this.entries.values()) {
+      if (entry.projectId === projectId) n += 1;
+    }
+    return n;
   }
 
   get size(): number {
@@ -521,6 +541,15 @@ export class Runner {
       lastHeartbeatAt: this.state.lastHeartbeatAt,
       lastError: this.state.lastError,
     };
+  }
+
+  /**
+   * 并发闸快照（v0.8.10 · M-N5）：同 project 的在飞 / 排队档位计数（`queuedByProject` 含
+   * `oldestWaitedMs`）。纯只读数据面，供 `/health degraded` 的装配点（归 M-N4）取用；
+   * 未接执行器（Phase A 形态）⇒ 两个映射皆空。
+   */
+  gateSnapshot(): DispatchGateSnapshot {
+    return this.executor?.gateSnapshot() ?? { inFlightByProject: {}, queuedByProject: {} };
   }
 
   /** 单次注册尝试：成功即返回；HTTP / 网络失败抛出（由循环退避） */

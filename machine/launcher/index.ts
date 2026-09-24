@@ -38,6 +38,7 @@ import {
 import { RUNNER_STATE_FILENAME } from "./runner-state.js";
 import { runStartupSelfCheck, type SelfCheckResult } from "./self-check.js";
 import { buildDegradedStatus, createLauncherApp } from "./server.js";
+import { StopEventLedger } from "./stop-ledger.js";
 
 /** 缺省机器配置：源码运行与构建运行均以 machine 单元根（含 package.json）为基准解析 */
 const DEFAULT_MACHINE_CONFIG = join(appRootFromModule(import.meta.url), "config", "config.json");
@@ -69,7 +70,13 @@ const inFlight = new InFlightLedger({
     }
   },
 });
-const manager = new AgentManager(machine, { inFlight });
+/**
+ * 进程内停事件账（v0.8.10 · M-N4）：**单一实例**，由 `manager.stop()` 写（盖停因 + 当时的
+ * 按项目在飞快照），`runner-exec` 结算时读（归因五键），`/health degraded` 与 `config-snapshot`
+ * 播报读（取消观察面）。**不落盘** —— 连坐是进程内事实，重启后无在飞任务可归因。
+ */
+const stopEvents = new StopEventLedger();
+const manager = new AgentManager(machine, { inFlight, stopEvents });
 
 /** 实例元数据（非锁）：供 REQ-01 status/stop 读取 pid */
 const PIDFILE_PATH = join(appRoot, ".a2a", "launcher.pid");
@@ -111,6 +118,12 @@ const app = createLauncherApp({
       outboxPendingCount: outbox?.pendingCount ?? 0,
       runnerLoopAlive: runner?.loopAlive ?? false,
       inFlightCount: inFlight.size,
+      // v0.8.10 · M-N4：取消超时未静默的项目集（与账单里的 `cancelUnsupported` 同名不同面）
+      cancelUnsupported: manager.cancelUnsupportedProjectIds(),
+      // v0.8.10 增补轨 · A1：闸快照两键（未接 bridge ⇒ 恒空映射，键不省略）
+      gate: runner?.gateSnapshot(),
+      // 全局最近一次「取消 → 静默」取消往返毫秒（停事件账透出；无观察 ⇒ null）
+      lastCancelQuietMs: stopEvents.lastCancelQuiesceMsOverall(),
     }),
   shutdownEndpoint: machine.launcher.shutdownEndpoint === true,
   ...(machine.launcher.shutdownToken !== undefined

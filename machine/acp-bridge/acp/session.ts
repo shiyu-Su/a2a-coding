@@ -74,6 +74,25 @@
  * - **无 `SessionMap` 的降级路径同步扩**：轮次 / 归档 / 注入簿记另立进程内表（`turnsInMemory`
  *   / `archiveInMemory` / `injectedInMemory`），否则 ③ 加固在该分支整段失效（R-Ⅸ）。
  *
+ * **会话层捕获台账换键（v0.8.10 · M-N2）**：捕获窗的键由 **`sessionId` 改为 `taskId`**，通知侧改走
+ * **两级路由**（`session/update` 只带 `sessionId` ⇒ `sessionId → 本 session 当前活跃 taskId → 该 task 的窗`）。
+ * 换键修掉两处结构性缺陷：① **幽灵轮**（等待已放弃、后端仍在跑的那一轮）的 chunk 漏进同一会话的下一轮
+ * ⇒ 结果污染；② 只读并行下写节点与只读节点**续接同一 `sessionId`** ⇒ 并发互相覆盖捕获窗。配套三条语义：
+ * - **dead 窗**：被取消（`cancel`）或被放弃（同 session 上新一轮开窗接管了活跃指针）的窗标记 `dead`
+ *   ⇒ 此后落入该窗的 chunk **一律丢弃并计数**（该轮文本与 `partialChars` 就此冻结，不再被幽灵输出推进）。
+ *   判 dead **不删窗**（计数还得报给该轮自己的 diagnostics）；删除仍只发生在 `closeCapture` /
+ *   `discardCapture` —— **不得为任何新特性保留捕获窗**，保留就是重现「尾巴漏进下一轮」。
+ * - **残段 id 登记**：窗判 dead 时把其已收集的活块 id 记入该 session 的 `staleMessageIds`（有界，口径同
+ *   归档 ≤32）⇒ 指针移交后仍试图落入**新窗**的同 id chunk 一并丢弃并计数。**失败 / 超时轮不登记**
+ *   （那条路径只删窗）—— 续跑轮（v0.8.9 场景 C）合法地接着写同一条消息，把它的 id 判残段会丢空整轮。
+ * - **`staleChunkCount`（纯可观测哨兵）**：本轮被上述两条丢弃的 chunk 条数，**恒报**（`0` = 「没有残段
+ *   漏进来」的正向证据）。**不接入 `ambiguityOf` 三判据、不参与 state 判定**，与 `replayDropped` 分账。
+ * 三处读者的口径：`replayMessageIds` **仍按 `sessionId` 键**（「窗外见过的 id」是会话级事实，不属于某个
+ * task），但**清理改为条件式** —— 仅当该 session 的活跃指针仍属于正在结束的 task 才清 ⇒ 先结束的 task
+ * 不再抹掉在飞 task 赖以判重放的登记；`archivedIds` 按 `contextId` 取快照后**存进本 task 自己的窗**
+ * （并发下各窗自带归档快照，不再互相覆盖）；`ambiguityOf` 只读窗对象字段 ⇒ 语义不变（残段既已不入
+ * `groups`，其 `blockCount` 反而更干净）。
+ *
  * 载荷键（v0.8.8 · M1 计量补全 + 取证面；改造文档 §2.5 / §2.3.1）：
  * - **恒定七键**：`acpErrorKind`（`AcpError["kind"]`，非结构化抛出归 `error`）· `stage`（`ensure` / `prompt`
  *   落点）· `promptElapsedMs`（**prompt 段**耗时，改名自 `elapsedMs`，避开与 launcher 侧同名异义的
@@ -96,6 +115,10 @@
  *   · `outcomeAmbiguous`（缺省 false ⇒ **不报该键**）· `ambiguousReason`（闭集，见上）；
  * - `sessionMapSize` / `sessionMapOldestAgeDays`（④ 可见面，**只搭桥的首个任务**一次；无映射 ⇒ 不报）；
  * - `continueAttempts`（续跑轮**自报** `1`；常规轮不报该键 —— launcher 用作跨轮防递归的第二信号）。
+ *
+ * **v0.8.10 · M-N2 新增键**：`staleChunkCount`（**恒定报**，与 `chunkCount` 同族的计数键；口径见上「捕获台账换键」）。
+ * ⚠ launcher 侧 `parseBridgeDiagnostics` 白名单须同步放行该键 —— `test/acp-session.test.ts` 的「M2↔M4 契约」
+ * 例断言**桥写键集 ⇔ launcher 放行键集相等**，漏放行即红。
  *
  * ⚠ launcher 侧 `parseBridgeDiagnostics` 是**逐键白名单**：未放行的键会被**静默忽略**（改造文档 §2.5
  * 「只加键不 breaking」）。M1 计量键与取证键的放行已由 M2 同步，契约由 `test/acp-session.test.ts`
@@ -127,6 +150,12 @@ export const DIAGNOSTICS_PARTIAL_TAIL_MAX_CHARS = 4_000;
 
 /** diagnostics 载荷里 `acpErrorData` 宽 JSON 原文的上限（字符）。 */
 const DIAGNOSTICS_DATA_MAX_CHARS = 2_000;
+
+/**
+ * 单个 session 的**残段 id 登记**上限（v0.8.10 · M-N2）：判 dead 的窗把其活块 id 记在这里，
+ * 供该 session 后续轮次识别「上一轮的尾巴」。取与跨轮归档同一界，防无界增长。
+ */
+const MAX_STALE_MESSAGE_IDS = MAX_LAST_MESSAGE_IDS;
 
 /** 人读文本（结果文本 / 日志）里的 `data` 摘要上限（字符）—— 比诊断载荷短，避免文本被淹。 */
 const REASON_DATA_MAX_CHARS = 300;
@@ -189,6 +218,8 @@ interface BridgeDiag {
   injectedChars?: number;
   blockCount: number;
   replayDropped: number;
+  /** 本轮被判**残段**而丢弃的 chunk 条数（v0.8.10 · M-N2 哨兵；恒报，`0` = 无残段漏进本轮） */
+  staleChunkCount: number;
   outcomeAmbiguous?: boolean;
   ambiguousReason?: OutcomeAmbiguousReason;
   continueTurn?: boolean;
@@ -207,11 +238,17 @@ interface MessageGroup {
 }
 
 /**
- * 本轮捕获窗（v0.8.8 · M1 → v0.8.9 · M2 分组 + 归档）：把此前分散在 `buffers` / `capturing` /
- * `captureOpenedAt` / `replayDropped` 四张并行 map 里的**同一份本轮状态**收成一处，避免跨表漂移与计量口径不一致。
+ * 本轮捕获窗（v0.8.8 · M1 分组 + 归档 → v0.8.10 · M-N2 换键 `taskId` + dead 语义）：把此前分散在
+ * `buffers` / `capturing` / `captureOpenedAt` / `replayDropped` 四张并行 map 里的**同一份本轮状态**
+ * 收成一处，避免跨表漂移与计量口径不一致。
  * 生命周期 = `session/prompt` 写出前置入（M9 捕获窗）、`takeText` / `discardCapture` 移除。
+ * **归属键 = `taskId`**（不是 `sessionId`）：同一 session 上先后/并发的多个 task 各记各窗。
  */
 interface CaptureWindow {
+  /** 本窗归属的 taskId（= `captures` 的键；留痕与日志用） */
+  readonly taskId: string;
+  /** 本窗所在会话（dead 时登记残段 id、注销会话级簿记都要用它） */
+  readonly sessionId: string;
   /** 本轮保留的 `agent_message_chunk` 按 `messageId` 分组（历史重放已在入缓冲前排除） */
   readonly groups: MessageGroup[];
   /** 本轮轮次序号（= 开窗时 `SessionMapEntry.turn + 1`；`turn` 键的事实源） */
@@ -232,6 +269,17 @@ interface CaptureWindow {
   replayDropped: number;
   /** 本轮出现归档命中的 id（判据 iii；无论该块最终被丢还是走安全阀保留） */
   archiveHit: boolean;
+  /**
+   * **死窗标记**（v0.8.10 · M-N2）：本轮已被取消或被放弃 ⇒ 此后落入本窗的 chunk 一律丢弃并计数，
+   * 文本与 `partialChars` 冻结在判死时刻。标记**不删窗**（计数还得报），删除仍只在收窗 / 弃窗两处。
+   */
+  dead: boolean;
+  /**
+   * 本轮被判**残段**丢弃的 chunk 条数（v0.8.10 · M-N2 哨兵 `staleChunkCount`）：
+   * ① 落入本窗时本窗已 dead；② 落入活窗但其 id 属于该 session 上一轮判死的窗。
+   * 与 `replayDropped`（历史重放）**分账**，且不参与任何判据。
+   */
+  staleChunkCount: number;
 }
 
 /** 会话建立结果（v0.8.8 · M1 回标：`load → resume → new` 阶梯的实际落点）。 */
@@ -405,15 +453,30 @@ export class AcpSessionRunner {
   private readonly sessionMeta: Record<string, unknown> | undefined;
   private readonly logger: (message: string) => void;
   /**
-   * sessionId → 本轮捕获窗（v0.8.8 · M1）：**开窗即存在、收窗即删** ⇒ 「有窗」等价于旧
-   * `capturing.has(...)`；窗内一次性收齐本轮的 chunk 文本与三原料计数（旧 `buffers` /
-   * `capturing` / `captureOpenedAt` / `replayDropped` 四张并行 map 的合并落点）。
+   * **taskId → 本轮捕获窗**（v0.8.10 · M-N2 换键，此前是 `sessionId → 窗`）：**开窗即存在、收窗即删**
+   * ⇒ 「有窗」等价于旧 `capturing.has(...)`；窗内一次性收齐本轮的 chunk 文本与三原料计数（旧
+   * `buffers` / `capturing` / `captureOpenedAt` / `replayDropped` 四张并行 map 的合并落点）。
+   * 换键的动因：`sessionId` 单值键下，同一会话的多个 task（幽灵轮 / 写节点与只读节点并发）
+   * **共用一格** ⇒ 互相覆盖、上一轮的尾巴漏进下一轮。
    */
   private readonly captures = new Map<string, CaptureWindow>();
   /**
+   * **sessionId → 本 session 当前活跃 taskId**（v0.8.10 · M-N2 两级路由的第一级）：
+   * `session/update` 只带 `sessionId`，通知侧须经本指针落到 `captures` 里对应的 taskId 窗。
+   * 开窗时接管、收窗 / 弃窗时（仅当自己仍持有）注销。
+   */
+  private readonly activeTaskOf = new Map<string, string>();
+  /**
+   * **sessionId → 已判死轮次的活块 id**（v0.8.10 · M-N2）：指针移交给新一轮后，同 id 的 chunk
+   * 若还想进新窗 ⇒ 判为上一轮（幽灵 / 已取消）的残段，丢弃并计入 `staleChunkCount`。
+   * 每 session 有界 ≤{@link MAX_STALE_MESSAGE_IDS}。
+   */
+  private readonly staleMessageIds = new Map<string, Set<string>>();
+  /**
    * sessionId → 重放 messageId 集合（M9-c）：捕获窗外（`session/load|resume` 回灌期）出现过的
    * 每个 messageId。窗内 chunk 的 id 命中本集合 ⇒ 判为历史重放；未命中 ⇒ 判为本轮实时消息的新 id。
-   * 随 `takeText`/失败路径一并清理，不跨轮泄漏。
+   * **键仍是 `sessionId`**（v0.8.10 · M-N2 不换）——「窗外见过某 id」是该会话的事实，不属于某个 task；
+   * 换的是**清理时机**：只在活跃指针仍属于正在结束的 task 时清，先结束的 task 不得抹掉在飞 task 的登记。
    */
   private readonly replayMessageIds = new Map<string, Set<string>>();
   /** taskId → sessionId（供 cancel 定位） */
@@ -545,6 +608,65 @@ export class AcpSessionRunner {
     };
   }
 
+  // ---------- v0.8.10 · M-N2：捕获台账（taskId 键 + 两级路由 + dead 窗）----------
+
+  /**
+   * 两级路由（通知侧唯一入口）：`sessionId →（本 session 当前活跃 taskId）→ 该 task 的窗`。
+   * 无活跃 task 或窗已收 ⇒ `undefined` = **窗外**（load/resume 回灌、或上一轮已弃置后的残段）。
+   */
+  private routeCapture(sessionId: string): CaptureWindow | undefined {
+    const taskId = this.activeTaskOf.get(sessionId);
+    return taskId === undefined ? undefined : this.captures.get(taskId);
+  }
+
+  /**
+   * 判 dead（v0.8.10 · M-N2）：把该 task 的窗标记为**已死** —— 此后落入该窗的 chunk 一律丢弃并计数，
+   * 其已收集的活块 id 登记为该 session 的**残段 id**（指针移交后，同 id 的 chunk 即便落进新窗也照样丢）。
+   * **不删窗**：窗对象还得持有计数，供该轮自己的 diagnostics 报出；删除只发生在收窗 / 弃窗两处。
+   */
+  private markCaptureDead(taskId: string, reason: "cancelled" | "superseded"): void {
+    const win = this.captures.get(taskId);
+    if (win === undefined || win.dead) return;
+    win.dead = true;
+    for (const group of win.groups) {
+      if (group.messageId !== undefined) this.rememberStaleMessageId(win.sessionId, group.messageId);
+    }
+    this.logger(
+      `[acp-session] 捕获窗判 dead（${reason}）：taskId=${taskId} sessionId=${win.sessionId} turn=${String(win.turn)} ⇒ 已收 ${String(countChunks(win))} 条冻结，该轮后续 chunk 一律丢弃并计数`,
+    );
+  }
+
+  /** 登记一个「属于已判死轮次」的 messageId（每 session 有界 ≤{@link MAX_STALE_MESSAGE_IDS}）。 */
+  private rememberStaleMessageId(sessionId: string, messageId: string): void {
+    let ids = this.staleMessageIds.get(sessionId);
+    if (ids === undefined) {
+      ids = new Set<string>();
+      this.staleMessageIds.set(sessionId, ids);
+    }
+    ids.add(messageId);
+    while (ids.size > MAX_STALE_MESSAGE_IDS) {
+      const oldest = ids.values().next().value;
+      if (oldest === undefined) break;
+      ids.delete(oldest);
+    }
+  }
+
+  /** 该 id 是否属于本 session 某个已判死轮次（残段判据；无登记 ⇒ false）。 */
+  private isStaleMessageId(sessionId: string, messageId: string | undefined): boolean {
+    return messageId !== undefined && this.staleMessageIds.get(sessionId)?.has(messageId) === true;
+  }
+
+  /**
+   * 注销本轮的**会话级**簿记（活跃指针 + 重放 id 登记）：只在该 session 的活跃指针仍属于正在结束的
+   * 这个 task 时才清 —— 并发（写节点与只读节点续接同一 `sessionId`）下，先结束的 task 不得抹掉仍在飞的
+   * task 赖以判重放的登记（那是 M9-c 的证据面，被抹掉即整轮失防）。
+   */
+  private releaseCaptureLedger(sessionId: string, taskId: string): void {
+    if (this.activeTaskOf.get(sessionId) !== taskId) return;
+    this.activeTaskOf.delete(sessionId);
+    this.replayMessageIds.delete(sessionId);
+  }
+
   /** 执行一个任务（B1 `TaskExecutor.execute` 语义）。 */
   async execute(input: TaskExecutionInput): Promise<TaskExecutionResult> {
     const ensureStartedAt = Date.now();
@@ -567,6 +689,7 @@ export class AcpSessionRunner {
         turn: this.completedTurns(input.contextId) + 1, // 映射现值（本出口不 bump）
         blockCount: 0,
         replayDropped: 0,
+        staleChunkCount: 0, // 窗从未开 ⇒ 无残段可言（恒报键，与 chunkCount 同口径）
         continueTurn,
         ...this.sessionMapStatsOnce(),
       });
@@ -587,7 +710,15 @@ export class AcpSessionRunner {
       // M9 捕获窗：prompt 写出前才清缓冲并开窗（窗外 backlog 直接丢弃，但其 messageId 已登记）。
       // 探针实测回灌尾部与本窗开启毫秒级交叠 ⇒ 窗内另按 M9-c 重放 id 集合 + v0.8.9 跨轮归档二次过滤。
       // 注意：不可在此清 replayMessageIds —— 其中的 id 正是本轮 ensureSession 的 load/resume 期登记的。
-      this.captures.set(sessionId, {
+      // v0.8.10 · M-N2：窗键 = taskId；开窗前若该 session 仍有**别的**活窗（等待已放弃、后端还在跑的
+      // 幽灵轮）⇒ 先判 dead，再接管活跃指针，此后它的尾巴一律落进 dead/残段通道，不再进本轮文本。
+      const priorTaskId = this.activeTaskOf.get(sessionId);
+      if (priorTaskId !== undefined && priorTaskId !== input.taskId) {
+        this.markCaptureDead(priorTaskId, "superseded");
+      }
+      this.captures.set(input.taskId, {
+        taskId: input.taskId,
+        sessionId,
         groups: [],
         turn,
         archived: this.archivedIds(input.contextId),
@@ -597,15 +728,21 @@ export class AcpSessionRunner {
         updateCount: 0,
         replayDropped: 0,
         archiveHit: false,
+        dead: false,
+        staleChunkCount: 0,
       });
+      this.activeTaskOf.set(sessionId, input.taskId);
       promptResult = await this.requestWithTimeout("session/prompt", {
         sessionId,
         prompt: [{ type: "text", text: promptText }],
       });
     } catch (err) {
+      // v0.8.10 · M-N3（B16′ 桥侧半边）：prompt **满窗** ⇒ 本轮已被桥放弃，但后端那一轮**仍在烧**。
+      // launcher 不再 `stop` 桥（stop 连坐同项目其它在飞任务）⇒ 这一轮的取消只能由桥自己发。
+      const promptTimedOut = err instanceof AcpError && err.kind === "timeout";
       // 计量与半截尾部快照须在 `discardCapture` **之前**取：失败后进程可能被杀 ⇒ 桥内存态必失效，
       // 尾部只能经 diagnostics 通道带回 launcher（M3 用它拼续跑 prompt）
-      const win = this.captures.get(sessionId);
+      const win = this.captures.get(input.taskId);
       const produced = win === undefined ? "" : groupTexts(win).join("");
       const blockCount = countValidOutcomeBlocks(produced);
       const diag: BridgeDiag = {
@@ -629,18 +766,27 @@ export class AcpSessionRunner {
         injectedChars: injection.length,
         blockCount,
         replayDropped: win === undefined ? 0 : win.replayDropped,
+        staleChunkCount: win === undefined ? 0 : win.staleChunkCount,
         continueTurn,
         ...this.ambiguityOf(win, blockCount),
         ...this.sessionMapStatsOnce(),
       };
-      this.discardCapture(sessionId);
+      // 弃置半截缓冲：**照旧删窗**（不得为 dead/残段这类新特性留窗 —— 留窗就是重现「尾巴漏进下一轮」）。
+      // 顺序：先自取消（`markCaptureDead` 要在窗还在时把已收活块 id 登记为残段），再删窗。
+      if (promptTimedOut) {
+        await this.cancel(input.taskId);
+      }
+      this.discardCapture(sessionId, input.taskId);
       // ①-b 守卫第 2 处：本轮**到达 prompt 段且后端确有推进**（任一 update / 任一产出）⇒ 约定已被
       // 消费 ⇒ 记为「曾发出过 prompt」，重派不再重复注入；「零输出」失败（未到达后端 / 疑似排队）
       // **不写** ⇒ 该类重派照旧注入（漏注入 = 后端不输出结论块被静默判 completed，比重复注入更坏）。
       if (firstTurn && win !== undefined && (win.updateCount > 0 || win.partialChars > 0)) {
         this.recordInjected(input.contextId);
       }
-      return this.withDiag(this.failureResult(err), diag);
+      return this.withDiag(
+        promptTimedOut ? { ...this.failureResult(err), abandoned: true } : this.failureResult(err),
+        diag,
+      );
     }
     // prompted 置位时机 = 收到响应即置（含 end_turn / input-required / cancelled）；
     // v0.8.9 · M2：注入前计数（injectedAt）改在 prompt **写出侧**记账（见 {@link recordInjected} 守卫），
@@ -649,7 +795,7 @@ export class AcpSessionRunner {
     if (firstTurn) this.recordInjected(input.contextId);
     this.recordPrompted(input.contextId);
 
-    const win = this.closeCapture(input.contextId, sessionId);
+    const win = this.closeCapture(input.contextId, sessionId, input.taskId);
     this.bumpTurn(input.contextId);
     const text = win === null ? "" : groupTexts(win).join("");
     const blockCount = countValidOutcomeBlocks(text);
@@ -671,6 +817,7 @@ export class AcpSessionRunner {
       injectedChars: injection.length,
       blockCount,
       replayDropped: win === null ? 0 : win.replayDropped,
+      staleChunkCount: win === null ? 0 : win.staleChunkCount,
       continueTurn,
       ...this.ambiguityOf(win, blockCount),
       ...this.sessionMapStatsOnce(),
@@ -707,10 +854,17 @@ export class AcpSessionRunner {
     return this.withDiag({ state: "completed", text: outcome.text }, diag);
   }
 
-  /** 取消：尽力通知后端 `session/cancel`（B1 `TaskExecutor.cancel` 语义；notification 形态，不等响应）。 */
+  /**
+   * 取消：尽力通知后端 `session/cancel`（B1 `TaskExecutor.cancel` 语义；notification 形态，不等响应）。
+   * v0.8.10 · M-N2：先把该 task 的捕获窗判 **dead** —— 后端处理取消前还会吐 chunk，那些尾巴既不该进
+   * 本轮结果，也不该把 `partialChars` 推过「有实质产出」门槛（否则一个已取消的任务能被误判成可续跑）。
+   * v0.8.10 · M-N3：本方法有两个调用面 —— ① 台账收到 `tasks/cancel`（launcher 定向取消 / 收尾取消）；
+   * ② **桥自己的 prompt 满窗出口**（该轮已放弃、后端仍在烧 ⇒ 立即自取消）。两者都只走控制通道。
+   */
   async cancel(taskId: string): Promise<void> {
     const sessionId = this.taskSessions.get(taskId);
     if (sessionId === undefined) return;
+    this.markCaptureDead(taskId, "cancelled");
     try {
       this.client.notify("session/cancel", { sessionId });
     } catch (err) {
@@ -763,6 +917,8 @@ export class AcpSessionRunner {
       resultChars: diag.partialChars,
       blockCount: diag.blockCount,
       replayDropped: diag.replayDropped,
+      // v0.8.10 · M-N2 哨兵：恒报（`0` = 「没有残段漏进本轮」的正向证据）；不参与任何判据
+      staleChunkCount: diag.staleChunkCount,
       outcomeAmbiguous: diag.outcomeAmbiguous,
       ambiguousReason: diag.ambiguousReason,
       // 续跑轮**自报**（launcher 的跨轮防递归第二信号）；常规轮不报该键（缺省 = 0，不占账面）
@@ -810,8 +966,9 @@ export class AcpSessionRunner {
     const sessionId = params["sessionId"];
     const update = params["update"];
     if (typeof sessionId !== "string" || !isRecord(update)) return;
+    // 两级路由（v0.8.10 · M-N2）：通知只带 sessionId ⇒ 经「本 session 当前活跃 taskId」落到该 task 的窗。
     // 本轮任意 session/update 都算「有推进」（含 thought / tool_call / plan）—— 窗内才计
-    const win = this.captures.get(sessionId);
+    const win = this.routeCapture(sessionId);
     if (win !== undefined) win.updateCount += 1;
     // P1 探针：仅 agent_message_chunk 计入回复（agent_thought_chunk 为思考，忽略）
     if (update["sessionUpdate"] !== "agent_message_chunk") return;
@@ -819,20 +976,32 @@ export class AcpSessionRunner {
     if (!isRecord(content)) return;
     const text = content["text"];
     if (typeof text !== "string") return;
+    const id = messageIdOf(update);
     if (win === undefined) {
       // 窗外 = load/resume 回灌 backlog，不入本轮缓冲；其 messageId 登记为重放 id（M9-c）
-      const replayId = messageIdOf(update);
-      if (replayId !== undefined) {
+      if (id !== undefined) {
         let ids = this.replayMessageIds.get(sessionId);
         if (ids === undefined) {
           ids = new Set<string>();
           this.replayMessageIds.set(sessionId, ids);
         }
-        ids.add(replayId);
+        ids.add(id);
       }
       return;
     }
-    const id = messageIdOf(update);
+    if (win.dead) {
+      // dead 窗（v0.8.10 · M-N2）：本轮已取消 / 已放弃 ⇒ 其 chunk 一律丢弃并计数，
+      // 并把该 id 登记为残段 —— 指针此后移交下一轮时，同 id 的尾巴照样进不了新窗。
+      if (id !== undefined) this.rememberStaleMessageId(sessionId, id);
+      win.staleChunkCount += 1;
+      return;
+    }
+    if (this.isStaleMessageId(sessionId, id)) {
+      // 残段漏进活窗（v0.8.10 · M-N2 的正面靶子）：该 id 属于本 session 某个已判死的轮次 ⇒ 丢弃并计数。
+      // **不并入 replayDropped**：那是「历史重放」的分账，两者机制不同、口径不得混。
+      win.staleChunkCount += 1;
+      return;
+    }
     if (id !== undefined && this.replayMessageIds.get(sessionId)?.has(id) === true) {
       // M9-c 轮边界：该 id 在捕获窗外已出现过 = 历史消息重放的尾部，排除出本轮文本
       win.replayDropped += 1;
@@ -858,17 +1027,23 @@ export class AcpSessionRunner {
   }
 
   /**
-   * 收窗（成功路径）：注销窗与重放 id 登记、留痕丢弃条数、**归档本轮活块 id**，并返回窗（供计量）。
+   * 收窗（成功路径）：**删窗** + 注销该窗持有的会话级簿记（活跃指针 / 重放 id 登记，见
+   * {@link releaseCaptureLedger}）、留痕丢弃条数、**归档本轮活块 id**，并返回窗（供计量）。
    * 归档只收**保留下来**的 id（被丢的重放 id 不入档 ⇒ 一次污染不会永久传染后续轮次）。
    */
-  private closeCapture(contextId: string, sessionId: string): CaptureWindow | null {
-    const win = this.captures.get(sessionId);
-    this.captures.delete(sessionId);
-    this.replayMessageIds.delete(sessionId);
+  private closeCapture(contextId: string, sessionId: string, taskId: string): CaptureWindow | null {
+    const win = this.captures.get(taskId);
+    this.captures.delete(taskId);
+    this.releaseCaptureLedger(sessionId, taskId);
     if (win === undefined) return null;
     if (win.replayDropped > 0) {
       this.logger(
         `[acp-session] 本轮丢弃历史重放 chunk ${String(win.replayDropped)} 条（sessionId=${sessionId}）`,
+      );
+    }
+    if (win.staleChunkCount > 0) {
+      this.logger(
+        `[acp-session] 本轮丢弃残段 chunk ${String(win.staleChunkCount)} 条（taskId=${taskId} sessionId=${sessionId}）：来自该会话已判 dead 的轮次`,
       );
     }
     this.archiveLiveIds(
@@ -882,10 +1057,13 @@ export class AcpSessionRunner {
    * prompt 失败/超时路径：关窗并弃置半截缓冲，避免残窗把下轮 backlog 收进来。
    * **调用方必须在调用前取走尾部与计量**（v0.8.8 · M1「取出再弃」）—— 窗一关即失。
    * 失败轮**不归档**活块 id（轮次未完成，其 id 不作为次轮的重放判据）。
+   * v0.8.10 · M-N2：删窗语义**不变** —— 判 dead 不是留窗的理由，失败轮一律即删（该 session 的活跃指针
+   * 也随删注销 ⇒ 之后到达的尾巴落进「窗外」分支，照旧登记为 M9-c 重放 id）。
+   * 失败轮**不登记残段 id**：续跑轮（场景 C）合法地接着写同一条消息，把它的 id 判残段会丢空整轮。
    */
-  private discardCapture(sessionId: string): void {
-    this.captures.delete(sessionId);
-    this.replayMessageIds.delete(sessionId);
+  private discardCapture(sessionId: string, taskId: string): void {
+    this.captures.delete(taskId);
+    this.releaseCaptureLedger(sessionId, taskId);
   }
 
   /**

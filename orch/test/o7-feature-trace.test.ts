@@ -1,17 +1,23 @@
 /**
  * v0.8.8 §2.10(c) · 节点 O7：Trace 面只读查询「在等谁 / 排队位次」单元测试。
+ * （v0.8.10 O-N3 起同一实现另挂 MCP 只读工具 `a2a_feature_trace`，本文件的判据即两条出口共用）
  *
  * 覆盖（验收判据逐条）：
  * - 同 project「一节点在飞（claimed）+ 另一节点已就绪未派发」⇒ 查询能答出
  *   **在等谁**（占用项目的节点 + 占位机 `claimed_by`）与**排队位次**（`queue_state='queued'
- *   ∧ created_at <` 我 的 FIFO 计数）；
+ *   ∧ queued_at <` 我 的 FIFO 计数；O-N3 起与 `claimTask` 实领序**同键**）；
  * - `blockedOn` 与真实依赖一致（未 completed 的直接依赖）；
  * - `projectBusy` 在无在飞节点时为 false（占用者完成后翻 false）；
  * - 项目忙判定走队列态（**不走 `remote_task_id`**——pull 模型下在飞期间恒 NULL）；
  * - 终态节点（completed / failed / blocked）不输出；`input-required` 归 `awaiting_user`；
  * - Feature 不在 `executing` ⇒ 就绪节点给 `feature_not_executing`；
  * - 纯读：查询前后 Feature 态与节点态**零变化**、不落库；
- * - 归属校验复用五出口同一判据（他组拒绝 / 未知 404 语义）；
+ * - 归属校验复用六出口同一判据（他组拒绝 / 未知 404 语义）；
+ * - **O-N3 ①**：位次同键 —— 早登记但晚入队者**不得**插队；
+ * - **O-N3 ②**：只读档占位面 `readOccupants[]` + `waitReason='read_lane_running'`
+ *   （写忙集 O-N1 起排除 read ⇒ 少了这一格就是「没被挡、却没开工」的假空洞，跨侧不变量 U9）；
+ * - **O-N3 ③**：trace 节点出参键集合固化（additive `lane` / `readOccupants`）+ `waitReason` 八值闭集；
+ * - **O-N3 ④**：归因五键进 orch 投影白名单（含「未列入不外泄」「缺键不补 0/false」反向断言）；
  * - 网页端点 `GET /api/features/:featureId/trace` 复用同一 helper（200 / 404 / 405）。
  */
 process.env["SESSION_DB"] = ":memory:"; // 必须在首次触碰 store 之前（默认存储惰性打开）
@@ -28,7 +34,16 @@ import {
   getTask,
   updateTaskState,
 } from "../session/store.js";
-import { handleFeatureTrace, type FeatureTraceNode } from "../bridge/feature-tools.js";
+import {
+  handleFeatureTrace,
+  projectTaskVisibility,
+  type FeatureTraceArgs,
+  type FeatureTraceNode,
+} from "../bridge/feature-tools.js";
+import { createServer } from "../bridge/register-tools.js";
+import type { BridgeCore } from "../bridge/index.js";
+import { Client } from "@modelcontextprotocol/sdk/client/index.js";
+import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import { startWebTransport } from "../bridge/transports/web.js";
 import type { WebCore, WebTransportHandle } from "../bridge/transports/web.js";
 
@@ -54,7 +69,7 @@ test("O7 主场景：在飞 + 就绪未派发 ⇒ 答出「在等谁」（占用
   close();
   createFeature({ featureId: "f-o7", title: "trace", state: "executing" });
 
-  // T5：他 Feature / 他项目的 queued 任务（提供「排队在我前面」的位次原料，created 最早）
+  // T5：他 Feature / 他项目的 queued 任务（提供「排队在我前面」的位次原料，入队最早）
   createTask({ taskId: "T5", projectId: "p2", contextId: "c5", state: "working" });
   enqueueTask("T5");
   await sleep(3); // created_at 毫秒级：拉开严格先后
@@ -120,7 +135,7 @@ test("O7 主场景：在飞 + 就绪未派发 ⇒ 答出「在等谁」（占用
   assert.equal(t2.projectBusy.taskId, "T1", "在等谁：占用项目的节点");
   assert.equal(t2.projectBusy.machineId, "m1", "占位机 = 占用节点的 claimed_by");
   assert.equal(t2.waitReason, "project_busy");
-  assert.equal(t2.position, 2, "位次：T5（更早的 queued 任务）排在我前面 ⇒ 第 2");
+  assert.equal(t2.position, 2, "位次：T5（唯一在队者、入队更早）排在我前面 ⇒ 第 2（未入队 ⇒ 不设上界）");
   assert.equal(t2.waitedSince, getTask("T2")?.createdAt, "未入队 ⇒ 等待起点 = 登记时刻");
 
   // ---- T3：blockedOn 与真实依赖一致 ----
@@ -186,6 +201,272 @@ test("O7 入参面：未知 Feature ⇒ feature_not_found；他组 Feature 按�
   const denied = handleFeatureTrace({ featureId: "f-o7d" }, "g2");
   assert.ok(!denied.ok && denied.code === "feature_not_owned", "他组只读口同样拒绝");
   assert.equal(trace("f-o7d").length, 0, "无身份（web 运维面）⇒ 放行（该 Feature 零节点）");
+  close();
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.10 O-N3 ①：位次与实领序**同键**（`queued_at`，不再拿登记时刻 `created_at` 比较）
+// ---------------------------------------------------------------------------
+
+test("O-N3 位次：早登记、晚入队 ⇒ 不插队（旧 created_at 口径此处恰好反序）", async () => {
+  close();
+  createFeature({ featureId: "f-o7q", title: "trace-q", state: "executing" });
+  // Q1 登记最早，但**最后**入队；Q2 登记晚、**先**入队 ⇒ 实领序 Q2 < Q1
+  createTask({ taskId: "Q1", projectId: "p9", contextId: "q1", state: "working", featureId: "f-o7q" });
+  await sleep(3);
+  createTask({ taskId: "Q2", projectId: "p9", contextId: "q2", state: "working", featureId: "f-o7q" });
+  await sleep(3);
+  enqueueTask("Q2");
+  await sleep(3);
+  enqueueTask("Q1");
+
+  const nodes = trace("f-o7q");
+  const q1 = nodeOf(nodes, "Q1");
+  const q2 = nodeOf(nodes, "Q2");
+  assert.equal(q1.waitReason, "queued");
+  assert.equal(q2.waitReason, "queued");
+  assert.equal(q2.position, 1, "先入队者在前 ⇒ 位次 1");
+  assert.equal(q1.position, 2, "后入队者紧随其后（旧口径按 created_at 会误报 q1=1 / q2=2）");
+  close();
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.10 O-N3 ②：read-lane 占位档（消「写门没挡、却没开工」的假空洞 = U9）
+// ---------------------------------------------------------------------------
+
+test("O-N3 只读档占位：read 在飞 ⇒ 写档就绪节点 projectBusy=false 但报 read_lane_running + 明细", async () => {
+  close();
+  createFeature({ featureId: "f-o7r", title: "trace-r", state: "executing" });
+  // 只读档 R1：入队后被 m3 领取（在飞）
+  createTask({
+    taskId: "R1",
+    projectId: "p11",
+    contextId: "r1",
+    state: "working",
+    featureId: "f-o7r",
+    lane: "read",
+  });
+  enqueueTask("R1");
+  assert.equal(claimTask({ claimedBy: "m3", projectIds: ["p11"] })?.taskId, "R1");
+  await sleep(3);
+  // 写档 W1：无依赖（就绪）、未入队 ⇒ 调度器不派（要等 machine 侧读位腾出）
+  createTask({ taskId: "W1", projectId: "p11", contextId: "w1", state: "working", featureId: "f-o7r" });
+
+  const nodes = trace("f-o7r");
+  const r1 = nodeOf(nodes, "R1");
+  assert.equal(r1.lane, "read", "出参带档位");
+  assert.equal(r1.waitReason, "running_remote");
+  assert.deepEqual(r1.readOccupants, [], "占位明细排除自己");
+
+  const w1 = nodeOf(nodes, "W1");
+  assert.equal(w1.lane, "write", "未带档 ⇒ 归一 write");
+  assert.equal(w1.projectBusy.busy, false, "只读档不入写忙集 ⇒ 写门确实没挡");
+  assert.equal(w1.readOccupants.length, 1, "但那片占用面必须报出来（不得留假空洞）");
+  assert.deepEqual(w1.readOccupants[0]?.taskId, "R1");
+  assert.equal(w1.readOccupants[0]?.machineId, "m3", "占位机 = 只读行的 claimed_by");
+  assert.equal(w1.readOccupants[0]?.queueState, "claimed");
+  assert.equal(w1.readOccupants[0]?.featureId, "f-o7r");
+  assert.equal(w1.waitReason, "read_lane_running");
+
+  // 只读档落定 ⇒ 明细清空、回到 ready_pending_dispatch（不留尾巴）
+  updateTaskState("R1", "completed");
+  const after2 = nodeOf(trace("f-o7r"), "W1");
+  assert.deepEqual(after2.readOccupants, [], "只读档落定后不再有占位");
+  assert.equal(after2.waitReason, "ready_pending_dispatch");
+  close();
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.10 O-N3 ③：出参形状固化（additive 两键 + waitReason 八值闭集）
+// ---------------------------------------------------------------------------
+
+const NODE_KEYS = [
+  "taskId",
+  "projectId",
+  "state",
+  "lane",
+  "queueState",
+  "waitReason",
+  "blockedOn",
+  "projectBusy",
+  "readOccupants",
+  "position",
+  "waitedSince",
+] as const;
+
+/** `FeatureWaitReason` 的闭集清单（多值/改名即红；与 §2.3 排队可见面对齐） */
+const WAIT_REASONS = [
+  "awaiting_user",
+  "running_remote",
+  "queued",
+  "upstream_dependencies",
+  "feature_not_executing",
+  "project_busy",
+  "read_lane_running",
+  "ready_pending_dispatch",
+] as const;
+
+test("O-N3 出参形状：trace 节点键集合固化（含 lane / readOccupants）；waitReason 落在八值闭集", async () => {
+  close();
+  createFeature({ featureId: "f-o7s", title: "trace-s", state: "executing" });
+  createTask({
+    taskId: "S1",
+    projectId: "p12",
+    contextId: "s1",
+    state: "working",
+    featureId: "f-o7s",
+    lane: "read",
+  });
+  createTask({
+    taskId: "S2",
+    projectId: "p12",
+    contextId: "s2",
+    state: "working",
+    featureId: "f-o7s",
+    dependencies: ["S1"],
+  });
+  createTask({
+    taskId: "S3",
+    projectId: "p13",
+    contextId: "s3",
+    state: "input-required",
+    featureId: "f-o7s",
+  });
+
+  const nodes = trace("f-o7s");
+  for (const n of nodes) {
+    assert.deepEqual(
+      Object.keys(n).sort(),
+      [...NODE_KEYS].sort(),
+      `trace 节点键集合与固化清单不一致（${n.taskId}）`,
+    );
+    assert.ok(
+      (WAIT_REASONS as readonly string[]).includes(n.waitReason),
+      `waitReason 必须落在八值闭集，实际 ${n.waitReason}`,
+    );
+    assert.ok(n.lane === "read" || n.lane === "write", `lane 闭集，实际 ${n.lane}`);
+    assert.ok(Array.isArray(n.readOccupants), "readOccupants 恒为数组（无占位 = 空数组，不是 null）");
+  }
+  assert.equal(nodeOf(nodes, "S1").waitReason, "ready_pending_dispatch", "只读档就绪、无同项目 read 占位");
+  assert.equal(nodeOf(nodes, "S2").waitReason, "upstream_dependencies");
+  assert.equal(nodeOf(nodes, "S3").waitReason, "awaiting_user");
+  close();
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.10 O-N3 ④：归因五键进 orch 白名单（漏列 = DB 有、MCP 面无 ⇒ 最难查的一类落差）
+// ---------------------------------------------------------------------------
+
+const VIEW_BASE = {
+  dispatchMessage: "正文",
+  dispatchRendered: null,
+  retryCount: 0,
+} as const;
+
+function diagOf(diagnostics: Record<string, unknown>) {
+  return projectTaskVisibility({ ...VIEW_BASE, diagnosticsJson: JSON.stringify(diagnostics) })
+    .diagnostics;
+}
+
+test("O-N3 归因五键：machine 报了就必须从 MCP 面透出；白名单外键不外泄；缺键不补 0/false", () => {
+  const full = diagOf({
+    turn: 2,
+    stopCause: "idle-reap",
+    stopCauseTaskId: "t-ghost",
+    ghostRoundCancelled: true,
+    cancelQuiesceMs: 1_240,
+    cancelUnsupported: false,
+    // 白名单外（machine 侧自有键 / 未来新键）⇒ 必须被投影滤掉
+    stopCauseDetail: "不该外泄",
+    cancelQuiesceBytes: 4_096,
+  });
+  assert.equal(full.stopCause, "idle-reap");
+  assert.equal(full.stopCauseTaskId, "t-ghost", "肇事任务 id（口径 U8），不是被停者清单");
+  assert.equal(full.ghostRoundCancelled, true);
+  assert.equal(full.cancelQuiesceMs, 1_240);
+  assert.equal(full.cancelUnsupported, false, "显式 false 必须原样透出（区别于下面的缺键省略）");
+  assert.equal("stopCauseDetail" in full, false, "白名单外 string 键不外泄");
+  assert.equal("cancelQuiesceBytes" in full, false, "白名单外 number 键不外泄");
+
+  // 未走取消路径的机：**一个键都不报** ⇒ 五键全部省略（不得补 0 / false，「没报」≠「报了 0」）
+  const empty = diagOf({ turn: 1 });
+  for (const key of [
+    "stopCause",
+    "stopCauseTaskId",
+    "ghostRoundCancelled",
+    "cancelQuiesceMs",
+    "cancelUnsupported",
+  ] as const) {
+    assert.equal(key in empty, false, `machine 未报 ⇒ ${key} 省略（不补零值）`);
+  }
+  assert.equal(empty.turn, 1, "既有键不受影响");
+
+  // 脏值（类型不符）按既有口径丢弃，不得污染归因
+  const dirty = diagOf({ cancelQuiesceMs: "1200", stopCause: 7 });
+  assert.equal("cancelQuiesceMs" in dirty, false, "number 键收到字符串 ⇒ 省略");
+  assert.equal("stopCause" in dirty, false, "string 键收到数字 ⇒ 省略");
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.10 O-N3 ②'：MCP 出口（Feature 工具组 5→6；**不**新增第 8 个泛型工具）
+// ---------------------------------------------------------------------------
+
+/** 只喂 `featureTrace` 的 BridgeCore 桩（其余方法一被调用即红：trace 必须是纯读、不牵动别的出口） */
+function traceOnlyCore(): BridgeCore {
+  return new Proxy(
+    {},
+    {
+      get: (_t, prop) =>
+        prop === "featureTrace"
+          ? (args: FeatureTraceArgs) => handleFeatureTrace(args)
+          : () => {
+              throw new Error(`trace 出口不得触碰其它 BridgeCore 方法：${String(prop)}`);
+            },
+    },
+  ) as unknown as BridgeCore;
+}
+
+test("O-N3 MCP 面：a2a_feature_trace 已注册（工具组 6 / 泛型仍 7）；callTool 返回同一 trace 投影", async () => {
+  close();
+  createFeature({ featureId: "f-o7m", title: "trace-m", state: "executing" });
+  createTask({
+    taskId: "M1",
+    projectId: "p14",
+    contextId: "m1",
+    state: "working",
+    featureId: "f-o7m",
+    lane: "read",
+  });
+
+  const server = createServer(traceOnlyCore());
+  const [clientTransport, serverTransport] = InMemoryTransport.createLinkedPair();
+  const client = new Client({ name: "o7-trace-test", version: "1.0.0" }, {});
+  await Promise.all([server.connect(serverTransport), client.connect(clientTransport)]);
+
+  const listed = (await client.listTools()).tools.map((t) => t.name).sort();
+  assert.ok(listed.includes("a2a_feature_trace"), "Feature 工具组必须含只读 trace 出口");
+  assert.equal(
+    listed.filter((n) => n === "a2a_trace").length,
+    0,
+    "不得以第 8 个泛型工具形态出现（网页/泛型面不另开编排入口）",
+  );
+  assert.equal(listed.length, 13, "泛型 7 + Feature 6");
+
+  const res = await client.callTool({ name: "a2a_feature_trace", arguments: { featureId: "f-o7m" } });
+  assert.notEqual(res.isError, true, "只读出口应成功");
+  const payload = JSON.parse((res.content as Array<{ text: string }>)[0]!.text) as {
+    ok: boolean;
+    featureState: string;
+    nodes: FeatureTraceNode[];
+  };
+  assert.equal(payload.ok, true);
+  assert.equal(payload.featureState, "executing");
+  assert.equal(nodeOf(payload.nodes, "M1").lane, "read", "MCP 出口同样带档位");
+
+  const missing = await client.callTool({ name: "a2a_feature_trace", arguments: { featureId: "f-nope" } });
+  assert.equal(missing.isError, true, "未知 Feature ⇒ 工具面报错（同一 feature_not_found 语义）");
+  await client.close();
+  await server.close();
   close();
 });
 

@@ -175,3 +175,33 @@ test("idleStopMs<=0：禁用空闲回收（不排计时、不触发）", () => {
   clock.advance(100_000);
   assert.deepEqual(stopped, []);
 });
+
+test("U2（v0.8.10 · M-N1）：在飞计数按项目 ⇒ A 空闲即回收，即使 B 正在忙", () => {
+  const clock = makeFakeClock();
+  // 全机在飞 = 1（B 忙）；按项目 = A:0 / B:1
+  const ledgerCounts: Record<string, number> = { alpha: 0, beta: 1 };
+  const stopped: string[] = [];
+  const reaper = new IdleReaper({
+    idleStopMs: 100,
+    inFlightCount: (projectId) => ledgerCounts[projectId] ?? 0,
+    onIdle: (projectId) => stopped.push(projectId),
+    now: clock.now,
+    setTimer: clock.setTimer,
+    log: () => {},
+  });
+
+  reaper.noteActivity("alpha");
+  clock.advance(100);
+  // 改前（全机 ledger.size=1>0）此处为 false 不回收；改后按项目 A 在飞 0 ⇒ 回收
+  assert.deepEqual(stopped, ["alpha"]);
+
+  // B 自己有在飞 ⇒ 到点不回收（判据消费的是 B 自己的计数）
+  reaper.noteActivity("beta");
+  clock.advance(10_000);
+  assert.deepEqual(stopped, ["alpha"], "beta 在飞 >0 不得被回收");
+
+  // B 在飞清零后下一次重查即回收
+  ledgerCounts["beta"] = 0;
+  clock.advance(100);
+  assert.deepEqual(stopped, ["alpha", "beta"]);
+});

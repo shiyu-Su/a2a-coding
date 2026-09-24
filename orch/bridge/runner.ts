@@ -302,6 +302,12 @@ export interface RunnerDispatchCommand {
   dependencies: string[];
   /** 下游声明的上游产物引用 */
   inputs: InputArtifactRef[] | null;
+  /**
+   * **只读档声明**（v0.8.10 O-N4，来源 `tasks.lane`）：仅 `lane === "read"` 时带（`= true`）；
+   * 缺省（undefined）= 按写档。**纯可选**：未升级对端忽略该键 ⇒ 行为退回改前现状（按写），
+   * 故 `PROTOCOL_VERSION` 保持 2.3 不升。⚠️ 只挂在命令顶层，**不进 `payload`**。
+   */
+  readOnly?: true;
 }
 
 export interface RunnerStopCommand {
@@ -1561,6 +1567,8 @@ function toDispatchCommand(rec: QueuedTaskRecord): RunnerDispatchCommand {
     featureId: rec.featureId,
     dependencies: rec.dependencies ?? [],
     inputs: rec.inputArtifacts,
+    // v0.8.10 O-N4：lane → readOnly（仅只读档显式带键；写档不带 = undefined = 对端按写）
+    ...(rec.lane === "read" ? { readOnly: true as const } : {}),
   };
 }
 

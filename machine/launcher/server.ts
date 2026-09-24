@@ -13,6 +13,11 @@
 import express, { type Express, type NextFunction, type Request, type Response } from "express";
 import { PROTOCOL_VERSION, type ApiError } from "../types.js";
 import { errorMessage } from "./process.js";
+import type {
+  DispatchQueueCounts,
+  DispatchGateSnapshot,
+  DispatchLaneCounts,
+} from "./runner-exec.js";
 import type { SelfCheckCause, SelfCheckFailure } from "./self-check.js";
 
 /** loopback 源地址白名单（IPv4 / IPv6 / IPv4-mapped） */
@@ -58,6 +63,30 @@ export interface DegradedStatus {
   outboxPendingCount: number;
   runnerLoopAlive: boolean;
   inFlightCount: number;
+  /**
+   * **取消超时未静默的项目集**（v0.8.10 · M-N4）：`tasks/cancel` 已发出、静默窗内该轮仍未达终态
+   * = 后端不认 `session/cancel`。与 diagnostics 的 `cancelUnsupported`（单张账单的事实）
+   * **同名不同面**（沿用既有先例，不新造别名）；空数组 = 本机当前无此降级项。
+   */
+  cancelUnsupported: string[];
+  /**
+   * **闸的按项目在飞档位计数**（v0.8.10 增补轨 · A1，改造文档 §2.3）：
+   * `{ [projectId]: { write, read } }`，闸快照原样透出（只含有活动的项目）。
+   * **恒在**：无在飞 ⇒ `{}`，不得省略键。
+   */
+  inFlightByProject: Record<string, DispatchLaneCounts>;
+  /**
+   * **闸的按项目排队计数**（v0.8.10 增补轨 · A1）：
+   * `{ [projectId]: { write, read, oldestWaitedMs } }`。
+   * **恒在**：无排队 ⇒ `{}`，不得省略键。
+   */
+  queuedByProject: Record<string, DispatchQueueCounts>;
+  /**
+   * **全局最近一次「定向取消 / 收尾取消 → 静默」取消往返耗时**（毫秒；v0.8.10 增补轨 · A1），
+   * 数据源 = 停事件账（`lastCancelQuiesceMsOverall`）。
+   * **恒在**：无取消往返观测 ⇒ `null`，不得省略键。
+   */
+  lastCancelQuietMs: number | null;
 }
 
 /** `buildDegradedStatus` 的原料：全部为各组件的只读现值，装配点不做加工 */
@@ -70,6 +99,12 @@ export interface DegradedInputs {
   outboxPendingCount: number;
   runnerLoopAlive: boolean;
   inFlightCount: number;
+  /** 缺省 = 无观察（空数组）；由 `index.ts` 从停事件账读点注入 */
+  cancelUnsupported?: readonly string[];
+  /** 闸快照（`Runner.gateSnapshot()`）；缺省 = 未接 bridge / 无活动 ⇒ 两映射均空 */
+  gate?: DispatchGateSnapshot;
+  /** 全局最近一次「取消 → 静默」取消往返毫秒（缺省 / null = 无观察） */
+  lastCancelQuietMs?: number | null;
 }
 
 /** 组装 `degraded` 段（纯函数）：负向用例的可测点，尤其「跳过自检不得伪装成自检通过」 */
@@ -86,6 +121,10 @@ export function buildDegradedStatus(inputs: DegradedInputs): DegradedStatus {
     outboxPendingCount: inputs.outboxPendingCount,
     runnerLoopAlive: inputs.runnerLoopAlive,
     inFlightCount: inputs.inFlightCount,
+    cancelUnsupported: [...(inputs.cancelUnsupported ?? [])],
+    inFlightByProject: inputs.gate?.inFlightByProject ?? {},
+    queuedByProject: inputs.gate?.queuedByProject ?? {},
+    lastCancelQuietMs: inputs.lastCancelQuietMs ?? null,
   };
 }
 

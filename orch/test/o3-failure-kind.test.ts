@@ -71,6 +71,7 @@ function fakeCore(): BridgeCore {
     featureAdvance: () => unused("featureAdvance"),
     featureApprove: () => unused("featureApprove"),
     featureCancel: () => unused("featureCancel"),
+    featureTrace: () => unused("featureTrace"),
     kickScheduler: () => unused("kickScheduler"),
   };
 }

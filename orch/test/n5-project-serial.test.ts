@@ -21,6 +21,10 @@
  * - **`computeReadyNodes` 第三参**：`projectId ∈ busy ⇒ 不 ready` + **同批顺序认领**（同批同
  *   project 至多一个）；依赖未满足的同 project 节点**不得占位**（否则饿死本可派发者）；
  *   两参调用**保持旧语义**（不启用项目认领）。
+ * - **v0.8.10 O-N1 读写分道（lane）**：忙集**只算写档** ⇒ ① **只读节点在飞不挡写**（同 project
+ *   写节点照常放行，旧口径下会被 R 挂住）② **写仍互斥**（第一个写节点落定前，第二个跨多 tick
+ *   不派发）③ **非空洞对照** = 把在飞节点换成写档 ⇒ 同 project 写节点一个都不放行（证明 ①
+ *   的松绑来自谓词的档位条件、不是门恒开）。松绑方向只有一条：**读不挡写**；本版**不**放开「写挡读」。
  *
  * 独立成文件（不与 `scheduler.test.ts` 混写）：N5 的验收断言与后续「测试重写」节点（N7）的
  * 改动面解耦，便于逐节点核验时单独跑。
@@ -71,6 +75,8 @@ function node(
     projectId,
     contextId: `ctx-${id}`,
     state,
+    // v0.8.10 O-N1：并发档；纯函数构造取缺省档（write = 参与串行门）
+    lane: "write",
     artifactsJson: null,
     text: null,
     prompt: null,
@@ -319,9 +325,126 @@ test("N5 · V1 同 project 串行：跨 Feature 同一时刻开放 ≤ 1，跨 p
 });
 
 // ---------------------------------------------------------------------------
-// V-ensure / V6：静止期禁 ensure（调度通道 + 看护通道各一条断言）
+// ★ v0.8.10 O-N1（REQ-v0.8.10-2026-09-23-01 §2.2 / §4-A2）：读写分道 = 「读不挡写、写仍互斥」
+//   上面两条真行为锚属**单档**（全写）时代；本版忙集只算写档 ⇒ 只读节点退出「挡人」面。
+//   ⚠ 松绑方向只有一条：**只读在飞不再挡人**。写在飞照旧挡住读写两侧 —— 本版**不**放开「写挡读」，
+//   `bridge/scheduler.ts` 亦零改动（忙集每 tick 由 DB 快照算出 ⇒ 谓词一改、门自动放宽）。
 // ---------------------------------------------------------------------------
 
+/** 与 {@link openCount} 同口径，另**只算写档**（v0.8.10 起「开放挡人节点」= 写档在队者） */
+function openWriteCount(projectId: string, featureIds: readonly string[]): number {
+  let count = 0;
+  for (const featureId of featureIds) {
+    for (const t of listFeatureTasks(featureId, { limit: 1000 })) {
+      if (t.projectId !== projectId || t.state !== "working") continue;
+      const q = getQueuedTask(t.taskId);
+      if (q !== null && q.queueState !== "settled" && q.lane === "write") count += 1;
+    }
+  }
+  return count;
+}
+
+test("N5 · v0.8.10 真行为锚：只读节点在飞不挡写；同 project 两个写节点仍互斥", async () => {
+  close();
+  createFeature({ featureId: "f-lane", title: "读写分道", state: "executing" });
+  // 只读节点 R：已派发、已入队、未落定 ⇒ 在 v0.8.9 口径下它是**唯一**忙源（同项目全挡）
+  createTask({
+    taskId: "R",
+    projectId: "p1",
+    contextId: "cr",
+    state: "working",
+    featureId: "f-lane",
+    lane: "read",
+  });
+  enqueueTask("R");
+  assert.equal(getQueuedTask("R")?.lane, "read", "前置：R 落只读档");
+  assert.equal(listBusyProjectIds().has("p1"), false, "只读在队 ⇒ 项目不忙（读不挡写）");
+
+  createTask({ taskId: "A", projectId: "p1", contextId: "ca", state: "working", featureId: "f-lane" });
+  createTask({ taskId: "B", projectId: "p1", contextId: "cb", state: "working", featureId: "f-lane" });
+
+  const started: string[] = [];
+  const scheduler = new FeatureScheduler({
+    dispatch: (n) => {
+      started.push(n.taskId);
+      enqueueTask(n.taskId);
+      return Promise.resolve<FeatureDispatchResult>({ ok: true });
+    },
+  });
+
+  scheduler.kick();
+  await flush();
+  // ① **读不挡写**：R 在飞仍放行一个写节点（旧口径下 A / B 一个都出不去）
+  assert.equal(started.length, 1, `只读在飞 ⇒ 写节点照常放行一个（实得 ${started.join(",")}）`);
+  const first = started[0];
+  assert.ok(first !== undefined);
+  const second = first === "A" ? "B" : "A";
+  assert.equal(getQueuedTask(first)?.lane, "write", "放行的节点是写档（缺省档）");
+
+  // ② **写仍互斥**：第一个写节点未落定 ⇒ 第二节点跨多 tick 仍不派发
+  for (let i = 0; i < 3; i += 1) {
+    scheduler.kick();
+    await flush();
+    assert.equal(
+      started.includes(second),
+      false,
+      `第 ${String(i + 1)} 次重 tick：${first} 未落定 ⇒ ${second} 仍不派发`,
+    );
+    assert.equal(openWriteCount("p1", ["f-lane"]), 1, "同 project 开放**写**节点数恒 ≤ 1");
+  }
+
+  // ③ 断言非空洞：R 全程在飞未落定 ⇒ 上面的放行与互斥都**不是**靠 R 结算换来的
+  assert.equal(getQueuedTask("R")?.queueState, "queued", "R 始终在飞（松绑由谓词的档位条件承担）");
+
+  settleAsRunner(first, "p1");
+  assert.equal(
+    listBusyProjectIds().has("p1"),
+    false,
+    "写落定后仅剩只读在飞 ⇒ 项目不忙（U9 口径：trace/明细面同谓词，随之变空）",
+  );
+  scheduler.kick();
+  await flush();
+  assert.deepEqual(started, [first, second], "写落定后同 project 排队写节点被放行");
+  settleAsRunner(second, "p1");
+  settleAsRunner("R", "p1");
+});
+
+test("N5 · v0.8.10 非空洞对照：把在飞节点换成写档 ⇒ 同 project 写节点一个都不放行", async () => {
+  close();
+  createFeature({ featureId: "f-lane2", title: "对照：写在飞", state: "executing" });
+  createTask({
+    taskId: "W",
+    projectId: "p1",
+    contextId: "cw",
+    state: "working",
+    featureId: "f-lane2",
+    lane: "write",
+  });
+  enqueueTask("W");
+  assert.equal(listBusyProjectIds().has("p1"), true, "写在队 ⇒ 项目忙（忙集只算写档 = 本条为真）");
+
+  createTask({ taskId: "A2", projectId: "p1", contextId: "ca2", state: "working", featureId: "f-lane2" });
+  createTask({ taskId: "B2", projectId: "p1", contextId: "cb2", state: "working", featureId: "f-lane2" });
+
+  const started: string[] = [];
+  const scheduler = new FeatureScheduler({
+    dispatch: (n) => {
+      started.push(n.taskId);
+      enqueueTask(n.taskId);
+      return Promise.resolve<FeatureDispatchResult>({ ok: true });
+    },
+  });
+  scheduler.kick();
+  await flush();
+  scheduler.kick();
+  await flush();
+  assert.deepEqual(started, [], "写在飞 ⇒ 同 project 两个写节点都被挡（上一条的松绑不是门恒开）");
+  settleAsRunner("W", "p1");
+});
+
+// ---------------------------------------------------------------------------
+// V-ensure / V6：静止期禁 ensure（调度通道 + 看护通道各一条断言）
+// ---------------------------------------------------------------------------
 test("N5 · V-ensure/V6：静止期与 needs_input 期零 ensure —— 调度通道零派发、看护通道无入队", async () => {
   close();
   createFeature({ featureId: "f-rest", title: "静止", state: "executing" });

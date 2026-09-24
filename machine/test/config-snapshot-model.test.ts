@@ -361,6 +361,41 @@ test("sessionRetention 段 · 显式配 ⇒ 生效值标注出处（agentConfig�
   );
 });
 
+// ---- gateLimits 段（v0.8.10 · M-N5：两把并发闸上限进播报，此前无任何回显面）----
+
+test("gateLimits 段 · 不配 ⇒ 缺省 1/1 且出处标注缺省", () => {
+  withScrubbedEnv(() =>
+    withFakeHome(() => {
+      assert.equal(
+        describeAgentConfig(project("qoder-cn")).gateLimits,
+        "并发闸：写上限=1（缺省） 读上限=1（缺省）",
+      );
+    }),
+  );
+});
+
+test("gateLimits 段 · 显式配 ⇒ 生效值标注出处（agentConfig），两档独立；配 1 仍与缺省可区分", () => {
+  withScrubbedEnv(() =>
+    withFakeHome(() => {
+      assert.equal(
+        describeAgentConfig(project("qoder-cn", { maxConcurrentWrites: 3, maxConcurrentReads: 2 }))
+          .gateLimits,
+        "并发闸：写上限=3（agentConfig） 读上限=2（agentConfig）",
+      );
+      assert.equal(
+        describeAgentConfig(project("codex", { maxConcurrentReads: 2 })).gateLimits,
+        "并发闸：写上限=1（缺省） 读上限=2（agentConfig）",
+        "只配读档 ⇒ 写档仍报缺省（两档互不派生）",
+      );
+      assert.equal(
+        describeAgentConfig(project("codex", { maxConcurrentWrites: 1 })).gateLimits,
+        "并发闸：写上限=1（agentConfig） 读上限=1（缺省）",
+        "显式配 1 与缺省回落 1 出处可区分",
+      );
+    }),
+  );
+});
+
 const CATALOG_URL = new URL("../../config/model-catalog.json", import.meta.url);
 
 test("model-catalog：JSON 合法，codex / claude 两段与既有段同形且键集齐备", () => {

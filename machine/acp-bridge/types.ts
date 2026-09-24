@@ -77,6 +77,12 @@ export interface TaskExecutionResult {
   reason?: string;
   /** 附加产物（追加在 `response` artifact 之后；缺省无） */
   artifacts?: A2AArtifact[];
+  /**
+   * 本轮已被**执行器放弃**、但后端那一轮可能仍在烧（v0.8.10 · M-N3 · B16′ 的桥侧半边）。
+   * 现唯一产出点 = ACP 会话执行器的 prompt 满窗出口。台账据此允许「终态支路」的迟到取消
+   * （只通知执行器、**不改 state**）。缺省 = false（未放弃 / 无需迟到取消）。
+   */
+  abandoned?: boolean;
 }
 
 /**

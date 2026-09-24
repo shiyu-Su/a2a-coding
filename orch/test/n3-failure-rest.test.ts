@@ -73,6 +73,8 @@ function node(
     projectId: "p1",
     contextId: `ctx-${id}`,
     state,
+    // v0.8.10 O-N1：并发档；纯函数构造取缺省档（write = 参与串行门）
+    lane: "write",
     artifactsJson: null,
     text: null,
     prompt: null,

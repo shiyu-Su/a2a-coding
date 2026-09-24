@@ -98,3 +98,28 @@ v0.8.9 起 `contextId` 是**节点级**会话标识：宿主选择沿用还是�
 **5. 已知过时文案（仅登记，不改代码）**
 
 `machine/agent-outcome.ts` 的 outcome 约定文案把解析落点写成 `@a2a-wrapper/core` 的 `resolveOutcome` —— 属过时表述（包装器族已于 v0.8.5 退役）。今天的解析器是 `machine/acp-bridge/outcome.ts`。本项只是口径登记，**不构成改动授权**。
+
+## 并发语义与派发纪律（v0.8.10）
+
+v0.8.10 把「同 project 串行」拆成「**写串行 + 读不挡人**」。派活前先看这六条，**别把刻意设计当缺陷**（规范全文见 `flow/spec/引擎映射.md` §4.1 补充「并发语义矩阵」）。
+
+**1. 串行单位 = project（不是 Feature）**：同 project 串行、**跨 project 真并行**；「Feature 间 / Feature 内串行」都只是同 project 串行的特例。
+
+**2. 四边矩阵（同 project 内）**
+
+| 组合 | 可否并行 | 依据 |
+|---|---|---|
+| 读 × 写 | ✅ **读不挡写** | 只读档退出写忙集 |
+| 写 × 读 | ❌ **写挡读 —— 刻意，本版不放开** | 写档在飞 ⇒ 项目忙 ⇒ 读写节点一律等 |
+| 读 × 读 | ✅ 门径可并行；受 machine 读闸限（**缺省 1 ⇒ 实际仍串行**，配 `maxConcurrentReads ≥ 2` 才有真并行） | 只读档不入忙集 |
+| 写 × 写 | ❌ 互斥 | 写档入忙集 |
+
+**⇒ 派活时的等待预期**：往**有写在飞**的 project 派只读任务，**它会等**（`waitReason=project_busy`）；往**只有读在飞**的 project 派写或读，照常进。
+
+**3. 两把闸（machine 侧、按 project、缺省 1/1）**：`agentConfig.maxConcurrentWrites` / `maxConcurrentReads`（FIFO 排队；**派发预算从放行时刻起算**，不吃排队时长）。**⚠ 闸上限没有日志回显** ⇒ 查「这台机配了多少」只能看配置或反推并发行为。
+
+**4. 判「在排队还是真在跑」用 `a2a_feature_trace(featureId)`**：看 `waitReason`（八值闭集）/ `position` / `waitedSince` / `projectBusy{taskId,machineId}` / `readOccupants[]`。**两个时钟不得相加**（orch 领取队列的等待 ≠ machine 本机闸内等待）；**闸内排队 orch 看不见** ⇒ 「`/health inFlightCount` 已到 3 而只有 2 个在跑」是正常形态。
+
+**5. 只读是「声明」不是「强制」**：`a2a_call(readOnly=true)` 落 `lane='read'`（缺省 / 非 `true` ⇒ 按写），inquiry 恒为 read 档；引擎**看不见任务动哪些文件** ⇒ 声明失真只能事后核对（工作树指纹）。
+
+**6. 同批只认领一个（避免误判为卡住）**：同一拍（tick）内同 project **至多认领一个**节点（批次布尔刻意不改）⇒ 两个只读即使都就绪，第二个也要等下一拍（约 30s 或事件触发）才被领。

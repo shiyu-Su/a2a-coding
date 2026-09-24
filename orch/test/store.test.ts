@@ -6,6 +6,8 @@
  * 以及 `pruneTasks` 对活跃 Feature 的 `blocked` 任务的保护。
  * v0.4.1：追加存储加固三项——busy timeout、默认库路径锚定 orch 单元根、CAS 条件更新。
  * v0.5.0：追加三时刻列（`created_at` / `started_at` / `finished_at`）的写入时机与旧库迁移。
+ * v0.8.10 O-N1：追加 `tasks.lane`（并发档）—— 存量行归一为 write、三处读写口、
+ * `claimTask` 写优先 + 同档 FIFO + NULL 算写档、候选窗（LIMIT 50）不丢行、忙集只算写档。
  *
  * 运行：`npm test`（先 `tsc` 构建，再 `node --test dist/test/`）。
  */
@@ -17,7 +19,7 @@ import { tmpdir } from "node:os";
 import { isAbsolute, join } from "node:path";
 import { Worker } from "node:worker_threads";
 import { appRootFromModule } from "../app-root.js";
-import type { TaskState } from "../types.js";
+import type { TaskLane, TaskState } from "../types.js";
 import {
   DEFAULT_SESSION_DB,
   EVENT_FEATURE_STATE,
@@ -1410,5 +1412,303 @@ test("v0.8.9 O1：dispatch_rendered 可写可读、不写为 NULL、领取路径
     again.close();
   } finally {
     cleanupDb(dbPath);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.10 O-N1 · tasks.lane：并发档列（加列 + 存量归一 write + 三处读写口）
+// ---------------------------------------------------------------------------
+
+/** 造「无 lane 列」的老 tasks 表（= v0.9 及以前的库）并落两条存量行，供 A1 归一断言 */
+function seedLegacyTasksWithoutLaneColumn(dbPath: string): void {
+  const legacy = openStoreDatabase(dbPath);
+  legacy.exec(
+    `CREATE TABLE tasks (
+       task_id        TEXT PRIMARY KEY,
+       project_id     TEXT NOT NULL,
+       context_id     TEXT NOT NULL,
+       state          TEXT NOT NULL,
+       artifacts_json TEXT,
+       text           TEXT,
+       prompt         TEXT,
+       updated_at     TEXT NOT NULL
+     )`,
+  );
+  legacy
+    .prepare(
+      `INSERT INTO tasks (task_id, project_id, context_id, state, updated_at)
+       VALUES ('legacy-w', 'p1', 'c1', 'working', '2026-09-01T00:00:00.000Z'),
+              ('legacy-c', 'p1', 'c2', 'completed', '2026-09-01T00:00:00.000Z')`,
+    )
+    .run();
+  legacy.close();
+}
+
+test("v0.8.10 O-N1 · lane 列：存量行归一为 write（A1）+ 幂等补列 + 不改 updated_at / 不写事件", () => {
+  const dbPath = tempDbPath("lane-migrate");
+  try {
+    seedLegacyTasksWithoutLaneColumn(dbPath);
+
+    const store = new SessionStore(dbPath);
+    try {
+      // A1：老行 NULL ⇒ **归一为 write**（反向解释 = 存量行退出忙集 = 静默放宽串行门）
+      assert.equal(store.getTask("legacy-w")?.lane, "write", "存量 working 行归一为写档");
+      assert.equal(store.getTask("legacy-c")?.lane, "write", "存量终态行同样归一");
+
+      const raw = openStoreDatabase(dbPath);
+      try {
+        const row = raw
+          .prepare("SELECT lane, updated_at FROM tasks WHERE task_id = 'legacy-w'")
+          .get() as Record<string, unknown>;
+        assert.equal(row["lane"], "write", "归一**落到库内字面值**（不是仅读侧兜底）");
+        assert.equal(
+          row["updated_at"],
+          "2026-09-01T00:00:00.000Z",
+          "归一不是活动 ⇒ 不得刷新 updated_at（避免存量行顶到列表首位）",
+        );
+      } finally {
+        raw.close();
+      }
+      assert.equal(store.listEvents({ limit: 10 }).length, 0, "迁移非运行期变更 ⇒ 不写事件");
+    } finally {
+      store.close();
+    }
+
+    // 幂等：列已存在 ⇒ try-ALTER 落 catch；归一语句二次启动零行命中（不覆写已声明档位）
+    const again = new SessionStore(dbPath);
+    again.createTask({
+      taskId: "declared-read",
+      projectId: "p1",
+      contextId: "c3",
+      state: "working",
+      lane: "read",
+    });
+    again.close();
+    const third = new SessionStore(dbPath);
+    assert.equal(
+      third.getTask("declared-read")?.lane,
+      "read",
+      "重启的归一语句只命中 NULL ⇒ 已声明的 read 不被改写",
+    );
+    third.close();
+  } finally {
+    cleanupDb(dbPath);
+  }
+});
+
+test("v0.8.10 O-N1 · lane 三处读写口：createTask 缺省写档、显式改档要显式传、rowToTask / 领取路径同列可读", () => {
+  const store = new SessionStore(":memory:");
+  try {
+    // 缺省 = write（保守、向后兼容）：不传 lane ⇒ 读回 write
+    store.createTask({ taskId: "d1", projectId: "p1", contextId: "c1", state: "working" });
+    assert.equal(store.getTask("d1")?.lane, "write", "createTask 不带 lane ⇒ write（缺省档）");
+
+    // 显式只读档往返
+    store.createTask({
+      taskId: "r1",
+      projectId: "p1",
+      contextId: "c2",
+      state: "working",
+      lane: "read",
+    });
+    assert.equal(store.getTask("r1")?.lane, "read", "显式 read ⇒ 原样读回");
+
+    // ⚠ ON CONFLICT 走 COALESCE：**不带 lane 的重登记不覆盖已声明的档位**
+    store.createTask({
+      taskId: "r1",
+      projectId: "p1",
+      contextId: "c2",
+      state: "working",
+      dispatchMessage: "重登记",
+    });
+    assert.equal(store.getTask("r1")?.lane, "read", "不带档重登记 ⇒ 保留原 read（不得悄悄降成 write）");
+    // 显式传值 = 显式改档（放宽门的方向必须由显式动作决定）
+    store.createTask({ taskId: "r1", projectId: "p1", contextId: "c2", state: "working", lane: "write" });
+    assert.equal(store.getTask("r1")?.lane, "write", "显式带档 ⇒ 覆盖（改档须显式）");
+
+    // 领取路径（QUEUE_TASK_COLUMNS）必须带出 lane：漏改即白改
+    store.createTask({
+      taskId: "r2",
+      projectId: "p1",
+      contextId: "c3",
+      state: "working",
+      lane: "read",
+    });
+    store.enqueueTask("r2");
+    const claimed = store.claimTask({ claimedBy: "m1" });
+    assert.equal(claimed?.taskId, "r2");
+    assert.equal(claimed?.lane, "read", "claimTask 返回的 QueuedTaskRecord 须带 lane");
+  } finally {
+    store.close();
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.10 O-N1 · claimTask 写优先 + 同档 FIFO + NULL 算写档（§4-A3 三断言）
+// ---------------------------------------------------------------------------
+
+/**
+ * 入队并把 `queued_at` 钉到可控递增时刻（定长毫秒 ⇒ ISO 字典序即时间序）。
+ *
+ * 走**文件库 + 第二条连接**直改：`enqueueTask()` 用真实时钟，同毫秒入队会并列
+ * ⇒ 「同档 FIFO」断言会在并列序上假绿（本文件多处 claim 序断言的前提）。
+ */
+function enqueueAt(store: SessionStore, dbPath: string, taskId: string, seq: number): void {
+  store.enqueueTask(taskId);
+  const raw = openStoreDatabase(dbPath);
+  try {
+    raw
+      .prepare("UPDATE tasks SET queued_at = ? WHERE task_id = ?")
+      .run(`2026-09-23T00:00:00.${String(seq).padStart(4, "0")}Z`, taskId);
+  } finally {
+    raw.close();
+  }
+}
+
+test("v0.8.10 O-N1 · claimTask 写优先：晚入队的 write 先于更早的 read（同档仍 FIFO）", () => {
+  const dbPath = tempDbPath("lane-priority");
+  const store = new SessionStore(dbPath);
+  try {
+    const mk = (id: string, lane: TaskLane, seq: number): void => {
+      store.createTask({ taskId: id, projectId: "p1", contextId: `c-${id}`, state: "working", lane });
+      enqueueAt(store, dbPath, id, seq);
+    };
+    // 三个只读早入队，一个写档最晚入队 ⇒ 领取序须是 w1 → r1 → r2 → r3
+    mk("r1", "read", 1);
+    mk("r2", "read", 2);
+    mk("r3", "read", 3);
+    mk("w1", "write", 9);
+
+    assert.equal(store.claimTask({ claimedBy: "m1" })?.taskId, "w1", "写优先：read 不得顶掉 write");
+    assert.equal(store.claimTask({ claimedBy: "m1" })?.taskId, "r1", "同档（read）内仍 FIFO");
+    assert.equal(store.claimTask({ claimedBy: "m1" })?.taskId, "r2");
+    assert.equal(store.claimTask({ claimedBy: "m1" })?.taskId, "r3");
+  } finally {
+    store.close();
+    cleanupDb(dbPath);
+  }
+});
+
+test("v0.8.10 O-N1 · claimTask：NULL 档算写档（未升版老行不沉底、仍守串行门）", () => {
+  const dbPath = tempDbPath("lane-null");
+  const store = new SessionStore(dbPath);
+  try {
+    store.createTask({
+      taskId: "r1",
+      projectId: "p1",
+      contextId: "c1",
+      state: "working",
+      lane: "read",
+    });
+    enqueueAt(store, dbPath, "r1", 1);
+    store.createTask({ taskId: "n1", projectId: "p1", contextId: "c2", state: "working" });
+    enqueueAt(store, dbPath, "n1", 9); // 入队**晚于** r1
+
+    // 模拟「未升版老代码写入的行」：库里 lane 落 NULL（迁移归一只在启动时跑）
+    const raw = openStoreDatabase(dbPath);
+    try {
+      raw.prepare("UPDATE tasks SET lane = NULL WHERE task_id = 'n1'").run();
+    } finally {
+      raw.close();
+    }
+
+    assert.equal(store.getTask("n1")?.lane, "write", "读侧归一：NULL ⇒ write");
+    assert.equal(
+      store.claimTask({ claimedBy: "m1" })?.taskId,
+      "n1",
+      "NULL 行按写档排到只读档之前（漏 NULL ⇒ 存量行整体沉底，永远领不到）",
+    );
+    assert.equal(
+      store.listBusyProjectIds().has("p1"),
+      true,
+      "NULL 行计入写忙集（串行门不因 NULL 放宽）",
+    );
+  } finally {
+    store.close();
+    cleanupDb(dbPath);
+  }
+});
+
+test("v0.8.10 O-N1 · claimTask 候选窗（LIMIT 50）：write 不被更早的 read 挤出本窗；超窗同档只顺延不丢", () => {
+  const dbPath = tempDbPath("lane-window");
+  const store = new SessionStore(dbPath);
+  try {
+    // 60 个更早入队的只读行（> 候选窗 50）+ 1 个最晚入队的写行
+    for (let i = 1; i <= 60; i += 1) {
+      const id = `r${String(i)}`;
+      store.createTask({
+        taskId: id,
+        projectId: "p1",
+        contextId: `c-${id}`,
+        state: "working",
+        lane: "read",
+      });
+      enqueueAt(store, dbPath, id, i);
+    }
+    store.createTask({
+      taskId: "w-late",
+      projectId: "p1",
+      contextId: "c-w",
+      state: "working",
+      lane: "write",
+    });
+    enqueueAt(store, dbPath, "w-late", 99);
+
+    // 旧口径（跨 lane 全局 FIFO）下 write 排在第 61 位 ⇒ **根本进不了本窗**（最坏等完整轮 read）；
+    // 写优先把它抬到排序首位 ⇒ 60 条更早的 read 也挤不掉。
+    assert.equal(store.claimTask({ claimedBy: "m1" })?.taskId, "w-late", "write 不被挤出本窗");
+
+    // 剩余的只读档：每轮重算候选窗 ⇒ 只顺延、**不丢行**（缺省不放宽 LIMIT，登记为已知上界）
+    const drained: string[] = [];
+    for (let i = 0; i < 60; i += 1) {
+      const got = store.claimTask({ claimedBy: "m1" });
+      if (got === null) break;
+      drained.push(got.taskId);
+    }
+    assert.equal(drained.length, 60, "60 个只读行全部被领到（无丢行）");
+    assert.deepEqual(drained.slice(0, 3), ["r1", "r2", "r3"], "只读档内仍按 queued_at FIFO");
+  } finally {
+    store.close();
+    cleanupDb(dbPath);
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v0.8.10 O-N1 · 忙集谓词只算写档：read 不挡写、写仍互斥（§4-A2 的 store 面）
+// ---------------------------------------------------------------------------
+
+test("v0.8.10 O-N1 · 忙集只算写档：read 退出忙集、write 仍计入、写仍互斥", () => {
+  const store = new SessionStore(":memory:");
+  try {
+    store.createTask({ taskId: "rd", projectId: "p1", contextId: "c1", state: "working", lane: "read" });
+    store.enqueueTask("rd");
+    assert.equal(
+      store.listBusyProjectIds().has("p1"),
+      false,
+      "只读在队 ⇒ 项目**不忙**（读不挡写：本版松绑的落点）",
+    );
+
+    store.createTask({ taskId: "wr", projectId: "p1", contextId: "c2", state: "working", lane: "write" });
+    store.enqueueTask("wr");
+    assert.equal(store.listBusyProjectIds().has("p1"), true, "写节点在队 ⇒ 项目忙（写仍互斥）");
+
+    // 写档结算 ⇒ 出忙集；只读行仍在队，但**不再把它算进来**
+    store.upsertTaskResult({
+      machineId: "m1",
+      taskId: "wr",
+      projectId: "p1",
+      contextId: "c2",
+      state: "completed",
+    });
+    assert.equal(store.listBusyProjectIds().has("p1"), false, "写落定后仅剩只读 ⇒ 不忙");
+
+    // 明细面与忙集共用同一谓词（`busyProjectPredicate()` 是唯一事实源）⇒ 只读行不计
+    assert.deepEqual(
+      store.listBusyTasksForProject("p1").map((t) => t.taskId),
+      [],
+      "只读行不进「谁占着这个项目」明细（= 与忙集同口径，非漏算）",
+    );
+  } finally {
+    store.close();
   }
 });

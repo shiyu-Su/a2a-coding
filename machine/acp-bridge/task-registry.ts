@@ -27,6 +27,13 @@ interface TaskRecord {
   /** 在飞执行 promise（`blocking:true` 等待用） */
   pending: Promise<void>;
   updatedAt: string;
+  /**
+   * 该轮已被执行器**放弃**、但后端那一轮可能仍在烧（v0.8.10 · M-N3 · B16′）。
+   * 来源 = `TaskExecutionResult.abandoned`（ACP 执行器的 prompt 满窗出口置位）。
+   * 用途：允许**终态支路**的迟到取消（见 {@link TaskRegistry.cancel}）。
+   * **不落 captures 窗** —— 窗是执行器内部的一格，台账侧要的是「这条 record 该不该再通知」的事实。
+   */
+  abandoned: boolean;
 }
 
 /** `message/send` 解析后的入参。 */
@@ -65,7 +72,12 @@ export class TaskRegistry {
     const taskId = this.idFactory();
     const task: A2ATask = { id: taskId, status: { state: "working" }, artifacts: [] };
     const pending = this.run(taskId, textFromParts(params.message.parts), params.message);
-    this.records.set(taskId, { task, pending, updatedAt: this.now().toISOString() });
+    this.records.set(taskId, {
+      task,
+      pending,
+      abandoned: false,
+      updatedAt: this.now().toISOString(),
+    });
     if (params.configuration?.blocking === true) {
       await pending;
     }
@@ -80,6 +92,17 @@ export class TaskRegistry {
   /**
    * 取消任务：`working` → `canceled`（并尽力通知执行器）；已是终态则幂等返回。
    * 未知 id 返回 `null`。
+   *
+   * **终态支路（v0.8.10 · M-N3 · B16′）**：`state ∈ 终态 ∧ 该轮标 `abandoned`` ⇒
+   * **仍向执行器发一次通知，但 state 不变**。为什么必须这一支：launcher 的定向取消常常迟到于
+   * 桥自判满窗（record 已 `failed`），而**纯 launcher 侧覆盖不了**这种「台账已终态、后端仍在烧」
+   * 的幽灵轮 —— 旧实现在终态直接跳过通知 ⇒ 取消永远到不了执行器 ⇒ 那一轮白烧到自然结束。
+   *
+   * ⚠ 三条硬约束（与 launcher 侧同源，缺一即开「第二条结果」的口子）：
+   * ① **只走控制通道**（`executor.cancel` = ACP notification，不等响应、不产出结果文本）；
+   * ② **不得改 record 的 state**（改 state 即触终态 CAS / 与 `applyResult` 抢写 = 第二条结果的成因）；
+   * ③ **必须排在 `outbox.deliver()` 之后**（账单先行；launcher 侧纪律，见 `runner-exec.ts`）。
+   * 三条同时成立 ⇒ 本支路结构上不可能产生第二条结果。
    */
   async cancel(taskId: string): Promise<A2ATask | null> {
     const record = this.records.get(taskId);
@@ -94,6 +117,15 @@ export class TaskRegistry {
         record.task.status = { state: "canceled" };
         record.updatedAt = this.now().toISOString();
       }
+      return record.task;
+    }
+    if (record.abandoned) {
+      // 硬约束 ②：本支路**不写** `record.task.status`、也不写 `updatedAt`（纯通知）。
+      try {
+        await this.executor.cancel?.(taskId);
+      } catch {
+        // 同样 best-effort：通知失败不改台账（该轮早已按 failed 收敛）。
+      }
     }
     return record.task;
   }
@@ -107,6 +139,11 @@ export class TaskRegistry {
         contextId: message.contextId ?? "",
         messageId: message.messageId,
       });
+      // 放弃标记须在终态回写**之前**落：`applyResult` 之后这条 record 即进入「终态支路」的判定窗口。
+      if (result.abandoned === true) {
+        const rec = this.records.get(taskId);
+        if (rec !== undefined) rec.abandoned = true;
+      }
       this.applyResult(taskId, result);
     } catch (err) {
       this.applyResult(taskId, {

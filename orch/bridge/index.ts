@@ -101,6 +101,7 @@ import {
   handleFeatureCancel,
   handleFeatureCreate,
   handleFeatureStatus,
+  handleFeatureTrace,
   ownershipFailure,
   projectTaskVisibility,
   type FeatureAdvanceArgs,
@@ -113,6 +114,8 @@ import {
   type FeatureStatusArgs,
   type FeatureStatusSuccess,
   type FeatureToolFailure,
+  type FeatureTraceArgs,
+  type FeatureTraceSuccess,
   type TaskDiagnosticsView,
 } from "./feature-tools.js";
 import {
@@ -923,6 +926,9 @@ export async function dispatchTask(input: DispatchTaskInput): Promise<DispatchOu
       projectId,
       contextId,
       state: "working",
+      // v0.8.10 O-N4：散活（inquiry）本就是只读语义 ⇒ 恒落只读档。
+      // 不显式标则按缺省 = 写档 ⇒ 撞 machine 写闸 ⇒ 散活排到 Feature 写节点后面。
+      lane: "read",
       prompt: truncatePrompt(input.newTask.prompt),
       dispatchMessage: input.newTask.dispatchMessage,
     });
@@ -1198,7 +1204,8 @@ function buildNodeDispatchMessage(node: TaskRecord, feature: FeatureRecord | nul
  * 可挂载态 = `MOUNTABLE_FEATURE_STATES`（**常量集合驱动**，现为
  * `executing` / `waiting_approval`；`analyzing`（分析扇出）已随主链收敛**有意撤销**；
  * 登记 ≠ 派发 —— `tick` 只看 `executing`。变更该常量即自动更新文案，经 `join` 取用）；
- * `dependencies` 引用同 Feature 内的本地 taskId；`inputs` 声明本节点引用的上游产物。
+ * `dependencies` 引用同 Feature 内的本地 taskId；`inputs` 声明本节点引用的上游产物；
+ * `readOnly`（v0.8.10 O-N4）声明本节点并发档：仅显式 `true` ⇒ `lane='read'`，否则 `'write'`。
  */
 function registerFeatureNode(
   projectId: string,
@@ -1208,6 +1215,7 @@ function registerFeatureNode(
   dependencies: readonly string[],
   inputs?: readonly InputArtifactRef[] | undefined,
   identity: string | null = null,
+  readOnly?: boolean | undefined,
 ): CallOutcome {
   const contextId =
     contextIdInput !== undefined && contextIdInput.length > 0 ? contextIdInput : randomUUID();
@@ -1225,7 +1233,7 @@ function registerFeatureNode(
   }
   /**
    * v0.8.6 req01 补正 R-1（跨组写入洞 · 安全）：挂载前必须校验「本连接身份 == Feature 归属组」。
-   * 五出口归属判据 **`ownershipFailure` 同源**（禁止第二套判据），三分支语义完全一致：
+   * 六出口归属判据 **`ownershipFailure` 同源**（禁止第二套判据），三分支语义完全一致：
    * - `identity === null`（未配组 / 3300 运维全量视图）⇒ 放行；
    * - `feature.ownerGroup === identity` ⇒ 放行；
    * - 其余（含 `ownerGroup` 为 NULL 的存量 Feature）⇒ **拒**（fail-closed），
@@ -1263,6 +1271,9 @@ function registerFeatureNode(
     projectId,
     contextId,
     state: "working",
+    // v0.8.10 O-N4：并发档显式写入（不依赖 NULL 缺省）—— readOnly 仅显式 true 才是只读档，
+    // 缺省 / false 一律按写档（保守）。
+    lane: readOnly === true ? "read" : "write",
     // prompt 保留截断片段用于辨识；dispatchMessage 存全文供调度器派发
     prompt: message,
     featureId,
@@ -1894,6 +1905,7 @@ export interface BridgeCore {
     featureId: string,
     dependencies: readonly string[],
     inputs?: readonly InputArtifactRef[] | undefined,
+    readOnly?: boolean | undefined,
   ): CallOutcome;
   taskStatus(taskId: string): Promise<TaskStatusOutcome>;
   cancel(taskId: string): Promise<CancelOutcome>;
@@ -1904,6 +1916,12 @@ export interface BridgeCore {
   featureAdvance(args: FeatureAdvanceArgs): FeatureAdvanceSuccess | FeatureToolFailure;
   featureApprove(args: FeatureApproveArgs): FeatureStateChangeSuccess | FeatureToolFailure;
   featureCancel(args: FeatureCancelArgs): FeatureStateChangeSuccess | FeatureToolFailure;
+  /**
+   * **只读 trace 投影**（v0.8.10 O-N3 挂成 MCP 工具 `a2a_feature_trace`）：
+   * 「这个 Feature 为什么还没完成」（在等谁 / 排队位次 / 写门与只读档占位）。
+   * 纯读、不落库、不触发调度 ⇒ 与其它五口同样**按连接身份做归属校验**（谁建谁见）。
+   */
+  featureTrace(args: FeatureTraceArgs): FeatureTraceSuccess | FeatureToolFailure;
   /** 工具返回后统一 kick 调度器（Feature 工具组用） */
   kickScheduler(): void;
 }
@@ -1916,7 +1934,7 @@ export interface BridgeCore {
  * 进程级可变状态共享，组判定经 {@link resolveGroup} 按身份取组）。
  * `identity = null`（缺省）= 无身份：未配组环境的匿名全量入口 / web 运维视图（N6 起显式注入）。
  * v0.8.6 §2.4 出口补齐 A 起：**12 个出口的只读三路（`tasks` / `events` / `wait`）也已按身份**
- * （游标随身份分离 = R-2；Feature 工具组五路归 N4）。
+ * （游标随身份分离 = R-2；Feature 工具组五路归 N4，v0.8.10 O-N3 起的 `a2a_feature_trace` 同判据）。
  */
 export function createCore(identity: string | null = null): BridgeCore {
   return {
@@ -1925,8 +1943,8 @@ export function createCore(identity: string | null = null): BridgeCore {
       handleTasks(projectId, state, limit, identity),
     call: (projectId, text, contextId, wait, mode): Promise<CallOutcome> =>
       handleCall(projectId, text, contextId, wait, mode, identity),
-    registerFeatureNode: (projectId, message, contextId, featureId, dependencies, inputs): CallOutcome =>
-      registerFeatureNode(projectId, message, contextId, featureId, dependencies, inputs, identity),
+    registerFeatureNode: (projectId, message, contextId, featureId, dependencies, inputs, readOnly): CallOutcome =>
+      registerFeatureNode(projectId, message, contextId, featureId, dependencies, inputs, identity, readOnly),
     taskStatus: (taskId): Promise<TaskStatusOutcome> => handleTaskStatus(taskId, identity),
     cancel: (taskId): Promise<CancelOutcome> => handleCancel(taskId, identity),
     events: (since): EventsOutcome | Failure => handleEvents(identity, since),
@@ -1943,6 +1961,9 @@ export function createCore(identity: string | null = null): BridgeCore {
       handleFeatureApprove(args, identity),
     featureCancel: (args): FeatureStateChangeSuccess | FeatureToolFailure =>
       handleFeatureCancel(args, identity),
+    // 只读面同样按身份做归属校验（他组 Feature 不可见）；无身份 ⇒ 全量放行（与五口同判据）
+    featureTrace: (args): FeatureTraceSuccess | FeatureToolFailure =>
+      handleFeatureTrace(args, identity),
     kickScheduler: (): void => scheduler.kick(),
   };
 }

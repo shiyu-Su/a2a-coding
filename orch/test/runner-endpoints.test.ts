@@ -81,6 +81,7 @@ function fakeCore(): BridgeCore {
     featureAdvance: () => unused("featureAdvance"),
     featureApprove: () => unused("featureApprove"),
     featureCancel: () => unused("featureCancel"),
+    featureTrace: () => unused("featureTrace"),
     kickScheduler: () => unused("kickScheduler"),
   };
 }
@@ -391,6 +392,61 @@ test("成员拒绝：非成员项目不 claim（心跳）；显式请求非成�
   const ghost = await post(h.port, RUNNER_CONNECT_PATH, { machineId: "m-ghost2" }, "tok-member");
   assert.equal(ghost.status, 403);
   assert.equal(errorCodeOf(ghost), "runner_not_allowed");
+});
+
+// ---------------------------------------------------------------------------
+// 只读档透传（v0.8.10 O-N4）：lane → DispatchCommand.readOnly
+// ---------------------------------------------------------------------------
+
+test("readOnly 透传：只读档领取命令显式带 readOnly=true；写档 / 缺档不带该键", async () => {
+  const cfg = makeConfig({ machines: [machine("m-lane", "tok-lane")], holdMs: 60 });
+  const h = await startHarness(cfg);
+  await register(h.port, "m-lane", "tok-lane", [
+    { projectId: "p-lane", agentKind: "opencode", a2aPort: 3061 },
+  ]);
+
+  function seedLaneTask(taskId: string, lane: "read" | "write" | undefined): void {
+    createTask({
+      taskId,
+      projectId: "p-lane",
+      contextId: `ctx-${taskId}`,
+      state: "working",
+      ...(lane === undefined ? {} : { lane }),
+      dispatchMessage: `lane task ${taskId}`,
+      prompt: `lane task ${taskId}`,
+    });
+    assert.notEqual(enqueueTask(taskId), null, `任务 ${taskId} 应成功入队`);
+  }
+
+  // 只读档 ⇒ 命令带 readOnly: true
+  seedLaneTask("t-read", "read");
+  const readRes = await post(h.port, RUNNER_CONNECT_PATH, { machineId: "m-lane" }, "tok-lane");
+  assert.equal(readRes.status, 200);
+  const readCmd = dataOf(readRes) as DispatchShape & Record<string, unknown>;
+  assert.equal(readCmd.taskId, "t-read");
+  assert.equal(readCmd.readOnly, true, "lane=read ⇒ 命令带 readOnly=true");
+
+  // 写档 ⇒ 不带该键
+  seedLaneTask("t-write", "write");
+  const writeRes = await post(h.port, RUNNER_CONNECT_PATH, { machineId: "m-lane" }, "tok-lane");
+  assert.equal(writeRes.status, 200);
+  const writeCmd = dataOf(writeRes) as Record<string, unknown>;
+  assert.equal(writeCmd.taskId, "t-write");
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(writeCmd, "readOnly"),
+    "lane=write ⇒ 命令不含 readOnly 键（undefined = 对端按写）",
+  );
+
+  // 缺档（未升级路径 / 存量语义）⇒ 同样不带该键
+  seedLaneTask("t-default", undefined);
+  const defaultRes = await post(h.port, RUNNER_CONNECT_PATH, { machineId: "m-lane" }, "tok-lane");
+  assert.equal(defaultRes.status, 200);
+  const defaultCmd = dataOf(defaultRes) as Record<string, unknown>;
+  assert.equal(defaultCmd.taskId, "t-default");
+  assert.ok(
+    !Object.prototype.hasOwnProperty.call(defaultCmd, "readOnly"),
+    "缺档 ⇒ 命令不含 readOnly 键",
+  );
 });
 
 // ---------------------------------------------------------------------------

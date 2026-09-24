@@ -140,3 +140,56 @@ test("M3 防御性剥块：执行器给未剥块原文 ⇒ artifact 无围栏残
 test("M3 约定文本零改动：A2A_OUTCOME_CONVENTION 常量不因接线变更而漂移", () => {
   assert.ok(A2A_OUTCOME_CONVENTION.includes("a2a-outcome"));
 });
+
+// ---------- REQ-v0.8.10-2026-09-24-01 · M-N3：台账终态支路（幽灵轮的迟到取消）----------
+
+/** 记录 `cancel` 通知落点的可控执行器（M-N3：断言「通知发了没」「state 动没动」） */
+class SpyExecutor extends ControllableExecutor {
+  readonly canceled: string[] = [];
+
+  cancel(taskId: string): void {
+    this.canceled.push(taskId);
+  }
+}
+
+test("M-N3 终态支路：abandoned 的 failed 轮收到迟到 cancel ⇒ 仍通知执行器，但 state 不变（不触 CAS）", async () => {
+  const executor = new SpyExecutor();
+  const registry = new TaskRegistry({ executor, idFactory: () => "tg-1" });
+  const task = await registry.send({
+    message: { role: "user", parts: [{ kind: "text", text: "hi" }], messageId: "m1" },
+  });
+  executor.settle("tg-1", { state: "failed", text: "会话满窗", abandoned: true });
+  await flush();
+  assert.equal(task.status.state, "failed");
+
+  const again = await registry.cancel("tg-1");
+  assert.deepEqual(executor.canceled, ["tg-1"], "幽灵轮必须拿得到取消（纯 launcher 侧覆盖不了这一格）");
+  assert.equal(again?.status.state, "failed", "硬约束 ②：终态支路**只通知、不改 state**");
+});
+
+test("M-N3 终态支路（负向）：未标 abandoned 的终态轮 ⇒ 幂等返回、零通知（正常收敛的轮不被打扰）", async () => {
+  const executor = new SpyExecutor();
+  const registry = new TaskRegistry({ executor, idFactory: () => "tn-1" });
+  await registry.send({
+    message: { role: "user", parts: [{ kind: "text", text: "hi" }], messageId: "m1" },
+  });
+  executor.settle("tn-1", { state: "completed", text: "正常收敛" });
+  await flush();
+
+  const task = await registry.cancel("tn-1");
+  assert.equal(task?.status.state, "completed");
+  assert.deepEqual(executor.canceled, []);
+});
+
+test("M-N3 在飞支路不回归：working 轮 cancel ⇒ 通知执行器 + state 置 canceled", async () => {
+  const executor = new SpyExecutor();
+  const registry = new TaskRegistry({ executor, idFactory: () => "tw-1" });
+  const task = await registry.send({
+    message: { role: "user", parts: [{ kind: "text", text: "hi" }], messageId: "m1" },
+  });
+
+  const canceled = await registry.cancel("tw-1");
+  assert.deepEqual(executor.canceled, ["tw-1"]);
+  assert.equal(canceled?.status.state, "canceled");
+  assert.equal(task.status.state, "canceled");
+});

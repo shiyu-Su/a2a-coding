@@ -25,7 +25,11 @@ import {
   type BackendEntryDeps,
 } from "../adapters/backend-entry.js";
 import {
+  DEFAULT_MAX_CONCURRENT_READS,
+  DEFAULT_MAX_CONCURRENT_WRITES,
   resolveContinueMarginMs,
+  resolveMaxConcurrentReads,
+  resolveMaxConcurrentWrites,
   resolveSessionRetentionDays,
   resolveSessionRetentionMax,
   resolveSessionTimeoutMs,
@@ -173,8 +177,13 @@ function describeSessionRetention(project: ProjectConfig): string {
  *
  * 余量缺省写作字面 0：其单一源是 `runner-exec.ts` 的 `DEFAULT_CONTINUE_MARGIN_MS`（缺省关闭），
  * 播报模块不引执行引擎（避免把整张派发依赖图拉进快照面）。
+ *
+ * `cancelQuiesceMs`（v0.8.10 · M-N4，v0.8.10 增补轨改口径）= 该项目**最近一次取消往返**的
+ * 墙钟耗时：本机 loopback 的 `tasks/cancel`/`tasks/get` 到桥台账转终态为止，
+ * **不反映后端是否真的停止计算**（桥侧 `session/cancel` 为 fire-and-forget、台账就地置终态）。
+ * 与上面两个配置面键同处播报。**没有取值就不出该键**（缺键 ≠ 报 0）。
  */
-function describeSessionWindow(project: ProjectConfig): string {
+function describeSessionWindow(project: ProjectConfig, cancelQuiesceMs?: number): string {
   const timeout = resolveSessionTimeoutMs(project.agentConfig);
   const margin = resolveContinueMarginMs(project.agentConfig);
   const timeoutText =
@@ -182,7 +191,34 @@ function describeSessionWindow(project: ProjectConfig): string {
       ? `${String(timeout)}（agentConfig）`
       : `${String(DEFAULT_SESSION_TIMEOUT_MS)}（缺省）`;
   const marginText = margin !== undefined ? `${String(margin)}（agentConfig）` : "0（缺省）";
-  return `sessionTimeoutMs=${timeoutText} continueMarginMs=${marginText}`;
+  const quiesceText =
+    cancelQuiesceMs === undefined
+      ? ""
+      : ` cancelQuiesceMs=${String(cancelQuiesceMs)}（取消往返：桥台账转终态耗时，非后端静默）`;
+  return `sessionTimeoutMs=${timeoutText} continueMarginMs=${marginText}${quiesceText}`;
+}
+
+/**
+ * 两把并发闸上限播报（v0.8.10 · M-N5）：此前 `maxConcurrentWrites` / `maxConcurrentReads`
+ * 是全仓唯一无任何回显面的配置键（闸只在 `DispatchGate` 内执法、类体无 logger，快照只有
+ * in-flight/queued 计数）⇒「这台机这一项配了多少」只能靠并发行为反推。
+ *
+ * 值与出处与执法通路**同一读点**（`resolveMaxConcurrent*`，即 `effectiveGateLimits` 的组成），
+ * 口径不分叉。**出处标注按「键配没配」判定而非「值是否等于缺省」** ⇒ 显式配 `1` 与缺省回落
+ * 可区分（同 `continueMarginMs=0（agentConfig）` 的判据）。
+ */
+function describeGateLimits(project: ProjectConfig): string {
+  const write = resolveMaxConcurrentWrites(project.agentConfig);
+  const read = resolveMaxConcurrentReads(project.agentConfig);
+  const writeText =
+    write !== undefined
+      ? `${String(write)}（agentConfig）`
+      : `${String(DEFAULT_MAX_CONCURRENT_WRITES)}（缺省）`;
+  const readText =
+    read !== undefined
+      ? `${String(read)}（agentConfig）`
+      : `${String(DEFAULT_MAX_CONCURRENT_READS)}（缺省）`;
+  return `并发闸：写上限=${writeText} 读上限=${readText}`;
 }
 
 /** 单次 Agent 启动的配置快照：配置层级 + endpoint / 模型 id + 后端入口分层解析结果 */
@@ -198,8 +234,15 @@ export interface AgentConfigSnapshot {
   /**
    * 会话窗与续跑余量（v0.8.9 需求2 · M3）：`sessionTimeoutMs=… continueMarginMs=…`，
    * 值标注出处（agentConfig / 缺省）—— 「这台机开没开续跑」的运维查表面。
+   * v0.8.10 · M-N4 起，有取消往返取值时同处再追
+   * `cancelQuiesceMs=<往返耗时>（取消往返：桥台账转终态耗时，非后端静默）`。
    */
   sessionWindow: string;
+  /**
+   * 两把并发闸的生效上限（v0.8.10 · M-N5）：`并发闸：写上限=… 读上限=…`，
+   * 值标注出处（agentConfig / 缺省）—— 「这台机这一项配了多少」的运维查表面。
+   */
+  gateLimits: string;
   /**
    * 后端入口 `[backend]` 日志行正文（不含 `[backend]` 前缀，manager 打印时加）。
    * 命中：`<projectId> kind=<kind> <层名> hit <绝对路径>`；
@@ -266,17 +309,23 @@ function describeBackend(
  * `userSettingsLoaded` 随段键推断一并退役 ⇒ 快照 = 平铺 `agentConfig` + 用户级配置层
  * + 模型 / endpoint（claude 的用户级层按文件存在性直读判定）。
  * v0.8.6 · B4：追加 `backend` 段（后端入口分层解析结果，供 `[backend]` 日志行）。
+ * v0.8.10 · M-N5：追加 `gateLimits` 段（两把并发闸的生效上限与出处）。
  * `deps` 仅供注入式单测造「命中 / 全 miss」两例；运行期缺省走真机 fs。
+ * `cancelQuiesceMs`（v0.8.10 · M-N4）= 该机该项目的取消往返耗时（本机 `tasks/cancel` →
+ * `tasks/get` 到桥台账转终态，来自停事件账）；**不反映后端是否真的停止计算**。
+ * 给出才播报、不给即省略该键。
  */
 export function describeAgentConfig(
   project: ProjectConfig,
   deps?: BackendEntryDeps,
+  cancelQuiesceMs?: number,
 ): AgentConfigSnapshot {
   return {
     hierarchy: `项目 agentConfig（平铺键）+ ${userConfigLayer(project)}`,
     ...resolveModelEndpoint(project),
     sessionRetention: describeSessionRetention(project),
-    sessionWindow: describeSessionWindow(project),
+    sessionWindow: describeSessionWindow(project, cancelQuiesceMs),
+    gateLimits: describeGateLimits(project),
     backend: describeBackend(project, deps),
   };
 }

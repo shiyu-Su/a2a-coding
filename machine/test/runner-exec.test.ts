@@ -367,6 +367,23 @@ test("stop：in-flight>0 拒收回执 error:in-flight（不触 stop）；台账�
   assert.deepEqual(calls.stopped, ["alpha"]);
 });
 
+test("stop（v0.8.10 · M-N1 按项目）：B 在飞不挡 A 的 stop；A 自己在飞 >0 才拒收", async () => {
+  const calls: HostCalls = { ensured: [], stopped: [] };
+  const ledger = new InFlightLedger();
+  const exec = makeExecutor({ host: makeHost(calls), ledger, outbox: captureOutbox().outbox });
+
+  // 只有 beta 在飞：alpha 的 stop 不再被全机计数拒收（改前 ledger.size=1 ⇒ 拒收）
+  ledger.add({ taskId: "b1", projectId: "beta", startedAt: STARTED_AT });
+  const ackAlpha = await exec.handle({ type: "stop", projectId: "alpha", commandId: "c1" });
+  assert.deepEqual(ackAlpha, { commandId: "c1" });
+  assert.deepEqual(calls.stopped, ["alpha"]);
+
+  // beta 自己在飞 >0 ⇒ 拒收 beta
+  const busyBeta = await exec.handle({ type: "stop", projectId: "beta", commandId: "c2" });
+  assert.deepEqual(busyBeta, { commandId: "c2", error: "in-flight" });
+  assert.deepEqual(calls.stopped, ["alpha"], "拒收 ⇒ 未停止 beta");
+});
+
 test("stop：manager.stop 抛错 → 回执带错误文本（不崩）", async () => {
   const ledger = new InFlightLedger();
   const host: RunnerExecHost = {
@@ -595,21 +612,28 @@ function fakeClock(): {
   };
 }
 
-/** 假桥：`message/send` 返 working 句柄，`tasks/get` 在假时钟到 `terminalAtMs` 前一直 working */
+/** 假桥：`message/send` 返 working 句柄，`tasks/get` 在假时钟到 `terminalAtMs` 前一直 working。
+ *  v0.8.10 · M-N3：`tasks/cancel` 恒答 `canceled`（在飞轮被定向取消即达静默），并记入 `cancels()`。 */
 function bridgedFetch(clock: { elapsedMs: () => number }, terminalAtMs: number, task: unknown) {
   const seen: string[] = [];
+  const cancelIds: string[] = [];
+  const id = String((task as { id?: string }).id ?? "a2a-1");
   const fetchFn: A2AFetch = async (_url, init) => {
     const req = JSON.parse(String(init.body)) as { method: string };
     seen.push(req.method);
-    if (req.method === "message/send") return rpcResult(taskResult("a2a-1", "working", ""));
+    if (req.method === "message/send") return rpcResult(taskResult(id, "working", ""));
+    if (req.method === "tasks/cancel") {
+      cancelIds.push(id);
+      return rpcResult(taskResult(id, "canceled", ""));
+    }
     if (req.method === "tasks/get") {
       return rpcResult(
-        clock.elapsedMs() >= terminalAtMs ? task : taskResult("a2a-1", "working", ""),
+        clock.elapsedMs() >= terminalAtMs ? task : taskResult(id, "working", ""),
       );
     }
     throw new Error(`未预期方法：${req.method}`);
   };
-  return { fetchFn, seen };
+  return { fetchFn, seen, cancels: () => cancelIds };
 }
 
 function sessionProject(sessionTimeoutMs: number | undefined): ProjectConfig {
@@ -1017,18 +1041,32 @@ test("M3 send 相位传输抛错 ⇒ transport + stage=send", async () => {
 /**
  * 按调用序号返回 `message/send` 结果的假桥：每步可以是结果体（成功响应）或 `Error`
  * （连接级抛错）；步数用尽后重复最后一步。`calls()` 返回已发生的 `message/send` 次数。
+ * v0.8.10 · M-N3：控制面 `tasks/cancel` / `tasks/get` 一律答 `canceled`（= 定向取消即达静默），
+ * 不计入 `calls()`；`cancels()` 供「取消发了几次 / 取消的是哪个 id」断言。
  */
-function sendScript(steps: Array<unknown | Error>): { fetchFn: A2AFetch; calls: () => number } {
+function sendScript(steps: Array<unknown | Error>): {
+  fetchFn: A2AFetch;
+  calls: () => number;
+  cancels: () => string[];
+} {
   let index = 0;
+  const cancelIds: string[] = [];
   const fetchFn: A2AFetch = async (_url, init) => {
-    const req = JSON.parse(String(init.body)) as { method: string };
+    const req = JSON.parse(String(init.body)) as { method: string; params?: { id?: string } };
+    if (req.method === "tasks/cancel") {
+      cancelIds.push(String(req.params?.id ?? ""));
+      return rpcResult(taskResult(String(req.params?.id ?? ""), "canceled", ""));
+    }
+    if (req.method === "tasks/get") {
+      return rpcResult(taskResult(String(req.params?.id ?? ""), "canceled", ""));
+    }
     assert.equal(req.method, "message/send");
     const step = steps[Math.min(index, steps.length - 1)];
     index += 1;
     if (step instanceof Error) throw step;
     return rpcResult(step);
   };
-  return { fetchFn, calls: () => index };
+  return { fetchFn, calls: () => index, cancels: () => cancelIds };
 }
 
 test("M5 常量：有界重发 = 至多 1 次、重发前剩余闸 60s；连接级文本可辨、超时类不可辨", () => {
@@ -1041,7 +1079,7 @@ test("M5 常量：有界重发 = 至多 1 次、重发前剩余闸 60s；连接�
   assert.equal(isConnectionLevelFailure("会话 60000ms 超时"), false);
 });
 
-test("M5 ① 终态 + closed + 零 chunk ⇒ 先 stop 再重跑一次并成功（早夭自愈主形态）", async () => {
+test("M5 ① 终态 + closed + 零 chunk ⇒ 先定向取消本轮再重跑一次并成功（早夭自愈主形态；不 stop 桥）", async () => {
   const calls: HostCalls = { ensured: [], stopped: [] };
   const cap = captureOutbox();
   const script = sendScript([
@@ -1069,7 +1107,8 @@ test("M5 ① 终态 + closed + 零 chunk ⇒ 先 stop 再重跑一次并成功�
   assert.ok(result.text.includes("late ok"));
   assert.equal(script.calls(), 2); // message/send 两次（首发夭折 + 重跑）
   assert.deepEqual(calls.ensured, ["alpha", "alpha"]); // 重跑前重新 ensure
-  assert.deepEqual(calls.stopped, ["alpha"]); // ★ 必须先 stop（消除忙会话）
+  assert.deepEqual(calls.stopped, []); // ★ v0.8.10 · M-N3：不再 stop 桥（连坐同项目在飞任务）
+  assert.deepEqual(script.cancels(), ["a2a-1"]); // ★ 改定向取消本轮（a2aTaskId 精确到那一轮）
   assert.equal(result.diagnostics?.attempts, 1); // 留痕
 });
 
@@ -1217,7 +1256,8 @@ test("M5 另断：attempts 封顶（每次终态都 spawn/零 chunk 也只重跑
   const result = await cap.wait();
   assert.equal(result.state, "failed");
   assert.equal(script.calls(), 2); // 首发 + 一次重跑即封顶（非 3）
-  assert.equal(calls.stopped.length, 1);
+  assert.deepEqual(calls.stopped, []); // v0.8.10 · M-N3：重跑不再 stop 桥
+  assert.deepEqual(script.cancels(), ["a2a-1"]); // 只取消那一轮
   assert.equal(result.diagnostics?.attempts, 1);
   assert.equal(result.diagnostics?.chunkCount, 0);
 });
@@ -1498,27 +1538,47 @@ test("M2 RECONCILE_FAILURE_KIND 定档 = runner（补结算路径取值，写面
 /**
  * 记录每次 `message/send` 请求文本的假桥（区别于 `sendScript`：续跑要断言**第二发 prompt**）。
  * 每步 = 结果体（成功响应）或 `Error`（连接级抛错）；步数用尽后重复最后一步。
+ * v0.8.10 · M-N3：控制面 `tasks/cancel` / `tasks/get` 按**该轮上一步的终态原样**回
+ * （= 桥「终态支路」的真实形状：通知送达、state 不变），不计入 `calls()`。
  */
 function capturingSend(steps: Array<unknown | Error>): {
   fetchFn: A2AFetch;
   calls: () => number;
   prompts: () => string[];
+  cancels: () => string[];
 } {
   const sentPrompts: string[] = [];
+  const cancelIds: string[] = [];
   let index = 0;
+  let lastState = "canceled";
   const fetchFn: A2AFetch = async (_url, init) => {
     const req = JSON.parse(String(init.body)) as {
       method: string;
-      params?: { message?: { parts?: Array<{ kind: string; text?: string }> } };
+      params?: {
+        id?: string;
+        message?: { parts?: Array<{ kind: string; text?: string }> };
+      };
     };
+    if (req.method === "tasks/cancel" || req.method === "tasks/get") {
+      if (req.method === "tasks/cancel") cancelIds.push(String(req.params?.id ?? ""));
+      const id = String(req.params?.id ?? "");
+      return rpcResult(taskResult(id, lastState === "working" ? "canceled" : lastState, ""));
+    }
     assert.equal(req.method, "message/send");
     sentPrompts.push(req.params?.message?.parts?.[0]?.text ?? "");
     const step = steps[Math.min(index, steps.length - 1)];
     index += 1;
     if (step instanceof Error) throw step;
+    lastState =
+      (step as { status?: { state?: string } }).status?.state ?? "canceled";
     return rpcResult(step);
   };
-  return { fetchFn, calls: () => index, prompts: () => sentPrompts };
+  return {
+    fetchFn,
+    calls: () => index,
+    prompts: () => sentPrompts,
+    cancels: () => cancelIds,
+  };
 }
 
 /** 收集 warn 文本的假 logger（断言 sessionResumed=false 留痕） */
@@ -1788,7 +1848,8 @@ test("M3 真链路：满窗有产出 ⇒ 续跑一次并成功（prompt 换续�
   // 两发：首发满窗 + 续跑轮
   assert.equal(script.calls(), 2);
   assert.deepEqual(calls.ensured, ["alpha", "alpha"]); // 续跑前重新 ensure
-  assert.deepEqual(calls.stopped, ["alpha"]); // ★ 续跑复用「先 stop 再 ensure」
+  assert.deepEqual(calls.stopped, []); // ★ v0.8.10 · M-N3：续跑**不再 stop 桥**（连坐同项目在飞任务）
+  assert.deepEqual(script.cancels(), ["a2a-1"]); // 只定向取消本轮（续跑轮成功 ⇒ 无收尾取消）
   // 续跑轮发的是拼装好的续跑 prompt（含锚 + 指令 + 中和后残段，且无有效失败块）
   const second = script.prompts()[1] ?? "";
   assert.ok(second.includes("原任务"));
@@ -2008,6 +2069,11 @@ function sealBridge(
       return rpcResult(
         round >= 2 && round2 === "complete" ? taskResult("a2a-1", "completed", "续后完成") : working,
       );
+    }
+    if (req.method === "tasks/cancel") {
+      // 桥的两支：轮 1 record 已终态（`abandoned` ⇒ 通知送达、**state 不变** = failed）；
+      // 轮 2 仍 working（挂死）⇒ working 支置 canceled。
+      return rpcResult(taskResult("a2a-1", round >= 2 ? "canceled" : "failed", ""));
     }
     if (req.method === "tasks/get") {
       if (round >= 2) return rpcResult(working); // 续跑轮永不收敛
@@ -2350,4 +2416,190 @@ test("AC-S2：成功轮 diagnostics 存在且含 turn / promptChars / resultChar
   assert.equal(d.partialTailChars, 18, "只留长度键");
   assert.equal(d.elapsedMs, 0, "launcher 自测键不由桥覆盖");
   assert.equal(d.stage, "send", "stage 取 launcher 落点，不采桥的 success");
+});
+
+// ---------- REQ-v0.8.10-2026-09-24-01 · M-N3：定向取消（不再 stop 桥）+ B16′ 收尾取消 ----------
+
+test("M-N3 封① 续跑走「定向取消 → 静默 → ensure」：零 stop，同项目在飞的只读任务不被连坐", async () => {
+  const calls: HostCalls = { ensured: [], stopped: [] };
+  const cap = captureOutbox();
+  const ledger = new InFlightLedger();
+  // 同项目另一条**在飞只读任务** —— 旧形态下续跑第一步 `stop` 整桥会把它一并杀掉（真机实证 4 个全灭）
+  ledger.add({ taskId: "t-read", projectId: "alpha", startedAt: STARTED_AT, a2aTaskId: "a2a-read" });
+  const script = capturingSend([
+    taskResult("a2a-1", "failed", "会话满窗", [
+      diagnosticsArtifact({
+        acpErrorKind: "timeout",
+        chunkCount: 3,
+        partialChars: 800,
+        updateCount: 12,
+        partialTail: "半截进度",
+      }),
+    ]),
+    taskResult("a2a-1", "completed", "续后完成"),
+  ]);
+  const exec = makeExecutor({
+    host: makeHost(calls, marginProject({ sessionTimeoutMs: 600_000, continueMarginMs: 300_000 })),
+    ledger,
+    outbox: cap.outbox,
+    fetch: script.fetchFn,
+  });
+  await exec.handle({
+    type: "dispatch",
+    taskId: "t-write",
+    projectId: "alpha",
+    contextId: "ctx",
+    payload: "原任务",
+  });
+
+  const result = await cap.wait();
+  assert.equal(script.calls(), 2); // 首发满窗 + 续跑轮
+  assert.deepEqual(calls.ensured, ["alpha", "alpha"]); // 静默达成 ⇒ ensure 幂等复用同桥
+  assert.deepEqual(calls.stopped, []); // ★ 全程**零** stop（不再连坐）
+  assert.deepEqual(script.cancels(), ["a2a-1"]); // ★ 取消精确到那一轮的 a2aTaskId
+  assert.equal(ledger.has("t-read"), true); // 兄弟只读任务仍在飞
+  assert.equal(ledger.countFor("alpha"), 1); // 本案自己已结算，台账只剩 read
+  assert.equal(result.state, "completed");
+  assert.equal(result.diagnostics?.continueAttempts, 1);
+});
+
+test("M-N3 封② 取消未达静默 ⇒ (C) 降级：不 stop、不续跑，保持 failed 交宿主（且不消费续跑计数）", async () => {
+  const calls: HostCalls = { ensured: [], stopped: [] };
+  const cap = captureOutbox();
+  const logger = warnCollector();
+  const clock = fakeClock();
+  let sends = 0;
+  // 该轮**对取消毫无反应**：tasks/cancel / tasks/get 恒 working ⇒ 静默永不达成
+  const fetchFn: A2AFetch = async (_url, init) => {
+    const req = JSON.parse(String(init.body)) as { method: string };
+    if (req.method === "message/send") {
+      sends += 1;
+      return rpcResult(
+        taskResult("a2a-1", "failed", "会话满窗", [
+          diagnosticsArtifact({
+            acpErrorKind: "timeout",
+            chunkCount: 3,
+            partialChars: 800,
+            updateCount: 12,
+            partialTail: "半截进度",
+          }),
+        ]),
+      );
+    }
+    if (req.method === "tasks/cancel" || req.method === "tasks/get") {
+      return rpcResult(taskResult("a2a-1", "working", ""));
+    }
+    throw new Error(`未预期方法：${req.method}`);
+  };
+  const exec = makeExecutor({
+    host: makeHost(calls, marginProject({ sessionTimeoutMs: 600_000, continueMarginMs: 300_000 })),
+    ledger: new InFlightLedger(),
+    outbox: cap.outbox,
+    fetch: fetchFn,
+    now: clock.now,
+    sleep: clock.sleep,
+    pollIntervalMs: 1_000,
+    logger: logger.logger,
+  });
+  await exec.handle({
+    type: "dispatch",
+    taskId: "t-degrade",
+    projectId: "alpha",
+    contextId: "ctx",
+    payload: "hi",
+  });
+
+  const result = await cap.wait();
+  assert.equal(sends, 1); // ★ 未起续跑轮
+  assert.deepEqual(calls.ensured, ["alpha"]); // 只 ensure 一次（无「取消后再 ensure」）
+  assert.deepEqual(calls.stopped, []); // ★ 降级也不 stop
+  assert.equal(result.state, "failed");
+  assert.equal(result.failureKind, "timeout");
+  assert.equal(result.diagnostics?.timeoutScope, "acp-prompt");
+  assert.equal(result.diagnostics?.continueAttempts, undefined); // 留痕不被「没跑的续跑轮」污染
+  assert.ok(logger.warns.some((m) => m.includes("续跑降级") && m.includes("保持 failed 交宿主")));
+});
+
+test("M-N3 封③ B16′ 收尾取消：放弃点（runner-deadline）在 outbox.deliver **之后**发有界 cancel，不拖账单", async () => {
+  const calls: HostCalls = { ensured: [], stopped: [] };
+  const clock = fakeClock();
+  const timeline: string[] = [];
+  const delivered: RunnerTaskResult[] = [];
+  let settle!: (result: RunnerTaskResult) => void;
+  const first = new Promise<RunnerTaskResult>((resolve) => {
+    settle = resolve;
+  });
+  let settleCancel!: () => void;
+  const canceled = new Promise<void>((resolve) => {
+    settleCancel = resolve;
+  });
+  // 桥到 500s 才收敛；派发框 = 60s 窗 + 300s 结构 + min(60s,60s) = 420s ⇒ launcher 先判 runner-deadline
+  const bridge = bridgedFetch(clock, 500_000, taskResult("a2a-1", "completed", "never"));
+  const fetchFn: A2AFetch = async (url, init) => {
+    const req = JSON.parse(String(init.body)) as { method: string };
+    if (req.method === "tasks/cancel") {
+      timeline.push("tasks/cancel");
+      settleCancel();
+    }
+    return bridge.fetchFn(url, init);
+  };
+  const exec = makeExecutor({
+    host: makeHost(calls, marginProject({ sessionTimeoutMs: 60_000, continueMarginMs: 60_000 })),
+    ledger: new InFlightLedger(),
+    outbox: {
+      deliver: (result) => {
+        timeline.push("deliver");
+        delivered.push(result);
+        settle(result);
+      },
+    },
+    fetch: fetchFn,
+    now: clock.now,
+    sleep: clock.sleep,
+    pollIntervalMs: 1_000,
+  });
+  await exec.handle({
+    type: "dispatch",
+    taskId: "t-tail",
+    projectId: "alpha",
+    contextId: "ctx",
+    payload: "hi",
+  });
+
+  const result = await first;
+  assert.equal(result.state, "failed");
+  assert.equal(result.failureKind, "timeout");
+  assert.equal(result.diagnostics?.timeoutScope, "runner-deadline");
+  assert.deepEqual(delivered.map((r) => r.taskId), ["t-tail"]); // 账单只有一张
+  await canceled; // 等收尾取消落地（账单已先行 ⇒ 它追不上交卷时刻）
+  assert.deepEqual(timeline, ["deliver", "tasks/cancel"]); // ★ 收尾取消**排在账单之后**、且只一发
+  assert.deepEqual(calls.stopped, []); // 收尾同样不 stop 桥
+});
+
+test("M-N3 封④ 未建立轮次（a2aTaskId=null）⇒ 跳过不发取消，重发照常", async () => {
+  const calls: HostCalls = { ensured: [], stopped: [] };
+  const cap = captureOutbox();
+  const script = sendScript([
+    new Error("connect ECONNREFUSED 127.0.0.1:4321"), // send 相位连接级失败：句柄从未到手
+    taskResult("a2a-1", "completed", "重投后成功"),
+  ]);
+  const exec = makeExecutor({
+    host: makeHost(calls),
+    ledger: new InFlightLedger(),
+    outbox: cap.outbox,
+    fetch: script.fetchFn,
+  });
+  await exec.handle({
+    type: "dispatch",
+    taskId: "t-nohandle",
+    projectId: "alpha",
+    contextId: "ctx",
+    payload: "hi",
+  });
+
+  const result = await cap.wait();
+  assert.equal(result.state, "completed");
+  assert.equal(script.calls(), 2); // 辅形态重发照常
+  assert.deepEqual(script.cancels(), []); // ★ 无句柄 ⇒ 无可取消对象，一发不发
+  assert.deepEqual(calls.stopped, []);
 });

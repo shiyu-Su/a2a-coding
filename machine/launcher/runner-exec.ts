@@ -51,6 +51,15 @@
  *   防后端复述 ⇒ outcome 解析器误读成假终态；
  * - **`sessionResumed=false` 照跑但留痕**（续跑静默退化成重跑 = 本机制最大隐性风险）；
  * - **不延长 `deadline`**：续跑只消费 `remaining()` ⇒ 本版只保证「不白烧」，不保证「续得完」。
+ *
+ * v0.8.10 · 节点 M-N5（REQ-v0.8.10-2026-09-23-01）本模块承担**两把并发闸 + `readOnly` 消费**
+ * （改造文档 §2.3；闸归 machine = 真资源只有它可见，且散活不经调度器 ⇒ orch 侧闸天然有洞）：
+ * - {@link DispatchGate}：**按 project 计**的写 / 读两把独立计数闸（读不占写位、写不占读位），
+ *   上限取项目平铺键 `maxConcurrentWrites` / `maxConcurrentReads`（缺省 **1/1** ⇒ 不配键时形态同 v0.8.9）；
+ * - **执法点** = {@link RunnerCommandExecutor.startDispatch} 的 fire-and-forget 之前
+ *   （{@link RunnerCommandExecutor.runGated}）：满位则**排队（FIFO）**，放行后才起 `executeDispatch`
+ *   ⇒ 派发预算从放行时刻起算、不吃排队时长；跨项目全局闸本版不做；
+ * - {@link DispatchCommand.readOnly}：**仅显式 `true` 进读档**，其余按写（保守缺省 ⇒ 老桥不下发即现状）。
  */
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
@@ -64,8 +73,13 @@ import {
   type A2AFetch,
   type A2ATaskView,
 } from "./a2a-client.js";
-import { agentEndpoint } from "./manager.js";
-import { effectiveSessionTimeoutMs, resolveContinueMarginMs } from "./agent-config.js";
+import { agentEndpoint, type StopOptions } from "./manager.js";
+import type { StopCause, StopEventLedger } from "./stop-ledger.js";
+import {
+  effectiveGateLimits,
+  effectiveSessionTimeoutMs,
+  resolveContinueMarginMs,
+} from "./agent-config.js";
 import { errorMessage } from "./process.js";
 import type { InFlightEntry, InFlightLedger, RunnerLogger } from "./runner.js";
 
@@ -87,7 +101,12 @@ export const DISPATCH_MARGIN_MS = 300_000;
 /** 任务态轮询间隔 */
 export const DEFAULT_POLL_INTERVAL_MS = 1_000;
 
-/** `tasks/cancel` 短请求超时（取消是控制面动作，不应拖长轮询预算） */
+/**
+ * `tasks/cancel` 短请求超时（取消是控制面动作，不应拖长轮询预算）。
+ * v0.8.10 · M-N3 起同时是**定向取消 / 收尾取消的静默窗**上限（规格区间 10~15s，此处取 10s）：
+ * 取消一律用本常量计时，**不用 `remaining()`** —— 放弃点上后者已 ≤0，会被
+ * `MIN_REQUEST_TIMEOUT_MS` 夹成不可控值。
+ */
 export const CANCEL_TIMEOUT_MS = 10_000;
 
 /**
@@ -298,6 +317,12 @@ export interface DispatchCommand {
    * 缺省 = 旧桥未下发（结果仍落盘重试；桥侧缺 token 会拒收，行为显式可观测）。
    */
   claimToken?: string;
+  /**
+   * 只读节点标志（v0.8.10 · M-N5；O-N4 起由桥按 `tasks.lane` 下发）。
+   * **只有显式 `true` 才进读档** —— 缺省 / `false` / 非布尔一律**按写**（保守）：
+   * 老桥不下发该键 ⇒ 读到 `undefined` 天然落写档 = v0.8.9 现状（不动 `PROTOCOL_VERSION`）。
+   */
+  readOnly?: true;
 }
 
 /** 停止命令：停止本机项目 Agent（in-flight>0 时拒收） */
@@ -432,6 +457,11 @@ export interface RunnerTaskDiagnostics {
   blockCount?: number;
   /** 本轮被丢弃的跨轮重放 chunk 数 */
   replayDropped?: number;
+  /**
+   * 本轮被判定为**残段**而丢弃的 chunk 数（v0.8.10 · M-N2 哨兵；恒报，`0` = 没有残段漏进本轮）。
+   * 与 `replayDropped`（历史重放）分账，**不参与任何判据**，纯取证面。
+   */
+  staleChunkCount?: number;
   /** outcome 不确定标志（true 才报；本侧 `business` 守卫据此退回账面 state） */
   outcomeAmbiguous?: boolean;
   /** 不确定诱因（闭集，见 {@link BridgeDiagnostics.ambiguousReason}） */
@@ -440,6 +470,35 @@ export interface RunnerTaskDiagnostics {
   sessionMapSize?: number;
   /** 其中最旧条目的年龄（天，向下取整） */
   sessionMapOldestAgeDays?: number;
+  // ---------- v0.8.10 · M-N4：归因五键（「谁杀了这一轮」的账面事实；不动 failureKind 六类闭集）----------
+  /**
+   * 停因闭集（四值）：本项目 Agent 被谁停掉 ⇒ 本次派发的在飞轮次随之连坐。
+   * 数据源 = 进程内停事件账（`manager.stop` 盖、本模块按 `projectId + 时间窗` 命中）。
+   * **无停因 ⇒ 省略该键**（不补 0 / 不补 null）；宿主据此把「被连坐」与「业务失败」分开读，
+   * 不再对裸 `failed` 误触发重派（改造文档 §3.2 U4）。
+   */
+  stopCause?: StopCause;
+  /** 肇事任务 id（触发停止的**归属者**，≠ 被停者；§3.2 U8） */
+  stopCauseTaskId?: string;
+  /**
+   * ★ B16′ 是否生效的账面证据 = 本次派发内对被放弃轮次的定向取消**达成静默**（true）／
+   * 发出但未静默（false）。未发出过任何取消 ⇒ **省略该键**。
+   * ⚠ 收尾取消按硬约束③排在 `outbox.deliver()` **之后** ⇒ 那一趟无法回写本单（已交卷），
+   * 改由停事件账 → `config-snapshot` 播报 + `/health degraded` 承载；本键覆盖的是
+   * **交卷前**已发生的取消（(C) 降级 / 续跑 / 重发路）。
+   */
+  ghostRoundCancelled?: boolean;
+  /**
+   * 取消往返耗时（量化判据；仅取消**达成静默**时有值，未静默 ⇒ 省略）。
+   * ⚠ 口径：量的是本机 loopback `tasks/cancel`/`tasks/get` 到桥台账转终态的墙钟差
+   * （桥侧 `session/cancel` fire-and-forget、就地置 `canceled`），**不反映后端是否真的停止计算**。
+   */
+  cancelQuiesceMs?: number;
+  /**
+   * 后端不认 `session/cancel`（取消已发出但窗口内未静默）。与 machine `/health degraded`
+   * **同名不同面**（沿用既有先例，不新造别名）。
+   */
+  cancelUnsupported?: boolean;
 }
 
 /** 任务结果（M4 落盘 `.a2a/outbox/<taskId>.json` 的载荷形状） */
@@ -479,11 +538,151 @@ export interface RunnerOutbox {
   stop?(): void;
 }
 
+/**
+ * 并发档位（v0.8.10 · M-N5）：**同 project 的两把独立计数闸** —— 读不占写位、写不占读位。
+ * 归档只认显式 `readOnly === true`，其余一律 `write`（保守方向 = 与 v0.8.9 现状同形）。
+ */
+export type DispatchLane = "write" | "read";
+
+/** 命令 / 台账条目 → 档位（`true` 之外的一切取值落写档） */
+export function laneOfReadOnly(readOnly: unknown): DispatchLane {
+  return readOnly === true ? "read" : "write";
+}
+
+/** 一档的并发上限（两档独立，见 {@link DispatchLaneLimits}） */
+export interface DispatchLaneCounts {
+  write: number;
+  read: number;
+}
+
+/** 某项目的排队计数：`oldestWaitedMs` = 两档队首里等得最久的那个（无队 ⇒ 不进快照） */
+export interface DispatchQueueCounts extends DispatchLaneCounts {
+  oldestWaitedMs: number;
+}
+
+/**
+ * 闸快照（v0.8.10 · M-N5 数据面）：**只含有活动的项目**（全零项目不出现）。
+ * `inFlightByProject` = 已过闸、真在跑的档位计数；`queuedByProject` = 还在等的档位计数。
+ * 已装配进 `/health degraded`（v0.8.10 增补轨 · A1，经 `server.ts` 的 `buildDegradedStatus`）。
+ */
+export interface DispatchGateSnapshot {
+  inFlightByProject: Record<string, DispatchLaneCounts>;
+  queuedByProject: Record<string, DispatchQueueCounts>;
+}
+
+interface GateWaiter {
+  taskId: string;
+  enqueuedAtMs: number;
+  /** 放行：席位由释放方**移交**（running 计数不动 ⇒ 后来者插不进队首之前） */
+  promote: () => void;
+}
+
+interface ProjectGate {
+  running: DispatchLaneCounts;
+  waiting: { write: GateWaiter[]; read: GateWaiter[] };
+}
+
+/**
+ * 两把并发闸（v0.8.10 · M-N5 · 改造文档 §2.3）：**按 project 计、与项目组正交**，
+ * 上限来自项目平铺键（缺省 1/1 ⇒ 不配键即与 v0.8.9 一致）。
+ *
+ * - **FIFO**：超限的派发进档内队列按到队顺序放行；释放出的席位**直接移交队首**，
+ *   不给「后到但恰好赶上空位」的命令插队 —— 否则 `oldestWaitedMs` 与「前面几个」的口径会漂。
+ * - **不丢弃、不设排队超时**：排队时长只计入可见面，派发预算（三段总框）从**放行之后**起算。
+ * - 跨项目全局闸本版不做（跨项目不共享桥、无连坐风险）。
+ */
+export class DispatchGate {
+  private readonly projects = new Map<string, ProjectGate>();
+
+  constructor(
+    private readonly limitsFor: (projectId: string) => DispatchLaneCounts,
+    private readonly clock: () => number,
+  ) {}
+
+  /**
+   * 取位：无队且有空位 ⇒ 立即 resolve(0)；否则排队，轮到放行时 resolve(已等毫秒)。
+   * 上限取不到（`limitsFor` 抛 = 项目未注册）⇒ 异常原样抛给调用方，**不占席位**。
+   */
+  acquire(projectId: string, lane: DispatchLane, taskId: string): Promise<number> {
+    const gate = this.gateFor(projectId);
+    const limits = this.limitsFor(projectId);
+    if (gate.waiting[lane].length === 0 && gate.running[lane] < limits[lane]) {
+      gate.running[lane] += 1;
+      return Promise.resolve(0);
+    }
+    return new Promise<number>((resolve) => {
+      const enqueuedAtMs = this.clock();
+      gate.waiting[lane].push({
+        taskId,
+        enqueuedAtMs,
+        promote: () => {
+          resolve(this.clock() - enqueuedAtMs);
+        },
+      });
+    });
+  }
+
+  /** 放位：有队 ⇒ 席位移交队首（running 不降）；无队 ⇒ 计数回落 */
+  release(projectId: string, lane: DispatchLane): void {
+    const gate = this.projects.get(projectId);
+    if (gate === undefined) return;
+    const next = gate.waiting[lane].shift();
+    if (next !== undefined) {
+      next.promote();
+      return;
+    }
+    gate.running[lane] = Math.max(0, gate.running[lane] - 1);
+  }
+
+  snapshot(): DispatchGateSnapshot {
+    const nowMs = this.clock();
+    const inFlightByProject: Record<string, DispatchLaneCounts> = {};
+    const queuedByProject: Record<string, DispatchQueueCounts> = {};
+    for (const [projectId, gate] of this.projects) {
+      if (gate.running.write > 0 || gate.running.read > 0) {
+        inFlightByProject[projectId] = { ...gate.running };
+      }
+      const headWrite = gate.waiting.write[0];
+      const headRead = gate.waiting.read[0];
+      if (gate.waiting.write.length === 0 && gate.waiting.read.length === 0) continue;
+      const waited: number[] = [];
+      if (headWrite !== undefined) waited.push(nowMs - headWrite.enqueuedAtMs);
+      if (headRead !== undefined) waited.push(nowMs - headRead.enqueuedAtMs);
+      queuedByProject[projectId] = {
+        write: gate.waiting.write.length,
+        read: gate.waiting.read.length,
+        oldestWaitedMs: Math.max(0, ...waited),
+      };
+    }
+    return { inFlightByProject, queuedByProject };
+  }
+
+  private gateFor(projectId: string): ProjectGate {
+    const existing = this.projects.get(projectId);
+    if (existing !== undefined) return existing;
+    const created: ProjectGate = {
+      running: { write: 0, read: 0 },
+      waiting: { write: [], read: [] },
+    };
+    this.projects.set(projectId, created);
+    return created;
+  }
+}
+
 /** 执行宿主：`AgentManager` 结构化满足（便于单测注入 fake，不依赖具体类） */
 export interface RunnerExecHost {
   ensure(projectId: string): Promise<{ endpoint: string }>;
-  stop(projectId: string): Promise<{ stopped: boolean }>;
+  /**
+   * `opts.cause`（v0.8.10 · M-N4）= 停因，带因的停止才进停事件账（`handleStop` 传
+   * `"stop-command"`）；不给 ⇒ 不记账（自检回收一类不是连坐）。
+   */
+  stop(projectId: string, opts?: StopOptions): Promise<{ stopped: boolean }>;
   getProject(projectId: string): ProjectConfig;
+  /**
+   * 进程内停事件账（v0.8.10 · M-N4）。**可选** = 未提供（单测 fake / 未接线）⇒
+   * 归因五键的停因侧与取消观察面一并省略（不补 0 / 不补 false）。
+   */
+  stopEventLedger?(): StopEventLedger;
 }
 
 export interface RunnerExecDeps {
@@ -576,6 +775,8 @@ export function parseRunnerCommand(body: unknown): RunnerCommand | null {
     const payload = o["payload"] ?? o["message"] ?? "";
     const claimToken = o["claimToken"];
     const base: DispatchCommand = { type: "dispatch", taskId, projectId, contextId, payload };
+    // v0.8.10 · M-N5：只认显式 `true`（缺省 / 其它取值 ⇒ 按写档，见 `DispatchCommand.readOnly`）
+    if (o["readOnly"] === true) base.readOnly = true;
     if (typeof claimToken === "string" && claimToken.length > 0) {
       return { ...base, claimToken };
     }
@@ -732,6 +933,11 @@ export interface BridgeDiagnostics {
   /** 本轮被丢弃的跨轮重放 chunk 数（replay-leak 判据的原料） */
   replayDropped?: number;
   /**
+   * 本轮被判定为**残段**（来自该会话已判 dead 的轮次）而丢弃的 chunk 数（v0.8.10 · M-N2）。
+   * 桥**恒报**该键（`0` = 「没有残段漏进本轮」的正向证据）；纯可观测，不参与判据与 state。
+   */
+  staleChunkCount?: number;
+  /**
    * outcome **不确定**标志（桥侧三判据任一命中 ⇒ true；false ⇒ 桥不报该键）。
    * launcher 只读不改写，且是本侧 `business` 守卫的唯一输入（见 {@link containsFailedOutcomeBlock}）。
    */
@@ -833,6 +1039,10 @@ function parseBridgeDiagnostics(text: string): BridgeDiagnostics | null {
   if (blockCount !== undefined) out.blockCount = blockCount;
   const replayDropped = uintOf(o["replayDropped"]);
   if (replayDropped !== undefined) out.replayDropped = replayDropped;
+  // v0.8.10 · M-N2：桥的残段哨兵键放行（桥侧恒报；不放行则该键取证链断在机内，
+  // 且 `test/acp-session.test.ts` 的「桥写键集 ⇔ 放行键集相等」断言会红）
+  const staleChunkCount = uintOf(o["staleChunkCount"]);
+  if (staleChunkCount !== undefined) out.staleChunkCount = staleChunkCount;
   if (typeof o["outcomeAmbiguous"] === "boolean") out.outcomeAmbiguous = o["outcomeAmbiguous"];
   const ambiguousReason = strOf(o["ambiguousReason"]);
   if (ambiguousReason !== undefined) out.ambiguousReason = ambiguousReason;
@@ -1051,7 +1261,60 @@ interface DispatchTrace {
 }
 
 /**
- * 一次派发尝试的结果 + 后续动作形态（v0.8.7 · M5 两种重发触发由「是否拿到终态」互斥划分；
+ * 一次派发内**已发生的取消事实**（v0.8.10 · M-N4 归因五键的取消侧三键）；
+ * 由 {@link RunnerCommandExecutor.cancelRound} 就地填写，交卷前并入 `diagnostics`。
+ * **没有对应事实就留空**（缺键 ⇒ 结果里不出现该键，不补 0 / 不补 false）。
+ */
+interface CancelFacts {
+  ghostRoundCancelled?: boolean;
+  cancelQuiesceMs?: number;
+  cancelUnsupported?: boolean;
+}
+
+/**
+ * {@link RunnerCommandExecutor.cancelRound} 的结果：三态判定 + 归因所需的两个度量。
+ * `quiesceMs` **仅达成静默时有值**（未静默 ⇒ 没有「取消到台账转终态」这段可测）；
+ * ⚠ 它是取消往返（loopback 到桥台账转终态）的墙钟差，**不是后端静默耗时**——
+ * 桥侧收到 `tasks/cancel` 即 fire-and-forget 转发 `session/cancel` 并就地写终态，从不回等后端。
+ * `cancelSent` **仅在取消请求确实发出过时带 true**（`not-started` 与「发出前即抛错」⇒ 省略），
+ * 是「取消已发出但未静默 = 后端不认 `session/cancel`」的判据。
+ */
+interface CancelRoundOutcome {
+  quiet: "quiet" | "not-started" | "unreachable";
+  quiesceMs?: number;
+  cancelSent?: boolean;
+}
+
+/**
+ * 停事件账 + 取消观察面（v0.8.10 · M-N4）：把一次取消的往返结果并入派发级事实袋，
+ * 并（有账时）写入**进程内**停事件账供 `config-snapshot` 播报与 `/health degraded` 读。
+ * `why = "收尾取消"` ⇒ 发生在交卷**之后**，事实袋已无用（账单不可回写）⇒ 只落观察面。
+ */
+function noteCancelFacts(
+  facts: CancelFacts | undefined,
+  ledger: StopEventLedger | undefined,
+  projectId: string,
+  outcome: CancelRoundOutcome,
+): void {
+  if (outcome.quiet === "not-started") return; // 取消从未发出 ⇒ 无任何事实
+  if (outcome.quiet === "quiet") {
+    if (outcome.quiesceMs !== undefined) ledger?.noteCancelQuiesce(projectId, outcome.quiesceMs);
+    if (facts === undefined) return;
+    facts.ghostRoundCancelled = true;
+    if (outcome.quiesceMs !== undefined) facts.cancelQuiesceMs = outcome.quiesceMs;
+    return;
+  }
+  if (outcome.cancelSent === true) {
+    // 取消**已发出**、静默窗内未达终态 = 后端不认 `session/cancel` 的降级事实
+    ledger?.noteCancelUnsupported(projectId);
+    if (facts === undefined) return;
+    const prior = facts.ghostRoundCancelled; // 先取再写：不让上一分支把本比较收窄成恒真
+    if (prior !== true) facts.ghostRoundCancelled = false; // 「发出但未静默」
+    facts.cancelUnsupported = true;
+  }
+}
+
+/** 一次派发尝试的结果 + 后续动作形态（v0.8.7 · M5 两种重发触发由「是否拿到终态」互斥划分；
  * v0.8.8 · M3 加第四值 `"timeout-continue"` = 续跑动作，`partialTail` 仅该形态携带）。
  */
 interface AttemptOutcome {
@@ -1068,6 +1331,8 @@ interface AttemptOutcome {
 export class RunnerCommandExecutor {
   private readonly host: RunnerExecHost;
   private readonly ledger: InFlightLedger;
+  /** 两把并发闸（v0.8.10 · M-N5）：上限按项目平铺键取，缺省 1/1 ⇒ 形态同 v0.8.9 */
+  private readonly gate: DispatchGate;
   private readonly machineId: string;
   private readonly outbox: RunnerOutbox;
   private readonly fetchFn: A2AFetch | undefined;
@@ -1082,6 +1347,11 @@ export class RunnerCommandExecutor {
   constructor(deps: RunnerExecDeps) {
     this.host = deps.host;
     this.ledger = deps.ledger;
+    this.gate = new DispatchGate(
+      (projectId) => effectiveGateLimits(this.host.getProject(projectId).agentConfig),
+      // 时钟源 = 执行器自身的 `now`（与派发预算同一口径），排队时长才可比
+      () => this.now().getTime(),
+    );
     this.machineId = deps.machineId;
     this.logger = deps.logger ?? defaultLogger;
     this.outbox = deps.outbox ?? createLoggingOutbox(this.logger);
@@ -1115,17 +1385,55 @@ export class RunnerCommandExecutor {
       this.logger.warn(`[runner] 派发命令重复（taskId=${command.taskId}），已忽略`);
       return;
     }
+    const lane = laneOfReadOnly(command.readOnly);
     const entry: InFlightEntry = {
       taskId: command.taskId,
       projectId: command.projectId,
       startedAt: this.isoNow(),
       a2aTaskId: null,
+      readOnly: lane === "read",
     };
+    // 登记即进台账：**排队中的派发也算在飞**（stop 拒收 / idleStop 判据 / 同 taskId 幂等去重都据它）
     this.ledger.add(entry);
-    void this.executeDispatch(command, entry).catch((err: unknown) => {
+    void this.runGated(command, entry, lane).catch((err: unknown) => {
       this.logger.error(`[runner] 派发执行异常（taskId=${command.taskId}）：${errorMessage(err)}`);
       this.ledger.remove(command.taskId);
     });
+  }
+
+  /**
+   * 闸 → 执行（v0.8.10 · M-N5）：同 project 同档满位 ⇒ **排队等待（FIFO）**；
+   * 放行后才起 {@link executeDispatch}，故派发预算（三段总框）从**放行时刻**起算、不吃排队时长。
+   * `admittedAt` = 放行时刻（区别于 `startedAt` = 命令领取时刻）；放行后重登记一次，
+   * 把准入时刻刷进落盘副本（同 taskId 覆盖，`InFlightLedger.add` 语义）。
+   */
+  private async runGated(
+    command: DispatchCommand,
+    entry: InFlightEntry,
+    lane: DispatchLane,
+  ): Promise<void> {
+    const waitedMs = await this.gate.acquire(command.projectId, lane, command.taskId);
+    if (waitedMs > 0) {
+      this.logger.info(
+        `[runner] 并发闸放行（档位=${lane} 排队 ${waitedMs}ms）：` +
+          `taskId=${command.taskId} project=${command.projectId}`,
+      );
+    }
+    entry.admittedAt = this.isoNow();
+    this.ledger.add(entry);
+    try {
+      await this.executeDispatch(command, entry);
+    } finally {
+      this.gate.release(command.projectId, lane);
+    }
+  }
+
+  /**
+   * 并发闸快照（v0.8.10 · M-N5）：**数据面**，供 `/health degraded` 读点取用。
+   * 装配点已落 `/health degraded`（v0.8.10 增补轨 · A1，同段含 `lastCancelQuietMs` / `cancelUnsupported`）⇒ 本方法不加也不改该段结构。
+   */
+  gateSnapshot(): DispatchGateSnapshot {
+    return this.gate.snapshot();
   }
 
   /**
@@ -1137,27 +1445,32 @@ export class RunnerCommandExecutor {
    *   （`result` 到手、`deliver` 之前）判定 —— v0.8.8 · M2 值域下语义不变 =「**载体早夭**」：
    *   `failureKind === "agent"`（`acpErrorKind ∈ {spawn, closed}` 的归属类）∧
    *   `diagnostics.chunkCount === 0` ⇒
-   *   **必须先 `host.stop(projectId)` 再 `ensure`** —— `ensure` 只幂等复用在册进程，桥进程
-   *   活着且忙时返回同一 endpoint ⇒ 不停则重发撞同一忙会话。这才是「早夭自愈」主体。
+   *   **先定向取消本轮再 `ensure`**（v0.8.10 · M-N3，见 {@link cancelRound}）—— `ensure` 只幂等
+   *   复用在册进程，桥进程活着且忙时返回同一 endpoint ⇒ 不先取消那一轮则重发撞同一忙会话。
    * - **辅形态 = 内部重投**（{@link isSendPhaseConnectFailure}）：唯一窄场景 = **send 相位连接级
    *   失败**（`entry.a2aTaskId === null` + 连接级错误文本）—— 此时连终态都拿不到；进程已死 ⇒
-   *   直接重 `ensure`（会重新拉起），无需 stop。
+   *   直接重 `ensure`（会重新拉起），取消无对象可指（`cancelRound` 退 `"not-started"`）。
    *
-   * **⚠ 边界（不得越界，务必保持不重发）**：「600s 超时且零输出」这一类**绝不重发 / 不重跑** ——
-   *   `timeout` 抛错路径只做 `discardCapture`、**从不发 `session/cancel`**（`session.ts:261/
-   *   :365-369`）⇒ 桥返回 failed 时后端那一轮**仍在跑**，同 `contextId` 重跑会与新会话的
-   *   load/resume 交织；而 ACP 的 cancel 是 notification、不等响应（`:297-306`）⇒ **确认不了
-   *   生效 ⇒ 不安全**。该类本版只能靠「加窗跑完」（M2/M3）或**等 orch 墙钟判死后由宿主重派**。
+   * **⚠ 边界（不得越界，务必保持不重发）**：「满窗且零输出」这一类**绝不重发 / 不重跑** ——
+   *   v0.8.10 · M-N3 前该场景连取消都发不出（桥 timeout 出口只 `discardCapture`）⇒ 后端那一轮
+   *   仍在烧，同 `contextId` 盲目重跑会与新会话的 load/resume 交织；今天桥满窗即**自取消**
+   *   （`session.ts` prompt 超时出口发 `session/cancel` + 标 `abandoned`），但 ACP 的 cancel 是
+   *   notification、不等响应 ⇒ **仍确认不了生效 ⇒ 不安全**。故该类依旧只能靠「加窗跑完」（M2/M3）
+   *   或**等 orch 墙钟判死后由宿主重派**；「有实质产出」才是续跑的准入（M3 门槛未变）。
    *   因此 `shouldRerunTerminal` 只认 `spawn/closed`（`timeout` kind 被排除），且 `poll` 相位
    *   抛错（已持有 `view.id`、任务可能仍在执行）不属辅形态 ⇒ 一律不重发 prompt。
    *   （M3 续跑是**另一条**被严格收窄的路：`timeoutScope="acp-prompt"` 桥已判满窗收尾 +
    *   实质产出门槛 + 180s 剩余预算闸 + 一次性 —— 与上述「盲目重跑」不是同一动作。）
    *
    * v0.8.8 · M3 加**场景 C 续跑**（{@link shouldContinueOn}）：命中判据 ⇒ 与重发同一个
-   * `stop → ensure` 闸后，**同 `contextId` 重发 prompt、prompt 换为续跑版**（{@link buildContinuePrompt}）。
+   * `定向取消 → ensure` 闸后，**同 `contextId` 重发 prompt、prompt 换为续跑版**（{@link buildContinuePrompt}）。
+   * **取消未达静默 ⇒ (C) 降级**：不 stop、不续跑，保持 `failed` 交宿主（宁可不续，不可连坐）。
    * `attempts`（传输重发）与 `continueAttempts`（续跑）**各自计数、各自留痕、不共用**；
    * `rounds < MAX_DISPATCH_ROUNDS` 为总轮数安全网（至多「1 重发 + 1 续跑」，防 2×2 组合）。
    * **deadline 不延长** —— 续跑只消费 `remaining()` ⇒ 只保证「不白烧」，不保证「续得完」。
+   *
+   * **B16′ 收尾取消**（v0.8.10 · M-N3，见 `deliver` 之后那段）：一趟派发以**被放弃的超时轮**收场
+   * 且不再续跑 ⇒ 在 `outbox.deliver()` **之后**补发一次有界定向取消，不任其后端白烧。
    *
    * **留痕**：日志 + `diagnostics.attempts` / `diagnostics.continueAttempts`+`continueTrigger`
    *   （**均不落库** —— `retry_count` 列是 Feature rearm 语义，不混用）。**orch 侧零改动且不可见**：
@@ -1170,6 +1483,8 @@ export class RunnerCommandExecutor {
     let attempts = 0;
     let continueAttempts = 0;
     let rounds = 0;
+    // v0.8.10 · M-N4：交卷前已发生的取消事实（归因五键中取消侧的三个）
+    const cancelFacts: CancelFacts = {};
     // 续跑轮的 prompt：初值 = 原任务文本；命中续跑后由 executeDispatch 就地拼装覆盖（残段本体不上带 orch）
     let promptText = payloadText(command.payload);
     let continuePrompt: string | undefined;
@@ -1194,12 +1509,27 @@ export class RunnerCommandExecutor {
           result = outcome.result;
           break;
         }
+        // v0.8.10 · M-N3：续跑 / 重发**不再 `host.stop(projectId)`** —— stop 停的是整个项目的桥，
+        // 会连坐同项目其它在飞任务（2026-09-23 真机实证：4 个只读任务全灭）。改为**只取消本轮**
+        // （定向 `tasks/cancel(entry.a2aTaskId)`），随后 `ensure` 幂等复用同桥。
+        const cancel = await this.cancelRound(entry, command.projectId);
+        noteCancelFacts(cancelFacts, this.stopLedger(), command.projectId, cancel);
+        if (action === "timeout-continue" && cancel.quiet !== "quiet") {
+          // ★ (C) 降级：静默未达成 ⇒ **不 stop、不续跑** ⇒ 保持 failed 交宿主裁决。
+          //   在消费任何计数器**之前**判定 ⇒ `continueAttempts` 留痕不会被「没跑的续跑轮」污染。
+          this.logger.warn(
+            `[runner] 场景 C 续跑降级（取消未达静默 = ${cancel.quiet} ⇒ 不 stop、不续跑，保持 failed 交宿主）：` +
+              `taskId=${command.taskId} project=${command.projectId}`,
+          );
+          result = outcome.result;
+          break;
+        }
         if (action !== "timeout-continue") {
           attempts += 1;
           this.logger.warn(
             `[runner] 传输层有界重发（第 ${attempts} 次，触发=${action}）：` +
               `taskId=${command.taskId} project=${command.projectId} remaining=${remaining()}ms ` +
-              `kind=${outcome.result.diagnostics?.acpErrorKind ?? "-"}`,
+              `kind=${outcome.result.diagnostics?.acpErrorKind ?? "-"} cancel=${cancel.quiet}`,
           );
         } else {
           continueAttempts += 1;
@@ -1222,15 +1552,6 @@ export class RunnerCommandExecutor {
           promptText = buildContinuePrompt(promptText, tail);
           continuePrompt = promptText; // 下一轮 attemptOnce 直接发送拼装好的续跑 prompt
         }
-        // 主形态/续跑：先 stop 消除忙会话；辅形态：桥进程已死，stop 幂等无副作用，亦先 stop 再 ensure。
-        try {
-          await this.host.stop(command.projectId);
-        } catch (err) {
-          this.logger.warn(
-            `[runner] ${action === "timeout-continue" ? "续跑" : "重发"}前 stop 抛错（忽略，继续 ensure）：` +
-              `taskId=${command.taskId} ${errorMessage(err)}`,
-          );
-        }
       }
     } finally {
       this.ledger.remove(command.taskId);
@@ -1239,9 +1560,13 @@ export class RunnerCommandExecutor {
       result = this.withDispatchStamp(result, trace, attempts, continueAttempts);
     }
     result = this.applyWorkspaceFingerprint(result, fpBefore, this.fingerprintAt(command.projectId));
+    // ★ 归因五键（v0.8.10 · M-N4）：必须在 `deliver()` **之前**并入（交卷后不可回写）
+    result = this.applyAttribution(result, trace, cancelFacts);
     this.logger.info(
       `[runner] 任务结束：taskId=${result.taskId} project=${result.projectId} state=${result.state}${
         result.failureKind !== undefined ? ` failureKind=${result.failureKind}` : ""
+      }${
+        result.diagnostics?.stopCause !== undefined ? ` stopCause=${result.diagnostics.stopCause}` : ""
       }${attempts > 0 ? ` attempts=${attempts}` : ""}${
         continueAttempts > 0 ? ` continueAttempts=${continueAttempts}` : ""
       }（交 outbox）`,
@@ -1251,6 +1576,137 @@ export class RunnerCommandExecutor {
         ? { claimToken: command.claimToken }
         : undefined;
     await this.outbox.deliver(result, credential);
+    // ★ **B16′ 收尾取消**（v0.8.10 · M-N3）：一趟派发结束时，若最终账单是一轮**被放弃的超时**
+    //   （`timedOut ⇒ runner-deadline` / 桥满窗 ⇒ `acp-prompt`）且本轮**不再续跑**（循环已退出），
+    //   后端那一轮可能仍在烧 ⇒ 主动取消它，不再任其白烧（机器上有别的活在跑 ⇒ CLI 不被回收，
+    //   会一直跑到自然结束、结果被丢弃 = v0.8.8 记录的 31 次「未知 id」形态）。
+    //   ⚠ 硬约束 ③：**必须排在 `outbox.deliver()` 之后**（账单先行 ⇒ 取消永不拖后交卷）；
+    //   失败只 warn，且 `cancelRound` 自身不抛。`entry.a2aTaskId === null` ⇒ 无可取消对象，跳过。
+    if (result.state === "failed" && result.failureKind === "timeout") {
+      const tail = await this.cancelRound(entry, command.projectId, "收尾取消");
+      // 账单已交 ⇒ 取消事实无处可写（不改已交卷的 diagnostics），只落观察面：
+      // 停事件账 → `config-snapshot` 播报 + `/health degraded`（见停事件账注释）。
+      noteCancelFacts(undefined, this.stopLedger(), command.projectId, tail);
+      if (tail.quiet === "unreachable") {
+        this.logger.warn(
+          `[runner] 收尾取消未生效（忽略，账单已交）：taskId=${command.taskId} project=${command.projectId}`,
+        );
+      }
+    }
+  }
+
+  /** 停事件账读点（宿主未注入 ⇒ undefined：归因与观察面双双省略，不报错） */
+  private stopLedger(): StopEventLedger | undefined {
+    return this.host.stopEventLedger?.();
+  }
+
+  /**
+   * **归因并入账单**（v0.8.10 · M-N4）：在 `outbox.deliver()` 前，把「谁杀了这一轮」的账面事实
+   * （停事件账按 `projectId + [起算, 现在]` 命中）与本次派发内的取消事实写进 `diagnostics`。
+   * **只增键、不改既有键**（`failureKind` 六类闭集口径完全不动）。
+   * 无命中 ⇒ 原样返回（一个键也不加）。
+   */
+  private applyAttribution(
+    result: RunnerTaskResult,
+    trace: DispatchTrace,
+    cancelFacts: CancelFacts,
+  ): RunnerTaskResult {
+    const ledger = this.stopLedger();
+    const stop =
+      ledger?.matchStop(result.projectId, trace.startedAtMs, this.now().getTime()) ?? null;
+    const extras = mergeDiagnostics({
+      ...(stop !== null
+        ? { stopCause: stop.cause, ...(stop.causeTaskId !== undefined ? { stopCauseTaskId: stop.causeTaskId } : {}) }
+        : {}),
+      ...cancelFacts,
+    });
+    if (Object.keys(extras).length === 0) return result;
+    // 归因只在「本轮确有事实」时发生 ⇒ 账单多半已带 diagnostics；缺时按派发自述补齐，
+    // 不复用别处的 elapsedMs / stage 口径。
+    const base: RunnerTaskDiagnostics =
+      result.diagnostics ??
+      {
+        elapsedMs: Math.max(0, this.now().getTime() - trace.startedAtMs),
+        stage: trace.stage,
+      };
+    return { ...result, diagnostics: { ...base, ...extras } };
+  }
+
+  /**
+   * **定向取消本轮**（v0.8.10 · M-N3）：`tasks/cancel(entry.a2aTaskId)` →（仍非终态时）有界轮询
+   * `tasks/get` 至终态，静默窗 ≤ {@link CANCEL_TIMEOUT_MS}。
+   * 替代的是旧「`host.stop(projectId)` 整桥」—— 后者连坐同项目所有在飞任务。
+   *
+   * 返回三态：
+   * - `"quiet"`：该轮已终止（`canceled`，或桥已自判终态且取消送达）⇒ 可安全 `ensure` 复用同桥续跑；
+   * - `"not-started"`：`a2aTaskId === null`（send 未返回）⇒ 无可取消对象，**跳过不发**；
+   * - `"unreachable"`：取消 / 轮询抛错或到点仍未终态 ⇒ 调用方**不得**据此续跑（(C) 降级）。
+   *
+   * ⚠ 三条硬约束（与桥侧 `task-registry.cancel` 同源，缺一即开「第二条结果」的口子）：
+   * ① **只走控制通道** —— 本方法只发 `tasks/cancel` / `tasks/get`，**绝不**读回结果文本、
+   *    **绝不**再交一次账单（读到的 state 只用于判静默）；
+   * ② **不得改该轮在桥台账里的 state**（通知与状态回写各归其主，见 `task-registry.ts`）；
+   * ③ **收尾取消必须排在 `outbox.deliver()` 之后**（见 {@link executeDispatch}）。
+   * 三条同时成立 ⇒ 结构上不可能产生第二条结果，堵死「`rearmForRetry` 后无 claimToken
+   * 命中补结算窄口」的误归因风险。
+   *
+   * 计时口径：取消请求与轮询请求**一律用常量 {@link CANCEL_TIMEOUT_MS}**，**不用 `remaining()`**
+   * —— 放弃点上 `remaining()` 已 ≤ 0，会被 `MIN_REQUEST_TIMEOUT_MS` 夹成不可控值。
+   * 本方法**不抛**（抛错 = 把已成交的账单退化成丢单）。
+   */
+  private async cancelRound(
+    entry: InFlightEntry,
+    projectId: string,
+    why = "定向取消",
+  ): Promise<CancelRoundOutcome> {
+    const a2aTaskId = entry.a2aTaskId;
+    if (a2aTaskId === null) return { quiet: "not-started" };
+    const startedAtMs = this.now().getTime();
+    try {
+      const endpoint = agentEndpoint(this.host.getProject(projectId).a2aPort);
+      const until = startedAtMs + CANCEL_TIMEOUT_MS;
+      let state = taskViewOf(
+        await postJsonRpc(
+          endpoint,
+          "tasks/cancel",
+          { id: a2aTaskId },
+          CANCEL_TIMEOUT_MS,
+          this.fetchFn,
+        ),
+      ).state;
+      // 轮询上限 = 墙钟窗 ∧ 次数双闸（假时钟下墙钟不前进 ⇒ 次数闸兜底，绝不空转）
+      const maxPolls = Math.max(1, Math.ceil(CANCEL_TIMEOUT_MS / this.pollIntervalMs));
+      for (let polls = 0; !A2A_TERMINAL_STATES.has(state) && state === "working"; polls += 1) {
+        if (polls >= maxPolls || this.now().getTime() >= until) break;
+        await this.sleepFn(this.pollIntervalMs);
+        state = taskViewOf(
+          await postJsonRpc(
+            endpoint,
+            "tasks/get",
+            { id: a2aTaskId },
+            CANCEL_TIMEOUT_MS,
+            this.fetchFn,
+          ),
+        ).state;
+      }
+      const quiet = A2A_TERMINAL_STATES.has(state);
+      this.logger.info(
+        `[runner] ${why}：taskId=${entry.taskId} a2aTaskId=${a2aTaskId} ` +
+          `state=${state || "-"} quiet=${String(quiet)}`,
+      );
+      return quiet
+        ? {
+            quiet: "quiet",
+            cancelSent: true,
+            quiesceMs: Math.max(0, this.now().getTime() - startedAtMs),
+          }
+        : { quiet: "unreachable", cancelSent: true };
+    } catch (err) {
+      this.logger.warn(
+        `[runner] ${why} 失败（taskId=${entry.taskId}）：${errorMessage(err)}`,
+      );
+      return { quiet: "unreachable" };
+    }
   }
 
   /**
@@ -1644,16 +2100,19 @@ export class RunnerCommandExecutor {
     };
   }
 
-  /** stop：本机有在飞 ⇒ 拒收；否则停项目 → ack */
+  /** stop：目标项目在飞 >0 ⇒ 拒收（v0.8.10 · M-N1 按项目，非全机）；否则停项目 → ack */
   private async handleStop(command: StopCommand): Promise<RunnerCommandAck> {
-    if (this.ledger.size > 0) {
+    const inFlightForProject = this.ledger.countFor(command.projectId);
+    if (inFlightForProject > 0) {
       this.logger.warn(
-        `[runner] stop 拒收（in-flight=${this.ledger.size}）：project=${command.projectId}`,
+        `[runner] stop 拒收（project=${command.projectId} in-flight=${inFlightForProject}）`,
       );
       return { commandId: command.commandId, error: "in-flight" };
     }
     try {
-      await this.host.stop(command.projectId);
+      // 带因停止 ⇒ 进停事件账（v0.8.10 · M-N4）：本项目在飞轮次随之连坐，结算时按时间窗归因。
+      // `stop` 命令不带任务 id ⇒ `stopCauseTaskId` 无从谈起（省略该键，不补空串）。
+      await this.host.stop(command.projectId, { cause: "stop-command" });
       return { commandId: command.commandId };
     } catch (err) {
       return { commandId: command.commandId, error: errorMessage(err) };
@@ -1681,6 +2140,10 @@ export class RunnerCommandExecutor {
         { id: a2aTaskId },
         CANCEL_TIMEOUT_MS,
         this.fetchFn,
+      );
+      // 成功路径留痕（v0.8.10 · M-N4）：此前「发没发出取消」只能从后端台账反推 ⇒ 本机自证一行
+      this.logger.info(
+        `[runner] cancel-task 已送达：taskId=${command.taskId} project=${projectId} a2aTaskId=${a2aTaskId}`,
       );
       return { commandId: command.commandId };
     } catch (err) {

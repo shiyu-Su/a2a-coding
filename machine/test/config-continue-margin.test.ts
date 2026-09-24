@@ -152,3 +152,21 @@ test("sessionWindow 段 · 显式配 ⇒ 生效值标注出处（agentConfig）�
     "只配余量=0 ⇒ 显式关闭与缺省关闭出处可区分",
   );
 });
+
+test("sessionWindow 段 · 有取消往返耗时 ⇒ 同处追 `cancelQuiesceMs=<耗时>（取消往返：桥台账转终态耗时，非后端静默）`；无取值 ⇒ 不出该键", () => {
+  // 无取值（缺省调用）⇒ 整段只有两键（缺键 ≠ 报 0）
+  assert.equal(
+    describeAgentConfig(project()).sessionWindow,
+    "sessionTimeoutMs=600000（缺省） continueMarginMs=0（缺省）",
+  );
+  assert.equal(
+    describeAgentConfig(project({ sessionTimeoutMs: 120_000, continueMarginMs: 60_000 }), undefined, 2_400)
+      .sessionWindow,
+    "sessionTimeoutMs=120000（agentConfig） continueMarginMs=60000（agentConfig） cancelQuiesceMs=2400（取消往返：桥台账转终态耗时，非后端静默）",
+  );
+  // 0ms 是合法取值（往返瞬时完成，不反映后端静默），不得当成「无值」丢掉
+  assert.equal(
+    describeAgentConfig(project(), undefined, 0).sessionWindow,
+    "sessionTimeoutMs=600000（缺省） continueMarginMs=0（缺省） cancelQuiesceMs=0（取消往返：桥台账转终态耗时，非后端静默）",
+  );
+});

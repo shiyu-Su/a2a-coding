@@ -27,6 +27,7 @@ import {
   type RunnerRegisterPayload,
 } from "../launcher/runner.js";
 import type { SelfCheckResult } from "../launcher/self-check.js";
+import { SELF_CHECK_LEDGER_PREFIX } from "../launcher/self-check.js";
 import { PROTOCOL_VERSION, type BridgeConfig, type MachineConfig } from "../types.js";
 
 const BRIDGE: BridgeConfig = { url: "http://bridge.test:3200", token: "tok-abc" };
@@ -270,4 +271,27 @@ test("in-flight 台账：Map 增删查与 projectId 反查", () => {
 
   ledger.clear();
   assert.equal(ledger.size, 0);
+});
+
+test("countFor：按项目在飞计数（v0.8.10 · M-N1），remove 后同步回落", () => {
+  const ledger = new InFlightLedger();
+  ledger.add({ taskId: "a1", projectId: "alpha", startedAt: "2026-09-18T00:00:00Z" });
+  ledger.add({ taskId: "a2", projectId: "alpha", startedAt: "2026-09-18T00:00:10Z" });
+  ledger.add({ taskId: "b1", projectId: "beta", startedAt: "2026-09-18T00:00:20Z" });
+
+  assert.equal(ledger.countFor("alpha"), 2);
+  assert.equal(ledger.countFor("beta"), 1);
+  assert.equal(ledger.countFor("gamma"), 0, "无条目项目 = 0，不抛");
+
+  assert.equal(ledger.remove("a2"), true);
+  assert.equal(ledger.countFor("alpha"), 1);
+  assert.equal(ledger.size, 2, "全机 size 与按项目 countFor 各自独立");
+
+  // 自检前缀条目同样计入按项目数（idleStop 保护口径与 size 一致）
+  ledger.add({
+    taskId: `${SELF_CHECK_LEDGER_PREFIX}alpha`,
+    projectId: "alpha",
+    startedAt: "2026-09-18T00:01:00Z",
+  });
+  assert.equal(ledger.countFor("alpha"), 2);
 });
