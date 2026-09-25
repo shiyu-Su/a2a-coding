@@ -128,6 +128,50 @@ export type FeatureState =
   | "failed"
   | "cancelled";
 
+/**
+ * Feature **阶段登记**值域（v0.9.0 B1″，落 `features.stage`）—— **观测面，不是状态机态**。
+ *
+ * 只登记「引擎看不见的段」（`需求分析` / `改造方案` / `发版`）；`改造` / `回归` / 验收
+ * **由引擎态派生**，不重复登记。**序校验与回退限制都不做**（B5″）。
+ */
+export const FEATURE_STAGES = ["需求分析", "改造方案", "改造", "回归", "发版"] as const;
+
+/** 阶段登记（由 `FEATURE_STAGES` 派生；勿另立第二份清单） */
+export type FeatureStage = (typeof FEATURE_STAGES)[number];
+
+/**
+ * `create` 未传 `stage` 时的缺省值：取「改造方案」= 既有调用方（Step 1 产出后建 Feature）
+ * 所处的段 ⇒ **既有行为逐字不变**。
+ */
+export const DEFAULT_FEATURE_STAGE: FeatureStage = "改造方案";
+
+/**
+ * Feature **审批门状态**值域（v0.9.0 B1″，落 `features.approval`）—— **单向、无回边**。
+ *
+ * ⚠️ 字段**不得命名 `state`**（该名已属引擎态）。`approve` 只校验 `approval = 待审批`，
+ * **不看 `stage`**（门看门状态，两维正交）。
+ */
+export const FEATURE_APPROVALS = ["未发起", "待审批", "已通过"] as const;
+
+/** 审批门状态（由 `FEATURE_APPROVALS` 派生；勿另立第二份清单） */
+export type FeatureApproval = (typeof FEATURE_APPROVALS)[number];
+
+/**
+ * `create` 未传 `approval` 时的缺省值：取「待审批」= 既有调用方建完即过审的语义
+ * ⇒ `approve` 门对既有调用零红。
+ */
+export const DEFAULT_FEATURE_APPROVAL: FeatureApproval = "待审批";
+
+/** 收窄：unknown → FeatureStage（**唯一闭集判据**；handler 校验与读侧归一共用） */
+export function isFeatureStage(v: unknown): v is FeatureStage {
+  return typeof v === "string" && (FEATURE_STAGES as readonly string[]).includes(v);
+}
+
+/** 收窄：unknown → FeatureApproval（同上） */
+export function isFeatureApproval(v: unknown): v is FeatureApproval {
+  return typeof v === "string" && (FEATURE_APPROVALS as readonly string[]).includes(v);
+}
+
 /** Feature 记录（落 SQLite `features` 表） */
 export interface FeatureRecord {
   featureId: string;
@@ -151,6 +195,24 @@ export interface FeatureRecord {
    * - 非空 = 该组名：Feature **谁建谁见**（列表 / 单查 / advance / approve / cancel 一律按此校验）。
    */
   ownerGroup: string | null;
+  /**
+   * **阶段登记**（v0.9.0 B1″ / B2″，落 `features.stage`）：值域见 {@link FEATURE_STAGES}。
+   *
+   * 类型**非空**是读侧单点归一的结论：`NULL`（存量行 / 未带值建行）一律按
+   * {@link DEFAULT_FEATURE_STAGE} 读出；**脏值**（非法值）在 ctor 一次性归一 + 告警，
+   * **读侧不 throw**（与 `lane` 同族纪律，区别于 `state` 的 fail-fast）。
+   */
+  stage: FeatureStage;
+  /**
+   * **版本登记**（v0.9.0 B1″，落 `features.version`）：自由文本，无闭集。
+   * `NULL` ⇒ 空串（缺省空，类型非空同上）。
+   */
+  version: string;
+  /**
+   * **审批门状态**（v0.9.0 B1″ / B2″，落 `features.approval`）：值域见 {@link FEATURE_APPROVALS}，
+   * `NULL` ⇒ {@link DEFAULT_FEATURE_APPROVAL}。**`approve` 的唯一判据**（`= 待审批` 才放行）。
+   */
+  approval: FeatureApproval;
   createdAt: string;
   updatedAt: string;
 }
@@ -169,6 +231,13 @@ export interface FeatureCreateInput {
   ownerGroup?: string | null;
   /** 缺省 `waiting_approval`（主链起点 / 审批门停靠点） */
   state?: FeatureState;
+  /**
+   * **登记字段**（v0.9.0 B1″）：`NULL` 与「不传」等价（读侧按缺省）；闭集校验在 handler，
+   * 存储层**不复核**（与 `state` 的 fail-fast 不同 —— 登记面不得抛）。
+   */
+  stage?: string | null;
+  version?: string | null;
+  approval?: string | null;
   createdAt?: string;
   updatedAt?: string;
 }

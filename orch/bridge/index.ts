@@ -1805,14 +1805,14 @@ function waitForSignal(timeoutMs: number): Promise<void> {
   });
 }
 
-interface EventsOutcome {
+export interface EventsOutcome {
   ok: true;
   cursor: number;
   count: number;
   events: EventRecord[];
 }
 
-interface WaitOutcome extends EventsOutcome {
+export interface WaitOutcome extends EventsOutcome {
   timedOut: boolean;
 }
 
@@ -2082,7 +2082,7 @@ function logRecoverySummary(recovery: unknown): void {
   if (scanned === 0 && interruptedTasks === 0) return;
   bridgeLog.info(
     "a2a-bridge",
-    `桥重启恢复：扫描非终态 Feature ${scanned}，收敛 failed ${failedFeatures}（interrupted 任务 ${interruptedTasks}）`,
+    `桥重启恢复：扫描 executing Feature ${scanned}，收敛 failed ${failedFeatures}（interrupted 任务 ${interruptedTasks}）`,
   );
 }
 

@@ -29,6 +29,7 @@ import {
   appendEvent,
   countQueuedBefore,
   createFeature,
+  featureTaskStateCounts,
   getFeature,
   getQueuedTask,
   listArtifactsByFeature,
@@ -39,11 +40,17 @@ import {
   rearmForRetry,
   rearmTask,
   updateFeatureContext,
+  updateFeatureRegistration,
   updateFeatureState,
   updateTaskState,
 } from "../session/store.js";
 import { planResume } from "./scheduler.js";
-import type { FeatureContextPatch, QueueState, QueuedTaskRecord } from "../session/store.js";
+import type {
+  FeatureContextPatch,
+  FeatureRegistrationPatch,
+  QueueState,
+  QueuedTaskRecord,
+} from "../session/store.js";
 import type { TaskLane } from "../types.js";
 import {
   allowedTransitions,
@@ -54,10 +61,21 @@ import {
 import type {
   ArtifactRecord,
   FailureKind,
+  FeatureApproval,
   FeatureRecord,
+  FeatureStage,
   FeatureState,
   InputArtifactRef,
   TaskRecord,
+  TaskState,
+} from "../types.js";
+import {
+  DEFAULT_FEATURE_APPROVAL,
+  DEFAULT_FEATURE_STAGE,
+  FEATURE_APPROVALS,
+  FEATURE_STAGES,
+  isFeatureApproval,
+  isFeatureStage,
 } from "../types.js";
 
 /**
@@ -360,10 +378,59 @@ export function ownershipFailure(
 }
 
 // ---------------------------------------------------------------------------
+// 登记字段（v0.9.0 B1″ / B2″）：闭集校验 + 写口收敛
+// ---------------------------------------------------------------------------
+
+/** 入参里可能携带登记字段的三个动作（`create` / `advance` 共用同一份校验） */
+interface RegistrationInput {
+  stage?: string;
+  version?: string;
+  approval?: string;
+}
+
+/**
+ * 登记字段的**唯一闭集校验**（schema 侧只用 `z.string()`，不用 `.enum()` ⇒ 校验落这里）。
+ *
+ * - 只回传**已提供**的字段（undefined = 本次不写该列，交 `updateFeatureRegistration` 保留原值）；
+ * - 非法值 ⇒ 结构化拒绝（`feature_invalid_stage` / `feature_invalid_approval`），**零写入**；
+ * - **不校验序、不校验回退**（B5″：`stage` 序校验 / 回退限制都不做）。
+ */
+type RegistrationParse =
+  | { ok: true; patch: FeatureRegistrationPatch }
+  | { ok: false; code: string; error: string };
+
+function parseRegistration(input: RegistrationInput): RegistrationParse {
+  const patch: FeatureRegistrationPatch = {};
+  if (input.stage !== undefined) {
+    if (!isFeatureStage(input.stage)) {
+      return {
+        ok: false,
+        code: "feature_invalid_stage",
+        error: `非法 stage "${input.stage}"（闭集：${FEATURE_STAGES.join(" / ")}）`,
+      };
+    }
+    patch.stage = input.stage;
+  }
+  if (input.approval !== undefined) {
+    if (!isFeatureApproval(input.approval)) {
+      return {
+        ok: false,
+        code: "feature_invalid_approval",
+        error: `非法 approval "${input.approval}"（闭集：${FEATURE_APPROVALS.join(" / ")}）`,
+      };
+    }
+    patch.approval = input.approval;
+  }
+  // `version` 是自由文本（无闭集、不校验）
+  if (input.version !== undefined) patch.version = input.version;
+  return { ok: true, patch };
+}
+
+// ---------------------------------------------------------------------------
 // create
 // ---------------------------------------------------------------------------
 
-export interface FeatureCreateArgs {
+export interface FeatureCreateArgs extends RegistrationInput {
   title: string;
   requirement?: string;
   /** Feature 级会话上下文（落 `features.context_id`，跨任务 / 跨 worker 启停复用） */
@@ -377,6 +444,10 @@ export interface FeatureCreateSuccess {
   title: string;
   /** 回显入参 contextId（已随 createFeature 持久化到 features.context_id） */
   contextId?: string;
+  /** 登记字段回显（v0.9.0 B1″：恒有值 —— 未传即缺省，见 {@link DEFAULT_FEATURE_STAGE}） */
+  stage: FeatureStage;
+  version: string;
+  approval: FeatureApproval;
 }
 
 export function handleFeatureCreate(
@@ -388,6 +459,10 @@ export function handleFeatureCreate(
   if (title.length === 0) {
     return { ok: false, code: "feature_invalid_args", error: "title 不能为空" };
   }
+  // 登记字段：先校验（非法 ⇒ 零写入），再施加缺省
+  // ⇒ **不传三参数的既有调用行为逐字不变**（缺省恰为「改造方案 + 待审批」= 既有语义）
+  const reg = parseRegistration(args);
+  if (reg.ok === false) return reg;
   const featureId = randomUUID();
   const rec = createFeature({
     featureId,
@@ -399,8 +474,21 @@ export function handleFeatureCreate(
     // 主链起点 = 审批门停靠点（REQ-v0.4.1-2026-09-16-01 §2.3）：引擎只做需求实现，
     // 前段讨论 / 方案（Step 0/1）不走引擎；`waiting_approval → executing` 只能经 `a2a_feature_approve`
     state: "waiting_approval",
+    // v0.9.0 登记字段：`version` 未传 ⇒ NULL（读回归一为空串，不落 "null" 字面量）
+    stage: reg.patch.stage ?? DEFAULT_FEATURE_STAGE,
+    version: args.version ?? null,
+    approval: reg.patch.approval ?? DEFAULT_FEATURE_APPROVAL,
   });
-  const success: FeatureCreateSuccess = { ok: true, featureId: rec.featureId, state: rec.state, title: rec.title };
+  const success: FeatureCreateSuccess = {
+    ok: true,
+    featureId: rec.featureId,
+    state: rec.state,
+    title: rec.title,
+    // 回显**落库后读回**的值（读侧已归一 ⇒ 恒非空，与后续 `status` 出参同源）
+    stage: rec.stage,
+    version: rec.version,
+    approval: rec.approval,
+  };
   if (rec.contextId !== null) success.contextId = rec.contextId;
   return success;
 }
@@ -419,7 +507,14 @@ export interface FeatureStatusSuccess {
   tasks?: FeatureTaskSummary[];
   /** 该 Feature 已登记的产物（v0.4.0；仅单 Feature 查询返回） */
   artifacts?: ArtifactRecord[];
-  features?: Array<FeatureRecord & { taskCount: number }>;
+  /**
+   * 列表分支出参（v0.9.0 B3″ 起 **additive** 增 `stateCounts`）。
+   *
+   * - `stateCounts`：各**任务态**的节点数（事实源 = 一条 `GROUP BY feature_id, state` 聚合 SQL）；
+   * - `taskCount`：**由 `stateCounts` 派生**（各态求和）—— 与改前「`listFeatureTasks` 数长度」**逐 Feature 同值**；
+   * - 两者都**只走列表读的视野判据**（归属谓词与 `listFeatures` 同源），他组节点不计数。
+   */
+  features?: Array<FeatureRecord & { taskCount: number; stateCounts: Partial<Record<TaskState, number>> }>;
 }
 
 export function handleFeatureStatus(
@@ -443,18 +538,37 @@ export function handleFeatureStatus(
   const features = listFeatures({
     limit: 1000,
     ownerGroup: identity === null ? undefined : identity,
-  }).map((f) => ({
-    ...f,
-    taskCount: listFeatureTasks(f.featureId, { limit: 1000 }).length,
-  }));
-  return { ok: true, features };
+  });
+  // v0.9.0 B3″：节点计数改**一条聚合 SQL**（`GROUP BY feature_id, state`，归属谓词与上面
+  // `listFeatures` 同源）⇒ 列表读由「1 + N」降为 **O(1)**。`taskCount` 由 `stateCounts` 求和派生，
+  // 与改前逐 Feature 的 `listFeatureTasks(...).length` 同值（对照断言见 `test/v090-o2-read-plane.test.ts`）。
+  const counts = featureTaskStateCounts(identity === null ? undefined : identity);
+  return {
+    ok: true,
+    features: features.map((f) => {
+      const stateCounts = counts.get(f.featureId) ?? {};
+      const taskCount = Object.values(stateCounts).reduce((sum, n) => sum + (n ?? 0), 0);
+      return { ...f, taskCount, stateCounts };
+    }),
+  };
 }
 
 // ---------------------------------------------------------------------------
 // advance
 // ---------------------------------------------------------------------------
 
-export interface FeatureAdvanceArgs {
+/**
+ * `advance` 入参（v0.9.0 起 `extends RegistrationInput`）。
+ *
+ * **登记字段写入**（`stage` / `version` / `approval`，见 {@link parseRegistration}）：
+ *
+ * - **additive**：三者全省略 = 既有行为逐字不变；
+ * - `to` **等于当前态** ∧ 带任一登记字段 ⇒ 走**显式特例**（同 `retryTaskIds` 先例：跳过
+ *   `canTransition`，转移表**零改动**、不出现自环），**只写登记、不动主链**；
+ * - 特例**不加终态守卫**（否则 `completed` 后永远写不进 `发版`）；
+ * - 非法值 ⇒ `feature_invalid_stage` / `feature_invalid_approval`（**在任何写入之前**拒绝）。
+ */
+export interface FeatureAdvanceArgs extends RegistrationInput {
   featureId: string;
   to: string;
   /** 统一方案 / 备注：落 Feature Context 的 `plan`（供审批与派发注入） */
@@ -510,13 +624,40 @@ export function handleFeatureAdvance(
   const denied = ownershipFailure(feature, identity);
   if (denied !== null) return denied;
 
+  // 登记字段：**先解析校验**（非法 ⇒ 任何写入之前拒绝，Feature 态与登记值零变更）
+  const reg = parseRegistration(args);
+  if (reg.ok === false) return reg;
+  const hasRegistration =
+    reg.patch.stage !== undefined ||
+    reg.patch.approval !== undefined ||
+    reg.patch.version !== undefined;
+
   // ---- 重派与解冻（§2.3 / N4）：**显式特例**，不得给 `TRANSITIONS` 加自环 ----------------------
   // `retryTaskIds` 是**派发语义操作**（重派指定失败节点 + 解冻其闭包外下游），不是状态流转
   // ⇒ 跳过 `canTransition`（转移表保持单一事实源、不出现 `executing → executing` 自环）；
   // `to` 必须**显式** `"executing"`，以防借本参数做状态流转。
   if (args.retryTaskIds !== undefined) {
-    return handleRetryResume(feature, { ...args, retryTaskIds: args.retryTaskIds });
+    return handleRetryResume(feature, { ...args, retryTaskIds: args.retryTaskIds }, reg.patch);
   }
+
+  // ---- 登记字段特例（v0.9.0 B1″）：`to` = 当前态 ∧ 带登记字段 ⇒ **只写登记、不做流转** ------------
+  // 与 `retryTaskIds` 同族：跳过 `canTransition`（转移表零改动、`executing → executing` 仍无路径）。
+  // ⚠️ **刻意不加终态守卫** —— 发版流程要在 `completed` 之后写 `stage = 发版`（`需求流程.md` §7）；
+  // 加了守卫就永远写不进去。主链态在此路径**逐字不变**（`from === state`）。
+  // F2（v0.9.0 O4 门禁报告）：早退**不得**丢弃同单 Feature Context —— 与合法流转同一出口落库。
+  if (hasRegistration && args.to === feature.state) {
+    applyFeatureContext(feature.featureId, args);
+    updateFeatureRegistration(feature.featureId, reg.patch);
+    const success: FeatureStateChangeSuccess = {
+      ok: true,
+      featureId: feature.featureId,
+      from: feature.state,
+      state: feature.state,
+    };
+    if (args.note !== undefined) success.note = args.note;
+    return success;
+  }
+
   if (!isFeatureState(args.to)) {
     return {
       ok: false,
@@ -563,13 +704,10 @@ export function handleFeatureAdvance(
   }
 
   // Feature Context 落库（v0.4.0 §2.5）：note → plan；decisions / contracts 可选
-  const patch: FeatureContextPatch = {};
-  if (args.note !== undefined) patch.plan = args.note;
-  if (args.decisions !== undefined) patch.decisions = args.decisions;
-  if (args.contracts !== undefined) patch.contracts = args.contracts;
-  if (Object.keys(patch).length > 0) {
-    updateFeatureContext(feature.featureId, patch);
-  }
+  applyFeatureContext(feature.featureId, args);
+
+  // 登记字段与**合法流转同单**写入（v0.9.0）：先落登记，再迁主链 ⇒ 出参回显的 `state` 是迁移后的态
+  if (hasRegistration) updateFeatureRegistration(feature.featureId, reg.patch);
 
   const updated = updateFeatureState(feature.featureId, args.to);
   const state = updated === null ? args.to : updated.state;
@@ -581,6 +719,23 @@ export function handleFeatureAdvance(
   };
   if (args.note !== undefined) success.note = args.note;
   return success;
+}
+
+/**
+ * Feature Context 落库的唯一出口（v0.4.0 §2.5）：`note` → `plan`；`decisions` / `contracts` 可选。
+ *
+ * 三条 `advance` 路径共用（合法流转 / `retryTaskIds` 重派 / 登记字段特例）——
+ * **同一单不得出现「一条路径丢 Context」的口径差**（v0.9.0 O4 门禁报告 F2）。
+ */
+function applyFeatureContext(
+  featureId: string,
+  args: Pick<FeatureAdvanceArgs, "note" | "decisions" | "contracts">,
+): void {
+  const patch: FeatureContextPatch = {};
+  if (args.note !== undefined) patch.plan = args.note;
+  if (args.decisions !== undefined) patch.decisions = args.decisions;
+  if (args.contracts !== undefined) patch.contracts = args.contracts;
+  if (Object.keys(patch).length > 0) updateFeatureContext(featureId, patch);
 }
 
 /**
@@ -601,6 +756,8 @@ export function handleFeatureAdvance(
 function handleRetryResume(
   feature: FeatureRecord,
   args: FeatureAdvanceArgs & { retryTaskIds: string[] },
+  /** 已校验的登记字段（v0.9.0）；**在所有重派校验通过之后**才落笔，避免半生效 */
+  registration: FeatureRegistrationPatch,
 ): FeatureAdvanceSuccess | FeatureToolFailure {
   // 互斥：`answer` 仅承载 needs_input 澄清（走 needs_input→executing 常规路径），不得与重派同传
   if (args.answer !== undefined) {
@@ -674,11 +831,17 @@ function handleRetryResume(
   }
 
   // Feature Context 同常规路径（note → plan；decisions / contracts 可选）；**Feature 态不动**
-  const patch: FeatureContextPatch = {};
-  if (args.note !== undefined) patch.plan = args.note;
-  if (args.decisions !== undefined) patch.decisions = args.decisions;
-  if (args.contracts !== undefined) patch.contracts = args.contracts;
-  if (Object.keys(patch).length > 0) updateFeatureContext(feature.featureId, patch);
+  applyFeatureContext(feature.featureId, args);
+
+  // 登记字段（v0.9.0）：与 Context 同族，**在全部重派校验通过之后**才写 ⇒ 拒绝路径零变更；
+  // **Feature 态仍不动**
+  if (
+    registration.stage !== undefined ||
+    registration.approval !== undefined ||
+    registration.version !== undefined
+  ) {
+    updateFeatureRegistration(feature.featureId, registration);
+  }
 
   return {
     ok: true,
@@ -717,7 +880,22 @@ export function handleFeatureApprove(
       error: `审批门仅适用于 waiting_approval（当前 ${feature.state}）`,
     };
   }
+  // **门看 `approval`，不看 `stage`**（v0.9.0 B2″ / 引擎映射 §3）：两维正交，`stage` 只登记段、
+  // 不代表已确认。不满足 ⇒ 结构化拒绝，**不放行、不改状态、不落 `approval = 已通过`**。
+  // 既有调用方零红：`create` 缺省即 `待审批`（见 {@link DEFAULT_FEATURE_APPROVAL}）。
+  if (feature.approval !== "待审批") {
+    return {
+      ok: false,
+      code: "feature_approval_not_ready",
+      error:
+        `审批门未发起或已不可过审（approval = ${feature.approval}，仅「待审批」可放行）：` +
+        `approve = 记录用户已给的方案确认，前置是改造文档已落文件且 approval 已置「待审批」` +
+        `（经 a2a_feature_advance 写登记字段）。`,
+    };
+  }
   const updated = updateFeatureState(feature.featureId, "executing");
+  // 过审即把门状态落定（**单向、无回边**）：同一张单不得被重复过审解释
+  updateFeatureRegistration(feature.featureId, { approval: "已通过" });
   return {
     ok: true,
     featureId: feature.featureId,

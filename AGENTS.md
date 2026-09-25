@@ -63,7 +63,7 @@ orch `/health degraded[]`（编排桥进程内降级登记器）与 machine `/he
 
 ## 单元路径守卫（无条件生效）
 
-PreToolUse 守卫（`.zcode/hooks/guard-unit-paths.cjs`，对所有会话生效，不区分角色）拒绝 Read / Edit / Write / Grep：`orch/**` 与 `machine/**`（单元代码：分析经 MCP 工具由项目 agent 返回、改动经 `a2a_call` 派发，宿主不直接读写）以及 `flow/**`（流程包资产；两份规范文件对 Read/Grep 放行只读）。Bash 通道走启发式：命令串中出现 orch / machine / flow 独立路径段即拦，另盖通配混淆、Windows 8.3 短名、仓库级递归搜索（grep -r / rg）；`orch/scripts/` 运维脚本白名单（如 bridgectl.mjs）；两份规范文件请用 Read/Grep 工具而非 Bash。日常开发需要直读直改单元代码时，在 `.zcode/config.json` 将 `hooks.enabled` 置 false 临时停用本守卫，用完恢复（守卫自测：`node .zcode/hooks/guard-unit-paths.cjs --selftest`）。
+PreToolUse 守卫（`.zcode/hooks/guard-unit-paths.cjs`，对所有会话生效，不区分角色）拒绝 Read / Edit / Write / Grep：`orch/**` · `machine/**` · **`board/**`**（**单元代码**：分析经 MCP 工具由项目 agent 返回、改动经 `a2a_call` 派发，宿主不直接读写）· `flow/**`（流程包资产；两份规范文件对 Read/Grep 放行只读）· **`test_codex/**` · `test_claude/**` · `test_opencode/**` · `test_qoder/**`（四个真机验证工作区 —— 2026-09-24 用户指令：与单元同等待遇）**。Bash 通道走启发式：命令串中出现 `orch / machine / flow / board / test_codex / test_claude / test_opencode / test_qoder` 独立路径段即拦，另盖通配混淆、Windows 8.3 短名、仓库级递归搜索（grep -r / rg）；`orch/scripts/` 运维脚本白名单（如 bridgectl.mjs）；两份规范文件请用 Read/Grep 工具而非 Bash。日常开发需要直读直改单元代码时，在 `.zcode/config.json` 将 `hooks.enabled` 置 false 临时停用本守卫，用完恢复（守卫自测：`node .zcode/hooks/guard-unit-paths.cjs --selftest`；**路径清单为单一源 `GUARDED_NAMES`，新增守卫面只改那一处**）。
 
 a2a MCP 已在 `.zcode/config.json` 注册（远程端点 `http://127.0.0.1:8787/mcp`；桥配置了项目组（v0.8.6 一桥多组）时 url 把组名写在路径首段 = `http://127.0.0.1:8787/<组名>/mcp`，身份由连接 url 决定、未配组仍写 `/mcp`，见 `orch/README.md`「连接身份与可见性」），会话前需桥常驻在跑，见 `orch/scripts/bridgectl.mjs`。残余缺口与设计 rationale 见 `CLAUDE.md`「架构约束」。
 

@@ -13,12 +13,12 @@
  * |---|---|---|
  * | `/` | — | 内联 HTML 页面（`bridge/web/html.ts`，零前端工具链） |
  * | `/api/projects` | `core.projects()`（= `handleProjects`） | **字段白名单** + 快照语义（来源 / 观测时间） |
- * | `/api/features` | `core.featureStatus({})`（= `handleFeatureStatus`） | 列出全部 Feature（含 taskCount） |
+ * | `/api/features` | `core.featureStatus({})`（= `handleFeatureStatus`） | 列出全部 Feature（含 `taskCount` 与逐态 `stateCounts`；v0.9.0 B3″ 起由**一条聚合 SQL** 派生） |
  * | `/api/features/:featureId` | `core.featureStatus({ featureId })` | 单 Feature + 任务摘要（**含三时刻 + 队列四字段**，渲染层派生）+ 产物；未知 → 404 |
  * | `/api/features/:featureId/trace` | `handleFeatureTrace`（store 只读投影；v0.8.8 §2.10(c)） | Trace 面：非终态节点「在等谁 / 排队位次」；未知 → 404 |
  * | `/api/tasks?project=&state=&limit=` | `core.tasks(...)`（= `handleTasks`） | `project` 必填（缺 → 400） |
  * | `/api/tasks/:taskId` | `store.getQueuedTask`（本地库只读） | 单任务详情（含三时刻 + 队列四字段；见下「已知偏离」） |
- * | `/api/events?since=&limit=` | `store.listEvents({ since, limit })` | **直连 store**；游标由前端传参 |
+ * | `/api/events?since=&limit=&featureId=` | `store.listEvents({ since, limit, featureId })` | **直连 store**；游标由前端传参；`featureId` = 按需求收窄（v0.9.0 B3″，仍纯读） |
  *
  * ## 硬约束：读事件**绝不移动宿主收件箱游标**
  *
@@ -641,8 +641,10 @@ function toTaskDetailView(record: QueuedTaskRecord): TaskDetailView {
 }
 
 /**
- * `GET /api/events?since=&limit=`：**直连 store 的 `listEvents({ since, limit })`**。
+ * `GET /api/events?since=&limit=&featureId=`：**直连 store 的 `listEvents({ since, limit, featureId })`**。
  * 缺省 `since = 0`（从头）—— 幂等、无状态；**不调用 `handleEvents`、不碰 `eventsCursor`**（见文件头）。
+ * `featureId`（v0.9.0 B3″）= 板读面按需求收窄，同样**纯读**：过滤落在 store 侧，
+ * **绝不经 `handleEvents`**（那条即便显式传 `since` 也推进按身份分的游标 ⇒ 静默吃掉宿主事件）。
  */
 function sendEvents(res: ServerResponse, url: URL): void {
   const sinceRaw = url.searchParams.get("since");
@@ -669,7 +671,14 @@ function sendEvents(res: ServerResponse, url: URL): void {
     return;
   }
 
-  const events: EventRecord[] = listEvents({ since, limit });
+  const featureIdRaw = url.searchParams.get("featureId");
+  const featureId = featureIdRaw === null || featureIdRaw.length === 0 ? undefined : featureIdRaw;
+  if (featureIdRaw !== null && featureId === undefined) {
+    respondJson(res, 400, failure("invalid_feature_id", "featureId 不得为空串"));
+    return;
+  }
+
+  const events: EventRecord[] = listEvents({ since, limit, featureId });
   respondJson(res, 200, { ok: true, since, count: events.length, events, note: EVENTS_NOTE });
 }
 

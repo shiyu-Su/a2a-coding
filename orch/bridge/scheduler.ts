@@ -181,7 +181,11 @@ const DRAIN_POLL_MS = 25;
 
 /** 启动恢复摘要 */
 export interface FeatureRecoverySummary {
-  /** 扫描到的非终态 Feature 数 */
+  /**
+   * 扫描到的 **`executing` Feature 数**（v0.9.0 B10″：`state='executing'` 过滤下推 SQL 后，
+   * 语义由旧的「非终态 Feature 数」**收窄为「executing 数」**——被 `recover()` 实际处置的正是这批，
+   * 非终态非 executing 的 Feature 旧代码也只 `scanned += 1` 后跳过，不计入本值）。
+   */
   scanned: number;
   /**
    * 被收敛为 `failed` 的 Feature 数。
@@ -702,10 +706,12 @@ export class FeatureScheduler {
       failedFeatures: 0,
       interruptedTasks: 0,
     };
-    for (const feature of listFeatures({ limit: 1000 })) {
-      if (isTerminalFeatureState(feature.state)) continue;
+    // v0.9.0 B10″：**`state='executing'` 过滤下推 SQL**（旧：扫全量非终态再在内存里 `!== executing`
+    // 跳过）。`executing` 恒为非终态 ⇒ 旧循环对「非终态非 executing」的 Feature 只做 `scanned += 1`
+    // 后 `continue`（零动作），下推到 SQL 后**被处理（在飞置 failed / kick）的 Feature 集合完全一致**。
+    // ⚠️ `scanned` 语义随之**重定义为「executing 数」**（旧 =「非终态数」）—— 见 `FeatureRecoverySummary`。
+    for (const feature of listFeatures({ state: "executing", limit: 1000 })) {
       summary.scanned += 1;
-      if (feature.state !== "executing") continue;
       const nodes = listFeatureTasks(feature.featureId, { limit: 1000 });
       // 已在飞（远端 id 已知）：既有恢复路径
       const inFlight = nodes.filter(
@@ -768,10 +774,15 @@ export class FeatureScheduler {
     try {
       // v0.6.1 REQ-05 §2.5（N5）：**每 tick 一次**项目忙快照（tick 内稳定）——与进程内
       // `reservedProjects` 相并构成派发判据的「项目忙」集合（见 `occupiedProjects()`）。
+      // ⚠️ v0.9.0 B10″：忙集判据**继续复用 `listBusyProjectIds()`**（其内部 = `busyProjectPredicate()`，
+      // 含 `lane IS NULL` 归写档）—— 本节点只把下面 Feature 扫描的 `state` 过滤下推，**不动忙集谓词**。
       this.busyProjectIds = listBusyProjectIds();
-      const features = listFeatures({ limit: 1000 });
+      // v0.9.0 B10″：**`state='executing'` 过滤下推 SQL**（旧：`listFeatures({limit})` 扫全量再在
+      // 内存里 `state !== "executing" ⇒ continue`）。等价性**只在 Feature 总数 ≤ `limit` 时成立**；
+      // **> `limit` 时下推后是修复**（旧路径先按 `updated_at DESC` 截断 `limit` 条、再内存筛选 ⇒
+      // 会漏扫排在窗口外的 `executing` Feature）。`executing` 恒非终态，故窗口内选取序不变。
+      const features = listFeatures({ state: "executing", limit: 1000 });
       for (const feature of features) {
-        if (feature.state !== "executing") continue;
         void this.advanceFeature(feature);
       }
     } catch (err) {

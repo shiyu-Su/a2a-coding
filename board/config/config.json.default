@@ -1,0 +1,21 @@
+{
+  "_comment": "board 活配置模板（BD12″ · v0.9.0）。约定与 orch/machine 同构：① 本文件是**入库模板**，列出全部可用配置项并逐项标注（语义 / 缺省值 / 是否 fail-fast / 不填会怎样）；实际生效的是同目录 config.json（活配置，gitignored）。两者之间**无自动复制/回退** —— 首次使用请 `cp config.json.default config.json` 再按需修改。② **注释键 = 下划线开头的普通 JSON 键**（本文件的 _comment / _xxxComment 族），加载器天然忽略、不参与解析；**注释留在模板，活配置勿拷贝**（machine 的活配置里一个注释键都没有）。③ **启动期读一次**：改配置须重启板进程才生效，热改不生效。④ **env 只覆盖配置文件路径**：BOARD_CONFIG=<路径>（空白按未设置算）；**没有任何 argv / env 通道能改配置内容**（--port / --orgs-dir= / --group= / --host-kind= 等启动参数已于 BD12″ 撤销，用户裁定「而非启动参数」）。⑤ **非法值统一 fail-fast**：启动以 `[config] <字段路径> …` 中文文案报错并给对策，**不静默降级、不部分生效**；缺文件不裸崩，文案提示从本模板复制。非必填键不需要时整键删除（或留空串），勿原样拷贝占位值。",
+  "port": 3400,
+  "_portComment": "板 HTTP 监听端口。缺省 3400（与 orch web 只读工作台 3300、编排桥 MCP 8787、Launcher 3100 分家）。**fail-fast**：非 1–65535 整数（字符串 / 小数 / 越界）⇒ `[config] port` 拒绝启动。不填 = 用缺省 3400。绑定地址恒为 loopback（见 host）。",
+  "host": "127.0.0.1",
+  "_hostComment": "绑定地址。缺省 127.0.0.1；可覆盖为 ::1 / localhost。**非 loopback 一律拒起**（server.assertLoopbackHost，BD1 安全约束不废 —— 本键只挪了来源，守卫原样）。空串 / 不填 = 用缺省。⚠ **loopback-only 是刻意封的，不是遗漏**：板带**真写面**（提需求 / 触发一轮 / 发确认 / 停桥）而**零鉴权**，绑到可路由地址 = 把这些写面裸奔进网络。**放开非 loopback 的前置 = 先有鉴权**（跨机鉴权归 **V4**，其落地前本守卫不松）。眼下确需远程访问 ⇒ **不动本绑定**，在板前面挂一层**反向代理**做鉴权（Basic Auth / 内网白名单，只放 `/` 到板），板自身仍只 listen loopback。",
+  "orgsDir": "<absolute path to the orgs root on this machine>",
+  "_orgsDirComment": "组织目录根（宿主面 BD8 · §3.8 裁定 9 · **BD15 两层分职**）。宿主桥的 --workspace = <orgsDir>/<组织名>。**根 = 部署面配置，必须预先存在**：不存在 / 不是目录 ⇒ 启动期明确 warn、触发期结构化 503 board_orgs_dir_missing（配错必须可见，**板刻意不代建根**）。**<orgsDir>/<组织名> = 数据，缺失时由板自动创建**（BD15：触发一轮时板代建该组织子目录，用户不必先回终端 mkdir；已有目录不碰；建不出来才报 org_workspace_missing，文案含绝对路径+根因）。**无缺省值：留空 / 缺键 = 未配置 ⇒ 宿主面不装配** —— 板不去 spawn 任何后端进程，GET /host 如实显示「宿主面未装配」，三条宿主写端点返回结构化 503 host_face_disabled。**这是配置面唯一的「未配置 ≠ 错误」的目录键：刻意不兜底**（板不可静默挑一个目录去起后端）。类型错（非字符串）⇒ `[config] orgsDir` fail-fast。",
+  "group": "<optional-default-group>",
+  "_groupComment": "板级**默认组织**（BD11 起 = 可选默认，非必填）。组织名的**主来源是提需求表单**的 group 字段（第一次填写某组织名 = 在板上创建该组织）；本键仅当**表单留空**时兜底。缺失 / 空串 ⇒ **不是错误**、不报错：此时表单组织名变必填，留空 ⇒ POST /requirements 请求期结构化 400 board_group_required（不猜、不回落兜底组名 —— 静默猜组名会把需求建到别的组）。它同时是宿主面「桥侧无 ownerGroup」时的回退组织名（身份链 S1）。空串 / 纯空白一律按未配置算。",
+  "hostKind": "claude",
+  "_hostKindComment": "宿主后端 kind（§3.8 裁定 #4 已裁 = claude）。仅作为**新建桥的缺省 kind**（kind → 后端命令的映射唯一事实源在 machine 侧 getAdapter()，板不自拼 argv；组织级可覆盖）。缺省 claude；空串 / 不填 = 用缺省；非字符串 ⇒ `[config] hostKind` fail-fast。kind 值本身不被 getAdapter() 认识时是**起桥期**报错（不在配置期猜）。",
+  "bridgeUrl": "http://127.0.0.1:3300",
+  "_bridgeUrlComment": "读面（只读视图 /api/*）连接的**编排桥 web 基址**。缺省 http://127.0.0.1:3300（orch 只读工作台端口）。**fail-fast**：非 http(s):// 绝对地址（无协议 / 无主机 / 乱串）⇒ `[config] bridgeUrl` 拒绝启动。不填 = 用缺省。桥不可达时页面如实显示 502，不缓存旧数据。",
+  "mcpBaseUrl": "http://127.0.0.1:8787",
+  "_mcpBaseUrlComment": "写面（提需求 POST /requirements → a2a_feature_create）连接的**编排桥 MCP 基址**。缺省 http://127.0.0.1:8787（编排桥 streamable-HTTP 面，与读面 3300 是两个端口）。组身份拼在 URL 首段：/<组名>/mcp（一桥多组，v0.8.6）。校验同 bridgeUrl（http(s):// 绝对地址，非法 fail-fast）。不填 = 用缺省。",
+  "machineDist": "<optional; default derived as <repo-root>/machine/dist>",
+  "_machineDistComment": "machine **运行时产物**目录（BD4a · 本版已知耦合面 = 构建产物，非仓内源文件）。板 spawn 宿主桥要吃 machine/dist/{acp-bridge,adapters}/index.js。缺省按仓根推导 <仓根>/machine/dist（由模块位置反推，源码运行与 dist 运行落同一仓根）。不填 = 用推导缺省；填写 = 指向已构建的 machine/dist（字符串路径，相对值按进程 cwd 解析）。产物缺失不是配置期错误，是**起桥期**清晰报错（machine_dist_missing：缺什么 / 期望路径 / 怎么补 —— machine/ 下 npm run build）。",
+  "turnTimeoutMs": 600000,
+  "_turnTimeoutMsComment": "宿主对话单轮的**有界等待**上限（毫秒；BD4b）。缺省 = 不配置本键 ⇒ 交下游 DEFAULT_TURN_TIMEOUT_MS（600000 = 10 min）。**fail-fast**：非正整数（0 / 负数 / 小数 / 字符串）⇒ `[config] turnTimeoutMs` 拒绝启动（不再像旧 env 通道那样静默忽略非法值）。到点落 timeout 终态，绝不无限等。"
+}

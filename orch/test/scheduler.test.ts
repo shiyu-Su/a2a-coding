@@ -30,6 +30,7 @@ import {
   getFeature,
   getTask,
   listEvents,
+  listFeatures,
   updateFeatureState,
   updateTaskState,
 } from "../session/store.js";
@@ -392,6 +393,9 @@ test("收敛：全部任务 completed → Feature executing → integrating", ()
 test("recover：收集全部在飞节点各置 failed(interrupted)，Feature 不判死且不重派", () => {
   close();
   createFeature({ featureId: "f-rec", title: "恢复", state: "executing" });
+  // v0.9.0 B10″：加一个**非 executing 的非终态**兄弟 Feature —— 下推后 `scanned` = executing 数，
+  // 不计它（旧「非终态数」语义会计成 2）。
+  createFeature({ featureId: "f-wait-1", title: "待批", state: "waiting_approval" });
   createTask({
     taskId: "A",
     projectId: "p1",
@@ -419,6 +423,7 @@ test("recover：收集全部在飞节点各置 failed(interrupted)，Feature 不
   });
   const summary = scheduler.recover();
 
+  // v0.9.0 B10″：scanned = **executing 数**（1，f-wait-1 不计）—— 旧语义会计成 2（含 waiting_approval）
   assert.equal(summary.scanned, 1);
   assert.equal(summary.interruptedTasks, 2);
   // v0.6.1 REQ-05 §2.1（v3）：`recover()` 不再 `failFeature`（字段保留、语义休眠）
@@ -435,16 +440,73 @@ test("recover：收集全部在飞节点各置 failed(interrupted)，Feature 不
 test("recover：无在飞任务的 executing Feature 保持，等待续推", () => {
   close();
   createFeature({ featureId: "f-idle", title: "空闲", state: "executing" });
+  // v0.9.0 B10″：非 executing 的非终态兄弟不计入 `scanned`（旧「非终态数」语义会计成 2）
+  createFeature({ featureId: "f-wait-2", title: "待批", state: "needs_input" });
   createTask({ taskId: "A", projectId: "p1", contextId: "c1", state: "working", featureId: "f-idle" });
 
   const scheduler = new FeatureScheduler({ dispatch: async () => ({ ok: true }) });
   const summary = scheduler.recover();
 
+  // v0.9.0 B10″：scanned = **executing 数**（1，f-wait-2 不计）
   assert.equal(summary.scanned, 1);
   assert.equal(summary.interruptedTasks, 0);
   assert.equal(summary.failedFeatures, 0);
   assert.equal(getFeature("f-idle")?.state, "executing");
   assert.equal(getTask("A")?.state, "working");
+});
+
+test("B10″ 等价性：tick()/recover() 下推后选中的 Feature 集合 = executing 集", () => {
+  close();
+  // 混布所有态各一 Feature，每个都挂一个「若被扫到就会动」的 working 节点：
+  //   - executing ×2（一个有在飞 A、一个就绪 B）→ 下推后**唯一**被 tick/recover 处置
+  //   - waiting_approval / needs_input / integrating（均非终态）→ 旧代码 scanned 计数但零动作、
+  //     tick 也 `!== executing` 跳过；下推后不进结果集 ⇒ **动作集合必须完全一致**
+  //   - completed（终态）→ 旧代码 `isTerminalFeatureState` 跳过
+  createFeature({ featureId: "e1", title: "执行1", state: "executing" });
+  createFeature({ featureId: "e2", title: "执行2", state: "executing" });
+  createFeature({ featureId: "wa", title: "待批", state: "waiting_approval" });
+  createFeature({ featureId: "ni", title: "待澄清", state: "needs_input" });
+  createFeature({ featureId: "ig", title: "集成", state: "integrating" });
+  createFeature({ featureId: "cd", title: "完成", state: "completed" });
+  // e1：一个在飞（remoteTaskId 非空、working）→ recover 应置 failed
+  createTask({ taskId: "e1-inflight", projectId: "pj1", contextId: "c1", state: "working", featureId: "e1", remoteTaskId: "r1" });
+  // e2：一个就绪（working、无 remote、无 guard）→ tick 应派发
+  createTask({ taskId: "e2-ready", projectId: "pj2", contextId: "c2", state: "working", featureId: "e2" });
+  // 非 executing Feature 的 working 节点（不同 project，避免忙集串扰，隔离出「是否被选中」这一维）
+  for (const [featureId, taskId, pid] of [
+    ["wa", "wa-w", "pj3"],
+    ["ni", "ni-w", "pj4"],
+    ["ig", "ig-w", "pj5"],
+  ] as const) {
+    createTask({ taskId, projectId: pid, contextId: "cx", state: "working", featureId });
+  }
+  createTask({ taskId: "cd-w", projectId: "pj6", contextId: "c6", state: "completed", featureId: "cd" });
+
+  const dispatched: string[] = [];
+  const scheduler = new FeatureScheduler({
+    dispatch: async (n) => {
+      dispatched.push(n.taskId);
+      return { ok: true };
+    },
+  });
+  const summary = scheduler.recover();
+
+  // scanned = executing 数（e1、e2），非终态的 wa/ni/ig 与终态的 cd 一律不计
+  assert.equal(summary.scanned, 2, "scanned = executing 数（下推后语义）");
+  // 被 recover 处置的在飞仅 e1-inflight（e2 无在飞、非 executing 的都不动）
+  assert.equal(summary.interruptedTasks, 1, "只收敛 executing Feature 的在飞节点");
+  assert.equal(getTask("e1-inflight")?.state, "failed");
+  // 非 executing Feature 的 working 节点必须**未被触碰**（旧代码同样跳过 ⇒ 等价）
+  assert.equal(getTask("wa-w")?.state, "working", "waiting_approval 节点不动");
+  assert.equal(getTask("ni-w")?.state, "working", "needs_input 节点不动");
+  assert.equal(getTask("ig-w")?.state, "working", "integrating 节点不动");
+  // tick 派发集合 = 仅 executing 且就绪的节点（e2-ready），不含任何非 executing Feature 的节点
+  assert.deepEqual(dispatched, ["e2-ready"], "tick 只推进 executing Feature");
+  // 下推的 SQL 谓词与旧内存过滤选中集合一致：`listFeatures({state:'executing'})` 恰为 {e1,e2}
+  assert.deepEqual(
+    listFeatures({ state: "executing", limit: 1000 }).map((f) => f.featureId).sort(),
+    ["e1", "e2"],
+  );
 });
 
 // ---------------------------------------------------------------------------

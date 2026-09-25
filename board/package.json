@@ -1,0 +1,24 @@
+{
+  "name": "@a2a-coding/board",
+  "version": "0.9.0",
+  "private": true,
+  "type": "module",
+  "engines": {
+    "node": ">=22.5"
+  },
+  "scripts": {
+    "typecheck": "tsc --noEmit",
+    "build": "tsc -p tsconfig.json",
+    "start": "node scripts/boardctl.mjs start",
+    "stop": "node scripts/boardctl.mjs stop",
+    "restart": "node scripts/boardctl.mjs restart",
+    "status": "node scripts/boardctl.mjs status",
+    "logs": "node scripts/boardctl.mjs logs",
+    "start:foreground": "node dist/index.js",
+    "test": "npm run build && node --test \"test/*.test.mjs\""
+  },
+  "devDependencies": {
+    "@types/node": "^22.10.0",
+    "typescript": "^5.7.0"
+  }
+}

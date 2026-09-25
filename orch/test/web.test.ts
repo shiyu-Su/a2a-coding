@@ -26,7 +26,8 @@ import type { Server } from "node:http";
 import { appendEvent, createFeature, createTask, latestEventId } from "../session/store.js";
 import type { ProjectStatus } from "../types.js";
 import { renderIndexHtml } from "../bridge/web/html.js";
-import { projectTaskVisibility } from "../bridge/feature-tools.js";
+import { handleFeatureStatus, projectTaskVisibility } from "../bridge/feature-tools.js";
+import type { TaskState } from "../types.js";
 import { startWebTransport } from "../bridge/transports/web.js";
 import type { WebCore, WebTransportHandle, WebTransportOptions } from "../bridge/transports/web.js";
 
@@ -195,7 +196,14 @@ interface ProjectsBody {
 
 interface FeaturesBody {
   ok: boolean;
-  features?: Array<{ featureId: string; title: string; state: string; taskCount: number }>;
+  features?: Array<{
+    featureId: string;
+    title: string;
+    state: string;
+    taskCount: number;
+    /** v0.9.0 B3″：出参 additive 扩的逐态计数 */
+    stateCounts?: Partial<Record<string, number>>;
+  }>;
   feature?: { featureId: string; title: string };
   code?: string;
 }
@@ -388,12 +396,16 @@ test("路由形状：未知路径 404；已注册路径非 GET → 405", async (
   assert.equal(featureNotGet.status, 405);
 });
 
-test("GET /api/features（列表 / 单查 / 未知 404）→ 复用 handleFeatureStatus", async () => {
+test("GET /api/features/:featureId → 详情 Task 行补三时刻（渲染层派生；本地缺记录给 null，不吞不造）", async () => {
   const feature = createFeature({ featureId: "f-web-1", title: "只读工作台" });
   const core = fakeCore({
     featureStatus: (args) => {
       if (args.featureId === undefined) {
-        return { ok: true, features: [{ ...feature, taskCount: 0 }] };
+        return {
+          ok: true,
+          // v0.9.0 B3″：`stateCounts` 是列表出参的 additive 扩字段（真实现由聚合 SQL 派生）
+          features: [{ ...feature, taskCount: 0, stateCounts: {} }],
+        };
       }
       if (args.featureId === "f-web-1") {
         return { ok: true, feature, tasks: [], artifacts: [] };
@@ -409,6 +421,7 @@ test("GET /api/features（列表 / 单查 / 未知 404）→ 复用 handleFeatur
   assert.equal(listBody.ok, true);
   assert.equal(at(listBody.features ?? [], 0).featureId, "f-web-1");
   assert.equal(at(listBody.features ?? [], 0).taskCount, 0);
+  assert.deepEqual(at(listBody.features ?? [], 0).stateCounts, {}, "B3″ additive 字段原样透出");
 
   const one = await get(handle.port, "/api/features/f-web-1");
   assert.equal(one.status, 200);
@@ -417,6 +430,62 @@ test("GET /api/features（列表 / 单查 / 未知 404）→ 复用 handleFeatur
   const unknown = await get(handle.port, "/api/features/f-nope");
   assert.equal(unknown.status, 404);
   assert.equal(json<ErrorBody>(unknown).code, "feature_not_found");
+});
+
+test("GET /api/features（列表）与 MCP 面 a2a_feature_status 列表分支逐项同值：stateCounts / taskCount 同源同值（零任务 ⇒ {}）", async () => {
+  // O6：板读的是 HTTP 面 `GET /api/features`（非 MCP 面）。此前真机冒烟发现 HTTP 面未透出
+  // `stateCounts`（`taskCount` 有）。投影补齐的**验收**不能只喂桩（桩会掩盖白名单丢字段），
+  // 必须让 HTTP 面的 core 委托到**同一个** `handleFeatureStatus`（= 生产 `coreFor(null).featureStatus`），
+  // 再逐 Feature 比对「HTTP 面 == MCP 面列表分支」的 `taskCount` + `stateCounts`。
+
+  // 两种真实形态：多态混合 + 零任务（真机现状就是 `{}`）
+  const mixed = createFeature({ featureId: "f-o6-mixed", title: "多态混合" }).featureId;
+  const mixedStates: TaskState[] = ["completed", "completed", "working", "failed"];
+  mixedStates.forEach((state, i) =>
+    createTask({
+      taskId: `t-o6-mixed-${String(i)}`,
+      projectId: "p-o6",
+      contextId: `c-o6-mixed-${String(i)}`,
+      state,
+      featureId: mixed,
+    }),
+  );
+  const empty = createFeature({ featureId: "f-o6-empty", title: "零任务" }).featureId;
+
+  // HTTP 面：真网页接面，featureStatus 委托到真 handler（identity null ⇒ 全量视野，与运维视图同判据）
+  const handle = await startWeb(fakeCore({ featureStatus: (args) => handleFeatureStatus(args, null) }));
+  const list = await get(handle.port, "/api/features");
+  assert.equal(list.status, 200);
+  const httpRows = (json<FeaturesBody>(list).features ?? []).map((f) => ({
+    featureId: f.featureId,
+    taskCount: f.taskCount,
+    stateCounts: f.stateCounts,
+  }));
+
+  // MCP 面：`a2a_feature_status` 列表分支（同一函数、同一 store 快照）
+  const mcp = handleFeatureStatus({}, null);
+  if (!mcp.ok) throw new Error(`MCP 列表分支应成功，实际失败：${mcp.code} ${mcp.error}`);
+  const mcpRows = (mcp.features ?? []).map((f) => ({
+    featureId: f.featureId,
+    taskCount: f.taskCount,
+    stateCounts: f.stateCounts,
+  }));
+
+  // ★ 逐项同值（按 featureId 对齐后全等）——两路读取同一 store、无写入介入
+  const byFeatureId = (a: { featureId: string }, b: { featureId: string }): number =>
+    a.featureId < b.featureId ? -1 : a.featureId > b.featureId ? 1 : 0;
+  assert.deepEqual(
+    [...httpRows].sort(byFeatureId),
+    [...mcpRows].sort(byFeatureId),
+    "HTTP /api/features 每项 { taskCount, stateCounts } 须与 MCP 面列表分支逐项同值",
+  );
+
+  // 具体形态断言（防两路同时错成一致的空值 / 键序差异掩盖丢字段）
+  const httpById = new Map(httpRows.map((f) => [f.featureId, f]));
+  assert.deepEqual(httpById.get(mixed)?.stateCounts, { completed: 2, working: 1, failed: 1 });
+  assert.equal(httpById.get(mixed)?.taskCount, 4);
+  assert.deepEqual(httpById.get(empty)?.stateCounts, {}, "零任务 Feature ⇒ stateCounts 空对象（真机现状）");
+  assert.equal(httpById.get(empty)?.taskCount, 0);
 });
 
 test("GET /api/features/:featureId → 详情 Task 行补三时刻（渲染层派生；本地缺记录给 null，不吞不造）", async () => {
@@ -600,6 +669,46 @@ test("GET /api/events → 直连 listEvents：since 透传、缺省 0、反复�
   const badSince = await get(handle.port, "/api/events?since=-1");
   assert.equal(badSince.status, 400);
   assert.equal(json<ErrorBody>(badSince).code, "invalid_since");
+});
+
+test("GET /api/events?featureId= → store.listEvents 只读收窄（B3″：不经 handleEvents）", async () => {
+  const base = latestEventId();
+  const a = createFeature({ featureId: "f-ev-a", title: "甲" });
+  const b = createFeature({ featureId: "f-ev-b", title: "乙" });
+  const aEvents = [
+    appendEvent({ featureId: a.featureId, kind: "feature.stage", state: null }).eventId,
+    appendEvent({ featureId: a.featureId, kind: "feature.state", state: "executing" }).eventId,
+  ];
+  appendEvent({ featureId: b.featureId, kind: "feature.stage", state: null });
+  appendEvent({ kind: "runner.registered", featureId: null });
+  const handle = await startWeb(fakeCore());
+
+  const only = await get(handle.port, `/api/events?featureId=${a.featureId}`);
+  assert.equal(only.status, 200);
+  const body = json<EventsBody>(only);
+  assert.equal(body.count, 2, "只回该 Feature 的事件（他 Feature / 孤儿事件被排除）");
+  assert.deepEqual(
+    body.events.map((ev) => ev.eventId),
+    aEvents,
+    "升序且逐条属于本 Feature",
+  );
+
+  // 过滤口本身无状态：同一 query 反复读 ⇒ 结果恒等（服务端不记任何进度）
+  const again = json<EventsBody>(await get(handle.port, `/api/events?featureId=${a.featureId}`));
+  assert.deepEqual(again.events, body.events);
+  assert.equal(again.since, 0, "featureId 过滤不得改动 since 语义");
+
+  const empty = json<EventsBody>(
+    await get(handle.port, "/api/events?featureId=f-no-such-feature"),
+  );
+  assert.equal(empty.count, 0, "未知 Feature ⇒ 空增量（不 404、不报错）");
+
+  const bad = await get(handle.port, "/api/events?featureId=");
+  assert.equal(bad.status, 400, "空串 featureId 是非法入参，不当成「无过滤」");
+  assert.equal(json<ErrorBody>(bad).code, "invalid_feature_id");
+
+  const all = json<EventsBody>(await get(handle.port, `/api/events?since=${base}`));
+  assert.equal(all.count, 4, "不传 featureId ⇒ 行为与改前逐字一致（本用例四条事件全回，不加过滤）");
 });
 
 test("非 loopback host ⇒ 拒起（不 throw，返回未启用）", async () => {

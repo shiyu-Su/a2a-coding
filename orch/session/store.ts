@@ -20,8 +20,10 @@ import type {
   ArtifactRecord,
   EventRecord,
   FailureKind,
+  FeatureApproval,
   FeatureCreateInput,
   FeatureRecord,
+  FeatureStage,
   FeatureState,
   InputArtifactRef,
   RiskLevel,
@@ -30,7 +32,18 @@ import type {
   TaskRecord,
   TaskState,
 } from "../types.js";
-import { AGENT_KINDS, FAILURE_KINDS, ORPHAN_FAILURE_KIND, TASK_LANES } from "../types.js";
+import {
+  AGENT_KINDS,
+  DEFAULT_FEATURE_APPROVAL,
+  DEFAULT_FEATURE_STAGE,
+  FAILURE_KINDS,
+  FEATURE_APPROVALS,
+  FEATURE_STAGES,
+  isFeatureApproval,
+  isFeatureStage,
+  ORPHAN_FAILURE_KIND,
+  TASK_LANES,
+} from "../types.js";
 
 /**
  * 默认数据库文件：锚定 orch 单元根（`<orch>/data/sessions.sqlite`），**非 cwd 相对**，
@@ -127,6 +140,17 @@ export const EVENT_TASK_BLOCKED = "task.blocked";
 export const EVENT_TASK_CONTINUED = "task.continued";
 /** 事件 kind：Feature 状态流转 */
 export const EVENT_FEATURE_STATE = "feature.state";
+/**
+ * 事件 kind：Feature **登记字段**变更（v0.9.0 B3″）—— `stage` / `version` / `approval` 三字段。
+ *
+ * - **只在值真变化时发**：同值重复写（宿主重复 `advance` 带同一 `stage`、`NULL` 归一后与目标值
+ *   相等的存量行）⇒ **零事件**（否则看板与宿主的登记流水会被无害重写灌满）；
+ * - 三字段**任一**变化即一条，`payload.fields` 逐项给 `{ from, to }`（同单多字段变更**不拆条** ——
+ *   一次 `advance` 是一次事实）；
+ * - **零 DDL**：`events.kind` 是既有自由文本列；`state` 列在此留 `NULL`（本事件不承载引擎态）；
+ * - 归属：`feature_id` 必填 ⇒ 案 B 谓词经 `features.owner_group` 反查即可见，他组不可见。
+ */
+export const EVENT_FEATURE_STAGE = "feature.stage";
 /**
  * 事件 kind：列表查询**触顶截断**告警（v0.6.1 REQ-05 §2.5 白捡 / C12）。
  *
@@ -373,6 +397,19 @@ export interface FeatureContextPatch {
   contracts?: string | null;
 }
 
+/**
+ * `updateFeatureRegistration` 入参（v0.9.0 B1″ 登记字段**唯一运行期写口**）：
+ * 仅提供的字段被更新（undefined = 保留原值）。
+ *
+ * 类型是**已校验的闭集值**（校验在 handler，见 `bridge/feature-tools.ts`）⇒ 存储层不再复核；
+ * `version` 是自由文本（无闭集）。
+ */
+export interface FeatureRegistrationPatch {
+  stage?: FeatureStage;
+  version?: string;
+  approval?: FeatureApproval;
+}
+
 /** `upsertArtifact` 入参：`createdAt` 缺省时由存储层补齐 */
 export interface ArtifactUpsertInput {
   artifactId: string;
@@ -412,13 +449,21 @@ export interface EventVisibilityScope {
   projectIds: readonly string[];
 }
 
-/** `listEvents` 入参：游标与条数上限（+ 可选组可见性范围） */
+/** `listEvents` 入参：游标与条数上限（+ 可选组可见性范围 / Feature 过滤） */
 export interface ListEventsOptions {
   /** 仅返回 `event_id > since` 的事件（缺省 0 = 从头） */
   since?: number;
   limit?: number;
   /** 缺省 / `null` = **不过滤**：未配组环境的匿名入口 / web 运维视图（§2.7） */
   scope?: EventVisibilityScope | null;
+  /**
+   * **只读过滤**（v0.9.0 B3″）：给定 ⇒ 仅返回该 Feature 的事件。
+   *
+   * 存在于**board 读面**：看板要看「这条需求的登记流水」，但**不得**借用
+   * `a2a_events`（`handleEvents`）—— 那条即便显式传 `since` 也会**推进按身份分的游标**，
+   * 会**静默吃掉宿主的事件**。本过滤留在 store 的纯读侧，**不接触任何游标**。
+   */
+  featureId?: string;
 }
 
 /**
@@ -715,7 +760,7 @@ const TASK_COLUMNS =
 /** features 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToFeature） */
 const FEATURE_COLUMNS =
   "feature_id, state, title, requirement, context_id, plan, decisions, contracts, " +
-  "owner_group, created_at, updated_at";
+  "owner_group, stage, version, approval, created_at, updated_at";
 
 /** 解析 `dependencies` 列（JSON 数组字符串）；非法即数据损坏（fail-fast） */
 function readDependencies(row: Record<string, unknown>): string[] | null {
@@ -803,6 +848,22 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
   };
 }
 
+/**
+ * `stage` 读侧归一（v0.9.0 B2″）：NULL（存量行 / 未带值建行）⇒ {@link DEFAULT_FEATURE_STAGE}；
+ * 脏值同样落缺省而**不 throw**（与 `state` 的 fail-fast **相反** —— 登记面不得让读取抛出去，
+ * 否则 `recover` 启动即抛 / `tick` 停摆）。脏值的**取证与一次性归一**在 ctor（见该处告警）。
+ */
+function readStage(row: Record<string, unknown>): FeatureStage {
+  const raw = readNullableString(row, "stage");
+  return raw !== null && isFeatureStage(raw) ? raw : DEFAULT_FEATURE_STAGE;
+}
+
+/** `approval` 读侧归一：口径同 {@link readStage}（NULL / 脏值 ⇒ 缺省，不 throw） */
+function readApproval(row: Record<string, unknown>): FeatureApproval {
+  const raw = readNullableString(row, "approval");
+  return raw !== null && isFeatureApproval(raw) ? raw : DEFAULT_FEATURE_APPROVAL;
+}
+
 function rowToFeature(row: Record<string, unknown>): FeatureRecord {
   const state = readString(row, "state");
   if (!isFeatureState(state)) {
@@ -819,9 +880,64 @@ function rowToFeature(row: Record<string, unknown>): FeatureRecord {
     contracts: readNullableString(row, "contracts"),
     // v0.8.6 §2.3 归属列：可空（NULL = 无归属，存量 / 未配组环境创建）；读侧不 fail-fast
     ownerGroup: readNullableString(row, "owner_group"),
+    // v0.9.0 B2″ 登记三列：**读侧单点归一**（NULL / 脏值 → 缺省，一律不 throw）
+    stage: readStage(row),
+    version: readNullableString(row, "version") ?? "",
+    approval: readApproval(row),
     createdAt: readString(row, "created_at"),
     updatedAt: readString(row, "updated_at"),
   };
+}
+
+/**
+ * Feature **归属谓词**（v0.8.6 §2.3）= 列表读口视野判据的**唯一事实源**。
+ *
+ * - 给定组名 ⇒ `owner_group = ?`（`NULL` 无归属行天然被排除 = 已配组环境 fail-closed）；
+ * - `undefined` ⇒ 空片段（未配组环境匿名入口 / web 运维视图全量）。
+ *
+ * ★ **列表读的一切分支必须共用本谓词**（需要裸条件时经 {@link featureOwnershipCondition} 取，
+ * 仍是同一事实源）：{@link SessionStore.listFeatures} 与 v0.9.0 B3″ 的
+ * {@link SessionStore.featureTaskStateCounts} 聚合 —— 另写一份 = 两个可见性判据漂移，
+ * 聚合侧会把不可见 Feature 的节点也算进计数（静默放宽视野）。
+ */
+function featureOwnershipPredicate(
+  ownerGroup: string | undefined,
+  startWithWhere = true,
+): { clause: string; params: string[] } {
+  const condition = featureOwnershipCondition(ownerGroup);
+  if (condition.clause === "") return { clause: "", params: [] };
+  return {
+    clause: startWithWhere ? ` WHERE ${condition.clause}` : ` AND ${condition.clause}`,
+    params: condition.params,
+  };
+}
+
+/** 归属谓词的**裸条件**（不含 `WHERE` / `AND` 前缀）= 多处拼接时的唯一条件事实源 */
+function featureOwnershipCondition(
+  ownerGroup: string | undefined,
+): { clause: string; params: string[] } {
+  if (ownerGroup === undefined) return { clause: "", params: [] };
+  return { clause: "owner_group = ?", params: [ownerGroup] };
+}
+
+/** `listFeatures` 的 WHERE 片段（状态过滤 ∧ 归属谓词；含尾空格，可直接接 `ORDER BY`） */
+function featureListWhere(opts: { state?: FeatureState; ownerGroup?: string }): string {
+  const clauses: string[] = [];
+  if (opts.state !== undefined) clauses.push("state = ?");
+  clauses.push(featureOwnershipCondition(opts.ownerGroup).clause);
+  const kept = clauses.filter((c) => c.length > 0);
+  return kept.length > 0 ? `WHERE ${kept.join(" AND ")} ` : "";
+}
+
+/** `listFeatures` 的绑定参数（顺序 = {@link featureListWhere} 的片段顺序：state → owner） */
+function featureListParams(opts: {
+  state?: FeatureState;
+  ownerGroup?: string;
+}): Array<string | number> {
+  const params: Array<string | number> = [];
+  if (opts.state !== undefined) params.push(opts.state);
+  params.push(...featureOwnershipCondition(opts.ownerGroup).params);
+  return params;
 }
 
 function rowToArtifact(row: Record<string, unknown>): ArtifactRecord {
@@ -1174,6 +1290,48 @@ export class SessionStore {
       this.db.exec("ALTER TABLE features ADD COLUMN owner_group TEXT");
     } catch {
       // 列已存在
+    }
+    // ── v0.9.0 B1″ 迁移（REQ-v0.9.0-2026-09-24-01）：features 加**登记三列** ──────────────
+    // `stage`（阶段）/ `version`（版本）/ `approval`（门状态）= **观测面登记字段**，
+    // 不是状态机态（不改 `TRANSITIONS`、不改主链判据）。
+    // 纪律照既有：只加列、**必可空**（存量行三列一律 NULL ⇒ 读侧按缺省）、不复用既有列、
+    // **只在 ctor try-ALTER**（无 `PRAGMA user_version`）。
+    for (const column of ["stage TEXT", "version TEXT", "approval TEXT"]) {
+      try {
+        this.db.exec(`ALTER TABLE features ADD COLUMN ${column}`);
+      } catch {
+        // 列已存在（幂等）
+      }
+    }
+    // 两枚举列的**脏值一次性归一**（照上方 `features.state` 脏值先例：先取证 `console.error`，再改）：
+    // 列**无 DB 约束**，非法值虽不会像 `state` 那样让读取抛（读侧 `readStage` / `readApproval` 已
+    // 归一兜住），但「库里一个谁都读不出来的值」必须留痕并落定到缺省。
+    // **NULL 不在归一范围**（存量行的合法态，语义 = 按缺省，见读侧）；
+    // **不改 `updated_at`**（归一不是活动）、**不写事件**（迁移非运行期状态变更）、**幂等**（二次启动零行）。
+    for (const [column, known, fallback] of [
+      ["stage", FEATURE_STAGES, DEFAULT_FEATURE_STAGE],
+      ["approval", FEATURE_APPROVALS, DEFAULT_FEATURE_APPROVAL],
+    ] as const) {
+      const placeholders = known.map(() => "?").join(", ");
+      const dirtyRows = this.db
+        .prepare(
+          `SELECT ${column} AS v, COUNT(*) AS n FROM features
+           WHERE ${column} IS NOT NULL AND ${column} NOT IN (${placeholders}) GROUP BY ${column}`,
+        )
+        .all(...known) as Array<Record<string, unknown>>;
+      if (dirtyRows.length === 0) continue;
+      const detail = dirtyRows
+        .map((row) => `${String(row["v"])}×${String(row["n"])}`)
+        .join(" / ");
+      const total = dirtyRows.reduce((sum, row) => sum + Number(row["n"]), 0);
+      console.error(
+        `[session-store] features.${column} 脏值归一 → ${fallback}：${detail}（共 ${total} 行）`,
+      );
+      this.db
+        .prepare(
+          `UPDATE features SET ${column} = ? WHERE ${column} IS NOT NULL AND ${column} NOT IN (${placeholders})`,
+        )
+        .run(fallback, ...known);
     }
     // v0.4.1 迁移（REQ-v0.4.1-2026-09-16-01 §2.3）：主链收敛 ⇒ 前段三态已从枚举删除。
     // `features.state` **无 DB 约束**（见 FEATURES_DDL），非法值在**读取时**抛（`rowToFeature`）⇒
@@ -2436,13 +2594,16 @@ export class SessionStore {
     const updatedAt = rec.updatedAt ?? createdAt;
     this.db
       .prepare(
-        `INSERT INTO features (feature_id, state, title, requirement, context_id, owner_group, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO features (feature_id, state, title, requirement, context_id, owner_group, stage, version, approval, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(feature_id) DO UPDATE SET
            state = excluded.state,
            title = excluded.title,
            requirement = excluded.requirement,
            context_id = COALESCE(excluded.context_id, context_id),
+           stage = excluded.stage,
+           version = excluded.version,
+           approval = excluded.approval,
            updated_at = excluded.updated_at`,
       )
       .run(
@@ -2454,6 +2615,12 @@ export class SessionStore {
         // 归属 = 建 Feature 时的连接身份；重跑（ON CONFLICT）**不改归属**（谁建谁见，owner 不可变），
         // 故不出现在 DO UPDATE SET 中。NULL = 未配组环境 / 存量。
         rec.ownerGroup ?? null,
+        // v0.9.0 登记三列：存储层**不补缺省、不复核闭集**（缺省由 handler 施加、校验由 handler 做；
+        // 登记面不得抛）。缺省不传 ⇒ NULL，读侧按缺省归一（见 `readStage`）。
+        // 重跑（ON CONFLICT）按入参**重写**（与 state / title 同族语义）；只想改登记请用 advance。
+        rec.stage ?? null,
+        rec.version ?? null,
+        rec.approval ?? null,
         createdAt,
         updatedAt,
       );
@@ -2549,23 +2716,73 @@ export class SessionStore {
     return this.getFeature(featureId);
   }
 
+  /**
+   * 更新 Feature **登记字段**（`stage` / `version` / `approval`；v0.9.0 B1″）。
+   * 仅提供的字段被写入（undefined = 保留原值）；Feature 不存在时返回 null。
+   *
+   * 与 {@link updateFeatureState} 的分工：本写口**不碰 `state` 列、不写 `feature.state` 事件**
+   * —— 登记字段是观测面，主链零变更。
+   * `updated_at` 照其它写口一样前进（这是一次真实写入，不是迁移归一）。
+   *
+   * **v0.9.0 B3″ 起**顺带发 {@link EVENT_FEATURE_STAGE}：diff 在**读侧归一之后**的值面上做
+   * （`NULL` 存量行被写成缺省值 ⇒ 归一后相等 ⇒ **不算变化、不发事件**），
+   * **三字段任一真变化 ⇒ 恰好一条**（同值重复写 ⇒ **零事件**）。
+   */
+  updateFeatureRegistration(
+    featureId: string,
+    patch: FeatureRegistrationPatch,
+  ): FeatureRecord | null {
+    const sets: string[] = [];
+    const params: Array<string> = [];
+    if (patch.stage !== undefined) {
+      sets.push("stage = ?");
+      params.push(patch.stage);
+    }
+    if (patch.version !== undefined) {
+      sets.push("version = ?");
+      params.push(patch.version);
+    }
+    if (patch.approval !== undefined) {
+      sets.push("approval = ?");
+      params.push(patch.approval);
+    }
+    if (sets.length === 0) return this.getFeature(featureId);
+    const previous = this.getFeature(featureId);
+    sets.push("updated_at = ?");
+    params.push(nowIso());
+    params.push(featureId);
+    this.db.prepare(`UPDATE features SET ${sets.join(", ")} WHERE feature_id = ?`).run(...params);
+    const stored = this.getFeature(featureId);
+    if (previous !== null && stored !== null) {
+      const diff: Array<{ field: string; from: string; to: string }> = [];
+      if (previous.stage !== stored.stage) {
+        diff.push({ field: "stage", from: previous.stage, to: stored.stage });
+      }
+      if (previous.version !== stored.version) {
+        diff.push({ field: "version", from: previous.version, to: stored.version });
+      }
+      if (previous.approval !== stored.approval) {
+        diff.push({ field: "approval", from: previous.approval, to: stored.approval });
+      }
+      if (diff.length > 0) {
+        this.appendEvent({
+          featureId,
+          taskId: null,
+          kind: EVENT_FEATURE_STAGE,
+          state: null,
+          payload: JSON.stringify({ fields: diff }),
+        });
+      }
+    }
+    return stored;
+  }
+
   /** 列出 Feature（updated_at 倒序；可选状态 / 归属组过滤；limit 默认 100，clamp 到 [1,1000]） */
   listFeatures(opts: ListFeaturesOptions = {}): FeatureRecord[] {
     const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
-    const clauses: string[] = [];
-    const params: Array<string | number> = [];
-    if (opts.state !== undefined) {
-      clauses.push("state = ?");
-      params.push(opts.state);
-    }
-    // v0.8.6 §2.3 归属过滤：给定组名 ⇒ `owner_group = ?`（NULL 无归属行被排除 = fail-closed）；
-    // 缺省 ⇒ 不加此谓词（未配组环境匿名入口 / web 运维视图全量）。
-    if (opts.ownerGroup !== undefined) {
-      clauses.push("owner_group = ?");
-      params.push(opts.ownerGroup);
-    }
+    const where = featureListWhere(opts);
+    const params = featureListParams(opts);
     params.push(limit);
-    const where = clauses.length > 0 ? `WHERE ${clauses.join(" AND ")} ` : "";
     const rows = this.db
       .prepare(
         `SELECT ${FEATURE_COLUMNS}
@@ -2582,24 +2799,51 @@ export class SessionStore {
       rows.length,
       limit,
       () => {
-        const countClauses: string[] = [];
-        const countParams: Array<string | number> = [];
-        if (stateFilter !== undefined) {
-          countClauses.push("state = ?");
-          countParams.push(stateFilter);
-        }
-        if (ownerFilter !== undefined) {
-          countClauses.push("owner_group = ?");
-          countParams.push(ownerFilter);
-        }
-        const countWhere = countClauses.length > 0 ? `WHERE ${countClauses.join(" AND ")}` : "";
         const row = this.db
-          .prepare(`SELECT COUNT(*) AS n FROM features ${countWhere}`)
-          .get(...countParams) as Record<string, unknown> | undefined;
+          .prepare(
+            `SELECT COUNT(*) AS n FROM features ${featureListWhere(opts).trim() || "WHERE 1=1"}`,
+          )
+          .get(...featureListParams(opts)) as Record<string, unknown> | undefined;
         return Number(row?.["n"] ?? 0);
       },
     );
     return rows.map(rowToFeature);
+  }
+
+  /**
+   * 列表读口的**节点态计数**（v0.9.0 B3″）：一条 `GROUP BY feature_id, state` 聚合 SQL
+   * 拿到每个 Feature 的各态节点数，替掉「每行 Feature 再查一次 `listFeatureTasks`」（1+N → O(1)）。
+   *
+   * ★ **归属谓词与 {@link listFeatures} 同源**（{@link featureOwnershipPredicate}）—— 视野判据
+   * 若另写一份，聚合会把不可见 Feature 的节点也算进计数（静默放宽可见性）。
+   *
+   * 返回 `Map<featureId, Partial<Record<TaskState, number>>>`：**无节点的 Feature 不出现在 map 里**
+   * （调用方按空对象处理 ⇒ `taskCount = 0`，与旧「查回空数组」同语义）。
+   * `state` 只回闭集内取值（脏值行不污染出参）。
+   */
+  featureTaskStateCounts(
+    ownerGroup?: string,
+  ): Map<string, Partial<Record<TaskState, number>>> {
+    const owner = featureOwnershipPredicate(ownerGroup, false);
+    const rows = this.db
+      .prepare(
+        `SELECT t.feature_id AS feature_id, t.state AS state, COUNT(*) AS n
+         FROM tasks t
+         JOIN features f ON f.feature_id = t.feature_id
+         WHERE t.feature_id IS NOT NULL${owner.clause}
+         GROUP BY t.feature_id, t.state`,
+      )
+      .all(...owner.params) as Array<Record<string, unknown>>;
+    const out = new Map<string, Partial<Record<TaskState, number>>>();
+    for (const row of rows) {
+      const featureId = readString(row, "feature_id");
+      const state = readString(row, "state");
+      if (!isTaskState(state)) continue;
+      const bucket = out.get(featureId) ?? {};
+      bucket[state] = Number(row["n"]);
+      out.set(featureId, bucket);
+    }
+    return out;
   }
 
   // ------------------------------------------------------------------
@@ -2699,17 +2943,25 @@ export class SessionStore {
   /**
    * 按游标列出事件（`event_id > since`，升序；limit 默认 100，clamp 到 [1,1000]）。
    * `opts.scope` 给定 ⇒ 按**案 B 谓词**过滤组可见性（缺省 = 不过滤，全量）。
+   * `opts.featureId` 给定 ⇒ 再按 Feature 收窄（v0.9.0 B3″ 板读面）。
+   *
+   * ★ **纯读口：本方法绝不推进任何游标**（`a2a_events` 的进程内按身份游标在 `bridge/index.ts`，
+   * 由 `handleEvents` / `handleWait` 独占）⇒ 看板反复扫同一 Feature 的事件不会吃掉宿主的事件。
    */
   listEvents(opts: ListEventsOptions = {}): EventRecord[] {
     const since = Math.max(opts.since ?? 0, 0);
     const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
     const visibility = eventVisibilityPredicate(opts.scope);
+    const feature =
+      opts.featureId === undefined
+        ? { clause: "", params: [] as string[] }
+        : { clause: " AND feature_id = ?", params: [opts.featureId] };
     const rows = this.db
       .prepare(
-        `SELECT * FROM events WHERE event_id > ?${visibility.clause}` +
+        `SELECT * FROM events WHERE event_id > ?${visibility.clause}${feature.clause}` +
           ` ORDER BY event_id ASC LIMIT ?`,
       )
-      .all(since, ...visibility.params, limit) as Array<Record<string, unknown>>;
+      .all(since, ...visibility.params, ...feature.params, limit) as Array<Record<string, unknown>>;
     return rows.map(rowToEvent);
   }
 
@@ -2988,6 +3240,14 @@ export function updateFeatureContext(
   return getDefaultStore().updateFeatureContext(featureId, patch);
 }
 
+/** 更新 Feature 登记字段（默认存储；v0.9.0 B1″，**不碰状态机态**） */
+export function updateFeatureRegistration(
+  featureId: string,
+  patch: FeatureRegistrationPatch,
+): FeatureRecord | null {
+  return getDefaultStore().updateFeatureRegistration(featureId, patch);
+}
+
 /** 写入/覆盖产物记录（默认存储） */
 export function upsertArtifact(rec: ArtifactUpsertInput): ArtifactRecord {
   return getDefaultStore().upsertArtifact(rec);
@@ -3026,6 +3286,16 @@ export function latestEventId(scope?: EventVisibilityScope | null): number {
 /** 列出 Feature（默认存储） */
 export function listFeatures(opts?: ListFeaturesOptions): FeatureRecord[] {
   return getDefaultStore().listFeatures(opts);
+}
+
+/**
+ * 列表读的节点态聚合（默认存储；v0.9.0 B3″）—— 见
+ * {@link SessionStore.featureTaskStateCounts}（**归属谓词与 `listFeatures` 同源**）。
+ */
+export function featureTaskStateCounts(
+  ownerGroup?: string,
+): Map<string, Partial<Record<TaskState, number>>> {
+  return getDefaultStore().featureTaskStateCounts(ownerGroup);
 }
 
 /** 清理保留策略（默认存储） */

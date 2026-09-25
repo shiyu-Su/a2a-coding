@@ -368,6 +368,25 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           .string()
           .optional()
           .describe("Feature 级会话上下文（落 features.context_id，跨任务 / 跨 worker 启停复用）"),
+        // v0.9.0 B1″ 登记字段：**schema 侧不收口**（`z.string()` 而非 `.enum()`），闭集校验在 handler
+        stage: z
+          .string()
+          .optional()
+          .describe(
+            "阶段登记（观测面，**不是状态机态**）：需求分析 / 改造方案 / 改造 / 回归 / 发版。" +
+              "**缺省「改造方案」**⇒ 不传时既有行为不变；板建需求显式传「需求分析」。非法值 ⇒ feature_invalid_stage",
+          ),
+        version: z
+          .string()
+          .optional()
+          .describe("版本登记（自由文本，如 v0.9.0；缺省空）：仅供看板 / 台账展示，引擎不解释"),
+        approval: z
+          .string()
+          .optional()
+          .describe(
+            "审批门状态登记：未发起 / 待审批 / 已通过（单向、无回边）。**缺省「待审批」**⇒ 既有调用建完即可过审；" +
+              "板建需求显式传「未发起」。非法值 ⇒ feature_invalid_approval",
+          ),
       },
     },
     async (args) => {
@@ -376,6 +395,9 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           title: args.title,
           requirement: args.requirement,
           contextId: args.contextId,
+          stage: args.stage,
+          version: args.version,
+          approval: args.approval,
         });
         return outcome.ok ? textResult(outcome) : errorResult(outcome);
       } catch (err) {
@@ -407,7 +429,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_feature_advance",
     {
       description:
-        "orch agent 驱动 Feature 主链推进（如 integrating→testing→reviewing→completed）；状态机校验合法后继，非法流转被拒。**waiting_approval→executing 已禁用**（唯一准入 = a2a_feature_approve，错误码 feature_approval_required）。needs_input 恢复用 to=executing 并携带 answer。**重派失败节点**用 retryTaskIds（须显式 to=executing，与 answer 互斥；重派 + 解冻闭包外 blocked 下游，不改 Feature 态）。",
+        "orch agent 驱动 Feature 主链推进（如 integrating→testing→reviewing→completed）；状态机校验合法后继，非法流转被拒。**waiting_approval→executing 已禁用**（唯一准入 = a2a_feature_approve，错误码 feature_approval_required）。needs_input 恢复用 to=executing 并携带 answer。**重派失败节点**用 retryTaskIds（须显式 to=executing，与 answer 互斥；重派 + 解冻闭包外 blocked 下游，不改 Feature 态）。**登记字段**用 stage / version / approval（`to` = 当前态时 = 只写登记、不动主链；无终态守卫，completed 后仍可写「发版」）。",
       inputSchema: {
         featureId: z.string().min(1).describe("Feature ID"),
         to: z
@@ -440,6 +462,23 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
               "须显式 `to=\"executing\"`（本参数是派发语义操作，不是状态流转）；与 `answer` **互斥**（同传 ⇒ feature_conflicting_args）；" +
               "空数组 / 任一 id 非法 ⇒ feature_nothing_to_resume（**整单拒绝，不做部分重派**，Feature 态不变）。",
           ),
+        // v0.9.0 B1″ 登记字段写入：`to` **等于当前态** ∧ 带任一登记字段 ⇒ 只写登记、不动主链
+        // （照 retryTaskIds 的「显式特例」先例，状态机转移表零改动；**无终态守卫**）
+        stage: z
+          .string()
+          .optional()
+          .describe(
+            "阶段登记（闭集：需求分析 / 改造方案 / 改造 / 回归 / 发版；非法值 ⇒ feature_invalid_stage）。" +
+              "**观测面，不是状态机态**：不改主链、不发状态事件；序与回退都不校验。",
+          ),
+        version: z.string().optional().describe("版本登记（自由文本，无闭集；引擎不解释）"),
+        approval: z
+          .string()
+          .optional()
+          .describe(
+            "审批门状态登记（闭集：未发起 / 待审批 / 已通过；非法值 ⇒ feature_invalid_approval）。" +
+              "写完改造文档后置「待审批」= 过审的前置；a2a_feature_approve 放行时落「已通过」。",
+          ),
       },
     },
     async (args) => {
@@ -452,6 +491,9 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           contracts: args.contracts,
           answer: args.answer,
           retryTaskIds: args.retryTaskIds,
+          stage: args.stage,
+          version: args.version,
+          approval: args.approval,
         });
         if (!outcome.ok) return errorResult(outcome);
         core.kickScheduler();

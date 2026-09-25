@@ -16,8 +16,18 @@
  *       [--backend-args <JSON字符串数组>]
  *       [--system-prompt <text> --system-prompt-mode <append|replace>]
  *       [--model <value>] [--mode <modeId>] [--collaboration-mode <value>]
- *       [--session-meta-json <JSON对象>] [--session-timeout <ms>]
+ *       [--session-meta-json <JSON对象>] [--mcp-servers-json <JSON对象数组>]
+ *       [--session-timeout <ms>]
  *       [--session-retention-days <n>] [--session-retention-max <n>]`
+ *
+ * v0.9.0 · M2a：`--mcp-servers-json <JSON 对象数组>` = ACP `session/new` / `session/load` 的
+ * `mcpServers` 取值来源（该槽位自 v0.8.0 起即存在但全仓无赋值点 ⇒ 恒 `[]`）。**缺省 / 空串 ⇒ 槽位仍为
+ * `[]`**（既有行为零变化）；给了则**元素原样透传**（桥不猜后端方言），仅校验形态，非法即抛（启动 fail-fast）。
+ *
+ * v0.9.0 · M2c（M2b 探针的派生收口）：M2b 实测后端 `session/new` 要的是 ACP **tagged-union** ——
+ * 每个元素**必须带判别键 `type` ∈ {`http`, `sse`, `acp`}**，且该键决定必填键（`http`/`sse` ⇒ `url`；
+ * `acp` ⇒ `command`）。M2a 只校验「`url` 与 `command` 至少其一」⇒ ACP 非法的 payload 能过启动期、
+ * 直到运行期 `session/new` 才炸。本节点把该事实前移为启动期拒收；**合法路径行为零变化**。
  *
  * v0.8.9 · M5：`--session-retention-days` / `--session-retention-max` = `SessionMap` 保留边界
  * （条目 TTL 天数 / 单项目条数上限），**只校验「整数 > 0」**（纪律同 `--session-timeout`）；
@@ -101,6 +111,11 @@ export interface BridgeArgs {
    */
   sessionMeta?: Record<string, unknown>;
   /**
+   * `--mcp-servers-json` 解析结果（ACP `mcpServers` 注入面，v0.9.0 · M2a）；缺省 / 空串 ⇒
+   * `undefined` ⇒ 会话建立实参 `mcpServers` 保持 `AcpSessionRunner` 自身缺省 `[]`（行为逐字不变）。
+   */
+  mcpServers?: readonly Record<string, unknown>[];
+  /**
    * `--session-timeout` 解析结果（会话执行超时毫秒数，v0.8.7 · M1）；缺省 ⇒ `undefined`
    * ⇒ 由 {@link startBridge} 落 `deps.sessionTimeoutMs ?? DEFAULT_SESSION_TIMEOUT_MS`。
    */
@@ -120,6 +135,16 @@ function requiredArg(map: ReadonlyMap<string, string>, key: string): string {
     throw new Error(`缺少必填参数 --${key}`);
   }
   return value;
+}
+
+/**
+ * ACP `mcpServers` 的 tagged-union 判别键闭集（M2b 真机实测：qoder-cn 对缺 `type` 的元素在
+ * `session/new` 报 `-32602`，三值即其 union 分支）。
+ */
+const MCP_TRANSPORT_TYPES = ["http", "sse", "acp"] as const;
+
+function isMcpTransportType(value: string): value is (typeof MCP_TRANSPORT_TYPES)[number] {
+  return (MCP_TRANSPORT_TYPES as readonly string[]).includes(value);
 }
 
 /** 解析 CLI 参数（`--key value` 形式；未知键忽略）。非法即抛错。 */
@@ -149,6 +174,7 @@ export function parseBridgeArgs(argv: readonly string[]): BridgeArgs {
   const mode = parseModelArg(map.get("mode"));
   const collaborationMode = parseModelArg(map.get("collaboration-mode"));
   const sessionMeta = parseSessionMetaArg(map.get("session-meta-json"));
+  const mcpServers = parseMcpServersArg(map.get("mcp-servers-json"));
   const systemPrompt = parseModelArg(map.get("system-prompt"));
   const systemPromptMode = parseSystemPromptModeArg(map.get("system-prompt-mode"));
   const sessionTimeoutMs = parseSessionTimeoutArg(map.get("session-timeout"));
@@ -167,6 +193,7 @@ export function parseBridgeArgs(argv: readonly string[]): BridgeArgs {
     ...(mode !== undefined ? { mode } : {}),
     ...(collaborationMode !== undefined ? { collaborationMode } : {}),
     ...(sessionMeta !== undefined ? { sessionMeta } : {}),
+    ...(mcpServers !== undefined ? { mcpServers } : {}),
     ...(sessionTimeoutMs !== undefined ? { sessionTimeoutMs } : {}),
     ...(sessionRetentionDays !== undefined ? { sessionRetentionDays } : {}),
     ...(sessionRetentionMax !== undefined ? { sessionRetentionMax } : {}),
@@ -240,6 +267,52 @@ export function parseSessionMetaArg(raw: string | undefined): Record<string, unk
     throw new Error("--session-meta-json 必须是 JSON 对象");
   }
   return parsed as Record<string, unknown>;
+}
+
+/**
+ * `--mcp-servers-json` 解析（REQ-v0.9.0 · M2a；M2c 增补 `type` 判别键校验）：JSON **对象数组**，
+ * 值即 ACP `session/new` / `session/load` 的 `mcpServers` 实参（结构 = 后端方言，桥**只接一根线**、
+ * 不改写也不补全键）。校验只挡明显打错的形态 —— 每个元素须为对象、带非空字符串 `name`、带 ACP 判别键
+ * `type` ∈ {@link MCP_TRANSPORT_TYPES}，且 `type` 决定的必填键非空（`http`/`sse` ⇒ `url`；
+ * `acp` ⇒ `command`）；其余键（`headers` / `args` / `env` …）原样透传。缺省 / 空串 ⇒ `undefined`
+ * ⇒ 槽位维持 `[]`（与未引入本 flag 时逐字一致）。
+ * 非法 JSON / 非数组 / 上述形态不合规 ⇒ 抛错（启动期 fail-fast，纪律同 `--session-meta-json`）。
+ */
+export function parseMcpServersArg(raw: string | undefined): Record<string, unknown>[] | undefined {
+  if (raw === undefined || raw.length === 0) return undefined;
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`--mcp-servers-json 不是合法 JSON：${raw.slice(0, 80)}`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error("--mcp-servers-json 必须是 JSON 数组");
+  }
+  const servers: Record<string, unknown>[] = [];
+  for (const [index, item] of parsed.entries()) {
+    if (typeof item !== "object" || item === null || Array.isArray(item)) {
+      throw new Error(`--mcp-servers-json 第 ${index + 1} 项必须是 JSON 对象`);
+    }
+    const record = item as Record<string, unknown>;
+    const name = record["name"];
+    if (typeof name !== "string" || name.length === 0) {
+      throw new Error(`--mcp-servers-json 第 ${index + 1} 项缺少非空字符串 name`);
+    }
+    const type = record["type"];
+    if (typeof type !== "string" || !isMcpTransportType(type)) {
+      throw new Error(
+        `--mcp-servers-json 项 ${name} 的 type 必须是 ${MCP_TRANSPORT_TYPES.join(" / ")}（ACP tagged-union 判别键）`,
+      );
+    }
+    const requiredKey = type === "acp" ? "command" : "url";
+    const required = record[requiredKey];
+    if (typeof required !== "string" || required.length === 0) {
+      throw new Error(`--mcp-servers-json 项 ${name} 的 type=${type} 需要非空字符串 ${requiredKey}`);
+    }
+    servers.push(record);
+  }
+  return servers;
 }
 
 /** `--backend-args` 解析：JSON 字符串数组；缺省返回 `undefined`（由调用方落 {@link DEFAULT_BACKEND_ARGS}）。 */
@@ -324,6 +397,7 @@ export async function startBridge(args: BridgeArgs, deps: StartBridgeDeps = {}):
     ...(args.mode !== undefined ? { mode: args.mode } : {}),
     ...(args.collaborationMode !== undefined ? { collaborationMode: args.collaborationMode } : {}),
     ...(args.sessionMeta !== undefined ? { sessionMeta: args.sessionMeta } : {}),
+    ...(args.mcpServers !== undefined ? { mcpServers: args.mcpServers } : {}),
     logger,
   });
   const server = createAcpA2AServer({ executor: runner, logger });

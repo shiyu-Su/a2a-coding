@@ -2,6 +2,29 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.9.0] - 2026-09-25
+
+> 主题：**Web 操作端 / Board 主入口**（单需求 `REQ-v0.9.0-2026-09-23-01`；改造文档 final v11）。**新建第四个单元 `board/`（端口 3400）架在 orch agent 前面** —— 人只通过板做事（提需求 / 触发·对话 / 澄清回答 / 人工确认 / 看进展），板为每个需求拉起并驱动一个宿主 agent，人不直接接触 agent。**板不写引擎状态机**（唯一状态机写 = 建需求那一次 `a2a_feature_create`；approve/advance/cancel 机制上归 agent，回归用例钉住 `src/**` 零引用）。**真机端到端走通**：用户板上首条需求（提需求 → 触发 → 澄清 → 回答 → 改造文档落盘 → 确认 → `approve` 放行 → 盘点合流 → 评审 → `completed`）全程无宿主介入。
+
+### Added
+
+- **board 新单元**：HTTP 面（需求列表 / 详情 / 任务 / 项目机器 / 宿主桥五页 + `/health`）· **写端点五条白名单**（`POST /requirements` / `/features/:id/turn` / `/features/:id/answer` / `/features/:id/confirm` / `/host/:org/stop`，其余非 GET 405）· **CSRF 双档**（`X-Board-Write` 头给 API / 同源 Origin·Referer 归一化逐字节比较给表单，`Origin: null`/缺失退 Referer）· **宿主桥进程托管**（板自己 spawn `machine/dist/acp-bridge`，空闲 15min 回收，SIGTERM→超时树杀）· **宿主轮台账**（一需求一 contextId 贯穿全阶段，轮状态七值闭集）· **配置文件三件套**（`config.json.default` 逐项 `_comment` 标注 + 活配置 gitignored + 启动期读一次；env 只覆盖配置文件路径、argv 零覆盖）· **boardctl 后台常驻**（start/stop/restart/status/logs + WMI 脱壳 + pidfile + `POST /shutdown` 优雅停机 + 行级时间戳日志）· **组织目录两层**（`orgsDir` 根 = 部署面必填前置校验〔缺失 `board_orgs_dir_missing`〕；`<orgsDir>/<组织名>` 子目录由板自动创建；组织名由前台表单给出 = 首次使用即创建）· `spawn_enoent` 归因（负 errno 明示）· 组织版 AGENTS.md/CLAUDE.md/flow/ 目录模板。
+- **宿主 agent http 型 MCP 注入**（machine 桥）：`--mcp-servers-json` flag（CLI flag → 装配 → ACP `session/new` payload），payload 必须 tagged-union（缺 `type` 启动期拒，不再运行期炸）；四 kind（qoder-cn / opencode / claude / codex）经 ACP 通路全验。
+- **features 登记字段**（orch）：`stage` / `version` / `approval` 三列（ctor try-ALTER）· `a2a_feature_create` 入参 + `advance` 登记特例（同态 + 登记字段 ⇒ 只写登记不改状态）· **`approve` 校验 `approval=待审批`**（`feature_approval_not_ready` —— 「提前批准方案未定的需求」机制上不可能）· 读面聚合（列表 `stateCounts` per-feature + `listEvents` 按 featureId 过滤）+ 新事件 `feature.stage` · 调度器忙集过滤下推。
+- **规范**：`flow/spec/引擎映射.md` 措辞 + §3.5 映射表 + 版本戳。
+- **收口轨 14–17（验收期用户实测驱动）**：**防误触**（五写表单提交即禁用 + 就地反馈；渲染态禁用〔在飞/排队轮〕；服务端 409 `board_turn_busy` 双层闸〔前置查 + 同步段竞态闸〕；`awaiting_answer`/终态轮不占闸；CSP 最小放宽 `script-src 'unsafe-inline'`，无外源）· **停启可靠性**（僵尸进程根因修复：孙进程继承管道写端 `resumeAndUnref()` + HTTP close 定时器 unref + 停机 3s 兜底退出闸〔全仓唯一 `process.exit` 注入点〕；启动失败可观测：logger 就绪前 fatal 同步落 `board.fatal.log` + boardctl 失败输出含其尾部；真机 3 轮 start→shutdown 52–106ms 自行退出）· **终态一致性**（completed/failed/cancelled ⇒ 不渲染幽灵澄清表单〔`findAwaitingTurn` 读侧取代判据，存量脏记录一体生效〕+ 触发/确认按钮渲染禁用 + 三入口 409 `board_feature_terminal`）· 错误码按根因分流（目录两档闸门 / spawn 归因）。
+- **本版新增测试**：board 单测 65 → **390**；根回归新套件 `test-v0.9.0-board.js`（TC23）。
+
+### Changed
+
+- **3300 保持只读运维视图**（逐步被板取代）；**组 ≠ 安全边界**（MCP 零鉴权）口径不变；**板绑非 loopback 的前置 = 鉴权（归 V4）**，四处留痕防遗忘。
+- **演进边界**：页面样式与多视图归 **V3**；板上建组织 / 增删成员 / machine 登记引导归 **V2**；跨机鉴权归 **V4**。协议零变更仍 2.3。
+
+### 门禁与真机
+
+- **orch 391**（390 pass / 1 skip）· **machine 560/560** · **board 390/390** · **宿主根回归 1364/1364**（新增 TC23；报告落 `reports/v0.9.0/`）。
+- **真机（2026-09-24 ~ 09-25，用户亲测驱动）**：板上首条需求全流程走通（见上）· 探针 Feature 用完即 cancel · `approve` 对 `approval=未发起` 负向被拒 · 配置面「改前不可达、改后可达」两码坐实 · 防误触 / 停启 / 终态三组修复同步验。
+
 ## [v0.8.10] - 2026-09-24
 
 > 主题：**执行可靠性 IV：并发与容量**（单需求 `REQ-v0.8.10-2026-09-23-01`；用户 2026-09-24 Step 3「通过」，改造文档 final）。**把「同 project 串行」拆成「写串行 + 读不挡人」，并给并发补上闸门与排队可见面**，同时修掉「只读并行一放开就会立刻引爆」的三处既有隐患。三件事：**① 并发语义定稿**（「场景 × 可否并行」矩阵落 `flow/spec/引擎映射.md` §4.1 + 宿主两份纪律）· **② 同 project 内节点读写分道**（只读档退出写忙集 + `claimTask` 写优先）· **③ 排队可见面 + 两把并发闸**（machine 侧 `maxConcurrentWrites` / `maxConcurrentReads`，缺省 **1/1**）。**三处隐患一次修掉**：**H1 连坐**（续跑/重发曾 `stop` 整个 project 的桥 ⇒ 同 project 在飞任务全遭殃；实证 = 4 个只读任务在续跑触发后数秒内 `failureKind=transport`）· **H2 回收失效**（空闲回收判据用**全机**在飞数 ⇒ 只读并行常态化后桥进程只增不减）· **H3 领取越队**（跨 lane 全局 FIFO ⇒ 早入队的 read 顶掉晚入队的 write、write 最坏等一整轮读窗）。**用户追加深补 B16′**：一趟派发结束时主动取消「仍在烧的那一轮」，不再任其白烧。**协议零变更**（`PROTOCOL_VERSION` 仍 **2.3** —— `readOnly` 走可选字段、归因走既有 `diagnostics` 自由 JSON，未升级对端忽略即按写档）。

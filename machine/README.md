@@ -161,6 +161,8 @@ v0.8.5 起四条 kind **同构**：适配器 `protocol` 恒为 `"acp"`，`buildL
     [--session-meta-json <JSON 对象>]
   ```
 
+- 桥 CLI 另有一个 **v0.9.0 · M2a 新增（M2c 收紧校验）、launcher 今天不装配** 的 flag：`--mcp-servers-json <JSON 对象数组>` = ACP `session/new` / `session/load` 的 `mcpServers` 取值来源（由板 / 手工起桥时直接传入）；缺省 / 空串 ⇒ 该槽位仍为 `[]`（既有行为零变化）。每个元素须为对象、带非空 `name`、带 ACP 判别键 `type` ∈ {`http`, `sse`, `acp`}，且该 `type` 要求的必填键非空（`http`/`sse` ⇒ `url`；`acp` ⇒ `command`）；非法 JSON / 非数组 / 上述形态不合规 ⇒ 启动即抛（M2b 实测：缺 `type` 的 payload 在 M2a 口径下能过启动期、直到运行期 `session/new` 才被后端拒 `-32602`）。
+
 ### 后端命令：外部安装 + `backendCmd` 可选覆盖（四层自动解析）
 
 machine **不内联任何后端**（`package.json` 零新增依赖）：ACP 后端由**适配器包各自外部安装**。v0.8.6 起 `agentConfig.backendCmd` 对四个 kind 一律为**可选覆盖**：缺省时机器按**四层链**自动解析适配器入口（`KIND → 入口` 表唯一事实源 = `adapters/backend-entry.ts` 的 `BACKEND_LOOKUP_BY_KIND`）；写了显式值则**以显式值为准**（含指向非标准位置安装的自建适配器）——显式值的契约 = **入口文件路径，必须存在且是文件**，不满足 ⇒ 该项目明确不可用、**不静默回落下层**（想按命令名走 PATH 的正确表达 = 删键，见 L0 行）。
