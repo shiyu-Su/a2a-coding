@@ -2,6 +2,28 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.9.1] - 2026-09-25
+
+> 主题：**Feature 交付收口**（三条需求同版交付 + 一条原登记需求中途废弃转待办；联合验收原话「两个需求 没问题」）。三条需求全部走完新落的「推进判据清单」流程（需求 1 交付的机制在需求 2/3 的推进上首次实战：每格 advance 带 note 凭据）。
+
+### Added
+
+- **Feature Integration / Acceptance 判据与载体**（`REQ-v0.9.1-2026-09-25-02`，Feature `4f3e3359`）：**A = flow 规范成文两张推进判据清单**（`需求流程.md` Step 3：进「验收」前 = 单元门禁全绿〔根回归不前置，留发版门〕+ 真机验收回执 + 未覆盖登记；进「完成」前 = 用户验收结论原话 + 改造文档 final 行 + 遗留登记去处）+ `引擎映射.md` 推进纪律（advance 每格 note 带凭据）；**B = orch 读面增强**（纯读零状态机改动）：`a2a_feature_status` 单 Feature 分支新增 `acceptance` 聚合块——`stages[]` 推进轨迹回放（首段从 createdAt 合成 / since 游标续读防截断 / 不按 state 聚合）、`failures[]` 失败账单归并（**零去重**原样序 + at/eventId）、`stateCounts` 单 Feature 下沉（与列表分支同一事实源）· 3300 详情页渲染 `stage`/`approval`/`version` 三列（含「≠ 引擎态」辨析标注）。协议零变更（出参纯增量、无新事件 kind）。
+- **板侧错误提示弹窗化**（`REQ-v0.9.1-2026-09-25-03`，Feature `6b86d09c`）：板上 10 个错误出口（A1–A10）浏览器表单档从**裸 JSON 直出**改为 `errorPage` 错误页 + **errorOverlay 浮层**（中文族名标题 + error 文案 + mono code + 「知道了」）；`wantsJson` JSON 档**逐字节不变**（护 API 调用方）；错误码→中文族名映射（无命中回退原文）；CSP/依赖零改动。
+- **阶段产出上板**（`REQ-v0.9.1-2026-09-25-04`，Feature `add92cf2` + 增补 `16fa5dc4`/`85fa04a1`/`98c39da1`）：板详情页新增**「阶段产出」区**——**双源合并**（主仓 `doc/{版本}/` ∪ `<orgsDir>/<org>/doc/{版本}/`）列出需求文档 + 单文档页（`<pre>` 原文 / 渲染双档）；**文档渲染**：markdown 子集渲染器（**escape-first**：先整体转义再按白名单语法加格式）+ **mermaid 流程图渲染**（vendored 11.17.2 本地钉版、不走 CDN；```` ```mermaid ```` 代码块出 SVG；CSP `script-src` 增加 `'self'` = 板首次放宽，README 登记升级纪律）+ **「产出登记」区**（`advance(decisions)` 登记的文档路径提取为可点条目，服务端源 A 未命中回落源 B）· **守卫四件套**（根内收 + version 白名单 `^v\d+\.\d+\.\d+$` + 仅 `.md` + 256KiB 上限）——板上第一条「参数→本地读文件」链路，21 项真实越界探针全 PASS（零泄根零泄内容）· flow `需求流程.md` 补「文档产出后 decisions 登记」纪律 + `文档模板.md` 补「流程图优先 mermaid」。
+
+### Changed
+
+- 版本号四处 `package.json` + 三处 lock 同升 **0.9.1**（board 首次参与同升）；宿主 pin 4 条（`test-v0.8.4-key-layout` / `test-v0.8.5-codex-claude-acp` 各 2 条）翻向 0.9.1。
+
+### Removed
+
+- **原登记需求「orch artifacts 生产写口」废弃转待办**（`REQ-v0.9.1-2026-09-25-01`，确认单/改造文档 v2 留档 `doc/v0.9.1/`）：经核实今天无消费方（结论传递靠宿主贴消息 + 文档落盘；`inputs` 无人真用；产物内容经 `/runner/result` 已回流桥库），触发条件 = 跨机 L3 真用 `inputs` / 板驱动产物账 / v0.11 集成引用产物。
+
+### 门禁与验收
+
+- orch **399/0**（+10）· machine **560/560** · board **474/474**（390 → +84）· 根回归见 `reports/v0.9.1/`；真机 = 桥与板均已 bring-up 新代码，宿主浏览器实测（浮层 / 双源清单 / 文档全文 / mermaid 流程图 7 节点出图）。
+
 ## [v0.9.0] - 2026-09-25
 
 > 主题：**Web 操作端 / Board 主入口**（单需求 `REQ-v0.9.0-2026-09-23-01`；改造文档 final v11）。**新建第四个单元 `board/`（端口 3400）架在 orch agent 前面** —— 人只通过板做事（提需求 / 触发·对话 / 澄清回答 / 人工确认 / 看进展），板为每个需求拉起并驱动一个宿主 agent，人不直接接触 agent。**板不写引擎状态机**（唯一状态机写 = 建需求那一次 `a2a_feature_create`；approve/advance/cancel 机制上归 agent，回归用例钉住 `src/**` 零引用）。**真机端到端走通**：用户板上首条需求（提需求 → 触发 → 澄清 → 回答 → 改造文档落盘 → 确认 → `approve` 放行 → 盘点合流 → 评审 → `completed`）全程无宿主介入。

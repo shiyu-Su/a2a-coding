@@ -54,6 +54,7 @@ npm run restart        # stop + start
 - **`group`（板级默认组织 · 可选默认，BD11 由「必填配置」降级）**：仅当**表单留空**时作为兜底；**未配置不是错误**——板照常起、`GET /host` 与读面不受牵连，只是表单的组织名变成必填。**空串 / 纯空白一律按未配置算**。**绝不猜、绝不回落任何兜底组名**（静默猜组名会把需求建到别的组里去）。
 - **`orgsDir`（组织目录根 · BD8 · §3.8 裁定 9 · BD15 两层分职）**：**配置文件里同样无兜底缺省**：留空 / 缺键 ⇒ **宿主面不装配**：板不去 spawn 任何后端进程，`GET /host` 如实显示「宿主面未装配」，宿主写端点返回结构化 503 `host_face_disabled`。**根 = 部署面配置，必须预先存在**（不存在 / 不是目录 ⇒ 启动期明确 warn + 触发期结构化 503 `board_orgs_dir_missing`，配错必须可见，**板刻意不代建根**）；**`<orgsDir>/<组织名>` = 数据，缺失时由板自动创建**（BD15：触发一轮时代建该组织子目录，用户不必先回终端 `mkdir`；已有目录不碰；建不出来才报 `org_workspace_missing`，文案含**绝对路径 + 根因**）。
 - **`hostKind`（宿主后端 kind · BD8）**：缺省 `claude`。仅作为**新建桥的缺省 kind**（`kind → 后端命令` 的映射唯一事实源在 machine 侧 `getAdapter()`，板不自拼 argv）。**`machineDist`**：machine 运行时产物目录，缺省按仓根推导 `<仓根>/machine/dist`。**`turnTimeoutMs`**：单轮有界等待毫秒，未配置交下游缺省（10 min）。
+- **`repoRoot`（主仓根 · BD10 读文档面）**：「阶段产出」区双源合并 = **源 A** `<repoRoot>/doc/{version}/` ∪ **源 B** `<orgsDir>/<org>/doc/{version}/`，本键只管源 A 的锚点。缺省 = 板根上一级（由模块位置反推，源码与 dist 运行落同一仓根）。不填 = 用推导缺省；非法类型 ⇒ `[config] repoRoot` fail-fast。⚠ **目录不存在不是错误**：列目录按空清单降级（B3 口径），板不代建、启动期不报错。读取受守卫四件套约束（根内收 / version 白名单 `v\d+\.\d+\.\d+` / 仅 `.md` / 256KiB 上限，超限截断标记），见 `src/docs-read.ts`。
 - **配置缺失的后果（两句同口径，互不牵连）**：
   - **默认组织未配置 ⇒ 什么都不牵连**（BD11：它已从「写面必填」降为「可选默认」，**启动期零硬失败**）。校验点在**请求期**：表单组织名留空 **且** 无板级默认 ⇒ `POST /requirements` 返回 **400 `board_group_required`**（不猜、不回落）；宿主面在桥侧 `ownerGroup` 也为空、且默认组织也未配置时返回结构化 503 `board_org_not_resolved`（**不猜组织名**）；
   - 组织目录根**未配置也不拒起**：宿主面不装配，起桥 / 触发一类的写端点返回结构化 503 `host_face_disabled`。
@@ -73,12 +74,14 @@ npm run restart        # stop + start
 
 开发：`npm run typecheck`（0 错）· `npm test`（纯单测，不依赖桥在跑）· `npm run build`。
 
-## 页面路由（BD3 只读视图 + BD7 / BD8 / BD9 写端点）
+## 页面路由（BD3 只读视图 + BD7 / BD8 / BD9 写端点 + BD11 读文档面）
 
 | 路径 | 方法 | 数据源（桥） | 内容 |
 |---|---|---|---|
 | `/` | GET | `/api/features` | 提需求表单（**含组织名字段** · BD11）+ 需求列表：登记 `stage`+`version`+`approval` + **派生阶段**（`derive.ts` 单点规则）+ 列表自带 `taskCount`（无 N+1）|
-| `/features/:id` | GET | `/api/features/:id` + `:id/trace` | 需求详情 + 任务列表 + **trace 三面**（在等谁 / 位次 / 为什么没跑）+ 宿主轮表单（触发一轮 / 确认指令；**回答框仅在该需求有 `awaiting_answer` 轮时出现**；**该需求已有在飞 / 排队轮 ⇒ 两按钮渲染为 disabled + 原因**，收口轨 14）|
+| `/features/:id` | GET | `/api/features/:id` + `:id/trace` + **本地 `doc/` 清单**（`docs-read.ts`） | 需求详情 + **产出登记**（`decisions` 逐条，含 doc 路径者成可点条目）+ 任务列表 + **trace 三面**（在等谁 / 位次 / 为什么没跑）+ **阶段产出**（双源 `.md` 清单 + 分类 / 来源标注）+ 宿主轮表单（触发一轮 / 确认指令；**回答框仅在该需求有 `awaiting_answer` 轮时出现**；**该需求已有在飞 / 排队轮 ⇒ 两按钮渲染为 disabled + 原因**，收口轨 14）|
+| `/features/:id/docs?file=<name>[&src=A\|B][&mode=render\|raw]` | GET | **本地 `doc/{version}/`**（`docs-read.ts`） | **单文档内容**（BD11 · **BD14 渲染/原文双档**）：版本与归属组织取自桥侧详情（**不接受调用方传版本**）；默认 `text/plain; charset=utf-8` + `no-store` 原文直出（`text/plain` 档不受 `mode` 影响），`Accept: text/html` ⇒ 整页：**缺省 `mode=render`**（markdown 子集渲染 + ```mermaid 围栏走流程图渲染），**`mode=raw`** ⇒ 现行 `<pre>` 转义原文，页头两档互链。守卫 = 四件套（根内收 / version 白名单 / 仅 `.md` / 256KiB 截断），越界或缺失 ⇒ **400 / 404 且响应不携根路径** |
+| `/static/<名>` | GET | **本地 vendored 资产**（`src/web/static/`，白名单闭集 `docs-render.VENDORED_ASSETS`） | **BD14 · 第三方静态资产端点**（当前唯一 = `mermaid.min.js`）：文件名精确匹配白名单，白名单外 / 越界段 / 缺文件 ⇒ **404**（不列目录、不越界读）；非 GET ⇒ 405。响应带同源 CSP（`script-src 'self'` 放行加载） |
 | `/tasks[?project=]` | GET | `/api/tasks`（`project` 桥侧必填） | 任务视图（无参 = 选单页）|
 | `/projects` | GET | `/api/projects` | 项目 / 机器 / Runner 快照（快照语义标注）|
 | `/host` | GET | （不触桥；本板进程宿主面） | 宿主桥状态页：五态 + 结构化错误 + 轮队列（BD8）|
@@ -90,6 +93,35 @@ npm run restart        # stop + start
 | `/shutdown` | **POST** | （不触桥；本板进程） | **运维路径**：优雅停机 —— 先停宿主桥 → 关卡口 → 删 pidfile；**仅 loopback 来源**（否则 403 `loopback_only`），**200 = 受理 ≠ 已停**（BD13″）|
 
 **方法门是白名单，不是一刀切**：读面仅 GET，写面只放开上表五条业务 POST（`write-guard.isWriteRoute`，清单单点 = `WRITE_ROUTES`）；其余任何路径 × 任何非 GET 方法一律 405，未知路径 404。**`POST /shutdown` 不在这条业务白名单里** —— 它是同服务上单独登记的**运维路径**（不经 CSRF 守卫头，改以「socket 远端地址必须 loopback」把关，非 loopback 一律 403）。板**不写状态机** —— 无 approve / advance / cancel 任何路径：确认与回答都只是**给宿主 agent 的一轮消息**，状态机推进归编排 agent（`src/**` 对三个状态推进工具名的引用数 = 0，由 `test/requirement.test.mjs` 纪律扫描钉死）。
+
+**读文档面（BD11 · 唯一的本地读面扩权）**：`/features/:id` 的「阶段产出」「产出登记」两区与 `/features/:id/docs` 让板**第一次读本地文件**。它是**纯读**（不写文件、不改 `orgsDir`，恒 GET ⇒ 不过 CSRF，与其余读面同口径），且参数只能落到 `doc/{version}/*.md` 子树：版本段白名单 `v\d+\.\d+\.\d+`、文件名段卫生 + `.md` 闭集、resolve 后根内收核验（Windows 大小写不敏感）、256KiB 读上限（超限截断提示）。任一不过 ⇒ 结构化降级（区块显示「无」/ 400 / 404），**降级不报错、响应不携根路径**。`decisions` 里提取到的路径**只作展示**，打开仍走上述守卫。
+
+### 文档渲染与 vendored 静态资产（BD14 · REQ-v0.9.1-2026-09-25-04 增补）
+
+文档页（`Accept: text/html`）由「原文直出」升级为「渲染 / 原文双档」，渲染缺省。三块：
+
+- **markdown 子集渲染器**（`src/docs-render.ts`，板侧纯函数，零 HTTP）：**escape-first** —— 输入先**整体 HTML 转义**，再按白名单语法加格式（标题 / 有序·无序列表 / 粗体·斜体 / 行内码 / 围栏代码块 / 表格 / 引用 / 链接）。**链接 href 只放行 `http`/`https`/站内相对路径/锚点**，`javascript:` / `data:` / 协议相对 `//host` 等**整串降级为纯文本**。未识别语法（HTML 内联块、脚注、任务列表……）转义后按段落原样呈现 —— **产出中的任何标签字面量都出自白名单模板**，这是可核对的安全不变量（`test/bd14-markdown-render.test.mjs` 用「产出标签集合 ⊆ 白名单」的负例钉死）。
+- **mermaid 流程图**：```mermaid 围栏 ⇒ 占位 `<div class="mermaid-block">` + 源文本经 **`<script type="application/json">` 安全通道**注入（JSON 串里 `<`/`>` 落 `\u003c`/`\u003e`，**绝不拼进 HTML**），页面脚本读 `textContent → JSON.parse → mermaid.render`，配置 **`securityLevel:'strict'`**。渲染失败 / 无 JS ⇒ 保留源文本 `<pre>`（降级可见，不整页崩）。非 mermaid 围栏照常 `<pre><code>`。
+- **双档切换**：页头「渲染视图 / 原文视图」互链（`mode=render|raw`，`src` 随链保留）；`raw` 档 = 现行 `<pre>` 转义原文**逐字节原样保留**；`text/plain` 档不受 `mode` 影响（恒原文）。
+
+**vendored 静态资产（板首个第三方静态资产）**：
+
+| 项 | 值 |
+|---|---|
+| 文件 | `src/web/static/mermaid.min.js`（**入库**，tsc 不拷非 ts 文件 ⇒ `defaultStaticRoot` 从 `dist/` 回落 `src/`）|
+| 上游版本 | **mermaid `11.17.2`**（钉死；常量单点 = `docs-render.ts` 的 `MERMAID_ASSET.upstreamVersion`）|
+| 取法 | `npm pack mermaid@11.17.2` → 取包内 `dist/mermaid.min.js` → 整文件放入上表路径（**不引 CDN、不进 `package.json` 依赖**：板运行期零第三方 npm 依赖，资产是仓库内的静态字节）|
+| 端点 | `GET /static/mermaid.min.js`，文件名 = `VENDORED_ASSETS` 白名单闭集；白名单外 / 越界 / 缺文件 ⇒ 404 |
+| CSP | 经 `script-src 'self'` 放行（同源；见上节 BD14 明示放宽）|
+
+**升级纪律**（换 mermaid 版本时）：
+
+1. `npm pack mermaid@<新 11.x 稳定版>`，取 `dist/mermaid.min.js` **整文件覆盖** `src/web/static/mermaid.min.js`（不得手改压缩包内容）；
+2. 同步更新 `docs-render.ts` 的 `MERMAID_ASSET.upstreamVersion`（版本钉单点）；
+3. 核对 `mermaidRenderScript` 用的 API（`initialize` / `render` / `securityLevel:'strict'`）在新版仍成立；
+4. 跑 `npm test`（`bd14-*` 断言占位与 JSON 安全注入，离线即绿，不实际断言 SVG 形状）。
+
+> **离线自测口径**：单测与 HTTP 档均只断言「占位 div + 源文本经 JSON 安全通道注入 + 同源 `<script src>` + CSP 放宽」，**不在 CI 里执行真实 mermaid 渲染 / 不比对 SVG 输出**（无浏览器环境）。真机浏览器渲染验证归 Step 3 用户测试。
 
 ### 写端点 `POST /requirements`（BD7）
 
@@ -105,7 +137,9 @@ npm run restart        # stop + start
   两档皆不成立 ⇒ 403，**两个码可分辨**（`write_guard_origin_unknown` = Origin 与 Referer 皆不可用，文案给出可操作的三条补救：板上表单 / API 带 `X-Board-Write` 头 / 浏览器白名单；`write_guard_origin` = **有名 Origin 且不同源**，明确跨站，**恒拒不放宽**）。CSRF 判定**先于**读请求体与板配置检查，未认证请求既不消耗 body 也不泄露「组配了没」。
 - **`Referrer-Policy` = `same-origin`（BD17 · 兜底信号的前提）**：板**同时**以响应头 `Referrer-Policy: same-origin` 与页面内 `<meta name="referrer" content="same-origin">` 给出（同值单点 = `web/layout.ts` 的 `BOARD_REFERRER_POLICY`）。**不得回退成 `no-referrer`** —— 那会让浏览器连**同源表单提交都不发 `Referer`**，而 `Origin` 在隐私扩展 / sandboxed iframe 下可能就是字面 `null`，两档来源信号同时归零 ⇒ 板把自己的「页面上提交需求」这条路掐死（收口轨 11 修的是判定，轨 12 修的是信号源）。`same-origin` **不削弱 CSRF**：跨站请求本来就发不出可冒充同源的 `Referer`，第一档自定义头同样发不出。
 - **为什么不是「只认自定义头」**：HTML 表单**不能**携带自定义请求头（规范限制），而列表页要求同源、无构建、**不依赖 JS**（收口轨 14 加的那段内联守卫只是体验层，脚本被禁用 / 失效时表单档必须照样能提交）。故采用上面的 (2) 档：**表单走同源 Origin 校验，自定义头留给 API 调用方**。
-- **对 CSP 的影响（收口轨 14 · 一处**最小**放宽，明示）**：写表单提交后是整页跳转 + 服务端同步等（触发一轮可跑数分钟），期间零反馈 ⇒ 用户连点。页面因此新增**一段同源内联脚本**（提交守卫，单点常量 = `web/layout.ts` 的 `SUBMIT_GUARD_SCRIPT`，**逐字节同一份、每页注入一次、不含用户数据 ⇒ 无注入面**），CSP 相应从 `default-src 'none'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'self'` 变为 **`… ; script-src 'unsafe-inline'; …`** —— **只放开 `'unsafe-inline'` 一档**（与既有 `style-src` 同款内联程度），**不引入任何外源**（无 `http(s)://`、无 `*`，`default-src 'none'` / `base-uri 'none'` / `form-action 'self'` 三条一律不动）。守卫**只是体验层**：禁用本表单的提交按钮 + 就地显示「已提交…」，整页跳转后自然复位；**无 JS / 脚本失效时表单照常提交**，CSRF 两档判定也**不依赖它**（同源表单照旧走 Origin/Referer 档），服务端防重另有 `board_turn_busy` 409 硬闸。
+- **对 CSP 的影响（收口轨 14 + BD14 · 两处**明示**放宽）**：
+  - **轨 14（第一次）**：写表单提交后是整页跳转 + 服务端同步等（触发一轮可跑数分钟），期间零反馈 ⇒ 用户连点。页面因此新增**一段同源内联脚本**（提交守卫，单点常量 = `web/layout.ts` 的 `SUBMIT_GUARD_SCRIPT`，**逐字节同一份、每页注入一次、不含用户数据 ⇒ 无注入面**），CSP 相应新增 `script-src 'unsafe-inline'`（与既有 `style-src` 同款内联程度）。守卫**只是体验层**：禁用本表单的提交按钮 + 就地显示「已提交…」，整页跳转后自然复位；**无 JS / 脚本失效时表单照常提交**，CSRF 两档判定也**不依赖它**，服务端防重另有 `board_turn_busy` 409 硬闸。
+  - **BD14（第二次 · 板 CSP 首次从「无外源脚本」放宽到「可加载同源脚本」）**：文档页渲染 ```mermaid 流程图需加载**同源 vendored 资产**（`/static/mermaid.min.js`），故 `script-src` 追加 **`'self'`**：最终 = **`script-src 'unsafe-inline' 'self'`**。放宽面**仅此一条**：`'self'` = **同源**（板恒绑 loopback，无外网主机可被加载），仍 **无任何外源主机 / 无 `*`**；`default-src 'none'` / `style-src 'unsafe-inline'` / `base-uri 'none'` / `form-action 'self'` **四条一律不动**。文档内容**不进 `<script>` 字面量**——mermaid 源文本经 `<script type="application/json">` 安全通道注入（页面脚本 `textContent → JSON.parse` 取回，不拼 HTML），且 mermaid 以 `securityLevel:'strict'` 初始化（详见下节）。
 
 ### 写端点 `confirm` / `answer`（BD9 · 人工确认入口 + 澄清回答入口）
 
@@ -142,7 +176,7 @@ npm run restart        # stop + start
 | 方法 | 路径 | 用途 |
 |---|---|---|
 | `getFeatures()` | `GET /api/features` | Feature 列表（含登记三字段容错解析 + 各项 `stateCounts` 本地累加为全局分布） |
-| `getFeature(id)` | `GET /api/features/:id` | 单 Feature 详情 + 任务摘要 |
+| `getFeature(id)` | `GET /api/features/:id` | 单 Feature 详情 + 任务摘要（v0.9.1 BD11 起解析 `decisions` / `contracts`，缺失容错 `null`）|
 | `getFeatureTrace(id)` | `GET /api/features/:id/trace` | 进展三面：`waitReason` / `position` / `waitedSince` / `projectBusy` / `readOccupants[]` |
 | `getProjects()` | `GET /api/projects` | 项目 / 机器 / Runner 快照 |
 | `getTasks(project, opts?)` | `GET /api/tasks?project=…` | 单项目任务列表（`project` 桥侧必填） |

@@ -68,12 +68,14 @@ test("BD17-③（负向锚）CSP 不含 referrer 指令 —— 含则它会盖�
 
 // --- 收口轨 14 ①：提交守卫（内联脚本）与 CSP 的**最小**放宽 ----------------
 
-test("轨14-CSP：script-src 只放开一档 'unsafe-inline'（与 style-src 同款内联程度），不引入任何外源", () => {
+test("轨14+BD14-CSP：script-src 放开 'unsafe-inline' + 'self'（vendored 同源资产），不引入任何外源主机", () => {
   const dir = /(^|;)\s*script-src([^;]*)/.exec(BOARD_CSP)?.[2]?.trim() ?? null;
-  assert.equal(dir, "'unsafe-inline'", "放宽只到既有页面同款内联程度");
+  assert.ok(dir !== null);
+  // BD14 明示放宽：'self' 只放行同源（板恒绑 loopback）的 /static/ vendored 资产；一档一义，不多放
+  assert.deepEqual(dir.split(/\s+/).sort(), ["'self'", "'unsafe-inline'"]);
   assert.doesNotMatch(BOARD_CSP, /https?:\/\//, "CSP 里不得出现任何主机名/URL");
   assert.doesNotMatch(BOARD_CSP, /\*/);
-  // 其余硬指令不因本轨松动
+  // 其余硬指令不因这两轨松动
   assert.match(BOARD_CSP, /default-src 'none'/);
   assert.match(BOARD_CSP, /base-uri 'none'/);
   assert.match(BOARD_CSP, /form-action 'self'/);

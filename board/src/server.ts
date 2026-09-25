@@ -4,7 +4,17 @@
  * 路由：
  * - `GET /health`          —— 板自身健康（保留 BD1 行为）；
  * - `GET /`                —— 需求列表（桥 `/api/features`）+ 提需求表单；
- * - `GET /features/:id`    —— 需求详情 + 任务 + trace 三面 + 「触发一轮」；
+ * - `GET /features/:id`    —— 需求详情 + 任务 + trace 三面 + 「触发一轮」+「阶段产出」/「产出登记」（BD11）；
+ * - `GET /features/:id/docs?file=<name>[&src=A|B][&mode=render|raw]` —— **单文档内容**（BD11 读文档面）：
+ *   `text/plain` 原文直出，
+ *   浏览器 `Accept: text/html` ⇒ 整页；**BD14 双档**：缺省 `render`（markdown 子集渲染 + mermaid 占位），
+ *   `mode=raw` ⇒ 现行 `<pre>` 原文视图原样保留；版本 / 归属取自桥侧详情（不接受调用方传版本），
+ *   守卫全在 `docs-read.ts`（四件套），失败 404 / 400 **不泄根路径**；
+ *   **BD13 补源 B**：`src` 未指定（缺省源 A）且源 A 未命中 ⇒ 自动回落源 B（回落同样逐守卫过一遍，
+ *   命中即停；两源同名 ⇒ 源 A 优先，实际来源经响应头 `X-Docs-Source` 与页面标注透出，不歧义）；
+ * - `GET /static/<名>`      —— **vendored 静态资产**（BD14，mermaid.min.js）：文件名 = 白名单闭集
+ *   （`docs-render.VENDORED_ASSETS`），白名单外 / 缺文件 ⇒ 404，不做目录遍历；同源脚本加载经
+ *   CSP `script-src 'self'` 放行（板 CSP 首次放宽，理由见 layout.ts 注释）；
  * - `GET /tasks[?project=]`—— 任务视图（桥 `/api/tasks`，project 必填；缺省为选单页）；
  * - `GET /projects`        —— 项目 / 机器视图（桥 `/api/projects`）；
  * - `GET /host`            —— **宿主桥状态页**（本板进程托管的桥：五态 + 结构化错误 + 轮队列）；
@@ -27,11 +37,18 @@
  * `config.json` 的 `group` 只是**可选默认**（表单未填才生效，BD12″ 起无 argv/env 通道）。两者皆空 ⇒
  * **请求期**结构化 400 `board_group_required`（**启动期不报错、不猜、不回落兜底组名**）。
  *
- * 读面对桥只发起 GET（经 `bridge-client`）；不推事件游标、不写配置。
+ * 读面对桥只发起 GET（经 `bridge-client`）；不推事件游标、不写配置。**BD11 起读面另有一条本地读路径**
+ * （`/features/:id/docs` → `docs-read.ts`，纯读、守卫四件套、失败不泄根）。
  * 桥不可达 ⇒ 页面如实显示读取失败（502），**不得静默**。
  * 宿主桥故障（起不来 / 连不上 / 中途消失）⇒ 状态页与触发响应一律显示「宿主桥已断」+ 结构化错误码。
+ *
+ * **错误呈现（REQ-v0.9.1-2026-09-25-03 弹窗化）**：结构化错误出口按 `wantsJson` 分流 ——
+ * `Accept: application/json` ⇒ JSON 形状 `{ok:false,code,error}` 逐字节不变；表单档（浏览器提交）⇒
+ * 同状态码渲染整页 + 错误浮层（`errorPage`：族名标题中文映射 + error 正文 + mono 错误码 +「知道了」）。
+ * `/shutdown`（运维口，板 UI 无表单）与既有 HTML 出口（宿主轮结果页 / 停桥提示 / 桥宕整页）不在分流范围。
  */
 import { createServer, type Server, type IncomingMessage, type ServerResponse } from "node:http";
+import { readFileSync } from "node:fs";
 import {
   createBridgeClient,
   type BridgeClient,
@@ -53,10 +70,14 @@ import {
   MAX_REQUIREMENT_BODY_BYTES,
 } from "./write-guard.js";
 import { readVersion } from "./version.js";
+import { defaultRepoRoot, listDocs, readDoc, type DocsSource } from "./docs-read.js";
+import { defaultStaticRoot, findVendoredAsset, VENDORED_ASSETS } from "./docs-render.js";
+import type { FeatureDocsView } from "./web/views.js";
 import { timestampPrefix } from "./log.js";
-import { BOARD_CSP, BOARD_REFERRER_POLICY, escapeHtml, renderPage, type NavKey } from "./web/layout.js";
+import { BOARD_CSP, BOARD_REFERRER_POLICY, escapeHtml, renderPage, type ErrorOverlayParams, type NavKey } from "./web/layout.js";
 import {
   VIEW_NOTES,
+  errorFamilyLabel,
   renderAnswerForm,
   renderConfirmForm,
   renderFeaturesList,
@@ -65,6 +86,7 @@ import {
   renderHostPage,
   renderNextStepGuide,
   renderProjects,
+  renderDocPage,
   renderRequirementForm,
   renderTasks,
   renderTasksPick,
@@ -113,6 +135,17 @@ export interface CreateBoardServerOptions {
    * `shutdown_unsupported`（服务未接停机链，不假装受理）。
    */
   onShutdown?: () => void;
+  /**
+   * **读文档面根**（BD11 · REQ-v0.9.1-2026-09-25-04）：`repoRoot` = 主仓根（源 A），
+   * `orgsDir` = 组织目录根（源 B，`<orgsDir>/<org>/doc/`；未配置 ⇒ `null` ⇒ 只剩源 A）。
+   * 缺省 = 按模块位置推导的板根上一级 + 无 orgsDir（目录不存在时按空清单降级，不报错）。
+   */
+  docs?: { repoRoot: string; orgsDir: string | null };
+  /**
+   * **vendored 静态资产目录**（BD14）：`GET /static/<名>` 的文件名闭集见 `docs-render.VENDORED_ASSETS`。
+   * 缺省 = 模块旁 `src/web/static/`（仅服务白名单文件，不做目录遍历）。
+   */
+  staticRoot?: string;
 }
 
 /** 仅接受 loopback（127.0.0.1 / ::1 / localhost）；否则抛错，拒绝绑定非本机地址 */
@@ -183,6 +216,18 @@ function respondHtml(res: ServerResponse, status: number, html: string): void {
   res.end(html);
 }
 
+/**
+ * 单文档内容出口（BD11）：`text/plain; charset=utf-8` + `no-store`（头口径同 {@link respondJson}）。
+ * 原文直出（不做 markdown 渲染 = B4），CSP 不适用（非 HTML）；`escapeHtml` 由视图层负责整页包装。
+ */
+function respondText(res: ServerResponse, status: number, text: string): void {
+  res.writeHead(status, {
+    "content-type": "text/plain; charset=utf-8",
+    "cache-control": "no-store",
+  });
+  res.end(text);
+}
+
 interface PageCtx {
   client: BridgeClient;
   now: () => number;
@@ -199,6 +244,8 @@ interface Ctx extends PageCtx {
   host: BoardHostFace | null;
   /** BD13″ 优雅停机回调（`null` ⇒ 未接停机链，`POST /shutdown` 返回 501）。 */
   shutdown: (() => void) | null;
+  /** BD11 读文档面根（源 A / 可选源 B）；BD14 增 vendored 静态资产根。 */
+  docs: { repoRoot: string; orgsDir: string | null; staticRoot: string };
 }
 
 interface Page {
@@ -206,6 +253,10 @@ interface Page {
   active: NavKey;
   bodyHtml: string;
   status?: number;
+  /** 表单档错误浮层（errorPage 专用；renderPage 内逐字段转义）。 */
+  errorOverlay?: ErrorOverlayParams;
+  /** BD14：页面级追加脚本（仅白名单字面量，如 mermaid 资产引用 + 渲染脚本；不承载文档内容）。 */
+  extraScripts?: string;
 }
 
 function sendPage(res: ServerResponse, page: Page): void {
@@ -215,14 +266,51 @@ function sendPage(res: ServerResponse, page: Page): void {
     renderPage({
       title: page.title,
       active: page.active,
-      bodyHtml: page.bodyHtml,
+      bodyHtml: page.bodyHtml + (page.extraScripts ?? ""),
       notes: VIEW_NOTES,
+      errorOverlay: page.errorOverlay,
     }),
   );
 }
 
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+function wantsJson(accept: string | undefined): boolean {
+  return (accept ?? "").includes("application/json");
+}
+
+/**
+ * 表单档错误页（REQ-v0.9.1-2026-09-25-03）：整页 = 正常页 + errorOverlay 浮层（族名标题 / error 正文 / mono code）。
+ * 只服务 **!wantsJson** 分流；JSON 档仍走 {@link respondJson}，形状逐字节不变。
+ */
+function errorPage(status: number, code: string, error: string, hint?: string): Page {
+  return {
+    title: "操作未成功",
+    active: "features",
+    status,
+    bodyHtml:
+      `<h2>操作未成功（${status}）</h2>` +
+      `<p class="hint">错误浮层已给出原因；关闭浮层后刷新或回到上方导航重试。</p>`,
+    errorOverlay: { family: errorFamilyLabel(code), error, code, hint },
+  };
+}
+
+/** 结构化错误的统一应答出口：JSON 档逐字节不变，表单档（!wantsJson）改走 {@link errorPage}。 */
+function respondError(
+  res: ServerResponse,
+  accept: string | undefined,
+  status: number,
+  code: string,
+  error: string,
+  hint?: string,
+): void {
+  if (wantsJson(accept)) {
+    respondJson(res, status, { ok: false, code, error });
+    return;
+  }
+  sendPage(res, errorPage(status, code, error, hint));
 }
 
 function bridgeDownPage(hint: string, err: unknown): Page {
@@ -244,6 +332,25 @@ async function pageFeatures(ctx: Ctx): Promise<Page> {
     active: "features",
     bodyHtml: renderRequirementForm(ctx.write.defaultGroup) + renderFeaturesList(view),
   };
+}
+
+/**
+ * 「阶段产出」清单（BD11 a 案）：双源合并列 `doc/{version}/`。
+ * version 缺失 / 不合白名单 ⇒ docs-read 返回空清单 ⇒ 区块如实显示「无」（不报错，B3）；
+ * 盘查不动等异常 ⇒ 只出可见错误文案（不静默、不泄根）。
+ */
+function loadDocsView(ctx: Ctx, version: string | null, org: string | null): FeatureDocsView {
+  try {
+    return {
+      entries: listDocs(
+        { repoRoot: ctx.docs.repoRoot, orgsDir: ctx.docs.orgsDir, org },
+        version ?? "",
+      ),
+      error: null,
+    };
+  } catch (err) {
+    return { entries: [], error: errText(err) };
+  }
 }
 
 async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
@@ -276,11 +383,78 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
     state: f.state,
   });
   const answerForm = awaiting === null ? "" : renderAnswerForm(f.featureId, awaiting.question);
+  const docs = loadDocsView(ctx, f.version, f.ownerGroup);
   return {
     title: `需求 ${featureId.slice(0, 8)}`,
     active: "features",
-    bodyHtml: renderFeatureDetail(detail, trace, traceError, ctx.now()) + nextStep + hostForms + answerForm,
+    bodyHtml: renderFeatureDetail(detail, trace, traceError, ctx.now(), docs) + nextStep + hostForms + answerForm,
   };
+}
+
+/**
+ * `GET /features/:id/docs?file=<name>[&src=A|B]`（BD11 a 案 HTTP 面）：
+ * 版本与归属组织从桥侧详情取（**不接受调用方传 version** ⇒ 无从绕开白名单），
+ * 落盘读取全权交 docs-read 的四件套守卫。读面恒 GET、不过 CSRF（既有口径）。
+ *
+ * 两档呈现（同 `wantsJson` 分流先例）：`Accept: text/html`（浏览器点开）⇒ 整页；
+ * 其余 ⇒ `text/plain; charset=utf-8`（原文，头口径同 `respondJson`）。失败一律纯文本 404 / 400
+ * （docs-read 的文案不携带根路径 = B3「不泄根」）。
+ *
+ * **BD14 渲染/原文双档**（仅 html 档内再分流）：`mode=render`（缺省）⇒ markdown 子集渲染 +
+ * mermaid 占位；`mode=raw` ⇒ 现行 `<pre>` 原文视图**原样保留**；`text/plain` 档不受 mode 影响。
+ *
+ * **BD13 补源 B（b 案·服务端回落）**：`src` 显式指定 ⇒ 只查该源（现状不变）；`src` 缺省 ⇒ 先查源 A，
+ * `not_found` 时回落源 B —— 回落是**换参重走 readDoc**，四件套守卫逐源各自过一遍（只加通路不开口子）。
+ * 实际来源经响应头 `X-Docs-Source: A|B` 透出，html 档另在页头标注 —— 两源同名时源 A 优先、不歧义。
+ */
+async function handleFeatureDoc(
+  ctx: Ctx,
+  res: ServerResponse,
+  req: IncomingMessage,
+  featureId: string,
+  params: URLSearchParams,
+): Promise<void> {
+  const file = params.get("file") ?? "";
+  const srcParam = params.get("src");
+  const srcExplicit = srcParam === "A" || srcParam === "B";
+  let version: string | null;
+  let org: string | null;
+  try {
+    const detail = await ctx.client.getFeature(featureId);
+    version = detail.feature.version;
+    org = detail.feature.ownerGroup;
+  } catch (err) {
+    respondText(res, 502, `需求数据读取失败，无法定位文档：${errText(err)}`);
+    return;
+  }
+  const dirs = { repoRoot: ctx.docs.repoRoot, orgsDir: ctx.docs.orgsDir, org };
+  const read = (source: DocsSource) => readDoc(dirs, source, version ?? "", file);
+  let src: DocsSource = srcExplicit ? (srcParam as DocsSource) : "A";
+  let result = read(src);
+  if (!srcExplicit && !result.ok && result.code === "docs_read_not_found") {
+    const fallback = read("B");
+    if (fallback.ok) {
+      src = "B";
+      result = fallback;
+    }
+  }
+  res.setHeader("X-Docs-Source", src);
+  if (!result.ok) {
+    respondText(res, result.code === "docs_read_not_found" ? 404 : 400, result.error);
+    return;
+  }
+  if ((req.headers.accept ?? "").includes("text/html")) {
+    const mode = params.get("mode") === "raw" ? "raw" : "render";
+    const view = renderDocPage(featureId, file, src, result.content, result.truncated, mode, ctx.docs.staticRoot);
+    sendPage(res, {
+      title: `文档 ${file}`,
+      active: "features",
+      bodyHtml: view.bodyHtml,
+      extraScripts: view.extraScripts,
+    });
+    return;
+  }
+  respondText(res, 200, result.truncated ? `${result.content}\n\n…（超过读取上限，已截断）` : result.content);
 }
 
 /** 宿主桥状态页（BD8）：本板进程的桥事实 + 轮队列；**不触桥**（宿主面故障与编排桥故障分开显示）。 */
@@ -343,6 +517,11 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
     },
     host: options.hostFace ?? null,
     shutdown: options.onShutdown ?? null,
+    docs: {
+      repoRoot: options.docs?.repoRoot ?? defaultRepoRoot(),
+      orgsDir: options.docs?.orgsDir ?? null,
+      staticRoot: options.staticRoot ?? defaultStaticRoot(),
+    },
   };
   const server: Server = createServer((req, res) => {
     void handle(req, res, server, ctx).catch((err: unknown) => {
@@ -350,7 +529,7 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
         res.end();
         return;
       }
-      respondJson(res, 500, { ok: false, code: "internal_error", error: errText(err) });
+      respondError(res, req.headers.accept, 500, "internal_error", errText(err));
     });
   });
   return new Promise<BoardServerHandle>((resolve, reject) => {
@@ -368,22 +547,50 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
 }
 
 const TRACE_SUFFIX = "/trace";
+/** 单文档子路径（BD11）：`GET /features/:id/docs?file=<name>`。 */
+const DOCS_SUFFIX = "/docs";
+
+/** `/static/` 名字段解码（异常编码 ⇒ null，不抛）。 */
+function decodeURIComponentSafe(value: string): string | null {
+  try {
+    return decodeURIComponent(value);
+  } catch {
+    return null;
+  }
+}
+
+/** `/static/` 段卫生（BD14）：单段、无分隔符 / 点段 / 冒号 / 百分号（白名单精确匹配前的第一道）。 */
+function isSafeStaticName(name: string): boolean {
+  return (
+    name !== "" &&
+    !name.includes("/") &&
+    !name.includes("\\") &&
+    !name.includes(":") &&
+    !name.includes("%") &&
+    !name.includes("..")
+  );
+}
 
 /** 宿主面未装配（板进程未接 BD4a / BD4b）时的统一码与文案。 */
 const HOST_FACE_DISABLED_CODE = "host_face_disabled";
 const HOST_FACE_DISABLED_DISPLAY =
   "宿主面未装配：本板进程未接上「组织目录根」（config.json 的 orgsDir 未配置，无缺省值）⇒ 不起桥、不触发一轮";
 
-function matchPage(pathname: string): { kind: "feature"; id: string } | { kind: NavKey } | null {
+type PageRoute = { kind: "feature" | "feature-docs"; id: string } | { kind: NavKey } | null;
+
+function matchPage(pathname: string): PageRoute {
   if (pathname === "/") return { kind: "features" };
   if (pathname === "/tasks") return { kind: "tasks" };
   if (pathname === "/projects") return { kind: "projects" };
   if (pathname === "/host") return { kind: "host" };
   if (pathname.startsWith("/features/")) {
     const raw = pathname.slice("/features/".length);
-    if (raw.length > 0 && !raw.includes("/") && !raw.endsWith(TRACE_SUFFIX)) {
+    const isDocs = raw.endsWith(DOCS_SUFFIX);
+    const idPart = isDocs ? raw.slice(0, -DOCS_SUFFIX.length) : raw;
+    if (idPart.length > 0 && !idPart.includes("/") && !idPart.endsWith(TRACE_SUFFIX)) {
       try {
-        return { kind: "feature", id: decodeURIComponent(raw) };
+        const id = decodeURIComponent(idPart);
+        return isDocs ? { kind: "feature-docs", id } : { kind: "feature", id };
       } catch {
         return null;
       }
@@ -402,7 +609,7 @@ async function handle(
   try {
     url = new URL(req.url ?? "/", "http://board.invalid");
   } catch {
-    respondJson(res, 400, { ok: false, code: "bad_url", error: "无法解析请求 URL" });
+    respondError(res, req.headers.accept, 400, "bad_url", "无法解析请求 URL");
     return;
   }
   if (url.pathname === "/health" && req.method === "GET") {
@@ -449,21 +656,56 @@ async function handle(
     return;
   }
   const route = matchPage(url.pathname);
+  /**
+   * BD14 `/static/<名>`：vendored 资产端点（读面，恒 GET）。文件名 = `VENDORED_ASSETS` 白名单闭集
+   * （`findVendoredAsset` 精确匹配，路径段卫生在拼接前完成）；缺文件 ⇒ 404，不列目录。
+   * 响应带同源 CSP（页面以 `<script src>` 加载须 `script-src 'self'` 放行，见 layout.ts 放宽说明）。
+   */
+  if (url.pathname.startsWith("/static/")) {
+    if (req.method !== "GET") {
+      respondError(res, req.headers.accept, 405, "method_not_allowed", "/static 仅支持 GET");
+      return;
+    }
+    const name = decodeURIComponentSafe(url.pathname.slice("/static/".length));
+    const found = name !== null && isSafeStaticName(name) ? findVendoredAsset(ctx.docs.staticRoot, name) : null;
+    if (found === null) {
+      respondError(res, req.headers.accept, 404, "not_found", "静态资产不在白名单");
+      return;
+    }
+    let buf: Buffer;
+    try {
+      buf = readFileSync(found.absPath);
+    } catch {
+      respondError(res, req.headers.accept, 404, "not_found", "静态资产文件缺失（见 README vendored 资产节）");
+      return;
+    }
+    res.writeHead(200, {
+      "content-type": found.asset.contentType,
+      "cache-control": "no-store",
+      "content-security-policy": BOARD_CSP,
+    });
+    res.end(buf);
+    return;
+  }
   if (route === null) {
-    respondJson(res, 404, { ok: false, code: "not_found", error: `未知路径 ${url.pathname}` });
+    respondError(res, req.headers.accept, 404, "not_found", `未知路径 ${url.pathname}`);
     return;
   }
   if (req.method !== "GET") {
-    respondJson(res, 405, {
-      ok: false,
-      code: "method_not_allowed",
-      error: `除已放开的写路径外仅支持 GET（写面 = ${WRITE_ROUTES.join(" · ")}；收到 ${req.method ?? "?"} ${url.pathname}）`,
-    });
+    respondError(
+      res,
+      req.headers.accept,
+      405,
+      "method_not_allowed",
+      `除已放开的写路径外仅支持 GET（写面 = ${WRITE_ROUTES.join(" · ")}；收到 ${req.method ?? "?"} ${url.pathname}）`,
+    );
     return;
   }
   try {
     if (route.kind === "feature") {
       sendPage(res, await pageFeatureDetail(ctx, route.id));
+    } else if (route.kind === "feature-docs") {
+      await handleFeatureDoc(ctx, res, req, route.id, url.searchParams);
     } else if (route.kind === "tasks") {
       sendPage(res, await pageTasks(ctx, url));
     } else if (route.kind === "host") {
@@ -516,7 +758,7 @@ async function handleWriteRequirement(req: IncomingMessage, res: ServerResponse,
   // ① CSRF 守卫先于一切（未认证请求不消耗 body 读取、也不泄露板配置）
   const auth = checkWriteAuth({ method: req.method, headers, proto: "http" });
   if (!auth.ok) {
-    respondJson(res, 403, { ok: false, code: auth.code, error: auth.error });
+    respondError(res, headers.accept, 403, auth.code, auth.error);
     return;
   }
   // ② 入参校验（空 title/version ⇒ 400；组织名见 `parseRequirementForm`：**表单 > 板级默认**，
@@ -526,12 +768,12 @@ async function handleWriteRequirement(req: IncomingMessage, res: ServerResponse,
     body = await readBodyCapped(req, MAX_REQUIREMENT_BODY_BYTES);
   } catch (err) {
     const code = errText(err) === "payload_too_large" ? "payload_too_large" : "body_read_failed";
-    respondJson(res, code === "payload_too_large" ? 413 : 400, { ok: false, code, error: errText(err) });
+    respondError(res, headers.accept, code === "payload_too_large" ? 413 : 400, code, errText(err));
     return;
   }
   const form = parseRequirementForm(body, Number(headers["content-length"] ?? NaN), ctx.write.defaultGroup);
   if (!form.ok) {
-    respondJson(res, form.status, { ok: false, code: form.code, error: form.error });
+    respondError(res, headers.accept, form.status, form.code, form.error);
     return;
   }
   // ③ 复用唯一写封装（不新写 MCP 调用）；组身份 = 表单组织名（缺省才回落板级默认）
@@ -540,7 +782,7 @@ async function handleWriteRequirement(req: IncomingMessage, res: ServerResponse,
     { group: form.group, baseUrl: ctx.write.mcpBaseUrl },
   );
   if (!outcome.ok) {
-    respondJson(res, 502, { ok: false, code: outcome.code, error: outcome.error });
+    respondError(res, headers.accept, 502, outcome.code, outcome.error);
     return;
   }
   // ④ 回显：浏览器表单 ⇒ 303 跳详情页（PRG，刷新不重复建）；声明 accept: application/json ⇒ 201 JSON
@@ -578,25 +820,21 @@ async function hostWriteGate(
   const headers = lowerHeaders(req);
   const auth = checkWriteAuth({ method: req.method, headers, proto: "http" });
   if (!auth.ok) {
-    respondJson(res, 403, { ok: false, code: auth.code, error: auth.error });
+    respondError(res, headers.accept, 403, auth.code, auth.error);
     return null;
   }
   try {
     const body = await readBodyCapped(req, MAX_REQUIREMENT_BODY_BYTES);
     if (ctx.host === null) {
-      respondJson(res, 503, { ok: false, code: HOST_FACE_DISABLED_CODE, error: HOST_FACE_DISABLED_DISPLAY });
+      respondError(res, headers.accept, 503, HOST_FACE_DISABLED_CODE, HOST_FACE_DISABLED_DISPLAY);
       return null;
     }
     return { face: ctx.host, body };
   } catch (err) {
     const code = errText(err) === "payload_too_large" ? "payload_too_large" : "body_read_failed";
-    respondJson(res, code === "payload_too_large" ? 413 : 400, { ok: false, code, error: errText(err) });
+    respondError(res, headers.accept, code === "payload_too_large" ? 413 : 400, code, errText(err));
     return null;
   }
-}
-
-function wantsJson(accept: string | undefined): boolean {
-  return (accept ?? "").includes("application/json");
 }
 
 /** turn / confirm / answer 共用的应答出口：JSON 档出结构化载荷，HTML 档出结果页（**失败不伪装成 200**）。 */
@@ -679,11 +917,13 @@ async function handleWriteAnswer(
   if (gate === null) return;
   const answer = (new URLSearchParams(gate.body).get("answer") ?? "").trim();
   if (answer === "") {
-    respondJson(res, 400, {
-      ok: false,
-      code: "answer_empty",
-      error: "回答内容为空（不得静默提交；澄清回答必须有内容）",
-    });
+    respondError(
+      res,
+      headers.accept,
+      400,
+      "answer_empty",
+      "回答内容为空（不得静默提交；澄清回答必须有内容）",
+    );
     return;
   }
   // 收口轨 16 ③ 服务端兜底：终态需求 ⇒ 409 `board_feature_terminal`（与 turn / confirm 同一判据；

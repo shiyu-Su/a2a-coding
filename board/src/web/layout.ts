@@ -1,6 +1,7 @@
 /**
  * 板页面模板骨架（BD3）—— 照 `orch/bridge/web/html.ts` 路线：
- * **同源、无构建、无框架、无外部资源**（内联 style、单文件模板字面量）。
+ * **同源、无构建、无框架**（内联 style、单文件模板字面量）。BD14 起文档页另可引用**一条同源
+ * vendored 资产**（`/static/mermaid.min.js`，CSP 放宽见 {@link BOARD_CSP}），仍无任何外源主机。
  * 服务器端渲染；页面脚本 = **零依赖的一段内联提交守卫**（收口轨 14，见 {@link SUBMIT_GUARD_SCRIPT}）；
  * 刷新 = 浏览器重载。
  */
@@ -13,9 +14,15 @@ import { readVersion } from "../version.js";
  * {@link SUBMIT_GUARD_SCRIPT}）—— 原 CSP 无 `script-src` 指令时脚本落 `default-src 'none'` 被全拒，
  * 故新增 `script-src 'unsafe-inline'`：**只放行页面内联脚本，仍无任何外源**（`'unsafe-inline'`
  * 仅作用于本仓服务端自己渲染的字面量，不加载任何 URL；其余指令一概未动）。
+ *
+ * **BD14 的第二次明示放宽**：文档页渲染流程图需加载**同源 vendored 资产**
+ * （`/static/mermaid.min.js`，版本钉与升级纪律见 README「vendored 静态资产」），
+ * 故 `script-src` 追加 `'self'`。放宽面**仅此一条**：`'self'` = 同源（板恒绑 loopback），
+ * 仍无任何外源主机可加载；`default-src 'none'` / `style-src` / `base-uri` / `form-action` 未动，
+ * 文档内容不进 `<script>` 字面量（mermaid 源文本走 `<script type="application/json">` 安全通道）。
  */
 export const BOARD_CSP =
-  "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline'; base-uri 'none'; form-action 'self'";
+  "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'self'; base-uri 'none'; form-action 'self'";
 
 /**
  * 本板文档的 Referer 送出策略（BD17）：**同时**以响应头与 `<meta name=referrer>` 给出（同值单点）。
@@ -87,6 +94,40 @@ export interface PageParams {
   bodyHtml: string;
   /** 页面级口径脚注（B13 / 并行度等，逐条渲染，内部已转义） */
   notes?: readonly string[];
+  /** 错误浮层（REQ 弹窗化 · 表单档错误出口专用；全部字段在本函数内 escapeHtml，调用方传原始值） */
+  errorOverlay?: ErrorOverlayParams;
+}
+
+export interface ErrorOverlayParams {
+  /** 标题 = 错误码中文族名（views.errorFamilyLabel 给出，无命中回退原文 code） */
+  family: string;
+  /** 正文 = 错误文案（原始值，本函数转义） */
+  error: string;
+  /** mono 小字 = 错误码（原始值，本函数转义） */
+  code: string;
+  /** 可选补充行（如「刷新本页重试」），同样转义 */
+  hint?: string;
+}
+
+function renderErrorOverlay(o: ErrorOverlayParams): string {
+  return `<div class="err-ov" id="err-ov" role="alertdialog" aria-modal="true">
+<div class="err-ov-card">
+<h2>${escapeHtml(o.family)}</h2>
+<p>${escapeHtml(o.error)}</p>
+${o.hint === undefined ? "" : `<p class="hint">${escapeHtml(o.hint)}</p>`}
+<p class="err-ov-code mono">${escapeHtml(o.code)}</p>
+<button type="button" id="err-ov-close">知道了</button>
+</div>
+</div>
+<script>
+(function () {
+  var ov = document.getElementById("err-ov");
+  var btn = document.getElementById("err-ov-close");
+  if (ov !== null && btn !== null) {
+    btn.addEventListener("click", function () { ov.parentNode.removeChild(ov); });
+  }
+})();
+</script>`;
 }
 
 export function renderPage(params: PageParams): string {
@@ -98,6 +139,7 @@ export function renderPage(params: PageParams): string {
     params.notes && params.notes.length > 0
       ? `<ul class="notes">${params.notes.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>`
       : "";
+  const overlay = params.errorOverlay === undefined ? "" : renderErrorOverlay(params.errorOverlay);
   return `<!doctype html>
 <html lang="zh-CN">
 <head>
@@ -136,7 +178,26 @@ export function renderPage(params: PageParams): string {
   p.nextstep { border-left: 3px solid #5678; padding: 4px 10px; background: #8881; border-radius: 0 6px 6px 0; }
   textarea { resize: vertical; }
   code { background: #8881; padding: 0 3px; border-radius: 3px; }
+  .md h1 { font-size: 17px; margin: 18px 0 6px; }
+  .md h2 { font-size: 15px; }
+  .md h3 { font-size: 14px; }
+  .md h4, .md h5, .md h6 { font-size: 13px; margin: 16px 0 6px; }
+  .md p { margin: 8px 0; }
+  .md ul, .md ol { margin: 8px 0; padding-left: 22px; }
+  .md li { margin: 2px 0; }
+  .md-t th, .md-t td { font-family: inherit; font-size: 13px; }
+  blockquote.md-q { margin: 8px 0; padding: 4px 10px; border-left: 3px solid #8886; color: #667; background: #8881; border-radius: 0 6px 6px 0; }
+  .md .mermaid-block { margin: 10px 0; overflow-x: auto; }
+  .md .mermaid-block[data-rendered="1"] pre.mermaid-src { display: none; }
+  .md .mermaid-block[data-rendered="1"] .mermaid-svg:empty { display: none; }
+  .md .mermaid-block svg { max-width: 100%; height: auto; }
   a.fl { color: inherit; }
+  .err-ov { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; background: #0006; padding: 16px; }
+  .err-ov-card { max-width: 560px; width: 100%; background: Canvas; border: 1px solid #b4231888; border-radius: 8px; padding: 14px 18px 16px; box-shadow: 0 6px 24px #0004; }
+  .err-ov-card h2 { font-size: 15px; margin: 0 0 8px; border: none; color: #b42318; padding: 0; }
+  .err-ov-card p { margin: 4px 0; white-space: pre-wrap; word-break: break-word; }
+  .err-ov-card .err-ov-code { color: #888; font-size: 11px; }
+  .err-ov-card button { margin-top: 10px; }
 </style>
 </head>
 <body>
@@ -147,6 +208,7 @@ export function renderPage(params: PageParams): string {
 ${params.bodyHtml}
 ${notes}
 </main>
+${overlay}
 ${SUBMIT_GUARD_SCRIPT}
 </body>
 </html>

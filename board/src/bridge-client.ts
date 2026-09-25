@@ -94,6 +94,12 @@ export interface FeatureDetailView {
     stage: string | null;
     version: string | null;
     approval: string | null;
+    /**
+     * Feature Context（BD11 · 阶段产出上板）：桥侧存的是 JSON 字符串（数组归一化属渲染层），
+     * 老桥 / 未登记 ⇒ null。
+     */
+    decisions: string | null;
+    contracts: string | null;
     createdAt: string | null;
     updatedAt: string | null;
   };
@@ -306,6 +312,8 @@ export function parseFeatureDetail(json: unknown): FeatureDetailView {
       stage: str(feature.stage),
       version: str(feature.version),
       approval: str(feature.approval),
+      decisions: str(feature.decisions),
+      contracts: str(feature.contracts),
       createdAt: str(feature.createdAt),
       updatedAt: str(feature.updatedAt),
     },

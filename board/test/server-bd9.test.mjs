@@ -147,7 +147,7 @@ test("BD9-⑤（负向）confirm/answer：无守卫头无来源 ⇒ 403 write_gu
     for (const path of ["/features/F1/confirm", "/features/F1/answer"]) {
       const bare = await req(base, path, { method: "POST", body: "answer=甲" });
       assert.equal(bare.status, 403, `${path} 裸 POST 必须拒`);
-      assert.match(bare.text, /write_guard_origin_unknown/);
+      assert.match(bare.text, /CSRF 来源不可判定/);
 
       const crossSite = await req(base, path, {
         method: "POST",
@@ -155,7 +155,7 @@ test("BD9-⑤（负向）confirm/answer：无守卫头无来源 ⇒ 403 write_gu
         body: "answer=甲",
       });
       assert.equal(crossSite.status, 403, `${path} 跨站 Origin 必须拒`);
-      assert.match(crossSite.text, /"code":"write_guard_origin"/);
+      assert.match(crossSite.text, /CSRF 来源校验拒绝/);
     }
     assert.deepEqual(faceCalls.confirmTurn, [], "被守卫拒的请求不得到达宿主面");
     assert.deepEqual(faceCalls.answerRequirement, []);

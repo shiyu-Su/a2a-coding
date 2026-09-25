@@ -14,7 +14,8 @@
  * `orgsDir` **无缺省**（留空 = 未配置 ⇒ 宿主面不装配，§3.8 裁定 9 严禁回落）·
  * `group` **可选默认**（缺失不报错，BD11 形态：表单 > 默认，皆无 ⇒ 请求期 400）·
  * `hostKind` `claude` · `bridgeUrl` `http://127.0.0.1:3300` · `mcpBaseUrl` `http://127.0.0.1:8787` ·
- * `machineDist` 按仓根推导（`<仓根>/machine/dist`）· `turnTimeoutMs` 未配 ⇒ 交 BD4b 缺省。
+ * `machineDist` 按仓根推导（`<仓根>/machine/dist`）· `repoRoot` 缺省 = 板根上一级（BD10 读文档面）·
+ * `turnTimeoutMs` 未配 ⇒ 交 BD4b 缺省。
  */
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -23,6 +24,7 @@ import { DEFAULT_BRIDGE_BASE_URL } from "./bridge-client.js";
 import { DEFAULT_MCP_BASE_URL } from "./requirement.js";
 import { DEFAULT_HOST_AGENT_KIND } from "./host-bridge.js";
 import { resolveMachineDistDir } from "./host-runtime.js";
+import { defaultRepoRoot } from "./docs-read.js";
 
 export const DEFAULT_PORT = 3400;
 export const DEFAULT_HOST = "127.0.0.1";
@@ -46,6 +48,8 @@ export interface BoardConfig {
   readonly bridgeUrl: string;
   readonly mcpBaseUrl: string;
   readonly machineDist: string;
+  /** 主仓根（BD10 读文档面源 A 的锚点）：配置键 `repoRoot` 缺省 = 板根上一级（恒有值，非 null）。 */
+  readonly repoRoot: string;
   /** 单轮有界等待毫秒；`null` = 未配置 ⇒ 交下游 `DEFAULT_TURN_TIMEOUT_MS`。 */
   readonly turnTimeoutMs: number | null;
 }
@@ -128,6 +132,10 @@ export function validateConfig(parsed: unknown, sourcePath: string): BoardConfig
   // 恒给出显式值 ⇒ 启动路径不再经 host-runtime 的 BOARD_MACHINE_DIST 兜底（旧 env 通道随之失效）。
   const machineDist = machineDistRaw ?? resolveMachineDistDir({});
 
+  // repoRoot（BD10）：读文档面源 A 的锚点，缺省 = 板根上一级；目录可不存在（列目录时按空清单降级）。
+  const repoRootRaw = optString(raw, "repoRoot");
+  const repoRoot = repoRootRaw === null ? defaultRepoRoot() : resolve(repoRootRaw);
+
   let turnTimeoutMs: number | null = null;
   if (raw.turnTimeoutMs !== undefined && raw.turnTimeoutMs !== null) {
     const v = raw.turnTimeoutMs;
@@ -137,7 +145,7 @@ export function validateConfig(parsed: unknown, sourcePath: string): BoardConfig
     turnTimeoutMs = v;
   }
 
-  return { sourcePath, port, host, orgsDir, group, hostKind, bridgeUrl, mcpBaseUrl, machineDist, turnTimeoutMs };
+  return { sourcePath, port, host, orgsDir, group, hostKind, bridgeUrl, mcpBaseUrl, machineDist, repoRoot, turnTimeoutMs };
 }
 
 /**

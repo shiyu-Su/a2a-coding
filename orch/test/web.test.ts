@@ -318,6 +318,25 @@ test("GET / → 任务子表时间列三段 + 耗时拆「排队 / 执行」两�
   assert.match(page.text, /t\.failureKind/, "任务行应渲染 failureKind");
 });
 
+test("GET / → 展开详情区渲染登记三列「阶段（登记）/ 审批门 / 版本」+ 缺值「—」+ 与引擎态区分（v0.9.1 O2）", async () => {
+  const handle = await startWeb(fakeCore());
+  const page = await get(handle.port, "/");
+  assert.equal(page.status, 200);
+  // loadDetail 除 tasks 外连 body.feature 一起缓存（否则三值到不了渲染层）
+  assert.match(page.text, /feature:\s*out\.body\.feature/, "详情缓存应含 body.feature");
+  assert.match(page.text, /registerHtml\(d\.feature\)/, "detailHtml 应渲染登记字段行");
+  assert.ok(page.text.includes("阶段（登记）"), "应含「阶段（登记）」列（stage）");
+  assert.ok(page.text.includes("审批门"), "应含「审批门」列（approval）");
+  assert.ok(page.text.includes("版本"), "应含「版本」列（version）");
+  // 三值取值只经 regVal 一条路（防 vacuous：确在渲染三值处）
+  assert.match(page.text, /regVal\(feature\.stage\)[\s\S]*regVal\(feature\.approval\)[\s\S]*regVal\(feature\.version\)/);
+  // 缺值（老桥未透出 / 未登记）⇒「—」回退，不臆造、不渲染空串
+  assert.match(page.text, /function regVal\(v\) \{ return \(v === null \|\| v === undefined \|\| v === ""\) \? "—" : v; \}/);
+  // state（引擎态）与 stage（登记字段）并排展示须可分辨：登记行显式标注区分
+  assert.match(page.text, /非引擎态/, "登记字段行应标注「非引擎态」");
+  assert.match(page.text, /≠ 上行「状态」（引擎态 state）/, "登记行应显式区分需求行 state 列");
+});
+
 test("GET /api/projects → 白名单（剔除 workspace / agentConfig / risk / Runner 内部字段）+ 桥注册表快照语义", async () => {
   /** 故意夹带 Runner 内部字段：网页白名单必须剔除（防 vacuous：全文断言不含这些值） */
   const runnerWithInternals = {

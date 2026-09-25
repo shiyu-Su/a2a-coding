@@ -282,11 +282,13 @@ test("BD7-⑤（负向）：跨站 Origin ⇒ 403；无守卫头无来源 ⇒ 40
     async (base) => {
       const cross = await post(base, { title: "甲", version: "v1" }, { origin: "http://evil.example:80" });
       assert.equal(cross.status, 403);
-      assert.match(cross.text, /"code":"write_guard_origin"/, "有名跨站 Origin 的码不得被并入'来源不可知'");
+      // 弹窗化（REQ-v0.9.1-2026-09-25-03）：表单档不再裸 JSON，错误浮层给中文族名 + 原文码
+      assert.match(cross.text, /CSRF 来源校验拒绝/, "有名跨站 Origin 的族名必须上浮层");
+      assert.doesNotMatch(cross.text, /"code":"write_guard_origin"/, "表单档不得残留裸 JSON");
 
       const wrongHeaderValue = await post(base, { title: "甲", version: "v1" }, { "x-board-write": "yes-please" });
       assert.equal(wrongHeaderValue.status, 403);
-      assert.match(wrongHeaderValue.text, /write_guard_origin_unknown/);
+      assert.match(wrongHeaderValue.text, /CSRF 来源不可判定/);
 
       const noProofAtAll = await req(base, "/requirements", { method: "POST", body: "title=甲&version=v1" });
       assert.equal(noProofAtAll.status, 403);
@@ -444,13 +446,14 @@ test("BD7-⑦（BD11 反转）：列表页表单**含**组织名字段；只读�
     assert.match(res.text, /需求甲/);
     assert.match(res.text, /<td>4<\/td>/);
     assert.deepEqual(calls, ["getFeatures"]);
-    // CSP（收口轨 14 明示口径）：default-src 仍 'none'、form-action 仍限同源；
-    // script-src 仅放行 'unsafe-inline'（页面内字面量守卫脚本），**无任何外源 URL**。
+    // CSP（收口轨 14 + BD14 明示口径）：default-src 仍 'none'、form-action 仍限同源；
+    // script-src = 'unsafe-inline'（页面内字面量脚本）+ 'self'（同源 vendored /static 资产），
+    // **无任何外源主机 URL**。
     const csp = res.headers.get("content-security-policy");
     assert.match(csp, /default-src 'none'/);
     assert.match(csp, /form-action 'self'/);
     const scriptDir = /(^|;)\s*script-src([^;]*)/.exec(csp)?.[2]?.trim() ?? "";
-    assert.equal(scriptDir, "'unsafe-inline'", "script-src 只允许内联一档");
+    assert.deepEqual(scriptDir.split(/\s+/).sort(), ["'self'", "'unsafe-inline'"], "script-src 只放开内联 + 同源两档");
     assert.equal(/https?:|\/\//.test(scriptDir), false, "script-src 不得含外源");
   });
   // 配了默认组织 ⇒ 组织名可不填，且把默认值如实显示在字段旁（不伪装成必填）
@@ -491,11 +494,11 @@ test("BD17-⑤（真机报障复现）Origin: null + 同源 Referer ⇒ 表单�
       // 不削弱 CSRF：Origin 不可用 + Referer 跨站 ⇒ 仍拒
       const evil = await post(base, { title: "乙", version: "v1" }, { origin: "null", referer: "http://evil.example/" });
       assert.equal(evil.status, 403);
-      assert.equal(JSON.parse(evil.text).code, "write_guard_origin_unknown");
+      assert.match(evil.text, /CSRF 来源不可判定/);
       // 同源 meta 头不影响跨站有名 Origin 的一律拒
       const crossNamed = await post(base, { title: "丙", version: "v1" }, { origin: "http://evil.example" });
       assert.equal(crossNamed.status, 403);
-      assert.equal(JSON.parse(crossNamed.text).code, "write_guard_origin");
+      assert.match(crossNamed.text, /CSRF 来源校验拒绝/);
       assert.equal(seen.length, 1, "两条被拒请求不得触达写封装");
     },
     { defaultGroup: "g", createRequirementImpl: fn },

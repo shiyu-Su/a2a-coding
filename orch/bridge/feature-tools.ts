@@ -7,7 +7,8 @@
  *
  * - `handleFeatureCreate`  新建 Feature（**初态 `waiting_approval`** = 主链起点；落 `contextId` 到
  *                          `features.context_id`）
- * - `handleFeatureStatus`  查询单个 Feature 详情 / 全部列表（state + tasks 摘要 + artifacts）
+ * - `handleFeatureStatus`  查询单个 Feature 详情 / 全部列表（state + tasks 摘要 + artifacts；
+ *                          v0.9.1 起单查增量扩 `acceptance` 聚合块 = 主链段轨迹 + 失败账单 + 节点态计数）
  * - `handleFeatureAdvance` orch agent 驱动主链推进（状态机校验合法后继；`note`→plan、
  *                          `decisions`/`contracts` 可选落 Feature Context；`answer` 用于 needs_input 补齐）；
  *                          **`waiting_approval → executing` 已禁用** —— 唯一准入 = `handleFeatureApprove`，
@@ -29,11 +30,13 @@ import {
   appendEvent,
   countQueuedBefore,
   createFeature,
+  EVENT_FEATURE_STATE,
   featureTaskStateCounts,
   getFeature,
   getQueuedTask,
   listArtifactsByFeature,
   listBusyTasksForProject,
+  listEvents,
   listFeatureTasks,
   listFeatures,
   listReadLaneTasksForProject,
@@ -44,7 +47,7 @@ import {
   updateFeatureState,
   updateTaskState,
 } from "../session/store.js";
-import { planResume } from "./scheduler.js";
+import { EVENT_FAILURE_REPORT, planResume } from "./scheduler.js";
 import type {
   FeatureContextPatch,
   FeatureRegistrationPatch,
@@ -60,6 +63,7 @@ import {
 } from "../feature/state-machine.js";
 import type {
   ArtifactRecord,
+  EventRecord,
   FailureKind,
   FeatureApproval,
   FeatureRecord,
@@ -501,12 +505,62 @@ export interface FeatureStatusArgs {
   featureId?: string;
 }
 
+/**
+ * **主链状态段轨迹**的一格（REQ-v0.9.1-2026-09-25-02 · B1）。
+ *
+ * ⚠ **stage 一词两义**：本结构的 `state` 承载的是**主链段轨迹**（`feature.state` 事件回放），
+ * 与 Feature **登记字段** `stage`（需求分析/改造方案/…/发版，观测面）及事件 kind
+ * `feature.stage`（登记流水）**同词不同物** —— 三者互不相干，读账时不得混用。
+ */
+export interface FeatureAcceptanceStage {
+  /** 主链状态机态（FeatureState），不是登记字段 `stage` */
+  state: FeatureState;
+  enteredAt: string;
+  /** 下一段的进入时刻；**末段 = null**（Feature 现停在此态） */
+  leftAt: string | null;
+}
+
+/**
+ * 一条 `feature.failure_report` 账单的**原样**投影（零去重；见 {@link FeatureAcceptance.failures}）。
+ */
+export interface FeatureAcceptanceFailure {
+  eventId: number;
+  /** = 事件 `created_at` */
+  at: string;
+  /** 事件 payload 原文（JSON 字符串：`failed[]` / `blockedSet`；可空） */
+  payload: string | null;
+}
+
+/**
+ * **acceptance 聚合块**（v0.9.1 起，仅 `a2a_feature_status` **单 Feature 分支**出参，additive）。
+ *
+ * - `stages`：主链段轨迹，回放本 Feature 的 `feature.state` 事件（新态在 `events.state` 列、
+ *   时间在 `created_at`、`payload=NULL`）。**首段合成**：`createFeature` 不写事件 ⇒
+ *   `waiting_approval` 的 `enteredAt` 从 `feature.createdAt` 合成；**不按 state 聚合去重** ⇒
+ *   `executing → needs_input → executing` 得 ≥2 段同名 `executing`（轨迹本义；相邻同态由
+ *   store 的「只在真变化时写事件」守卫保证不可能）。
+ * - `failures`：`feature.failure_report` 按 `eventId` 升序**原样列出、零去重**（payload 无
+ *   retryCount、调度器签名 Map 为进程内态重启失忆 ⇒ 按 payload 去重不可行，也不该做）。
+ * - `stateCounts`：与**列表分支**同一事实源（`featureTaskStateCounts` 聚合 SQL，归属谓词同侧），
+ *   不做 tasks 就地计数。
+ */
+export interface FeatureAcceptance {
+  stages: FeatureAcceptanceStage[];
+  failures: FeatureAcceptanceFailure[];
+  stateCounts: Partial<Record<TaskState, number>>;
+}
+
 export interface FeatureStatusSuccess {
   ok: true;
   feature?: FeatureRecord;
   tasks?: FeatureTaskSummary[];
   /** 该 Feature 已登记的产物（v0.4.0；仅单 Feature 查询返回） */
   artifacts?: ArtifactRecord[];
+  /**
+   * **acceptance 聚合块**（v0.9.1 / REQ-02 B1；**仅单 Feature 查询返回**，列表分支出参不变）。
+   * 语义与「stage 一词两义」警示见 {@link FeatureAcceptance}。
+   */
+  acceptance?: FeatureAcceptance;
   /**
    * 列表分支出参（v0.9.0 B3″ 起 **additive** 增 `stateCounts`）。
    *
@@ -515,6 +569,52 @@ export interface FeatureStatusSuccess {
    * - 两者都**只走列表读的视野判据**（归属谓词与 `listFeatures` 同源），他组节点不计数。
    */
   features?: Array<FeatureRecord & { taskCount: number; stateCounts: Partial<Record<TaskState, number>> }>;
+}
+
+/** `listEvents` 的 limit clamp 上限 = 游标续读的单页大小（短页即读到末尾） */
+const ACCEPTANCE_EVENT_PAGE = 1000;
+
+/**
+ * **游标续读**本 Feature 的全部事件（`listEvents` 单次调用被 clamp 在 1000 且无 kind 过滤 ⇒
+ * 必须 `since` 循环读到短页为止，禁单次调用当作全量）。事件天然按 `eventId` 升序。
+ */
+function readAllFeatureEvents(featureId: string): EventRecord[] {
+  const all: EventRecord[] = [];
+  let since = 0;
+  for (;;) {
+    const page = listEvents({ featureId, since, limit: ACCEPTANCE_EVENT_PAGE });
+    all.push(...page);
+    const last = page[page.length - 1];
+    if (page.length < ACCEPTANCE_EVENT_PAGE || last === undefined) return all;
+    since = last.eventId;
+  }
+}
+
+/**
+ * 构造 acceptance 聚合块（只读；不触任何写口 / 门）。
+ *
+ * `stateCounts` 归属不放宽：`identity` 透传口径与列表分支一致（无身份 ⇒ 全量视野）。
+ */
+function buildFeatureAcceptance(feature: FeatureRecord, identity: string | null): FeatureAcceptance {
+  const events = readAllFeatureEvents(feature.featureId);
+  const stateEvents = events.filter(
+    (e) => e.kind === EVENT_FEATURE_STATE && typeof e.state === "string",
+  );
+  const stages: FeatureAcceptanceStage[] = [];
+  // 首段合成：createFeature 不写 `feature.state` 事件，初态恒 waiting_approval
+  let state: FeatureState = "waiting_approval";
+  let enteredAt = feature.createdAt;
+  for (const e of stateEvents) {
+    stages.push({ state, enteredAt, leftAt: e.createdAt });
+    state = e.state as FeatureState;
+    enteredAt = e.createdAt;
+  }
+  stages.push({ state, enteredAt, leftAt: null });
+  const failures: FeatureAcceptanceFailure[] = events
+    .filter((e) => e.kind === EVENT_FAILURE_REPORT)
+    .map((e) => ({ eventId: e.eventId, at: e.createdAt, payload: e.payload }));
+  const counts = featureTaskStateCounts(identity === null ? undefined : identity);
+  return { stages, failures, stateCounts: counts.get(feature.featureId) ?? {} };
 }
 
 export function handleFeatureStatus(
@@ -531,7 +631,7 @@ export function handleFeatureStatus(
     if (denied !== null) return denied;
     const tasks = listFeatureTasks(feature.featureId, { limit: 1000 }).map(summarizeTask);
     const artifacts = listArtifactsByFeature(feature.featureId, 1000);
-    return { ok: true, feature, tasks, artifacts };
+    return { ok: true, feature, tasks, artifacts, acceptance: buildFeatureAcceptance(feature, identity) };
   }
   // 列表路径：配组 ⇒ 只列本组 Feature（`owner_group = identity`，NULL 无归属被排除 = fail-closed）；
   // 无身份 ⇒ 全量（未配组 / web 运维视图）。

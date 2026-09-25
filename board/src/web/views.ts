@@ -23,6 +23,16 @@ import {
   traceWaitDisplay,
 } from "../derive.js";
 import type { ConfirmAffordance, NextStepInput } from "../derive.js";
+import type { DocsEntry, DocsSource } from "../docs-read.js";
+import { isValidDocVersion } from "../docs-read.js";
+import {
+  MERMAID_ASSET,
+  defaultStaticRoot,
+  mermaidAssetScriptTag,
+  mermaidRenderScript,
+  renderMarkdown,
+  vendoredAssetExists,
+} from "../docs-render.js";
 import type { OccupantTurnView } from "../host-turn.js";
 import type { HostStatusEntry, StopBridgeOutcome, TriggerTurnOutcome } from "../host-face.js";
 import { emptyRow, escapeHtml } from "./layout.js";
@@ -64,6 +74,173 @@ function stamp(iso: string | null): string {
 function featureLink(featureId: string, text?: string): string {
   return `<a class="fl" href="/features/${encodeURIComponent(featureId)}">${escapeHtml(text ?? shortId(featureId))}</a>`;
 }
+
+// ---------------------------------------------------------------------------
+// 阶段产出 / 产出登记 / 单文档页（BD11 · REQ-v0.9.1-2026-09-25-04）
+// ---------------------------------------------------------------------------
+
+/**
+ * decisions 元素里的文档路径提取（b 案）：`doc/…/x.md` 或裸 `{version}/x.md` 形态，
+ * 只取文件名段。**提取结果只作展示** —— 打开必走 docs-read 守卫（`/features/:id/docs`
+ * 以 version 白名单 + 段卫生 + 根内收 + `.md` 闭集拒绝越界名），本正则不是打开依据。
+ */
+const DOC_PATH_RE = /(?:doc\/)?(?:([^/\\:%"'>\s]+)\/)?([^/\\:%"'>\s]+\.md)/;
+
+/** 从任意 decisions 文本提取 `{version, file}`；无 `.md` 路径 ⇒ null。 */
+export function extractDocPath(text: string): { version: string; file: string } | null {
+  const m = DOC_PATH_RE.exec(text);
+  if (m === null) return null;
+  return { version: m[1] ?? "", file: m[2] ?? "" };
+}
+
+/**
+ * 单文档打开链接（src 缺省 = 源 A 主仓根）。**版本不进链接** —— 服务端从桥侧详情取，
+ * 不接受调用方传版本（否则等于把白名单交给请求方）。
+ */
+function docHref(featureId: string, file: string, src: DocsSource | null): string {
+  const qs = new URLSearchParams({ file });
+  if (src !== null) qs.set("src", src);
+  return `/features/${encodeURIComponent(featureId)}/docs?${qs.toString()}`;
+}
+
+/** 源标注（判据 2 的「来源标注」）：A = 主仓根，B = 组织工作区。 */
+function docsSourceLabel(source: DocsSource): string {
+  return source === "A" ? "主仓" : "组织工作区";
+}
+
+/**
+ * decisions / note 载荷 → 逐条字符串数组（容错口径同 bridge-client：不抛错）。
+ * JSON 数组（桥侧 decisions 落库形态）⇒ 逐元素字符串；非数组 / 解析失败 ⇒ 整段原文一条；空 ⇒ []。
+ */
+export function parseDecisionItems(decisions: string | null | undefined): string[] {
+  if (decisions === null || decisions === undefined || decisions.trim() === "") return [];
+  try {
+    const parsed: unknown = JSON.parse(decisions);
+    if (Array.isArray(parsed)) {
+      return parsed.map((x) => (typeof x === "string" ? x : JSON.stringify(x) ?? String(x)));
+    }
+  } catch {
+    /* 非 JSON ⇒ 按整段原文显示 */
+  }
+  return [decisions];
+}
+
+/**
+ * 详情页「产出登记」区（head 表下，b 案裁决 ③）：逐条渲染 decisions 元素；
+ * 含 doc 路径的元素把路径渲染为可点条目（链到单文档 GET）。空 ⇒ 如实显示无。
+ */
+function renderDecisionsSection(featureId: string, decisions: string | null | undefined): string {
+  const items = parseDecisionItems(decisions);
+  const rows = items.map((item) => {
+    const hit = extractDocPath(item);
+    const link =
+      hit === null || hit.version === ""
+        ? ""
+        : ` <a class="fl" href="${escapeHtml(docHref(featureId, hit.file, null))}">打开 ${escapeHtml(hit.file)}</a>`;
+    return `<li>${escapeHtml(item)}${link}</li>`;
+  });
+  const body = items.length === 0 ? `<p class="hint">（无产出登记：decisions 未登记或桥未透出）</p>` : `<ul class="docs">${rows.join("")}</ul>`;
+  return `<h2>产出登记（decisions）</h2>
+<p class="hint">数据 = Feature Context 的 <code>decisions</code>（宿主 agent 经 <code>advance</code> 逐轮 append）；含 <code>doc/…&#47;*.md</code> 路径的条目给出打开链接 —— <b>路径只作展示</b>，打开经板读文档面守卫（版本白名单 / 根内收 / 仅 .md）。链接不带 src ⇒ 服务端先查主仓、未命中自动回落组织工作区（实际来源在文档页头标注）。</p>
+${body}`;
+}
+
+/** 详情页「阶段产出」区入参（server 侧经 docs-read 汇总后下传；null 字段 = 未取到）。 */
+export interface FeatureDocsView {
+  /** 双源合并清单（version 非法 ⇒ docs-read 返回空清单，区块如实显示无）。 */
+  entries: DocsEntry[];
+  /** 清单读取异常（盘/权限等）⇒ 可见文案，不静默。 */
+  error: string | null;
+}
+
+/**
+ * 详情页「阶段产出」区（a 案）：逐文档一行 —— 文件名（可点）+ 分类标注 + 来源标注。
+ * 空 ⇒ 如实显示「无」（版本不合法 / 两源皆无目录，均为降级，不报错）。
+ */
+function renderDocsSection(featureId: string, version: string | null, docs: FeatureDocsView | null): string {
+  const hint =
+    "数据 = 主仓 <code>doc/{版本}/</code> ∪ 组织工作区 <code>doc/{版本}/</code> 双源合并（存在哪个算哪个，同名分行各标来源）；分类尽力标注（前缀式∪后缀式），板不做裁判。";
+  if (docs === null) return "";
+  if (docs.error !== null) {
+    return `<h2>阶段产出</h2><p class="hint err">清单读取失败：${escapeHtml(docs.error)}（如实显示，不静默）</p>`;
+  }
+  if (version === null || version === "") {
+    return `<h2>阶段产出</h2><p class="hint">无（该需求未登记版本，无法定位 <code>doc/{版本}/</code>）。</p>`;
+  }
+  if (!isValidDocVersion(version)) {
+    return `<h2>阶段产出</h2><p class="hint">无（版本「${escapeHtml(version)}」不符合 <code>v{major}.{minor}.{patch}</code> 白名单 ⇒ 不打开任何目录）。</p>`;
+  }
+  if (docs.entries.length === 0) {
+    return `<h2>阶段产出</h2><p class="hint">无（两源 <code>doc/${escapeHtml(version)}/</code> 下暂无 .md 文档）。</p>`;
+  }
+  const rows = docs.entries.map((e) => {
+    const link = `<a class="fl" href="${escapeHtml(docHref(featureId, e.name, e.source))}">${escapeHtml(e.name)}</a>`;
+    return (
+      "<tr>" +
+      `<td>${link}</td>` +
+      `<td>${escapeHtml(e.kind)}</td>` +
+      `<td>${escapeHtml(docsSourceLabel(e.source))}</td>` +
+      "</tr>"
+    );
+  });
+  return `<h2>阶段产出</h2>
+<p class="hint">${hint}</p>
+<table><thead><tr><th>文档</th><th>分类</th><th>来源</th></tr></thead>
+<tbody>${rows.join("")}</tbody></table>`;
+}
+
+/** 文档页双档（BD14）：render = markdown 子集渲染；raw = 现行 `<pre>` 原文视图。 */
+export type DocPageMode = "render" | "raw";
+
+/** 文档页渲染出口：正文 HTML + 页面级追加脚本（仅白名单字面量，不承载文档内容）。 */
+export interface DocPageView {
+  readonly bodyHtml: string;
+  readonly extraScripts: string;
+}
+
+/**
+ * 单文档页正文（BD14 渲染/原文双档，页头互链切换，渲染缺省）：
+ * - `render`：`docs-render.renderMarkdown`（escape-first 子集）；```mermaid 围栏 ⇒ 占位 div +
+ *   `<script type="application/json">` 安全注入，页面脚本读 textContent 渲染（源文本不拼 HTML）；
+ *   vendored 资产缺文件 ⇒ 不挂脚本，mermaid 块保留源文本（降级可见，不 404 静默）；
+ * - `raw`：现行 `<pre>` + escapeHtml 原文直出**原样保留**。
+ * 超限内容 docs-read 只读到 256KiB 打 truncated ⇒ 两档均显截断提示。
+ * `src` = 服务端实际命中的源（BD13 补源 B）⇒ 页头标注来源，不歧义。
+ */
+export function renderDocPage(
+  featureId: string,
+  file: string,
+  src: DocsSource,
+  content: string,
+  truncated: boolean,
+  mode: DocPageMode = "render",
+  staticRoot: string = defaultStaticRoot(),
+): DocPageView {
+  const truncNote = truncated
+    ? `<p class="hint warn">文档超过读取上限，以下为前段内容（已截断）。</p>`
+    : "";
+  const selfQs = (extra: Record<string, string>): string => {
+    const qs = new URLSearchParams({ file, src, ...extra });
+    return `/features/${encodeURIComponent(featureId)}/docs?${qs.toString()}`;
+  };
+  const other = mode === "raw" ? "render" : "raw";
+  const otherLabel = mode === "raw" ? "渲染视图" : "原文视图";
+  const toggle = `<a class="fl" href="${escapeHtml(selfQs({ mode: other }))}">${otherLabel}</a>`;
+  const head = `<p class="hint"><a class="fl" href="/features/${encodeURIComponent(featureId)}">回到需求详情</a> · <span class="mono">${escapeHtml(file)}</span> · 来源：${escapeHtml(docsSourceLabel(src))} · 当前：<b>${mode === "raw" ? "原文" : "渲染"}</b> · ${toggle}</p>
+<h2>${escapeHtml(file)}</h2>`;
+  if (mode === "raw") {
+    return { bodyHtml: `${head}\n${truncNote}\n<pre class="result">${escapeHtml(content)}</pre>`, extraScripts: "" };
+  }
+  const md = renderMarkdown(content);
+  let extraScripts = "";
+  if (md.hasMermaid) {
+    extraScripts = vendoredAssetExists(staticRoot, MERMAID_ASSET.file)
+      ? mermaidAssetScriptTag() + mermaidRenderScript()
+      : `<p class="hint warn">mermaid 静态资产缺失（vendored 文件未就位，见 README），流程图按源文本显示。</p>`;
+  }
+  return { bodyHtml: `${head}\n${truncNote}\n${md.html}`, extraScripts };
+}
+
 
 // ---------------------------------------------------------------------------
 // 提需求表单（BD7 · 板唯一写控件；同源 POST，服务器端渲染）
@@ -141,6 +318,7 @@ export function renderFeatureDetail(
   trace: FeatureTraceView | null,
   traceError: string | null,
   nowMs: number,
+  docs: FeatureDocsView | null = null,
 ): string {
   const f = detail.feature;
   const d = deriveDisplayStage(f.state, f.stage);
@@ -195,7 +373,9 @@ export function renderFeatureDetail(
 <table><thead><tr><th>taskId</th><th>项目</th><th>状态</th><th>档</th><th>waitReason</th><th>写门（projectBusy）</th><th>读档占位（readOccupants）</th><th>位次</th><th>已等待（只取 waitedSince）</th><th>在等谁</th></tr></thead>
 <tbody>${rows.length === 0 ? emptyRow(10, "（无非终态节点）") : rows.join("")}</tbody></table>`;
   }
-  return `${head}\n${tasks}\n${traceHtml}`;
+  const decisionsSection = renderDecisionsSection(f.featureId, f.decisions);
+  const docsSection = renderDocsSection(f.featureId, f.version, docs);
+  return `${head}\n${decisionsSection}\n${tasks}\n${traceHtml}\n${docsSection}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -548,6 +728,48 @@ ${notice}
 <p class="hint">状态取 BD4a 的五态闭集（<code>running / starting / unreachable / exited / failed</code>）· 队列取 BD4b 的闸位视图（<b>容量恒 1</b>：同组织一时刻只跑一轮）· 后端 CLI 一律 <b>SIGTERM 后超时树杀</b>（桥 + 后端两级）。</p>
 <table><thead><tr><th>组织</th><th>状态</th><th>显示文案</th><th>pid</th><th>port</th><th>kind</th><th>在飞轮 / 回收</th><th>起 / 末次活动 / 空闲</th><th>轮队列</th><th>结构化错误</th><th>动作</th></tr></thead>
 <tbody>${rows.join("")}</tbody></table>`;
+}
+
+// ---------------------------------------------------------------------------
+// 错误码 → 中文族名（REQ-v0.9.1-2026-09-25-03 · 表单档错误浮层的标题）
+// ---------------------------------------------------------------------------
+
+/** 动态码前缀（jsonrpc_<n> / http_<n>）→ 族名；精确表未命中才查前缀。 */
+const ERROR_FAMILY_PREFIXES: ReadonlyArray<readonly [string, string]> = [
+  ["jsonrpc_", "桥调用错误"],
+  ["http_", "桥调用错误"],
+];
+
+const ERROR_FAMILY_LABELS: Readonly<Record<string, string>> = {
+  write_guard_origin: "CSRF 来源校验拒绝",
+  write_guard_origin_unknown: "CSRF 来源不可判定",
+  requirement_form_invalid: "表单字段校验失败",
+  board_group_required: "表单字段校验失败",
+  payload_too_large: "请求体超限",
+  body_read_failed: "请求体读取失败",
+  response_invalid: "桥调用错误",
+  protocol_error: "桥调用错误",
+  jsonrpc_error: "桥调用错误",
+  transport_error: "桥调用错误",
+  no_fetch: "桥调用错误",
+  unknown: "桥调用错误",
+  host_face_disabled: "宿主面未装配",
+  answer_empty: "参数校验失败",
+  bad_url: "请求不合法",
+  not_found: "未知路径",
+  method_not_allowed: "方法不允许",
+  internal_error: "系统异常",
+};
+
+/** 错误码 → 中文族名；**无命中回退原文 code**（不吞不猜）。 */
+export function errorFamilyLabel(code: string): string {
+  for (const [prefix, family] of ERROR_FAMILY_PREFIXES) {
+    if (code.startsWith(prefix)) return family;
+  }
+  for (const [key, family] of Object.entries(ERROR_FAMILY_LABELS)) {
+    if (key === code) return family;
+  }
+  return code;
 }
 
 // ---------------------------------------------------------------------------

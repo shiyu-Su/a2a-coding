@@ -31,6 +31,9 @@
  *   prompt 摘要（截断）。
  *   **首屏只发 1 次 `GET /api/features`** —— 绝不为首屏发起 N 次详情请求；展开态与详情缓存
  *   **跨自动刷新保留**（否则每 15s 会被折叠一次）。
+ * - **展开详情区含「登记字段」行**（v0.9.1 O2）：详情缓存除 `tasks` 外**连 `body.feature` 一起缓存**，
+ *   渲染登记 `stage`（阶段）/ `approval`（审批门）/ `version`（版本）三值，缺值显示「—」（与板同口径）。
+ *   **登记字段是观测面不是引擎态** —— 该行显式标注与需求行「状态」列（`state`）的区分；不改需求行 thead。
  * - **已移除**：手输 `projectId` 输入框 + 「查询任务」按钮（`GET /api/tasks` 路由**保留不变**，
  *   只是本页不再调用）；「本地库 + 只读探测」「快照语义」等术语长句（页头改为一句人话说明）。
  *
@@ -284,7 +287,18 @@ export function renderIndexHtml(params: WebPageParams): string {
     var d = detail[featureId];
     if (!d) return '<p class="hint">任务加载中…</p>';
     if (d.error) return '<p class="hint err">任务读取失败：' + esc(d.error) + "</p>";
-    return taskTable(d.tasks);
+    return registerHtml(d.feature) + taskTable(d.tasks);
+  }
+  /* 登记字段（v0.9.1 O2）：stage / approval / version 是观测面登记值，**不是引擎态** ——
+     与需求行「状态」列（state）并排展示时须可分辨；缺值（老桥未透出 / 未登记）显示「—」，不臆造 */
+  function registerHtml(f) {
+    var feature = f || {};
+    function regVal(v) { return (v === null || v === undefined || v === "") ? "—" : v; }
+    return '<p class="hint" style="margin:2px 0">登记字段（观测面 · 非引擎态）：' +
+      "阶段（登记） <code>" + esc(regVal(feature.stage)) + "</code>" +
+      ' <span class="muted">≠ 上行「状态」（引擎态 state）</span>' +
+      " · 审批门 <code>" + esc(regVal(feature.approval)) + "</code>" +
+      " · 版本 <code>" + esc(regVal(feature.version)) + "</code></p>";
   }
   function featureRows(list) {
     var rows = [];
@@ -315,7 +329,7 @@ export function renderIndexHtml(params: WebPageParams): string {
       if (!out.body || out.body.ok !== true) {
         detail[featureId] = { error: errText(out) };
       } else {
-        detail[featureId] = { tasks: out.body.tasks || [] };
+        detail[featureId] = { tasks: out.body.tasks || [], feature: out.body.feature || null };
       }
       renderFeatures();
     }).catch(function (e) {

@@ -198,6 +198,7 @@ test("BD13-③ 未接停机链 ⇒ 501 shutdown_unsupported（不假装受理）
     assert.equal((await res.json()).code, "shutdown_unsupported");
     const get = await fetch(`${base}/shutdown`, { method: "GET" });
     assert.equal(get.status, 405);
+    // /shutdown = 运维口（无板 UI 表单档），decideShutdown 恒 JSON，不参与弹窗化分流
     assert.equal((await get.json()).code, "method_not_allowed");
   });
 });

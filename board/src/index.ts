@@ -134,6 +134,7 @@ async function main(): Promise<void> {
     defaultGroup: group,
     mcpBaseUrl: cfg.mcpBaseUrl,
     hostFace: hostFace?.face ?? null,
+    docs: { repoRoot: cfg.repoRoot, orgsDir: cfg.orgsDir },
     onShutdown: () => shutdown("POST /shutdown"),
   });
   process.stdout.write(
