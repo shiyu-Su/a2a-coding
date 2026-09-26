@@ -74,7 +74,13 @@ function okOutcome(featureId, over = {}) {
 
 /** 假宿主面：记录实收入参，出参可控。 */
 function fakeFace(outcomes = {}) {
-  const calls = { triggerTurn: [], confirmTurn: [], answerRequirement: [], awaitingTurnOf: [] };
+  const calls = {
+    triggerTurn: [],
+    confirmTurn: [],
+    answerRequirement: [],
+    awaitingTurnOf: [],
+    queueView: [],
+  };
   const face = {
     async triggerTurn(input) {
       calls.triggerTurn.push(input);
@@ -94,6 +100,10 @@ function fakeFace(outcomes = {}) {
     },
     busyTurnOf() {
       return outcomes.busy ?? null;
+    },
+    queueView(org) {
+      calls.queueView.push(org);
+      return outcomes.queue ?? { org, running: null, waiting: [], capacity: 1 };
     },
     async statusView() {
       return [];
@@ -504,8 +514,7 @@ test("轨14-HTTP（负向）turn / confirm / answer 三入口在占用时同返 
   );
 });
 
-test("轨14-HTTP（正向锚）awaiting_answer 不被当成占用 ⇒ 回答照常 200（防重不误锁澄清链路）", async () => {
-  await withServer(
+test("轨14-HTTP（正向锚）awaiting_answer 不被当成占用 ⇒ 回答照常 200（防重不误锁澄清链路）", async () => {  await withServer(
     async (base) => {
       const res = await req(base, "/features/F1/answer", {
         method: "POST",
@@ -538,3 +547,211 @@ test("轨14-HTTP（正向锚）awaiting_answer 不被当成占用 ⇒ 回答照�
     },
   );
 });
+
+// ---------------------------------------------------------------------------
+// REQ-v0.9.2 N7：turn / confirm / answer 的 HTML 档分流 —— 受理成功（排队）⇒ 303 回详情页；
+// 有内容回执（摘要 / 澄清问题 / 失败根因）⇒ 仍出整页（跳转不得吞掉 agent 的回答）
+// ---------------------------------------------------------------------------
+
+const QUEUED = okOutcome("F1", {
+  disposition: "queued",
+  queued: true,
+  state: "queued",
+  round: 3,
+  turnId: "turn-q3",
+  summary: null,
+  display: "已排队（同组织一时刻只跑一轮）",
+});
+
+function turnPost(base, headers, body, redirect = "follow") {
+  return req(base, "/features/F1/turn", { method: "POST", headers, body, redirect });
+}
+
+test("N7-HTTP 受理成功（queued）HTML 档 ⇒ 303 + Location 详情页（PRG：刷新不重复烧一轮）、无正文", async () => {
+  await withServer(
+    async (base) => {
+      const res = await turnPost(base, { ...WRITE_HEADERS, accept: "text/html" }, undefined, "manual");
+      assert.equal(res.status, 303);
+      assert.equal(res.headers.get("location"), "/features/F1");
+      assert.equal(res.headers.get("cache-control"), "no-store");
+      assert.equal(res.text, "", "303 不出正文（内容在详情页的轮次进度行）");
+    },
+    { outcomes: { trigger: QUEUED } },
+  );
+});
+
+test("N7-HTTP 受理成功 JSON 档不变（202 + 结构化载荷）；confirm / answer 同规则", async () => {
+  await withServer(
+    async (base, _c, faceCalls) => {
+      const json = await turnPost(base, { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(json.status, 202, "JSON 档仍是 202（受理语义不因 303 而丢）");
+      assert.equal(JSON.parse(json.text).disposition, "queued");
+
+      const confirm = await req(base, "/features/F1/confirm", {
+        method: "POST",
+        headers: { ...WRITE_HEADERS, accept: "text/html" },
+        redirect: "manual",
+      });
+      assert.equal(confirm.status, 303, "确认走的同一条触发通道 ⇒ 受理成功同样 303 回详情页");
+      assert.equal(confirm.headers.get("location"), "/features/F1");
+
+      const followed = await turnPost(base, { ...WRITE_HEADERS, accept: "text/html" });
+      assert.equal(followed.status, 200, "浏览器跟随 303 ⇒ 落在详情页");
+      assert.match(followed.text, /轮次进度：<b>第 3 轮 排队中<\/b>/, "落点必须看得见轮次（queued 时队列面查不到位次 ⇒ 只说排队中）");
+
+      const answer = await req(base, "/features/F1/answer", {
+        method: "POST",
+        headers: { ...WRITE_HEADERS, accept: "text/html" },
+        body: new URLSearchParams({ answer: "以 v0.9.0 落" }).toString(),
+      });
+      assert.equal(answer.status, 200, "回答档出的是 agent 的产出（摘要）⇒ 仍整页，不跳转");
+      assert.match(answer.text, /agent 已核对并放行/);
+      assert.equal(faceCalls.answerRequirement.length, 1);
+    },
+    {
+      outcomes: {
+        trigger: QUEUED,
+        confirm: QUEUED,
+        // 303 的落点：台账侧这条排队轮就是详情页要显示的「第 3 轮 排队中」
+        busy: {
+          turnId: "turn-q3",
+          requirementId: "F1",
+          org: "g",
+          contextId: "ctx-1",
+          round: 3,
+          state: "queued",
+          queuedAt: "q",
+          startedAt: null,
+        },
+      },
+    },
+  );
+});
+
+test("N7-HTTP（负向锚）有内容回执仍整页：succeeded 摘要 / awaiting_answer 问题 / turn_failed 根因", async () => {
+  const succeeded = okOutcome("F1", { round: 5, summary: "改造文档已落 doc/v0.9.2/" });
+  await withServer(
+    async (base) => {
+      const res = await turnPost(base, { ...WRITE_HEADERS, accept: "text/html" });
+      assert.equal(res.status, 200);
+      assert.match(res.text, /本轮产出（摘要）/);
+      assert.match(res.text, /改造文档已落 doc\/v0\.9\.2\//, "agent 的回答不得被 303 丢掉");
+    },
+    { outcomes: { trigger: succeeded } },
+  );
+
+  const awaiting = okOutcome("F1", {
+    disposition: "awaiting_answer",
+    state: "awaiting_answer",
+    summary: null,
+    question: "改造文档以哪个版本落？",
+    display: "需要你回答",
+  });
+  await withServer(
+    async (base) => {
+      const res = await turnPost(base, { ...WRITE_HEADERS, accept: "text/html" });
+      assert.equal(res.status, 200);
+      assert.match(res.text, /要你回答的问题/);
+      assert.match(res.text, /改造文档以哪个版本落？/);
+    },
+    { outcomes: { trigger: awaiting } },
+  );
+
+  const failed = okOutcome("F1", {
+    ok: false,
+    disposition: "turn_failed",
+    state: "failed",
+    summary: null,
+    error: { code: "turn_failed", message: "后端 agent 未收敛" },
+    display: "本轮失败",
+  });
+  await withServer(
+    async (base) => {
+      const res = await turnPost(base, { ...WRITE_HEADERS, accept: "text/html" });
+      assert.equal(res.status, 502, "失败不伪装成 2xx，也不借 303 把根因藏掉");
+      assert.match(res.text, /后端 agent 未收敛/);
+    },
+    { outcomes: { trigger: failed } },
+  );
+});
+
+test("N7-页面 详情页轮次进度：在飞轮 ⇒「第 N 轮 在飞」；排队轮 ⇒ 队列位次", async () => {
+  const running = {
+    turnId: "turn-run",
+    requirementId: "F1",
+    org: "g",
+    contextId: "ctx-1",
+    round: 4,
+    state: "running",
+    queuedAt: "q",
+    startedAt: "s",
+  };
+  await withServer(
+    async (base, _c, faceCalls) => {
+      const res = await req(base, "/features/F1");
+      assert.equal(res.status, 200);
+      assert.match(res.text, /轮次进度：<b>第 4 轮 在飞<\/b>/);
+      assert.match(res.text, /<span class="mono">turn-run<\/span>/);
+      assert.equal(faceCalls.queueView.length, 0, "在飞不查队列（没有位次可言）");
+    },
+    { outcomes: { busy: running } },
+  );
+
+  const waiting = {
+    turnId: "turn-queue",
+    requirementId: "F1",
+    org: "g",
+    contextId: "ctx-1",
+    round: 2,
+    state: "queued",
+    queuedAt: "q",
+    startedAt: null,
+  };
+  await withServer(
+    async (base) => {
+      const res = await req(base, "/features/F1");
+      assert.match(res.text, /轮次进度：<b>第 2 轮 排队中 · 队列第 2 位<\/b>/);
+    },
+    {
+      outcomes: {
+        busy: waiting,
+        queue: {
+          org: "g",
+          running: { turnId: "turn-other", requirementId: "F2", taskId: "t", startedAt: "s" },
+          waiting: [
+            { turnId: "turn-a", requirementId: "F3", queuedAt: "q1", display: "排队中" },
+            { turnId: "turn-queue", requirementId: "F1", queuedAt: "q2", display: "排队中" },
+          ],
+          capacity: 1,
+        },
+      },
+    },
+  );
+});
+
+test("N7-页面（负向）无在飞 / 排队轮 ⇒ 不渲染进度行；队列面里查不到这条轮 ⇒ 不臆造位次", async () => {
+  await withServer(async (base) => {
+    const res = await req(base, "/features/F1");
+    assert.doesNotMatch(res.text, /轮次进度：/);
+  });
+
+  const waiting = {
+    turnId: "turn-gone",
+    requirementId: "F1",
+    org: "g",
+    contextId: "ctx-1",
+    round: 1,
+    state: "queued",
+    queuedAt: "q",
+    startedAt: null,
+  };
+  await withServer(
+    async (base) => {
+      const res = await req(base, "/features/F1");
+      assert.match(res.text, /轮次进度：<b>第 1 轮 排队中<\/b>/, "队列面没有它 ⇒ 只说排队中，不给位次");
+      assert.doesNotMatch(res.text, /队列第/);
+    },
+    { outcomes: { busy: waiting } },
+  );
+});
+

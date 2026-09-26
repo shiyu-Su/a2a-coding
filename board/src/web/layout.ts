@@ -2,7 +2,9 @@
  * 板页面模板骨架（BD3）—— 照 `orch/bridge/web/html.ts` 路线：
  * **同源、无构建、无框架**（内联 style、单文件模板字面量）。BD14 起文档页另可引用**一条同源
  * vendored 资产**（`/static/mermaid.min.js`，CSP 放宽见 {@link BOARD_CSP}），仍无任何外源主机。
- * 服务器端渲染；页面脚本 = **零依赖的一段内联提交守卫**（收口轨 14，见 {@link SUBMIT_GUARD_SCRIPT}）；
+ * 服务器端渲染；页面脚本 = **白名单化内联字面量常量**（无 `src=`、不含用户数据、单点常量可审计；
+ * 纪律钉 = `test/n3-regression-anchors.test.mjs` N3-⑦/⑧，闭集 = 提交守卫 {@link SUBMIT_GUARD_SCRIPT}
+ * + 错误浮层关闭 + mermaid 渲染 + 排期页详情浮层 {@link FEATURE_DETAIL_OVERLAY_SCRIPT}）；
  * 刷新 = 浏览器重载。
  */
 import { readVersion } from "../version.js";
@@ -20,9 +22,15 @@ import { readVersion } from "../version.js";
  * 故 `script-src` 追加 `'self'`。放宽面**仅此一条**：`'self'` = 同源（板恒绑 loopback），
  * 仍无任何外源主机可加载；`default-src 'none'` / `style-src` / `base-uri` / `form-action` 未动，
  * 文档内容不进 `<script>` 字面量（mermaid 源文本走 `<script type="application/json">` 安全通道）。
+ *
+ * **增补轨 2 的第三次明示放宽**：排期页详情浮层（{@link FEATURE_DETAIL_OVERLAY_SCRIPT}）以
+ * `fetch(同 URL)` 拉取整页再摘取详情区，而本 CSP 此前**无 `connect-src` 指令** ⇒ 回落到
+ * `default-src 'none'`，同源 fetch 被浏览器静默拦截、浮层永远走降级整页导航。
+ * 故新增 **`connect-src 'self'`**：仅放行**同源**请求（板恒绑 loopback），仍无任何外源主机
+ * 可被 fetch；其余指令一概未动。
  */
 export const BOARD_CSP =
-  "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'self'; base-uri 'none'; form-action 'self'";
+  "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'";
 
 /**
  * 本板文档的 Referer 送出策略（BD17）：**同时**以响应头与 `<meta name=referrer>` 给出（同值单点）。
@@ -45,7 +53,7 @@ export function escapeHtml(value: unknown): string {
     .replace(/'/g, "&#39;");
 }
 
-export type NavKey = "features" | "tasks" | "projects" | "host";
+export type NavKey = "features" | "schedule" | "tasks" | "projects" | "orgs" | "host";
 
 /**
  * **提交守卫**（收口轨 14 ①）：页面全部写表单共用的**一段内联脚本**。
@@ -80,10 +88,191 @@ export const SUBMIT_GUARD_SCRIPT = `<script>
 })();
 </script>`;
 
+/**
+ * **排期页详情浮层脚本**（REQ-v0.9.2-2026-09-26-02 增补 ④）：渐进增强 —— 卡片标题仍是
+ * `<a href="/features/:id">`（禁 JS / 脚本失效 = 整页详情，回退面不受影响）。JS 可用时，
+ * 委托监听 `.kcard` 内指向详情页的链接点击：`preventDefault()` → fetch 同 URL →
+ * `DOMParser` 抽 `<main>` 内层 → 节点搬进 `#feat-dialog` 的 body（不用 innerHTML 字符串
+ * 重解析）→ `showModal()`；fetch 失败 / 响应非 2xx / 解析不到 `<main>` ⇒ 降级为原生导航
+ * （`location.href`）。
+ *
+ * **浮层内导航**（增补轨 · 本轮修根因）：委托同时拦截 `#feat-dialog` 内任意同源内部链接
+ * （`a[href^="/"]` 且无 `target` 属性）—— 文档页 /「回到需求详情」/ 渲染原文切换等点击
+ * 同样 fetch + 抽 `<main>` 替换 body，URL 不变，降级口径同上。两分支互斥：dialog 内
+ * 链接先命中浮层分支（卡片在 dialog 外，不受影响）。
+ *
+ * **`Accept: "text/html"` 不是装饰，是这个分支能否工作的条件**（真浏览器反馈的根因）：
+ * 文档读面 `GET /features/:id/docs` 按 `Accept` **双档分流**（`server.ts` 的 `handleFeatureDoc`：
+ * 含 `text/html` ⇒ 整页；否则 ⇒ `text/plain` 原文）。而 `fetch()` 缺省的 `Accept` 是通配
+ * （不含 `text/html`）⇒ 拿到的是纯文本 ⇒ `DOMParser` 里**没有 `<main>`** ⇒ 走 `fallback()`
+ * **整页跳转**
+ * —— 分支代码在、`preventDefault()` 也调了，用户看到的仍是跳页（详情页 / 排期页两条路由
+ * 无 Accept 分流，所以卡片打开浮层一直是好的，只有文档链跳）。故两处 fetch **必须**显式声明
+ * `Accept: "text/html"`；缺省头一恢复即回归本缺陷（锚见 `test/schedule-page.test.mjs` N2-⑥/⑦）。
+ *
+ * **浮层内表单提交 = 浮层内完成**（增补轨 · 推翻旧「不拦截」口径）：委托 `submit` 事件，
+ * **只拦 `#feat-dialog` 内的 POST 表单**（触发一轮 / 发送确认指令 / 澄清回答 / 保存排期）→
+ * `preventDefault()` → `fetch(form.action, POST, body)`。响应分两档：
+ * **2xx/3xx（含 303 自动跟随后的最终页）⇒ 抽 `<main>` 换入浮层 body**（详情在浮层内刷新）；
+ * **4xx/5xx ⇒ 不替换 body**（保表单与已填输入），只抽 `.err-ov-card` **作为 dialog 的直接子元素
+ * 叠加**（`position: fixed` 居中 + 超大 spread shadow 当遮罩 ⇒ 悬浮在浮层内容之上，**不挤占
+ * `.fd-body` 文档流**；dialog 在 top-layer 内，fixed 相对视口生效，样式见 `dialog.fd > .err-ov-card`），
+ * 「知道了」点击经委托摘卡（浮层不关），用户可改后重提交 —— 旧口径「错误页 main 也换入 body」
+ * 作废（那是「重复内容」缺陷的根因：表单页主体 + 错误卡两份）；旧口径「错误卡前置进 `.fd-body`」
+ * 同样作废（那是「错误卡出现在弹窗页最上面而非上层」的根因 —— 挤进内容流、把表单顶下去）。
+ * 抽不到 `.err-ov-card`
+ * ⇒ 回退为「换入错误页 main」（现行为，保错误信息不丢）。
+ * 搬入的错误卡里「知道了」按钮的原页面脚本不会执行（搬运节点不跑 `<script>`），
+ * 故本脚本自带一条委托把它摘掉卡片。浮层内换页 / 换入新内容（{@link swapPage}）时先摘残留的
+ * 叠加卡（{@link dropCard}），不让旧错误卡在 top-layer 上钉死。
+ * 编码纪律：**body 必须 urlencoded**
+ * （`new URLSearchParams(new FormData(form))`）—— 服务端写面用 `new URLSearchParams(raw)` 解析，
+ * `FormData` 直投会发成 `multipart/form-data` ⇒ 字段全丢。fetch 网络异常 / 响应结构不可解析
+ * ⇒ 降级 `form.submit()` 原生提交（行为同无 JS；此前不动 body，表单仍在文档内，submit 可执行）。
+ * **提交后的表单状态恢复**（{@link restoreForm}）：{@link SUBMIT_GUARD_SCRIPT} 在 submit 时禁用
+ * 提交按钮并挂 `.submit-pending` 提示行，其复位依赖「整页跳转后新页面自然复位」—— 浮层内提交
+ * **不跳页**，故本脚本在响应处理完之后对该 form 主动恢复（重新启用 `button[disabled]` + 摘提示行）；
+ * 错误路径必须恢复（用户要改后重提），成功路径 body 已被替换 ⇒ 恢复落在已摘走的表单上，自然无效。
+ * 降级 `form.submit()` **之前**同样先恢复（防「禁用态提交」与后续 UI 卡在灰态）。
+ * CSRF 不因此改变：同源 fetch 自动带 `Origin`（`Referrer-Policy: same-origin` 下另带同源
+ * `Referer`），`checkWriteAuth` 两档原样工作；连点防护仍靠 {@link SUBMIT_GUARD_SCRIPT}
+ * （与本脚本同事件、不同注册点，`preventDefault()` 不互相阻断）+ 服务端 409 硬闸。
+ * 卡片分支与浮层外一切表单**不变**（无 JS 回退面保持整页 POST）。
+ * 脚本字面量本身不含用户数据 ⇒ 无注入面
+ * （与 {@link SUBMIT_GUARD_SCRIPT} 同规格：单点常量、纯内联、无 `src=`、无 `</script` 字面量）。
+ */
+export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
+(function () {
+  var dlg = document.getElementById("feat-dialog");
+  if (dlg === null || typeof dlg.showModal !== "function" || typeof fetch !== "function") return;
+  var body = dlg.querySelector(".fd-body");
+  var lastHref = "";
+  function fallback(a) { window.location.href = a.href; }
+  function restoreForm(form) {
+    var btns = form.querySelectorAll("button[disabled]");
+    for (var i = 0; i < btns.length; i += 1) {
+      btns[i].disabled = false;
+      btns[i].removeAttribute("aria-disabled");
+    }
+    var p = form.querySelector(".submit-pending");
+    if (p !== null && p.parentNode !== null) { p.parentNode.removeChild(p); }
+  }
+  function nativeSubmit(form) { restoreForm(form); form.submit(); }
+  function parsePage(html) {
+    var doc = new DOMParser().parseFromString(html, "text/html");
+    return { main: doc.querySelector("main"), card: doc.querySelector(".err-ov-card") };
+  }
+  function dropCard() {
+    var kids = dlg.children;
+    for (var i = kids.length - 1; i >= 0; i -= 1) {
+      if (kids[i].classList.contains("err-ov-card") && kids[i].parentNode !== null) { kids[i].parentNode.removeChild(kids[i]); }
+    }
+  }
+  function showCard(card) {
+    dropCard();
+    dlg.appendChild(card);
+    if (!dlg.open) dlg.showModal();
+  }
+  function swapPage(html) {
+    var parsed = parsePage(html);
+    var main = parsed.main;
+    var card = parsed.card;
+    if (main === null && card === null) return false;
+    dropCard();
+    if (body !== null) {
+      while (body.firstChild !== null) { body.removeChild(body.firstChild); }
+      if (card !== null) { body.appendChild(card); }
+      if (main !== null) { while (main.firstChild !== null) { body.appendChild(main.firstChild); } }
+    }
+    if (!dlg.open) dlg.showModal();
+    return true;
+  }
+  function open(a, toggle) {
+    var href = a.getAttribute("href") || "";
+    if (toggle && href === lastHref && dlg.open) { dlg.close(); dlg.returnValue = ""; return; }
+    dlg.returnValue = "";
+    if (body !== null) body.textContent = "加载中…";
+    fetch(href, { credentials: "same-origin", headers: { Accept: "text/html" } }).then(function (res) {
+      if (!res.ok) { fallback(a); return null; }
+      return res.text();
+    }).then(function (text) {
+      if (text === null || text === undefined) return;
+      if (swapPage(text)) { lastHref = href; } else { fallback(a); }
+    }).catch(function () { fallback(a); });
+  }
+  function postForm(form) {
+    var data;
+    try { data = new URLSearchParams(new FormData(form)); } catch (err) { data = null; }
+    if (data === null) { nativeSubmit(form); return; }
+    dlg.returnValue = "";
+    fetch(form.action, {
+      method: "POST",
+      body: data,
+      credentials: "same-origin",
+      headers: { Accept: "text/html" },
+    }).then(function (res) {
+      if (!res.ok) { return res.text().then(function (text) { return { err: true, text: text }; }); }
+      return res.text().then(function (text) { return { err: false, text: text }; });
+    }).then(function (r) {
+      if (r.err) {
+        var parsed = parsePage(r.text);
+        if (parsed.card !== null) { showCard(parsed.card); return; }
+        if (!swapPage(r.text)) { nativeSubmit(form); }
+        return;
+      }
+      if (!swapPage(r.text)) { nativeSubmit(form); }
+    }).then(function () {
+      restoreForm(form);
+    }).catch(function () { nativeSubmit(form); });
+  }
+  document.addEventListener("click", function (e) {
+    var t = e.target;
+    if (t === null || typeof t.closest !== "function") return;
+    var dismiss = t.closest("#feat-dialog #err-ov-close");
+    if (dismiss !== null) {
+      e.preventDefault();
+      var card = dismiss.closest(".err-ov-card");
+      if (card !== null && card.parentNode !== null) { card.parentNode.removeChild(card); }
+      return;
+    }
+    var nav = t.closest('#feat-dialog a[href^="/"]');
+    if (nav !== null) {
+      if (nav.hasAttribute("target")) return;
+      e.preventDefault();
+      open(nav, false);
+      return;
+    }
+    var a = t.closest('a[href^="/features/"]');
+    if (a === null || a.closest(".kcard") === null) return;
+    e.preventDefault();
+    open(a, true);
+  });
+  document.addEventListener("submit", function (e) {
+    var form = e.target;
+    if (form === null || typeof form.closest !== "function") return;
+    if (form.closest("#feat-dialog") === null) return;
+    if ((form.getAttribute("method") || "").toLowerCase() !== "post") return;
+    e.preventDefault();
+    postForm(form);
+  });
+  var closeBtn = document.getElementById("feat-dialog-close");
+  if (closeBtn !== null) closeBtn.addEventListener("click", function () { dlg.close(); dlg.returnValue = ""; });
+  dlg.addEventListener("cancel", function () { dlg.returnValue = ""; });
+  dlg.addEventListener("click", function (e) {
+    if (e.target !== dlg) return;
+    var r = dlg.getBoundingClientRect();
+    var inBox = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+    if (!inBox) { dlg.close(); dlg.returnValue = ""; }
+  });
+})();
+</script>`;
+
 const NAV: ReadonlyArray<{ key: NavKey; href: string; text: string }> = [
-  { key: "features", href: "/", text: "需求" },
+  { key: "features", href: "/requirements", text: "需求" },
+  { key: "schedule", href: "/schedule", text: "排期" },
   { key: "tasks", href: "/tasks", text: "任务" },
   { key: "projects", href: "/projects", text: "项目 / 机器" },
+  { key: "orgs", href: "/orgs", text: "组织" },
   { key: "host", href: "/host", text: "宿主桥" },
 ];
 
@@ -98,6 +287,11 @@ export interface PageParams {
   errorOverlay?: ErrorOverlayParams;
 }
 
+export interface ErrorOverlayField {
+  label: string;
+  value: string;
+}
+
 export interface ErrorOverlayParams {
   /** 标题 = 错误码中文族名（views.errorFamilyLabel 给出，无命中回退原文 code） */
   family: string;
@@ -107,16 +301,29 @@ export interface ErrorOverlayParams {
   code: string;
   /** 可选补充行（如「刷新本页重试」），同样转义 */
   hint?: string;
+  /** 回填字段（REQ-v0.9.2 N1）：表单写路径失败时回显用户刚提交值，逐字段转义（空值由调用方省略） */
+  fields?: readonly ErrorOverlayField[];
 }
 
 function renderErrorOverlay(o: ErrorOverlayParams): string {
+  const fields =
+    o.fields === undefined || o.fields.length === 0
+      ? ""
+      : o.fields
+          .map(
+            (x) =>
+              `<p class="err-ov-field"><span class="err-ov-field-label">${escapeHtml(x.label)}</span>` +
+              `<span class="err-ov-field-value mono">${escapeHtml(x.value)}</span></p>`,
+          )
+          .join("\n") +
+        "\n";
   return `<div class="err-ov" id="err-ov" role="alertdialog" aria-modal="true">
 <div class="err-ov-card">
 <h2>${escapeHtml(o.family)}</h2>
 <p>${escapeHtml(o.error)}</p>
 ${o.hint === undefined ? "" : `<p class="hint">${escapeHtml(o.hint)}</p>`}
 <p class="err-ov-code mono">${escapeHtml(o.code)}</p>
-<button type="button" id="err-ov-close">知道了</button>
+${fields}<button type="button" id="err-ov-close">知道了</button>
 </div>
 </div>
 <script>
@@ -176,6 +383,7 @@ export function renderPage(params: PageParams): string {
   button:disabled { opacity: .45; cursor: not-allowed; }
   p.submit-pending { color: #b26a00; font-weight: 600; }
   p.nextstep { border-left: 3px solid #5678; padding: 4px 10px; background: #8881; border-radius: 0 6px 6px 0; }
+  p.turn-progress { border-left: 3px solid #b26a0088; padding: 4px 10px; background: #8881; border-radius: 0 6px 6px 0; color: #b26a00; }
   textarea { resize: vertical; }
   code { background: #8881; padding: 0 3px; border-radius: 3px; }
   .md h1 { font-size: 17px; margin: 18px 0 6px; }
@@ -197,7 +405,25 @@ export function renderPage(params: PageParams): string {
   .err-ov-card h2 { font-size: 15px; margin: 0 0 8px; border: none; color: #b42318; padding: 0; }
   .err-ov-card p { margin: 4px 0; white-space: pre-wrap; word-break: break-word; }
   .err-ov-card .err-ov-code { color: #888; font-size: 11px; }
+  .err-ov-field { font-size: 12px; margin: 2px 0; }
+  .err-ov-field-label { color: #888; margin-right: 6px; }
+  .err-ov-field-value { color: inherit; word-break: break-word; }
   .err-ov-card button { margin-top: 10px; }
+  .kanban { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; padding-bottom: 6px; }
+  .kcol { flex: 0 0 260px; border: 1px solid #8884; border-radius: 6px; background: #8881; padding: 6px 8px 8px; }
+  .kcol > h3 { font-size: 13px; margin: 2px 0 8px; border-bottom: 1px solid #8884; padding-bottom: 4px; }
+  .kcard { border: 1px solid #8884; border-radius: 6px; background: Canvas; padding: 6px 8px; margin: 0 0 6px; font-size: 12px; }
+  .kbadge { float: right; margin-left: 6px; font-size: 11px; color: #567; border: 1px solid #8886; border-radius: 8px; padding: 0 6px; white-space: nowrap; }
+  .vbadge { float: none; cursor: help; }
+  .vbadge.locked { color: #654321; border-color: #a67c52; background: #f3e5d0; font-weight: 600; }
+  .vbadge.wip { color: #25567a; border-color: #5b86a8; background: #e3eef7; }
+  .vbadge.closed { color: #3a5a40; border-color: #6b8f71; background: #e6f0e8; }
+  .kmeta { margin: 4px 0 0; color: #667; font-size: 11px; }
+  dialog.fd { width: min(880px, 92vw); max-height: 86vh; overflow-y: auto; margin: auto; border: 1px solid #8888; border-radius: 8px; padding: 12px 18px 16px; background: Canvas; color: CanvasText; box-shadow: 0 8px 32px #0005; }
+  dialog.fd::backdrop { background: #0006; }
+  dialog.fd > button { margin: 0 0 8px; }
+  dialog.fd .fd-body > h2:first-child { margin-top: 0; }
+  dialog.fd > .err-ov-card { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; z-index: 60; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }
 </style>
 </head>
 <body>

@@ -6,9 +6,9 @@
 
 - **板 = 人的唯一入口**：建需求、提需求、点确认都经板；板架在 orch agent 前面。
 - **独立进程 + 独立进程树 + 端口 3400**（3300 保持只读运维视图不动）。
-- **板不写状态机**：唯一的状态机写是「建需求」那一次 `a2a_feature_create`（v0.9.0 BD7 已经 `POST /requirements` 接线）；`approve` / `advance` / `cancel` 只由编排 agent 经 MCP 执行，板侧连内核路径都不提供。
+- **板不写状态机迁移**：状态机写只有「建需求」那一次 `a2a_feature_create`（v0.9.0 BD7 已 `POST /requirements` 接线）；`approve` / `cancel` 与「把主链 `advance` 到非当前态」只由编排 agent 经 MCP 执行，板侧不提供路径。唯一放开的登记字段写 = `version` 排期写（v0.9.2 M2/M3 · 经 `feature-schedule.ts` 用 advance「`to` = 当前态」特例，仅 `version` 一字段、不携带 stage/approval；HTTP 端点 `POST /features/:id/schedule` 已接线 · **增补 ⑤：本端点与提需求口同受已发版锁执法**）。
 
-> 本 README 描述的当前进度 = **BD1 骨架 + BD3 只读视图 + BD2 建需求封装 + BD4a 宿主桥进程托管 + BD7 写面接线（提需求）+ BD8 宿主轮（触发一轮 / 状态页 / 停桥）+ BD9 人工确认与澄清回答入口 + BD11 组织名进表单（板级配置降为可选默认）+ BD12″ 板配置化（config.json + 模板 + 加载器，argv/env 配置通道撤销）+ BD13″ 板服务化（`scripts/boardctl.mjs` 静默启停 / `POST /shutdown` 优雅停机 / pidfile 板自写 / 日志行级时间戳）+ 收口轨 14 写按钮防误触（内联提交守卫 · 详情页占用轮渲染禁用 · `board_turn_busy` 409 同需求防重）**：最小 HTTP 服务（`GET /health` + 只读页面 + 五条业务写端点 + 一条运维写端点 `POST /shutdown`，见「页面路由」）+ 对桥的**只读** API 客户端 + `createRequirement` 封装 + 「一组织一宿主桥」的起 / 停 / 查 / 空闲回收 + 板侧对话轮台账 + 纯单测。**确认与回答都是「给宿主 agent 的一轮消息」，不是状态机写口**（边界见下）。
+> 本 README 描述的当前进度 = **BD1 骨架 + BD3 只读视图 + BD2 建需求封装 + BD4a 宿主桥进程托管 + BD7 写面接线（提需求）+ BD8 宿主轮（触发一轮 / 状态页 / 停桥）+ BD9 人工确认与澄清回答入口 + BD11 组织名进表单（板级配置降为可选默认）+ BD12″ 板配置化（config.json + 模板 + 加载器，argv/env 配置通道撤销）+ BD13″ 板服务化（`scripts/boardctl.mjs` 静默启停 / `POST /shutdown` 优雅停机 / pidfile 板自写 / 日志行级时间戳）+ 收口轨 14 写按钮防误触（内联提交守卫 · 详情页占用轮渲染禁用 · `board_turn_busy` 409 同需求防重）+ **v0.9.2 排期写面（`POST /features/:id/schedule` · M3）与已发版版本锁（增补 ⑤ · config `releasedVersions` 事实源 · 提需求/排期两写口 409 执法 + 列头 🔒 徽标）**：最小 HTTP 服务（`GET /health` + 只读页面 + 六条业务写端点 + 一条运维写端点 `POST /shutdown`，见「页面路由」）+ 对桥的**只读** API 客户端 + `createRequirement` / `scheduleFeature` 两个 MCP 写封装 + 「一组织一宿主桥」的起 / 停 / 查 / 空闲回收 + 板侧对话轮台账 + 纯单测。**确认与回答都是「给宿主 agent 的一轮消息」，不是状态机写口**（边界见下）。
 
 ## 如何起
 
@@ -54,7 +54,8 @@ npm run restart        # stop + start
 - **`group`（板级默认组织 · 可选默认，BD11 由「必填配置」降级）**：仅当**表单留空**时作为兜底；**未配置不是错误**——板照常起、`GET /host` 与读面不受牵连，只是表单的组织名变成必填。**空串 / 纯空白一律按未配置算**。**绝不猜、绝不回落任何兜底组名**（静默猜组名会把需求建到别的组里去）。
 - **`orgsDir`（组织目录根 · BD8 · §3.8 裁定 9 · BD15 两层分职）**：**配置文件里同样无兜底缺省**：留空 / 缺键 ⇒ **宿主面不装配**：板不去 spawn 任何后端进程，`GET /host` 如实显示「宿主面未装配」，宿主写端点返回结构化 503 `host_face_disabled`。**根 = 部署面配置，必须预先存在**（不存在 / 不是目录 ⇒ 启动期明确 warn + 触发期结构化 503 `board_orgs_dir_missing`，配错必须可见，**板刻意不代建根**）；**`<orgsDir>/<组织名>` = 数据，缺失时由板自动创建**（BD15：触发一轮时代建该组织子目录，用户不必先回终端 `mkdir`；已有目录不碰；建不出来才报 `org_workspace_missing`，文案含**绝对路径 + 根因**）。
 - **`hostKind`（宿主后端 kind · BD8）**：缺省 `claude`。仅作为**新建桥的缺省 kind**（`kind → 后端命令` 的映射唯一事实源在 machine 侧 `getAdapter()`，板不自拼 argv）。**`machineDist`**：machine 运行时产物目录，缺省按仓根推导 `<仓根>/machine/dist`。**`turnTimeoutMs`**：单轮有界等待毫秒，未配置交下游缺省（10 min）。
-- **`repoRoot`（主仓根 · BD10 读文档面）**：「阶段产出」区双源合并 = **源 A** `<repoRoot>/doc/{version}/` ∪ **源 B** `<orgsDir>/<org>/doc/{version}/`，本键只管源 A 的锚点。缺省 = 板根上一级（由模块位置反推，源码与 dist 运行落同一仓根）。不填 = 用推导缺省；非法类型 ⇒ `[config] repoRoot` fail-fast。⚠ **目录不存在不是错误**：列目录按空清单降级（B3 口径），板不代建、启动期不报错。读取受守卫四件套约束（根内收 / version 白名单 `v\d+\.\d+\.\d+` / 仅 `.md` / 256KiB 上限，超限截断标记），见 `src/docs-read.ts`。
+- **`repoRoot`（主仓根 · BD10 读文档面）**：**单文档打开**（`/features/:id/docs?file=`）的**源 A** 锚点 = `<repoRoot>/doc/{version}/`，源 B = `<orgsDir>/<org>/doc/{version}/`。缺省 = 板根上一级（由模块位置反推，源码与 dist 运行落同一仓根）。不填 = 用推导缺省；非法类型 ⇒ `[config] repoRoot` fail-fast。⚠ **目录不存在不是错误**：读取按结构化 `not_found` 降级（B3 口径），板不代建、启动期不报错。读取受守卫四件套约束（根内收 / version 白名单 `v\d+\.\d+\.\d+` / 仅 `.md` / 256KiB 上限，超限截断标记），见 `src/docs-read.ts`。**v0.9.2 按需求归约后本键不再承载目录扫描**（详情页「阶段产出」改由 `decisions` 驱动，板不列 `doc/{版本}/` 全目录）。
+- **`releasedVersions`（已发版锁版清单 · REQ-v0.9.2 增补 ⑤ N1/N2/N3）**：**板前台版本锁的唯一事实源**（人工在发版收尾时登记，语义见 `config/config.json.default` 的 `_releasedVersionsComment`）。**锁判据 = trim 后精确串匹配**（不前缀连坐、不做 semver 归一），命中即锁两条写口：**提需求**（目标 ∈ 锁版 ⇒ 409 `board_version_released`）与**排期写**（`POST /features/:id/schedule` 三分判：现 ∉ 锁版 ∧ 目标 ∈ 锁版 = 入锁拒；现 ∈ 锁版 ∧ 目标 ≠ 现版本 = 出锁拒，**含清空回池**；现 = 目标 ∈ 锁版 = **幂等放行**）。空 version（未排期）恒不参与锁 ⇒ 未排期 ↔ 未锁版间的一切变动照常；**已发版版本内存量的非终态需求仍可触发一轮 / 确认 / 澄清 / 推进收尾**（锁只作用于 `version` 写，不锁生命周期）。缺省（整键删除 / 空数组）⇒ 无锁。⚠ **只锁板前台**，宿主经 MCP 直写 `version` 是已知后门；改动须重启板进程生效。
 - **配置缺失的后果（两句同口径，互不牵连）**：
   - **默认组织未配置 ⇒ 什么都不牵连**（BD11：它已从「写面必填」降为「可选默认」，**启动期零硬失败**）。校验点在**请求期**：表单组织名留空 **且** 无板级默认 ⇒ `POST /requirements` 返回 **400 `board_group_required`**（不猜、不回落）；宿主面在桥侧 `ownerGroup` 也为空、且默认组织也未配置时返回结构化 503 `board_org_not_resolved`（**不猜组织名**）；
   - 组织目录根**未配置也不拒起**：宿主面不装配，起桥 / 触发一类的写端点返回结构化 503 `host_face_disabled`。
@@ -69,8 +70,9 @@ npm run restart        # stop + start
 2. **组织目录** `<orgsDir>/<组织名>` ⇒ 宿主桥 `--workspace`（经 `resolveOrgWorkspace`，含防逃逸校验；**该子目录缺失时由板自动创建** —— BD15，「第一次填写组织名」自此不需要人工先建目录）。
 
 **不包含**：组织管理页 / 增删成员 / 在 machine 侧建 project / 写 `projectGroup` / 改 orch·machine 配置 —— **全归 V2**。
-**板仍不写引擎状态机**：`a2a_feature_approve` / `advance` / `cancel` 三个工具名在 `src/**` 的引用数恒为 **0**
-（`test/requirement.test.mjs` 纪律扫描 + `test/server-write.test.mjs` 的 BD11-⑥ 负向锚：写面白名单里也不存在任何 approve / advance / cancel 路径）。
+**板仍不写引擎状态机迁移**：`a2a_feature_approve` / `a2a_feature_cancel` 两个真·迁移工具名在 `src/**` 的引用数恒为 **0**；
+`a2a_feature_advance` 命中文件集合恒 == **`feature-schedule.ts` 一处**（排期写唯一封装，只借「`to` = 当前态 ∧ 仅 `version`」登记字段特例，不迁移状态机）。
+（`test/requirement.test.mjs` 纪律扫描 + `test/server-write.test.mjs` 的 BD11-⑥ 负向锚：写面白名单里不存在任何 approve / cancel 路径，`/features/:id/advance` 亦非写路径 → 404）。
 
 开发：`npm run typecheck`（0 错）· `npm test`（纯单测，不依赖桥在跑）· `npm run build`。
 
@@ -78,8 +80,11 @@ npm run restart        # stop + start
 
 | 路径 | 方法 | 数据源（桥） | 内容 |
 |---|---|---|---|
-| `/` | GET | `/api/features` | 提需求表单（**含组织名字段** · BD11）+ 需求列表：登记 `stage`+`version`+`approval` + **派生阶段**（`derive.ts` 单点规则）+ 列表自带 `taskCount`（无 N+1）|
-| `/features/:id` | GET | `/api/features/:id` + `:id/trace` + **本地 `doc/` 清单**（`docs-read.ts`） | 需求详情 + **产出登记**（`decisions` 逐条，含 doc 路径者成可点条目）+ 任务列表 + **trace 三面**（在等谁 / 位次 / 为什么没跑）+ **阶段产出**（双源 `.md` 清单 + 分类 / 来源标注）+ 宿主轮表单（触发一轮 / 确认指令；**回答框仅在该需求有 `awaiting_answer` 轮时出现**；**该需求已有在飞 / 排队轮 ⇒ 两按钮渲染为 disabled + 原因**，收口轨 14）|
+| `/` | GET | `/api/features`（**复用列表 `getFeatures()`，零新桥接口**） | **排期看板首页**（REQ-v0.9.2 增补 ④ N1 起；`/schedule` 为本页别名）：**v0.9.2 M4** 板内存按 `version` 归组（`version-order.ts`：semver 数值序、非 `x.y.z` 字典序垫底）；列头 = 版本号 + **版本状态徽标（增补 ⑤ N4 · `version-status.ts`：锁版命中 ⇒「🔒 已发版」、未锁版按派生态 ⇒「进行中」/「已收尾」（增补 ② 补渲染，样式区分：锁=棕 🔒 / 进行中=蓝 / 已收尾=绿），**仅显示提示、不参与执法**，tooltip = 派生 note）** + 卡片数，卡片 = title + 状态徽标 + stage/approval + taskCount（按状态分列不做）；未排期（`trim()===""` 单一判据）不占版本列，集中本页末列「需求池」（M5）。**详情浮层（REQ-v0.9.2-2026-09-26-02 增补 ④）**：点卡片标题 = `FEATURE_DETAIL_OVERLAY_SCRIPT`（页面脚本白名单内联字面量常量之一，见「渲染」段口径）拦截 → fetch 同 URL → 抽详情页 `<main>` 内层搬进 `<dialog>` `showModal()`（Esc / 关闭按钮 / 点 backdrop 收起；fetch 失败降级原生导航）；卡片仍是真 `<a href="/features/:id">` ⇒ **浮层脚本失效 / 链接直达 = 整页详情**（渐进增强回退面）；浮层内同源链接（文档页 / 回到需求详情 / 渲染原文切换）同样在浮层内展示，浮层内表单提交（触发一轮 / 确认 / 保存排期）也在浮层内完成 —— fetch 承接响应：成功（303 跟随后）换入新详情正文，4xx/5xx **不换 body**（表单与已填输入原样保留）、只抽 errorOverlay 卡**叠加为 `<dialog>` 的直接子元素**（`position: fixed` 居中 + 超大 spread shadow 当半透明遮罩 ⇒ 悬浮在浮层内容之上，**不进 `.fd-body` 文档流、不把表单顶下去**；浮层内换页时先摘残留卡，「知道了」摘卡后本表单已由脚本复位〔重新启用提交按钮 + 摘「已提交…」提示行〕⇒ 可改后重提；抽不到卡才回退换入错误页正文）；浮层内提交**不跳页**，故提交守卫的禁用态由 `FEATURE_DETAIL_OVERLAY_SCRIPT` 在响应处理完后主动恢复（降级原生提交前同样先恢复）；两处 fetch **必须带 `Accept: text/html`**（文档读面按 Accept 双档分流，缺省 `*/*` 拿到 `text/plain` 无 `<main>` ⇒ 会降级成整页跳转）；网络异常才回落原生提交 / 原生导航（同无 JS）|
+| `/requirements` | **GET** | `/api/features`（含板内存过滤） | **需求列表页**（增补 ④ N1 起自旧 `/` 迁入）：提需求表单（**含组织名字段** · BD11；**`version` 去必填 · v0.9.2 M6**：留空 = 未排期，建卡即进需求池）+ 需求列表：登记 `stage`+`version`+`approval` + **派生阶段**（`derive.ts` 单点规则）+ 列表自带 `taskCount`（无 N+1）+ 过滤表单。**与下行 POST 同路径双义**（方法门先于页面匹配：同 URL GET ⇒ 列表页、POST ⇒ 建需求）|
+| `/requirements` | **POST** | MCP `a2a_feature_create`（经 `requirement.ts`） | 提需求：建一条初态 `waiting_approval` 的需求（详见下节）|
+| `/schedule` | GET | （同 `/`） | **`/` 的别名**（v0.9.2 M4 曾是本页正主，增补 ④ N1 起首页即看板、本路径保留兼容历史深链）：与 `GET /` 同 kind 同渲染、逐字节同构 |
+| `/features/:id` | GET | `/api/features/:id` + `:id/trace`（**v0.9.2 起不再扫本地 `doc/` 目录**） | 需求详情 + **阶段产出**（**REQ-v0.9.2-2026-09-26-01 按需求归约**：数据源 = 本需求 `decisions`，旧「产出登记」并入本区 ⇒ 逐条渲染、含 `doc/…/*.md` 路径者成可点条目（版本取当前排期值）；**登记的文档版本 ≠ 当前版本 ⇒ 区首渲染失联警示行**（M6，纯文案警示，不新增页面脚本）；**无含 doc 路径的条目 ⇒ 「无（本需求未登记产出）」，不回落版本目录清单**）+ 任务列表 + **trace 三面**（在等谁 / 位次 / 为什么没跑）+ **排期表单（M6 · `POST /features/:id/schedule` 的 GET 面）** + 宿主轮表单（触发一轮 / 确认指令；**回答框仅在该需求有 `awaiting_answer` 轮时出现**；**该需求已有在飞 / 排队轮 ⇒ 两按钮渲染为 disabled + 原因**，收口轨 14）|
 | `/features/:id/docs?file=<name>[&src=A\|B][&mode=render\|raw]` | GET | **本地 `doc/{version}/`**（`docs-read.ts`） | **单文档内容**（BD11 · **BD14 渲染/原文双档**）：版本与归属组织取自桥侧详情（**不接受调用方传版本**）；默认 `text/plain; charset=utf-8` + `no-store` 原文直出（`text/plain` 档不受 `mode` 影响），`Accept: text/html` ⇒ 整页：**缺省 `mode=render`**（markdown 子集渲染 + ```mermaid 围栏走流程图渲染），**`mode=raw`** ⇒ 现行 `<pre>` 转义原文，页头两档互链。守卫 = 四件套（根内收 / version 白名单 / 仅 `.md` / 256KiB 截断），越界或缺失 ⇒ **400 / 404 且响应不携根路径** |
 | `/static/<名>` | GET | **本地 vendored 资产**（`src/web/static/`，白名单闭集 `docs-render.VENDORED_ASSETS`） | **BD14 · 第三方静态资产端点**（当前唯一 = `mermaid.min.js`）：文件名精确匹配白名单，白名单外 / 越界段 / 缺文件 ⇒ **404**（不列目录、不越界读）；非 GET ⇒ 405。响应带同源 CSP（`script-src 'self'` 放行加载） |
 | `/tasks[?project=]` | GET | `/api/tasks`（`project` 桥侧必填） | 任务视图（无参 = 选单页）|
@@ -90,11 +95,12 @@ npm run restart        # stop + start
 | `/host/:org/stop` | **POST** | 同上（进程侧） | 停桥（BD8）|
 | `/features/:id/confirm` | **POST** | 同 turn 通道（`triggerTurn(kind=confirm)`） | 人工确认指令：投「用户已确认改造文档，请核对后执行放行」的一轮消息给宿主 agent（BD9，**板不批准**）；占用时同 **409 `board_turn_busy`**（收口轨 14）|
 | `/features/:id/answer` | **POST** | `answerTurn`（同 `contextId` 续推） | 澄清回答：仅当最新轮 `awaiting_answer` 可投，否则结构化 409（BD9）；占用时同 **409 `board_turn_busy`**（收口轨 14）|
+| `/features/:id/schedule` | **POST** | MCP `a2a_feature_advance`（经 `feature-schedule.ts` 唯一封装，「`to` = 当前态」特例） | **排期写（v0.9.2 M3 · 唯一放开的登记字段 `version` 写）**：表单 `version` 键必传（空串 = 清空回池，服务端 `trim()`）；身份 = 该需求 `ownerGroup`（缺失 ⇒ 503 `board_schedule_owner_group_missing`，**绝不回落板级默认组**）；**已发版锁（增补 ⑤ N3）**= 出网前「现版本 × 目标版本」三分判：入锁 / 出锁（含清空）⇒ **409 `board_version_released`**（回填目标 + 现版本）、同锁版无变化 ⇒ **幂等放行**；桥拒 ⇒ 502 如实弹（不自动重试）；成功 = PRG 303 回详情页 / JSON 档 200|
 | `/shutdown` | **POST** | （不触桥；本板进程） | **运维路径**：优雅停机 —— 先停宿主桥 → 关卡口 → 删 pidfile；**仅 loopback 来源**（否则 403 `loopback_only`），**200 = 受理 ≠ 已停**（BD13″）|
 
-**方法门是白名单，不是一刀切**：读面仅 GET，写面只放开上表五条业务 POST（`write-guard.isWriteRoute`，清单单点 = `WRITE_ROUTES`）；其余任何路径 × 任何非 GET 方法一律 405，未知路径 404。**`POST /shutdown` 不在这条业务白名单里** —— 它是同服务上单独登记的**运维路径**（不经 CSRF 守卫头，改以「socket 远端地址必须 loopback」把关，非 loopback 一律 403）。板**不写状态机** —— 无 approve / advance / cancel 任何路径：确认与回答都只是**给宿主 agent 的一轮消息**，状态机推进归编排 agent（`src/**` 对三个状态推进工具名的引用数 = 0，由 `test/requirement.test.mjs` 纪律扫描钉死）。
+**方法门是白名单，不是一刀切**：读面仅 GET，写面只放开上表六条业务 POST（`write-guard.isWriteRoute`，清单单点 = `WRITE_ROUTES`）；其余任何路径 × 任何非 GET 方法一律 405，未知路径 404。**`POST /shutdown` 不在这条业务白名单里** —— 它是同服务上单独登记的**运维路径**（不经 CSRF 守卫头，改以「socket 远端地址必须 loopback」把关，非 loopback 一律 403）。板**不写状态机迁移** —— 无 approve / cancel 任何路径、也不把主链 `advance` 到非当前态：确认与回答都只是**给宿主 agent 的一轮消息**，状态机推进归编排 agent（`src/**` 对 approve / cancel 两个迁移工具名引用数 = 0，`a2a_feature_advance` 只收敛于 `feature-schedule.ts` 一处排期写封装，由 `test/requirement.test.mjs` 纪律扫描钉死；`version` 排期写端点 `POST /features/:id/schedule` = 该封装的唯一 HTTP 前台，**已发版锁版在此端点与提需求口一并执法**，见「配置项」`releasedVersions`）。
 
-**读文档面（BD11 · 唯一的本地读面扩权）**：`/features/:id` 的「阶段产出」「产出登记」两区与 `/features/:id/docs` 让板**第一次读本地文件**。它是**纯读**（不写文件、不改 `orgsDir`，恒 GET ⇒ 不过 CSRF，与其余读面同口径），且参数只能落到 `doc/{version}/*.md` 子树：版本段白名单 `v\d+\.\d+\.\d+`、文件名段卫生 + `.md` 闭集、resolve 后根内收核验（Windows 大小写不敏感）、256KiB 读上限（超限截断提示）。任一不过 ⇒ 结构化降级（区块显示「无」/ 400 / 404），**降级不报错、响应不携根路径**。`decisions` 里提取到的路径**只作展示**，打开仍走上述守卫。
+**读文档面（BD11 · 唯一的本地读面扩权）**：`/features/:id` 的「阶段产出」区与 `/features/:id/docs` 让板**第一次读本地文件**。它是**纯读**（不写文件、不改 `orgsDir`，恒 GET ⇒ 不过 CSRF，与其余读面同口径），且参数只能落到 `doc/{version}/*.md` 子树：版本段白名单 `v\d+\.\d+\.\d+`、文件名段卫生 + `.md` 闭集、resolve 后根内收核验（Windows 大小写不敏感）、256KiB 读上限（超限截断提示）。任一不过 ⇒ 结构化降级（区块显示「无」/ 400 / 404），**降级不报错、响应不携根路径**。`decisions` 里提取到的路径**不进条目展示**（v0.9.2 条目样式简化：条目 = 单链接、文字为剥去 `doc/{版本}/` 后的文件名），打开仍走上述守卫。**v0.9.2 按需求归约**：区块条目 = 本需求 `decisions` 登记（不再由目录扫描得出），`docs-read.ts` 的 `listDocs` / `classifyDoc` 已作废删除，板本地读收窄为**单文件读取**一条路径。
 
 ### 文档渲染与 vendored 静态资产（BD14 · REQ-v0.9.1-2026-09-25-04 增补）
 
@@ -125,9 +131,10 @@ npm run restart        # stop + start
 
 ### 写端点 `POST /requirements`（BD7）
 
-- **入参**（`application/x-www-form-urlencoded`）：`group`（**BD11 起进表单**：本条需求的组织名；留空则用板级默认组织）/ `title`（必填）/ `version`（必填）/ `requirement`（可选）。
-  - 空 `title` 或空 `version` ⇒ **400 `requirement_form_invalid`**；
+- **入参**（`application/x-www-form-urlencoded`）：`group`（**BD11 起进表单**：本条需求的组织名；留空则用板级默认组织）/ `title`（必填）/ `version`（**v0.9.2 M6 起去必填**：留空 = 未排期，建卡后进需求池；发送前 `trim()`，空白串归一为空 ⇒ 不会自成一「空格版本列」）/ `requirement`（可选）。
+  - 空 `title` ⇒ **400 `requirement_form_invalid`**（M6 起空 `version` 不再 400）；
   - `group` 留空 **且** 板级默认组织未配置 ⇒ **400 `board_group_required`**（校验点在**请求期**，文案给出可照做的两条路：表单填组织名 / 配 `config.json` 的 `group`）；
+  - `version` 命中已发版锁（config `releasedVersions` · **增补 ⑤ N2**）⇒ **409 `board_version_released`**（零出网不建卡，错误浮层回填「版本」字段）；
   - 全部校验先于任何出网调用（不静默创建）。请求体上限 256 KiB，超限 413。
 - **成功回显**：浏览器表单 ⇒ **303 跳转 `/features/:id`**（PRG 三态码，刷新不重复建，且复用既有只读详情页作结果页）；API 调用方带 `accept: application/json` ⇒ **201 + `{featureId, group, state, stage, version, approval}`**（`group` = 本条实际生效的组织名，归属可核对）。
 - **失败透传**：桥的业务错误码（`feature_invalid_stage` / `project_not_a_member` …）与传输异常（`transport_error`）一律**原样结构化透出**（HTTP 502 + `{ok:false, code, error}`），不吞、不改写成通用错误。
@@ -137,9 +144,10 @@ npm run restart        # stop + start
   两档皆不成立 ⇒ 403，**两个码可分辨**（`write_guard_origin_unknown` = Origin 与 Referer 皆不可用，文案给出可操作的三条补救：板上表单 / API 带 `X-Board-Write` 头 / 浏览器白名单；`write_guard_origin` = **有名 Origin 且不同源**，明确跨站，**恒拒不放宽**）。CSRF 判定**先于**读请求体与板配置检查，未认证请求既不消耗 body 也不泄露「组配了没」。
 - **`Referrer-Policy` = `same-origin`（BD17 · 兜底信号的前提）**：板**同时**以响应头 `Referrer-Policy: same-origin` 与页面内 `<meta name="referrer" content="same-origin">` 给出（同值单点 = `web/layout.ts` 的 `BOARD_REFERRER_POLICY`）。**不得回退成 `no-referrer`** —— 那会让浏览器连**同源表单提交都不发 `Referer`**，而 `Origin` 在隐私扩展 / sandboxed iframe 下可能就是字面 `null`，两档来源信号同时归零 ⇒ 板把自己的「页面上提交需求」这条路掐死（收口轨 11 修的是判定，轨 12 修的是信号源）。`same-origin` **不削弱 CSRF**：跨站请求本来就发不出可冒充同源的 `Referer`，第一档自定义头同样发不出。
 - **为什么不是「只认自定义头」**：HTML 表单**不能**携带自定义请求头（规范限制），而列表页要求同源、无构建、**不依赖 JS**（收口轨 14 加的那段内联守卫只是体验层，脚本被禁用 / 失效时表单档必须照样能提交）。故采用上面的 (2) 档：**表单走同源 Origin 校验，自定义头留给 API 调用方**。
-- **对 CSP 的影响（收口轨 14 + BD14 · 两处**明示**放宽）**：
+- **对 CSP 的影响（收口轨 14 + BD14 + 增补轨 2 · 三处**明示**放宽）**：
   - **轨 14（第一次）**：写表单提交后是整页跳转 + 服务端同步等（触发一轮可跑数分钟），期间零反馈 ⇒ 用户连点。页面因此新增**一段同源内联脚本**（提交守卫，单点常量 = `web/layout.ts` 的 `SUBMIT_GUARD_SCRIPT`，**逐字节同一份、每页注入一次、不含用户数据 ⇒ 无注入面**），CSP 相应新增 `script-src 'unsafe-inline'`（与既有 `style-src` 同款内联程度）。守卫**只是体验层**：禁用本表单的提交按钮 + 就地显示「已提交…」，整页跳转后自然复位；**无 JS / 脚本失效时表单照常提交**，CSRF 两档判定也**不依赖它**，服务端防重另有 `board_turn_busy` 409 硬闸。
   - **BD14（第二次 · 板 CSP 首次从「无外源脚本」放宽到「可加载同源脚本」）**：文档页渲染 ```mermaid 流程图需加载**同源 vendored 资产**（`/static/mermaid.min.js`），故 `script-src` 追加 **`'self'`**：最终 = **`script-src 'unsafe-inline' 'self'`**。放宽面**仅此一条**：`'self'` = **同源**（板恒绑 loopback，无外网主机可被加载），仍 **无任何外源主机 / 无 `*`**；`default-src 'none'` / `style-src 'unsafe-inline'` / `base-uri 'none'` / `form-action 'self'` **四条一律不动**。文档内容**不进 `<script>` 字面量**——mermaid 源文本经 `<script type="application/json">` 安全通道注入（页面脚本 `textContent → JSON.parse` 取回，不拼 HTML），且 mermaid 以 `securityLevel:'strict'` 初始化（详见下节）。
+  - **增补轨 2（第三次 · REQ-v0.9.2-2026-09-26-02 · 用户真浏览器反馈）**：排期页详情浮层（增补 ④ · `FEATURE_DETAIL_OVERLAY_SCRIPT`）以 `fetch(同 URL)` 拉整页再摘取详情区，而本 CSP 此前**无 `connect-src` 指令** ⇒ 按 CSP 规范回落 `default-src 'none'`，**同源 fetch 被浏览器静默拦截**（无控制台错误可依赖），浮层总是走降级整页导航。故新增 **`connect-src 'self'`**：最终 = **`default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'`**。放宽面**仅此一条**：`'self'` = **同源**（板恒绑 loopback，fetch 打不到外源主机）；不带 `unsafe-inline` 之外的任何新增档位，其余指令（含前两次放宽的 `script-src` 两档）**一律不动**。断言钉 = `test/web.test.mjs`「增补轨2-CSP」正例锚 + `test/server-write.test.mjs` 响应头全串精确断言。
 
 ### 写端点 `confirm` / `answer`（BD9 · 人工确认入口 + 澄清回答入口）
 
@@ -148,10 +156,12 @@ npm run restart        # stop + start
 - `POST /features/:id/confirm` —— 「人工确认」= 板把「用户已确认改造文档，请核对后执行放行（approve 语义）」作为**一轮消息**投给该需求的宿主 agent（`BoardHostFace.confirmTurn` = `triggerTurn(kind=confirm)`），**由 agent 决定是否真的放行**：条件不满足（如 approval 非「待审批」）agent 会拒绝放行并回报原因，结果如实回显（含 agent 回复摘要 / 错误码）。详情页按钮文案诚实标注「给 agent 的指令 · 不存在『板上批准』」。
 - `POST /features/:id/answer`（body `answer=…`）—— 「澄清回答」**仅当**该需求**最新一轮**处于 `awaiting_answer`（= 桥的 `input-required`）时可用：经 `answerTurn` 续推**同一 `contextId`**（组织取该轮记录的 `org`，不重猜）；否则结构化拒绝 **409 `board_no_awaiting_turn`**（一条消息都不投、不起桥）；空答案 ⇒ **400 `answer_empty`**。回答框仅在适用时渲染（判据 = `awaitingTurnOf`）。
 - 结局分流沿用 `dispositionHttpStatus` 单点：`succeeded/awaiting_answer/canceled` ⇒ 200 · `queued` ⇒ 202 · `not_awaiting` / **`busy`** ⇒ 409 · `bridge_down/turn_failed` ⇒ 502 · `timeout` ⇒ 504 · `config_error` ⇒ 503。
+- **HTML 档的受理成功改 303（REQ-v0.9.2 N7）**：`Accept` 为表单档且结局 = **`queued`（受理成功、本轮排队未开跑）** ⇒ **303 跳转 `/features/:id`**（PRG，同 `POST /requirements` 先例 —— 该档结果页除「排队中」外无内容，详情页的轮次进度行才是它该有的落点，刷新也不重复烧一轮）。**有内容回执的档仍出整页**：`succeeded` 摘要 / `awaiting_answer` 问题原文 / 各失败档根因，跳转会把 agent 的回答与失败原因丢掉。JSON 档不受影响（`queued` 照旧 202 + 结构化载荷）。
+- **详情页轮次进度行（REQ-v0.9.2 N7）**：该需求有在飞 / 排队轮时，详情页在「下一步」引导行下方渲染一行 `轮次进度：第 N 轮 在飞` / `第 N 轮 排队中 · 队列第 K 位`（数据 = 板侧轮台账 `round` + 该桥队列可见面 `waiting`，**位次查不到就不显示位次、不臆造**；规则源 = `derive.ts` 的 `deriveTurnProgress`）。**不做 meta-refresh / 自动刷新**（页面脚本 = 白名单化内联字面量常量（无 `src=`、不含用户数据、单点常量可审计；纪律钉见增补 ④ N3），自动刷新不在闭集内 + 与 ~30s 调度拍错拍，登记 planlog 遗留），刷新方式 = 重载本页，文案已写明。
 - **同需求防重（收口轨 14 ③）**：`turn` / `confirm` / `answer` 三入口在**该需求已有在飞或排队轮**时一律 **409 `board_turn_busy`**（与 `board_no_awaiting_turn` 同族、同 `error{code,message}` 形状，载荷回显**占用轮**的 `turnId` / `round` / `state`，HTML 与 JSON 同码），**不起桥、不发轮、不重复入队**。占用判据 = `running` ∨ `queued` 两值闭集；**`awaiting_answer` 不占**（等人回答不占闸位 —— 否则澄清链路被自己锁死）。落点两层、同一事实源（BD4b 轮闸）：宿主面**前置查** `busyTurnOf`（判据不满足不惊动托管器），`submitTurn` 的**同步段**再查一次并一体入队（连点两发哪怕同一 tick 到达也只放行一条；第二发带 `occupant` 回来 ⇒ 收口成同一个 409）。被拒的提交**不推进轮计数**（检查在 `openSession` 之前）、**不落台账**。
 - **渲染态禁用（收口轨 14 ②）**：详情页在占用时把「触发一轮」「发送确认指令」渲染为 `disabled + aria-disabled` + 原因行（**不隐藏入口**）；confirm 的占用原因**优先于** `approval` 判据展示（它直接对应「点了会白点」），无占用时回到既有 approval 三态。规则源 = `derive.ts` 的 `deriveTurnBusyAffordance`，视图不内嵌判据。
 
-渲染 = 同源服务器端单文件模板（`src/web/layout.ts` + `src/web/views.ts`，内联 style、强 CSP、零前端框架；脚本只有一段**同源内联**的提交守卫，见上条 CSP）。桥不可达 ⇒ 502 页面如实显示错误，不静默。
+渲染 = 同源服务器端单文件模板（`src/web/layout.ts` + `src/web/views.ts`，内联 style、强 CSP、零重型框架；页面脚本 = **白名单化内联字面量常量**（无 `src=`、不含用户数据、单点常量可审计）= 提交守卫 + 错误浮层关闭 + mermaid 渲染 + 排期页详情浮层四枚，纪律钉 = `test/n3-regression-anchors.test.mjs` N3-⑦/⑧ 钉死「全站可执行内联脚本 ⊆ 该闭集且每枚恰好 1 处」；CSP 见上条）。桥不可达 ⇒ 502 页面如实显示错误，不静默。
 
 **已知边界（收口轨 14 刻意不做的部分）**：**「提需求」被连点 = 建出两条 Feature** —— 本轨只靠前端禁用缓解，**服务端幂等键不做**（要做得给表单发一个一次性 token 并在板侧记账去重，属写面幂等设计，不在「防误触」范围内）。轮类入口（turn / confirm / answer）已由 `board_turn_busy` 硬闸封住，不受此边界影响。
 
@@ -181,7 +191,7 @@ npm run restart        # stop + start
 | `getProjects()` | `GET /api/projects` | 项目 / 机器 / Runner 快照 |
 | `getTasks(project, opts?)` | `GET /api/tasks?project=…` | 单项目任务列表（`project` 桥侧必填） |
 
-硬约束：**本节的 `bridge-client.ts` 严禁调用任何非 GET**；**严禁触碰事件游标语义**（桥 `/api/events` 之外一律不碰，事件读取由后续节点专门处理）。解析逻辑（`parse*` 纯函数）与网络调用分离，可脱离桥单测。BD7 的写面**不走本节客户端**，只经 `requirement.ts` 打编排桥 MCP 面（8787），且只有 feature 创建这一个调用点。
+硬约束：**本节的 `bridge-client.ts` 严禁调用任何非 GET**；**严禁触碰事件游标语义**（桥 `/api/events` 之外一律不碰，事件读取由后续节点专门处理）。解析逻辑（`parse*` 纯函数）与网络调用分离，可脱离桥单测。BD7 的写面**不走本节客户端**，只经 MCP 写封装打编排桥 MCP 面（8787）——**MCP 写封装清单共六处调用面**：`requirement.ts`（`a2a_feature_create` 建需求）+ `feature-schedule.ts`（`a2a_feature_advance` 排期写，v0.9.2 M2/M3，HTTP 端点 `POST /features/:id/schedule` 已接线）为**仅有的两个** `a2a_feature_*` 写点，其余四条业务写端点（turn / stop / confirm / answer）经宿主桥 A2A 面而非 MCP。
 
 ## 与宿主 agent 的关系
 

@@ -93,7 +93,7 @@ function fakeClient(overrides = {}) {
       };
     },
     async getTasks(projectId, options) {
-      calls.push(`getTasks:${projectId}:${options?.state ?? ""}`);
+      calls.push(`getTasks:${projectId}:${options?.state ?? ""}:${options?.limit ?? ""}`);
       return {
         projectId,
         reachable: true,
@@ -125,9 +125,9 @@ async function get(base, path, method = "GET") {
   return { status: res.status, text, headers: res.headers };
 }
 
-test("GET / 需求列表：渲染派生阶段 + taskCount；桥一次调用（无 N+1）", async () => {
+test("GET /requirements 需求列表：渲染派生阶段 + taskCount；桥一次调用（无 N+1）", async () => {
   await withServer(async (base, calls) => {
-    const res = await get(base, "/");
+    const res = await get(base, "/requirements");
     assert.equal(res.status, 200);
     assert.match(res.text, /需求甲/);
     assert.match(res.text, /改造中/);
@@ -136,9 +136,49 @@ test("GET / 需求列表：渲染派生阶段 + taskCount；桥一次调用（�
   });
 });
 
+test("GET /?state=… ⇒ 板内存过滤（桥列表调用不带 query，REQ-v0.9.2 N4）", async () => {
+  const many = {
+    features: [
+      { featureId: "F1", state: "executing", title: "甲", taskCount: 1, ownerGroup: null, stage: "改造方案", version: "v0.9.0", approval: "已通过", createdAt: null, updatedAt: null, stateCounts: { working: 1 } },
+      { featureId: "F2", state: "completed", title: "乙", taskCount: 0, ownerGroup: null, stage: null, version: "v0.9.0", approval: "已通过", createdAt: null, updatedAt: null, stateCounts: {} },
+      { featureId: "F3", state: "completed", title: "丙", taskCount: 0, ownerGroup: null, stage: null, version: "v0.9.1", approval: "待审批", createdAt: null, updatedAt: null, stateCounts: {} },
+    ],
+    stateCounts: { working: 1, completed: 2 },
+  };
+  await withServer(
+    async (base, calls) => {
+      const pos = await get(base, "/requirements?state=completed");
+      assert.equal(pos.status, 200);
+      assert.match(pos.text, /过滤后 2 \/ 共 3 条/);
+      assert.match(pos.text, /乙/);
+      assert.match(pos.text, /丙/);
+      assert.ok(!pos.text.includes(">甲<"));
+      // 各态分布保持全列表口径（不随过滤重算）
+      assert.match(pos.text, /completed=2/);
+      const ver = await get(base, "/requirements?state=completed&version=v0.9.1");
+      assert.match(ver.text, /过滤后 1 \/ 共 3 条/);
+      assert.match(ver.text, /丙/);
+      const neg = await get(base, "/requirements?state=no_such_state");
+      assert.equal(neg.status, 200);
+      assert.match(neg.text, /过滤后 0 \/ 共 3 条/);
+      assert.match(neg.text, /无匹配需求/);
+      const none = await get(base, "/requirements");
+      assert.match(none.text, /共 3 条/);
+      assert.ok(!/过滤后/.test(none.text));
+      // 覆盖版 getFeatures 不记录调用 ⇒ calls 保持空 = 全程**没有任何额外桥调用**（无逐行 N+1、query 不触桥）
+      assert.deepEqual(calls, []);
+    },
+    {
+      async getFeatures() {
+        return many;
+      },
+    },
+  );
+});
+
 test("HTML 应答带强 CSP + no-store；页面同源无外部资源", async () => {
   await withServer(async (base) => {
-    const res = await get(base, "/");
+    const res = await get(base, "/requirements");
     assert.match(res.headers.get("content-security-policy"), /default-src 'none'/);
     assert.equal(res.headers.get("cache-control"), "no-store");
     assert.doesNotMatch(res.text, /src="http/);
@@ -156,6 +196,7 @@ test("GET /features/F1：详情 = feature+tasks+trace 三面（B13 显示齐备�
     assert.match(res.text, /写门未挡/);
     assert.match(res.text, /读档占位 1 个：r1@m1/);
     assert.match(res.text, /5m 0s/);
+    assert.match(res.text, /action="\/features\/F1\/schedule"/, "M6：排期表单 GET 面 = 详情页");
     assert.deepEqual(calls, ["getFeature:F1", "getFeatureTrace:F1"]);
   });
 });
@@ -188,6 +229,36 @@ test("GET /tasks 无 project ⇒ 选单页；?project=p ⇒ 任务表", async ()
   });
 });
 
+test("GET /tasks?state=… ⇒ 透传给桥 getTasks（服务端过滤，REQ-v0.9.2 N4）", async () => {
+  await withServer(async (base, calls) => {
+    const res = await get(base, "/tasks?project=p&state=working");
+    assert.equal(res.status, 200);
+    assert.ok(calls.includes("getTasks:p:working:"));
+    assert.match(res.text, /state=working/);
+    assert.match(res.text, /桥服务端过滤/);
+  });
+});
+
+test("GET /tasks?limit=5 ⇒ 透传；limit 非法（0 / abc / 1.5 / 负数 / 超界）⇒ 结构化 400 不静默吞", async () => {
+  await withServer(async (base, calls) => {
+    const ok = await get(base, "/tasks?project=p&limit=5");
+    assert.equal(ok.status, 200);
+    assert.ok(calls.includes("getTasks:p::5"));
+    for (const bad of ["0", "abc", "1.5", "-2", "600"]) {
+      const res = await get(base, `/tasks?project=p&limit=${bad}`);
+      assert.equal(res.status, 400, `limit=${bad} 应 400`);
+      assert.match(res.text, /invalid_limit/);
+    }
+    assert.ok(!calls.some((c) => c.startsWith("getTasks:p::a")), "非法 limit 不得触桥");
+    const json = await fetch(`${base}/tasks?project=p&limit=0`, { headers: { accept: "application/json" } });
+    assert.equal(json.status, 400);
+    const body = await json.json();
+    assert.equal(body.ok, false);
+    assert.equal(body.code, "invalid_limit");
+    assert.match(body.error, /limit/);
+  });
+});
+
 test("GET /projects：机器/项目/runner 三表 + 快照注", async () => {
   await withServer(async (base) => {
     const res = await get(base, "/projects");
@@ -216,13 +287,18 @@ test("只读面：非 GET 一律 405；未知路径 404；/health 保留", async
   });
 });
 
-test("桥不可达 ⇒ 502 页面如实可见（不静默、不缓存旧数据）", async () => {
+test("桥不可达 ⇒ 502 页面如实可见（不静默、不缓存旧数据；REQ-v0.9.2 N2 起套 BD2 浮层版式）", async () => {
   await withServer(
     async (base) => {
-      const res = await get(base, "/");
+      const res = await get(base, "/requirements");
       assert.equal(res.status, 502);
-      assert.match(res.text, /桥数据读取失败（502）/);
-      assert.match(res.text, /connection refused/);
+      // 整页 = errorPage 统一版式：错误正文改由浮层承载（族名标题 / error / mono code /「知道了」）
+      assert.match(res.text, /class="err-ov"/, "桥宕页必须套 BD2 浮层");
+      assert.ok(res.text.includes("<h2>桥不可达</h2>"), "浮层标题 = 错误码中文族名");
+      assert.match(res.text, /<p>connection refused<\/p>/, "error 正文上浮层");
+      assert.ok(res.text.includes('<p class="err-ov-code mono">bridge_unreachable</p>'), "mono 小字 = code");
+      assert.match(res.text, /<button type="button" id="err-ov-close">知道了<\/button>/);
+      assert.match(res.text, /恢复后刷新本页即可/, "刷新重试口径保留（hint）");
     },
     {
       async getFeatures() {

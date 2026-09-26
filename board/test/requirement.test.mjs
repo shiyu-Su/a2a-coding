@@ -43,6 +43,12 @@ test("buildFeatureCreateArgs: 始终显式带 stage=需求分析 + approval=未�
   assert.equal(REQUIREMENT_APPROVAL, "未发起");
 });
 
+test("buildFeatureCreateArgs（M6）: version 发送前 trim；空 / 纯空白 ⇒ 空串出网（未排期，不抛不拒）", () => {
+  assert.equal(buildFeatureCreateArgs({ title: "甲", version: "  v0.9.2  " }).version, "v0.9.2");
+  assert.equal(buildFeatureCreateArgs({ title: "甲", version: "" }).version, "");
+  assert.equal(buildFeatureCreateArgs({ title: "甲", version: "   " }).version, "");
+});
+
 test("createRequirement: 出网 body 的 arguments 确实携带 stage/approval（端到端捕获）", async () => {
   let capturedBody = null;
   const fetchImpl = async (_url, init) => {
@@ -178,8 +184,8 @@ test("纪律扫描：src/** 中 a2a_feature_create 仅出现在 requirement.ts",
   assert.deepEqual(hits, ["requirement.ts"], "对 a2a_feature_create 的引用必须收敛在唯一封装文件");
 });
 
-test("纪律扫描：板代码里绝不出现 approve / advance / cancel 三工具名（板不写状态机）", () => {
-  const forbidden = ["a2a_feature_approve", "a2a_feature_advance", "a2a_feature_cancel"];
+test("纪律扫描：板代码里 approve / cancel 字面量 0 命中（真·状态机迁移仍零路径）", () => {
+  const forbidden = ["a2a_feature_approve", "a2a_feature_cancel"];
   const offenders = [];
   for (const f of walkTs(SRC_DIR)) {
     const src = readFileSync(f, "utf8");
@@ -187,5 +193,12 @@ test("纪律扫描：板代码里绝不出现 approve / advance / cancel 三工�
       if (src.includes(tok)) offenders.push(`${relFromSrc(f)} -> ${tok}`);
     }
   }
-  assert.deepEqual(offenders, [], "板不写状态机：不得引用任何状态推进工具");
+  assert.deepEqual(offenders, [], "板不写状态机迁移：approve / cancel 不得出现在任何 src 文件");
+});
+
+test("纪律扫描：a2a_feature_advance 命中文件集合 == [feature-schedule.ts]（排期写唯一封装）", () => {
+  const hits = walkTs(SRC_DIR)
+    .filter((f) => readFileSync(f, "utf8").includes("a2a_feature_advance"))
+    .map(relFromSrc);
+  assert.deepEqual(hits, ["feature-schedule.ts"], "advance 工具名必须收敛在唯一排期封装文件");
 });

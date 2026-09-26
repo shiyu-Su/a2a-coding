@@ -251,12 +251,12 @@ test("BD7-③：桥错误码原样透传（feature_invalid_stage / project_not_a
 });
 
 // ---------------------------------------------------------------------------
-// ④ 空 title/version ⇒ 400（且不出网）
+// ④ 空 title ⇒ 400（且不出网）；M6 起空 version 合法（未排期）⇒ 建卡成功
 // ---------------------------------------------------------------------------
 
-test("BD7-④（负向）：空 title / 空 version ⇒ 400 结构化，校验先于写封装（不静默创建）", async () => {
+test("BD7-④（负向 · M6 收敛为仅 title 必填）：空 title ⇒ 400 结构化，校验先于写封装（不静默创建）", async () => {
   const { fn, seen } = fakeCreate();
-  for (const fields of [{ title: "   ", version: "v1" }, { title: "甲", version: "  " }, { version: "v1" }]) {
+  for (const fields of [{ title: "   ", version: "v1" }, { title: "  " }]) {
     await withServer(
       async (base) => {
         const res = await post(base, fields, { ...WRITE_HEADERS, accept: "application/json" });
@@ -270,6 +270,26 @@ test("BD7-④（负向）：空 title / 空 version ⇒ 400 结构化，校验�
     );
   }
   assert.deepEqual(seen, [], "入参校验必须在触达写封装之前");
+});
+
+test("M6：空 version 建卡成功（未排期）；出网 version 已 trim（空白不落「空格列」）", async () => {
+  const { fn, captured } = realCreateCapturing(
+    okEnvelope({ ok: true, featureId: "F-Pool", state: "waiting_approval", stage: "需求分析", version: "", approval: "未发起" }),
+  );
+  await withServer(
+    async (base) => {
+      const missing = await post(base, { title: "进池需求" }, { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(missing.status, 201, "version 键缺失 ⇒ 合法（未排期）");
+      const blank = await post(base, { title: "进池需求乙", version: "   " }, { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(blank.status, 201, "纯空白 version ⇒ 合法，不再 400");
+      assert.equal(JSON.parse(blank.text).featureId, "F-Pool");
+    },
+    { defaultGroup: "g", mcpBaseUrl: "http://127.0.0.1:8787", createRequirementImpl: fn },
+  );
+  const argsMissing = captured.bodies[0].params.arguments;
+  assert.equal(argsMissing.version, "", "缺键归一为空串出网");
+  const argsBlank = captured.bodies[1].params.arguments;
+  assert.equal(argsBlank.version, "", "空 version 发送前 trim ⇒ 空串（orch 无 trim，空白会自成一列）");
 });
 
 // ---------------------------------------------------------------------------
@@ -373,10 +393,11 @@ test("BD7-⑥（负向）：读面路径的非 GET 一律仍 405；写路径只�
         assert.match(res.text, /\/requirements/, "405 文案须点明放开的写路径");
       }
       const getOnWritePath = await req(base, "/requirements", { method: "GET" });
-      assert.equal(getOnWritePath.status, 404, "写路径不注册读面路由");
+      // REQ-v0.9.2 N1：GET/POST 同路径双义（GET = 需求页读面，POST = 提需求写面）—— 宿主微裁接受
+      assert.equal(getOnWritePath.status, 200, "GET /requirements = 需求页读面");
       const putOnWritePath = await req(base, "/requirements", { method: "PUT" });
-      assert.equal(putOnWritePath.status, 404, "非 POST 不落 405 也不落写面（未知路径先行）");
-      assert.deepEqual(calls, [], "方法门与路由判定都不得触桥");
+      assert.equal(putOnWritePath.status, 405, "N1 双义路径：PUT 不落写面（只认 POST），落读面方法门 ⇒ 405");
+      assert.deepEqual(calls, ["getFeatures"], "GET /requirements 渲染需求页恰一次触桥；方法门判定本身不触桥");
     },
     { defaultGroup: "g" },
   );
@@ -386,7 +407,7 @@ test("BD7-⑥（负向）：读面路径的非 GET 一律仍 405；写路径只�
 // BD11-⑥（负向锚）：组织名进表单**没有**顺手开出状态机写口
 // ---------------------------------------------------------------------------
 
-test("BD11-⑥（负向锚）：板仍不写状态机 —— src/** 零引用三工具名，且写面白名单不含 approve/advance/cancel", async () => {
+test("BD11-⑥（负向锚）：板不写状态机迁移 —— approve/cancel 零引用、advance 收敛于排期封装、写面白名单不含状态机口", async () => {
   const srcDir = fileURLToPath(new URL("../src/", import.meta.url));
   const walk = (dir, acc = []) => {
     for (const ent of readdirSync(dir, { withFileTypes: true })) {
@@ -396,15 +417,23 @@ test("BD11-⑥（负向锚）：板仍不写状态机 —— src/** 零引用三
     }
     return acc;
   };
-  const forbidden = ["a2a_feature_approve", "a2a_feature_advance", "a2a_feature_cancel"];
-  let hits = 0;
+  // v0.9.2 新口径：排期写借 advance「to=当前态 ∧ 仅 version」特例，收敛于唯一封装 feature-schedule.ts；
+  // approve / cancel 两个真·迁移工具名仍须 0 命中，advance 命中只允许出现在该白名单文件。
+  const stateMachineTools = ["a2a_feature_approve", "a2a_feature_cancel"];
+  const ADVANCE_WHITELIST_BASENAME = "feature-schedule.ts";
+  let smHits = 0;
+  const advanceOffenders = [];
   const files = walk(srcDir);
   assert.ok(files.length > 0, "应能枚举 src 下 .ts 文件");
   for (const f of files) {
     const text = readFileSync(f, "utf8");
-    for (const tok of forbidden) hits += text.split(tok).length - 1;
+    for (const tok of stateMachineTools) smHits += text.split(tok).length - 1;
+    if (text.includes("a2a_feature_advance") && !f.endsWith(ADVANCE_WHITELIST_BASENAME)) {
+      advanceOffenders.push(f.replace(srcDir, "").split(/[\\/]/).join("/"));
+    }
   }
-  assert.equal(hits, 0, "板不写状态机：三个状态推进工具名在 src/** 出现次数必须为 0");
+  assert.equal(smHits, 0, "板不写状态机迁移：approve / cancel 在 src/** 出现次数必须为 0");
+  assert.deepEqual(advanceOffenders, [], "a2a_feature_advance 只能出现在 feature-schedule.ts（排期写唯一封装）");
 
   // 组织名是**入参**，不是新的状态机口：五条写路径之外一律不放行
   for (const path of [
@@ -427,10 +456,10 @@ test("BD11-⑥（负向锚）：板仍不写状态机 —— src/** 零引用三
   );
 });
 
-test("BD7-⑦（BD11 反转）：列表页表单**含**组织名字段；只读渲染与 CSP 均未变", async () => {
+test("BD7-⑦（BD11 反转）：需求页表单**含**组织名字段；只读渲染与 CSP 均未变", async () => {
   // 未配默认组织 ⇒ 组织名带 required（前端便利；硬校验仍在服务端）
   await withServer(async (base, calls) => {
-    const res = await req(base, "/");
+    const res = await req(base, "/requirements");
     assert.equal(res.status, 200);
     assert.match(res.text, /<form method="post" action="\/requirements"/);
     assert.match(res.text, /name="title"/);
@@ -438,6 +467,8 @@ test("BD7-⑦（BD11 反转）：列表页表单**含**组织名字段；只读�
     assert.match(res.text, /name="requirement"/);
     assert.match(res.text, /name="group"[^>]*required/, "未配默认组织 ⇒ 表单组织名为必填");
     assert.match(res.text, /首次填写即创建该组织/, "表单须说明「首次使用该组织名 = 创建该组织」");
+    // N3：本文件默认未装配宿主面 ⇒ 首页表单旁如实标 orgsDir 未装配
+    assert.match(res.text, /组织目录根（orgsDir）未装配/);
     // 收口轨 14：页面引入**唯一一段同源内联提交守卫**（无外源 src=）
     assert.match(res.text, /<script>/);
     assert.doesNotMatch(res.text, /<script[^>]*src=/, "不得引入外源脚本");
@@ -446,23 +477,54 @@ test("BD7-⑦（BD11 反转）：列表页表单**含**组织名字段；只读�
     assert.match(res.text, /需求甲/);
     assert.match(res.text, /<td>4<\/td>/);
     assert.deepEqual(calls, ["getFeatures"]);
-    // CSP（收口轨 14 + BD14 明示口径）：default-src 仍 'none'、form-action 仍限同源；
+    // CSP（收口轨 14 + BD14 + 增补轨 2 明示口径）：default-src 仍 'none'、form-action 仍限同源；
     // script-src = 'unsafe-inline'（页面内字面量脚本）+ 'self'（同源 vendored /static 资产），
-    // **无任何外源主机 URL**。
+    // connect-src = 'self'（详情浮层同源 fetch），**无任何外源主机 URL**。
     const csp = res.headers.get("content-security-policy");
     assert.match(csp, /default-src 'none'/);
     assert.match(csp, /form-action 'self'/);
+    assert.equal(
+      csp,
+      "default-src 'none'; style-src 'unsafe-inline'; script-src 'unsafe-inline' 'self'; connect-src 'self'; base-uri 'none'; form-action 'self'",
+      "CSP 全串单点 = layout.ts BOARD_CSP（含第三处放宽 connect-src 'self'）",
+    );
     const scriptDir = /(^|;)\s*script-src([^;]*)/.exec(csp)?.[2]?.trim() ?? "";
     assert.deepEqual(scriptDir.split(/\s+/).sort(), ["'self'", "'unsafe-inline'"], "script-src 只放开内联 + 同源两档");
     assert.equal(/https?:|\/\//.test(scriptDir), false, "script-src 不得含外源");
+    const connectDir = /(^|;)\s*connect-src([^;]*)/.exec(csp)?.[2]?.trim() ?? "";
+    assert.deepEqual(connectDir.split(/\s+/), ["'self'"], "connect-src 只放开同源一档");
   });
   // 配了默认组织 ⇒ 组织名可不填，且把默认值如实显示在字段旁（不伪装成必填）
   await withServer(async (base) => {
-    const res = await req(base, "/");
+    const res = await req(base, "/requirements");
     assert.match(res.text, /name="group"/);
     assert.doesNotMatch(res.text, /name="group"[^>]*required/, "有默认组织 ⇒ 该字段允许留空");
     assert.match(res.text, /留空 = 用板级默认 board-default-org/);
   }, { defaultGroup: "board-default-org" });
+});
+
+test("N3（真 HTTP）：需求页表单旁 orgsDir 提示随宿主面状态三档渲染（就绪 / 配了但不可用）", async () => {
+  const faceWith = (orgsDir, problem) => ({
+    configView: () => ({ orgsDir, defaultOrg: null, kind: "claude" }),
+    orgsDirProblem: () => problem,
+  });
+  await withServer(async (base) => {
+    const res = await req(base, "/requirements");
+    assert.equal(res.status, 200);
+    assert.match(res.text, /组织目录根（orgsDir）<b>就绪<\/b>/);
+    assert.match(res.text, /C:\/orgs\/live/);
+  }, { hostFace: faceWith("C:/orgs/live", null) });
+  await withServer(async (base) => {
+    const res = await req(base, "/requirements");
+    assert.match(res.text, /class="hint err"/, "不可用档须走红字错误样式");
+    assert.match(res.text, /board_orgs_dir_missing/);
+    assert.match(res.text, /组织目录根不存在：C:\\orgs\\gone/);
+  }, {
+    hostFace: faceWith("C:/orgs/gone", {
+      code: "board_orgs_dir_missing",
+      message: "组织目录根不存在：C:\\orgs\\gone ⇒ 任何组织的宿主桥都无落点，不 spawn 进程。",
+    }),
+  });
 });
 
 // ---------------------------------------------------------------------------
@@ -494,12 +556,153 @@ test("BD17-⑤（真机报障复现）Origin: null + 同源 Referer ⇒ 表单�
       // 不削弱 CSRF：Origin 不可用 + Referer 跨站 ⇒ 仍拒
       const evil = await post(base, { title: "乙", version: "v1" }, { origin: "null", referer: "http://evil.example/" });
       assert.equal(evil.status, 403);
+      assert.equal(seen.length, 1);
       assert.match(evil.text, /CSRF 来源不可判定/);
       // 同源 meta 头不影响跨站有名 Origin 的一律拒
       const crossNamed = await post(base, { title: "丙", version: "v1" }, { origin: "http://evil.example" });
       assert.equal(crossNamed.status, 403);
       assert.match(crossNamed.text, /CSRF 来源校验拒绝/);
       assert.equal(seen.length, 1, "两条被拒请求不得触达写封装");
+    },
+    { defaultGroup: "g", createRequirementImpl: fn },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 增补 ⑤ N2：提需求执法 —— 已发版锁版（config releasedVersions）⇒ 409 board_version_released
+// ---------------------------------------------------------------------------
+
+test("N2-①（负向 · API 档）：锁版排入 ⇒ 409 board_version_released，文案含版本号与「不可排入」，零出网", async () => {
+  const { fn, seen } = fakeCreate();
+  await withServer(
+    async (base) => {
+      const res = await post(
+        base,
+        { group: "g", title: "往已发版排", version: "v0.9.1", requirement: "原文" },
+        { ...WRITE_HEADERS, accept: "application/json" },
+      );
+      assert.equal(res.status, 409);
+      const json = JSON.parse(res.text);
+      assert.equal(json.ok, false);
+      assert.equal(json.code, "board_version_released");
+      assert.match(json.error, /v0\.9\.1/, "文案须点明被锁的版本号");
+      assert.match(json.error, /已发版版本不可排入新需求/);
+      assert.equal(seen.length, 0, "锁校验必须先于写封装（零出网）");
+    },
+    { defaultGroup: null, createRequirementImpl: fn, releasedVersions: ["v0.9.1"] },
+  );
+});
+
+test("N2-②（负向 · 表单档）：锁版排入 ⇒ 409 错误浮层（族名「版本已发版锁定」+ code）+ 提交字段回填", async () => {
+  const { fn, seen } = fakeCreate();
+  await withServer(
+    async (base) => {
+      const res = await post(base, { group: "flow", title: "队列可见", version: "v0.9.1", requirement: "文案回填" }, { origin: base });
+      assert.equal(res.status, 409);
+      assert.match(res.text, /<div class="err-ov"/, "表单档须走错误浮层，不裸 JSON");
+      assert.match(res.text, /版本已发版锁定/, "族名须有中文映射（views.ERROR_FAMILY_LABELS）");
+      assert.match(res.text, /board_version_released/);
+      assert.doesNotMatch(res.text, /"code":"board_version_released"/, "表单档不得残留裸 JSON");
+      // 回填：组织 / 标题 / 版本 / 需求描述 原值带回（与 requirementBackfillFields 同字段集）
+      const field = (label, value) =>
+        new RegExp(
+          `<span class="err-ov-field-label">${label}</span>\\s*<span class="err-ov-field-value mono">${value}</span>`,
+        );
+      assert.match(res.text, field("组织", "flow"));
+      assert.match(res.text, field("标题", "队列可见"));
+      assert.match(res.text, field("版本", "v0\\.9\\.1"));
+      assert.match(res.text, field("需求描述", "文案回填"));
+      assert.equal(seen.length, 0);
+    },
+    { defaultGroup: null, createRequirementImpl: fn, releasedVersions: ["v0.9.1"] },
+  );
+});
+
+test("N2-③（正向）：未锁版本照常放行（201）；锁表存在不影响其它版排期", async () => {
+  const { fn, seen } = fakeCreate();
+  await withServer(
+    async (base) => {
+      const res = await post(
+        base,
+        { title: "往在制版排", version: "v0.9.2" },
+        { ...WRITE_HEADERS, accept: "application/json" },
+      );
+      assert.equal(res.status, 201);
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0].input.version, "v0.9.2");
+    },
+    { defaultGroup: "g", createRequirementImpl: fn, releasedVersions: ["v0.9.0", "v0.9.1"] },
+  );
+});
+
+test("N2-④（正向 · 不扩拦）：空 version（键缺失 / 纯空白）在未排期池放行 —— 锁不拦空", async () => {
+  const { fn, seen } = fakeCreate();
+  await withServer(
+    async (base) => {
+      const missing = await post(base, { title: "进池甲" }, { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(missing.status, 201, "version 键缺失 = 未排期 ⇒ 恒不锁");
+      const blank = await post(base, { title: "进池乙", version: "   " }, { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(blank.status, 201, "纯空白 version trim 后 = 空串 ⇒ 恒不锁");
+      assert.equal(seen.length, 2);
+    },
+    { defaultGroup: "g", createRequirementImpl: fn, releasedVersions: ["v0.9.1"] },
+  );
+});
+
+test("N2-⑤（锁判据边界）：前后空白仍锁（trim 全等）；近似串不前缀连坐（v0.9.1-probe / 子串放行）", async () => {
+  const { fn, seen } = fakeCreate();
+  await withServer(
+    async (base) => {
+      const spaced = await post(
+        base,
+        { title: "带空白", version: "  v0.9.1  " },
+        { ...WRITE_HEADERS, accept: "application/json" },
+      );
+      assert.equal(spaced.status, 409, "表单值先 trim 再判锁（parseRequirementForm 已 trim）");
+      const probe = await post(
+        base,
+        { title: "探针版", version: "v0.9.1-probe" },
+        { ...WRITE_HEADERS, accept: "application/json" },
+      );
+      assert.equal(probe.status, 201, "禁前缀匹配：v0.9.1 已发版不得连坐 v0.9.1-probe");
+      const partial = await post(
+        base,
+        { title: "半截版", version: "v0.9" },
+        { ...WRITE_HEADERS, accept: "application/json" },
+      );
+      assert.equal(partial.status, 201, "禁子串匹配：锁表元素与提交值都必须全等");
+      assert.equal(seen.length, 2);
+    },
+    { defaultGroup: "g", createRequirementImpl: fn, releasedVersions: [" v0.9.1 ", "v0.9.0"] },
+  );
+});
+
+test("N2-⑥（校验顺序锚）：锁校验排在 CSRF / 入参校验之后 —— 未认证与空 title 不因锁版改判", async () => {
+  const { fn, seen } = fakeCreate();
+  await withServer(
+    async (base) => {
+      const unauthed = await post(base, { title: "甲", version: "v0.9.1" });
+      assert.equal(unauthed.status, 403, "CSRF 守卫先于一切（锁版不提前暴露配置）");
+      const noTitle = await post(
+        base,
+        { title: "   ", version: "v0.9.1" },
+        { ...WRITE_HEADERS, accept: "application/json" },
+      );
+      assert.equal(noTitle.status, 400, "入参校验先于锁校验");
+      assert.equal(JSON.parse(noTitle.text).code, "requirement_form_invalid");
+      assert.equal(seen.length, 0);
+    },
+    { defaultGroup: "g", createRequirementImpl: fn, releasedVersions: ["v0.9.1"] },
+  );
+});
+
+test("N2-⑦（缺省不锁）：未注入 releasedVersions ⇒ 任何版本都可排入（config 未登记 = 无锁，行为逐字节同旧）", async () => {
+  const { fn, seen } = fakeCreate();
+  await withServer(
+    async (base) => {
+      const res = await post(base, { title: "甲", version: "v0.9.1" }, { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(res.status, 201);
+      assert.equal(seen.length, 1);
     },
     { defaultGroup: "g", createRequirementImpl: fn },
   );

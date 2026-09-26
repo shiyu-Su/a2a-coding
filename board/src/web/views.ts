@@ -5,7 +5,9 @@
  * `derive.ts`，不散落在模板字符串里。所有动态值经 `escapeHtml`。
  */
 import type {
+  AcceptanceView,
   FeatureDetailView,
+  FeatureListItem,
   FeaturesListView,
   FeatureTraceView,
   ProjectTasksView,
@@ -22,9 +24,8 @@ import {
   deriveTurnBusyAffordance,
   traceWaitDisplay,
 } from "../derive.js";
-import type { ConfirmAffordance, NextStepInput } from "../derive.js";
-import type { DocsEntry, DocsSource } from "../docs-read.js";
-import { isValidDocVersion } from "../docs-read.js";
+import type { ConfirmAffordance, NextStepInput, TurnProgressView } from "../derive.js";
+import type { DocsSource } from "../docs-read.js";
 import {
   MERMAID_ASSET,
   defaultStaticRoot,
@@ -34,8 +35,13 @@ import {
   vendoredAssetExists,
 } from "../docs-render.js";
 import type { OccupantTurnView } from "../host-turn.js";
-import type { HostStatusEntry, StopBridgeOutcome, TriggerTurnOutcome } from "../host-face.js";
+import type { HostStatusEntry, StopBridgeOutcome, TriggerDisposition, TriggerTurnOutcome } from "../host-face.js";
+import { NO_OWNER_GROUP_LABEL } from "../orgs-view.js";
+import type { OrgProjectsOutcome } from "../orgs-view.js";
+import { compareVersionOrder, isUnscheduled, normalizeVersion, sortPoolEntries } from "../version-order.js";
+import { deriveVersionStatus, isVersionLocked } from "../version-status.js";
 import { emptyRow, escapeHtml } from "./layout.js";
+import type { ErrorOverlayParams } from "./layout.js";
 
 /** 引擎态中文（**仅展示层**，照 orch 网页面先例；未命中原样显示，不吞不猜）。 */
 const FEATURE_STATE_LABELS: Readonly<Record<string, string>> = {
@@ -58,6 +64,63 @@ const TASK_STATE_LABELS: Readonly<Record<string, string>> = {
   blocked: "已阻塞",
 };
 
+/**
+ * 需求列表过滤候选（REQ-v0.9.2 N4）：值域 = 主链 6 态 + 异常 3 态（与上表一致）+ `blocked`
+ * （良性终态，§4 口径）。过滤本身不做值域校验（内存精确匹配，未知值 ⇒ 空集如实显示）。
+ */
+const FEATURE_FILTER_STATES = [
+  "waiting_approval",
+  "executing",
+  "integrating",
+  "testing",
+  "reviewing",
+  "completed",
+  "needs_input",
+  "failed",
+  "cancelled",
+  "blocked",
+] as const;
+
+/** 审批门过滤候选（登记字段闭集，见 `flow/spec/引擎映射.md` §3.5）。 */
+const FEATURE_FILTER_APPROVALS = ["未发起", "待审批", "已通过"] as const;
+
+/** 需求列表板内存过滤条件（REQ-v0.9.2 N4：桥 `/api/features` 无过滤参数 ⇒ 不向桥发无意义 query）。 */
+export interface FeaturesFilter {
+  state?: string;
+  approval?: string;
+  version?: string;
+}
+
+/** 从 query 参数解析过滤条件；空值不算条件（`?state=` ⇒ 无过滤）。 */
+export function parseFeaturesFilter(params: URLSearchParams): FeaturesFilter {
+  const out: FeaturesFilter = {};
+  for (const key of ["state", "approval", "version"] as const) {
+    const raw = params.get(key);
+    if (raw !== null) {
+      const v = raw.trim();
+      if (v !== "") out[key] = v;
+    }
+  }
+  return out;
+}
+
+export function featuresFilterActive(filter: FeaturesFilter): boolean {
+  return filter.state !== undefined || filter.approval !== undefined || filter.version !== undefined;
+}
+
+/** 板内存精确匹配过滤（全量拉取不变，仅收敛渲染；分页不做 = planlog 遗留）。 */
+export function applyFeaturesFilter<T extends { state: string; approval: string | null; version: string | null }>(
+  features: readonly T[],
+  filter: FeaturesFilter,
+): T[] {
+  return features.filter(
+    (f) =>
+      (filter.state === undefined || f.state === filter.state) &&
+      (filter.approval === undefined || f.approval === filter.approval) &&
+      (filter.version === undefined || f.version === filter.version),
+  );
+}
+
 function label(map: Readonly<Record<string, string>>, value: string | null): string {
   if (value === null || value === "") return "—";
   return Object.prototype.hasOwnProperty.call(map, value) ? `${map[value]}（${value}）` : value;
@@ -76,7 +139,8 @@ function featureLink(featureId: string, text?: string): string {
 }
 
 // ---------------------------------------------------------------------------
-// 阶段产出 / 产出登记 / 单文档页（BD11 · REQ-v0.9.1-2026-09-25-04）
+// 阶段产出（decisions 驱动 · 单区）/ 单文档页（BD11 · REQ-v0.9.1-2026-09-25-04；
+// REQ-v0.9.2-2026-09-26-01 起区块按需求归约：版本目录 flat 清单作废）
 // ---------------------------------------------------------------------------
 
 /**
@@ -86,11 +150,29 @@ function featureLink(featureId: string, text?: string): string {
  */
 const DOC_PATH_RE = /(?:doc\/)?(?:([^/\\:%"'>\s]+)\/)?([^/\\:%"'>\s]+\.md)/;
 
+/** decisions 条目里的登记文档路径：`doc/` 前缀 + 至多两段（`{version}/{file}.md` 或 `{file}.md`）。 */
+const REGISTERED_DOC_PATH_RE = /doc\/((?:[^/\\:%"'>\s]+\/)?[^/\\:%"'>\s]+\.md)/;
+
 /** 从任意 decisions 文本提取 `{version, file}`；无 `.md` 路径 ⇒ null。 */
 export function extractDocPath(text: string): { version: string; file: string } | null {
   const m = DOC_PATH_RE.exec(text);
   if (m === null) return null;
   return { version: m[1] ?? "", file: m[2] ?? "" };
+}
+
+/**
+ * 从 decisions 文本提取**本需求登记**的文档路径，仅认 `doc/…/*.md` 形态：
+ * `doc/{version}/{file}.md` ⇒ 两段；`doc/{file}.md` ⇒ version 段为空（打开仍按当前版本定位）。
+ * 裸 `{version}/x.md`（无 `doc/` 前缀）不算登记产出。
+ */
+export function extractRegisteredDocPath(text: string): { version: string; file: string } | null {
+  const m = REGISTERED_DOC_PATH_RE.exec(text);
+  const path = m?.[1];
+  if (path === undefined) return null;
+  const segs = path.split("/");
+  const file = segs[segs.length - 1] ?? "";
+  const version = segs.length >= 2 ? (segs[0] ?? "") : "";
+  return { version, file };
 }
 
 /**
@@ -126,67 +208,63 @@ export function parseDecisionItems(decisions: string | null | undefined): string
 }
 
 /**
- * 详情页「产出登记」区（head 表下，b 案裁决 ③）：逐条渲染 decisions 元素；
- * 含 doc 路径的元素把路径渲染为可点条目（链到单文档 GET）。空 ⇒ 如实显示无。
+ * decisions 登记里的文档版本集合（保序去重）：只收 `extractRegisteredDocPath` 命中且 version 段非空的条目。
+ * 改版失联警示的判据源（不校验白名单 —— 不合白名单的登记本来就打不开，警示口径与其一致）。
  */
-function renderDecisionsSection(featureId: string, decisions: string | null | undefined): string {
-  const items = parseDecisionItems(decisions);
-  const rows = items.map((item) => {
-    const hit = extractDocPath(item);
-    const link =
-      hit === null || hit.version === ""
-        ? ""
-        : ` <a class="fl" href="${escapeHtml(docHref(featureId, hit.file, null))}">打开 ${escapeHtml(hit.file)}</a>`;
-    return `<li>${escapeHtml(item)}${link}</li>`;
-  });
-  const body = items.length === 0 ? `<p class="hint">（无产出登记：decisions 未登记或桥未透出）</p>` : `<ul class="docs">${rows.join("")}</ul>`;
-  return `<h2>产出登记（decisions）</h2>
-<p class="hint">数据 = Feature Context 的 <code>decisions</code>（宿主 agent 经 <code>advance</code> 逐轮 append）；含 <code>doc/…&#47;*.md</code> 路径的条目给出打开链接 —— <b>路径只作展示</b>，打开经板读文档面守卫（版本白名单 / 根内收 / 仅 .md）。链接不带 src ⇒ 服务端先查主仓、未命中自动回落组织工作区（实际来源在文档页头标注）。</p>
-${body}`;
-}
-
-/** 详情页「阶段产出」区入参（server 侧经 docs-read 汇总后下传；null 字段 = 未取到）。 */
-export interface FeatureDocsView {
-  /** 双源合并清单（version 非法 ⇒ docs-read 返回空清单，区块如实显示无）。 */
-  entries: DocsEntry[];
-  /** 清单读取异常（盘/权限等）⇒ 可见文案，不静默。 */
-  error: string | null;
+export function registeredDecisionDocVersions(decisions: string | null | undefined): string[] {
+  const seen = new Set<string>();
+  for (const item of parseDecisionItems(decisions)) {
+    const hit = extractRegisteredDocPath(item);
+    if (hit !== null && hit.version !== "") seen.add(hit.version);
+  }
+  return [...seen];
 }
 
 /**
- * 详情页「阶段产出」区（a 案）：逐文档一行 —— 文件名（可点）+ 分类标注 + 来源标注。
- * 空 ⇒ 如实显示「无」（版本不合法 / 两源皆无目录，均为降级，不报错）。
+ * M6 改版失联警示行（纯文案警示 ⇒ 不新增页面脚本，白名单内联字面量常量闭集（N3 纪律钉）不动）：
+ * 「阶段产出」里存在版本段 ≠ 当前版本的文档登记 ⇒ 该文档的读锚 `doc/{旧版本}/` 已随改版失联
+ * （打开端点按当前版本定位，改版不搬文档 = 板零本地写 ⇒ 点开 404，失联为已知语义）。
+ * 未登记文档、或登记版本与当前版本一致 ⇒ 空串（不渲染）。
  */
-function renderDocsSection(featureId: string, version: string | null, docs: FeatureDocsView | null): string {
-  const hint =
-    "数据 = 主仓 <code>doc/{版本}/</code> ∪ 组织工作区 <code>doc/{版本}/</code> 双源合并（存在哪个算哪个，同名分行各标来源）；分类尽力标注（前缀式∪后缀式），板不做裁判。";
-  if (docs === null) return "";
-  if (docs.error !== null) {
-    return `<h2>阶段产出</h2><p class="hint err">清单读取失败：${escapeHtml(docs.error)}（如实显示，不静默）</p>`;
-  }
-  if (version === null || version === "") {
-    return `<h2>阶段产出</h2><p class="hint">无（该需求未登记版本，无法定位 <code>doc/{版本}/</code>）。</p>`;
-  }
-  if (!isValidDocVersion(version)) {
-    return `<h2>阶段产出</h2><p class="hint">无（版本「${escapeHtml(version)}」不符合 <code>v{major}.{minor}.{patch}</code> 白名单 ⇒ 不打开任何目录）。</p>`;
-  }
-  if (docs.entries.length === 0) {
-    return `<h2>阶段产出</h2><p class="hint">无（两源 <code>doc/${escapeHtml(version)}/</code> 下暂无 .md 文档）。</p>`;
-  }
-  const rows = docs.entries.map((e) => {
-    const link = `<a class="fl" href="${escapeHtml(docHref(featureId, e.name, e.source))}">${escapeHtml(e.name)}</a>`;
-    return (
-      "<tr>" +
-      `<td>${link}</td>` +
-      `<td>${escapeHtml(e.kind)}</td>` +
-      `<td>${escapeHtml(docsSourceLabel(e.source))}</td>` +
-      "</tr>"
-    );
+export function renderVersionSwitchWarningLine(
+  decisions: string | null | undefined,
+  currentVersion: string | null,
+): string {
+  const current = (currentVersion ?? "").trim();
+  const stale = registeredDecisionDocVersions(decisions).filter((v) => v !== current);
+  if (stale.length === 0) return "";
+  return `<p class="hint warn">文档读锚将随版本切换：已登记的 <code>${escapeHtml(stale.join(" · "))}</code> 文档与当前版本（<code>${escapeHtml(current === "" ? "未排期" : current)}</code>）不一致 ⇒ 打开按当前版本定位，旧版本文档在板上打不开（板零本地写，不搬文档目录）。</p>`;
+}
+
+/**
+ * 详情页「阶段产出」区（REQ-v0.9.2 按需求归约：与旧「产出登记」合并为单区）：
+ * 数据源 = 本需求 `decisions` 逐条 —— 含 `doc/…/*.md` 路径的条目即产出条目（**单链接、链接文字 = 剥去
+ * `doc/{版本}/` 后的文件名**，复用 `GET /features/:id/docs` 守卫端点；版本取当前值，登记路径不进链接）；
+ * 其余条目原样保留（登记即产出记录，不再两处重复）。
+ * 无含 doc 路径的条目 ⇒ 「无（本需求未登记产出）」+ 口径一句；不回落版本目录清单（用户裁决）。
+ * `currentVersion` 传入时（排期表单在本页渲染）区首追加 M6 改版失联警示行，不传 ⇒ 行为不变。
+ */
+function renderStageOutputs(
+  featureId: string,
+  decisions: string | null | undefined,
+  currentVersion?: string | null,
+): string {
+  const items = parseDecisionItems(decisions);
+  const docCount = items.filter((item) => extractRegisteredDocPath(item) !== null).length;
+  const rows = items.map((item) => {
+    const hit = extractRegisteredDocPath(item);
+    if (hit === null) return `<li>${escapeHtml(item)}</li>`;
+    return `<li><a class="fl" href="${escapeHtml(docHref(featureId, hit.file, null))}">${escapeHtml(hit.file)}</a></li>`;
   });
+  const body =
+    docCount === 0
+      ? `<p class="hint">无（本需求未登记产出）—— 产出登记由宿主 / agent 经 <code>advance</code> 的 <code>decisions</code> 逐轮 append 承载，板不回落版本目录清单。</p>`
+      : `<ul class="docs">${rows.join("")}</ul>`;
+  const warning =
+    currentVersion === undefined ? "" : renderVersionSwitchWarningLine(decisions, currentVersion);
   return `<h2>阶段产出</h2>
-<p class="hint">${hint}</p>
-<table><thead><tr><th>文档</th><th>分类</th><th>来源</th></tr></thead>
-<tbody>${rows.join("")}</tbody></table>`;
+<p class="hint">数据 = 本需求 Feature Context 的 <code>decisions</code>（宿主 agent 经 <code>advance</code> 逐轮 append）：条目 = <code>decisions</code> 登记的文档文件名（剥去 <code>doc/{版本}/</code> 前缀作链接文字，登记路径不再展示），含 <code>doc/…&#47;*.md</code> 路径的条目即产出条目，打开经板读文档面守卫（版本白名单 / 根内收 / 仅 .md，版本取当前排期值）。链接不带 src ⇒ 服务端先查主仓、未命中自动回落组织工作区（实际来源在文档页头标注）。</p>
+${warning}${body}`;
 }
 
 /** 文档页双档（BD14）：render = markdown 子集渲染；raw = 现行 `<pre>` 原文视图。 */
@@ -255,18 +333,47 @@ export function renderDocPage(
  * 创建/指定 —— 首次填写某组织名即在板上创建该组织。板级配置只是**可选默认**：配置了则占位提示、
  * 允许留空；未配置则该字段 `required`（服务端另在请求期硬校验，缺 ⇒ 400，**不猜不回落**）。
  */
-export function renderRequirementForm(defaultGroup: string | null): string {
+/**
+ * 首页提需求表单旁的**组织目录根（orgsDir）配置状态**（REQ-v0.9.2 N3 · 三档）：
+ * - `not_configured` —— 本板进程未装配宿主面（config.json 无 orgsDir，无缺省值）；
+ * - `problem` —— 配了但目录此刻不可用（code/message 沿用 `host-face.diagnoseOrgsDir` 闭集）；
+ * - `ready` —— 就绪，`orgsDir` 为 configView 的绝对/原样路径。
+ */
+export type OrgsDirStatus =
+  | { tier: "not_configured" }
+  | { tier: "problem"; code: string; message: string }
+  | { tier: "ready"; orgsDir: string };
+
+export function renderRequirementForm(
+  defaultGroup: string | null,
+  orgsStatus?: OrgsDirStatus | null,
+  releasedVersions: readonly string[] = [],
+): string {
   const cfg = (defaultGroup ?? "").trim();
   const orgHint =
     cfg === ""
       ? "组织名 *（必填：本板未配默认组织 · 首次填写即创建该组织）"
       : `组织名（留空 = 用板级默认 ${cfg}；填写其它名字 = 在板上创建该组织）`;
+  const versionHint =
+    releasedVersions.length === 0
+      ? ""
+      : `<p class="hint warn">已发版版本（config <code>releasedVersions</code> 登记）<b>排期锁定</b>：${releasedVersions.map((v) => `<code>${escapeHtml(v)}</code>`).join(" · ")} —— 已发版版本不可排入新需求（服务端 409 拒绝；登记/解锁改 config.json 后重启生效）。字段仍可输入，执法在服务端。</p>`;
+  const orgsLine =
+    orgsStatus === undefined || orgsStatus === null
+      ? ""
+      : orgsStatus.tier === "ready"
+        ? `<p class="hint">组织目录根（orgsDir）<b>就绪</b>：<code>${escapeHtml(orgsStatus.orgsDir)}</code></p>`
+        : orgsStatus.tier === "problem"
+          ? `<p class="hint err"><code>${escapeHtml(orgsStatus.code)}</code> 组织目录根已配置但不可用：${escapeHtml(orgsStatus.message)}</p>`
+          : `<p class="hint warn"><code>board_orgs_dir_not_configured</code> 组织目录根（orgsDir）未装配：提需求本身不受影响，但触发一轮 / 起宿主桥将结构化 503，请配置 config.json 的 orgsDir 后重启板。</p>`;
   return `<h2>提需求</h2>
+${orgsLine}
 <p class="hint">建一条需求 = 以<b>表单所填组织名</b>（留空则板级默认）经唯一写封装（<code>requirement.ts</code>）在桥侧建 Feature，落初态 <code>waiting_approval</code>（登记 <code>stage=需求分析</code> · <code>approval=未发起</code>）。板<b>不写状态机</b>：审批 / 推进 / 取消一律归编排 agent。</p>
 <form method="post" action="/requirements" class="w" data-submit="已提交，建需求中…">
 <label>组织名 ${cfg === "" ? "*" : ""}<input name="group" ${cfg === "" ? "required " : ""}placeholder="如 flow-team"></label>
 <label>标题 *<input name="title" required placeholder="需求的简短摘要"></label>
-<label>版本 *<input name="version" required placeholder="v0.9.0"></label>
+<label>版本<input name="version" placeholder="如 v0.9.2；留空 = 未排期（进需求池）"></label>
+${versionHint}
 <label>需求原文<textarea name="requirement" rows="3" placeholder="可选"></textarea></label>
 <p class="hint">${escapeHtml(orgHint)}</p>
 <button type="submit">提交需求</button>
@@ -274,10 +381,62 @@ export function renderRequirementForm(defaultGroup: string | null): string {
 }
 
 // ---------------------------------------------------------------------------
+// 排期表单（v0.9.2 M3 写端点的 GET 面 · M6 上需求详情页）
+// ---------------------------------------------------------------------------
+
+/**
+ * 需求详情页上的「排期」表单：`POST /features/:id/schedule`（GET 面 = 承载该表单的本页）。
+ * 单端点三语义（M3 口径）：填版本 = 新增/修改排期，留空提交 = 删除排期（回未排期）；
+ * `version` 键恒携带（`parseScheduleForm` 的缺键 = 编程错误前置由此保证）。
+ */
+export function renderScheduleForm(
+  featureId: string,
+  version: string | null,
+  releasedVersions: readonly string[] = [],
+): string {
+  const current = (version ?? "").trim();
+  const currentLocked = isVersionLocked(current, releasedVersions);
+  const lockHint = currentLocked
+    ? `<p class="hint warn">本需求现排期版本 <code>${escapeHtml(current)}</code> <b>已发版（🔒 锁定）</b>：不可移出、取消排期或改入其它版本（服务端 409 拒绝；同版本无变化提交放行）。登记/解锁改 config.json 的 <code>releasedVersions</code> 后重启生效。</p>`
+    : `<p class="hint">已发版版本（config <code>releasedVersions</code> 登记 = 列头标 🔒 已发版）不可改入 / 移出（服务端 409 执法）；字段仍可输入，执法在服务端。</p>`;
+  return `<h2>排期</h2>
+<p class="hint">排期写 = 板唯一放开的登记字段写（经 <code>feature-schedule.ts</code> 走 advance「<code>to</code> = 当前态 ∧ 仅 <code>version</code>」特例，<b>不写状态机迁移</b>）；留空提交 = 删除排期（回需求池）。改版前先看「阶段产出」区的失联警示。</p>
+${lockHint}
+<form method="post" action="/features/${encodeURIComponent(featureId)}/schedule" class="w" data-submit="已提交，排期写入中…">
+<label>版本<input name="version" value="${escapeHtml(current)}" placeholder="如 v0.9.2；留空 = 删除排期"></label>
+<button type="submit">保存排期</button>
+</form>`;
+}
+
+// ---------------------------------------------------------------------------
 // 需求列表（视图 V1 · §2.2-9）
 // ---------------------------------------------------------------------------
 
-export function renderFeaturesList(view: FeaturesListView): string {
+/** `<select>` 选项生成（当前值不在候选内 ⇒ 追加一项原样保留，不吞）。 */
+function selectOptions(candidates: readonly string[], current: string | undefined): string {
+  const values = [...candidates];
+  if (current !== undefined && !values.includes(current)) values.push(current);
+  return values
+    .map((v) => `<option value="${escapeHtml(v)}"${v === current ? " selected" : ""}>${escapeHtml(label(FEATURE_STATE_LABELS, v))}</option>`)
+    .join("");
+}
+
+/**
+ * 需求列表过滤表单（REQ-v0.9.2 N4）：GET 提交回需求页 `/requirements`（增补 ④：`/` 已改排期看板、
+ * 不消费过滤参数），条件由板内存过滤消费。
+ * 各态分布（`stateCounts`）保持**全列表口径** —— 本地聚合自桥列表各项，不随过滤重算（过滤只收敛渲染）。
+ */
+function renderFeaturesFilterForm(filter: FeaturesFilter): string {
+  return `<form method="get" action="/requirements" class="filter-form">
+<label>引擎态 <select name="state"><option value="">全部</option>${selectOptions(FEATURE_FILTER_STATES, filter.state)}</select></label>
+<label>审批门 <select name="approval"><option value="">全部</option>${selectOptions(FEATURE_FILTER_APPROVALS, filter.approval)}</select></label>
+<label>版本 <input name="version" value="${escapeHtml(filter.version ?? "")}" placeholder="如 v0.9.2"></label>
+<button type="submit">过滤</button>
+${featuresFilterActive(filter) ? '<a class="fl" href="/requirements">清除过滤</a>' : ""}
+</form>`;
+}
+
+export function renderFeaturesList(view: FeaturesListView, filter: FeaturesFilter = {}, total: number | null = null): string {
   const rows = view.features.map((f) => {
     const d = deriveDisplayStage(f.state, f.stage);
     const derivedMark = d.basis === "derived" ? "派生" : "登记";
@@ -297,16 +456,21 @@ export function renderFeaturesList(view: FeaturesListView): string {
   const countsNote =
     view.stateCounts === null
       ? `<p class="hint">各态分布：桥 <code>GET /api/features</code> 未透出 per-feature <code>stateCounts</code>（老桥）⇒ 本板不显示（板不做 N 次查询补齐）。</p>`
-      : `<p class="hint">各态分布：${escapeHtml(
+      : `<p class="hint">各态分布${total === null ? "" : "（全列表口径，不随过滤重算）"}：${escapeHtml(
           Object.entries(view.stateCounts)
             .map(([k, v]) => `${k}=${v}`)
             .join(" · ") || "（空分布 · 无任务）",
         )} <span class="muted">（本地聚合自列表各项 <code>stateCounts</code>）</span></p>`;
+  const countLine =
+    total === null
+      ? `共 ${view.features.length} 条`
+      : `过滤后 ${view.features.length} / 共 ${total} 条 <span class="muted">（板内存过滤，非桥侧参数）</span>`;
   return `<h2>需求列表</h2>
-<p class="hint">共 ${view.features.length} 条；「阶段」列 = 登记值 + 引擎态派生（派生规则集中于 <code>derive.ts</code>）；任务数取列表自带 <code>taskCount</code>（无逐行二次查询）。</p>
+${renderFeaturesFilterForm(filter)}
+<p class="hint">${countLine}；「阶段」列 = 登记值 + 引擎态派生（派生规则集中于 <code>derive.ts</code>）；任务数取列表自带 <code>taskCount</code>（无逐行二次查询）。</p>
 ${countsNote}
 <table><thead><tr><th>需求</th><th>引擎态</th><th>阶段（显示）</th><th>阶段（登记）</th><th>版本</th><th>审批门</th><th>任务数</th><th>更新</th></tr></thead>
-<tbody>${rows.length === 0 ? emptyRow(8, "（无需求）") : rows.join("")}</tbody></table>`;
+<tbody>${rows.length === 0 ? emptyRow(8, "（无匹配需求）") : rows.join("")}</tbody></table>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -318,7 +482,8 @@ export function renderFeatureDetail(
   trace: FeatureTraceView | null,
   traceError: string | null,
   nowMs: number,
-  docs: FeatureDocsView | null = null,
+  withScheduleForm: boolean = false,
+  releasedVersions: readonly string[] = [],
 ): string {
   const f = detail.feature;
   const d = deriveDisplayStage(f.state, f.stage);
@@ -373,9 +538,10 @@ export function renderFeatureDetail(
 <table><thead><tr><th>taskId</th><th>项目</th><th>状态</th><th>档</th><th>waitReason</th><th>写门（projectBusy）</th><th>读档占位（readOccupants）</th><th>位次</th><th>已等待（只取 waitedSince）</th><th>在等谁</th></tr></thead>
 <tbody>${rows.length === 0 ? emptyRow(10, "（无非终态节点）") : rows.join("")}</tbody></table>`;
   }
-  const decisionsSection = renderDecisionsSection(f.featureId, f.decisions);
-  const docsSection = renderDocsSection(f.featureId, f.version, docs);
-  return `${head}\n${decisionsSection}\n${tasks}\n${traceHtml}\n${docsSection}`;
+  const stageOutputsSection = renderStageOutputs(f.featureId, f.decisions, f.version ?? null);
+  // M6：排期表单上详情页（GET 面）；缺省不渲染 ⇒ 未接线的调用方保持旧行为。
+  const scheduleForm = withScheduleForm ? renderScheduleForm(f.featureId, f.version, releasedVersions) : "";
+  return `${head}\n${stageOutputsSection}\n${tasks}\n${traceHtml}\n${scheduleForm}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -391,18 +557,26 @@ export function renderTasksPick(projects: ProjectsView | null, pickError: string
           .map((pid) => `<li><a class="fl" href="/tasks?project=${encodeURIComponent(pid)}">${escapeHtml(pid)}</a></li>`)
           .join("")
       : "";
-  const err =
+  const hint =
     pickError !== null
       ? `<p class="hint err">项目清单读取失败：${escapeHtml(pickError)}（不影响手工输入项目名查询）</p>`
       : "";
+  const stateSelect = `<option value="">全部</option>${FEATURE_FILTER_STATES.map(
+    (s) => `<option value="${escapeHtml(s)}">${escapeHtml(label(TASK_STATE_LABELS, s))}</option>`,
+  ).join("")}`;
   return `<h2>任务视图</h2>
-${err}
-<p class="hint">桥 <code>GET /api/tasks</code> 以 <code>project</code> 为必填参数 ⇒ 先选/输项目。</p>
-<form method="get" action="/tasks"><label>projectId <input name="project" placeholder="项目 id"></label><button type="submit">查询</button></form>
+${hint}
+<p class="hint">桥 <code>GET /api/tasks</code> 以 <code>project</code> 为必填参数 ⇒ 先选/输项目；<code>state</code>/<code>limit</code> 经桥服务端过滤（REQ-v0.9.2 N4）。</p>
+<form method="get" action="/tasks">
+<label>projectId <input name="project" placeholder="项目 id"></label>
+<label>状态 <select name="state">${stateSelect}</select></label>
+<label>limit <input name="limit" type="number" min="1" step="1" placeholder="不限"></label>
+<button type="submit">查询</button>
+</form>
 ${list === "" ? "" : `<p class="hint">当前快照中的项目：</p><ul>${list}</ul>`}`;
 }
 
-export function renderTasks(view: ProjectTasksView): string {
+export function renderTasks(view: ProjectTasksView, filter: { state?: string; limit?: number } = {}): string {
   const rows = view.tasks.map((t) => {
     return (
       "<tr>" +
@@ -418,8 +592,16 @@ export function renderTasks(view: ProjectTasksView): string {
   const reach = view.reachable
     ? ""
     : `<p class="hint err">项目 ${escapeHtml(view.projectId)} 当前不可达${view.notice !== null ? `：${escapeHtml(view.notice)}` : ""}</p>`;
+  const filterNote =
+    filter.state === undefined && filter.limit === undefined
+      ? ""
+      : ` · 过滤：<span class="mono">${escapeHtml(
+          [filter.state === undefined ? "" : `state=${filter.state}`, filter.limit === undefined ? "" : `limit=${filter.limit}`]
+            .filter((s) => s !== "")
+            .join(" · "),
+        )}</span> <span class="muted">（桥服务端过滤）</span>`;
   return `<h2>任务 · 项目 <span class="mono">${escapeHtml(view.projectId)}</span></h2>
-<p class="hint"><a class="fl" href="/tasks">换项目</a> · 共 ${view.tasks.length} 条</p>
+<p class="hint"><a class="fl" href="/tasks">换项目</a> · 共 ${view.tasks.length} 条${filterNote}</p>
 ${reach}
 <table><thead><tr><th>taskId</th><th>contextId</th><th>状态</th><th>stale</th><th>更新</th><th>prompt 摘要</th></tr></thead>
 <tbody>${rows.length === 0 ? emptyRow(6, "（无任务）") : rows.join("")}</tbody></table>
@@ -470,6 +652,234 @@ ${snapshot}
 <table><thead><tr><th>machineId</th><th>online</th><th>lastHeartbeatAt</th></tr></thead>
 <tbody>${runners === "" ? emptyRow(3, "（无 runner）") : runners}</tbody></table>
 <p class="hint">${escapeHtml(INFLIGHT_CALIBRATION_NOTE)}</p>`;
+}
+
+// ---------------------------------------------------------------------------
+// 组织视角页（REQ-v0.9.2 N6 · 只读）
+// ---------------------------------------------------------------------------
+
+/** 组织视角页的一行 = 一个组织（归并后的清单 + 逐组查询结果 + 该组需求）。 */
+export interface OrgsRow {
+  org: string;
+  /** 伪分组（无归属）不进组织清单、只进需求表：其项目查询面恒 `null`。 */
+  pseudo: boolean;
+  /** 逐组 `a2a_projects` 结果；`null` = 未查询（伪分组 / 查询器未装配）。 */
+  projectsOutcome: OrgProjectsOutcome | null;
+  features: FeatureListItem[];
+}
+
+export interface OrgsPageInput {
+  rows: OrgsRow[];
+  /** 组织目录根（`<orgsDir>`）；`null` = 未配置 ⇒ 磁盘枚举源缺席，页上如实标注。 */
+  orgsDir: string | null;
+  /** 组织目录根不可用结论（沿用 host-face 闭集）；可用 / 未配置 ⇒ null。 */
+  orgsDirProblem?: { code: string; message: string } | null;
+  /** 查询器未装配时的说明（如页级降级），null ⇒ 正常逐组查询。 */
+  queryDisabledNote?: string | null;
+}
+
+/** 逐组查询状态单元格：ok = 正常；fail = 「不可达」+ 结构化错误码（灰化行，不炸页）。 */
+function orgProjectsStatusCell(outcome: OrgProjectsOutcome | null): string {
+  if (outcome === null) return '<td class="muted">未查询</td>';
+  if (outcome.ok) return "<td>可达</td>";
+  return `<td class="muted">不可达 <span class="mono">${escapeHtml(outcome.code)}</span></td>`;
+}
+
+function renderOrgFeaturesTable(features: readonly FeatureListItem[]): string {
+  const rows = features.map((f) => {
+    const d = deriveDisplayStage(f.state, f.stage);
+    return (
+      "<tr>" +
+      `<td>${featureLink(f.featureId, f.title === "" ? f.featureId : f.title)}</td>` +
+      `<td>${escapeHtml(label(FEATURE_STATE_LABELS, f.state))}</td>` +
+      `<td>${escapeHtml(d.label)}</td>` +
+      `<td>${escapeHtml(f.version === null || f.version === "" ? "—" : f.version)}</td>` +
+      `<td>${escapeHtml(f.approval ?? "—")}</td>` +
+      `<td>${escapeHtml(stamp(f.updatedAt))}</td>` +
+      "</tr>"
+    );
+  });
+  return `<h3>需求（${String(features.length)}）</h3>
+<table><thead><tr><th>需求</th><th>引擎态</th><th>阶段（显示）</th><th>版本</th><th>审批门</th><th>更新</th></tr></thead>
+<tbody>${rows.length === 0 ? emptyRow(6, "（该组织暂无需求）") : rows.join("")}</tbody></table>`;
+}
+
+function renderOrgProjectsTable(outcome: OrgProjectsOutcome | null): string {
+  if (outcome === null) {
+    return `<h3>项目</h3><p class="hint muted">（本组不查询项目：无归属需求不构成组织连接身份）</p>`;
+  }
+  if (!outcome.ok) {
+    return `<h3>项目</h3><p class="hint warn">不可达（<code>${escapeHtml(outcome.code)}</code>）：${escapeHtml(outcome.error)} —— 项目清单未知（灰化不炸页；刷新本页重查）。</p>`;
+  }
+  const rows = outcome.projects.map((p) => {
+    return (
+      "<tr" + (p.machineError !== null ? ' class="warn"' : "") + ">" +
+      `<td>${escapeHtml(p.machineId)}</td>` +
+      `<td><a class="fl" href="/tasks?project=${encodeURIComponent(p.projectId)}">${escapeHtml(p.projectId)}</a></td>` +
+      `<td>${escapeHtml(p.agentKind ?? "—")}</td>` +
+      `<td>${p.a2aPort === null ? "—" : String(p.a2aPort)}</td>` +
+      `<td>${escapeHtml(p.status ?? "—")}</td>` +
+      `<td>${escapeHtml(p.startedAt ?? "—")}</td>` +
+      `<td>${escapeHtml(p.machineError ?? "—")}</td>` +
+      "</tr>"
+    );
+  });
+  return `<h3>项目（${String(outcome.projects.length)}）</h3>
+<table><thead><tr><th>machineId</th><th>projectId</th><th>agentKind</th><th>a2aPort</th><th>status</th><th>startedAt</th><th>机器 error</th></tr></thead>
+<tbody>${rows.length === 0 ? emptyRow(7, "（该组织快照中无项目）") : rows.join("")}</tbody></table>`;
+}
+
+/**
+ * `GET /orgs` 组织视角页（N6 · 纯函数）：总表一行一组织（可达性 / 项目数 / 需求数），
+ * 其下逐组织小节 = 需求表 ∪ 项目表。「（无归属）」伪分组如实呈现（不丢弃、不回落板级默认组）；
+ * 不可达组织灰化（`.muted` + 「不可达」+ 错误码），其余组织照常。
+ */
+export function renderOrgsPage(input: OrgsPageInput): string {
+  const dirLine =
+    input.orgsDir === null
+      ? `<p class="hint warn"><code>board_orgs_dir_not_configured</code> 组织目录根（orgsDir）未配置 ⇒ 磁盘枚举源缺席，组织清单 = 板托管台账 ∪ 板级默认 ∪ 需求归属三源归并。</p>`
+      : input.orgsDirProblem
+        ? `<p class="hint err"><code>${escapeHtml(input.orgsDirProblem.code)}</code> ${escapeHtml(input.orgsDirProblem.message)}</p>`
+        : `<p class="hint">组织目录根：<code>${escapeHtml(input.orgsDir)}</code>（磁盘枚举 ∪ 板托管台账 ∪ 板级默认 ∪ 需求归属，四源归并）</p>`;
+  const disabled =
+    input.queryDisabledNote === undefined || input.queryDisabledNote === null
+      ? ""
+      : `<p class="hint warn">${escapeHtml(input.queryDisabledNote)}</p>`;
+  const summaryRows = input.rows.map((r) => {
+    const outcome = r.projectsOutcome;
+    const projCell =
+      outcome === null
+        ? '<td class="muted">—</td>'
+        : outcome.ok
+          ? `<td>${String(outcome.projects.length)}</td>`
+          : `<td class="muted">未知</td>`;
+    return (
+      `<tr${r.pseudo || (outcome !== null && !outcome.ok) ? ' class="muted"' : ""}>` +
+      `<td>${escapeHtml(r.org)}${r.pseudo ? ' <span class="muted">（伪分组）</span>' : ""}</td>` +
+      (r.pseudo ? '<td class="muted">不适用</td>' : orgProjectsStatusCell(outcome)) +
+      projCell +
+      `<td>${String(r.features.length)}</td>` +
+      "</tr>"
+    );
+  });
+  const sections = input.rows
+    .map((r) => {
+      const warn = r.projectsOutcome !== null && !r.projectsOutcome.ok;
+      return `<h2${warn ? ' class="muted"' : ""}>${escapeHtml(r.org)}${warn ? " · 不可达" : ""}</h2>
+${renderOrgFeaturesTable(r.features)}
+${renderOrgProjectsTable(r.projectsOutcome)}`;
+    })
+    .join("\n");
+  return `<h2>组织视角</h2>
+${dirLine}
+${disabled}
+<p class="hint">数据 = 需求列表 <code>ownerGroup</code> 板内存归并 + 逐组织以<b>组身份</b>只读查询 <code>a2a_projects</code>（单组超时即降级为「不可达」，不缓存、不落新存储；项目清单沿用快照口径，无「实时在线」语义）。文档入口 = 需求详情链（阶段产出在详情页呈现）。</p>
+<table><thead><tr><th>组织</th><th>项目查询</th><th>项目数</th><th>需求数</th></tr></thead>
+<tbody>${summaryRows.length === 0 ? emptyRow(4, "（无任何组织：盘 / 台账 / 默认 / 需求归属四源皆空）") : summaryRows.join("")}</tbody></table>
+${sections}`;
+}
+
+// ---------------------------------------------------------------------------
+// 排期看板页（v0.9.2 M4 · 只读；数据 = 列表 `getFeatures()` 复用，零新桥接口）
+// ---------------------------------------------------------------------------
+
+/** 看板的一个版本列（列头 + 该版本下的需求卡；未排期不进列，归需求池 M5）。 */
+export interface ScheduleColumn {
+  /** 已归一（trim）的版本串，列内恒定。 */
+  version: string;
+  features: FeatureListItem[];
+}
+
+/**
+ * 需求列表 → 版本列（纯函数）：未排期（`trim() === ""` 单一判据，含 null）直接滤除；
+ * 列序 = `version-order.ts` 比较器（semver 数值序、非 `x.y.z` 字典序垫底）；
+ * 列内保持入参顺序（不做列内二次排序 —— 抖动排序键会让卡片跳位）。
+ */
+export function groupFeaturesByVersion(features: readonly FeatureListItem[]): ScheduleColumn[] {
+  const byVersion = new Map<string, FeatureListItem[]>();
+  for (const f of features) {
+    if (isUnscheduled(f.version)) continue;
+    const v = normalizeVersion(f.version);
+    const bucket = byVersion.get(v);
+    if (bucket === undefined) byVersion.set(v, [f]);
+    else bucket.push(f);
+  }
+  return [...byVersion.entries()]
+    .sort(([a], [b]) => compareVersionOrder(a, b))
+    .map(([version, list]) => ({ version, features: list }));
+}
+
+/** 看板的一张需求卡；`withRequirement` ⇒ 池卡追加需求原文（截断 120 字 + 转义，标题已链详情页）。 */
+function renderScheduleCard(f: FeatureListItem, withRequirement = false): string {
+  const d = deriveDisplayStage(f.state, f.stage);
+  const reqLine =
+    withRequirement && f.requirement !== null && f.requirement !== ""
+      ? `<p class="kmeta">需求：${escapeHtml(truncate(f.requirement, 120))}</p>`
+      : "";
+  return `<div class="kcard">
+<span class="kbadge">${escapeHtml(label(FEATURE_STATE_LABELS, f.state))}</span>
+${featureLink(f.featureId, f.title === "" ? f.featureId : f.title)} <span class="muted mono" title="${escapeHtml(f.featureId)}">${escapeHtml(shortId(f.featureId))}</span>
+<p class="kmeta">阶段：${escapeHtml(d.label)}（${d.basis === "derived" ? "派生" : "登记"}） · 审批门：${escapeHtml(f.approval ?? "—")} · 任务数：${f.taskCount === null ? "—" : f.taskCount}</p>
+${reqLine}</div>`;
+}
+
+/**
+ * 未排期需求 → 池序（纯函数）：判据单一 `trim(version) === ""`；
+ * 排序不依赖 orch 列表序（改排期会前进 `updated_at`、列表序可变），池序见 `version-order.ts`。
+ */
+export function selectRequirementPool(features: readonly FeatureListItem[]): FeatureListItem[] {
+  return sortPoolEntries(features.filter((f) => isUnscheduled(f.version)));
+}
+
+/**
+ * 列头版本状态徽标（REQ-v0.9.2 增补 ⑤ N4 · **仅显示，不执法**）：
+ * 锁版（config `releasedVersions` 命中）⇒「🔒 已发版」（tooltip = 派生 note）；
+ * 未锁 ⇒ 按派生态渲染「进行中」/「已收尾」（增补 ② 补渲染，样式与锁徽标区分）；
+ * 「未排期」不进版本列，无需处理。
+ */
+function renderVersionBadge(version: string, features: readonly FeatureListItem[], releasedVersions: readonly string[]): string {
+  const st = deriveVersionStatus(version, features, releasedVersions);
+  if (st.status === "未排期") return "";
+  const text = st.status === "已发版" ? "🔒 已发版" : st.status;
+  const variant = st.status === "已发版" ? "locked" : st.status === "进行中" ? "wip" : "closed";
+  return ` <span class="kbadge vbadge ${variant}" title="${escapeHtml(st.note)}">${escapeHtml(text)}</span>`;
+}
+
+/**
+ * `GET /schedule` 排期看板（纯函数）：版本列从左到右按 semver 数值序（M1 比较器），
+ * 列头 = 版本号 + 状态徽标（N4：锁版「🔒 已发版」/ 未锁「进行中」/「已收尾」，仅显示）+ 卡片数；
+ * 未排期卡不占版本列，集中在末列「需求池」（池序 = 入参已排，见 {@link selectRequirementPool}）。
+ */
+export function renderSchedule(
+  columns: readonly ScheduleColumn[],
+  pool: readonly FeatureListItem[] = [],
+  releasedVersions: readonly string[] = [],
+): string {
+  const cols = columns.map(
+    (c) => `<div class="kcol">
+<h3>${escapeHtml(c.version)}${renderVersionBadge(c.version, c.features, releasedVersions)} <span class="muted">(${String(c.features.length)})</span></h3>
+${c.features.map((f) => renderScheduleCard(f)).join("\n")}
+</div>`,
+  );
+  const poolCol = `<div class="kcol">
+<h3>需求池 <span class="muted">(${String(pool.length)})</span></h3>
+${pool.length === 0 ? `<p class="hint">（无未排期需求）</p>` : pool.map((f) => renderScheduleCard(f, true)).join("\n")}
+</div>`;
+  const board = `<div class="kanban">${[...cols, poolCol].join("\n")}</div>`;
+  const emptyNote =
+    cols.length === 0
+      ? `<p class="hint">（无已排期需求：全部需求 version 为空 ⇒ 都在需求池列）</p>`
+      : "";
+  // 详情浮层骨架（REQ-v0.9.2 增补 ④）：dialog 内容运行时由 FEATURE_DETAIL_OVERLAY_SCRIPT
+  // 搬入详情页 <main> 节点，骨架恒空、不嵌任何用户数据；脚本随 renderPage 每页注入，
+  // 无 dialog（其它页）或禁 JS 时不生效 ⇒ 卡片 <a> 即整页详情回退。
+  return `<h2>排期看板</h2>
+<p class="hint">数据 = 需求列表 <code>getFeatures()</code> 板内存按 <code>version</code> 归组（无新桥接口）；列从左到右 = semver 数值序（<code>v0.9.0 &lt; v0.10.0</code>），非 <code>x.y.z</code> 串字典序垫底；未排期（version 空）不进版本列，集中末列「需求池」（<code>createdAt</code> 降序）。状态作卡片徽标，不按状态分列；版本列头徽标（🔒 已发版 / 进行中 / 已收尾）仅为显示提示，执法在服务端写口；拖拽调整排期 = v0.9.3。点卡片标题 = 浮层打开详情（禁 JS 时回退整页）。</p>
+${emptyNote}${board}
+<dialog class="fd" id="feat-dialog">
+<button type="button" id="feat-dialog-close">关闭</button>
+<div class="fd-body"></div>
+</dialog>`;
 }
 
 // ---------------------------------------------------------------------------
@@ -547,6 +957,87 @@ export function renderNextStepGuide(input: NextStepInput): string {
 }
 
 /**
+ * 详情页「下一步」引导区的**验收轨迹块**（REQ-v0.9.2 N8）：消费桥详情出参顶层 `acceptance`
+ * （stages 段轨迹 + failures 账单 + stateCounts），计数与反推全归 orch，板侧只如实渲染。
+ * `null` = 老桥 / 缺键 ⇒ 不渲染（详情页现行为）。
+ *
+ * 消费纪律：`state` 值域**非封闭**（存量库有退役值 analyzing/planning）⇒ 未命中标签表原样显示 + 灰化；
+ * **末段** `leftAt === null` = 当前停留态（非缺字段）；同态重复段不合并。
+ */
+export function renderAcceptanceSection(acceptance: AcceptanceView | null | undefined): string {
+  if (acceptance === null || acceptance === undefined) return "";
+  const stageRows = acceptance.stages.map((s, i) => {
+    const known = Object.prototype.hasOwnProperty.call(FEATURE_STATE_LABELS, s.state);
+    const stateCell = known
+      ? escapeHtml(label(FEATURE_STATE_LABELS, s.state))
+      : `<span class="muted">${escapeHtml(s.state === "" ? "—" : s.state)}</span>`;
+    const last = i === acceptance.stages.length - 1;
+    const leftCell = s.leftAt !== null ? escapeHtml(stamp(s.leftAt)) : last ? '<span class="warn">当前停留</span>' : "—";
+    return `<tr><td>${stateCell}</td><td>${escapeHtml(stamp(s.enteredAt))}</td><td>${leftCell}</td></tr>`;
+  });
+  const stageTable = `<table><thead><tr><th>主链态（轨迹段）</th><th>进入</th><th>离开</th></tr></thead>
+<tbody>${stageRows.length === 0 ? emptyRow(3, "（无段轨迹）") : stageRows.join("")}</tbody></table>`;
+  const counts = Object.entries(acceptance.stateCounts)
+    .map(([k, n]) => `${escapeHtml(label(TASK_STATE_LABELS, k))} × ${String(n)}`)
+    .join(" · ");
+  const failureRows = acceptance.failures.map((fl) => {
+    return (
+      "<tr>" +
+      `<td class="mono">${fl.eventId === null ? "—" : String(fl.eventId)}</td>` +
+      `<td>${escapeHtml(stamp(fl.at))}</td>` +
+      `<td class="mono">${escapeHtml(acceptancePayloadSummary(fl.payload))}</td>` +
+      "</tr>"
+    );
+  });
+  const failuresBlock =
+    acceptance.failures.length === 0
+      ? `<p class="hint">失败账单：<b>0 条</b></p>`
+      : `<p class="hint">失败账单：<b>${String(acceptance.failures.length)} 条</b>（orch 零去重原样列出）</p>
+<table><thead><tr><th>eventId</th><th>时间</th><th>payload 摘要</th></tr></thead>
+<tbody>${failureRows.join("")}</tbody></table>`;
+  return `<h2>验收轨迹（acceptance）</h2>
+<p class="hint">数据 = 桥详情出参顶层 <code>acceptance</code> 块（orch 聚合，板不重算、不按 state 反推）；态值域非封闭，未知/退役态原样显示。${counts === "" ? "" : ` 节点态计数：${counts}`}</p>
+${stageTable}
+${failuresBlock}`;
+}
+
+/**
+ * 失败账单 payload 摘要：`payload` 是事件原文 JSON 字符串（可 null），**内层键不作契约** ——
+ * 能 parse 成对象则按「实际有的键」浅层概括（数组记长度、标量记值），坏 JSON / 非对象 ⇒ 原文截断显示。
+ */
+function acceptancePayloadSummary(payload: string | null): string {
+  if (payload === null || payload === "") return "—";
+  try {
+    const parsed: unknown = JSON.parse(payload);
+    if (parsed !== null && typeof parsed === "object" && !Array.isArray(parsed)) {
+      const parts = Object.entries(parsed as Record<string, unknown>).map(([k, v]) =>
+        Array.isArray(v) ? `${k}×${String(v.length)}` : `${k}=${String(v)}`,
+      );
+      if (parts.length > 0) return parts.join(" · ");
+      return "（空对象）";
+    }
+  } catch {
+    // 防御式：payload 非合法 JSON 属容错面，原文如实显示，不崩不吞
+  }
+  return truncate(payload, 120);
+}
+
+/**
+ * 详情页「轮次进度」行（REQ-v0.9.2 N7）：该需求有在飞 / 排队的轮时显示「第 N 轮 · 在飞 / 排队中（位次）」，
+ * 无 ⇒ 空串（不渲染）。触发一轮受理成功后 303 回本页，这一行就是它该有的落点。
+ *
+ * **不做自动刷新**（自动刷新不在页面脚本白名单闭集〔内联字面量常量 · N3 纪律钉〕内 + 与调度拍错拍）：文案直接写明刷新方式 = 重载本页。
+ */
+export function renderTurnProgress(view: TurnProgressView | null): string {
+  if (view === null) return "";
+  const where =
+    view.state === "running"
+      ? "在飞"
+      : `排队中${view.position === null ? "" : ` · 队列第 ${String(view.position)} 位`}`;
+  return `<p class="hint turn-progress">轮次进度：<b>第 ${String(view.round)} 轮 ${where}</b> · <span class="mono">${escapeHtml(view.turnId)}</span> · 刷新本页看最新（板不自动刷新）</p>`;
+}
+
+/**
  * 需求详情页上的「澄清回答」表单：`POST /features/:id/answer`（BD9）。
  * **仅在存在 `awaiting_answer` 轮时渲染**（调用方判据 = {@link BoardHostFace.awaitingTurnOf}）；
  * 回答将以同一 `contextId` 续接该需求的宿主会话（澄清续推口径）。
@@ -569,14 +1060,7 @@ ${q}<p class="hint">回答将<b>续接同一 contextId</b>（同一逻辑任务�
  * `queued` 显示「排队中」并指向状态页（本节点不等排队轮的终态）。
  */
 export function renderTurnOutcome(o: TriggerTurnOutcome): string {
-  const bad =
-    o.disposition === "bridge_down" ||
-    o.disposition === "turn_failed" ||
-    o.disposition === "timeout" ||
-    o.disposition === "not_awaiting" ||
-    o.disposition === "busy" ||
-    o.disposition === "terminal" ||
-    o.disposition === "config_error";
+  const bad = isFailureDisposition(o.disposition);
   const hintClass = bad ? "hint err" : "hint";
   const rows = [
     ["组织", o.org],
@@ -622,6 +1106,50 @@ ${summary}
 ${note}
 ${back}`;
 }
+
+/** 结局是否属「失败档」（与 {@link renderTurnOutcome} 的 `bad` 判据同一闭集）。 */
+function isFailureDisposition(d: TriggerDisposition): boolean {
+  return (
+    d === "bridge_down" ||
+    d === "turn_failed" ||
+    d === "timeout" ||
+    d === "not_awaiting" ||
+    d === "busy" ||
+    d === "terminal" ||
+    d === "config_error"
+  );
+}
+
+/**
+ * 轮结果失败档的 BD2 浮层参数（REQ-v0.9.2 N2）：标题 = 错误码中文族名、正文 = error 消息、
+ * mono 小字 = code、「知道了」由渲染层给出。成功 / `awaiting_answer` / `queued` 等非失败档 ⇒ `null`
+ * （不弹——它们不是错误）。整页信息架构不变（renderTurnOutcome 原样保留），浮层只是统一样式面。
+ */
+export function turnOutcomeErrorOverlay(o: TriggerTurnOutcome): ErrorOverlayParams | null {
+  if (!isFailureDisposition(o.disposition)) return null;
+  const code = o.error?.code ?? `turn_${o.disposition}`;
+  return {
+    family: errorFamilyLabel(code),
+    error: o.error?.message ?? (o.display === "" ? `本轮未成功（${o.disposition}）` : o.display),
+    code,
+    hint: "整页仍保留本轮台账明细；关闭浮层后可回宿主桥状态页重试。",
+  };
+}
+
+/** 停桥结果失败档的 BD2 浮层参数（同判据：`ok:false` ⇒ 浮层；成功 ⇒ null）。 */
+export function stopBridgeErrorOverlay(o: StopBridgeOutcome): ErrorOverlayParams | null {
+  if (o.ok) return null;
+  const code = o.error?.code ?? "host_stop_failed";
+  return {
+    family: errorFamilyLabel(code),
+    error: o.error?.message ?? (o.display === "" ? "停桥未成功" : o.display),
+    code,
+    hint: "状态页已如实回显；关闭浮层后可重试或查桥日志。",
+  };
+}
+
+/** 桥不可达整页的错误码（BD2 浮层版式统一 · REQ-v0.9.2 N2）。 */
+export const BRIDGE_UNREACHABLE_CODE = "bridge_unreachable";
 
 /** 停桥结果横幅（同页显示；失败如实带错误码，不伪装成「已停」）。 */
 export function renderHostNotice(o: StopBridgeOutcome): string {
@@ -747,6 +1275,29 @@ const ERROR_FAMILY_LABELS: Readonly<Record<string, string>> = {
   board_group_required: "表单字段校验失败",
   payload_too_large: "请求体超限",
   body_read_failed: "请求体读取失败",
+  bridge_unreachable: "桥不可达",
+  host_turn_rejected: "本轮未受理",
+  host_stop_failed: "停桥未成功",
+  host_not_managed: "本板未托管该组织",
+  turn_failed: "本轮执行失败",
+  timeout: "本轮超时",
+  bridge_down: "宿主桥不可达",
+  config_error: "宿主面配置错误",
+  board_orgs_dir_not_configured: "宿主面未配置组织根",
+  board_orgs_dir_missing: "组织目录根不可用",
+  board_org_not_resolved: "归属组织无法确定",
+  board_org_name_invalid: "组织名不合法",
+  board_turn_request_invalid: "本轮入参不合法",
+  board_no_awaiting_turn: "无可回答的澄清轮",
+  board_turn_busy: "本轮已在进行",
+  board_feature_terminal: "需求已终态",
+  board_version_released: "版本已发版锁定",
+  org_workspace_missing: "组织工作区缺失",
+  bridge_unavailable: "宿主桥不可达",
+  bridge_exited: "宿主桥已退出",
+  bridge_start_timeout: "宿主桥启动超时",
+  spawn_failed: "宿主桥起不来",
+  launch_plan_failed: "宿主桥启动计划失败",
   response_invalid: "桥调用错误",
   protocol_error: "桥调用错误",
   jsonrpc_error: "桥调用错误",
@@ -755,6 +1306,8 @@ const ERROR_FAMILY_LABELS: Readonly<Record<string, string>> = {
   unknown: "桥调用错误",
   host_face_disabled: "宿主面未装配",
   answer_empty: "参数校验失败",
+  board_schedule_owner_group_missing: "归属组织缺失",
+  schedule_request_invalid: "排期写入参错误",
   bad_url: "请求不合法",
   not_found: "未知路径",
   method_not_allowed: "方法不允许",

@@ -28,6 +28,22 @@ test("parseFeaturesList: 归一列表字段", () => {
   assert.equal(view.features[1].ownerGroup, null);
 });
 
+test("parseFeaturesList: requirement 映射（M5）——字符串原样、缺列/非字符串容错 null", () => {
+  const view = parseFeaturesList({
+    ok: true,
+    features: [
+      { featureId: "F1", state: "waiting_approval", requirement: "  原文照抄  " },
+      { featureId: "F2", state: "waiting_approval", requirement: "" },
+      { featureId: "F3", state: "waiting_approval", requirement: 42 },
+      { featureId: "F4", state: "waiting_approval" },
+    ],
+  });
+  assert.equal(view.features[0].requirement, "  原文照抄  ", "原样透传（不 trim 不改写）");
+  assert.equal(view.features[1].requirement, "");
+  assert.equal(view.features[2].requirement, null, "非字符串 ⇒ null 容错");
+  assert.equal(view.features[3].requirement, null, "老桥缺列 ⇒ null 容错");
+});
+
 test("parseFeaturesList: ok:false 抛 BridgeResponseError 并带 code", () => {
   assert.throws(
     () => parseFeaturesList({ ok: false, code: "boom", error: "炸了" }),
@@ -212,6 +228,86 @@ test("parseFeatureDetail: 登记字段透出（桥未给 ⇒ null，不臆造缺
   });
   assert.equal(without.feature.stage, null);
   assert.equal(without.feature.version, null);
+});
+
+// --- REQ-v0.9.2 N8：详情出参**顶层** acceptance 块（老桥缺键 ⇒ null ⇒ 详情页现行为） --------
+
+test("parseFeatureDetail: acceptance 顶层键透传（stages/failures/stateCounts）", () => {
+  const view = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [],
+    acceptance: {
+      stages: [
+        { state: "waiting_approval", enteredAt: "e0", leftAt: "e1" },
+        { state: "executing", enteredAt: "e1", leftAt: null },
+      ],
+      failures: [{ eventId: 7, at: "a1", payload: '{"failed":["t1"],"blockedSet":["t2"]}' }],
+      stateCounts: { completed: 2, failed: 1, bogus: "x" },
+    },
+  });
+  assert.equal(view.acceptance.stages.length, 2);
+  assert.equal(view.acceptance.stages[1].state, "executing");
+  assert.equal(view.acceptance.stages[1].leftAt, null, "末段 leftAt=null 是合法语义，不得被吞");
+  assert.equal(view.acceptance.failures[0].eventId, 7);
+  assert.equal(view.acceptance.failures[0].payload, '{"failed":["t1"],"blockedSet":["t2"]}');
+  assert.deepEqual(view.acceptance.stateCounts, { completed: 2, failed: 1 });
+});
+
+test("parseFeatureDetail: 老桥 / acceptance 缺键 ⇒ null（现行为不降级报错）", () => {
+  const legacy = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [],
+  });
+  assert.equal(legacy.acceptance, null);
+  const notObject = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [],
+    acceptance: "x",
+  });
+  assert.equal(notObject.acceptance, null);
+});
+
+test("parseFeatureDetail: acceptance 容错（空对象 / 非数组 / 未知态 / payload 坏 JSON）", () => {
+  const empty = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [],
+    acceptance: {},
+  });
+  assert.deepEqual(empty.acceptance, { stages: [], failures: [], stateCounts: {} }, "空对象 = 合法零段，不是缺位");
+  const weird = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [],
+    acceptance: {
+      stages: "no",
+      failures: [null, { eventId: "bad" }],
+      stateCounts: 7,
+    },
+  });
+  assert.deepEqual(weird.acceptance.stages, []);
+  assert.deepEqual(weird.acceptance.failures, [
+    { eventId: null, at: null, payload: null },
+    { eventId: null, at: null, payload: null },
+  ]);
+  assert.deepEqual(weird.acceptance.stateCounts, {});
+  const retired = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [],
+    acceptance: {
+      // 值域非封闭：存量库退役态 analyzing / 缺 state 键 ⇒ 原样/空串，不校验不抛
+      stages: [{ state: "analyzing", enteredAt: "e0", leftAt: "e1" }, {}],
+      // payload 原文字符串（内层键不作契约）；坏 JSON 原样保留
+      failures: [{ eventId: 1, at: "a1", payload: "{坏 JSON" }],
+    },
+  });
+  assert.equal(retired.acceptance.stages[0].state, "analyzing");
+  assert.deepEqual(retired.acceptance.stages[1], { state: "", enteredAt: null, leftAt: null });
+  assert.equal(retired.acceptance.failures[0].payload, "{坏 JSON");
 });
 
 test("parseProjects: machines/projects/runners 归一 + 缺字段容错", () => {

@@ -60,6 +60,7 @@ test("①完整配置：逐键生效，`_` 前缀注释键（_comment 族）被�
       mcpBaseUrl: "http://10.0.0.5:9000",
       machineDist: "D:/custom/machine-dist",
       turnTimeoutMs: 123456,
+      releasedVersions: ["v0.9.0", "v0.9.1"],
     });
     assert.equal(cfg.port, 4599);
     assert.equal(cfg.host, "::1");
@@ -70,6 +71,7 @@ test("①完整配置：逐键生效，`_` 前缀注释键（_comment 族）被�
     assert.equal(cfg.mcpBaseUrl, "http://10.0.0.5:9000");
     assert.equal(cfg.machineDist, "D:/custom/machine-dist");
     assert.equal(cfg.turnTimeoutMs, 123456);
+    assert.deepEqual(cfg.releasedVersions, ["v0.9.0", "v0.9.1"]);
     assert.ok(cfg.sourcePath.endsWith("config.json"));
   } finally {
     rmSync(orgs, { recursive: true, force: true });
@@ -87,6 +89,7 @@ test("①b缺省值逐项与 BD12″ 之前一致（空对象 = 全缺省）", (
   assert.equal(cfg.mcpBaseUrl, "http://127.0.0.1:8787");
   assert.equal(cfg.machineDist, resolveMachineDistDir({}));
   assert.equal(cfg.turnTimeoutMs, null);
+  assert.deepEqual(cfg.releasedVersions, []);
 });
 
 test("②（负向）缺 config.json ⇒ [config] 明确文案 + 提示从模板复制，不裸崩", () => {
@@ -131,6 +134,33 @@ test("⑤未知键 ⇒ 忽略、不影响解析", () => {
   const cfg = load({ futureKnob: { deep: true }, anotherString: "x", port: 4601 });
   assert.equal(cfg.port, 4601);
   assert.equal(cfg.orgsDir, null);
+});
+
+test("⑤b releasedVersions（REQ-v0.9.2 N1）：缺省 = []；合法登记 trim + 去重后原样生效", () => {
+  assert.deepEqual(validateConfig({}, "t://x").releasedVersions, [], "整键缺失 ⇒ 缺省空 = 无锁版");
+  assert.deepEqual(validateConfig({ releasedVersions: null }, "t://x").releasedVersions, [], "null 同缺省");
+  assert.deepEqual(validateConfig({ releasedVersions: [] }, "t://x").releasedVersions, []);
+  const cfg = validateConfig({ releasedVersions: ["v0.9.0", " v0.9.1 ", "v0.9.0", "v0.9.2 "] }, "t://x");
+  assert.deepEqual(cfg.releasedVersions, ["v0.9.0", "v0.9.1", "v0.9.2"], "元素 trim 后保序去重（先到先得）");
+});
+
+test("⑤c（负向）releasedVersions 非法 ⇒ `[config] releasedVersions` fail-fast", () => {
+  const cases = [
+    { releasedVersions: "v0.9.1" },
+    { releasedVersions: 42 },
+    { releasedVersions: {} },
+    { releasedVersions: ["v0.9.0", 7] },
+    { releasedVersions: [""] },
+    { releasedVersions: ["   "] },
+    { releasedVersions: ["v0.9.0", null] },
+  ];
+  for (const obj of cases) {
+    assert.throws(
+      () => validateConfig(obj, "t://x"),
+      (err) => err instanceof Error && /^\[config\] releasedVersions/.test(err.message),
+      `非法 ${JSON.stringify(obj)} 必须被拒（不静默降级）`,
+    );
+  }
 });
 
 test("⑥（负向）orgsDir 留空 / 缺键 ⇒ 宿主面不装配（buildHostFace 返 null）", () => {

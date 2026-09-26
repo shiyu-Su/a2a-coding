@@ -1,10 +1,18 @@
 /**
- * board HTTP 服务（BD1 骨架 + BD3 只读视图 + BD7 写面 + BD8 宿主面 + BD9 确认/回答入口）—— **只绑 loopback**、零框架（`node:http`）。
+ * board HTTP 服务（BD1 骨架 + BD3 只读视图 + BD7 写面 + BD8 宿主面 + BD9 确认/回答入口 + v0.9.2 M3 排期写）—— **只绑 loopback**、零框架（`node:http`）。
  *
  * 路由：
  * - `GET /health`          —— 板自身健康（保留 BD1 行为）；
- * - `GET /`                —— 需求列表（桥 `/api/features`）+ 提需求表单；
- * - `GET /features/:id`    —— 需求详情 + 任务 + trace 三面 + 「触发一轮」+「阶段产出」/「产出登记」（BD11）；
+ * - `GET /`                —— **排期看板首页**（REQ-v0.9.2 增补 ④ N1：与 `/schedule` 同 kind 同渲染、逐字节同构）；
+ * - `GET /requirements`    —— **需求列表页**（增补 ④ N1 起自旧 `/` 迁入；与下 `POST /requirements` **同路径双义**
+ *   —— 方法门先于路由匹配：GET ⇒ 列表页，POST ⇒ 建需求）：桥 `/api/features`，含板内存过滤 + 提需求表单；
+ * - `GET /schedule`        —— **`/` 的别名**（历史深链兼容）：以下描述即首页看板内容
+ *   （v0.9.2 M4/M5，只读）：数据 = 列表 `getFeatures()` 复用，
+ *   板内存按 `version` 归组（M1 `version-order.ts` 数值序，非 `x.y.z` 字典序垫底）；列头 = 版本号 +
+ *   卡片数；卡片 = title + 状态徽标 + stage/approval + taskCount（按状态分列不做）；
+ *   **未排期卡**（单一判据 `trim() === ""`）不占版本列，集中本页末列「需求池」（卡上需求原文截断 120 字）；零写、零新桥接口；
+ * - `GET /features/:id`    —— 需求详情 + 任务 + trace 三面 + 「触发一轮」+「阶段产出」（BD11；
+ *   REQ-v0.9.2 按需求归约：该区由本需求 `decisions` 登记驱动，与旧「产出登记」合并为单区，版本目录清单作废）；
  * - `GET /features/:id/docs?file=<name>[&src=A|B][&mode=render|raw]` —— **单文档内容**（BD11 读文档面）：
  *   `text/plain` 原文直出，
  *   浏览器 `Accept: text/html` ⇒ 整页；**BD14 双档**：缺省 `render`（markdown 子集渲染 + mermaid 占位），
@@ -17,21 +25,33 @@
  *   CSP `script-src 'self'` 放行（板 CSP 首次放宽，理由见 layout.ts 注释）；
  * - `GET /tasks[?project=]`—— 任务视图（桥 `/api/tasks`，project 必填；缺省为选单页）；
  * - `GET /projects`        —— 项目 / 机器视图（桥 `/api/projects`）；
+ * - `GET /orgs`            —— **组织视角页**（REQ-v0.9.2 N6，只读）：组织清单 = `<orgsDir>` 磁盘枚举
+ *   ∪ 板托管台账 ∪ 板级默认 ∪ 需求归属 四源归并；逐组织以**组身份**只读 MCP 查 `a2a_projects`
+ *   （并发 + 单组超时，失败/超时标「不可达」灰化不炸页）；需求按 `ownerGroup` 归组，
+ *   null 归属归「（无归属）」伪分组如实呈现。零写、零缓存、零新增存储；
  * - `GET /host`            —— **宿主桥状态页**（本板进程托管的桥：五态 + 结构化错误 + 轮队列）；
- * - `POST /requirements`            —— 提需求（BD7 接线 · BD11 组织名进表单）；
+ * - `POST /requirements`            —— 提需求（BD7 接线 · BD11 组织名进表单 · v0.9.2 M6 `version` 去必填，留空 = 未排期 ·
+ *   **v0.9.2 增补 ⑤ N2**：`form.version` 命中 config `releasedVersions`（已发版锁版）⇒ **409 `board_version_released`**
+ *   零出网 + 表单字段回填；空 version（未排期）不参与锁判）；
  * - `POST /features/:id/turn`       —— 触发一轮（BD8，起桥 + 发轮，**不等排队轮**；该需求已有在飞 /
  *   排队轮 ⇒ **409 `board_turn_busy`** 不重复入队 —— 收口轨 14 服务端防重，confirm / answer 同；
  *   需求已入**引擎终态** ⇒ **409 `board_feature_terminal`** 直接拒单不烧轮 —— 收口轨 16 ③，三入口同）；
  * - `POST /host/:org/stop`          —— 停桥（BD8，与上两条同规格受写面守卫）；
  * - `POST /features/:id/confirm`    —— 人工确认指令（BD9，**投消息给 agent**：由 agent 核对后自行执行 approve，板不批准）；
  * - `POST /features/:id/answer`     —— 澄清回答（BD9，仅当最新轮 `awaiting_answer` ⇒ 同 `contextId` 续推）；
+ * - `POST /features/:id/schedule`   —— 排期写（v0.9.2 M3，唯一放开的登记字段 `version` 写）：表单 `version` **必须显式传**
+ *   （空串 = 删除排期；服务端发送前 `trim()`），身份 = 该 Feature 的 `ownerGroup`（**null ⇒ 结构化 503，绝不回落板级默认组**），
+ *   `to` = 先 `getFeature` 取当前态再经 `feature-schedule.ts` 封装走 advance「`to` = 当前态」特例；
+ *   **已发版锁（v0.9.2 增补 ⑤ N3）**：现版本 ∉ 锁版 ∧ 目标 ∈ 锁版（入锁）或 现 ∈ 锁版 ∧ 目标 ≠ 现（出锁，含清空）
+ *   ⇒ 409 `board_version_released` 零出网；同锁版无变化 ⇒ 幂等放行；
+ *   读-写窗口态漂移被桥拒 ⇒ 如实弹错误浮层 + 表单值回填，**不自动重试**；
  * - `POST /shutdown`                —— **优雅停机（BD13″，仅 loopback 来源）**：200 仅代表「受理」；
  *   不经 CSRF 写面守卫（它是运维停机口，不是业务写面），来源门 = `socket.remoteAddress` 必须 loopback，
  *   非 loopback 一律 403 `loopback_only`（负向用例钉住）。
  *
- * **方法门**：读面仅 GET；写面只放开上面五条业务路径（白名单 = `write-guard.parseWriteRoute`）+
+ * **方法门**：读面仅 GET；写面只放开上面六条业务路径（白名单 = `write-guard.parseWriteRoute`）+
  * `/shutdown` 一条运维路径（本文件内处理），其余路径的非 GET 一律 405。写端点另受 CSRF 守卫（自定义头或同源 Origin/Referer，见 `write-guard.ts`）。
- * 板**不写状态机**：无 approve / advance / cancel 任何路径（确认与回答都只是给宿主 agent 的一轮消息，推进归 agent）。
+ * 板**不写状态机迁移**：approve / cancel 与「advance 到非当前态」的主链推进均无路径（确认与回答都只是给宿主 agent 的一轮消息，推进归 agent）；唯一放开的是 `version` 排期写（经 `feature-schedule.ts` 用 advance「`to` = 当前态」特例，M3 已接线 `POST /features/:id/schedule`）。
  *
  * **组织名（BD11）**：由**提需求表单**给出（= MCP URL 首段 = 组织目录名，身份链 S1）；配置文件
  * `config.json` 的 `group` 只是**可选默认**（表单未填才生效，BD12″ 起无 argv/env 通道）。两者皆空 ⇒
@@ -55,7 +75,7 @@ import {
   type BridgeClientOptions,
 } from "./bridge-client.js";
 import { dispositionHttpStatus, terminalTurnRejection, type BoardHostFace, type TriggerTurnOutcome } from "./host-face.js";
-import { isTerminalFeatureState } from "./derive.js";
+import { deriveTurnProgress, isTerminalFeatureState } from "./derive.js";
 import {
   createRequirement,
   DEFAULT_MCP_BASE_URL,
@@ -63,21 +83,56 @@ import {
   type CreateRequirementOutcome,
 } from "./requirement.js";
 import {
+  scheduleFeature,
+  type ScheduleAdvanceInput,
+  type ScheduleFeatureOptions,
+  type ScheduleOutcome,
+  FeatureScheduleConfigError,
+} from "./feature-schedule.js";
+import {
   checkWriteAuth,
   parseRequirementForm,
+  parseScheduleForm,
   parseWriteRoute,
   WRITE_ROUTES,
   MAX_REQUIREMENT_BODY_BYTES,
+  ScheduleFormProgrammingError,
 } from "./write-guard.js";
 import { readVersion } from "./version.js";
-import { defaultRepoRoot, listDocs, readDoc, type DocsSource } from "./docs-read.js";
+import { isVersionLocked } from "./version-status.js";
+import { normalizeVersion } from "./version-order.js";
+import { defaultRepoRoot, readDoc, type DocsSource } from "./docs-read.js";
 import { defaultStaticRoot, findVendoredAsset, VENDORED_ASSETS } from "./docs-render.js";
-import type { FeatureDocsView } from "./web/views.js";
-import { timestampPrefix } from "./log.js";
-import { BOARD_CSP, BOARD_REFERRER_POLICY, escapeHtml, renderPage, type ErrorOverlayParams, type NavKey } from "./web/layout.js";
 import {
+  NO_OWNER_GROUP_LABEL,
+  createOrgProjectsFetcher,
+  groupFeaturesByOwner,
+  listOrgDirs,
+  mergeOrgNames,
+  type OrgProjectsFetcher,
+  type OrgProjectsOutcome,
+} from "./orgs-view.js";
+import type { OrgsDirStatus, OrgsPageInput, OrgsRow } from "./web/views.js";
+import { timestampPrefix } from "./log.js";
+import {
+  BOARD_CSP,
+  BOARD_REFERRER_POLICY,
+  escapeHtml,
+  renderPage,
+  FEATURE_DETAIL_OVERLAY_SCRIPT,
+  type ErrorOverlayField,
+  type ErrorOverlayParams,
+  type NavKey,
+} from "./web/layout.js";
+import {
+  BRIDGE_UNREACHABLE_CODE,
   VIEW_NOTES,
+  applyFeaturesFilter,
   errorFamilyLabel,
+  featuresFilterActive,
+  groupFeaturesByVersion,
+  parseFeaturesFilter,
+  renderAcceptanceSection,
   renderAnswerForm,
   renderConfirmForm,
   renderFeaturesList,
@@ -85,13 +140,19 @@ import {
   renderHostNotice,
   renderHostPage,
   renderNextStepGuide,
+  renderOrgsPage,
   renderProjects,
   renderDocPage,
   renderRequirementForm,
+  renderSchedule,
   renderTasks,
   renderTasksPick,
   renderTurnForm,
   renderTurnOutcome,
+  renderTurnProgress,
+  selectRequirementPool,
+  stopBridgeErrorOverlay,
+  turnOutcomeErrorOverlay,
 } from "./web/views.js";
 
 export interface BoardServerHandle {
@@ -124,6 +185,14 @@ export interface CreateBoardServerOptions {
     options: CreateRequirementOptions,
   ) => Promise<CreateRequirementOutcome>;
   /**
+   * `scheduleFeature` 注入（测试离线自证，v0.9.2 M3）；缺省用 `feature-schedule.js` 的实现。
+   * 排期写 = 板唯一放开的登记字段写，仍**只经该单一封装**触达 MCP advance 特例。
+   */
+  scheduleFeatureImpl?: (
+    input: ScheduleAdvanceInput,
+    options: ScheduleFeatureOptions,
+  ) => Promise<ScheduleOutcome>;
+  /**
    * **宿主面**（BD8）：触发一轮 / 桥状态 / 停桥的唯一入口，缺省 `null` ⇒ 宿主面不可用
    * （`GET /host` 如实显示「未装配」，写端点结构化 503 `host_face_disabled`，**不假数据**）。
    * 名字与 `host`（绑定地址）区分 —— 绑定地址仍是 `host: string`。
@@ -146,6 +215,18 @@ export interface CreateBoardServerOptions {
    * 缺省 = 模块旁 `src/web/static/`（仅服务白名单文件，不做目录遍历）。
    */
   staticRoot?: string;
+  /**
+   * **组织视角页的逐组项目查询器**（REQ-v0.9.2 N6）：只读 MCP 调用（`a2a_projects`，组身份 = 组织名）。
+   * 缺省 = 按写面同基址（`mcpBaseUrl`）经 `mcp-client.ts` 真查；测试注入假桥。
+   * `null` ⇒ 不查询，页面项目列如实显示「未查询」（不编造数据）。
+   */
+  orgProjectsFetcher?: OrgProjectsFetcher | null;
+  /**
+   * **已发版版本清单**（REQ-v0.9.2 增补 ⑤ N1/N2）：= config `releasedVersions` 的注入通道。
+   * 缺省 `[]`（未登记 ⇒ 无锁）。**锁判据唯一走 `version-status.isVersionLocked`**（trim 后精确串匹配）；
+   * 启动期读一次，热改不生效（须重启）。
+   */
+  releasedVersions?: readonly string[];
 }
 
 /** 仅接受 loopback（127.0.0.1 / ::1 / localhost）；否则抛错，拒绝绑定非本机地址 */
@@ -233,12 +314,13 @@ interface PageCtx {
   now: () => number;
 }
 
-/** 写面配置（**可选默认**组织名 + MCP 基址 + 唯一写封装）；生效序 = 表单组织名 > `defaultGroup`。 */
+/** 写面配置（**可选默认**组织名 + MCP 基址 + 两个 MCP 写封装）；生效序 = 表单组织名 > `defaultGroup`（仅提需求；排期**不回落**）。 */
 interface Ctx extends PageCtx {
   write: {
     defaultGroup: string | null;
     mcpBaseUrl: string;
     createRequirement: NonNullable<CreateBoardServerOptions["createRequirementImpl"]>;
+    scheduleFeature: NonNullable<CreateBoardServerOptions["scheduleFeatureImpl"]>;
   };
   /** BD8 宿主面（`null` ⇒ 未装配，写端点结构化 503、状态页如实显示）。 */
   host: BoardHostFace | null;
@@ -246,6 +328,10 @@ interface Ctx extends PageCtx {
   shutdown: (() => void) | null;
   /** BD11 读文档面根（源 A / 可选源 B）；BD14 增 vendored 静态资产根。 */
   docs: { repoRoot: string; orgsDir: string | null; staticRoot: string };
+  /** N6 组织视角页的逐组项目查询器（`null` ⇒ 不查询，页面如实显示「未查询」）。 */
+  orgProjects: OrgProjectsFetcher | null;
+  /** 增补 ⑤ N2：已发版版本清单（config `releasedVersions` 注入；`[]` ⇒ 无锁）。锁判执法只走 `isVersionLocked`。 */
+  releasedVersions: readonly string[];
 }
 
 interface Page {
@@ -284,16 +370,24 @@ function wantsJson(accept: string | undefined): boolean {
 /**
  * 表单档错误页（REQ-v0.9.1-2026-09-25-03）：整页 = 正常页 + errorOverlay 浮层（族名标题 / error 正文 / mono code）。
  * 只服务 **!wantsJson** 分流；JSON 档仍走 {@link respondJson}，形状逐字节不变。
+ * `fields`（REQ-v0.9.2 N1）：表单写路径失败时的回填字段回显；`active`：错误页导航高亮（缺省 features）。
  */
-function errorPage(status: number, code: string, error: string, hint?: string): Page {
+function errorPage(
+  status: number,
+  code: string,
+  error: string,
+  hint?: string,
+  fields?: readonly ErrorOverlayField[],
+  active: NavKey = "features",
+): Page {
   return {
     title: "操作未成功",
-    active: "features",
+    active,
     status,
     bodyHtml:
       `<h2>操作未成功（${status}）</h2>` +
       `<p class="hint">错误浮层已给出原因；关闭浮层后刷新或回到上方导航重试。</p>`,
-    errorOverlay: { family: errorFamilyLabel(code), error, code, hint },
+    errorOverlay: { family: errorFamilyLabel(code), error, code, hint, fields },
   };
 }
 
@@ -305,52 +399,79 @@ function respondError(
   code: string,
   error: string,
   hint?: string,
+  fields?: readonly ErrorOverlayField[],
+  active: NavKey = "features",
 ): void {
   if (wantsJson(accept)) {
     respondJson(res, status, { ok: false, code, error });
     return;
   }
-  sendPage(res, errorPage(status, code, error, hint));
+  sendPage(res, errorPage(status, code, error, hint, fields, active));
 }
 
-function bridgeDownPage(hint: string, err: unknown): Page {
-  return {
-    title: "桥不可达",
-    active: "features",
-    status: 502,
-    bodyHtml:
-      `<h2>桥数据读取失败（502）</h2>` +
-      `<p class="hint err">${escapeHtml(errText(err))}</p>` +
-      `<p class="hint">${escapeHtml(hint)} —— 板只读视图不缓存旧数据，恢复后刷新本页即可。</p>`,
-  };
+/**
+ * 桥不可达整页（REQ-v0.9.2 N2）：改走 {@link errorPage} ⇒ 与其它结构化错误同一 BD2 浮层版式
+ * （标题 = 族名「桥不可达」、正文 = 错误消息、mono = `bridge_unreachable`、「知道了」）。
+ * 原「刷新重试」口径保留为 hint；`active` 随发起页，保证导航高亮不跳。
+ */
+function bridgeDownPage(hint: string, err: unknown, active: NavKey = "features"): Page {
+  return errorPage(
+    502,
+    BRIDGE_UNREACHABLE_CODE,
+    errText(err),
+    `${hint} —— 板只读视图不缓存旧数据，恢复后刷新本页即可。`,
+    undefined,
+    active,
+  );
 }
 
-async function pageFeatures(ctx: Ctx): Promise<Page> {
+/**
+ * 首页表单旁的 orgsDir 三档结论（REQ-v0.9.2 N3 · 纯呈现）：
+ * 未装配宿主面 / 装配了但根未配置或目录不可用（code 沿用 host-face 闭集）/ 就绪。
+ */
+function orgsStatusOf(host: BoardHostFace | null): OrgsDirStatus {
+  if (host === null) return { tier: "not_configured" };
+  const configured = host.configView().orgsDir;
+  if (configured === null) return { tier: "not_configured" };
+  const problem = host.orgsDirProblem();
+  if (problem !== null) return { tier: "problem", code: problem.code, message: problem.message };
+  return { tier: "ready", orgsDir: configured };
+}
+
+async function pageFeatures(ctx: Ctx, params: URLSearchParams): Promise<Page> {
   const view = await ctx.client.getFeatures();
+  // REQ-v0.9.2 N4：桥 `/api/features` 无过滤参数 ⇒ query 条件在**板内存**过滤（不发无意义 query）；
+  // 全量拉取量不变，仅渲染收敛（分页不做 = planlog 遗留）。
+  const filter = parseFeaturesFilter(params);
+  const active = featuresFilterActive(filter);
+  const shown = active ? { ...view, features: applyFeaturesFilter(view.features, filter) } : view;
   return {
     title: "需求列表",
     active: "features",
-    bodyHtml: renderRequirementForm(ctx.write.defaultGroup) + renderFeaturesList(view),
+    bodyHtml:
+      renderRequirementForm(ctx.write.defaultGroup, orgsStatusOf(ctx.host), ctx.releasedVersions) +
+      renderFeaturesList(shown, filter, active ? view.features.length : null),
   };
 }
 
 /**
- * 「阶段产出」清单（BD11 a 案）：双源合并列 `doc/{version}/`。
- * version 缺失 / 不合白名单 ⇒ docs-read 返回空清单 ⇒ 区块如实显示「无」（不报错，B3）；
- * 盘查不动等异常 ⇒ 只出可见错误文案（不静默、不泄根）。
+ * 排期看板页（v0.9.2 M4 + M5 需求池）：数据 = 列表 `getFeatures()` 复用（零新桥接口），
+ * 板内存按 version 归组；未排期卡不占版本列，集中本页末列「需求池」（判据单一 = `trim() === ""`）。
  */
-function loadDocsView(ctx: Ctx, version: string | null, org: string | null): FeatureDocsView {
-  try {
-    return {
-      entries: listDocs(
-        { repoRoot: ctx.docs.repoRoot, orgsDir: ctx.docs.orgsDir, org },
-        version ?? "",
-      ),
-      error: null,
-    };
-  } catch (err) {
-    return { entries: [], error: errText(err) };
-  }
+async function pageSchedule(ctx: Ctx): Promise<Page> {
+  const view = await ctx.client.getFeatures();
+  return {
+    title: "排期看板",
+    active: "schedule",
+    bodyHtml: renderSchedule(
+      groupFeaturesByVersion(view.features),
+      selectRequirementPool(view.features),
+      ctx.releasedVersions,
+    ),
+    // REQ-v0.9.2 增补 ④：详情浮层脚本随本页（= schedule kind，`/` 与 `/schedule` 同一通路）注入，
+    // 单点常量；其它 kind 无 dialog 骨架，脚本自身空转 ⇒ 不注入。卡片 <a> 回退不依赖它。
+    extraScripts: FEATURE_DETAIL_OVERLAY_SCRIPT,
+  };
 }
 
 async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
@@ -372,6 +493,10 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
   const terminal = isTerminalFeatureState(f.state);
   const awaiting = ctx.host === null || terminal ? null : ctx.host.awaitingTurnOf(f.featureId);
   const busy = ctx.host === null ? null : ctx.host.busyTurnOf(f.featureId);
+  // REQ-v0.9.2 N7：轮次进度行 —— 排队位次取该桥队列可见面（在飞不查、查不到 ⇒ 不显示位次，
+  // 队列面异常也不该把详情页带崩 ⇒ 兜成 null）。
+  const queuePosition =
+    busy !== null && busy.state === "queued" ? hostQueuePositionOf(ctx, busy.org, busy.turnId) : null;
   const hostForms =
     ctx.host === null
       ? ""
@@ -382,13 +507,31 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
     approval: f.approval,
     state: f.state,
   });
+  const turnProgress = renderTurnProgress(deriveTurnProgress(busy, queuePosition));
   const answerForm = awaiting === null ? "" : renderAnswerForm(f.featureId, awaiting.question);
-  const docs = loadDocsView(ctx, f.version, f.ownerGroup);
   return {
     title: `需求 ${featureId.slice(0, 8)}`,
     active: "features",
-    bodyHtml: renderFeatureDetail(detail, trace, traceError, ctx.now(), docs) + nextStep + hostForms + answerForm,
+    bodyHtml:
+      renderFeatureDetail(detail, trace, traceError, ctx.now(), true, ctx.releasedVersions) +
+      nextStep +
+      renderAcceptanceSection(detail.acceptance) +
+      turnProgress +
+      hostForms +
+      answerForm,
   };
+}
+
+/** 该桥队列里这条排队轮的位次（1 起）；队列面里没有它 / 取不到 ⇒ `null`（不臆造位次）。 */
+function hostQueuePositionOf(ctx: Ctx, org: string, turnId: string): number | null {
+  const face = ctx.host;
+  if (face === null) return null;
+  try {
+    const index = face.queueView(org).waiting.findIndex((w) => w.turnId === turnId);
+    return index < 0 ? null : index + 1;
+  } catch {
+    return null;
+  }
 }
 
 /**
@@ -468,6 +611,12 @@ async function pageHost(ctx: Ctx, notice: string | null): Promise<Page> {
         config: { orgsDir: null, defaultOrg: null, kind: "（宿主面未装配）" },
         notice: HOST_FACE_DISABLED_DISPLAY,
       }),
+      // REQ-v0.9.2 N2：503 降级档整页套 BD2 浮层版式（与写门 POST 的 errorPage 同码同文案；只加样式面，不动信息架构）。
+      errorOverlay: {
+        family: errorFamilyLabel(HOST_FACE_DISABLED_CODE),
+        error: HOST_FACE_DISABLED_DISPLAY,
+        code: HOST_FACE_DISABLED_CODE,
+      },
     };
   }
   const entries = await ctx.host.statusView();
@@ -484,7 +633,7 @@ async function pageHost(ctx: Ctx, notice: string | null): Promise<Page> {
   };
 }
 
-async function pageTasks(ctx: PageCtx, url: URL): Promise<Page> {
+async function pageTasks(ctx: PageCtx, url: URL, res: ServerResponse, accept: string | undefined): Promise<void> {
   const project = url.searchParams.get("project");
   if (project === null || project.length === 0) {
     let projects = null;
@@ -494,15 +643,93 @@ async function pageTasks(ctx: PageCtx, url: URL): Promise<Page> {
     } catch (err) {
       projectsError = errText(err);
     }
-    return { title: "任务视图", active: "tasks", bodyHtml: renderTasksPick(projects, projectsError) };
+    sendPage(res, { title: "任务视图", active: "tasks", bodyHtml: renderTasksPick(projects, projectsError) });
+    return;
   }
-  const view = await ctx.client.getTasks(project);
-  return { title: `任务 · ${project}`, active: "tasks", bodyHtml: renderTasks(view) };
+  // REQ-v0.9.2 N4：`state`/`limit` 接进桥（客户端已具备并真发 query，bridge-client `getTasks`）——
+  // 纯服务端接线。`limit` 非法 ⇒ 结构化 400（不静默吞）；`state` 不校验值域（桥侧过滤，如实回显）。
+  const state = (url.searchParams.get("state") ?? "").trim();
+  const limitRaw = (url.searchParams.get("limit") ?? "").trim();
+  let limit: number | undefined;
+  if (limitRaw !== "") {
+    const parsed = /^([1-9]\d*)$/.exec(limitRaw);
+    if (parsed === null || Number(parsed[1]) > MAX_TASKS_LIMIT) {
+      respondError(
+        res,
+        accept,
+        400,
+        "invalid_limit",
+        `limit 参数非法：${limitRaw.slice(0, 40)}（须为 1–${MAX_TASKS_LIMIT} 的整数）`,
+        undefined,
+        undefined,
+        "tasks",
+      );
+      return;
+    }
+    limit = Number(parsed[1]);
+  }
+  const filter = { ...(state === "" ? {} : { state }), ...(limit === undefined ? {} : { limit }) };
+  const view = await ctx.client.getTasks(project, filter);
+  sendPage(res, { title: `任务 · ${project}`, active: "tasks", bodyHtml: renderTasks(view, filter) });
 }
 
 async function pageProjects(ctx: PageCtx): Promise<Page> {
   const view = await ctx.client.getProjects();
   return { title: "项目 / 机器", active: "projects", bodyHtml: renderProjects(view) };
+}
+
+/**
+ * `GET /orgs` 组织视角页（REQ-v0.9.2 N6 · 只读）：
+ * 组织清单 = 磁盘 `<orgsDir>` 一级目录 ∪ 板托管台账 ∪ 板级默认 ∪ 需求归属 四源归并（纯函数
+ * `mergeOrgNames`）；逐组织经组身份只读查 `a2a_projects`（`Promise.allSettled` 并发 + 单组超时，
+ * 失败/超时该组织标「不可达」灰化，**不炸页**）；需求按 `ownerGroup` 板内存归组，
+ * null 归属归「（无归属）」伪分组如实呈现。零写、零缓存、零新增存储。
+ */
+async function pageOrgs(ctx: Ctx): Promise<Page> {
+  const view = await ctx.client.getFeatures();
+  const byOwner = groupFeaturesByOwner(view.features);
+  const orgsStatus = orgsStatusOf(ctx.host);
+  const orgsDir = ctx.docs.orgsDir;
+  const dirProblem = orgsStatus.tier === "problem" ? { code: orgsStatus.code, message: orgsStatus.message } : null;
+  const orgNames = mergeOrgNames({
+    disk: listOrgDirs(orgsDir),
+    // 台账源 = 宿主面托管记录（测试假宿主面可能未实现本方法 ⇒ 缺席按空源归并，不炸页）。
+    ledger: ctx.host?.managedOrgs?.() ?? [],
+    featureGroups: [...byOwner.keys()].filter((k) => k !== NO_OWNER_GROUP_LABEL),
+    defaultGroup: ctx.write.defaultGroup,
+  });
+  type SettledQuery = PromiseSettledResult<OrgProjectsOutcome | null>;
+  const settled = await Promise.allSettled(
+    orgNames.map((org): Promise<OrgProjectsOutcome | null> =>
+      ctx.orgProjects === null
+        ? Promise.resolve(null)
+        : ctx.orgProjects(org).catch((err: unknown): OrgProjectsOutcome => ({
+            ok: false,
+            code: "org_query_failed",
+            error: err instanceof Error ? err.message : String(err),
+          })),
+    ),
+  ) as SettledQuery[];
+  const rows: OrgsRow[] = orgNames.map((org, i): OrgsRow => {
+    const r: SettledQuery | undefined = settled[i];
+    return {
+      org,
+      pseudo: false,
+      projectsOutcome: r !== undefined && r.status === "fulfilled" ? r.value : null,
+      features: byOwner.get(org) ?? [],
+    };
+  });
+  const unowned = byOwner.get(NO_OWNER_GROUP_LABEL);
+  if (unowned !== undefined && unowned.length > 0) {
+    rows.push({ org: NO_OWNER_GROUP_LABEL, pseudo: true, projectsOutcome: null, features: unowned });
+  }
+  const input: OrgsPageInput = {
+    rows,
+    orgsDir,
+    orgsDirProblem: dirProblem,
+    ...(ctx.orgProjects === null ? { queryDisabledNote: "逐组项目查询器未装配 ⇒ 本页不查询任何组织的项目。" } : {}),
+  };
+  return { title: "组织视角", active: "orgs", bodyHtml: renderOrgsPage(input) };
 }
 
 export function createBoardServer(options: CreateBoardServerOptions): Promise<BoardServerHandle> {
@@ -514,6 +741,7 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
       defaultGroup: options.defaultGroup ?? null,
       mcpBaseUrl: options.mcpBaseUrl ?? DEFAULT_MCP_BASE_URL,
       createRequirement: options.createRequirementImpl ?? createRequirement,
+      scheduleFeature: options.scheduleFeatureImpl ?? scheduleFeature,
     },
     host: options.hostFace ?? null,
     shutdown: options.onShutdown ?? null,
@@ -522,6 +750,11 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
       orgsDir: options.docs?.orgsDir ?? null,
       staticRoot: options.staticRoot ?? defaultStaticRoot(),
     },
+    orgProjects:
+      options.orgProjectsFetcher === undefined
+        ? createOrgProjectsFetcher({ baseUrl: options.mcpBaseUrl ?? DEFAULT_MCP_BASE_URL })
+        : options.orgProjectsFetcher,
+    releasedVersions: options.releasedVersions ?? [],
   };
   const server: Server = createServer((req, res) => {
     void handle(req, res, server, ctx).catch((err: unknown) => {
@@ -547,6 +780,8 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
 }
 
 const TRACE_SUFFIX = "/trace";
+/** `?limit=` 上界（REQ-v0.9.2 N4）：越界与格式错误同样落结构化 400，防超大值直传桥。 */
+const MAX_TASKS_LIMIT = 500;
 /** 单文档子路径（BD11）：`GET /features/:id/docs?file=<name>`。 */
 const DOCS_SUFFIX = "/docs";
 
@@ -579,9 +814,12 @@ const HOST_FACE_DISABLED_DISPLAY =
 type PageRoute = { kind: "feature" | "feature-docs"; id: string } | { kind: NavKey } | null;
 
 function matchPage(pathname: string): PageRoute {
-  if (pathname === "/") return { kind: "features" };
+  // REQ-v0.9.2 N1：`/` = 排期看板首页；`/schedule` 保留为别名（同 kind 同渲染，深链零红面）。
+  if (pathname === "/" || pathname === "/schedule") return { kind: "schedule" };
+  if (pathname === "/requirements") return { kind: "features" };
   if (pathname === "/tasks") return { kind: "tasks" };
   if (pathname === "/projects") return { kind: "projects" };
+  if (pathname === "/orgs") return { kind: "orgs" };
   if (pathname === "/host") return { kind: "host" };
   if (pathname.startsWith("/features/")) {
     const raw = pathname.slice("/features/".length);
@@ -639,7 +877,7 @@ async function handle(
     });
     return;
   }
-  /** 方法门 = 读面白名单 ∪ 写面白名单（三条 POST，见 `write-guard.parseWriteRoute`）；其余非 GET 一律 405 */
+  /** 方法门 = 读面白名单 ∪ 写面白名单（六条 POST，见 `write-guard.parseWriteRoute`）；其余非 GET 一律 405 */
   const writeRoute = parseWriteRoute(req.method, url.pathname);
   if (writeRoute !== null) {
     if (writeRoute.kind === "requirement") {
@@ -650,6 +888,8 @@ async function handle(
       await handleWriteTurn(req, res, ctx, writeRoute.featureId, "confirm");
     } else if (writeRoute.kind === "answer") {
       await handleWriteAnswer(req, res, ctx, writeRoute.featureId);
+    } else if (writeRoute.kind === "schedule") {
+      await handleWriteSchedule(req, res, ctx, writeRoute.featureId);
     } else {
       await handleWriteHostStop(req, res, ctx, writeRoute.org);
     }
@@ -707,23 +947,32 @@ async function handle(
     } else if (route.kind === "feature-docs") {
       await handleFeatureDoc(ctx, res, req, route.id, url.searchParams);
     } else if (route.kind === "tasks") {
-      sendPage(res, await pageTasks(ctx, url));
+      await pageTasks(ctx, url, res, req.headers.accept);
     } else if (route.kind === "host") {
       sendPage(res, await pageHost(ctx, null));
+    } else if (route.kind === "orgs") {
+      sendPage(res, await pageOrgs(ctx));
+    } else if (route.kind === "schedule") {
+      sendPage(res, await pageSchedule(ctx));
     } else {
       const page =
         route.kind === "features"
-          ? await pageFeatures(ctx)
+          ? await pageFeatures(ctx, url.searchParams)
           : await pageProjects(ctx);
       sendPage(res, page);
     }
   } catch (err) {
-    sendPage(res, bridgeDownPage(`目标 = ${url.pathname}`, err));
+    sendPage(res, bridgeDownPage(`目标 = ${url.pathname}`, err, route !== null ? pageActiveOf(route) : "features"));
   }
 }
 
+/** 页面路由 → 导航高亮键（桥宕页随发起页高亮，REQ-v0.9.2 N2）。 */
+function pageActiveOf(route: NonNullable<PageRoute>): NavKey {
+  return route.kind === "feature" || route.kind === "feature-docs" ? "features" : route.kind;
+}
+
 // ---------------------------------------------------------------------------
-// BD7 / BD8 写面（三条放开的 POST；CSRF 守卫与结构化错误口径同一规格）
+// BD7 / BD8 / M3 写面（六条放开的 POST；CSRF 守卫与结构化错误口径同一规格）
 // ---------------------------------------------------------------------------
 
 function lowerHeaders(req: IncomingMessage): Record<string, string | undefined> {
@@ -753,6 +1002,25 @@ function readBodyCapped(req: IncomingMessage, max: number): Promise<string> {
   });
 }
 
+/**
+ * 提需求表单失败回填（REQ-v0.9.2 N1）：从已收取的 urlencoded 原始 body 提取非空提交值，
+ * 供浮层回显。body 不可解析 / 字段全空 ⇒ 空数组（浮层与无回填时逐字节一致）。
+ */
+function requirementBackfillFields(body: string): ErrorOverlayField[] {
+  const f = new URLSearchParams(body);
+  const fields: ErrorOverlayField[] = [];
+  for (const [key, label] of [
+    ["group", "组织"],
+    ["title", "标题"],
+    ["version", "版本"],
+    ["requirement", "需求描述"],
+  ] as const) {
+    const value = (f.get(key) ?? "").trim();
+    if (value !== "") fields.push({ label, value });
+  }
+  return fields;
+}
+
 async function handleWriteRequirement(req: IncomingMessage, res: ServerResponse, ctx: Ctx): Promise<void> {
   const headers = lowerHeaders(req);
   // ① CSRF 守卫先于一切（未认证请求不消耗 body 读取、也不泄露板配置）
@@ -773,19 +1041,46 @@ async function handleWriteRequirement(req: IncomingMessage, res: ServerResponse,
   }
   const form = parseRequirementForm(body, Number(headers["content-length"] ?? NaN), ctx.write.defaultGroup);
   if (!form.ok) {
-    respondError(res, headers.accept, form.status, form.code, form.error);
+    respondError(res, headers.accept, form.status, form.code, form.error, undefined, requirementBackfillFields(body));
     return;
   }
-  // ③ 复用唯一写封装（不新写 MCP 调用）；组身份 = 表单组织名（缺省才回落板级默认）
+  // ③ 已发版锁（REQ-v0.9.2 增补 ⑤ N2）：目标版本 ∈ config `releasedVersions` ⇒ 409 零出网。
+  //    锁判据唯一走 `isVersionLocked`（trim 后精确串匹配，禁前缀）；空 version = 未排期 ⇒ 恒不锁、放行。
+  if (isVersionLocked(form.version, ctx.releasedVersions)) {
+    respondError(
+      res,
+      headers.accept,
+      409,
+      "board_version_released",
+      `版本 ${form.version} 已发版 ⇒ 已发版版本不可排入新需求。请排入后续版本（本板只锁前台写口，登记/解锁改 config.json 的 releasedVersions 后重启生效）。`,
+      undefined,
+      requirementBackfillFields(body),
+    );
+    return;
+  }
+  // ④ 复用唯一写封装（不新写 MCP 调用）；组身份 = 表单组织名（缺省才回落板级默认）
   const outcome = await ctx.write.createRequirement(
     { title: form.title, version: form.version, requirement: form.requirement },
     { group: form.group, baseUrl: ctx.write.mcpBaseUrl },
   );
   if (!outcome.ok) {
-    respondError(res, headers.accept, 502, outcome.code, outcome.error);
+    respondError(
+      res,
+      headers.accept,
+      502,
+      outcome.code,
+      outcome.error,
+      undefined,
+      [
+        { label: "组织", value: form.group },
+        { label: "标题", value: form.title },
+        { label: "版本", value: form.version },
+        ...(form.requirement === undefined ? [] : [{ label: "需求描述", value: form.requirement }]),
+      ],
+    );
     return;
   }
-  // ④ 回显：浏览器表单 ⇒ 303 跳详情页（PRG，刷新不重复建）；声明 accept: application/json ⇒ 201 JSON
+  // ⑤ 回显：浏览器表单 ⇒ 303 跳详情页（PRG，刷新不重复建）；声明 accept: application/json ⇒ 201 JSON
   const accept = headers.accept ?? "";
   if (accept.includes("application/json")) {
     respondJson(res, 201, {
@@ -837,7 +1132,16 @@ async function hostWriteGate(
   }
 }
 
-/** turn / confirm / answer 共用的应答出口：JSON 档出结构化载荷，HTML 档出结果页（**失败不伪装成 200**）。 */
+/**
+ * turn / confirm / answer 共用的应答出口：JSON 档出结构化载荷，HTML 档出结果页（**失败不伪装成 200**）。
+ * 失败档（bridge_down / turn_failed / timeout / not_awaiting / busy / terminal / config_error）
+ * 叠加 BD2 错误浮层（REQ-v0.9.2 N2 出口样式统一）；整页台账结构不动。
+ *
+ * **REQ-v0.9.2 N7**：HTML 档的**受理成功（排队）档**改 303 回需求详情页（PRG，同提需求 `POST /requirements`
+ * 的先例）—— 该档本轮还没跑、结果页除「排队中」外无内容，详情页的轮次进度行才是它该有的落点，
+ * 刷新也不重复烧一轮。**有内容回执的档（succeeded 摘要 / awaiting_answer 问题 / 各失败档）仍出整页**，
+ * 否则 agent 的回答与失败根因会在跳转中丢失。JSON 档不受影响（载荷照常返回）。
+ */
 function respondTurnOutcome(
   res: ServerResponse,
   accept: string | undefined,
@@ -849,11 +1153,20 @@ function respondTurnOutcome(
     respondJson(res, status, outcome);
     return;
   }
+  if (outcome.disposition === "queued") {
+    res.writeHead(303, {
+      location: `/features/${encodeURIComponent(outcome.featureId)}`,
+      "cache-control": "no-store",
+    });
+    res.end();
+    return;
+  }
   sendPage(res, {
     title: `${title} · ${outcome.featureId.slice(0, 8)}`,
     active: "features",
     status,
     bodyHtml: renderTurnOutcome(outcome),
+    errorOverlay: turnOutcomeErrorOverlay(outcome) ?? undefined,
   });
 }
 
@@ -962,7 +1275,175 @@ async function handleWriteHostStop(
     return;
   }
   const page = await pageHost(ctx, renderHostNotice(outcome));
-  sendPage(res, { ...page, status });
+  sendPage(res, {
+    ...page,
+    status,
+    errorOverlay: stopBridgeErrorOverlay(outcome) ?? undefined,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.2 M3 写面：POST /features/:id/schedule（排期写 —— 唯一放开的登记字段 `version` 写）
+// ---------------------------------------------------------------------------
+
+/** 排期写「归属组织缺失」的结构化错误码（503，请求期）—— 与提需求的 400 `board_group_required` 是两回事。 */
+const SCHEDULE_OWNER_GROUP_MISSING_CODE = "board_schedule_owner_group_missing";
+
+/** 锁版拒绝的回填：提交的目标版本 + 现版本（被锁的一侧要让用户看到「从哪被锁」；现为空 ⇒ 未排期）。 */
+function scheduleLockBackfill(targetVersion: string, currentVersion: string | null): ErrorOverlayField[] {
+  return [
+    { label: "目标版本", value: targetVersion },
+    { label: "现版本", value: normalizeVersion(currentVersion) === "" ? "（未排期）" : normalizeVersion(currentVersion) },
+  ];
+}
+
+/**
+ * 排期写一条需求（经 `feature-schedule.ts` 唯一封装，装配仅 {featureId, to, version} 三键）：
+ * - 表单 `version` **必须显式传**（键缺失 ⇒ 编程错误，经全局兜底落 500，不做缺键语义）；
+ *   空串 = 删除排期；服务端发送前一律 `trim()`；
+ * - `to` = 先 `getFeature` 取当前态原样回填（advance「`to` = 当前态」登记字段特例，不迁移状态机）；
+ * - **已发版锁（增补 ⑤ N3）**：`getFeature` 之后、出网之前做三分判（现版本 × 目标版本）——
+ *   入锁（现 ∉ 锁版 ∧ 目标 ∈ 锁版）⇒ 409；出锁（现 ∈ 锁版 ∧ 目标 ≠ 现版本，含清空回池）⇒ 409；
+ *   同锁版无变化 ⇒ 幂等放行；未排期 ↔ 未锁版间的一切变动照常（错误码同提需求面 `board_version_released`）；
+ * - 身份 = 该 Feature 的 `ownerGroup`，**null ⇒ 结构化 503，绝不回落板级默认组**
+ *   （排期改的是既有需求归属，拿板级组名出网会把写打到别的组织目录）；
+ * - 读-写窗口内态漂移被桥拒（非法流转）⇒ 如实弹错误浮层 + N1 字段回填，**不自动重试**；
+ * - 成功 = PRG 303 回详情页；`Accept: application/json` ⇒ 200 JSON。
+ */
+async function handleWriteSchedule(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: Ctx,
+  featureId: string,
+): Promise<void> {
+  const headers = lowerHeaders(req);
+  // ① CSRF 守卫先于一切（与既有五条同规格，含 body 读取都不做）
+  const auth = checkWriteAuth({ method: req.method, headers, proto: "http" });
+  if (!auth.ok) {
+    respondError(res, headers.accept, 403, auth.code, auth.error);
+    return;
+  }
+  // ② 入参解析（超限 413；version 键缺失 = 编程错误 ⇒ 不 catch，落全局兜底）
+  let body: string;
+  try {
+    body = await readBodyCapped(req, MAX_REQUIREMENT_BODY_BYTES);
+  } catch (err) {
+    const code = errText(err) === "payload_too_large" ? "payload_too_large" : "body_read_failed";
+    respondError(res, headers.accept, code === "payload_too_large" ? 413 : 400, code, errText(err));
+    return;
+  }
+  const form = parseScheduleForm(body, Number(headers["content-length"] ?? NaN));
+  if (!form.ok) {
+    respondError(res, headers.accept, form.status, form.code, form.error);
+    return;
+  }
+  const backfill = [{ label: "版本", value: form.version }];
+  // ③ 当前态 + 归属 + 现版本：getFeature 失败 ⇒ 502 如实报（不猜态、不回落组名，交错误浮层）
+  let to: string;
+  let ownerGroup: string | null;
+  let currentVersion: string | null;
+  try {
+    const detail = await ctx.client.getFeature(featureId);
+    to = detail.feature.state;
+    ownerGroup = detail.feature.ownerGroup;
+    currentVersion = detail.feature.version;
+  } catch (err) {
+    respondError(
+      res,
+      headers.accept,
+      502,
+      BRIDGE_UNREACHABLE_CODE,
+      `需求数据读取失败，无法确定当前态与归属组织：${errText(err)}`,
+      undefined,
+      backfill,
+    );
+    return;
+  }
+  if (ownerGroup === null || ownerGroup.trim() === "") {
+    respondError(
+      res,
+      headers.accept,
+      503,
+      SCHEDULE_OWNER_GROUP_MISSING_CODE,
+      `该需求无归属组织（ownerGroup 缺失）⇒ 拒绝排期写：不猜、绝不回落板级默认组（默认组只属于「提需求」链路）。` +
+        "请先在引擎侧为该需求补齐 owner_group 后重试。",
+      undefined,
+      backfill,
+    );
+    return;
+  }
+  // ③b 已发版锁（REQ-v0.9.2 增补 ⑤ N3）：现版本（getFeature）× 目标版本（表单）三分判，零出网。
+  //    同锁版无变化 ⇒ 幂等放行（不报错）；锁判据唯一走 `isVersionLocked`（trim 后精确匹配）；
+  //    清空回池 = 目标归一后空串 ⇒ 若现 ∈ 锁版即"出锁"被拒。回填带上现版本值（用户看到从哪被锁）。
+  const targetLocked = isVersionLocked(form.version, ctx.releasedVersions);
+  const currentLocked = isVersionLocked(currentVersion, ctx.releasedVersions);
+  // 同版判据 = 归一后**精确等串**（非前缀）：`v0.9.1-probe` 相对锁版 `v0.9.1` 算「改到别的版」⇒ 出锁拒。
+  const sameVersion = normalizeVersion(currentVersion) === normalizeVersion(form.version);
+  if (!currentLocked && targetLocked) {
+    respondError(
+      res,
+      headers.accept,
+      409,
+      "board_version_released",
+      `版本 ${form.version} 已发版 ⇒ 该版本已发版，不可将需求排入（本板只锁前台写口，登记/解锁改 config.json 的 releasedVersions 后重启生效）。`,
+      undefined,
+      scheduleLockBackfill(form.version, currentVersion),
+    );
+    return;
+  }
+  if (currentLocked && !sameVersion) {
+    respondError(
+      res,
+      headers.accept,
+      409,
+      "board_version_released",
+      `该需求现排期版本 ${normalizeVersion(currentVersion)} 已发版 ⇒ 已发版版本的需求不可移出或取消排期（本板只锁前台写口，登记/解锁改 config.json 的 releasedVersions 后重启生效）。`,
+      undefined,
+      scheduleLockBackfill(form.version, currentVersion),
+    );
+    return;
+  }
+  // ④ 唯一封装出网（装配仅三键；桥拒原样透传，不自动重试）
+  let outcome: ScheduleOutcome;
+  try {
+    outcome = await ctx.write.scheduleFeature(
+      { featureId, to, version: form.version },
+      { group: ownerGroup, baseUrl: ctx.write.mcpBaseUrl },
+    );
+  } catch (err) {
+    // 封装的前置校验（空 featureId / 空 to / 缺 version 键 / 组名仅空白）= 编程错误口径，
+    // 但其中「组名仅空白」可经真表单 + 老桥数据出现 ⇒ 归一为结构化 400，不裸 500。
+    if (err instanceof ScheduleFormProgrammingError || err instanceof FeatureScheduleConfigError) {
+      respondError(res, headers.accept, 400, "schedule_request_invalid", errText(err), undefined, backfill);
+      return;
+    }
+    throw err;
+  }
+  if (!outcome.ok) {
+    respondError(
+      res,
+      headers.accept,
+      502,
+      outcome.code,
+      outcome.error + "（读-写窗口内状态可能已漂移；未自动重试，请刷新核对后再次提交）",
+      undefined,
+      backfill,
+    );
+    return;
+  }
+  // ⑤ 回显：JSON 档 200；表单档 PRG 303 回详情页（刷新不重复写）
+  if (wantsJson(headers.accept)) {
+    respondJson(res, 200, {
+      ok: true,
+      featureId: outcome.featureId,
+      group: ownerGroup,
+      state: outcome.state,
+      version: outcome.version,
+    });
+    return;
+  }
+  res.writeHead(303, { location: `/features/${encodeURIComponent(outcome.featureId)}`, "cache-control": "no-store" });
+  res.end();
 }
 
 /**

@@ -199,6 +199,41 @@ export function deriveTurnBusyAffordance(busy: BusyTurnView | null): ConfirmAffo
 }
 
 // ---------------------------------------------------------------------------
+// REQ-v0.9.2 N7：详情页「轮次进度」行（轮台账派生）
+// ---------------------------------------------------------------------------
+
+/**
+ * 详情页轮次进度视图（`null` ⇒ 该需求当前没有在飞 / 排队轮 ⇒ 整行不渲染）。
+ * 数据全部来自板侧轮台账与该桥的队列可见面，**不做任何推算**。
+ */
+export interface TurnProgressView {
+  turnId: string;
+  /** 第几轮（1 起，= 会话台账 `round`）。 */
+  round: number;
+  state: "running" | "queued";
+  /** 排队位次（1 起）；在飞、或队列里查不到这条轮 ⇒ `null`（不臆造位次）。 */
+  position: number | null;
+}
+
+/**
+ * 轮次进度（纯函数）：占用轮 + 该桥队列位次 ⇒ 一行进度所需的最小事实。
+ * 位次只在 `queued` 时取（在飞没有位次可言）；`queuePosition` 由调用方从队列可见面查得，
+ * 查不到传 `null` —— 本函数不猜。
+ */
+export function deriveTurnProgress(
+  busy: BusyTurnView | null,
+  queuePosition: number | null,
+): TurnProgressView | null {
+  if (busy === null) return null;
+  return {
+    turnId: busy.turnId,
+    round: busy.round,
+    state: busy.state,
+    position: busy.state === "queued" ? queuePosition : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 收口轨 16 ①：引擎终态闭集（详情渲染与写面兜底共用同一判据）
 // ---------------------------------------------------------------------------
 

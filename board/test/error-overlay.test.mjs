@@ -346,6 +346,267 @@ test("BD20-③：error 值含 <script> 片段 ⇒ 浮层正文全转义，不产
 });
 
 // ---------------------------------------------------------------------------
+// N1（REQ-v0.9.2-2026-09-25-01）：错误浮层字段回填
+// ---------------------------------------------------------------------------
+
+test("BD21-N1a：提需求 MCP 失败（表单档）⇒ 浮层逐字段回显刚提交的 group/title/version/requirement", async () => {
+  const fn = async () => ({ ok: false, code: "transport_error", error: "连接被重置" });
+  await withServer(
+    async (base) => {
+      const res = await postReq(
+        base,
+        { group: "g2", title: "甲需求", version: "v1", requirement: "描述正文" },
+        WRITE_HEADERS,
+      );
+      assert.equal(res.status, 502);
+      assert.match(res.text, /class="err-ov"/);
+      for (const [label, value] of [
+        ["组织", "g2"],
+        ["标题", "甲需求"],
+        ["版本", "v1"],
+        ["需求描述", "描述正文"],
+      ]) {
+        assert.ok(
+          res.text.includes(
+            `<p class="err-ov-field"><span class="err-ov-field-label">${label}</span><span class="err-ov-field-value mono">${value}</span></p>`,
+          ),
+          `回填字段必须在浮层：${label}=${value}`,
+        );
+      }
+      // 回填渲染在 code 之下、按钮之上（顺序钉住）
+      const codeAt = res.text.indexOf('class="err-ov-code mono"');
+      const fieldAt = res.text.indexOf('class="err-ov-field"');
+      const btnAt = res.text.indexOf('id="err-ov-close"');
+      assert.ok(codeAt !== -1 && fieldAt > codeAt && fieldAt < btnAt, "回填字段位于 code 之下、按钮之上");
+    },
+    { createRequirementImpl: fn },
+  );
+});
+
+test("BD21-N1b：回填值含 <script>/引号片段 ⇒ 与 error 同档逐字段转义", async () => {
+  const fn = async () => ({ ok: false, code: "transport_error", error: "连接被重置" });
+  await withServer(
+    async (base) => {
+      const evil = '<script>alert("x")</script>';
+      const res = await postReq(base, { title: evil, version: "v1" }, WRITE_HEADERS);
+      assert.equal(res.status, 502);
+      const ov = res.text.slice(res.text.indexOf('id="err-ov"'));
+      assert.ok(ov.includes("&lt;script&gt;alert(&quot;x&quot;)&lt;/script&gt;"), "值必须转义后渲染");
+      assert.ok(!ov.includes(evil), "浮层内不得出现原始 <script>… 片段");
+    },
+    { createRequirementImpl: fn },
+  );
+});
+
+test("BD21-N1c：无回填档（未带 fields 的出口）⇒ 浮层与现行为一致，不渲染空回填块", async () => {
+  await withServer(async (base) => {
+    // 非提需求写路径（answer 校验失败）不带回填；requirement 字段为空也不回填
+    const nf = await req(base, "/nope");
+    assertOverlayPage(nf, { status: 404, family: "未知路径", code: "not_found" });
+    assert.doesNotMatch(nf.text, /class="err-ov-field"/, "无 fields 时不得出现回填块");
+    const empty = await postReq(base, { title: "  " }, WRITE_HEADERS);
+    assertOverlayPage(empty, {
+      status: 400,
+      family: "表单字段校验失败",
+      code: "requirement_form_invalid",
+      errorSnippet: "必填字段为空",
+    });
+    assert.doesNotMatch(empty.text, /class="err-ov-field"/, "空值字段不回填");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// N2（REQ-v0.9.2-2026-09-25-01）：既有 HTML 出口套 BD2 浮层版式
+// ---------------------------------------------------------------------------
+
+/** 造一个轮结局（只填断言需要的键，其余按 TriggerTurnOutcome 缺省形状）。 */
+function turnOutcome(over = {}) {
+  return {
+    ok: false,
+    org: "g",
+    featureId: "F1",
+    disposition: "turn_failed",
+    queued: false,
+    turnId: "t1",
+    contextId: "c1",
+    round: 1,
+    state: "failed",
+    display: "",
+    summary: null,
+    question: null,
+    error: null,
+    bridge: null,
+    ...over,
+  };
+}
+
+function faceReturning(outcome) {
+  return {
+    async triggerTurn() {
+      return outcome;
+    },
+    async confirmTurn() {
+      return outcome;
+    },
+    async answerRequirement() {
+      return outcome;
+    },
+    awaitingTurnOf() {
+      return null;
+    },
+    busyTurnOf() {
+      return null;
+    },
+    async statusView() {
+      return [];
+    },
+    configView() {
+      return { orgsDir: null, defaultOrg: null, kind: "（假）" };
+    },
+    orgsDirProblem() {
+      return null;
+    },
+    async stopBridge() {
+      return outcome;
+    },
+  };
+}
+
+test("BD22-N2a：桥宕整页（GET /host，宿主面探活抛错）⇒ BD2 浮层（族名「桥不可达」+ mono bridge_unreachable），随发起页高亮", async () => {
+  await withServer(
+    async (base) => {
+      const res = await req(base, "/host");
+      assert.equal(res.status, 502);
+      assertOverlayPage(res, { status: 502, family: "桥不可达", code: "bridge_unreachable", errorSnippet: "宿主桥探活失败（假）" });
+      assert.match(res.text, /<a href="\/host" class="on">宿主桥<\/a>/, "导航高亮跟随发起页（不再是恒 features）");
+    },
+    {
+      hostFace: {
+        ...fakeFace(),
+        async statusView() {
+          throw new Error("宿主桥探活失败（假）");
+        },
+      },
+    },
+  );
+});
+
+test("BD22-N2b：宿主面 503 降级档（GET /host，hostFace=null）⇒ 状态页叠加 BD2 浮层，信息架构不动", async () => {
+  await withServer(
+    async (base) => {
+      const res = await req(base, "/host");
+      assert.equal(res.status, 200);
+      assert.match(res.text, /class="err-ov"/);
+      assert.ok(res.text.includes("<h2>宿主面未装配</h2>"), "标题 = 错误码中文族名");
+      assert.ok(res.text.includes('<p class="err-ov-code mono">host_face_disabled</p>'), "mono 小字 = code");
+      assert.match(res.text, /<button type="button" id="err-ov-close">知道了<\/button>/);
+      assert.match(res.text, /<h2>宿主桥<\/h2>/, "整页结构保留（状态页仍是状态页）");
+      assert.match(res.text, /组织目录根 = <code>（未配置/, "配置行保留");
+    },
+    { hostFace: null },
+  );
+});
+
+test("BD22-N2c：turn 失败档（busy 409 / turn_failed 502）⇒ 结果页叠 BD2 浮层；成功与 awaiting_answer 不叠", async () => {
+  const busy = turnOutcome({
+    disposition: "busy",
+    error: { code: "board_turn_busy", message: "已有在飞的一轮" },
+  });
+  await withServer(async (base) => {
+    const res = await req(base, "/features/F1/turn", {
+      method: "POST",
+      headers: { ...FORM_HEADERS, ...WRITE_HEADERS },
+      body: "",
+    });
+    assert.equal(res.status, 409);
+    assertOverlayPage(res, { status: 409, family: "本轮已在进行", code: "board_turn_busy", errorSnippet: "已有在飞的一轮" });
+    assert.match(res.text, /结局 = <code>busy<\/code>/, "整页台账结构保留");
+  }, { hostFace: faceReturning(busy) });
+
+  const failed = turnOutcome({ error: { code: "some_backend_code", message: "后端收敛失败" } });
+  await withServer(async (base) => {
+    const res = await req(base, "/features/F1/turn", {
+      method: "POST",
+      headers: { ...FORM_HEADERS, ...WRITE_HEADERS },
+      body: "",
+    });
+    assert.equal(res.status, 502);
+    assertOverlayPage(res, { status: 502, family: "some_backend_code", code: "some_backend_code", errorSnippet: "后端收敛失败" });
+  }, { hostFace: faceReturning(failed) });
+
+  // 转义档：失败结局的 error 消息含脚本片段 ⇒ 浮层正文全转义（与 A 系同判据）
+  const evil = turnOutcome({ error: { code: "turn_failed", message: "后端输出 <script>alert(1)</script>" } });
+  await withServer(async (base) => {
+    const res = await req(base, "/features/F1/turn", {
+      method: "POST",
+      headers: { ...FORM_HEADERS, ...WRITE_HEADERS },
+      body: "",
+    });
+    assert.equal(res.status, 502);
+    assert.ok(res.text.includes("&lt;script&gt;alert(1)&lt;/script&gt;"), "error 必须转义后渲染");
+    assert.ok(!res.text.includes("<script>alert(1)</script>"), "原始 <script>…</script> 片段不得出现在响应里");
+  }, { hostFace: faceReturning(evil) });
+
+  // 非失败档不弹（不是错误）：成功 / awaiting_answer / queued
+  for (const ok of [
+    turnOutcome({ ok: true, disposition: "succeeded", state: "succeeded", error: null }),
+    turnOutcome({ ok: true, disposition: "awaiting_answer", state: "awaiting_answer", error: null, question: "以哪个版本落？" }),
+    turnOutcome({ ok: true, disposition: "queued", queued: true, state: "queued", error: null }),
+  ]) {
+    await withServer(async (base) => {
+      const res = await req(base, "/features/F1/turn", {
+        method: "POST",
+        headers: { ...FORM_HEADERS, ...WRITE_HEADERS },
+        body: "",
+      });
+      assert.doesNotMatch(res.text, /class="err-ov"/, `${ok.disposition} 不得弹错误浮层`);
+    }, { hostFace: faceReturning(ok) });
+  }
+});
+
+test("BD22-N2d：turn 失败档 JSON 档逐字节不变（同 outcome 载荷、无浮层）", async () => {
+  const busy = turnOutcome({
+    disposition: "busy",
+    error: { code: "board_turn_busy", message: "已有在飞的一轮" },
+  });
+  await withServer(
+    async (base) => {
+      const res = await req(base, "/features/F1/turn", {
+        method: "POST",
+        headers: { ...FORM_HEADERS, ...WRITE_HEADERS, accept: "application/json" },
+        body: "",
+      });
+      assert.equal(res.status, 409);
+      const json = JSON.parse(res.text);
+      assert.equal(json.disposition, "busy");
+      assert.deepEqual(json.error, { code: "board_turn_busy", message: "已有在飞的一轮" });
+      assert.doesNotMatch(res.text, /err-ov/, "JSON 档不得带浮层");
+    },
+    { hostFace: faceReturning(busy) },
+  );
+});
+
+test("BD22-N2e：停桥失败档（POST /host/:org/stop）⇒ 状态页叠 BD2 浮层（host_stop_failed）", async () => {
+  const stopFail = {
+    ok: false,
+    org: "g",
+    status: null,
+    error: { code: "host_stop_failed", message: "停桥未返回状态：组织 g" },
+    display: "停桥未成功",
+  };
+  await withServer(async (base) => {
+    const res = await req(base, "/host/g/stop", {
+      method: "POST",
+      headers: { ...FORM_HEADERS, ...WRITE_HEADERS },
+      body: "",
+    });
+    assert.equal(res.status, 502);
+    assertOverlayPage(res, { status: 502, family: "停桥未成功", code: "host_stop_failed" });
+    assert.match(res.text, /<h2>宿主桥<\/h2>/, "状态页结构保留");
+  }, { hostFace: faceReturning(stopFail) });
+});
+
+// ---------------------------------------------------------------------------
 // 族名映射（无命中回退原文 code；动态前缀 jsonrpc_* / http_*）
 // ---------------------------------------------------------------------------
 

@@ -16,7 +16,9 @@
  *   （与 `triggerTurn` 同一条触发通道），**放不放行由 agent 判断**；
  *   `answerRequirement` = 仅当该需求存在**当前待澄清的一轮**（`awaiting_answer` ∧ 未被更新轮取代）时，
  *   把回答经 `answerTurn` **续推同一 `contextId`**；否则结构化拒绝（`board_no_awaiting_turn`）；
- * - **不写引擎状态机**：`approve` / `advance` / `cancel` 一个都不碰（含**文案级**不出现其工具全名）；
+ * - **本文件不写引擎状态机迁移**：`approve` / `cancel` / 主链 `advance`（迁到非当前态）一个都不碰
+ *   （含**文案级**不出现其工具全名）；唯一放开的登记字段写（`version` 排期，经 advance「`to` = 当前态」
+ *   特例）落点在**并列的第二个 MCP 写封装** `feature-schedule.ts`，不在本文件；
  *   轮的终态只落板侧台账（BD4b 已做）；
  * - **不新写进程管理与 RPC**：起 / 停 / 查委派 {@link BridgeOps}，发轮委派 {@link TurnOps}
  *   —— 两者都是**窄接口**（真类结构上即满足）⇒ 单测注入假托管器 / 假桥即可离线断言全部语义。
@@ -720,6 +722,15 @@ export class BoardHostFace {
       });
     }
     return entries;
+  }
+
+  /**
+   * **板托管台账的组织名**（REQ-v0.9.2 N6 · 只读同步口径）：托管器里当前有记录的组织集合。
+   * 与 `statusView()` 的区别：本方法**不探活、不改任何状态** —— 组织视角页只要「台账里有哪些名字」，
+   * 探活归宿主桥状态页自己的职责。
+   */
+  managedOrgs(): string[] {
+    return this.deps.bridges.statuses().map((s) => s.org);
   }
 
   /**

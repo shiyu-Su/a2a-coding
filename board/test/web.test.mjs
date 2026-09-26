@@ -10,10 +10,18 @@ import {
   renderProjects,
   renderHostPage,
   renderRequirementForm,
+  renderScheduleForm,
+  renderVersionSwitchWarningLine,
+  registeredDecisionDocVersions,
   renderConfirmForm,
   renderTurnForm,
+  renderTurnProgress,
   renderAnswerForm,
   renderNextStepGuide,
+  renderAcceptanceSection,
+  parseFeaturesFilter,
+  featuresFilterActive,
+  applyFeaturesFilter,
   VIEW_NOTES,
 } from "../dist/web/views.js";
 
@@ -37,7 +45,7 @@ test("renderPage: 标题转义 + 导航高亮 + 口径脚注逐条渲染", () =>
     notes: ["注 A", "注 <B>"],
   });
   assert.match(html, /<title>页 &lt;x&gt; · board<\/title>/);
-  assert.match(html, /<a href="\/" class="on">需求<\/a>/);
+  assert.match(html, /<a href="\/requirements" class="on">需求<\/a>/);
   assert.match(html, /<li>注 A<\/li>/);
   assert.match(html, /<li>注 &lt;B&gt;<\/li>/);
 });
@@ -79,6 +87,16 @@ test("轨14+BD14-CSP：script-src 放开 'unsafe-inline' + 'self'（vendored 同
   assert.match(BOARD_CSP, /default-src 'none'/);
   assert.match(BOARD_CSP, /base-uri 'none'/);
   assert.match(BOARD_CSP, /form-action 'self'/);
+});
+
+// --- 增补轨 2：详情浮层 fetch 的第三处明示放宽 = connect-src 'self' ----------
+
+test("增补轨2-CSP：页面 CSP 含 connect-src 'self'（浮层同源 fetch），且只放开同源一档", () => {
+  assert.match(BOARD_CSP, /connect-src 'self'/);
+  const dir = /(^|;)\s*connect-src([^;]*)/.exec(BOARD_CSP)?.[2]?.trim() ?? null;
+  assert.ok(dir !== null);
+  // 一档一义：只放行同源 fetch（板恒绑 loopback），不多放、不引外源
+  assert.deepEqual(dir.split(/\s+/), ["'self'"]);
 });
 
 test("轨14-守卫脚本：一段内联 · 零外源 · 零求值 · 只作用于 POST 表单", () => {
@@ -156,6 +174,76 @@ test("轨17-页面（正向锚）非终态 / null / 未知态 ⇒ 两表单回�
   assert.match(renderConfirmForm("F1", "未发起", null, null), /方案未就绪/, "缺省参数不改变 approval 判据");
 });
 
+// ---------------------------------------------------------------------------
+// REQ-v0.9.2 N7：详情页轮次进度行（303 回详情页后的可见落点）
+// ---------------------------------------------------------------------------
+
+test("N7-页面 在飞轮 ⇒ 「第 N 轮 在飞」+ 轮 id，不显示位次", () => {
+  const html = renderTurnProgress({ turnId: "turn-run", round: 4, state: "running", position: null });
+  assert.match(html, /<p class="hint turn-progress">轮次进度：<b>第 4 轮 在飞<\/b>/);
+  assert.match(html, /<span class="mono">turn-run<\/span>/);
+  assert.doesNotMatch(html, /队列第/);
+});
+
+test("N7-页面 排队轮 ⇒ 「第 N 轮 排队中 · 队列第 K 位」；位次查不到 ⇒ 只说排队中（不臆造第 1 位）", () => {
+  assert.match(
+    renderTurnProgress({ turnId: "turn-q", round: 2, state: "queued", position: 3 }),
+    /<b>第 2 轮 排队中 · 队列第 3 位<\/b>/,
+  );
+  const noPos = renderTurnProgress({ turnId: "turn-q", round: 2, state: "queued", position: null });
+  assert.match(noPos, /第 2 轮 排队中/);
+  assert.doesNotMatch(noPos, /队列第/);
+});
+
+test("N7-页面（负向）无在飞 / 排队轮 ⇒ 整行不渲染；文案不做自动刷新（自动刷新不在页面脚本白名单闭集）", () => {
+  assert.equal(renderTurnProgress(null), "");
+  const html = renderTurnProgress({ turnId: "turn-run", round: 1, state: "running", position: null });
+  assert.doesNotMatch(html, /http-equiv|setTimeout|location\.reload/i, "进度行不得自带刷新");
+  assert.match(html, /刷新本页看最新/);
+});
+
+// --- REQ-v0.9.2 N8：详情页验收轨迹块（消费 acceptance，板不重算） ---------------- --------
+
+test("N8-验收轨迹：acceptance 缺位（老桥 null / undefined）⇒ 整块不渲染（现行为）", () => {
+  assert.equal(renderAcceptanceSection(null), "");
+  assert.equal(renderAcceptanceSection(undefined), "");
+});
+
+test("N8-验收轨迹：未知/退役态原样灰化、末段 leftAt=null=当前停留、同态重复段不合并", () => {
+  const html = renderAcceptanceSection({
+    stages: [
+      { state: "analyzing", enteredAt: "e0", leftAt: "e1" },
+      { state: "executing", enteredAt: "e1", leftAt: "e2" },
+      { state: "needs_input", enteredAt: "e2", leftAt: "e3" },
+      { state: "executing", enteredAt: "e3", leftAt: null },
+    ],
+    failures: [],
+    stateCounts: { completed: 2 },
+  });
+  assert.match(html, /<span class="muted">analyzing<\/span>/, "值域非封闭 ⇒ 未命中标签表原样显示 + 灰化");
+  assert.match(html, /<span class="warn">当前停留<\/span>/);
+  assert.equal(html.split("执行中（executing）").length - 1, 2, "同名 executing 两段如实显示，不合并");
+  assert.match(html, /失败账单：<b>0 条<\/b>/);
+  assert.match(html, /已完成（completed） × 2/);
+});
+
+test("N8-验收轨迹：failures 计数 + payload 防御式摘要（坏 JSON 原文截断、null ⇒ —）", () => {
+  const html = renderAcceptanceSection({
+    stages: [],
+    failures: [
+      { eventId: 7, at: "a1", payload: '{"failed":["t1","t2"],"blockedSet":[]}' },
+      { eventId: null, at: null, payload: "{坏 JSON" },
+      { eventId: 9, at: "a3", payload: null },
+    ],
+    stateCounts: {},
+  });
+  assert.match(html, /（无段轨迹）/);
+  assert.match(html, /失败账单：<b>3 条<\/b>/);
+  assert.match(html, /failed×2 · blockedSet×0/);
+  assert.match(html, /\{坏 JSON/, "坏 JSON 不抛不吞，原文如实显示");
+  assert.match(html, /<td class="mono">—<\/td><\/tr>/, "payload=null ⇒ —");
+});
+
 test("轨14-页面骨架：提交后的就地提示有样式（.submit-pending）+ 守卫脚本随每页注入一次", () => {
   const page = renderPage({ title: "t", active: "features", bodyHtml: "<p>b</p>" });
   assert.match(page, /p\.submit-pending\s*{/);
@@ -228,6 +316,49 @@ test("renderFeaturesList: stateCounts = {} ⇒ 显示空分布，不得报缺位
   assert.match(html, /各态分布：（空分布 · 无任务）/);
   assert.ok(!/未透出/.test(html));
   assert.ok(!/TODO/.test(html));
+});
+
+// ---------------------------------------------------------------------------
+// 列表过滤纯函数（REQ-v0.9.2 N4：桥无过滤参数 ⇒ 板内存过滤）
+// ---------------------------------------------------------------------------
+
+const filterTargets = [
+  { state: "executing", approval: "已通过", version: "v0.9.0" },
+  { state: "completed", approval: "已通过", version: "v0.9.1" },
+  { state: "waiting_approval", approval: "待审批", version: null },
+  { state: "completed", approval: null, version: "" },
+];
+
+test("parseFeaturesFilter: 空值 / 缺键不算条件；trim；非法值容错（不抛）", () => {
+  assert.deepEqual(parseFeaturesFilter(new URLSearchParams("")), {});
+  assert.deepEqual(parseFeaturesFilter(new URLSearchParams("state=&approval=%20")), {});
+  assert.deepEqual(parseFeaturesFilter(new URLSearchParams("state=completed&foo=bar")), { state: "completed" });
+  assert.deepEqual(parseFeaturesFilter(new URLSearchParams("state=no_such")), { state: "no_such" });
+  assert.deepEqual(parseFeaturesFilter(new URLSearchParams("state=a&state=b")), { state: "a" }); // 重复键取首值（URLSearchParams 语义）
+});
+
+test("featuresFilterActive / applyFeaturesFilter：正负用例", () => {
+  assert.equal(featuresFilterActive({}), false);
+  assert.equal(featuresFilterActive({ state: "completed" }), true);
+  assert.deepEqual(applyFeaturesFilter(filterTargets, {}), filterTargets);
+  assert.deepEqual(applyFeaturesFilter(filterTargets, { state: "completed" }).map((f) => f.approval), ["已通过", null]);
+  assert.deepEqual(applyFeaturesFilter(filterTargets, { approval: "待审批" }).map((f) => f.state), ["waiting_approval"]);
+  assert.deepEqual(applyFeaturesFilter(filterTargets, { version: "v0.9.0" }).map((f) => f.state), ["executing"]);
+  assert.deepEqual(applyFeaturesFilter(filterTargets, { state: "completed", approval: "已通过" }).length, 1);
+  assert.deepEqual(applyFeaturesFilter(filterTargets, { state: "no_such_state" }), []);
+  // version null / "" 不匹配任何给定值
+  assert.deepEqual(applyFeaturesFilter(filterTargets, { version: "" + "x" }), []);
+});
+
+test("renderFeaturesList：过滤表单渲染 + 当前值保留 selected + 过滤计数行", () => {
+  const plain = renderFeaturesList(listFixture);
+  assert.match(plain, /<form method="get" action="\/requirements"/, "REQ-v0.9.2 增补④：`/` 已改看板，过滤 GET 必须回需求页");
+  assert.ok(!/selected/.test(plain));
+  assert.ok(!/过滤后/.test(plain));
+  const filtered = renderFeaturesList({ ...listFixture, features: [listFixture.features[1]] }, { state: "waiting_approval" }, 2);
+  assert.match(filtered, /<option value="waiting_approval" selected>/);
+  assert.match(filtered, /过滤后 1 \/ 共 2 条/);
+  assert.match(filtered, /清除过滤/);
 });
 
 // ---------------------------------------------------------------------------
@@ -401,6 +532,102 @@ test("BD11 renderRequirementForm：未配默认组织 ⇒ group 必填 + 首次�
   assert.match(withDefault, /留空 = 用板级默认 flow-team/);
 
   assert.equal(renderRequirementForm("   ").includes("留空 = 用板级默认"), false, "纯空白默认等同未配置");
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.2 M6：提需求 version 去必填 + 排期表单 GET 面 + 改版失联警示行
+// ---------------------------------------------------------------------------
+
+test("M6 renderRequirementForm：version 去必填（无 required、label 无 *），placeholder 提示「留空 = 未排期」", () => {
+  const html = renderRequirementForm("flow");
+  assert.match(html, /<label>版本<input name="version"[^>]*>/, "label 不得带 *");
+  assert.doesNotMatch(html, /name="version"[^>]*required/, "version 不得再 required");
+  assert.match(html, /name="version"[^>]*placeholder="[^"]*留空 = 未排期/);
+  assert.match(html, /<label>标题 \*<input name="title" required/, "title 仍必填（回归锚）");
+});
+
+test("M6 renderScheduleForm：单输入 + version 键恒携带 + 当前值回填 + POST 到排期写端点", () => {
+  const html = renderScheduleForm("F1", "v0.9.2");
+  assert.match(html, /action="\/features\/F1\/schedule"[^>]*data-submit="[^"]+"/, "写表单恒带防连点文案（轨14 同规格）");
+  assert.match(html, /name="version" value="v0\.9\.2"/, "当前版本回填");
+  assert.match(html, /留空 = 删除排期/);
+  assert.match(renderScheduleForm("F1", null), /name="version" value=""/, "未排期 ⇒ 空值回填（键仍恒在）");
+});
+
+test("M6 registeredDecisionDocVersions：取 decisions 里的文档版本段（去重、无 .md ⇒ 空）", () => {
+  const decisions = JSON.stringify([
+    "doc/v0.9.1/甲-改造文档.md 已确认",
+    "doc/v0.9.1/甲-需求确认单.md",
+    "doc/v0.9.2/乙-改造文档.md",
+    "无路径的一条 note",
+  ]);
+  assert.deepEqual(registeredDecisionDocVersions(decisions), ["v0.9.1", "v0.9.2"]);
+  assert.deepEqual(registeredDecisionDocVersions(null), []);
+});
+
+test("M6 renderVersionSwitchWarningLine：登记版本 ≠ 当前版本 ⇒ 警示行；一致 / 无登记 ⇒ 空串", () => {
+  const decisions = JSON.stringify(["doc/v0.9.1/甲-改造文档.md"]);
+  const warn = renderVersionSwitchWarningLine(decisions, "v0.9.2");
+  assert.match(warn, /文档读锚将随版本切换/);
+  assert.match(warn, /class="hint warn"/);
+  assert.match(warn, /v0\.9\.1/, "点名失联的旧版本");
+  assert.match(warn, /不搬文档目录/);
+  assert.equal(renderVersionSwitchWarningLine(decisions, "v0.9.1"), "", "版本一致 ⇒ 不警示");
+  assert.equal(renderVersionSwitchWarningLine(null, "v0.9.2"), "", "无文档登记 ⇒ 不警示");
+  assert.equal(renderVersionSwitchWarningLine(JSON.stringify(["纯 note，无文档"]), "v0.9.2"), "");
+  assert.match(renderVersionSwitchWarningLine(decisions, ""), /当前版本（<code>未排期<\/code>）/, "改到未排期也如实点名");
+});
+
+test("renderFeatureDetail 阶段产出（按需求归约）：警示行 + 清单 + note 条目三区共存", () => {
+  const detail = structuredClone(detailFixture);
+  detail.feature.version = "v0.9.2";
+  detail.feature.decisions = JSON.stringify([
+    "本轮裁决：数据源改 decisions 驱动",
+    "产出：doc/v0.9.1/甲-改造文档.md",
+  ]);
+  const html = renderFeatureDetail(detail, null, null, NOW);
+  assert.match(html, /<h2>阶段产出<\/h2>/);
+  assert.match(html, /class="hint warn"[\s\S]*文档读锚将随版本切换/, "失联警示在区内");
+  assert.match(html, />甲-改造文档\.md<\/a>/, "警示不吞条目");
+  assert.match(html, /本轮裁决：数据源改 decisions 驱动/, "非 doc 条目同区保留");
+  assert.doesNotMatch(html, /产出登记（decisions）/, "旧第二区已合并消失");
+});
+
+test("registeredDecisionDocVersions 只认 doc/ 前缀登记：裸版本目录形态与提及 README 不计警示", () => {
+  const decisions = JSON.stringify(["参照 v0.9.1/乙-改造文档.md（他需求路径，非本需求登记）", "口径见 README.md", "doc/v0.9.1/甲-需求确认单.md"]);
+  assert.deepEqual(registeredDecisionDocVersions(decisions), ["v0.9.1"]);
+  assert.equal(registeredDecisionDocVersions(JSON.stringify(["doc/甲-需求确认单.md"])).length, 0, "单段无版本 ⇒ 不产警示版本段");
+});
+
+test("M6 renderFeatureDetail：withScheduleForm=true ⇒ 排期表单在本页（GET 面）；缺省不渲染（向后兼容）", () => {
+  const withForm = renderFeatureDetail(detailFixture, null, null, NOW, true);
+  assert.match(withForm, /action="\/features\/F1\/schedule"/);
+  assert.match(withForm, /<h2>排期<\/h2>/);
+  const without = renderFeatureDetail(detailFixture, null, null, NOW);
+  assert.doesNotMatch(without, /\/features\/F1\/schedule/, "调用方未接线 ⇒ 不渲染（旧行为不变）");
+});
+
+test("N3 renderRequirementForm：orgsDir 三档提示（未装配 / 配了但不可用 / 就绪）；不传 ⇒ 不出行", () => {
+  const bare = renderRequirementForm(null);
+  assert.doesNotMatch(bare, /组织目录根/, "未传状态 ⇒ 不渲染提示行（向后兼容）");
+
+  const notConfigured = renderRequirementForm(null, { tier: "not_configured" });
+  assert.match(notConfigured, /board_orgs_dir_not_configured/, "未装配档沿用闭集 code");
+  assert.match(notConfigured, /未装配/, "未装配档文案可见");
+
+  const problem = renderRequirementForm(null, {
+    tier: "problem",
+    code: "board_orgs_dir_missing",
+    message: "组织目录根不存在：C:/tmp/no-such ⇒ 不 spawn 进程",
+  });
+  assert.match(problem, /class="hint err"/, "不可用档走红字错误样式");
+  assert.match(problem, /board_orgs_dir_missing/);
+  assert.match(problem, /组织目录根不存在/, "diagnoseOrgsDir 原文照登");
+
+  const ready = renderRequirementForm(null, { tier: "ready", orgsDir: "C:/tmp/orgs" });
+  assert.match(ready, /就绪/);
+  assert.match(ready, /C:\/tmp\/orgs/);
+  assert.doesNotMatch(ready, /class="hint err"/, "就绪档不出错误样式");
 });
 
 test("BD11 renderHostPage 配置行：默认组织未配置时如实显示「由提需求表单给出」，不编造兜底组名", () => {

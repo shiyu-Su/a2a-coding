@@ -1,26 +1,27 @@
 /**
  * 板读文档面（BD10 · REQ-v0.9.1-2026-09-25-04 · **纯函数**，零 HTTP —— HTTP 归 BD11）。
  *
- * 职责：文档根解析 + version/文件名解析 + 双源列目录 + 单文件读取。
+ * 职责：文档根解析 + version/文件名解析 + 单文件读取（守卫端点 `/features/:id/docs?file=`）。
  * 双源（改造文档裁决 ①）：
  * - 源 A = `<repoRoot>/doc/{version}/`（主仓根，板配置键 `repoRoot`，缺省 = 板根上一级）；
  * - 源 B = `<orgsDir>/<org>/doc/{version}/`（组织工作区，沿用既有 `orgsDir` 配置）。
- * 合并列出：存在哪个算哪个；同名文件两处都有 ⇒ 分行、各标注来源，不做优先级裁决。
  *
- * **守卫四件套**（裁决 ②，全部必配）：
+ * **目录扫描（`listDocs`）已作废**（REQ-v0.9.2-2026-09-26-01 按需求归约）：详情页「阶段产出」
+ * 改由本需求 `decisions` 登记驱动，板不再列 `doc/{版本}/` 全目录。
+ *
+ * **守卫四件套**（裁决 ②，读取路径全部必配）：
  * 1. 根内收 —— resolve 后核验仍在允许根内（照抄 `resolveOrgWorkspace` 双保险，
  *    host-face.ts:117-133 风格；拒 `..`/盘符/分隔符 + Windows 大小写不敏感比较）；
- * 2. version 白名单 —— `^v\d+\.\d+\.\d+$`，不匹配 ⇒ 空清单 / 结构化拒绝（**不抛错**）；
- * 3. 仅 `.md` 后缀闭集（列目录过滤 + 读取再校验一次）；
+ * 2. version 白名单 —— `^v\d+\.\d+\.\d+$`，不匹配 ⇒ 结构化拒绝（**不抛错**）；
+ * 3. 仅 `.md` 后缀闭集（读取前校验）；
  * 4. 256KiB 读上限（先例 write-guard.ts:30），超限只读到上限并打截断标记（不整读大文件）。
  *
- * 降级不报错口径（B3）：非法输入一律走结构化失败值或空清单，**本模块不抛未捕获异常**；
+ * 降级不报错口径（B3）：非法输入一律走结构化失败值，**本模块不抛未捕获异常**；
  * 失败文案**不得携带根绝对路径**（HTTP 层 404 不泄根）。
  */
-import { openSync, readSync, closeSync, statSync, readdirSync } from "node:fs";
+import { openSync, readSync, closeSync, statSync } from "node:fs";
 import { dirname, join, resolve, sep } from "node:path";
 import { fileURLToPath } from "node:url";
-import type { DirKind } from "./host-runtime.js";
 
 /** 单文档读取上限（字节）：与写面请求体上限同值同先例（write-guard.ts `MAX_REQUIREMENT_BODY_BYTES`）。 */
 export const MAX_DOC_FILE_BYTES = 262_144;
@@ -33,18 +34,6 @@ export const DOC_FILE_SUFFIX = ".md";
 
 /** 双源标识：A = 主仓根，B = 组织工作区。 */
 export type DocsSource = "A" | "B";
-
-/** 读盘三态探针（可注入，同 host-runtime 口径；单测喂假盘）。 */
-export type DocsDirProbe = (path: string) => DirKind;
-
-/** 读盘错误 → 三态：查不动等于看不见（权限/非法路径/名字过长都按 missing）。 */
-function statDirKind(path: string): DirKind {
-  try {
-    return statSync(path).isDirectory() ? "dir" : "not_dir";
-  } catch {
-    return "missing";
-  }
-}
 
 /** version 白名单判定（守卫 2 的布尔投影）。 */
 export function isValidDocVersion(version: string): boolean {
@@ -92,61 +81,6 @@ export function defaultRepoRoot(metaUrl: string = import.meta.url): string {
 export function docsRootFor(source: DocsSource, dirs: { repoRoot: string; orgsDir: string; org: string }): string {
   if (source === "A") return join(dirs.repoRoot, "doc");
   return join(dirs.orgsDir, dirs.org, "doc");
-}
-
-/** 清单条目：文件名 + 来源（守卫 B3 的「分行标注来源」载体）+ 分类标注。 */
-export interface DocsEntry {
-  readonly name: string;
-  readonly source: DocsSource;
-  readonly kind: DocKind;
-}
-
-export type DocKind = "需求确认单" | "改造文档" | "其它";
-
-/**
- * 分类标注（尽力而为，板不做裁判）：主仓后缀式（`{topic}-需求确认单.md`）与
- * 工作区前缀式（`需求确认单-{topic}.md`）都认，命中不了 ⇒ 「其它」照列。
- */
-export function classifyDoc(name: string): DocKind {
-  const stem = name.endsWith(DOC_FILE_SUFFIX) ? name.slice(0, -DOC_FILE_SUFFIX.length) : name;
-  if (stem.includes("需求确认单")) return "需求确认单";
-  if (stem.includes("改造文档")) return "改造文档";
-  return "其它";
-}
-
-/** 单源列目录：目录缺失 / 查不动 / version 非法 ⇒ 空；只收 `.md` 普通文件，名字异常条目跳过。 */
-function listOneSource(docRoot: string, version: string, source: DocsSource, probe: DocsDirProbe): DocsEntry[] {
-  if (!isValidDocVersion(version)) return [];
-  const versionDir = resolve(join(docRoot, version));
-  if (!insideRoot(resolve(docRoot), versionDir)) return [];
-  if (probe(versionDir) !== "dir") return [];
-  let names: string[];
-  try {
-    names = readdirSync(versionDir, { withFileTypes: true })
-      .filter((e) => e.isFile() && e.name.endsWith(DOC_FILE_SUFFIX))
-      .map((e) => e.name);
-  } catch {
-    return [];
-  }
-  names.sort();
-  return names.filter((n) => isSafeSegment(n)).map((n) => ({ name: n, source, kind: classifyDoc(n) }));
-}
-
-/**
- * 双源合并清单（判据 2）：源 A + 源 B 顺序拼接（A 在前），同名两处都有 ⇒ 两条都列、
- * 各标来源。version 非法 ⇒ 空清单（不抛错）；两源目录都不存在 ⇒ 空清单。
- */
-export function listDocs(
-  dirs: { repoRoot: string; orgsDir: string | null; org: string | null },
-  version: string,
-  probe: DocsDirProbe = statDirKind,
-): DocsEntry[] {
-  const entries: DocsEntry[] = [];
-  entries.push(...listOneSource(join(resolve(dirs.repoRoot), "doc"), version, "A", probe));
-  if (dirs.orgsDir !== null && dirs.org !== null && isSafeSegment(dirs.org)) {
-    entries.push(...listOneSource(join(resolve(dirs.orgsDir), dirs.org, "doc"), version, "B", probe));
-  }
-  return entries;
 }
 
 /** 读取成功：内容 + 是否因 256KiB 上限截断 + 实际读到的字节数。 */

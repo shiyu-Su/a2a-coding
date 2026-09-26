@@ -13,8 +13,8 @@
  * （谁在排队、哪条需求绑了哪个 `contextId`、本轮摘要是什么），**绝不落 Feature Context** ——
  * `features` 的文本列是执行节点的注入源，写进去会被拼进每一个派发消息。
  *
- * **本台账不写引擎状态机**（BD4b 硬约束）：这里只有板侧记账，`approve` / `advance` / `cancel`
- * 全归编排 agent。
+ * **本台账不写引擎状态机迁移**（BD4b 硬约束）：这里只有板侧记账，`approve` / `cancel` / 主链 `advance`
+ * 全归编排 agent（`version` 排期写经 advance「`to` = 当前态」登记字段特例，唯一落点在 `feature-schedule.ts`）。
  *
  * 单进程单写手（§2.2-1 独立进程树）⇒ 原子替换写（临时文件 + rename），不加文件锁。
  */

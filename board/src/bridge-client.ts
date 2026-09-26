@@ -39,6 +39,8 @@ export interface FeatureListItem {
   featureId: string;
   state: string;
   title: string;
+  /** 需求原文（桥列表出参已透出该键，`…title,requirement,contextId,plan,…`）；老桥缺列 ⇒ null 容错。 */
+  requirement: string | null;
   taskCount: number | null;
   ownerGroup: string | null;
   /**
@@ -83,6 +85,34 @@ export interface FeatureTaskItem {
   dependencies: string[] | null;
 }
 
+/**
+ * acceptance 主链段轨迹的一格（桥单查顶层 `acceptance.stages[]`，v0.9.2 N8 消费）。
+ * **`state` 值域非封闭**（存量库有已退役值 analyzing / planning）⇒ 原样透传，不校验。
+ */
+export interface AcceptanceStageView {
+  state: string;
+  enteredAt: string | null;
+  /** null = 末段（Feature 现停在此态）或缺键；渲染层按「是否末段」区分语义 */
+  leftAt: string | null;
+}
+
+/** 一条失败账单（`acceptance.failures[]`）。`payload` = 事件 payload 原文 JSON 字符串（可 null），内层键不作契约。 */
+export interface AcceptanceFailureView {
+  eventId: number | null;
+  at: string | null;
+  payload: string | null;
+}
+
+/**
+ * 详情页验收轨迹块（= 桥 `GET /api/features/:id` 出参**顶层** `acceptance` 键，非 feature 内；
+ * 列表出参无该键）。老桥 / 缺键 ⇒ `null` ⇒ 详情页现行为。
+ */
+export interface AcceptanceView {
+  stages: AcceptanceStageView[];
+  failures: AcceptanceFailureView[];
+  stateCounts: StateCounts;
+}
+
 export interface FeatureDetailView {
   feature: {
     featureId: string;
@@ -104,6 +134,8 @@ export interface FeatureDetailView {
     updatedAt: string | null;
   };
   tasks: FeatureTaskItem[];
+  /** 详情出参顶层 `acceptance` 块；老桥 / 缺键 / 非对象 ⇒ null（现行为） */
+  acceptance: AcceptanceView | null;
 }
 
 /** `GET /api/projects` 归一视图（快照语义：`observedAt` + note，非实时在线） */
@@ -243,6 +275,7 @@ export function parseFeaturesList(json: unknown): FeaturesListView {
       featureId: reqStr(f.featureId, "feature.featureId"),
       state: reqStr(f.state, "feature.state"),
       title: str(f.title) ?? "",
+      requirement: str(f.requirement),
       taskCount: num(f.taskCount),
       ownerGroup: str(f.ownerGroup),
       stage: str(f.stage),
@@ -318,7 +351,31 @@ export function parseFeatureDetail(json: unknown): FeatureDetailView {
       updatedAt: str(feature.updatedAt),
     },
     tasks,
+    acceptance: parseAcceptance(body.acceptance),
   };
+}
+
+/**
+ * 顶层 `acceptance` 块（v0.9.2 N8）：**非对象（缺失 / 老桥）⇒ null**；对象 ⇒ 逐键容错展开
+ * （空对象 = 合法的零段轨迹，不是缺位）。只消费 orch 聚合结果，不在板侧重算、不按 state 反推。
+ */
+function parseAcceptance(v: unknown): AcceptanceView | null {
+  if (!isRecord(v)) return null;
+  const rawStages = Array.isArray(v.stages) ? v.stages : [];
+  const stages: AcceptanceStageView[] = rawStages.map((entry) => {
+    const s = isRecord(entry) ? entry : {};
+    return {
+      state: str(s.state) ?? "",
+      enteredAt: str(s.enteredAt),
+      leftAt: str(s.leftAt),
+    };
+  });
+  const rawFailures = Array.isArray(v.failures) ? v.failures : [];
+  const failures: AcceptanceFailureView[] = rawFailures.map((entry) => {
+    const fl = isRecord(entry) ? entry : {};
+    return { eventId: num(fl.eventId), at: str(fl.at), payload: str(fl.payload) };
+  });
+  return { stages, failures, stateCounts: parseStateCounts(v.stateCounts) ?? {} };
 }
 
 /** `GET /api/features/:featureId/trace` → 进展三面视图（纯函数）。 */

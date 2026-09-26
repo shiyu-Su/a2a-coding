@@ -5,11 +5,13 @@ import {
   isWriteRoute,
   checkWriteAuth,
   parseRequirementForm,
+  parseScheduleForm,
   GROUP_REQUIRED_CODE,
   WRITE_GUARD_HEADER,
   WRITE_GUARD_HEADER_VALUE,
   REQUIREMENTS_WRITE_PATH,
   MAX_REQUIREMENT_BODY_BYTES,
+  ScheduleFormProgrammingError,
 } from "../dist/write-guard.js";
 
 const HOST = "127.0.0.1:3400";
@@ -178,19 +180,23 @@ test("BD16-⑥（回归）既有 X-Board-Write 头档不受 Origin 不可知 / �
   }
 });
 
-test("parseRequirementForm：title/version 必填去空白，requirement 空串归一为未提供", () => {
+test("parseRequirementForm：title 必填去空白；version 去必填（M6，留空 = 未排期），requirement 空串归一为未提供", () => {
   const ok = parseRequirementForm("title=%20甲%20&version=%20v0.9.0%20&requirement=%20", undefined, "g");
   assert.deepEqual(ok, { ok: true, title: "甲", version: "v0.9.0", group: "g" });
   const withReq = parseRequirementForm("title=甲&version=v1&requirement=%E5%8E%9F%E6%96%87", undefined, "g");
   assert.equal(withReq.ok && withReq.requirement, "原文");
+  // M6：version 缺失 / 空 / 纯空白 ⇒ 合法（未排期），归一为空串
+  for (const raw of ["title=甲", "title=甲&version=", "title=甲&version=%20%20"]) {
+    assert.deepEqual(parseRequirementForm(raw, undefined, "g"), { ok: true, title: "甲", version: "", group: "g" }, raw);
+  }
 });
 
-test("parseRequirementForm（负向）：任一必填为空 ⇒ 400 结构化，指出缺哪个", () => {
+test("parseRequirementForm（负向）：M6 起必填仅 title ⇒ 空 title 400 结构化，空 version 不拒", () => {
   for (const [raw, expectMissing] of [
     ["title=&version=v1", "title"],
     ["version=v1", "title"],
-    ["title=%20%20&version=", "title/version"],
-    ["title=%E7%94%B2", "version"],
+    ["title=%20%20&version=v1", "title"],
+    ["title=%20%20", "title"],
   ]) {
     const out = parseRequirementForm(raw, undefined, "g");
     assert.equal(out.ok, false, `${raw} 必须被拒`);
@@ -245,4 +251,43 @@ test("parseRequirementForm：超限体 ⇒ 413（content-length 或实际字节�
   assert.equal(byBytes.ok, false);
   assert.equal(byBytes.status, 413);
   assert.ok(MAX_REQUIREMENT_BODY_BYTES > 0);
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.2 M3：排期写路由 + 表单解析（POST /features/{id}/schedule）
+// ---------------------------------------------------------------------------
+
+test("M3 isWriteRoute：schedule 只放开 POST 单段 id；近似路径不放行", () => {
+  assert.equal(isWriteRoute("POST", "/features/F1/schedule"), true);
+  for (const [method, path] of [
+    ["GET", "/features/F1/schedule"],
+    ["PUT", "/features/F1/schedule"],
+    ["POST", "/features/F1/schedule/"],
+    ["POST", "/features//schedule"],
+    ["POST", "/features/F1/x/schedule"],
+    ["POST", "/schedule"],
+  ]) {
+    assert.equal(isWriteRoute(method, path), false, `${method} ${path} 不得放行`);
+  }
+});
+
+test("M3 parseScheduleForm：显式 version 去空白；空串 = 删除排期（合法值，不拒）", () => {
+  assert.deepEqual(parseScheduleForm("version=%20%20v0.9.2%20"), { ok: true, version: "v0.9.2" });
+  assert.deepEqual(parseScheduleForm("version="), { ok: true, version: "" });
+  assert.deepEqual(parseScheduleForm("version=%20%20"), { ok: true, version: "" }, "纯空白 trim 后同为清空语义");
+});
+
+test("M3 parseScheduleForm（负向）：version 键缺失 = 编程错误抛出，不做缺键语义", () => {
+  assert.throws(() => parseScheduleForm("title=无关"), ScheduleFormProgrammingError);
+  assert.throws(() => parseScheduleForm(""), ScheduleFormProgrammingError);
+});
+
+test("M3 parseScheduleForm：超限体 ⇒ 413（口径同 parseRequirementForm）", () => {
+  const byLength = parseScheduleForm("version=v1", MAX_REQUIREMENT_BODY_BYTES + 1);
+  assert.equal(byLength.ok, false);
+  assert.equal(byLength.status, 413);
+  assert.equal(byLength.code, "payload_too_large");
+  const byBytes = parseScheduleForm("version=" + "甲".repeat(200_000));
+  assert.equal(byBytes.ok, false);
+  assert.equal(byBytes.status, 413);
 });

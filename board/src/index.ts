@@ -135,6 +135,7 @@ async function main(): Promise<void> {
     mcpBaseUrl: cfg.mcpBaseUrl,
     hostFace: hostFace?.face ?? null,
     docs: { repoRoot: cfg.repoRoot, orgsDir: cfg.orgsDir },
+    releasedVersions: cfg.releasedVersions,
     onShutdown: () => shutdown("POST /shutdown"),
   });
   process.stdout.write(
@@ -143,6 +144,11 @@ async function main(): Promise<void> {
   process.stdout.write(
     `生效值：port = ${cfg.port} · host = ${cfg.host} · 读面桥 = ${cfg.bridgeUrl} · MCP 基址 = ${cfg.mcpBaseUrl} · hostKind = ${cfg.hostKind} · machineDist = ${cfg.machineDist} · turnTimeoutMs = ${cfg.turnTimeoutMs ?? "未配置（下游缺省 10 min）"}\n`,
   );
+  if (cfg.releasedVersions.length > 0) {
+    process.stdout.write(
+      `已发版锁定：${cfg.releasedVersions.join(" · ")}（config.json 的 releasedVersions）⇒ 提需求排入这些版本、以及排期写改入 / 改出（含清空）这些版本一律 409 board_version_released 拒绝（同锁版重提放行）；改动须重启板生效\n`,
+    );
+  }
   if (group === null) {
     process.stdout.write(
       "未配默认组织（config.json 的 group）：不是错误 —— 组织名由提需求表单给出；未配默认时表单的组织名为必填，留空 ⇒ POST /requirements 结构化 400 board_group_required（不猜、不回落兜底组名）\n",

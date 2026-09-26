@@ -7,6 +7,7 @@ import {
   deriveTurnBusyAffordance,
   deriveTerminalFeatureAffordance,
   deriveNextStepHint,
+  deriveTurnProgress,
   formatWaitedSince,
   traceWaitDisplay,
   UNKNOWN_STAGE_LABEL,
@@ -304,4 +305,25 @@ test("BD18-derive 下一步：approval 缺值 ⇒ 兜底行透出原值（不臆
   const hint = deriveNextStepHint({ ...NS, approval: null });
   assert.match(hint, /审批门值（当前 = 缺失）/);
   assert.match(hint, /触发一轮/);
+});
+
+// ---------------------------------------------------------------------------
+// REQ-v0.9.2 N7：详情页轮次进度（轮台账派生；位次只在排队时取）
+// ---------------------------------------------------------------------------
+
+test("N7-derive 在飞轮 ⇒ 第 N 轮 + 无位次（在飞没有位次可言，不自造 1）", () => {
+  assert.deepEqual(
+    deriveTurnProgress({ turnId: "turn-9", round: 4, state: "running" }, null),
+    { turnId: "turn-9", round: 4, state: "running", position: null },
+  );
+});
+
+test("N7-derive 排队轮 ⇒ 带位次；位次查不到 ⇒ null（不臆造）", () => {
+  const busy = { turnId: "turn-10", round: 2, state: "queued" };
+  assert.deepEqual(deriveTurnProgress(busy, 3), { turnId: "turn-10", round: 2, state: "queued", position: 3 });
+  assert.deepEqual(deriveTurnProgress(busy, null), { turnId: "turn-10", round: 2, state: "queued", position: null });
+});
+
+test("N7-derive（负向）无在飞 / 排队轮 ⇒ null：整行不渲染，不显示「第 0 轮」", () => {
+  assert.equal(deriveTurnProgress(null, 1), null);
 });

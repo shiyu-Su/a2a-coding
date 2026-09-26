@@ -1,18 +1,22 @@
 /**
- * 板写面守卫与入参解析（BD7 · BD8 扩两条 · BD9 再扩两条 · BD16 修「来源不可知」误判）—— **纯函数**（不依赖 http 类型，便于离线单测）。
+ * 板写面守卫与入参解析（BD7 · BD8 扩两条 · BD9 再扩两条 · BD16 修「来源不可知」误判 · v0.9.2 M3 再扩一条）—— **纯函数**（不依赖 http 类型，便于离线单测）。
  *
- * 放开的写路径共五条，方法**恒为 POST**：
+ * 放开的写路径共六条，方法**恒为 POST**：
  * - `POST /requirements`          —— 提需求（BD7）；
  * - `POST /features/:id/turn`     —— 触发宿主桥的一轮（BD8）；
  * - `POST /host/:org/stop`        —— 停桥（BD8，**与上两条同规格**：守卫头 / 同源校验）；
  * - `POST /features/:id/confirm`  —— 人工确认指令（BD9，投消息给 agent，**板不批准**）；
- * - `POST /features/:id/answer`   —— 澄清回答（BD9，仅当最新轮 `awaiting_answer` 可续推）。
+ * - `POST /features/:id/answer`   —— 澄清回答（BD9，仅当最新轮 `awaiting_answer` 可续推）；
+ * - `POST /features/:id/schedule` —— 排期写（v0.9.2 M3，唯一放开的登记字段写，经 `feature-schedule.ts` 封装）。
  * 三件事收敛在这里：
  * - {@link parseWriteRoute}：方法门的放行白名单（含路径参数提取；其余路径的非 GET 仍 405，负向用例钉住）；
  * - {@link checkWriteAuth}：CSRF 防线（自定义头优先；无 JS 的表单退而求 Origin/Referer 同源，
  *   Origin「不可用」（缺失 / 空 / 字面 `null`）算**来源不可知**并退 Referer —— BD16；
  *   该兜底档能拿到 Referer 的前提 = 板页面 `Referrer-Policy: same-origin` —— BD17，见 `web/layout.ts`）；
- * - {@link parseRequirementForm}：urlencoded 表单 → createRequirement 入参（空必填 ⇒ 结构化 400）。
+ * - {@link parseRequirementForm}：urlencoded 表单 → createRequirement 入参（超限 / 解码失败 / `title` 为空
+ *   ⇒ 结构化 400；v0.9.2 M6 起 `version` **不再必填**，留空 = 未排期）；
+ * - {@link parseScheduleForm}：urlencoded 表单 → 排期写入参（M3；`version` **键必须显式存在**，
+ *   空串 = 删除排期；缺键 = 编程错误抛出 {@link ScheduleFormProgrammingError}，不做缺键语义）。
  *
  * **组织名的校验点在请求期，不在启动期**（BD11 反转 BD10）：组织名由**用户在前台创建/指定**
  * （提需求表单 `group` 字段），板级 `config.json` 的 `group` 只是**可选默认组织**（BD12″ 起无 argv/env 通道）。
@@ -40,6 +44,9 @@ export const HOST_STOP_WRITE_PATH_TEMPLATE = "/host/{org}/stop";
 export const CONFIRM_WRITE_PATH_TEMPLATE = "/features/{id}/confirm";
 export const ANSWER_WRITE_PATH_TEMPLATE = "/features/{id}/answer";
 
+/** v0.9.2 M3 写路径模板（排期写 = 唯一放开的登记字段 `version` 写，按需求定位）。 */
+export const SCHEDULE_WRITE_PATH_TEMPLATE = "/features/{id}/schedule";
+
 /** 写路径清单（405 文案与 README 共用此单点）。 */
 export const WRITE_ROUTES: readonly string[] = [
   "POST " + REQUIREMENTS_WRITE_PATH,
@@ -47,6 +54,7 @@ export const WRITE_ROUTES: readonly string[] = [
   `POST ${HOST_STOP_WRITE_PATH_TEMPLATE}`,
   `POST ${CONFIRM_WRITE_PATH_TEMPLATE}`,
   `POST ${ANSWER_WRITE_PATH_TEMPLATE}`,
+  `POST ${SCHEDULE_WRITE_PATH_TEMPLATE}`,
 ];
 
 /** 已放开的写路由（携路径参数）。 */
@@ -55,7 +63,8 @@ export type WriteRoute =
   | { kind: "turn"; featureId: string }
   | { kind: "host_stop"; org: string }
   | { kind: "confirm"; featureId: string }
-  | { kind: "answer"; featureId: string };
+  | { kind: "answer"; featureId: string }
+  | { kind: "schedule"; featureId: string };
 
 /** 解出单个路径参数段（含编码；拒绝空段与再含分隔符）。 */
 function paramSegment(pathname: string, prefix: string, suffix: string): string | null {
@@ -83,6 +92,8 @@ export function parseWriteRoute(method: string | undefined, pathname: string): W
   if (confirmId !== null) return { kind: "confirm", featureId: confirmId };
   const answerId = paramSegment(pathname, "/features/", "/answer");
   if (answerId !== null) return { kind: "answer", featureId: answerId };
+  const scheduleId = paramSegment(pathname, "/features/", "/schedule");
+  if (scheduleId !== null) return { kind: "schedule", featureId: scheduleId };
   const org = paramSegment(pathname, "/host/", "/stop");
   if (org !== null) return { kind: "host_stop", org };
   return null;
@@ -207,7 +218,7 @@ export function checkWriteAuth(input: WriteAuthInput): WriteAuthResult {
   };
 }
 
-/** POST 体 → createRequirement 入参（纯函数；超限/解码失败/必填为空都是结构化失败）。 */
+/** POST 体 → createRequirement 入参（纯函数；超限/解码失败/必填为空都是结构化失败；v0.9.2 M6 起必填仅 `title`）。 */
 export type RequirementFormOk = { ok: true; title: string; version: string; group: string; requirement?: string };
 export type RequirementFormFail = { ok: false; status: 400 | 413; code: string; error: string };
 export type RequirementFormResult = RequirementFormOk | RequirementFormFail;
@@ -236,12 +247,10 @@ export function parseRequirementForm(
   }
   const f = new URLSearchParams(raw);
   const title = (f.get("title") ?? "").trim();
+  // v0.9.2 M6：`version` 去必填 —— 留空 = 未排期（orch create 对 version 全链无校验，空串/缺键读面同值）。
   const version = (f.get("version") ?? "").trim();
-  if (title === "" || version === "") {
-    const missing = [title === "" ? "title" : null, version === "" ? "version" : null]
-      .filter((x): x is string => x !== null)
-      .join("/");
-    return { ok: false, status: 400, code: "requirement_form_invalid", error: `必填字段为空：${missing}（不得静默创建）` };
+  if (title === "") {
+    return { ok: false, status: 400, code: "requirement_form_invalid", error: "必填字段为空：title（不得静默创建）" };
   }
   const formGroup = (f.get(REQUIREMENT_FORM_GROUP_FIELD) ?? "").trim();
   const group = formGroup !== "" ? formGroup : (defaultGroup ?? "").trim();
@@ -259,4 +268,54 @@ export function parseRequirementForm(
   return requirement !== null && requirement.trim() !== ""
     ? { ok: true, title, version, group, requirement }
     : { ok: true, title, version, group };
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.2 M3：排期写表单（POST /features/:id/schedule）
+// ---------------------------------------------------------------------------
+
+/** 排期表单的版本字段（HTML 表单恒携带该键；`required` 不硬拦 —— 空串 = 删除排期是合法语义）。 */
+export const SCHEDULE_FORM_VERSION_FIELD = "version";
+
+/** 排期表单「version 键缺失」= 编程错误（页面表单永远带该键；裸 API 调用省略键不是业务语义）。 */
+export class ScheduleFormProgrammingError extends Error {
+  constructor(message: string) {
+    super(message);
+    this.name = "ScheduleFormProgrammingError";
+  }
+}
+
+export interface ScheduleFormOk {
+  ok: true;
+  /** 已 `trim()` 的目标版本；空串 = 删除排期（回「未排期」）。 */
+  version: string;
+}
+export interface ScheduleFormFail {
+  ok: false;
+  status: 413;
+  code: "payload_too_large";
+  error: string;
+}
+export type ScheduleFormResult = ScheduleFormOk | ScheduleFormFail;
+
+/**
+ * urlencoded 表单 → 排期写入参（纯函数，口径与 {@link parseRequirementForm} 同规格）：
+ * - `version` **必须显式传**（键缺失 ⇒ 抛 {@link ScheduleFormProgrammingError}，不做缺键语义）；
+ * - 服务端发送前一律 `trim()`（「空格自成一列」的坑）；**空串 = 删除排期** ⇒ 合法值，不拒；
+ * - 超限（content-length 或实际字节数任一越界）⇒ 结构化 413。
+ */
+export function parseScheduleForm(raw: string, contentLength?: number): ScheduleFormResult {
+  if (
+    (contentLength !== undefined && contentLength > MAX_REQUIREMENT_BODY_BYTES) ||
+    Buffer.byteLength(raw, "utf8") > MAX_REQUIREMENT_BODY_BYTES
+  ) {
+    return { ok: false, status: 413, code: "payload_too_large", error: "请求体超过板写面上限（256 KiB）" };
+  }
+  const f = new URLSearchParams(raw);
+  if (!f.has(SCHEDULE_FORM_VERSION_FIELD)) {
+    throw new ScheduleFormProgrammingError(
+      `排期表单缺少 ${SCHEDULE_FORM_VERSION_FIELD} 键：排期写必须显式传 version（清空排期 = 空串），不做缺键语义`,
+    );
+  }
+  return { ok: true, version: (f.get(SCHEDULE_FORM_VERSION_FIELD) ?? "").trim() };
 }

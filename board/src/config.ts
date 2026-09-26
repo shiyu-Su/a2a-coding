@@ -52,6 +52,11 @@ export interface BoardConfig {
   readonly repoRoot: string;
   /** 单轮有界等待毫秒；`null` = 未配置 ⇒ 交下游 `DEFAULT_TURN_TIMEOUT_MS`。 */
   readonly turnTimeoutMs: number | null;
+  /**
+   * 已发版版本号清单（REQ-v0.9.2 N1）：**「已发版」事实源**，板前台版本锁的判据
+   * （`version-status.isVersionLocked` trim 后精确匹配）。缺省 = `[]`（未登记 ⇒ 无锁）。
+   */
+  readonly releasedVersions: readonly string[];
 }
 
 /** 缺省配置文件落点：`<board>/config/config.json`（源码与 `dist/` 运行都落到同一处）。 */
@@ -84,6 +89,34 @@ function optString(raw: Record<string, unknown>, key: string): string | null {
   }
   const t = v.trim();
   return t === "" ? null : t;
+}
+
+/**
+ * 可选字符串数组键（REQ-v0.9.2 N1 `releasedVersions`）：未配置（键缺失 / null）⇒ `[]`；
+ * 非数组 / 元素非字符串 / 元素 trim 后空串 ⇒ `[config] <字段>` fail-fast；
+ * 元素统一 trim 并按 trim 后值去重（保序，先到先得）。
+ */
+function optStringArray(raw: Record<string, unknown>, key: string, remedy: string): string[] {
+  const v = raw[key];
+  if (v === undefined || v === null) return [];
+  if (!Array.isArray(v)) {
+    throw configError(key, `必须是字符串数组（收到 ${JSON.stringify(v)}）`, remedy);
+  }
+  const seen = new Set<string>();
+  const out: string[] = [];
+  for (const [i, el] of (v as unknown[]).entries()) {
+    if (typeof el !== "string") {
+      throw configError(`${key}[${i}]`, `元素必须是字符串（收到 ${JSON.stringify(el)}）`, remedy);
+    }
+    const t = el.trim();
+    if (t === "") {
+      throw configError(`${key}[${i}]`, "元素不能是空串/纯空白（空版本号不参与锁）", remedy);
+    }
+    if (seen.has(t)) continue;
+    seen.add(t);
+    out.push(t);
+  }
+  return out;
 }
 
 function requireUrl(raw: string, key: string): string {
@@ -145,7 +178,13 @@ export function validateConfig(parsed: unknown, sourcePath: string): BoardConfig
     turnTimeoutMs = v;
   }
 
-  return { sourcePath, port, host, orgsDir, group, hostKind, bridgeUrl, mcpBaseUrl, machineDist, repoRoot, turnTimeoutMs };
+  const releasedVersions = optStringArray(
+    raw,
+    "releasedVersions",
+    '改成如 ["v0.9.0","v0.9.1"] 的字符串数组，或整键删除（缺省 = 空 = 无锁版）',
+  );
+
+  return { sourcePath, port, host, orgsDir, group, hostKind, bridgeUrl, mcpBaseUrl, machineDist, repoRoot, turnTimeoutMs, releasedVersions };
 }
 
 /**

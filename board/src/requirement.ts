@@ -1,29 +1,31 @@
 /**
- * 板对编排桥 MCP 面的**唯一写封装**（v0.9.0 B9）—— 只暴露 {@link createRequirement}。
+ * 板对编排桥 MCP 面的**建需求写封装**（v0.9.0 B9）—— 只暴露 {@link createRequirement}。
  *
  * **为什么只有 create**：板是「人的入口」，需求即 Feature（§2.2-3）。板建一条需求 =
- * 以**组身份**调 `a2a_feature_create`，落初态 `waiting_approval`。板**不写状态机** ——
- * 审批门放行（approve）/ 主链推进（advance）/ 终止（cancel）全归编排 agent，本模块
- * 机制上不提供这些路径（仅 create 一个调用点，`test/requirement.test.mjs` 以源码扫描坐实）。
+ * 以**组身份**调 `a2a_feature_create`，落初态 `waiting_approval`。板**不写状态机迁移** ——
+ * 审批门放行（approve）/ 终止（cancel）/ 主链推进（advance 到非当前态）全归编排 agent，本模块
+ * 机制上不提供这些路径。唯一放开的登记字段写（`version` 排期写，经 advance「`to` = 当前态」特例）
+ * 在**并列的第二个 MCP 写封装** `feature-schedule.ts`，不在本文件（`test/requirement.test.mjs`
+ * 以源码扫描坐实：create 命中集 == {requirement.ts}、approve/cancel 零命中、advance 命中集 == {feature-schedule.ts}）。
  *
  * **两种 `waiting_approval` 不再歧义的机制**：板建的需求**显式**传 `stage = 需求分析` +
  * `approval = 未发起`（与既有 12 处调用的唯一行为区别 —— 那些走缺省 `stage = 改造方案` /
  * `approval = 待审批`）。缺省值由桥给出，故「提前批准一个方案未定的需求」在机制上不可能。
  *
- * **选型：自写最小 JSON-RPC over Streamable-HTTP，不引官方 SDK**。理由 —— ① 桥的 MCP 面
- * **无状态**（每请求新建 server/transport、响应无 `Mcp-Session-Id`），官方 SDK 的
- * `StreamableHTTPClientTransport` 会走 `initialize` 握手并期待 session 语义，对本端点是多余；
- * ② 本模块只需一次 `tools/call`，裸 POST + JSON.parse 即足；③ 保持板**零运行时依赖**
- * （见 package.json，当前仅 devDependencies）。
+ * **N5 起分层**：通用 MCP 客户端能力（端点组装 / tools/call 请求体 / 信封解析 / 一次
+ * 调用的 fetch 链路）在 `mcp-client.ts`；本文件只保留 `a2a_feature_create` 的**入参口径**
+ * 与**结果归一**（`RequirementCreated` 的 featureId/stage/... 抽取），同名导出为委托
+ * 薄包装以保持既有 import 面与返回契约（`a2a_feature_create` 字面量仍收敛于本文件 =
+ * 纪律扫描锚点）。
  *
  * **组身份是参数、绝不硬编码**：身份由连接 URL 决定（`/<组名>/mcp`，S1 身份链），
  * 故 {@link CreateRequirementOptions.group} 必填、`null` 身份不可用（空组名直接抛错）。
  * BD11 起该值的**主来源是提需求表单**（用户在前台创建/指定组织），板级配置仅作表单留空时的默认；
  * 无论来自哪，到本模块都必须是**已定且非空**的显式组名 —— 缺失的判定在写面请求期（400），不在这里猜。
- *
- * 网络与解析**分离**：`build*` / `parse*` 为纯函数（不依赖桥在跑即单测）；
- * {@link createRequirement} 负责 fetch + 委派解析。桥返回的业务错误码**结构化透传、不吞**。
  */
+
+import * as mcpClient from "./mcp-client.js";
+import { callTool, McpConfigError } from "./mcp-client.js";
 
 /** 桥 MCP 端点缺省基址（8787 = 编排桥 streamable-HTTP 面；只读运维视图另在 3300）。 */
 export const DEFAULT_MCP_BASE_URL = "http://127.0.0.1:8787";
@@ -38,7 +40,7 @@ export const FEATURE_CREATE_TOOL = "a2a_feature_create";
 export interface CreateRequirementInput {
   /** Feature 标题（需求的简短摘要）—— 桥侧必填。 */
   title: string;
-  /** 版本号（需求登记要带版本，如 `v0.9.0`）—— 由调用方给出。 */
+  /** 版本号（如 `v0.9.0`）—— 由调用方给出；v0.9.2 M6 起可留空（= 未排期），本封装发送前 `trim()`。 */
   version: string;
   /** 需求原文（可选）。 */
   requirement?: string;
@@ -85,33 +87,32 @@ export class RequirementConfigError extends Error {
 }
 
 // ---------------------------------------------------------------------------
-// 纯函数（无 I/O；单测目标）
+// 纯函数（无 I/O；单测目标）—— create 专属入参口径与结果归一
+// 通用客户端能力在 mcp-client.ts（端点组装 / tools/call 请求体 / 信封解析 / callTool）；
+// 本文件的同名导出是 create 口径薄包装（工具名固定、返回归一为 create 结果），
+// 保持既有 import 面与返回契约不变。
 // ---------------------------------------------------------------------------
-
-function isRecord(v: unknown): v is Record<string, unknown> {
-  return typeof v === "object" && v !== null && !Array.isArray(v);
-}
 
 function str(v: unknown): string | null {
   return typeof v === "string" ? v : null;
 }
 
-/** 归一 MCP 基址（去尾部斜杠）。 */
+/** 归一 MCP 基址（去尾部斜杠）—— 委托 mcp-client.ts。 */
 export function normalizeMcpBaseUrl(baseUrl: string): string {
-  return baseUrl.replace(/\/+$/, "");
+  return mcpClient.normalizeMcpBaseUrl(baseUrl);
 }
 
 /**
- * 组装 MCP 端点 URL：`<base>/<组名>/mcp`。组名**必须显式非空**（`null` 身份不可用），
- * 且经 `encodeURIComponent` 安全编码进路径首段。
+ * 组装 MCP 端点 URL（`<base>/<组名>/mcp`）—— 委托 mcp-client.ts；
+ * 空组名（null 身份）在写面边界仍以 RequirementConfigError 语义抛出（同 name、同消息）。
  */
 export function buildMcpEndpoint(baseUrl: string, group: string): string {
-  const g = group.trim();
-  if (g === "") {
-    throw new RequirementConfigError("组身份（group）缺失：板必须以显式组名连接 MCP，null 身份不可用");
+  try {
+    return mcpClient.buildMcpEndpoint(baseUrl, group);
+  } catch (err) {
+    if (err instanceof McpConfigError) throw new RequirementConfigError(err.message);
+    throw err;
   }
-  const base = normalizeMcpBaseUrl(baseUrl);
-  return `${base}/${encodeURIComponent(g)}/mcp`;
 }
 
 /**
@@ -125,7 +126,8 @@ export function buildFeatureCreateArgs(input: CreateRequirementInput): Record<st
   }
   const args: Record<string, unknown> = {
     title,
-    version: input.version,
+    // M6 起 version 可留空（未排期）；发送前 trim —— orch 无 trim，空白串会「自成一列」。
+    version: input.version.trim(),
     stage: REQUIREMENT_STAGE,
     approval: REQUIREMENT_APPROVAL,
   };
@@ -134,87 +136,36 @@ export function buildFeatureCreateArgs(input: CreateRequirementInput): Record<st
   return args;
 }
 
-/** 组装 JSON-RPC `tools/call` 请求体。 */
+/**
+ * 组装 JSON-RPC `tools/call` 请求体（通用实现在 mcp-client.ts，
+ * 此处固定为 `a2a_feature_create` 的写面口径，签名与既有调用/断言一致）。
+ */
 export function buildToolsCallRequest(args: Record<string, unknown>, id = 1): unknown {
-  return {
-    jsonrpc: "2.0",
-    id,
-    method: "tools/call",
-    params: { name: FEATURE_CREATE_TOOL, arguments: args },
-  };
-}
-
-/** 从 `result.content[]` 抽出全部 text 块并拼接。 */
-function textOfContent(content: unknown): string {
-  if (!Array.isArray(content)) return "";
-  return content
-    .filter((b): b is Record<string, unknown> => isRecord(b) && b.type === "text")
-    .map((b) => (typeof b.text === "string" ? b.text : ""))
-    .join("\n");
+  return mcpClient.buildToolsCallRequest(FEATURE_CREATE_TOOL, args, id);
 }
 
 /**
- * 解析桥的 tools/call 响应为归一结果（纯函数，供断言③「结构化透传」）。三层信封：
- * - JSON-RPC 层 `error` → `jsonrpc_<code>`；
- * - `result.content[].text` 内是桥 handler 的 JSON（`{ok:true,...}` / `{ok:false,code,error}`）；
- * - 非 JSON 文本（如 `MCP error -32602: Input validation error`）→ `protocol_error` 承载原文。
+ * 解析桥的 tools/call 响应并归一为 create 结果（纯函数，供断言③「结构化透传」）：
+ * 通用信封解析在 mcp-client.ts，此处叠加 create 归一（成功负载缺 featureId →
+ * `response_invalid`；失败原样透传 code/error）。
  */
 export function parseToolCallEnvelope(json: unknown): CreateRequirementOutcome {
-  if (!isRecord(json)) {
-    return { ok: false, code: "response_invalid", error: "桥响应不是 JSON 对象" };
-  }
+  return normalizeCreateOutcome(mcpClient.parseToolCallEnvelope(json));
+}
 
-  const rpcError = json.error;
-  if (isRecord(rpcError)) {
-    const code = typeof rpcError.code === "number" ? `jsonrpc_${rpcError.code}` : "jsonrpc_error";
-    return { ok: false, code, error: str(rpcError.message) ?? "JSON-RPC 错误" };
-  }
-
-  const result = json.result;
-  if (!isRecord(result)) {
-    return { ok: false, code: "response_invalid", error: "桥响应缺 result" };
-  }
-
-  const text = textOfContent(result.content);
-  let payload: unknown;
-  try {
-    payload = JSON.parse(text) as unknown;
-  } catch {
-    payload = undefined;
-  }
-
-  if (isRecord(payload) && payload.ok === true) {
-    const featureId = str(payload.featureId);
-    if (featureId === null) {
-      return { ok: false, code: "response_invalid", error: "create 成功但缺 featureId" };
-    }
-    return {
-      ok: true,
-      featureId,
-      state: str(payload.state),
-      stage: str(payload.stage),
-      version: str(payload.version),
-      approval: str(payload.approval),
-    };
-  }
-
-  if (isRecord(payload) && payload.ok === false) {
-    // 结构化透传桥的错误码与说明（不吞、不改写）。
-    return {
-      ok: false,
-      code: str(payload.code) ?? "unknown",
-      error: str(payload.error) ?? "桥返回失败",
-    };
-  }
-
-  // content 非约定 JSON（协议级校验错误等）：以 isError / 原文兜底，仍结构化返回。
-  if (text.trim() === "") {
-    return { ok: false, code: "response_invalid", error: "桥 result.content 无文本负载" };
+function normalizeCreateOutcome(outcome: mcpClient.ToolCallOutcome): CreateRequirementOutcome {
+  if (!outcome.ok) return { ok: false, code: outcome.code, error: outcome.error };
+  const featureId = str(outcome.payload.featureId);
+  if (featureId === null) {
+    return { ok: false, code: "response_invalid", error: "create 成功但缺 featureId" };
   }
   return {
-    ok: false,
-    code: result.isError === true ? "protocol_error" : "response_invalid",
-    error: text,
+    ok: true,
+    featureId,
+    state: str(outcome.payload.state),
+    stage: str(outcome.payload.stage),
+    version: str(outcome.payload.version),
+    approval: str(outcome.payload.approval),
   };
 }
 
@@ -231,36 +182,23 @@ export async function createRequirement(
   input: CreateRequirementInput,
   options: CreateRequirementOptions,
 ): Promise<CreateRequirementOutcome> {
-  const url = buildMcpEndpoint(options.baseUrl ?? DEFAULT_MCP_BASE_URL, options.group);
-  const body = buildToolsCallRequest(buildFeatureCreateArgs(input));
-  const fetchImpl = options.fetchImpl ?? globalThis.fetch;
-  if (typeof fetchImpl !== "function") {
-    return { ok: false, code: "no_fetch", error: "运行环境无 fetch 实现" };
-  }
-
-  let res: Response;
+  // 前置校验顺序与重构前一致：先组身份（端点组装）、后标题（入参组装），均先于网络。
   try {
-    res = await fetchImpl(url, {
-      method: "POST",
-      signal: AbortSignal.timeout(options.timeoutMs ?? 10_000),
-      headers: {
-        "content-type": "application/json",
-        accept: "application/json, text/event-stream",
-      },
-      body: JSON.stringify(body),
-    });
+    mcpClient.buildMcpEndpoint(options.baseUrl ?? DEFAULT_MCP_BASE_URL, options.group);
   } catch (err) {
-    // 传输层异常：如实结构化上报，不吞成「成功」。
-    return { ok: false, code: "transport_error", error: err instanceof Error ? err.message : String(err) };
+    if (err instanceof McpConfigError) throw new RequirementConfigError(err.message);
+    throw err;
   }
-
-  const raw = await res.text();
-  if (!res.ok) {
-    return { ok: false, code: `http_${res.status}`, error: `桥返回 HTTP ${res.status}：${raw.slice(0, 200)}` };
-  }
-  try {
-    return parseToolCallEnvelope(JSON.parse(raw) as unknown);
-  } catch {
-    return { ok: false, code: "response_invalid", error: `桥响应不是合法 JSON：${raw.slice(0, 200)}` };
-  }
+  const args = buildFeatureCreateArgs(input);
+  const outcome = await callTool(
+    options.baseUrl ?? DEFAULT_MCP_BASE_URL,
+    options.group,
+    FEATURE_CREATE_TOOL,
+    args,
+    { fetchImpl: options.fetchImpl, timeoutMs: options.timeoutMs },
+  ).catch((err: unknown) => {
+    if (err instanceof McpConfigError) throw new RequirementConfigError(err.message);
+    throw err;
+  });
+  return normalizeCreateOutcome(outcome);
 }

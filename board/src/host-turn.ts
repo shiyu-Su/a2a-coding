@@ -20,7 +20,8 @@
  * - **不做进程管理**：起 / 停 / 探活 / 空闲回收复用 BD4a 的出口，经 {@link BridgeGateway} 接线
  *   （缺省实现 {@link createHostBridgeGateway}）；在飞轮数喂回 `beginRound/endRound`
  *   ⇒ BD4a 的「有在飞 ⇒ 不回收」判据自动成立；
- * - **不写引擎状态机**：不调 `approve` / `advance` / `cancel`，也不经 MCP 写 `features`；
+ * - **不写引擎状态机迁移**：不调 `approve` / `cancel`，也不把主链 `advance` 到非当前态、不经 MCP 写 `features`；
+ *   （`version` 排期写是 advance「`to` = 当前态」的登记字段特例，唯一落点在 `feature-schedule.ts`，不在本模块）
  *   终态 + 摘要只落**板侧台账**；
  * - **不走 Launcher**：端点 = 板自己 spawn 的桥端口 `http://127.0.0.1:<port>/a2a/jsonrpc`；
  * - **等待有界**：轮询受 `turnTimeoutMs` 约束；到点先发 `tasks/cancel`（防后端那一轮继续烧），
