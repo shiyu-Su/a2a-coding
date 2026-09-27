@@ -3,9 +3,11 @@
  *
  * 路由：
  * - `GET /health`          —— 板自身健康（保留 BD1 行为）；
- * - `GET /`                —— **排期看板首页**（REQ-v0.9.2 增补 ④ N1：与 `/schedule` 同 kind 同渲染、逐字节同构）；
- * - `GET /requirements`    —— **需求列表页**（增补 ④ N1 起自旧 `/` 迁入；与下 `POST /requirements` **同路径双义**
- *   —— 方法门先于路由匹配：GET ⇒ 列表页，POST ⇒ 建需求）：桥 `/api/features`，含板内存过滤 + 提需求表单；
+ * - `GET /`                —— **排期看板首页**（REQ-v0.9.2 增补 ④ N1：与 `/schedule` 同 kind 同渲染、逐字节同构；
+ *   **REQ-2026-09-26-04 Q1**：页头「＋ 新增需求」按钮 + `<dialog id="new-req-dialog">` 提需求表单弹窗
+ *   —— 表单 = `renderRequirementForm` 原样复用，提交经白名单内联脚本同源 fetch `POST /requirements`）；
+ * - `GET /requirements`    —— **303 重定向回 `/`**（REQ-2026-09-26-04 Q2：需求列表页退役，旧地址深链兼容；
+ *   与下 `POST /requirements` **同路径双义已终结** —— GET 恒重定向、不触桥，POST 仍建需求）；
  * - `GET /schedule`        —— **`/` 的别名**（历史深链兼容）：以下描述即首页看板内容
  *   （v0.9.2 M4/M5，只读）：数据 = 列表 `getFeatures()` 复用，
  *   板内存按 `version` 归组（M1 `version-order.ts` 数值序，非 `x.y.z` 字典序垫底）；列头 = 版本号 +
@@ -29,10 +31,20 @@
  *   ∪ 板托管台账 ∪ 板级默认 ∪ 需求归属 四源归并；逐组织以**组身份**只读 MCP 查 `a2a_projects`
  *   （并发 + 单组超时，失败/超时标「不可达」灰化不炸页）；需求按 `ownerGroup` 归组，
  *   null 归属归「（无归属）」伪分组如实呈现。零写、零缓存、零新增存储；
+ * - `GET /agents`          —— **Agent View（机器与在飞）**（REQ-2026-09-26-02 B-T3，只读）：
+ *   ① 机器表 = 桥 `/api/projects` 的 `runners` ∪ `machines` 归并（online/lastHeartbeatAt，无 runner 登记 ⇒ 未知）；
+ *   ② 在飞任务区 = **逐 project 并发** `GET /api/tasks`（照 N6 模式：单项超时 `AGENT_QUERY_TIMEOUT_MS`、
+ *   失败该项目灰化「不可达 ≠ 没有在飞」不炸页），按 `claimedAt` 升序、缺键沉底；
+ *   ③ 页头 = **3300 页面退役后桥 identity/version 的唯一承载位**（`GET <mcpBaseUrl>/health` 的
+ *   status/role/pid/startedAt/version，逐键容错、来源如实标注）；
+ *   ④ 页脚口径行 = `AGENT_VIEW_CALIBRATION_NOTE`（闸内排队 orch 不可见、两个时钟不得相加）。
+ *   零写、零缓存、零新增存储；
  * - `GET /host`            —— **宿主桥状态页**（本板进程托管的桥：五态 + 结构化错误 + 轮队列）；
  * - `POST /requirements`            —— 提需求（BD7 接线 · BD11 组织名进表单 · v0.9.2 M6 `version` 去必填，留空 = 未排期 ·
  *   **v0.9.2 增补 ⑤ N2**：`form.version` 命中 config `releasedVersions`（已发版锁版）⇒ **409 `board_version_released`**
  *   零出网 + 表单字段回填；空 version（未排期）不参与锁判）；
+ *   **REQ-2026-09-26-04 Q2 起为提需求的唯一入口**（契约不变）：表单宿主 = 首页弹窗（`NEW_REQUIREMENT_DIALOG_SCRIPT` fetch 提交），
+ *   无 JS / fetch 失效时弹窗内表单仍走原生整页 POST；成功 303 跳详情页的既有口径原样保留；
  * - `POST /features/:id/turn`       —— 触发一轮（BD8，起桥 + 发轮，**不等排队轮**；该需求已有在飞 /
  *   排队轮 ⇒ **409 `board_turn_busy`** 不重复入队 —— 收口轨 14 服务端防重，confirm / answer 同；
  *   需求已入**引擎终态** ⇒ **409 `board_feature_terminal`** 直接拒单不烧轮 —— 收口轨 16 ③，三入口同）；
@@ -44,6 +56,10 @@
  *   `to` = 先 `getFeature` 取当前态再经 `feature-schedule.ts` 封装走 advance「`to` = 当前态」特例；
  *   **已发版锁（v0.9.2 增补 ⑤ N3）**：现版本 ∉ 锁版 ∧ 目标 ∈ 锁版（入锁）或 现 ∈ 锁版 ∧ 目标 ≠ 现（出锁，含清空）
  *   ⇒ 409 `board_version_released` 零出网；同锁版无变化 ⇒ 幂等放行；
+ *   **双条件状态闸（v0.9.3 B-T5）**：排期改动仅 `stage=需求分析 ∧ approval=未发起`（想法挪版）可写
+ *   ⇒ 否则 409 `board_schedule_state_locked` 零出网（与已发版锁**叠加、互不替代**；同版重提两闸均豁免）；
+ *   **改版自动善后（v0.9.3 B-T6）**：version 确实改动 ∧ decisions 含 `doc/{旧版}/` 登记 ⇒ 服务端受限 mv
+ *   搬文档至 `doc/{新版}/` + 第二跳 advance 追加 decisions 新路径（仅源 A、仅登记路径、幂等；见 `docs-move.ts`）；
  *   读-写窗口态漂移被桥拒 ⇒ 如实弹错误浮层 + 表单值回填，**不自动重试**；
  * - `POST /shutdown`                —— **优雅停机（BD13″，仅 loopback 来源）**：200 仅代表「受理」；
  *   不经 CSRF 写面守卫（它是运维停机口，不是业务写面），来源门 = `socket.remoteAddress` 必须 loopback，
@@ -102,7 +118,9 @@ import { readVersion } from "./version.js";
 import { isVersionLocked } from "./version-status.js";
 import { normalizeVersion } from "./version-order.js";
 import { defaultRepoRoot, readDoc, type DocsSource } from "./docs-read.js";
-import { defaultStaticRoot, findVendoredAsset, VENDORED_ASSETS } from "./docs-render.js";
+import { docsMoveRegistrations, executeDocsMove, planDocsMove, type DocsMoveResult } from "./docs-move.js";
+import { defaultStaticRoot, findVendoredAsset, VENDORED_ASSETS, MERMAID_ASSET, mermaidAssetScriptTag, mermaidRenderScript, vendoredAssetExists } from "./docs-render.js";
+import { renderDependencyGraphSection } from "./graph-view.js";
 import {
   NO_OWNER_GROUP_LABEL,
   createOrgProjectsFetcher,
@@ -112,7 +130,17 @@ import {
   type OrgProjectsFetcher,
   type OrgProjectsOutcome,
 } from "./orgs-view.js";
-import type { OrgsDirStatus, OrgsPageInput, OrgsRow } from "./web/views.js";
+import type { AgentsPageInput, OrgsDirStatus, OrgsPageInput, OrgsRow } from "./web/views.js";
+import { deriveScheduleGateOpen } from "./derive.js";
+import {
+  buildInflightModel,
+  buildMachineRows,
+  createAgentTasksFetcher,
+  createBridgeIdentityFetcher,
+  type AgentTasksFetcher,
+  type AgentTasksOutcome,
+  type BridgeIdentityFetcher,
+} from "./agent-view.js";
 import { timestampPrefix } from "./log.js";
 import {
   BOARD_CSP,
@@ -120,6 +148,8 @@ import {
   escapeHtml,
   renderPage,
   FEATURE_DETAIL_OVERLAY_SCRIPT,
+  NEW_REQUIREMENT_DIALOG_SCRIPT,
+  DRAG_SCHEDULE_SCRIPT,
   type ErrorOverlayField,
   type ErrorOverlayParams,
   type NavKey,
@@ -127,23 +157,20 @@ import {
 import {
   BRIDGE_UNREACHABLE_CODE,
   VIEW_NOTES,
-  applyFeaturesFilter,
   errorFamilyLabel,
-  featuresFilterActive,
   groupFeaturesByVersion,
-  parseFeaturesFilter,
   renderAcceptanceSection,
+  renderAgentsPage,
   renderAnswerForm,
   renderConfirmForm,
-  renderFeaturesList,
   renderFeatureDetail,
   renderHostNotice,
   renderHostPage,
+  renderNewRequirementDialog,
   renderNextStepGuide,
   renderOrgsPage,
   renderProjects,
   renderDocPage,
-  renderRequirementForm,
   renderSchedule,
   renderTasks,
   renderTasksPick,
@@ -221,6 +248,18 @@ export interface CreateBoardServerOptions {
    * `null` ⇒ 不查询，页面项目列如实显示「未查询」（不编造数据）。
    */
   orgProjectsFetcher?: OrgProjectsFetcher | null;
+  /**
+   * **Agent View 页的逐项目在飞任务查询器**（v0.9.3 B-T3）：只读桥单查 `GET /api/tasks?project=…`
+   * （并发 + 单项超时，失败该项目灰化）。缺省 = 按板侧桥客户端同基址真查；测试注入假桥。
+   * `null` ⇒ 不查询，全部项目按「不可达」灰化（如实降级，不编造「没有在飞」）。
+   */
+  agentTasksFetcher?: AgentTasksFetcher | null;
+  /**
+   * **Agent View 页头桥身份查询器**（v0.9.3 B-T3 · G3 收编）：只读 `GET <mcpBaseUrl>/health`
+   * 取 role / pid / startedAt / version（3300 页面退役后的唯一承载位）。缺省 = 按写面同基址真查；
+   * 测试注入假端点。`null` ⇒ 不查询，页头如实标「未查询」（不编造身份）。
+   */
+  bridgeIdentityFetcher?: BridgeIdentityFetcher | null;
   /**
    * **已发版版本清单**（REQ-v0.9.2 增补 ⑤ N1/N2）：= config `releasedVersions` 的注入通道。
    * 缺省 `[]`（未登记 ⇒ 无锁）。**锁判据唯一走 `version-status.isVersionLocked`**（trim 后精确串匹配）；
@@ -330,6 +369,10 @@ interface Ctx extends PageCtx {
   docs: { repoRoot: string; orgsDir: string | null; staticRoot: string };
   /** N6 组织视角页的逐组项目查询器（`null` ⇒ 不查询，页面如实显示「未查询」）。 */
   orgProjects: OrgProjectsFetcher | null;
+  /** B-T3 Agent View 页的逐项目在飞任务查询器（`null` ⇒ 不查询，项目全灰化）。 */
+  agentTasks: AgentTasksFetcher | null;
+  /** B-T3 Agent View 页头桥身份查询器（`null` ⇒ 不查询，页头如实标「未查询」）。 */
+  bridgeIdentity: BridgeIdentityFetcher | null;
   /** 增补 ⑤ N2：已发版版本清单（config `releasedVersions` 注入；`[]` ⇒ 无锁）。锁判执法只走 `isVersionLocked`。 */
   releasedVersions: readonly string[];
 }
@@ -339,6 +382,8 @@ interface Page {
   active: NavKey;
   bodyHtml: string;
   status?: number;
+  /** 页头动作区（随标题渲染的字面量按钮；REQ-2026-09-26-04 首页「＋ 新增需求」）。 */
+  headerActions?: string;
   /** 表单档错误浮层（errorPage 专用；renderPage 内逐字段转义）。 */
   errorOverlay?: ErrorOverlayParams;
   /** BD14：页面级追加脚本（仅白名单字面量，如 mermaid 资产引用 + 渲染脚本；不承载文档内容）。 */
@@ -354,6 +399,7 @@ function sendPage(res: ServerResponse, page: Page): void {
       active: page.active,
       bodyHtml: page.bodyHtml + (page.extraScripts ?? ""),
       notes: VIEW_NOTES,
+      headerActions: page.headerActions,
       errorOverlay: page.errorOverlay,
     }),
   );
@@ -412,9 +458,9 @@ function respondError(
 /**
  * 桥不可达整页（REQ-v0.9.2 N2）：改走 {@link errorPage} ⇒ 与其它结构化错误同一 BD2 浮层版式
  * （标题 = 族名「桥不可达」、正文 = 错误消息、mono = `bridge_unreachable`、「知道了」）。
- * 原「刷新重试」口径保留为 hint；`active` 随发起页，保证导航高亮不跳。
+ * 原「刷新重试」口径保留为 hint；`active` 随发起页，保证导航高亮不跳（首页/排期缺省「排期」）。
  */
-function bridgeDownPage(hint: string, err: unknown, active: NavKey = "features"): Page {
+function bridgeDownPage(hint: string, err: unknown, active: NavKey = "schedule"): Page {
   return errorPage(
     502,
     BRIDGE_UNREACHABLE_CODE,
@@ -438,39 +484,41 @@ function orgsStatusOf(host: BoardHostFace | null): OrgsDirStatus {
   return { tier: "ready", orgsDir: configured };
 }
 
-async function pageFeatures(ctx: Ctx, params: URLSearchParams): Promise<Page> {
-  const view = await ctx.client.getFeatures();
-  // REQ-v0.9.2 N4：桥 `/api/features` 无过滤参数 ⇒ query 条件在**板内存**过滤（不发无意义 query）；
-  // 全量拉取量不变，仅渲染收敛（分页不做 = planlog 遗留）。
-  const filter = parseFeaturesFilter(params);
-  const active = featuresFilterActive(filter);
-  const shown = active ? { ...view, features: applyFeaturesFilter(view.features, filter) } : view;
-  return {
-    title: "需求列表",
-    active: "features",
-    bodyHtml:
-      renderRequirementForm(ctx.write.defaultGroup, orgsStatusOf(ctx.host), ctx.releasedVersions) +
-      renderFeaturesList(shown, filter, active ? view.features.length : null),
-  };
-}
-
 /**
- * 排期看板页（v0.9.2 M4 + M5 需求池）：数据 = 列表 `getFeatures()` 复用（零新桥接口），
- * 板内存按 version 归组；未排期卡不占版本列，集中本页末列「需求池」（判据单一 = `trim() === ""`）。
+ * 排期看板页（v0.9.2 M4 + M5 需求池；REQ-2026-09-26-04 Q1 起另承载「＋ 新增需求」弹窗）：
+ * 数据 = `getFeatures()` 复用（零新桥接口），板内存按 version 归组；
+ * 未排期卡不占版本列，集中末列「需求池」（判据单一 = `trim() === ""`）。
+ * 弹窗 = 页头按钮 + dialog 骨架（表单复用 `renderRequirementForm`）+ 白名单内联脚本；
+ * GET /requirements 列表页已退役（Q2：303 回本页）。
  */
 async function pageSchedule(ctx: Ctx): Promise<Page> {
   const view = await ctx.client.getFeatures();
   return {
     title: "排期看板",
     active: "schedule",
-    bodyHtml: renderSchedule(
-      groupFeaturesByVersion(view.features),
-      selectRequirementPool(view.features),
-      ctx.releasedVersions,
-    ),
+    headerActions:
+      '<button type="button" id="new-req-open" class="header-actions">＋ 新增需求</button>',
+    bodyHtml:
+      renderSchedule(
+        groupFeaturesByVersion(view.features),
+        selectRequirementPool(view.features),
+        ctx.releasedVersions,
+      ) +
+      // 提需求弹窗骨架（表单原样复用；orgsDir 三档提示与锁版警示随表单呈现）
+      renderNewRequirementDialog(ctx.write.defaultGroup, orgsStatusOf(ctx.host), ctx.releasedVersions),
     // REQ-v0.9.2 增补 ④：详情浮层脚本随本页（= schedule kind，`/` 与 `/schedule` 同一通路）注入，
     // 单点常量；其它 kind 无 dialog 骨架，脚本自身空转 ⇒ 不注入。卡片 <a> 回退不依赖它。
-    extraScripts: FEATURE_DETAIL_OVERLAY_SCRIPT,
+    // REQ-2026-09-26-04 Q1：新增需求弹窗脚本同页、同 extraScripts 通路注入（两枚各管各的 dialog）。
+    // v0.9.3 B-T5：排期拖拽脚本同页、同通路（第三枚，常量分立不可共置；无 #schedule-board 的页面自然空转）。
+    // v0.9.3 增补 ②：浮层换入的详情页依赖图/文档 mermaid 不经脚本执行（搬运节点不跑 `<script>`）⇒
+    // 本页同挂 vendored 库 + 渲染脚本，浮层经 window.a2aRenderMermaid 钩子补渲（缺资产 ⇒ 不挂，源文本降级）。
+    extraScripts:
+      FEATURE_DETAIL_OVERLAY_SCRIPT +
+      NEW_REQUIREMENT_DIALOG_SCRIPT +
+      DRAG_SCHEDULE_SCRIPT +
+      (vendoredAssetExists(ctx.docs.staticRoot, MERMAID_ASSET.file)
+        ? mermaidAssetScriptTag() + mermaidRenderScript()
+        : ""),
   };
 }
 
@@ -509,16 +557,26 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
   });
   const turnProgress = renderTurnProgress(deriveTurnProgress(busy, queuePosition));
   const answerForm = awaiting === null ? "" : renderAnswerForm(f.featureId, awaiting.question);
+  // T2 依赖图：mermaid 源经 application/json 数据通道注入（非可执行脚本、不入 n3 闭集）；
+  // 渲染脚本只在区块存在且 vendored 资产在盘时挂（缺资产 ⇒ 源文本降级可见，不 404 静默）。
+  const graph = renderDependencyGraphSection(detail.tasks);
+  const extraScripts =
+    graph.needsMermaid && vendoredAssetExists(ctx.docs.staticRoot, MERMAID_ASSET.file)
+      ? mermaidAssetScriptTag() + mermaidRenderScript()
+      : "";
   return {
     title: `需求 ${featureId.slice(0, 8)}`,
     active: "features",
     bodyHtml:
       renderFeatureDetail(detail, trace, traceError, ctx.now(), true, ctx.releasedVersions) +
+      graph.html +
+      "\n" +
       nextStep +
       renderAcceptanceSection(detail.acceptance) +
       turnProgress +
       hostForms +
       answerForm,
+    extraScripts,
   };
 }
 
@@ -732,6 +790,52 @@ async function pageOrgs(ctx: Ctx): Promise<Page> {
   return { title: "组织视角", active: "orgs", bodyHtml: renderOrgsPage(input) };
 }
 
+/**
+ * `GET /agents` Agent View 页（v0.9.3 B-T3 · 只读）：
+ * 机器表 = `/api/projects` 的 `runners` ∪ `machines` 归并；在飞任务区 = **逐 project 并发**
+ * `GET /api/tasks`（照 N6 模式：单项超时、失败该项目灰化「不可达 ≠ 没有在飞」，**不炸页**）；
+ * 页头 = 3300 页面退役后桥 identity/version 的唯一承载位（`GET <mcpBaseUrl>/health`，取不到 ⇒ 灰化）。
+ * 零写、零缓存、零新增存储。
+ */
+async function pageAgents(ctx: Ctx): Promise<Page> {
+  const view = await ctx.client.getProjects();
+  const projectIds = [...new Set(view.machines.flatMap((m) => m.projects.map((p) => p.projectId)))];
+  const settled = await Promise.all(
+    projectIds.map(async (projectId): Promise<AgentTasksOutcome> =>
+      ctx.agentTasks === null
+        ? { ok: false, code: "agent_tasks_not_queried", error: "在飞任务查询器未装配" }
+        : ctx.agentTasks(projectId).catch((err: unknown): AgentTasksOutcome => ({
+            ok: false,
+            code: "tasks_query_failed",
+            error: err instanceof Error ? err.message : String(err),
+          })),
+    ),
+  );
+  const tasks = new Map<string, AgentTasksOutcome>();
+  projectIds.forEach((projectId, i) => {
+    if (!tasks.has(projectId)) tasks.set(projectId, settled[i] as AgentTasksOutcome);
+  });
+  let identity: AgentsPageInput["identity"] = null;
+  if (ctx.bridgeIdentity !== null) {
+    try {
+      identity = await ctx.bridgeIdentity();
+    } catch (err) {
+      identity = { ok: false, code: "health_query_failed", error: err instanceof Error ? err.message : String(err) };
+    }
+  }
+  const input: AgentsPageInput = {
+    identity,
+    identitySource: ctx.write.mcpBaseUrl,
+    machineRows: buildMachineRows(view),
+    inflight: buildInflightModel(view, tasks),
+    observedAt: view.observedAt,
+    ...(ctx.agentTasks === null
+      ? { queryDisabledNote: "逐项目在飞任务查询器未装配 ⇒ 本页不查询任何项目的在飞任务（全部项目标为不可达）。" }
+      : {}),
+  };
+  return { title: "Agent View", active: "agents", bodyHtml: renderAgentsPage(input) };
+}
+
 export function createBoardServer(options: CreateBoardServerOptions): Promise<BoardServerHandle> {
   assertLoopbackHost(options.host);
   const ctx: Ctx = {
@@ -754,6 +858,14 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
       options.orgProjectsFetcher === undefined
         ? createOrgProjectsFetcher({ baseUrl: options.mcpBaseUrl ?? DEFAULT_MCP_BASE_URL })
         : options.orgProjectsFetcher,
+    agentTasks:
+      options.agentTasksFetcher === undefined
+        ? createAgentTasksFetcher(options.client ?? createBridgeClient(options.bridge ?? {}))
+        : options.agentTasksFetcher,
+    bridgeIdentity:
+      options.bridgeIdentityFetcher === undefined
+        ? createBridgeIdentityFetcher({ baseUrl: options.mcpBaseUrl ?? DEFAULT_MCP_BASE_URL })
+        : options.bridgeIdentityFetcher,
     releasedVersions: options.releasedVersions ?? [],
   };
   const server: Server = createServer((req, res) => {
@@ -811,15 +923,17 @@ const HOST_FACE_DISABLED_CODE = "host_face_disabled";
 const HOST_FACE_DISABLED_DISPLAY =
   "宿主面未装配：本板进程未接上「组织目录根」（config.json 的 orgsDir 未配置，无缺省值）⇒ 不起桥、不触发一轮";
 
-type PageRoute = { kind: "feature" | "feature-docs"; id: string } | { kind: NavKey } | null;
+type PageRoute = { kind: "feature" | "feature-docs"; id: string } | { kind: Exclude<NavKey, "features"> } | null;
 
 function matchPage(pathname: string): PageRoute {
   // REQ-v0.9.2 N1：`/` = 排期看板首页；`/schedule` 保留为别名（同 kind 同渲染，深链零红面）。
   if (pathname === "/" || pathname === "/schedule") return { kind: "schedule" };
-  if (pathname === "/requirements") return { kind: "features" };
+  // REQ-2026-09-26-04 Q2：`/requirements` 列表页退役 ⇒ 不再注册读面路由（GET 重定向在 handle 先行处理）。
   if (pathname === "/tasks") return { kind: "tasks" };
   if (pathname === "/projects") return { kind: "projects" };
   if (pathname === "/orgs") return { kind: "orgs" };
+  // REQ-2026-09-26-02 B-T3：Agent View（机器表 + 逐项目在飞任务 + 3300 收编的桥身份头）。
+  if (pathname === "/agents") return { kind: "agents" };
   if (pathname === "/host") return { kind: "host" };
   if (pathname.startsWith("/features/")) {
     const raw = pathname.slice("/features/".length);
@@ -927,6 +1041,19 @@ async function handle(
     res.end(buf);
     return;
   }
+  /**
+   * REQ-2026-09-26-04 Q2：需求列表页退役 —— `GET /requirements` 303 回首页（排期看板，弹窗承载提需求）。
+   * 先于路由匹配处理（该路径不再是读面路由）；重定向不触桥。板惯例用 303（R1 裁决：替代 301，留反悔余地）。
+   */
+  if (url.pathname === "/requirements") {
+    if (req.method === "GET") {
+      res.writeHead(303, { location: "/", "cache-control": "no-store" });
+      res.end();
+      return;
+    }
+    respondError(res, req.headers.accept, 405, "method_not_allowed", `GET /requirements 已改 303 回首页；其余方法不放开（收到 ${req.method ?? "?"} ${url.pathname}）`);
+    return;
+  }
   if (route === null) {
     respondError(res, req.headers.accept, 404, "not_found", `未知路径 ${url.pathname}`);
     return;
@@ -954,15 +1081,13 @@ async function handle(
       sendPage(res, await pageOrgs(ctx));
     } else if (route.kind === "schedule") {
       sendPage(res, await pageSchedule(ctx));
+    } else if (route.kind === "agents") {
+      sendPage(res, await pageAgents(ctx));
     } else {
-      const page =
-        route.kind === "features"
-          ? await pageFeatures(ctx, url.searchParams)
-          : await pageProjects(ctx);
-      sendPage(res, page);
+      sendPage(res, await pageProjects(ctx));
     }
   } catch (err) {
-    sendPage(res, bridgeDownPage(`目标 = ${url.pathname}`, err, route !== null ? pageActiveOf(route) : "features"));
+    sendPage(res, bridgeDownPage(`目标 = ${url.pathname}`, err, pageActiveOf(route)));
   }
 }
 
@@ -1308,6 +1433,13 @@ function scheduleLockBackfill(targetVersion: string, currentVersion: string | nu
  * - 身份 = 该 Feature 的 `ownerGroup`，**null ⇒ 结构化 503，绝不回落板级默认组**
  *   （排期改的是既有需求归属，拿板级组名出网会把写打到别的组织目录）；
  * - 读-写窗口内态漂移被桥拒（非法流转）⇒ 如实弹错误浮层 + N1 字段回填，**不自动重试**；
+ * - **双条件状态闸（v0.9.3 B-T5）**：排期改动（新 version ≠ 现 version）仅
+ *   `stage=需求分析 ∧ approval=未发起` 可写 ⇒ 409 `board_schedule_state_locked` 零出网；
+ *   stage/approval 只作读判（getFeature），不进 HTTP 载荷与 `ScheduleAdvanceInput`；
+ * - **改版自动善后（v0.9.3 B-T6）**：第一跳成功后，若 version 确实改动 ∧ decisions 含 `doc/{旧版}/`
+ *   登记 ⇒ 受限 mv（`docs-move.ts`：仅源 A 树内、仅登记路径、目标已存在 = 跳 mv 仅登记、
+ *   org 工作区路径不自动搬列入 manual）+ 第二跳 advance 追加 decisions 新路径；
+ *   善后异常不回滚已成功的排期写，回执 `docMoves` 如实列出（JSON 出参；表单档 200 JSON 直显）；
  * - 成功 = PRG 303 回详情页；`Accept: application/json` ⇒ 200 JSON。
  */
 async function handleWriteSchedule(
@@ -1342,11 +1474,17 @@ async function handleWriteSchedule(
   let to: string;
   let ownerGroup: string | null;
   let currentVersion: string | null;
+  let stage: string | null;
+  let approval: string | null;
+  let decisions: string | null;
   try {
     const detail = await ctx.client.getFeature(featureId);
     to = detail.feature.state;
     ownerGroup = detail.feature.ownerGroup;
     currentVersion = detail.feature.version;
+    stage = detail.feature.stage;
+    approval = detail.feature.approval;
+    decisions = detail.feature.decisions;
   } catch (err) {
     respondError(
       res,
@@ -1359,6 +1497,9 @@ async function handleWriteSchedule(
     );
     return;
   }
+  // ③a′ 同版判据（归一后**精确等串**，非前缀）：既是锁版幂等放行判据，也是双条件闸的豁免判据
+  //     —— 同版重提 = 零变更写，不属「排期改动」，闸/锁都不拦（幂等语义原样保留）。
+  const sameVersion = normalizeVersion(currentVersion) === normalizeVersion(form.version);
   if (ownerGroup === null || ownerGroup.trim() === "") {
     respondError(
       res,
@@ -1377,8 +1518,7 @@ async function handleWriteSchedule(
   //    清空回池 = 目标归一后空串 ⇒ 若现 ∈ 锁版即"出锁"被拒。回填带上现版本值（用户看到从哪被锁）。
   const targetLocked = isVersionLocked(form.version, ctx.releasedVersions);
   const currentLocked = isVersionLocked(currentVersion, ctx.releasedVersions);
-  // 同版判据 = 归一后**精确等串**（非前缀）：`v0.9.1-probe` 相对锁版 `v0.9.1` 算「改到别的版」⇒ 出锁拒。
-  const sameVersion = normalizeVersion(currentVersion) === normalizeVersion(form.version);
+  // 入锁判据：`v0.9.1-probe` 相对锁版 `v0.9.1` 算「改到别的版」⇒ 出锁拒（同版判据见 ③a′ 精确等串）。
   if (!currentLocked && targetLocked) {
     respondError(
       res,
@@ -1398,6 +1538,28 @@ async function handleWriteSchedule(
       409,
       "board_version_released",
       `该需求现排期版本 ${normalizeVersion(currentVersion)} 已发版 ⇒ 已发版版本的需求不可移出或取消排期（本板只锁前台写口，登记/解锁改 config.json 的 releasedVersions 后重启生效）。`,
+      undefined,
+      scheduleLockBackfill(form.version, currentVersion),
+    );
+    return;
+  }
+  // ③c 双条件状态闸（v0.9.3 B-T5 · 规范 §7 改版纪律）：排期改动仅
+  //    `stage = 需求分析 ∧ approval = 未发起`（想法挪版档）可写 ⇒ 否则 409
+  //    `board_schedule_state_locked` 零出网。stage/approval **只作读判**（来自 getFeature），
+  //    不进 ScheduleAdvanceInput / HTTP 载荷（类型层封死，feature-schedule.ts）。
+  //    与 ③b 已发版锁**叠加、互不替代**（两把锁各自独立 409，本版先判版本锁）；
+  //    同版重提（sameVersion）= 零变更 ⇒ 闸豁免（口径同锁版幂等放行）。
+  //    老桥登记字段缺失（null）⇒ fail-closed 拒写，不猜。
+  if (!sameVersion && !deriveScheduleGateOpen(stage, approval)) {
+    respondError(
+      res,
+      headers.accept,
+      409,
+      "board_schedule_state_locked",
+      `需求已确认（stage = ${stage ?? "缺失"} · approval = ${approval ?? "缺失"}）⇒ 排期锁定：需求确认单经用户确认后（stage 迁「改造方案」/ approval 过门）该需求的排期即不可在本板改动，` +
+        `仅「stage = 需求分析 ∧ approval = 未发起」的想法可改版/入池/出池（板前台执法，拖拽与表单同口）。` +
+        `如确需挪版：方案变 ⇒ 由宿主走流程（主需求 cancel 后从 Step 0 新建）；**本板不提供解除入口**（approval 单向、无回边，锁不会因拖拽解除）。` +
+        `宿主经 MCP 直写 \`version\` **不经过本闸**，由流程规范纪律句兜底。`,
       undefined,
       scheduleLockBackfill(form.version, currentVersion),
     );
@@ -1431,6 +1593,37 @@ async function handleWriteSchedule(
     );
     return;
   }
+  // ④b 改版自动善后（v0.9.3 B-T6 · 受限 mv）：version 确实改动 ∧ decisions 含 doc/{旧版}/ 登记
+  //    ⇒ 自动 mv 至 doc/{新版}/ + decisions 追加新路径（第二跳 advance，仅携带 version 回显 +
+  //    decisions，仍不触 stage/approval）。守卫与幂等口径见 docs-move.ts：
+  //    仅源 A 树内、仅登记路径、目标已存在 ⇒ 跳 mv 仅登记；org 工作区路径不自动搬、列入 manual。
+  //    mv 为服务端文件动作，不经 HTTP 写路由面；第一跳已成功 ⇒ 善后异常不回滚排期写、不裸 5xx，
+  //    moved/registerOnly/failed/manual 全部如实进回执（JSON 出参 / 表单档 JSON 直显）。
+  let docMoves: (DocsMoveResult & { rejected: string[]; notes: string[] }) | null = null;
+  if (!sameVersion) {
+    const plan = planDocsMove(decisions, form.version, ctx.docs.repoRoot);
+    if (plan.actions.length > 0 || plan.manual.length > 0 || plan.rejected.length > 0) {
+      const executed = executeDocsMove(plan);
+      docMoves = { ...executed, rejected: plan.rejected, notes: [] };
+      const registrations = docsMoveRegistrations(executed);
+      if (registrations.length > 0) {
+        let appended: ScheduleOutcome;
+        try {
+          appended = await ctx.write.scheduleFeature(
+            { featureId, to, version: form.version, decisions: registrations },
+            { group: ownerGroup, baseUrl: ctx.write.mcpBaseUrl },
+          );
+        } catch (err) {
+          appended = { ok: false, code: "schedule_request_invalid", error: errText(err) };
+        }
+        if (appended.ok) {
+          docMoves.notes.push(`decisions 已追加 ${String(registrations.length)} 条搬移后路径`);
+        } else {
+          docMoves.failed.push(`decisions 追加未成功（${appended.code}：${appended.error}）⇒ 文档已搬至新目录，请宿主手工补登记`);
+        }
+      }
+    }
+  }
   // ⑤ 回显：JSON 档 200；表单档 PRG 303 回详情页（刷新不重复写）
   if (wantsJson(headers.accept)) {
     respondJson(res, 200, {
@@ -1439,6 +1632,7 @@ async function handleWriteSchedule(
       group: ownerGroup,
       state: outcome.state,
       version: outcome.version,
+      ...(docMoves === null ? {} : { docMoves }),
     });
     return;
   }

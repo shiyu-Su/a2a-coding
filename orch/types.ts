@@ -196,6 +196,12 @@ export interface FeatureRecord {
    */
   ownerGroup: string | null;
   /**
+   * **父需求登记**（v0.9.3 O1 / parentFeatureId，落 `features.parent_feature_id`）：
+   * 增补轨挂主需求的**单值**记录（只透不解析：不递归父链、不判环、无派生语义）。
+   * `null` = 无父（合法缺省，存量行不回填）。
+   */
+  parentFeatureId: string | null;
+  /**
    * **阶段登记**（v0.9.0 B1″ / B2″，落 `features.stage`）：值域见 {@link FEATURE_STAGES}。
    *
    * 类型**非空**是读侧单点归一的结论：`NULL`（存量行 / 未带值建行）一律按
@@ -229,6 +235,11 @@ export interface FeatureCreateInput {
    * （未配组环境的匿名入口）。落 `features.owner_group`，Feature 六出口的可见性/可操作性据此判定。
    */
   ownerGroup?: string | null;
+  /**
+   * **父需求登记**（v0.9.3 O1）：建 Feature 时一次性写入 `features.parent_feature_id`；
+   * 缺省 / `null` = 无父。存在性与可见性校验在 handler（fail-closed），存储层不复核、不解析父链。
+   */
+  parentFeatureId?: string | null;
   /** 缺省 `waiting_approval`（主链起点 / 审批门停靠点） */
   state?: FeatureState;
   /**

@@ -1,19 +1,20 @@
 /**
- * 只读网页接面单元测试（`bridge/transports/web.ts` + `bridge/web/html.ts`；v0.5.0 §2.2 / §2.5，节点 N3）。
+ * 只读 JSON API 接面单元测试（`bridge/transports/web.ts`；v0.5.0 §2.2 / §2.5，节点 N3；
+ * v0.9.3 O2 起页面退役 —— 原 `GET /` 内联工作台页与 `bridge/web/html.ts` 断言已删除，
+ * 页面断言的承接面 = Board 测试）。
  *
  * 覆盖：
  * - **路由形状**：path / method / 状态码 / 出参形状（含 404 / 405 / 400）；
  * - **字段白名单**：`/api/projects` 剔除 `workspace`（绝对路径）与 `agentConfig`；
  * - **事件游标隔离**：`/api/events` 直连 `store.listEvents`（`since` 由前端传参、缺省从头、反复读幂等）；
- * - **降级**：端口被占 / 非 loopback host ⇒ 不 throw，返回「未启用」句柄；
- * - **HTML**：首页非空 + 桥标识（role / pid / startedAt）+ 刷新下限 15s + 无外部资源标签。
+ * - **降级**：端口被占 / 非 loopback host ⇒ 不 throw，返回「未启用」句柄。
  *
  * 关于「游标隔离」这条断言为什么这样写（**宿主游标不可直接观测**）：
  * `eventsCursor` 是 `bridge/index.ts` 的**模块私有**变量（未导出），且 `bridge/index.ts` 顶层
  * 直接调用 `main()`（import 它就会拉起整座桥，测试不可 import）⇒ 无法在测试里直接读该游标。
  * 故本用例以**行为**锁定契约：同一 `since` 反复读结果恒等（读口不持有、不推进任何服务端游标），
  * 且缺省 `since` 恒为 0（不会退化成「从隐式游标起」）。配合模块边界（`web.ts` 对 `index.ts`
- * 只有 `import type`）即成充分保证：网页路径**在类型与运行时都不可能**碰到宿主收件箱游标。
+ * 只有 `import type`）即成充分保证：数据面路径**在类型与运行时都不可能**碰到宿主收件箱游标。
  *
  * 运行：`npm test`（先 `tsc` 构建，再 `node --test dist/test/`）。
  */
@@ -25,7 +26,6 @@ import { createServer as createHttpServer, request as httpRequest } from "node:h
 import type { Server } from "node:http";
 import { appendEvent, createFeature, createTask, latestEventId } from "../session/store.js";
 import type { ProjectStatus } from "../types.js";
-import { renderIndexHtml } from "../bridge/web/html.js";
 import { handleFeatureStatus, projectTaskVisibility } from "../bridge/feature-tools.js";
 import type { TaskState } from "../types.js";
 import { startWebTransport } from "../bridge/transports/web.js";
@@ -139,9 +139,6 @@ function baseOptions(
     core,
     host: overrides.host ?? "127.0.0.1",
     port: overrides.port ?? 0,
-    readiness:
-      overrides.readiness ??
-      (() => ({ role: "owner", pid: 4242, startedAt: "2026-09-16T00:00:00Z" })),
     version: overrides.version ?? "0.5.0-test",
   };
   if (overrides.refreshMs !== undefined) options.refreshMs = overrides.refreshMs;
@@ -246,97 +243,6 @@ interface EventsBody {
 // 用例
 // ---------------------------------------------------------------------------
 
-test("GET / → 内联 HTML（非空 + 桥标识 + 刷新下限 15s + 无外部资源标签）", async () => {
-  // refreshMs 低于下限 ⇒ 服务端应收口到 15000
-  const handle = await startWeb(fakeCore(), { refreshMs: 1_000 });
-  const page = await get(handle.port, "/");
-  assert.equal(page.status, 200);
-  assert.match(String(page.contentType), /text\/html/);
-  assert.ok(page.text.length > 0, "HTML 非空");
-  assert.match(page.text, /^<!doctype html>/i);
-  assert.ok(page.text.includes("owner"), "页面应显示 role（RuntimeReadiness）");
-  assert.ok(page.text.includes("4242"), "页面应显示 pid（RuntimeReadiness）");
-  assert.ok(page.text.includes("2026-09-16T00:00:00Z"), "页面应显示 startedAt（RuntimeReadiness）");
-  assert.ok(page.text.includes("0.5.0-test"), "页面应显示桥版本");
-  assert.ok(page.text.includes("15000"), "自动刷新间隔下限应为 15000ms");
-  assert.ok(!/\ssrc=|\shref=/i.test(page.text), "页面不得经标签加载外部资源（零前端工具链）");
-  assert.match(String(page.csp), /default-src 'none'/, "HTML 应下发 CSP（禁止外部资源）");
-});
-
-test("renderIndexHtml：未就绪（readiness=null）如实标注 starting", () => {
-  const html = renderIndexHtml({ readiness: null, version: "0.5.0", refreshMs: 15_000 });
-  assert.ok(html.length > 0);
-  assert.ok(html.includes("<dt>role</dt><dd>starting</dd>"));
-  assert.ok(html.includes("未就绪"));
-});
-
-test("GET / → 层级视图「需求 → 任务」（§8 增补 #2）：无手输 projectId / 无查询按钮 / 中文状态映射在展示层", async () => {
-  const handle = await startWeb(fakeCore());
-  const page = await get(handle.port, "/");
-  assert.equal(page.status, 200);
-  assert.ok(page.text.includes("需求 → 任务"), "两块面板应合并为「需求 → 任务」层级视图");
-  assert.ok(page.text.includes("需求（标题）"), "需求行主标识应为标题");
-  assert.ok(page.text.includes("进度"), "需求行应含「进度」列");
-  assert.ok(page.text.includes("/api/features/"), "展开应懒加载 GET /api/features/:featureId");
-  assert.equal(
-    /id="tasks-project"|查询任务|本地库 \+ 只读探测/.test(page.text),
-    false,
-    "手输 projectId / 「查询任务」按钮 / 术语长句应已移除",
-  );
-  for (const zh of ["待审批", "执行中", "集成中", "测试中", "评审中", "已完成", "待澄清", "失败", "已取消", "已阻塞"]) {
-    assert.ok(page.text.includes(zh), `页面应含中文状态「${zh}」（映射只在展示层）`);
-  }
-});
-
-test("GET / → 任务子表时间列三段 + 耗时拆「排队 / 执行」两列 + 重派/失败类两列（v0.8.7 U1 / v0.8.8 O6）", async () => {
-  const handle = await startWeb(fakeCore());
-  const page = await get(handle.port, "/");
-  assert.equal(page.status, 200);
-  assert.ok(
-    page.text.includes("<th>createdAt → startedAt → finishedAt</th>"),
-    "时间列表头应为三段（含 startedAt）",
-  );
-  assert.ok(page.text.includes("<th>排队</th>"), "应含「排队」列");
-  assert.ok(page.text.includes("<th>执行</th>"), "应含「执行」列（startedAt → finishedAt）");
-  assert.ok(page.text.includes("<th>重派</th>"), "应含「重派」列（retryCount，O6）");
-  assert.ok(page.text.includes("<th>失败类</th>"), "应含「失败类」列（failureKind，O6）");
-  assert.equal(page.text.includes("<th>耗时</th>"), false, "原单列「耗时」应已被两列取代");
-  // startedAt 合法为 NULL（已入队未领取）⇒ 三段时刻与两列时长各有占位，不得渲染成空串/0
-  assert.match(page.text, /function startedStamp\(iso\) \{ return iso \?[\s\S]*: "—";/, "startedAt 缺值应占位「—」");
-  // O6：排队列改用真源（queuedAt → claimedAt），不再用 createdAt → startedAt 近似；执行列仍以 startedAt 为界
-  assert.match(
-    page.text,
-    /duration\(t\.queuedAt, t\.claimedAt\)[\s\S]*duration\(t\.startedAt, t\.finishedAt\)/,
-    "两列时长应分别取真源（排队 = queuedAt→claimedAt / 执行 = startedAt→finishedAt；缺失时 duration 返回「—」，不按 0 计）",
-  );
-  assert.equal(
-    page.text.includes("duration(t.createdAt, t.startedAt)"),
-    false,
-    "排队列不得再用 createdAt → startedAt 近似（O6 改真源）",
-  );
-  assert.match(page.text, /t\.retryCount/, "任务行应渲染 retryCount");
-  assert.match(page.text, /t\.failureKind/, "任务行应渲染 failureKind");
-});
-
-test("GET / → 展开详情区渲染登记三列「阶段（登记）/ 审批门 / 版本」+ 缺值「—」+ 与引擎态区分（v0.9.1 O2）", async () => {
-  const handle = await startWeb(fakeCore());
-  const page = await get(handle.port, "/");
-  assert.equal(page.status, 200);
-  // loadDetail 除 tasks 外连 body.feature 一起缓存（否则三值到不了渲染层）
-  assert.match(page.text, /feature:\s*out\.body\.feature/, "详情缓存应含 body.feature");
-  assert.match(page.text, /registerHtml\(d\.feature\)/, "detailHtml 应渲染登记字段行");
-  assert.ok(page.text.includes("阶段（登记）"), "应含「阶段（登记）」列（stage）");
-  assert.ok(page.text.includes("审批门"), "应含「审批门」列（approval）");
-  assert.ok(page.text.includes("版本"), "应含「版本」列（version）");
-  // 三值取值只经 regVal 一条路（防 vacuous：确在渲染三值处）
-  assert.match(page.text, /regVal\(feature\.stage\)[\s\S]*regVal\(feature\.approval\)[\s\S]*regVal\(feature\.version\)/);
-  // 缺值（老桥未透出 / 未登记）⇒「—」回退，不臆造、不渲染空串
-  assert.match(page.text, /function regVal\(v\) \{ return \(v === null \|\| v === undefined \|\| v === ""\) \? "—" : v; \}/);
-  // state（引擎态）与 stage（登记字段）并排展示须可分辨：登记行显式标注区分
-  assert.match(page.text, /非引擎态/, "登记字段行应标注「非引擎态」");
-  assert.match(page.text, /≠ 上行「状态」（引擎态 state）/, "登记行应显式区分需求行 state 列");
-});
-
 test("GET /api/projects → 白名单（剔除 workspace / agentConfig / risk / Runner 内部字段）+ 桥注册表快照语义", async () => {
   /** 故意夹带 Runner 内部字段：网页白名单必须剔除（防 vacuous：全文断言不含这些值） */
   const runnerWithInternals = {
@@ -397,7 +303,7 @@ test("GET /api/projects → 白名单（剔除 workspace / agentConfig / risk / 
   assert.ok(!raw.includes("do-not-leak-token"), "响应全文不得含 Runner token");
 });
 
-test("路由形状：未知路径 404；已注册路径非 GET → 405", async () => {
+test("路由形状：未知路径 404；已注册路径非 GET → 405；页面退役后 GET / → 404 JSON", async () => {
   const handle = await startWeb(fakeCore());
 
   const missing = await get(handle.port, "/api/nope");
@@ -408,11 +314,14 @@ test("路由形状：未知路径 404；已注册路径非 GET → 405", async (
   assert.equal(apiNotGet.status, 405);
   assert.equal(json<ErrorBody>(apiNotGet).code, "method_not_allowed");
 
-  const pageNotGet = await get(handle.port, "/", "POST");
-  assert.equal(pageNotGet.status, 405);
-
   const featureNotGet = await get(handle.port, "/api/features/f1", "DELETE");
   assert.equal(featureNotGet.status, 405);
+
+  // v0.9.3 O2 页面退役：`/` 不再注册 ⇒ 走未注册路径的 404 JSON（不是 405，也不返回 HTML）
+  const retiredPage = await get(handle.port, "/");
+  assert.equal(retiredPage.status, 404);
+  assert.equal(json<ErrorBody>(retiredPage).code, "not_found");
+  assert.equal(retiredPage.csp, null, "退役后不再下发 HTML/CSP 应答头");
 });
 
 test("GET /api/features/:featureId → 详情 Task 行补三时刻（渲染层派生；本地缺记录给 null，不吞不造）", async () => {

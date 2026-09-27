@@ -56,7 +56,7 @@ test("parseFeatureDetail: feature + tasks", () => {
     ok: true,
     feature: { featureId: "F1", state: "executing", title: "甲", plan: null },
     tasks: [
-      { taskId: "t1", projectId: "p", state: "failed", lane: "read", failureKind: "timeout", retryCount: 1, dependencies: ["t0"] },
+      { taskId: "t1", projectId: "p", state: "failed", lane: "read", failureKind: "timeout", retryCount: 1, dependencies: ["t0"], prompt: "修复依赖图节点标签" },
       { taskId: "t2", projectId: "p", state: "completed", dependencies: null },
     ],
   });
@@ -64,9 +64,56 @@ test("parseFeatureDetail: feature + tasks", () => {
   assert.equal(view.tasks.length, 2);
   assert.equal(view.tasks[0].lane, "read");
   assert.equal(view.tasks[0].failureKind, "timeout");
+  assert.equal(view.tasks[0].prompt, "修复依赖图节点标签", "增补轨 III N1：收 prompt（依赖图任务要点数据源）");
+  assert.equal(view.tasks[1].prompt, null, "缺键 ⇒ null（老桥容错）");
   assert.deepEqual(view.tasks[0].dependencies, ["t0"]);
   assert.equal(view.tasks[1].lane, "write");
   assert.equal(view.tasks[1].dependencies, null);
+});
+
+test("parseFeatureDetail: 任务行三时刻 + 队列四字段（B-T4 3300 收编补差）", () => {
+  const view = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [
+      {
+        taskId: "t1",
+        projectId: "p",
+        state: "completed",
+        createdAt: "2026-09-26T00:00:00Z",
+        startedAt: "2026-09-26T00:01:30Z",
+        finishedAt: "2026-09-26T00:06:30Z",
+        queueState: "settled",
+        queuedAt: "2026-09-26T00:00:00Z",
+        claimedAt: "2026-09-26T00:01:00Z",
+        claimedBy: "m1",
+      },
+    ],
+  });
+  const t = view.tasks[0];
+  assert.equal(t.createdAt, "2026-09-26T00:00:00Z");
+  assert.equal(t.startedAt, "2026-09-26T00:01:30Z");
+  assert.equal(t.finishedAt, "2026-09-26T00:06:30Z");
+  assert.equal(t.queueState, "settled");
+  assert.equal(t.queuedAt, "2026-09-26T00:00:00Z");
+  assert.equal(t.claimedAt, "2026-09-26T00:01:00Z");
+  assert.equal(t.claimedBy, "m1");
+});
+
+test("parseFeatureDetail: 任务行时刻/队列字段缺键 ⇒ null（老桥容错，不臆造）", () => {
+  const view = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [{ taskId: "t1", projectId: "p", state: "completed" }],
+  });
+  const t = view.tasks[0];
+  assert.equal(t.createdAt, null);
+  assert.equal(t.startedAt, null);
+  assert.equal(t.finishedAt, null);
+  assert.equal(t.queueState, null);
+  assert.equal(t.queuedAt, null);
+  assert.equal(t.claimedAt, null);
+  assert.equal(t.claimedBy, null);
 });
 
 test("parseTrace: 三面字段 waitReason/position/waitedSince/projectBusy/readOccupants", () => {
@@ -168,6 +215,37 @@ test("parseFeaturesList: stage/version/approval 解析；缺列容错 null；老
   assert.equal(view.features[1].approval, null);
   assert.equal(view.features[0].stateCounts, null);
   assert.equal(view.stateCounts, null);
+});
+
+// --- v0.9.3 B1：parentFeatureId 解析（增补挂主需求 · 读面标注）---
+
+test("parseFeaturesList: parentFeatureId 解析；缺列 / 非字符串容错 null（口径同 stage，老桥无此字段）", () => {
+  const view = parseFeaturesList({
+    ok: true,
+    features: [
+      { featureId: "F1", state: "executing", parentFeatureId: "P1" },
+      { featureId: "F2", state: "executing" },
+      { featureId: "F3", state: "executing", parentFeatureId: 42 },
+    ],
+  });
+  assert.equal(view.features[0].parentFeatureId, "P1");
+  assert.equal(view.features[1].parentFeatureId, null);
+  assert.equal(view.features[2].parentFeatureId, null);
+});
+
+test("parseFeatureDetail: parentFeatureId 透出（桥未给 ⇒ null，不臆造缺省）", () => {
+  const withField = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing", parentFeatureId: "P1" },
+    tasks: [],
+  });
+  assert.equal(withField.feature.parentFeatureId, "P1");
+  const without = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [],
+  });
+  assert.equal(without.feature.parentFeatureId, null);
 });
 
 // --- BD6：「各态分布」改用 per-feature stateCounts 本地聚合（三条用例）---

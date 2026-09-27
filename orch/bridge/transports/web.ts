@@ -1,17 +1,20 @@
 /**
- * orch 只读网页接面（页面 + JSON API；v0.5.0 §2.2 / §2.5；节点 N3 —— **只写模块，不接线**）。
+ * orch 只读 JSON API 接面（v0.5.0 §2.2 / §2.5；v0.9.3 起页面退役，仅保留 `/api/*` 数据面）。
  *
- * 定位：给编排加一个**只读**观察口 ——
- * ① 项目成员（machine + project + 在线态）② 任务情况（Feature / Task + 耗时）。
+ * 定位：给编排与 Board 提供**只读**数据口 —— 项目 / Feature / 任务 / 事件。
  * 数据**全部来自桥侧既有能力，不新增数据源**：项目 / Feature / 任务复用 `BridgeCore`
  * （即 `handleProjects` / `handleFeatureStatus` / `handleTasks`），事件直连 store。
  * **只读**：无写操作、无操作端、无鉴权（鉴权待 v0.7.0）、不读 Launcher 日志文件。
+ *
+ * ## 页面退役（v0.9.3 O2）
+ *
+ * 原 `GET /` 内联只读工作台页面（`bridge/web/html.ts`）已退役 —— 页面由 Board 取代。
+ * 本模块只剩 `/api/*` JSON 路由；出参契约零增减（`/api/projects` 的 `runners` 在其出参内，非独立端点）。
  *
  * ## 路由（全部 `GET`；命中已注册路径但非 GET → 405，未注册 → 404）
  *
  * | 路径 | 数据来源 | 说明 |
  * |---|---|---|
- * | `/` | — | 内联 HTML 页面（`bridge/web/html.ts`，零前端工具链） |
  * | `/api/projects` | `core.projects()`（= `handleProjects`） | **字段白名单** + 快照语义（来源 / 观测时间） |
  * | `/api/features` | `core.featureStatus({})`（= `handleFeatureStatus`） | 列出全部 Feature（含 `taskCount` 与逐态 `stateCounts`；v0.9.0 B3″ 起由**一条聚合 SQL** 派生） |
  * | `/api/features/:featureId` | `core.featureStatus({ featureId })` | 单 Feature + 任务摘要（**含三时刻 + 队列四字段**，渲染层派生）+ 产物；未知 → 404 |
@@ -37,14 +40,13 @@
  *
  * `handleTasks` 不是纯读：① 先 `pruneTasks()` 跑一次保留策略清理；② 若结果中存在
  * `working` 任务，会经 `locateProject` 读**桥注册表**（v0.7.0 A6：零出站）判定可达性。
- * 即：网页刷新会**顺带**参与保留策略清理与注册表读取。本模块**刻意不加**服务端缓存来规避 ——
+ * 即：数据面刷新会**顺带**参与保留策略清理与注册表读取。本模块**刻意不加**服务端缓存来规避 ——
  * 缓存会掩盖真实观测时刻，与「快照 + 观测时间」语义冲突。
  *
  * ## 快照语义（§2.2）
  *
- * `/api/projects` 的 `observedAt` 在**每次请求的内存态**中计算（`new Date()`），
- * **不落库**；响应与页面均标注「由桥注册表（Runner 上报快照）派生 + 观测时间」，
- * **不得呈现为实时在线**。
+ * `/api/projects` 的 `observedAt` 在**每次请求的内存态**中计算（`new Date()`），**不落库**；
+ * 响应标注「由桥注册表（Runner 上报快照）派生 + 观测时间」，**不得呈现为实时在线**。
  *
  * ## 监听 / 降级（§2.5：网页接面**不得拖垮 MCP 工具面**）
  *
@@ -68,14 +70,10 @@ import { getQueuedTask, listEvents } from "../../session/store.js";
 import type { QueueState, QueuedTaskRecord } from "../../session/store.js";
 import type { EventRecord, ProjectStatus, TaskRecord, TaskState } from "../../types.js";
 import { bridgeLog } from "../bridge-log.js";
-import { renderIndexHtml } from "../web/html.js";
-import type { WebReadiness } from "../web/html.js";
 import { handleFeatureTrace } from "../feature-tools.js";
 import type { FeatureTaskSummary } from "../feature-tools.js";
 import type { BridgeCore } from "../index.js";
 import { isLoopbackHostOrAddress } from "./http.js";
-
-export type { WebReadiness };
 
 /** 自动刷新最小间隔（§2.2 硬下限；小于它一律抬到它） */
 export const WEB_MIN_REFRESH_MS = 15_000;
@@ -110,9 +108,7 @@ export interface WebTransportOptions {
   host: string;
   /** 绑定端口（`0` = 系统分配，实测用） */
   port: number;
-  /** 桥自身标识（role / pid / startedAt）；常驻化后由 lifecycle 就绪回调提供，未就绪返回 null */
-  readiness: () => WebReadiness | null;
-  /** 桥版本（页面展示，与 `/health` 同源） */
+  /** 桥版本（与 `/health` 同源；页面退役后仅作接面标识） */
   version: string;
   /** 自动刷新间隔（ms；< 15000 一律抬到 15000） */
   refreshMs?: number;
@@ -315,7 +311,6 @@ export function resolveRefreshMs(requested?: number): number {
 // ---------------------------------------------------------------------------
 
 type WebRoute =
-  | { kind: "page" }
   | { kind: "projects" }
   | { kind: "features"; featureId: string | null }
   | { kind: "featureTrace"; featureId: string }
@@ -327,7 +322,6 @@ const TRACE_SUFFIX = "/trace";
 const TASKS_PREFIX = "/api/tasks/";
 
 function matchRoute(path: string): WebRoute | null {
-  if (path === "/") return { kind: "page" };
   if (path === "/api/projects") return { kind: "projects" };
   if (path === "/api/features") return { kind: "features", featureId: null };
   if (path.startsWith(FEATURES_PREFIX)) {
@@ -377,9 +371,6 @@ async function handleRequest(
   }
 
   switch (route.kind) {
-    case "page":
-      respondHtml(res, 200, pageHtml(options));
-      return;
     case "projects":
       await sendProjects(res, options);
       return;
@@ -422,14 +413,6 @@ async function handleRequest(
       sendEvents(res, url);
       return;
   }
-}
-
-function pageHtml(options: WebTransportOptions): string {
-  return renderIndexHtml({
-    readiness: options.readiness(),
-    version: options.version,
-    refreshMs: resolveRefreshMs(options.refreshMs),
-  });
 }
 
 // ---------------------------------------------------------------------------
@@ -504,7 +487,7 @@ function toProjectView(project: {
  *
  * **单 Feature 详情**额外给每个 Task 摘要补**三时刻**（`createdAt` / `startedAt` / `finishedAt`）
  * 与**队列四字段**（`queueState` / `claimedAt` / `queuedAt` / `claimedBy`）——
- * 页面（§8 增补 #2 / v0.8.8 O6）要用时刻显示「`createdAt → finishedAt`」与「耗时」，用队列四字段
+ * 数据面（v0.5.0 §8 增补 #2 / v0.8.8 O6）要用时刻显示「`createdAt → finishedAt`」与「耗时」，用队列四字段
  * 显示真实「排队」区间（`queuedAt → claimedAt`），而 `FeatureTaskSummary` 不含这七列。补法是
  * **渲染层就地派生**（`getQueuedTask`，本地只读、store 零改动），
  * **不改** `FeatureTaskSummary` / `handleFeatureStatus` / MCP 工具面；列表分支（`/api/features`）
@@ -544,8 +527,8 @@ function sendFeatureTrace(res: ServerResponse, featureId: string): void {
 
 /**
  * 单 Feature 详情里 Task 行补三时刻（v0.5.0 §8 增补 #2「进度 / 耗时」）
- * + 队列四字段（v0.8.8 O6：页面「排队」列改用真源 `queuedAt → claimedAt`）。
- * 本地无该记录（理论不该发生）⇒ 时刻与队列字段一律 `null`（页面显示「未知 / —」），**不吞不造**。
+ * + 队列四字段（v0.8.8 O6：排队列改用真源 `queuedAt → claimedAt`）。
+ * 本地无该记录（理论不该发生）⇒ 时刻与队列字段一律 `null`（消费方据此显示「未知 / —」），**不吞不造**。
  */
 function withFeatureTaskTimings(task: FeatureTaskSummary): FeatureTaskView {
   const record = getQueuedTask(task.taskId);
@@ -733,18 +716,4 @@ function respondJson(res: ServerResponse, status: number, payload: unknown): voi
     "cache-control": "no-store",
   });
   res.end(JSON.stringify(payload));
-}
-
-/**
- * HTML 应答：**CSP 强制「无外部资源」**（`default-src 'none'` + 仅同源 connect + 内联 style/script），
- * 与 §2.2「零前端工具链 / 无外部资源」互为约束。
- */
-function respondHtml(res: ServerResponse, status: number, html: string): void {
-  res.writeHead(status, {
-    "content-type": "text/html; charset=utf-8",
-    "cache-control": "no-store",
-    "content-security-policy":
-      "default-src 'none'; connect-src 'self'; script-src 'unsafe-inline'; style-src 'unsafe-inline'; base-uri 'none'; form-action 'none'",
-  });
-  res.end(html);
 }

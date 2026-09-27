@@ -2122,12 +2122,6 @@ async function startWebIfEnabled(mode: TransportMode, readiness: RuntimeReadines
       core: createCore(null),
       host: web.host,
       port: web.port,
-      // 页面标识（role / pid / startedAt）来自 lifecycle；此处恒非 null（已过 `runtime.start()`）
-      readiness: (): { role: string; pid: number; startedAt: string } => ({
-        role: readiness.role,
-        pid: readiness.pid,
-        startedAt: readiness.startedAt,
-      }),
       version: BRIDGE_VERSION,
     });
   } catch (err) {

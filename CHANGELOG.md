@@ -2,6 +2,24 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.9.3] - 2026-09-27
+
+> 主题：**flow 规范修订 + 板多视图与 3300 收编 + 排期页弹窗**（三条需求 + 三条验收增补轨；验收原话「可以吧」「验收通过」「图现在展示的可以了」）。过程沉淀：**「主需求最后完成」与「增补轨挂主需求」首次完整实战**（第一例真实增补链 REQ-2026-09-27-01/03/04，REQ-ID 新格式首用）；planlog 本版起**退役归档**（需求事实源 = 引擎 + 板，登记类改道改造文档 §6）。
+
+### Added
+
+- **flow 规范修订**（`REQ-v0.9.3-2026-09-26-01`，Feature `738e5784`，十件）：**验收增补挂主需求**——引擎加登记字段 `parentFeatureId`（照 `owner_group` 模板加列、create 可选参数 + fail-closed 存在性校验〔不可见与不存在同拒绝码〕、create 回显、读面透传；板三面「增补 · 父需求」徽标 + 单跳深链）· **三档定性判据成文** · **主需求最后完成**（最先实现、最后 completed，验收结论下在全部增补收口之后）· **改造文档对照最新实现**（增补方案写父文档增补节、final 对照终实现）· 规范回炉句改写（needs_input 通道按引擎现实改述）· **运维嵌套 = 载体升级 DAG 末位节点**（替代独立运维 Feature）· **混合反馈分拣** · **需求提出即入板成文** · **改版纪律两档**（想法挪版拖拽直达；有产出物板自动 mv + decisions 追加）· **REQ-ID 新格式 `REQ-YYYY-MM-DD-XX`**（去版本段，存量不迁移）+ **planlog 退役**（版本状态事实源 = 引擎，读面 = 板）。状态机/调度器/挂载白名单/PROTOCOL 零改动。
+- **板多视图与 3300 收编**（`REQ-v0.9.3-2026-09-26-02`，Feature `df5bbde7`，9 节点）：**`/timeline` 时间轴**（逐需求并发拉 acceptance 轨迹）· 详情页**「依赖图」**（mermaid 源经 `application/json` 数据通道；节点 = project 标识 + 任务要点摘要、taskId hover）· **`/agents` Agent View**（机器表 + 逐 project 在飞任务 + 3300 收编的桥 identity/version 头 + 「闸内排队 orch 不可见」口径行）· **3300 页面退役**（orch 删 `web/html.ts` 430 行 + web.ts 页面分支 + `WebReadiness` 孤儿清理；**/api/\* 数据面全保留**）· 详情任务行 **12 列**（三时刻 + 排队/执行时长）· **拖拽排期**（`DRAG_SCHEDULE_SCRIPT` 白名单常量；**双条件闸** `stage=需求分析 ∧ approval=未发起` 才可写，409 `board_schedule_state_locked`）· **改版自动善后**（受限 mv：decisions 登记文档自动搬 `doc/{新版本}/` + 幂等 + 越树/org 路径守卫）。脚本白名单闭集四→六元。
+- **排期页新增需求弹窗**（`REQ-v0.9.3-2026-09-26-04`，Feature `78ba839a`）：排期页「＋ 新增需求」按钮 + `<dialog>` 弹窗承载提需求表单（复用 `renderRequirementForm`）；**GET /requirements 退役**（303 → /，导航摘除，POST 端点保留）；`NEW_REQUIREMENT_DIALOG_SCRIPT` 白名单 +1。
+
+### Changed
+
+- 版本号四处 `package.json` + 三处 lock 同升 **0.9.3**；宿主 pin 翻向 0.9.3。`flow/spec` 两文件 + 文档模板版本戳升 v0.9.3（REQ-ID 新格式 / planlog 退役改写 / needs_input 口径注）。**planlog.md 归档 `doc/_archive/`（退役首次执行）**；根回归 TC10/TC1 锚随退役翻向（planlog 检查移除 + planlog.md 不存在反向锚）+ 3300 页面 5 条锚随退役移除。
+
+### 门禁与验收
+
+- board **709/709** · orch 门禁绿（O1 407 + O2 删向 typecheck 收敛）· machine 零改动 · 根回归 **1367/1367**（`reports/v0.9.3/`）；真机 = 桥与板均 bring-up 新代码，用户真浏览器多轮点验（增补轨三连：降噪 / 依赖图渲染二轮修复 + 节点可读化 / 拖拽双条件闸实测）。
+
 ## [v0.9.2] - 2026-09-26
 
 > 主题：**板侧随版优化轨 II**（两条主需求 + 三条增补 + 多条验收期增补轨；验收原话「可以了」）。全版 board 单单元实现（orch/machine 零改动；flow 仅规范措辞与纪律句）。过程沉淀两条宿主纪律：**「需求提出即入板」**（宿主对话需求当场建观测态 Feature）与**「文档写完当场 decisions 登记」**。

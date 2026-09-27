@@ -41,6 +41,13 @@ export interface ScheduleAdvanceInput {
   to: string;
   /** 目标版本号；空串 = 取消排期（回「未排期」）。必填，类型上无法省略。 */
   version: string;
+  /**
+   * **改版自动善后登记追加**（v0.9.3 B-T6）：`decisions` 数组（append 语义，桥侧逐条追加），
+   * 承载搬移后的新文档路径。**可选** ⇒ 缺省（undefined / 空数组）装配不携带该键，
+   * 既有排期写出网仍是 {featureId, to, version} 三键（M3-① 装配锁不破）。
+   * 同样**不接受 `stage` / `approval` 键** —— 类型层封死口径不变。
+   */
+  decisions?: readonly string[];
 }
 
 export interface ScheduleFeatureOptions {
@@ -106,10 +113,12 @@ export function buildMcpEndpoint(baseUrl: string, group: string): string {
 }
 
 /**
- * 组装 `a2a_feature_advance` 的排期入参对象 —— 出参键集合**有且仅有** `{featureId, to, version}`：
+ * 组装 `a2a_feature_advance` 的排期入参对象 —— 出参键集合 = `{featureId, to, version}`，
+ * **仅当** `decisions` 传入且去空白后非空时追加 `decisions` 一键（v0.9.3 B-T6 善后登记）：
  * - **绝不携带 `stage` / `approval`**（TS 类型层已封死，装配也不补）；
  * - `to` **恒等**于调用方传入的当前态（不加工、不回落）；
- * - `version` **键始终存在**（清空 = 显式 `""`），缺失即编程错误抛出。
+ * - `version` **键始终存在**（清空 = 显式 `""`），缺失即编程错误抛出；
+ * - `decisions` 逐条 trim、空条剔除；含非字符串元素 = 编程错误抛出（不静默吞登记项）。
  * 纯函数，供纪律与契约断言。
  */
 export function buildScheduleAdvanceArgs(input: ScheduleAdvanceInput): Record<string, unknown> {
@@ -127,7 +136,22 @@ export function buildScheduleAdvanceArgs(input: ScheduleAdvanceInput): Record<st
   if (typeof input.version !== "string") {
     throw new FeatureScheduleConfigError("version 必须是字符串（清空 = 空串）");
   }
-  return { featureId, to, version: input.version };
+  const args: Record<string, unknown> = { featureId, to, version: input.version };
+  if (input.decisions !== undefined && input.decisions !== null) {
+    if (!Array.isArray(input.decisions)) {
+      throw new FeatureScheduleConfigError("decisions 必须是字符串数组（善后登记逐条 append）");
+    }
+    const items: string[] = [];
+    for (const x of input.decisions) {
+      if (typeof x !== "string") {
+        throw new FeatureScheduleConfigError("decisions 元素必须是字符串（不静默吞登记项）");
+      }
+      const t = x.trim();
+      if (t !== "") items.push(t);
+    }
+    if (items.length > 0) args.decisions = items;
+  }
+  return args;
 }
 
 /**

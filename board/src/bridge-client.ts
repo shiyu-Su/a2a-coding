@@ -50,6 +50,8 @@ export interface FeatureListItem {
   stage: string | null;
   version: string | null;
   approval: string | null;
+  /** 增补 Feature 的父需求 id（v0.9.3 B1 读面标注）；老桥无此列 ⇒ null 容错，口径同 stage。 */
+  parentFeatureId: string | null;
   createdAt: string | null;
   updatedAt: string | null;
   /**
@@ -83,6 +85,26 @@ export interface FeatureTaskItem {
   failureKind: string | null;
   retryCount: number | null;
   dependencies: string[] | null;
+  /**
+   * 三时刻 + 队列四字段（v0.9.3 B-T4 3300 收编补差）：桥详情分支
+   * `GET /api/features/:id` 对每个任务摘要就地补投影（`web.ts` `withFeatureTaskTimings`）。
+   * 老桥 / 缺键 ⇒ `null`（不臆造、不拿 `updatedAt` 顶替），渲染层出 `—`。
+   */
+  createdAt: string | null;
+  startedAt: string | null;
+  finishedAt: string | null;
+  /** 队列态原样透传（值域归桥，板不自造中文词，口径同 trace `waitReason`）。 */
+  queueState: string | null;
+  /** 入队时刻（排队区间起点：`queuedAt → claimedAt`）。 */
+  queuedAt: string | null;
+  /** 首次领取时刻（排队区间终点；在飞/未领取 ⇒ null）。 */
+  claimedAt: string | null;
+  claimedBy: string | null;
+  /**
+   * 派发消息落库片段（桥 `summarizeTask` 的截断 `prompt`，非全文）。
+   * 增补轨 III N1 依赖图节点「任务要点」的数据源；老桥 / 缺键 ⇒ null（容错回退裸 taskId）。
+   */
+  prompt: string | null;
 }
 
 /**
@@ -124,6 +146,8 @@ export interface FeatureDetailView {
     stage: string | null;
     version: string | null;
     approval: string | null;
+    /** 增补 Feature 的父需求 id（v0.9.3 B1 读面标注）；老桥无此列 ⇒ null 容错，口径同 {@link FeatureListItem.parentFeatureId} */
+    parentFeatureId: string | null;
     /**
      * Feature Context（BD11 · 阶段产出上板）：桥侧存的是 JSON 字符串（数组归一化属渲染层），
      * 老桥 / 未登记 ⇒ null。
@@ -182,6 +206,11 @@ export interface ProjectTaskItem {
   text: string | null;
   updatedAt: string | null;
   stale: boolean;
+  /**
+   * 首次领取时刻（v0.9.3 B-T3 在飞区的排序键）。桥 `/api/tasks` 出参**当前未投影该键** ⇒
+   * 容错为 `null`（不臆造、不拿 `updatedAt` 顶替）；排序侧把 `null` 沉底（见 `agent-view.ts`）。
+   */
+  claimedAt: string | null;
 }
 
 export interface ProjectTasksView {
@@ -281,6 +310,7 @@ export function parseFeaturesList(json: unknown): FeaturesListView {
       stage: str(f.stage),
       version: str(f.version),
       approval: str(f.approval),
+      parentFeatureId: str(f.parentFeatureId),
       createdAt: str(f.createdAt),
       updatedAt: str(f.updatedAt),
       stateCounts: parseStateCounts(f.stateCounts),
@@ -333,6 +363,14 @@ export function parseFeatureDetail(json: unknown): FeatureDetailView {
       failureKind: str(t.failureKind),
       retryCount: num(t.retryCount),
       dependencies: t.dependencies === null ? null : strArray(t.dependencies),
+      createdAt: str(t.createdAt),
+      startedAt: str(t.startedAt),
+      finishedAt: str(t.finishedAt),
+      queueState: str(t.queueState),
+      queuedAt: str(t.queuedAt),
+      claimedAt: str(t.claimedAt),
+      claimedBy: str(t.claimedBy),
+      prompt: str(t.prompt),
     };
   });
   return {
@@ -345,6 +383,7 @@ export function parseFeatureDetail(json: unknown): FeatureDetailView {
       stage: str(feature.stage),
       version: str(feature.version),
       approval: str(feature.approval),
+      parentFeatureId: str(feature.parentFeatureId),
       decisions: str(feature.decisions),
       contracts: str(feature.contracts),
       createdAt: str(feature.createdAt),
@@ -476,6 +515,7 @@ export function parseTasks(json: unknown): ProjectTasksView {
       text: str(t.text),
       updatedAt: str(t.updatedAt),
       stale: t.stale === true,
+      claimedAt: str(t.claimedAt),
     };
   });
   return { projectId, reachable: body.reachable !== false, notice: str(body.notice), tasks };

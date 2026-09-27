@@ -145,6 +145,19 @@ function mermaidJsonPayload(source: string): string {
   return JSON.stringify(source).replace(/</g, "\\u003c").replace(/>/g, "\\u003e");
 }
 
+/**
+ * mermaid 块安全通道（**单点发射器**，BD14；T2 依赖图复用同一通道）：
+ * 占位 div + 源文本经 `<script type="application/json">` 注入（`id` = 占位 `data-src` 指向的载体）。
+ * JSON 载荷中 `<`/`>` 落 \u 形态 ⇒ 数据通道不是可执行脚本（n3 闭集锚口径），源文本绝不拼进 HTML。
+ */
+export function mermaidBlockData(id: string, source: string): string {
+  return (
+    `<div class="mermaid-block" data-src="${escapeHtml(id)}" data-rendered="0" role="img" aria-label="mermaid 图` +
+    `（渲染失败时保留源文本）"><pre class="result mermaid-src">${escapeHtml(source)}</pre></div>` +
+    `<script type="application/json" id="${escapeHtml(id)}">${mermaidJsonPayload(source)}</script>`
+  );
+}
+
 interface ListItem {
   readonly indent: number;
   readonly ordered: boolean;
@@ -217,12 +230,7 @@ export function renderMarkdown(src: string): MarkdownHtml {
       if (info === "mermaid") {
         hasMermaid = true;
         mermaidSeq += 1;
-        const id = `mermaid-src-${mermaidSeq}`;
-        blocks.push(
-          `<div class="mermaid-block" data-src="${id}" data-rendered="0" role="img" aria-label="mermaid 图` +
-            `（渲染失败时保留源文本）"><pre class="result mermaid-src">${escapeHtml(text)}</pre></div>` +
-            `<script type="application/json" id="${id}">${mermaidJsonPayload(text)}</script>`,
-        );
+        blocks.push(mermaidBlockData(`mermaid-src-${mermaidSeq}`, text));
       } else {
         blocks.push(`<pre class="result"><code>${escapeHtml(text)}</code></pre>`);
       }
@@ -342,14 +350,24 @@ export function renderMarkdown(src: string): MarkdownHtml {
 // mermaid 页面脚本（一段内联字面量 + 一条同源资产引用；与 SUBMIT_GUARD_SCRIPT 同规格）
 // ---------------------------------------------------------------------------
 
-/** 文档页 mermaid 渲染脚本：源文本只经 JSON 安全通道取回（textContent → JSON.parse），不拼 HTML。 */
+/**
+ * 文档页 mermaid 渲染脚本：源文本只经 JSON 安全通道取回（textContent → JSON.parse），不拼 HTML。
+ *
+ * **v0.9.3 增补 ②（依赖图修根因）**：
+ * - 扫描**幂等化**（`data-rendered="1"` 的块跳过）并暴露全局钩子 `window.a2aRenderMermaid` ——
+ *   排期页详情浮层把详情页 `<main>` 经 DOMParser 搬入时**搬运节点不执行脚本**，
+ *   依赖图/文档 mermaid 停在源文本；浮层在 `showModal()` 之后调用本钩子补渲
+ *   （可见容器在先，不重犯 98c39da1「渲染进 display:none 容器」）；
+ * - 触发 = DOMContentLoaded（defer 库先于本事件执行 ⇒ 常规整页档库已就位）∧ window load 兜底
+ *   （未DOMContentLoaded 立即补试 / 已越过则同步补试）。
+ */
 export function mermaidRenderScript(): string {
   return `<script>
 (function () {
-  function go() {
-    if (typeof window.mermaid === "undefined") { return; }
-    try { window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict" }); } catch (e) { return; }
-    var nodes = document.querySelectorAll(".mermaid-block[data-src]");
+  function renderBlocks() {
+    if (typeof window.mermaid === "undefined") { return false; }
+    try { window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict" }); } catch (e) { return false; }
+    var nodes = document.querySelectorAll('.mermaid-block[data-src]:not([data-rendered="1"])');
     var seq = 0;
     Array.prototype.forEach.call(nodes, function (host) {
       var srcEl = document.getElementById(host.getAttribute("data-src"));
@@ -369,10 +387,15 @@ export function mermaidRenderScript(): string {
         host.setAttribute("data-rendered", "1");
       }, function () { /* 渲染失败：保留源文本，不整页崩 */ });
     });
+    return true;
   }
+  /* 浮层补渲钩子：FEATURE_DETAIL_OVERLAY_SCRIPT 换入 <main>（showModal 之后）调用；幂等，已渲染块不重复扫 */
+  window.a2aRenderMermaid = renderBlocks;
+  /* defer 库先于 DOMContentLoaded 执行 ⇒ DC 一次；load 再兜一次（幂等扫描，防极迟就绪的加载形态） */
   if (document.readyState === "loading") {
-    document.addEventListener("DOMContentLoaded", function () { go(); });
-  } else { go(); }
+    document.addEventListener("DOMContentLoaded", renderBlocks);
+  } else { renderBlocks(); }
+  window.addEventListener("load", renderBlocks);
 })();
 </script>`;
 }

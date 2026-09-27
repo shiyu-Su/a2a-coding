@@ -760,7 +760,7 @@ const TASK_COLUMNS =
 /** features 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToFeature） */
 const FEATURE_COLUMNS =
   "feature_id, state, title, requirement, context_id, plan, decisions, contracts, " +
-  "owner_group, stage, version, approval, created_at, updated_at";
+  "owner_group, parent_feature_id, stage, version, approval, created_at, updated_at";
 
 /** 解析 `dependencies` 列（JSON 数组字符串）；非法即数据损坏（fail-fast） */
 function readDependencies(row: Record<string, unknown>): string[] | null {
@@ -880,6 +880,8 @@ function rowToFeature(row: Record<string, unknown>): FeatureRecord {
     contracts: readNullableString(row, "contracts"),
     // v0.8.6 §2.3 归属列：可空（NULL = 无归属，存量 / 未配组环境创建）；读侧不 fail-fast
     ownerGroup: readNullableString(row, "owner_group"),
+    // v0.9.3 O1 父需求列：可空自由 ID（NULL = 无父，合法值）；不做闭集归一、不解析父链
+    parentFeatureId: readNullableString(row, "parent_feature_id"),
     // v0.9.0 B2″ 登记三列：**读侧单点归一**（NULL / 脏值 → 缺省，一律不 throw）
     stage: readStage(row),
     version: readNullableString(row, "version") ?? "",
@@ -1288,6 +1290,15 @@ export class SessionStore {
     // 纪律照既有：只加列、必可空、不复用既有列、**只在 ctor try-ALTER**（无 `PRAGMA user_version`、不引入 DDL 版本管理）。
     try {
       this.db.exec("ALTER TABLE features ADD COLUMN owner_group TEXT");
+    } catch {
+      // 列已存在
+    }
+    // v0.9.3 O1 迁移（REQ-v0.9.3 · parentFeatureId 引擎字段）：features 加 `parent_feature_id`
+    // （增补轨挂主需求的单值父引用）。**必可空、老行不回填**（NULL = 无父，合法缺省）；
+    // 自由 ID 列：**不套**登记三列的脏值归一循环**（无闭集、NULL 即合法、脏值不猜语义只透存）。
+    // 纪律照既有：只加列、不复用既有列、读侧 `readNullableString`、**只在 ctor try-ALTER**。
+    try {
+      this.db.exec("ALTER TABLE features ADD COLUMN parent_feature_id TEXT");
     } catch {
       // 列已存在
     }
@@ -2594,8 +2605,8 @@ export class SessionStore {
     const updatedAt = rec.updatedAt ?? createdAt;
     this.db
       .prepare(
-        `INSERT INTO features (feature_id, state, title, requirement, context_id, owner_group, stage, version, approval, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        `INSERT INTO features (feature_id, state, title, requirement, context_id, owner_group, parent_feature_id, stage, version, approval, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(feature_id) DO UPDATE SET
            state = excluded.state,
            title = excluded.title,
@@ -2615,6 +2626,9 @@ export class SessionStore {
         // 归属 = 建 Feature 时的连接身份；重跑（ON CONFLICT）**不改归属**（谁建谁见，owner 不可变），
         // 故不出现在 DO UPDATE SET 中。NULL = 未配组环境 / 存量。
         rec.ownerGroup ?? null,
+        // v0.9.3 O1 父需求 = 建 Feature 时一次性写入（同 owner_group 语义：重跑不改父，
+        // 故**不进 DO UPDATE SET**）。NULL = 无父。校验（存在性 + 可见性）在 handler，存储层不复核。
+        rec.parentFeatureId ?? null,
         // v0.9.0 登记三列：存储层**不补缺省、不复核闭集**（缺省由 handler 施加、校验由 handler 做；
         // 登记面不得抛）。缺省不传 ⇒ NULL，读侧按缺省归一（见 `readStage`）。
         // 重跑（ON CONFLICT）按入参**重写**（与 state / title 同族语义）；只想改登记请用 advance。

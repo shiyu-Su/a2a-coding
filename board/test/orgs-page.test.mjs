@@ -296,17 +296,18 @@ test("N6-⑪ 方法门与写面纪律: /orgs 只认 GET；源文件不含状态�
 });
 
 // ---------------------------------------------------------------------------
-// 导航闭集更新（NavKey 五项 → 六项，v0.9.2 M4 增排期看板）
+// 导航闭集更新（v0.9.2 M4 增排期看板 = 六项；REQ-2026-09-26-04 Q2 需求页退役 = 五项；
+// REQ-2026-09-26-02 B-T3 增 Agent View = 六项；同版增补 ③ Timeline 退役 = 六项维持）
 // ---------------------------------------------------------------------------
 
-test("N6-⑫ 导航闭集: 六项（需求/排期/任务/项目·机器/组织/宿主桥），href 与顺序钉死", () => {
+test("N6-⑫ 导航闭集: 六项（排期/任务/项目·机器/Agent/组织/宿主桥），href 与顺序钉死（需求项已随列表页退役；Timeline 随增补 ③ 退役）", () => {
   const html = renderPage({ title: "t", active: "orgs", bodyHtml: "<p>b</p>" });
   const anchors = [...html.matchAll(/<a href="(\/[^"]*)"[^>]*>([^<]+)<\/a>/g)].map((m) => `${m[1]}|${m[2]}`);
-  assert.deepEqual(anchors.slice(0, 6), [
-    "/requirements|需求",
+  assert.deepEqual(anchors, [
     "/schedule|排期",
     "/tasks|任务",
     "/projects|项目 / 机器",
+    "/agents|Agent",
     "/orgs|组织",
     "/host|宿主桥",
   ]);

@@ -18,9 +18,11 @@ function fakeClient(featureOver = {}) {
     title: "需求甲",
     plan: null,
     ownerGroup: "g",
-    stage: "改造方案",
+    // v0.9.3 B-T5 双条件闸默认放行态（想法挪版档：stage=需求分析 ∧ approval=未发起）
+    // —— 排期写既有用例验的是「三键装配 / 锁版 / CSRF / 漂移」，闸自身的正负例见 G-①…G-④。
+    stage: "需求分析",
     version: "v0.9.1",
-    approval: "已通过",
+    approval: "未发起",
     decisions: null,
     contracts: null,
     createdAt: "c",
@@ -569,4 +571,141 @@ test("N3-⑨（边界）：现版本为 null（引擎未登记）⇒ 目标锁�
     client,
   );
   assert.equal(seen.length, 1);
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.3 B-T5 双条件状态闸：排期改动仅 `stage=需求分析 ∧ approval=未发起`（想法挪版）可写
+// —— 与 ③b 已发版锁**叠加、互不替代**；stage/approval 只作读判，不进载荷与出网装配。
+// ---------------------------------------------------------------------------
+
+test("G-①（正向）：想法挪版态（需求分析 ∧ 未发起）⇒ 改版放行，出网仍仅三键（不含 stage/approval）", async () => {
+  const { fn, captured } = realScheduleCapturing(
+    okEnvelope({ ok: true, featureId: "F1", state: "executing", version: "v0.9.3" }),
+  );
+  const { client } = fakeClient({ stage: "需求分析", approval: "未发起", version: "v0.9.1" });
+  await withServer(
+    async (base) => {
+      const res = await schedulePost(base, "version=v0.9.3", { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(res.status, 200);
+      const args = captured.bodies[0].params.arguments;
+      assert.deepEqual(Object.keys(args).sort(), ["featureId", "to", "version"], "闸读判不改装配（stage/approval 不进载荷）");
+    },
+    { defaultGroup: "g", mcpBaseUrl: "http://127.0.0.1:8787", scheduleFeatureImpl: fn },
+    client,
+  );
+});
+
+test("G-②（负向 · 两锁态）：stage 已进「改造方案」或 approval 已「待审批 / 已通过」⇒ 409 board_schedule_state_locked 零出网", async () => {
+  for (const over of [
+    { stage: "改造方案", approval: "未发起" },
+    { stage: "需求分析", approval: "待审批" },
+    { stage: "改造方案", approval: "已通过" },
+    { stage: "发版", approval: "已通过" },
+  ]) {
+    const { fn, seen } = fakeSchedule();
+    const { client } = fakeClient(over);
+    await withServer(
+      async (base) => {
+        const res = await schedulePost(base, "version=v0.9.3", { ...WRITE_HEADERS, accept: "application/json" });
+        assert.equal(res.status, 409, `${over.stage}/${over.approval} ⇒ 非想法态，改版被闸拒`);
+        const json = JSON.parse(await res.text());
+        assert.equal(json.code, "board_schedule_state_locked");
+        assert.match(json.error, /排期锁定/);
+        assert.match(json.error, /stage = 需求分析 ∧ approval = 未发起/, "文案给出放行态的完整双条件");
+        assert.match(json.error, /需求确认单经用户确认后（stage 迁「改造方案」\/ approval 过门）该需求的排期即不可在本板改动/, "R5 文案句 ①");
+        assert.match(json.error, /本板不提供解除入口/, "R5 文案句 ②（不得暗示板上可解）");
+        assert.match(json.error, /主需求 cancel 后从 Step 0 新建/, "R5 解锁去处 = 流程，不是板操作");
+        assert.match(json.error, /宿主经 MCP 直写[\s\S]*不经过本闸/, "R5 文案句 ③：如实标注 MCP 口不经本闸");
+        assert.match(json.error, /流程规范纪律句兜底/);
+        assert.doesNotMatch(json.error, /后门不豁免/, "不得声称拦得住 MCP 直写（判据 ⑥ / R5 口径）");
+      },
+      { defaultGroup: "g", scheduleFeatureImpl: fn },
+      client,
+    );
+    assert.deepEqual(seen, [], "闸判必须前置于出网（零出网）");
+  }
+});
+
+test("G-③（负向 · 老桥 fail-closed）：stage / approval 缺失（null）⇒ 一律拒写，不猜放行", async () => {
+  const { fn, seen } = fakeSchedule();
+  const { client } = fakeClient({ stage: null, approval: null });
+  await withServer(
+    async (base) => {
+      const res = await schedulePost(base, "version=v0.9.3", { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(res.status, 409);
+      const json = JSON.parse(await res.text());
+      assert.equal(json.code, "board_schedule_state_locked");
+      assert.match(json.error, /缺失/);
+    },
+    { defaultGroup: "g", scheduleFeatureImpl: fn },
+    client,
+  );
+  assert.deepEqual(seen, []);
+});
+
+test("G-④（正向 · 同版豁免）：已确认需求重提**同一版本** ⇒ 幂等放行（零变更不属排期改动，闸与锁版同口径）", async () => {
+  const { fn, seen } = fakeSchedule();
+  const { client } = fakeClient({ stage: "改造方案", approval: "已通过", version: " v0.9.2 " });
+  await withServer(
+    async (base) => {
+      const res = await schedulePost(base, "version=v0.9.2", { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(res.status, 200, "trim 后精确等串 ⇒ 同版重提放行");
+      assert.equal(seen.length, 1);
+    },
+    { defaultGroup: "g", scheduleFeatureImpl: fn },
+    client,
+  );
+});
+
+test("G-⑤（负向 · 入池/清空同样受闸）：想法之外的需求「移出排期回池」也是排期改动 ⇒ 409 同码", async () => {
+  const { fn, seen } = fakeSchedule();
+  const { client } = fakeClient({ stage: "改造方案", approval: "已通过", version: "v0.9.2" });
+  await withServer(
+    async (base) => {
+      const res = await schedulePost(base, "version=", { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(res.status, 409);
+      assert.equal(JSON.parse(await res.text()).code, "board_schedule_state_locked");
+    },
+    { defaultGroup: "g", scheduleFeatureImpl: fn },
+    client,
+  );
+  assert.deepEqual(seen, []);
+});
+
+test("G-⑥（叠加 · 互不替代）：闸锁 ∧ 目标锁版 ⇒ 版本锁先判（board_version_released）；闸不吞锁、锁不吞闸", async () => {
+  const { fn, seen } = fakeSchedule();
+  const { client } = fakeClient({ stage: "改造方案", approval: "已通过", version: "v0.9.2" });
+  await withServer(
+    async (base) => {
+      const both = await schedulePost(base, "version=v0.9.1", { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(both.status, 409);
+      assert.equal(JSON.parse(await both.text()).code, "board_version_released", "两把锁都在时以已发版锁作答（v0.9.2 既有语义不回退）");
+      const gateOnly = await schedulePost(base, "version=v0.9.3", { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(gateOnly.status, 409);
+      assert.equal(JSON.parse(await gateOnly.text()).code, "board_schedule_state_locked", "目标未锁 ⇒ 闸独立作答");
+    },
+    { defaultGroup: "g", scheduleFeatureImpl: fn, releasedVersions: LOCK },
+    client,
+  );
+  assert.deepEqual(seen, [], "两把锁一律零出网");
+});
+
+test("G-⑦（表单档）：闸拒 ⇒ 错误浮层族名「排期状态锁定」+ 目标/现版本回填", async () => {
+  const { fn, seen } = fakeSchedule();
+  const { client } = fakeClient({ stage: "改造方案", approval: "已通过", version: "v0.9.2" });
+  await withServer(
+    async (base) => {
+      const res = await schedulePost(base, "version=v0.9.3", { origin: base });
+      assert.equal(res.status, 409);
+      const html = await res.text();
+      assert.match(html, /<div class="err-ov"/);
+      assert.match(html, /排期状态锁定/, "族名中文映射（views.ERROR_FAMILY_LABELS）");
+      assert.match(html, /board_schedule_state_locked/);
+      assert.match(html, /<span class="err-ov-field-label">目标版本<\/span>\s*<span class="err-ov-field-value mono">v0\.9\.3<\/span>/);
+      assert.match(html, /<span class="err-ov-field-label">现版本<\/span>\s*<span class="err-ov-field-value mono">v0\.9\.2<\/span>/);
+    },
+    { defaultGroup: "g", scheduleFeatureImpl: fn },
+    client,
+  );
+  assert.deepEqual(seen, []);
 });

@@ -77,6 +77,24 @@ export function formatWaitedSince(waitedSince: string | null, nowMs: number): st
   return `${Math.floor(min / 60)}h ${min % 60}m`;
 }
 
+/**
+ * 区间时长（v0.9.3 B-T4 详情页任务行「排队时长 / 执行时长」）：两端 ISO 差值，
+ * 格式同 {@link formatWaitedSince}。**单一口径**：缺任一端 / 非法 / 为负 ⇒ `—`
+ * （不做「至 now」推算 —— 在飞任务的执行时长终点未到，如实显示 `—`）。
+ */
+export function formatDurationBetween(fromIso: string | null, toIso: string | null): string {
+  if (fromIso === null || toIso === null) return "—";
+  const from = Date.parse(fromIso);
+  const to = Date.parse(toIso);
+  if (!Number.isFinite(from) || !Number.isFinite(to)) return "—";
+  const elapsedSec = Math.floor((to - from) / 1000);
+  if (elapsedSec < 0) return "—";
+  if (elapsedSec < 60) return `${elapsedSec}s`;
+  const min = Math.floor(elapsedSec / 60);
+  if (min < 60) return `${min}m ${elapsedSec % 60}s`;
+  return `${Math.floor(min / 60)}h ${min % 60}m`;
+}
+
 // ---------------------------------------------------------------------------
 // B13-③ trace 节点的等待归因（projectBusy 只反映写门 → 读档占位）
 // ---------------------------------------------------------------------------
@@ -169,6 +187,25 @@ export function deriveConfirmAffordance(approval: string | null): ConfirmAfforda
         note: `仅当审批门 = 「${APPROVAL_PENDING}」时确认按钮可点（当前值 = ${approval ?? "缺失"}）；方案未就绪时先「触发一轮」让 agent 产出改造文档。`,
       };
   }
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.3 B-T5：排期写「双条件闸」可用性（想法挪版才可拖拽/改版，单一规则源）
+// ---------------------------------------------------------------------------
+
+/** 登记阶段「需求分析」—— 想法挪版（零善后档）的阶段判据。 */
+const STAGE_REQUIREMENT_ANALYSIS = "需求分析";
+/** 审批门「未发起」—— 确认动作未发生（approval 单向无回边）的门判据。 */
+const APPROVAL_NOT_INITIATED = "未发起";
+
+/**
+ * 排期改动（改版/入池/出池）是否放行（纯函数，**视图与服务端共用同一规则源**）：
+ * 仅 `stage = 需求分析` ∧ `approval = 未发起`（= 规范 §7 改版纪律「想法挪版」档）可写；
+ * 任一不满足（含老桥缺登记字段 ⇒ null）⇒ 锁定 —— fail-closed，视图置灰、服务端 409
+ * `board_schedule_state_locked`（执法见 `server.ts` 排期写处理，本函数只作读判）。
+ */
+export function deriveScheduleGateOpen(stage: string | null, approval: string | null): boolean {
+  return stage === STAGE_REQUIREMENT_ANALYSIS && approval === APPROVAL_NOT_INITIATED;
 }
 
 // ---------------------------------------------------------------------------
@@ -323,6 +360,14 @@ export const INFLIGHT_CALIBRATION_NOTE =
 export const PARALLELISM_NOTE =
   "并行度口径：编排侧并行 ≠ 改造侧并行；写串行不变；「读并行」仅在节点声明 read 档且 machine 配 " +
   "maxConcurrentReads ≥ 2 时才真发生（缺省 1/1）⇒ DAG 拆宽 ≠ 并行。板不承诺「多需求并行」。";
+
+/**
+ * Agent View 页脚口径行（v0.9.3 B-T3）：本页只呈现 orch 看得见的在飞面 ——
+ * **machine 侧的两件事 orch 没有数据**（闸内排队、读席占席），板既不显示也不推算，
+ * 只把口径钉在这一行（与 B13「两个时钟不得相加」同族，本页为完整句）。
+ */
+export const AGENT_VIEW_CALIBRATION_NOTE =
+  "口径：闸内排队与 machine 读席占用 orch 不可见，两个时钟不得相加。";
 
 /** B13 三条显示口径脚注（列表 / 详情 / trace 视图统一挂载）。 */
 export const B13_CALIBRATION_NOTES: readonly string[] = [

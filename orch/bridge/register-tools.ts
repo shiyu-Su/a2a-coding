@@ -387,6 +387,15 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
             "审批门状态登记：未发起 / 待审批 / 已通过（单向、无回边）。**缺省「待审批」**⇒ 既有调用建完即可过审；" +
               "板建需求显式传「未发起」。非法值 ⇒ feature_invalid_approval",
           ),
+        // v0.9.3 O1：父需求登记（增补轨挂主需求）。校验在 handler（存在性 + 带身份过滤可见性，
+        // 不可见 ⇒ 同 feature_not_found，不新增第二拒绝码）；schema 侧仅收成串入参
+        parentFeatureId: z
+          .string()
+          .optional()
+          .describe(
+            "父 Feature ID（可选）：增补轨挂主需求时传，落 features.parent_feature_id（单值、**只存不解析**" +
+              "—— 不递归父链、不判环）。不存在或不可见 ⇒ feature_not_found",
+          ),
       },
     },
     async (args) => {
@@ -398,6 +407,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           stage: args.stage,
           version: args.version,
           approval: args.approval,
+          parentFeatureId: args.parentFeatureId,
         });
         return outcome.ok ? textResult(outcome) : errorResult(outcome);
       } catch (err) {

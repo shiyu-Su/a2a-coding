@@ -4,7 +4,9 @@
  * vendored 资产**（`/static/mermaid.min.js`，CSP 放宽见 {@link BOARD_CSP}），仍无任何外源主机。
  * 服务器端渲染；页面脚本 = **白名单化内联字面量常量**（无 `src=`、不含用户数据、单点常量可审计；
  * 纪律钉 = `test/n3-regression-anchors.test.mjs` N3-⑦/⑧，闭集 = 提交守卫 {@link SUBMIT_GUARD_SCRIPT}
- * + 错误浮层关闭 + mermaid 渲染 + 排期页详情浮层 {@link FEATURE_DETAIL_OVERLAY_SCRIPT}）；
+ * + 错误浮层关闭 + mermaid 渲染 + 排期页详情浮层 {@link FEATURE_DETAIL_OVERLAY_SCRIPT}
+ * + 新增需求弹窗 {@link NEW_REQUIREMENT_DIALOG_SCRIPT}
+ * + 排期拖拽 {@link DRAG_SCHEDULE_SCRIPT}（v0.9.3 B-T5，闭集五→六元；与弹窗常量分立、不可共置））；
  * 刷新 = 浏览器重载。
  */
 import { readVersion } from "../version.js";
@@ -53,7 +55,7 @@ export function escapeHtml(value: unknown): string {
     .replace(/'/g, "&#39;");
 }
 
-export type NavKey = "features" | "schedule" | "tasks" | "projects" | "orgs" | "host";
+export type NavKey = "features" | "schedule" | "tasks" | "projects" | "agents" | "orgs" | "host";
 
 /**
  * **提交守卫**（收口轨 14 ①）：页面全部写表单共用的**一段内联脚本**。
@@ -184,7 +186,11 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
       if (card !== null) { body.appendChild(card); }
       if (main !== null) { while (main.firstChild !== null) { body.appendChild(main.firstChild); } }
     }
-    if (!dlg.open) dlg.showModal();
+    if (!dlg.open) { dlg.showModal(); }
+    // 搬运节点不跑内联 script（DOMParser 惰性文档）⇒ 详情页依赖图/文档 mermaid 换入后
+    // 须主动补渲（钩子由 docs-render.mermaidRenderScript 暴露；无该全局 = 本页未挂 mermaid，跳过）。
+    // showModal 在先：渲染不得落在 display:none 容器（98c39da1 前科口径）。
+    if (typeof window.a2aRenderMermaid === "function") { try { window.a2aRenderMermaid(); } catch (err) {} }
     return true;
   }
   function open(a, toggle) {
@@ -267,11 +273,232 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
 })();
 </script>`;
 
+/**
+ * **新增需求弹窗脚本**（REQ-2026-09-26-04 Q1）：排期页页头「＋ 新增需求」按钮 →
+ * `showModal()` 打开 `#new-req-dialog`（骨架由 `views.renderNewRequirementDialog` 渲染，
+ * 内嵌 `views.renderRequirementForm` 的表单（字段/校验/组织选择器原样复用）。
+ *
+ * **提交 = 同源 fetch POST `/requirements`**（照 {@link FEATURE_DETAIL_OVERLAY_SCRIPT}
+ * 增补轨 `65cd03e1` 的先例口径）：
+ * - **2xx/3xx（303 被 fetch 自动跟随 ⇒ 最终页 ok）⇒ 关弹窗 + 整页刷新**——新卡落需求池立即可见；
+ * - **4xx/5xx ⇒ 只抽 `.err-ov-card` 叠加为 dialog 直接子元素**（fixed 居中盖在内容之上，
+ *   不进 `.fd-body` 文档流；样式复用 `dialog.fd > .err-ov-card`），「知道了」经委托摘卡、
+ *   弹窗不关、表单值保留可改后重提；抽不到卡 ⇒ 关弹窗原生提交（整页错误页可见，不静默）；
+ * - **提交后表单状态恢复**：{@link SUBMIT_GUARD_SCRIPT} 在 submit 时禁用提交按钮并挂
+ *   `.submit-pending` 提示行，弹窗内提交不跳页 ⇒ 本脚本处理完响应主动恢复（错误路径必须恢复）；
+ * - 编码纪律：body 必须 urlencoded（`new URLSearchParams(new FormData(form))`），服务端写面
+ *   用 `new URLSearchParams(raw)` 解析，FormData 直投会发成 multipart ⇒ 字段全丢；
+ *   fetch 网络异常 ⇒ 降级 `form.submit()` 原生提交（行为同无 JS）。
+ *
+ * **为什么是独立 dialog id `#new-req-dialog` 而不是复用 `#feat-dialog`**：详情浮层脚本的 submit
+ * 委托拦截 `#feat-dialog` 内全部 POST 表单并做「成功换入 body」——提需求 303 跟随后会把详情页
+ * 换进浮层，与「关弹窗刷新看板」的语义冲突；两脚本互不拦截、各管各的 dialog。
+ *
+ * CSRF 不依赖本脚本：同源 fetch 自动带 `Origin`（`Referrer-Policy: same-origin` 下另带同源
+ * `Referer`），`checkWriteAuth` 两档原样工作。脚本字面量不含用户数据 ⇒ 无注入面
+ * （与 {@link SUBMIT_GUARD_SCRIPT} 同规格：单点常量、纯内联、无 `src=`、无 `</script` 字面量）。
+ */
+export const NEW_REQUIREMENT_DIALOG_SCRIPT = `<script>
+(function () {
+  var dlg = document.getElementById("new-req-dialog");
+  var openBtn = document.getElementById("new-req-open");
+  if (dlg === null || typeof dlg.showModal !== "function") return;
+  var form = dlg.querySelector("form");
+  function restoreForm() {
+    if (form === null) return;
+    var btns = form.querySelectorAll("button[disabled]");
+    for (var i = 0; i < btns.length; i += 1) {
+      btns[i].disabled = false;
+      btns[i].removeAttribute("aria-disabled");
+    }
+    var p = form.querySelector(".submit-pending");
+    if (p !== null && p.parentNode !== null) { p.parentNode.removeChild(p); }
+  }
+  function closeAndReload() { dlg.close(); dlg.returnValue = ""; window.location.reload(); }
+  function dropCard() {
+    var kids = dlg.children;
+    for (var i = kids.length - 1; i >= 0; i -= 1) {
+      if (kids[i].classList.contains("err-ov-card") && kids[i].parentNode !== null) { kids[i].parentNode.removeChild(kids[i]); }
+    }
+  }
+  function showCard(card) {
+    dropCard();
+    dlg.appendChild(card);
+    if (!dlg.open) dlg.showModal();
+  }
+  function submitNative() {
+    if (form === null) return;
+    restoreForm();
+    form.submit();
+  }
+  if (openBtn !== null) {
+    openBtn.addEventListener("click", function () {
+      dropCard();
+      dlg.returnValue = "";
+      dlg.showModal();
+    });
+  }
+  document.addEventListener("click", function (e) {
+    var t = e.target;
+    if (t === null || typeof t.closest !== "function") return;
+    var dismiss = t.closest("#new-req-dialog #err-ov-close");
+    if (dismiss !== null) {
+      e.preventDefault();
+      var card = dismiss.closest(".err-ov-card");
+      if (card !== null && card.parentNode !== null) { card.parentNode.removeChild(card); }
+      return;
+    }
+    if (t.closest("#new-req-close") === null) return;
+    e.preventDefault();
+    dlg.close();
+    dlg.returnValue = "";
+  });
+  if (form !== null) {
+    form.addEventListener("submit", function (e) {
+      e.preventDefault();
+      var data;
+      try { data = new URLSearchParams(new FormData(form)); } catch (err) { data = null; }
+      if (data === null) { submitNative(); return; }
+      dlg.returnValue = "";
+      fetch(form.action, {
+        method: "POST",
+        body: data,
+        credentials: "same-origin",
+        headers: { Accept: "text/html" },
+      }).then(function (res) {
+        return res.text().then(function (text) { return { ok: res.ok, text: text }; });
+      }).then(function (r) {
+        if (!r.ok) {
+          var doc = new DOMParser().parseFromString(r.text, "text/html");
+          var card = doc.querySelector(".err-ov-card");
+          if (card === null) { closeAndReload(); return; }
+          showCard(card);
+          restoreForm();
+          return;
+        }
+        closeAndReload();
+      }).catch(function () { closeAndReload(); });
+    });
+  }
+  dlg.addEventListener("cancel", function () { dlg.returnValue = ""; });
+  dlg.addEventListener("click", function (e) {
+    if (e.target !== dlg) return;
+    var rect = dlg.getBoundingClientRect();
+    var inBox = e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom;
+    if (!inBox) { dlg.close(); dlg.returnValue = ""; }
+  });
+})();
+</script>`;
+
+/**
+ * **排期拖拽脚本**（v0.9.3 B-T5 · REQ-2026-09-26-02 T5）：排期看板卡拖到目标版本列
+ * （需求池列 = `data-version=""` ⇒ 清空排期）⇒ `fetch` POST **复用**
+ * `POST /features/:id/schedule`（`version=<目标>` urlencoded，与详情页排期表单同载荷、
+ * 同 write-guard kind=schedule ⇒ **不新增写路由**）。**成功 = 整页刷新**（列归组以
+ * 引擎回写后的列表为事实源，板不本地乐观挪卡）；**失败 = 抽错误页 `.err-ov-card`
+ * 叠加为 `document.body` 直接子元素**（fixed 居中，复用 `dialog.fd > .err-ov-card`
+ * 的遮罩先例 ⇒ 409 双条件闸 / 已发版锁可见、「知道了」经委托摘卡）；抽不到卡 ⇒
+ * 原生整页导航到错误页兜底可见；fetch 网络异常 ⇒ 提示行后刷新（不静默）。
+ *
+ * 执法永远在服务端（本脚本只是体验层）：闸锁卡片服务端渲染为**无 `draggable` 属性**
+ * （`views.ts` 的 `deriveScheduleGateOpen` 判据），拖不动即拖不了；
+ * 目标列与卡片现版本相同 ⇒ 不发请求（同版重提本为幂等，省一跳）。
+ * `dragover` 需 `preventDefault()` 才能落地；版本列与池列都带 `data-version`，
+ * 以属性存在而非 class 判定，避免与列头徽标样式耦合。
+ *
+ * 与 {@link FEATURE_DETAIL_OVERLAY_SCRIPT} / {@link NEW_REQUIREMENT_DIALOG_SCRIPT}
+ * 同规格：单点常量、纯内联、无 `src=`、不含用户数据、体内无 `</script` 字面量；
+ * **与弹窗常量分立、不可共置**（闭集钉「每枚恰好 1 处」，N3-⑦/⑧）。
+ */
+export const DRAG_SCHEDULE_SCRIPT = `<script>
+(function () {
+  var board = document.getElementById("schedule-board");
+  if (board === null || typeof fetch !== "function" || typeof DragEvent !== "function") return;
+  function colOf(node) {
+    var el = node;
+    while (el !== null && el !== board) {
+      if (el.nodeType === 1 && typeof el.getAttribute === "function" && el.getAttribute("data-version") !== null) return el;
+      el = el.parentNode;
+    }
+    return null;
+  }
+  function dropCard() {
+    var kids = document.body.children;
+    for (var i = kids.length - 1; i >= 0; i -= 1) {
+      if (kids[i].classList && kids[i].classList.contains("err-ov-card") && kids[i].parentNode !== null) { kids[i].parentNode.removeChild(kids[i]); }
+    }
+  }
+  function showCard(card) {
+    dropCard();
+    card.classList.add("drag-err-overlay");
+    document.body.appendChild(card);
+    var btn = card.querySelector("#err-ov-close");
+    if (btn !== null) btn.addEventListener("click", dropCard);
+  }
+  function submitDrag(featureId, version) {
+    fetch("/features/" + encodeURIComponent(featureId) + "/schedule", {
+      method: "POST",
+      body: new URLSearchParams({ version: version }),
+      credentials: "same-origin",
+      headers: { Accept: "text/html" }
+    }).then(function (res) {
+      if (res.ok) { window.location.reload(); return null; }
+      return res.text();
+    }).then(function (text) {
+      if (text === null || text === undefined) return;
+      var doc = new DOMParser().parseFromString(text, "text/html");
+      var card = doc.querySelector(".err-ov-card");
+      if (card === null) { window.location.reload(); return; }
+      showCard(card);
+    }).catch(function () { window.location.reload(); });
+  }
+  document.addEventListener("dragstart", function (e) {
+    var card = e.target !== null && typeof e.target.closest === "function" ? e.target.closest(".kcard[draggable=true]") : null;
+    if (card === null) return;
+    var id = card.getAttribute("data-feature");
+    if (id === null) return;
+    e.dataTransfer.setData("text/plain", id);
+    e.dataTransfer.effectAllowed = "move";
+  });
+  document.addEventListener("dragover", function (e) {
+    var col = colOf(e.target);
+    if (col === null) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    col.classList.add("dragover");
+  });
+  document.addEventListener("dragleave", function (e) {
+    var col = colOf(e.target);
+    if (col !== null) col.classList.remove("dragover");
+  });
+  document.addEventListener("drop", function (e) {
+    var col = colOf(e.target);
+    if (col === null) return;
+    e.preventDefault();
+    col.classList.remove("dragover");
+    var id = e.dataTransfer.getData("text/plain");
+    if (id === "") return;
+    var card = document.querySelector('.kcard[data-feature="' + id + '"]');
+    var target = col.getAttribute("data-version");
+    if (card === null) return;
+    if ((card.getAttribute("data-version") || "") === (target || "")) return;
+    submitDrag(id, target === null ? "" : target);
+  });
+  document.addEventListener("dragend", function (e) {
+    if (e.target !== null && typeof e.target.closest === "function" && e.target.closest(".kcard[draggable=true]") !== null) {
+      var cols = board.querySelectorAll(".kcol.dragover");
+      for (var i = 0; i < cols.length; i += 1) cols[i].classList.remove("dragover");
+    }
+  });
+})();
+</script>`;
+
 const NAV: ReadonlyArray<{ key: NavKey; href: string; text: string }> = [
-  { key: "features", href: "/requirements", text: "需求" },
   { key: "schedule", href: "/schedule", text: "排期" },
   { key: "tasks", href: "/tasks", text: "任务" },
   { key: "projects", href: "/projects", text: "项目 / 机器" },
+  // v0.9.3 B-T3：Agent View（机器表 + 逐项目在飞任务 + 3300 收编的桥身份头）
+  { key: "agents", href: "/agents", text: "Agent" },
   { key: "orgs", href: "/orgs", text: "组织" },
   { key: "host", href: "/host", text: "宿主桥" },
 ];
@@ -283,6 +510,8 @@ export interface PageParams {
   bodyHtml: string;
   /** 页面级口径脚注（B13 / 并行度等，逐条渲染，内部已转义） */
   notes?: readonly string[];
+  /** 页头动作区（随标题渲染的**字面量**按钮等，REQ-2026-09-26-04「＋ 新增需求」；不承载用户数据） */
+  headerActions?: string;
   /** 错误浮层（REQ 弹窗化 · 表单档错误出口专用；全部字段在本函数内 escapeHtml，调用方传原始值） */
   errorOverlay?: ErrorOverlayParams;
 }
@@ -399,6 +628,17 @@ export function renderPage(params: PageParams): string {
   .md .mermaid-block[data-rendered="1"] pre.mermaid-src { display: none; }
   .md .mermaid-block[data-rendered="1"] .mermaid-svg:empty { display: none; }
   .md .mermaid-block svg { max-width: 100%; height: auto; }
+  /* T2 详情页依赖图：与 .md 文档页同构的 mermaid 块样式（选择器另起一行，不并入上行锚定口径） */
+  .dep-graph .mermaid-block { margin: 10px 0; overflow-x: auto; }
+  .dep-graph .mermaid-block[data-rendered="1"] pre.mermaid-src { display: none; }
+  .dep-graph .mermaid-block[data-rendered="1"] .mermaid-svg:empty { display: none; }
+  .dep-graph .mermaid-block svg { max-width: 100%; height: auto; }
+  /* 增补轨 III N1 节点布局放宽：长标签（project + 要点）使画布变宽，整体缩到容器宽会让
+     节点文字不可读 ⇒ 依赖图按原生尺寸渲染、超宽由上面的 overflow-x 横向滚动承担 */
+  .dep-graph .mermaid-block[data-rendered="1"] svg { max-width: none; height: auto; }
+  .dep-graph .mermaid-block .nodeLabel { font-size: 13px; word-break: break-word; }
+  .dg-legend { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; font-size: 12px; color: #667; }
+  .dg-legend i { display: inline-block; width: 12px; height: 12px; border: 1px solid #8886; border-radius: 3px; }
   a.fl { color: inherit; }
   .err-ov { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; background: #0006; padding: 16px; }
   .err-ov-card { max-width: 560px; width: 100%; background: Canvas; border: 1px solid #b4231888; border-radius: 8px; padding: 14px 18px 16px; box-shadow: 0 6px 24px #0004; }
@@ -413,22 +653,31 @@ export function renderPage(params: PageParams): string {
   .kcol { flex: 0 0 260px; border: 1px solid #8884; border-radius: 6px; background: #8881; padding: 6px 8px 8px; }
   .kcol > h3 { font-size: 13px; margin: 2px 0 8px; border-bottom: 1px solid #8884; padding-bottom: 4px; }
   .kcard { border: 1px solid #8884; border-radius: 6px; background: Canvas; padding: 6px 8px; margin: 0 0 6px; font-size: 12px; }
+  .kcard[draggable="true"] { cursor: grab; }
+  .kcard.draglocked { opacity: .55; }
+  .kcard .draglock { color: #b26a00; border-color: #b26a0088; }
+  .kcol.dragover { outline: 2px dashed #5b86a8; outline-offset: -2px; }
+  .err-ov-card.drag-err-overlay { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; width: min(560px, 92vw); z-index: 70; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }
   .kbadge { float: right; margin-left: 6px; font-size: 11px; color: #567; border: 1px solid #8886; border-radius: 8px; padding: 0 6px; white-space: nowrap; }
   .vbadge { float: none; cursor: help; }
   .vbadge.locked { color: #654321; border-color: #a67c52; background: #f3e5d0; font-weight: 600; }
   .vbadge.wip { color: #25567a; border-color: #5b86a8; background: #e3eef7; }
   .vbadge.closed { color: #3a5a40; border-color: #6b8f71; background: #e6f0e8; }
   .kmeta { margin: 4px 0 0; color: #667; font-size: 11px; }
+  .tpoints { margin: 4px 0 0; padding-left: 16px; color: #667; font-size: 11px; }
+  .tpoints li { margin: 1px 0; }
+  .tpoints .tcurrent { color: inherit; font-weight: 600; }
   dialog.fd { width: min(880px, 92vw); max-height: 86vh; overflow-y: auto; margin: auto; border: 1px solid #8888; border-radius: 8px; padding: 12px 18px 16px; background: Canvas; color: CanvasText; box-shadow: 0 8px 32px #0005; }
   dialog.fd::backdrop { background: #0006; }
   dialog.fd > button { margin: 0 0 8px; }
   dialog.fd .fd-body > h2:first-child { margin-top: 0; }
   dialog.fd > .err-ov-card { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; z-index: 60; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }
+  .header-actions { float: right; margin-top: 2px; }
 </style>
 </head>
 <body>
 <header>
-  <h1>${escapeHtml(params.title)}</h1>
+  <h1>${escapeHtml(params.title)}</h1>${params.headerActions ?? ""}
   <nav>${nav} <span class="muted mono">board v${escapeHtml(readVersion())} · 只读 + 提需求</span></header>
 <main>
 ${params.bodyHtml}

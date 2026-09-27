@@ -439,6 +439,12 @@ export interface FeatureCreateArgs extends RegistrationInput {
   requirement?: string;
   /** Feature 级会话上下文（落 `features.context_id`，跨任务 / 跨 worker 启停复用） */
   contextId?: string;
+  /**
+   * **父需求登记**（v0.9.3 O1）：增补轨挂主需求的单值父引用（落 `features.parent_feature_id`）。
+   * 存在性 + 可见性校验 fail-closed（不可见 ⇒ 与不存在同一拒绝码，不泄漏他组存在性）；
+   * 父链**只存不解析**（不递归、不判环）。
+   */
+  parentFeatureId?: string;
 }
 
 export interface FeatureCreateSuccess {
@@ -448,6 +454,8 @@ export interface FeatureCreateSuccess {
   title: string;
   /** 回显入参 contextId（已随 createFeature 持久化到 features.context_id） */
   contextId?: string;
+  /** 回显父需求（v0.9.3 O1：仅带父创建时出现，同 contextId 回显口径） */
+  parentFeatureId?: string;
   /** 登记字段回显（v0.9.0 B1″：恒有值 —— 未传即缺省，见 {@link DEFAULT_FEATURE_STAGE}） */
   stage: FeatureStage;
   version: string;
@@ -467,6 +475,20 @@ export function handleFeatureCreate(
   // ⇒ **不传三参数的既有调用行为逐字不变**（缺省恰为「改造方案 + 待审批」= 既有语义）
   const reg = parseRegistration(args);
   if (reg.ok === false) return reg;
+  // 父需求校验（v0.9.3 O1，零写入前）：存在性 + 可见性走带身份过滤读口
+  // （`ownershipFailure` 同源判据，禁止第二套）⇒ 不存在与他组不可见**同一拒绝码**
+  // `feature_not_found`（不泄漏他组 Feature 的存在性，fail-closed）。只存不解析：不递归、不判环。
+  if (args.parentFeatureId !== undefined) {
+    const parent = getFeature(args.parentFeatureId);
+    const visible = parent !== null && ownershipFailure(parent, identity) === null;
+    if (!visible) {
+      return {
+        ok: false,
+        code: "feature_not_found",
+        error: `父 Feature ${args.parentFeatureId} 不存在或不可见（带身份过滤读口，fail-closed）`,
+      };
+    }
+  }
   const featureId = randomUUID();
   const rec = createFeature({
     featureId,
@@ -475,6 +497,8 @@ export function handleFeatureCreate(
     contextId: args.contextId ?? null,
     // 入口打标：归属 = 本次连接身份（组名）；无身份 ⇒ NULL（无归属，fail-closed 存量语义）
     ownerGroup: identity,
+    // v0.9.3 O1：父需求一次性登记（重跑不改父，同 owner_group 语义）
+    parentFeatureId: args.parentFeatureId ?? null,
     // 主链起点 = 审批门停靠点（REQ-v0.4.1-2026-09-16-01 §2.3）：引擎只做需求实现，
     // 前段讨论 / 方案（Step 0/1）不走引擎；`waiting_approval → executing` 只能经 `a2a_feature_approve`
     state: "waiting_approval",
@@ -494,6 +518,8 @@ export function handleFeatureCreate(
     approval: rec.approval,
   };
   if (rec.contextId !== null) success.contextId = rec.contextId;
+  // v0.9.3 O1：回显**落库后读回**的父需求（仅带父创建时出现，同 contextId 口径）
+  if (rec.parentFeatureId !== null) success.parentFeatureId = rec.parentFeatureId;
   return success;
 }
 

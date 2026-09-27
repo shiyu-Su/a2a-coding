@@ -125,60 +125,43 @@ async function get(base, path, method = "GET") {
   return { status: res.status, text, headers: res.headers };
 }
 
-test("GET /requirements 需求列表：渲染派生阶段 + taskCount；桥一次调用（无 N+1）", async () => {
+test("GET /requirements ⇒ 303 回首页（REQ-04 Q2 列表页退役；不触桥）", async () => {
   await withServer(async (base, calls) => {
-    const res = await get(base, "/requirements");
+    const res = await fetch(`${base}/requirements`, { redirect: "manual" });
+    assert.equal(res.status, 303);
+    assert.equal(res.headers.get("location"), "/");
+    await res.body?.cancel();
+    assert.deepEqual(calls, [], "退役地址只做重定向，不触桥");
+  });
+});
+
+test("GET / 首页需求卡：渲染派生阶段徽标 + taskCount；桥一次调用（无 N+1）", async () => {
+  await withServer(async (base, calls) => {
+    const res = await get(base, "/");
     assert.equal(res.status, 200);
     assert.match(res.text, /需求甲/);
     assert.match(res.text, /改造中/);
-    assert.match(res.text, /<td>4<\/td>/);
+    assert.match(res.text, /任务数：4/, "卡片带 taskCount（列表自带、无二次查询）");
     assert.deepEqual(calls, ["getFeatures"]);
   });
 });
 
-test("GET /?state=… ⇒ 板内存过滤（桥列表调用不带 query，REQ-v0.9.2 N4）", async () => {
-  const many = {
-    features: [
-      { featureId: "F1", state: "executing", title: "甲", taskCount: 1, ownerGroup: null, stage: "改造方案", version: "v0.9.0", approval: "已通过", createdAt: null, updatedAt: null, stateCounts: { working: 1 } },
-      { featureId: "F2", state: "completed", title: "乙", taskCount: 0, ownerGroup: null, stage: null, version: "v0.9.0", approval: "已通过", createdAt: null, updatedAt: null, stateCounts: {} },
-      { featureId: "F3", state: "completed", title: "丙", taskCount: 0, ownerGroup: null, stage: null, version: "v0.9.1", approval: "待审批", createdAt: null, updatedAt: null, stateCounts: {} },
-    ],
-    stateCounts: { working: 1, completed: 2 },
-  };
-  await withServer(
-    async (base, calls) => {
-      const pos = await get(base, "/requirements?state=completed");
-      assert.equal(pos.status, 200);
-      assert.match(pos.text, /过滤后 2 \/ 共 3 条/);
-      assert.match(pos.text, /乙/);
-      assert.match(pos.text, /丙/);
-      assert.ok(!pos.text.includes(">甲<"));
-      // 各态分布保持全列表口径（不随过滤重算）
-      assert.match(pos.text, /completed=2/);
-      const ver = await get(base, "/requirements?state=completed&version=v0.9.1");
-      assert.match(ver.text, /过滤后 1 \/ 共 3 条/);
-      assert.match(ver.text, /丙/);
-      const neg = await get(base, "/requirements?state=no_such_state");
-      assert.equal(neg.status, 200);
-      assert.match(neg.text, /过滤后 0 \/ 共 3 条/);
-      assert.match(neg.text, /无匹配需求/);
-      const none = await get(base, "/requirements");
-      assert.match(none.text, /共 3 条/);
-      assert.ok(!/过滤后/.test(none.text));
-      // 覆盖版 getFeatures 不记录调用 ⇒ calls 保持空 = 全程**没有任何额外桥调用**（无逐行 N+1、query 不触桥）
-      assert.deepEqual(calls, []);
-    },
-    {
-      async getFeatures() {
-        return many;
-      },
-    },
-  );
+test("过滤参数随列表页退役：`/` 与 `/requirements` 均不消费 query（REQ-04 Q3）", async () => {
+  await withServer(async (base, calls) => {
+    const res = await get(base, "/?state=completed");
+    assert.equal(res.status, 200);
+    assert.match(res.text, /<title>排期看板 · board<\/title>/, "看板恒全量渲染，过滤参数无效果");
+    assert.doesNotMatch(res.text, /过滤后|filter-form/, "过滤表单已随列表页删除");
+    const redirected = await fetch(`${base}/requirements?state=completed`, { redirect: "manual" });
+    assert.equal(redirected.status, 303, "带 query 的旧深链同样 303 回首页");
+    await redirected.body?.cancel();
+    assert.deepEqual(calls, ["getFeatures"], "仅首页渲染触桥一次，重定向零触达");
+  });
 });
 
 test("HTML 应答带强 CSP + no-store；页面同源无外部资源", async () => {
   await withServer(async (base) => {
-    const res = await get(base, "/requirements");
+    const res = await get(base, "/");
     assert.match(res.headers.get("content-security-policy"), /default-src 'none'/);
     assert.equal(res.headers.get("cache-control"), "no-store");
     assert.doesNotMatch(res.text, /src="http/);
@@ -290,7 +273,7 @@ test("只读面：非 GET 一律 405；未知路径 404；/health 保留", async
 test("桥不可达 ⇒ 502 页面如实可见（不静默、不缓存旧数据；REQ-v0.9.2 N2 起套 BD2 浮层版式）", async () => {
   await withServer(
     async (base) => {
-      const res = await get(base, "/requirements");
+      const res = await get(base, "/");
       assert.equal(res.status, 502);
       // 整页 = errorPage 统一版式：错误正文改由浮层承载（族名标题 / error / mono code /「知道了」）
       assert.match(res.text, /class="err-ov"/, "桥宕页必须套 BD2 浮层");

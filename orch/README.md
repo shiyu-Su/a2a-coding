@@ -5,9 +5,9 @@
 ## 整体形态
 
 - **接入面**：**常驻 stateless Streamable HTTP**（唯一形态；**stdio 已于 v0.7.1 退役**），桥经 `bridgectl` 常驻，以 **stateless Streamable HTTP** 暴露 MCP（路由 `POST /mcp`、`GET /health`、`POST /shutdown`），宿主经 MCP `type: "remote"` 连接。配组后端点亦可写成 **`POST /<组名>/mcp`**（组身份，见「连接身份与可见性」）。
-- **工具面**：泛型工具 7（`a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` / `a2a_events` / `a2a_wait`）+ Feature 工具组 6（`a2a_feature_create` / `a2a_feature_status` / `a2a_feature_advance` / `a2a_feature_approve` / `a2a_feature_cancel` / `a2a_feature_trace`），静态注册、零重连。`a2a_feature_trace`（v0.8.10 O-N3）是**只读**排队可见面，与工作台 `/api/features/:id/trace` 复用同一实现。
+- **工具面**：泛型工具 7（`a2a_projects` / `a2a_call` / `a2a_task_status` / `a2a_tasks` / `a2a_cancel` / `a2a_events` / `a2a_wait`）+ Feature 工具组 6（`a2a_feature_create` / `a2a_feature_status` / `a2a_feature_advance` / `a2a_feature_approve` / `a2a_feature_cancel` / `a2a_feature_trace`），静态注册、零重连。`a2a_feature_trace`（v0.8.10 O-N3）是**只读**排队可见面，与数据面 `/api/features/:id/trace` 复用同一实现。
 - **单实例与单调度权**：靠 core 租约（`core.lock`）—— 只有租约持有者运行 scheduler 与 task-watcher；同一 data dir 的第二个实例降级为 `follower`，照常提供 MCP 工具但不跑后台循环。`GET /health` 报当前 `role`（`owner` / `follower`）。
-- **只读工作台**：常驻形态下可另起只读 HTTP 服务（默认仅 `owner`、绑 loopback），只读自桥的 SQLite（含 Runner 注册投影 `runners` / `runner_projects`），不做第二编排入口。**它是运维全量视图，不是身份面**（见「只读工作台（3300）」）。
+- **只读数据面（3300）**：常驻形态下可另起只读 HTTP 服务（默认仅 `owner`、绑 loopback），只读自桥的 SQLite（含 Runner 注册投影 `runners` / `runner_projects`），不做第二编排入口。**3300 仅剩 `/api/*` 数据面，页面已由 Board 取代**（v0.9.3 起 `GET /` 返回 404）。**它是运维全量视图，不是身份面**（见「只读数据面（3300）」）。
 
 ## 连接身份与可见性
 
@@ -23,11 +23,12 @@
 - **组间互斥**：同一 `(machineId, projectId)` 出现在两个组 ⇒ **配置期 fail-fast**（桥拒绝启动，不 bind）。
 - ⚠ **组不是鉴权边界，`/mcp` 零鉴权**：`/<组名>/mcp` 上的组名只决定「视野收窄到哪」，**不决定「谁能连」** —— 任何能访问该端口的进程写上组名即取得该组视野。真正的访问控制（跨机鉴权 / 反向代理）归已登记的「安全与治理」待办，本单元不提供；桥的 loopback 绑定与 Runner 侧 Bearer 是各自独立的另一回事。
 
-## 只读工作台（3300）
+## 只读数据面（3300）
 
-- ⚠ **3300 不作为 orch agent 的身份面**：网页接面注入的是**「全量身份」的内核视图**，即**运维全量视图** —— 一眼看全桥所有组的项目 / 任务 / Feature / 事件；**不存在**「按组渲染」的网页入口，也不接受任何身份参数。
-- 要**本组视野**只能走 MCP 端点 `/<组名>/mcp`（见上节），不是在网页上切换。
-- 因此网页侧的可见范围**始终 ⊇** 任一组身份的连接；运维页面用于观察与排障，不用于编排。
+- **3300 仅剩 `/api/*` 数据面**：原内联「只读工作台」页面（`GET /`）已于 v0.9.3 退役，页面由 Board 取代；`GET /` 现返回 404 JSON。出参契约零增减：`/api/projects`（`runners` 在其出参内，非独立端点）/ `/api/features[/:id][/trace]` / `/api/tasks[/:id]` / `/api/events`。
+- ⚠ **3300 不作为 orch agent 的身份面**：数据面注入的是**「全量身份」的内核视图**，即**运维全量视图** —— 一眼看全桥所有组的项目 / 任务 / Feature / 事件；**不存在**「按组渲染」的数据入口，也不接受任何身份参数。
+- 要**本组视野**只能走 MCP 端点 `/<组名>/mcp`（见上节），不是在 3300 上切换。
+- 因此数据面侧的可见范围**始终 ⊇** 任一组身份的连接；Board 经 `/api/*` 读数据用于观察与排障，不用于编排。
 
 ## Runner 反向注册（pull）
 

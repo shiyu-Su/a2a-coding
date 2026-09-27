@@ -4,6 +4,9 @@
  * 需求池（判据单一、池序 createdAt 降序 null 落底 featureId 兜底、卡上需求原文截断转义）/
  * HTTP 面（GET 200 + 导航高亮 / 方法门 405 / 桥不可达 502）/ 导航闭集六项。
  * REQ-v0.9.2-2026-09-26-02 增补 ④ —— 详情浮层：dialog 骨架 + 内联脚本常量规格 + `<a>` 回退。
+ * REQ-2026-09-26-02 T5 —— 拖拽排期视图闸：可拖属性仅「想法挪版」态出、锁态置灰 + 紧凑标记（增补 ①
+ * 降噪：长说明只在 409 错误卡）、
+ * `#schedule-board` / 列 `data-version`（池列空串）落点、拖拽脚本常量规格（与浮层常量分立）。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -16,7 +19,12 @@ import {
   renderSchedule,
   selectRequirementPool,
 } from "../dist/web/views.js";
-import { FEATURE_DETAIL_OVERLAY_SCRIPT, renderPage } from "../dist/web/layout.js";
+import {
+  DRAG_SCHEDULE_SCRIPT,
+  FEATURE_DETAIL_OVERLAY_SCRIPT,
+  NEW_REQUIREMENT_DIALOG_SCRIPT,
+  renderPage,
+} from "../dist/web/layout.js";
 import { createBoardServer } from "../dist/server.js";
 
 function feature(featureId, version, overrides = {}) {
@@ -158,6 +166,109 @@ test("M5-③ renderSchedule 池列恒在: 空池如实「无未排期需求」�
   const html = renderSchedule([], selectRequirementPool([feature("F1", null)]));
   assert.match(html, /无已排期需求.*都在需求池列/s);
   assert.match(html, /\/features\/F1/);
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.3 B1 增补徽标（排期卡 / 池卡 · fixture 自构造，不依赖真桥 O1）
+// ---------------------------------------------------------------------------
+
+test("B1-① renderSchedule 卡: parentFeatureId 非空 ⇒「增补 · 父需求」徽标 + 单跳深链", () => {
+  const html = renderSchedule(
+    groupFeaturesByVersion([feature("A1", "v0.9.3", { parentFeatureId: "P1" })]),
+    selectRequirementPool([feature("A2", null, { parentFeatureId: "P2" })]),
+  );
+  assert.match(html, /<span class="kbadge">增补 · 父需求 <a class="fl" href="\/features\/P1">P1<\/a><\/span>/);
+  assert.match(html, /增补 · 父需求 <a class="fl" href="\/features\/P2">P2<\/a>/, "池卡同款徽标");
+});
+
+test("B1-② renderSchedule 卡: 无 parentFeatureId（缺省 null）⇒ 不徽标（老桥口径）", () => {
+  const html = renderSchedule(groupFeaturesByVersion([feature("A1", "v0.9.3")]), []);
+  assert.doesNotMatch(html, /增补 · 父需求/);
+});
+
+test("B1-③ 增补徽标只取一层不递归：父链 href 只做编码拼接 + 文本转义", () => {
+  const html = renderSchedule(
+    groupFeaturesByVersion([feature("A1", "v0.9.3", { parentFeatureId: `P/x"><script>` })]),
+    [],
+  );
+  assert.match(
+    html,
+    /href="\/features\/P%2Fx%22%3E%3Cscript%3E"/,
+    "href 经 encodeURIComponent，不注入原串",
+  );
+  assert.doesNotMatch(html, /<script>/, "徽标文本不得逃逸成脚本");
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.3 B-T5 拖拽排期（视图层闸：可拖 = 想法挪版 · 置灰 = 需求已确认）
+// ---------------------------------------------------------------------------
+
+/** 取某张卡的完整 HTML（卡内无嵌套 div ⇒ 以 `<div class="kcard` 切段即可定位）。 */
+function cardOf(html, featureId) {
+  const cards = html.split('<div class="kcard').slice(1);
+  const hit = cards.find((c) => c.includes(`href="/features/${featureId}"`));
+  assert.ok(hit !== undefined, `未找到 ${featureId} 的卡片`);
+  return hit;
+}
+
+test("T5-① 卡片拖拽属性: 仅「stage=需求分析 ∧ approval=未发起」出 draggable + data-feature/data-version；闸锁卡只留紧凑标记", () => {
+  const html = renderSchedule(
+    groupFeaturesByVersion([
+      feature("IDEA", "v0.9.3", { stage: "需求分析", approval: "未发起" }),
+      feature("CONFIRMED", "v0.9.3", { stage: "改造方案", approval: "已通过" }),
+    ]),
+    [],
+  );
+  const idea = cardOf(html, "IDEA");
+  assert.match(idea, /^" draggable="true"/, "想法卡可拖（属性挂在卡根节点上）");
+  assert.match(idea, /data-feature="IDEA"/);
+  assert.match(idea, /data-version="v0\.9\.3"/, "卡片带现版本 ⇒ 拖同列 = 无操作（脚本早退）");
+  assert.doesNotMatch(idea, /draglocked|🔒 排期已锁/, "放行卡不置灰、不出锁定标记");
+  const locked = cardOf(html, "CONFIRMED");
+  assert.doesNotMatch(locked, /draggable=/, "已确认卡不出拖拽属性（不是「拖了再拒」）");
+  assert.match(locked, /^ draglocked"/, "置灰类（cardOf 以 kcard 起头切段 ⇒ 段首是类名余部）");
+  // 增补 ① 降噪：卡面 = 紧凑标记（🔒 + 短文案），完整说明只随拖拽被拒的 409 错误卡呈现
+  assert.match(locked, /<span class="kbadge draglock">🔒 排期已锁<\/span>/, "紧凑锁定标记在场");
+  assert.doesNotMatch(locked, /需求确认单|本板不提供解除入口|Step 0/, "长文案（为何锁/解除入口/去处）不上卡面");
+  assert.match(locked, /href="\/features\/CONFIRMED"/, "卡片仍可点击（拖不动 ≠ 打不开）");
+});
+
+test("T5-② 闸判据两条件缺一即锁（含老桥 null ⇒ fail-closed），与池卡同口径", () => {
+  const cases = [
+    ["approval 已发起", { stage: "需求分析", approval: "待审批" }],
+    ["stage 已进改造方案", { stage: "改造方案", approval: "未发起" }],
+    ["老桥缺登记字段", { stage: null, approval: null }],
+  ];
+  for (const [label, over] of cases) {
+    const html = renderSchedule([], selectRequirementPool([feature("P1", null, over)]));
+    assert.doesNotMatch(html, /draggable=/, `${label} ⇒ 池卡同样不可拖`);
+    assert.match(html, /draglocked/, `${label} ⇒ 置灰`);
+  }
+  const open = renderSchedule([], selectRequirementPool([feature("P1", null, { stage: "需求分析", approval: "未发起" })]));
+  assert.match(open, /draggable="true" data-feature="P1" data-version=""/, "池卡现版本 = 空串，仍带 data-version（拖到版本列才生效）");
+});
+
+test("T5-③ 看板容器与列落点: #schedule-board + 每列 data-version（池列 = 空串 = 清空排期）", () => {
+  const html = renderSchedule(
+    groupFeaturesByVersion([feature("F1", "v0.9.3"), feature("F2", "backlog-x")]),
+    selectRequirementPool([feature("F3", null)]),
+  );
+  assert.match(html, /<div class="kanban" id="schedule-board">/, "拖拽脚本的单点锚");
+  assert.match(html, /<div class="kcol" data-version="v0\.9\.3">/);
+  assert.match(html, /<div class="kcol" data-version="backlog-x">/, "非 semver 列同样是落点");
+  assert.match(html, /<div class="kcol" data-version="">\s*<h3>需求池/, "池列 data-version 空串 ⇒ 拖入 = 清空排期");
+  assert.match(html, /data-version="backlog-x"/, "列版本经转义（不裸拼）");
+});
+
+test("T5-④ 拖拽脚本常量规格（与弹窗常量分立）：一段内联 · 零外源 · 零求值 · 不含用户数据", () => {
+  assert.match(DRAG_SCHEDULE_SCRIPT, /^<script>/);
+  assert.doesNotMatch(DRAG_SCHEDULE_SCRIPT, /<script[^>]*src=/, "无 src=（CSP 资产白名单不扩）");
+  assert.doesNotMatch(DRAG_SCHEDULE_SCRIPT, /eval|new Function|document\.write/);
+  const body = DRAG_SCHEDULE_SCRIPT.replace(/^<script>/, "").replace(/<\/script>$/, "");
+  assert.doesNotMatch(body, /<\/script/, "脚本体内不得出现 </script 字面量");
+  assert.doesNotMatch(DRAG_SCHEDULE_SCRIPT, /F1|v0\.9\./, "不嵌任何用户数据（列/卡数据只经 data-* 属性读取）");
+  assert.notEqual(DRAG_SCHEDULE_SCRIPT, FEATURE_DETAIL_OVERLAY_SCRIPT, "与详情浮层常量分立、不可共置");
+  assert.ok(!DRAG_SCHEDULE_SCRIPT.includes("feat-dialog"), "不含浮层逻辑（各管一事）");
 });
 
 // ---------------------------------------------------------------------------
@@ -441,18 +552,85 @@ test("M4-⑥ GET /schedule: 200 + 导航「排期」高亮 + 版本列有序；�
   });
 });
 
-test("N2-④ 注入面 = schedule kind 页：`/` 与 `/schedule` 都注入；非看板页不注入", async () => {
+test("N2-④ 注入面 = schedule kind 页：`/` 与 `/schedule` 都注入；非看板页不注入（REQ-04：新增需求弹窗脚本同注入面）", async () => {
   await withScheduleServer(fakeClient([feature("F1", "v0.9.2"), feature("F3", null)]), async (base) => {
     for (const path of ["/", "/schedule"]) {
       const text = await (await fetch(`${base}${path}`)).text();
       assert.ok(text.includes(FEATURE_DETAIL_OVERLAY_SCRIPT), `${path} 含浮层脚本`);
       assert.match(text, /<dialog class="fd" id="feat-dialog">/, `${path} 含 dialog 骨架`);
+      assert.ok(text.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), `${path} 含新增需求弹窗脚本`);
+      assert.match(text, /<dialog class="fd" id="new-req-dialog">/, `${path} 含新增需求 dialog 骨架`);
+      assert.match(text, /<button type="button" id="new-req-open"/, `${path} 页头有「＋ 新增需求」按钮`);
     }
-    for (const path of ["/requirements", "/tasks", "/projects"]) {
+    for (const path of ["/tasks", "/projects", "/orgs", "/host"]) {
       const text = await (await fetch(`${base}${path}`)).text();
       assert.ok(!text.includes(FEATURE_DETAIL_OVERLAY_SCRIPT), `${path} 不注入浮层脚本`);
+      assert.ok(!text.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), `${path} 不注入弹窗脚本`);
     }
+    // 退役页 = 303 回 `/`（跟随后落看板 ⇒ 脚本随首页注入，但重定向本身不渲染正文）
+    const redicted = await fetch(`${base}/requirements`, { redirect: "manual" });
+    assert.equal(redicted.status, 303);
+    assert.equal(redicted.headers.get("location"), "/");
   });
+});
+
+test("增补② 注入面：排期页同挂 vendored mermaid + 渲染脚本（浮层换入的依赖图补渲）；非看板页不挂", async () => {
+  await withScheduleServer(fakeClient([feature("F1", "v0.9.2")]), async (base) => {
+    const text = await (await fetch(`${base}/schedule`)).text();
+    assert.match(text, /<script src="\/static\/mermaid\.min\.js" defer><\/script>/, "库先（defer 于解析末段执行）");
+    assert.match(text, /window\.a2aRenderMermaid = renderBlocks/, "渲染脚本（含补渲钩子）随后");
+    assert.ok(
+      text.indexOf('/static/mermaid.min.js') < text.indexOf("window.a2aRenderMermaid = renderBlocks"),
+      "注入顺序 = 先库后渲染脚本（浮层脚本只**引用**钩子名，不含赋值，故以赋值为序标）",
+    );
+    const other = await (await fetch(`${base}/tasks`)).text();
+    assert.ok(!other.includes("a2aRenderMermaid"), "非浮层承载页不挂 mermaid 脚本");
+  });
+});
+
+test("增补① 锁定说明归属：409 服务端文案完整保留（卡面降噪后此文案是长说明唯一落点）", async () => {
+  const client = fakeClient([feature("LOCKED", "v0.9.2", { stage: "改造方案", approval: "已通过" })], {
+    // 排期写的前置读走 getFeature（不提供 ⇒ 读面失败落 502，见 server-schedule-write M3-⑤b）
+    async getFeature(featureId) {
+      return {
+        feature: {
+          featureId,
+          state: "executing",
+          title: "已确认需求",
+          plan: null,
+          ownerGroup: "alpha",
+          stage: "改造方案",
+          version: "v0.9.2",
+          approval: "已通过",
+          decisions: null,
+          contracts: null,
+          createdAt: "c",
+          updatedAt: "u",
+        },
+        tasks: [],
+        acceptance: null,
+      };
+    },
+  });
+  const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client });
+  try {
+    const base = `http://127.0.0.1:${handle.port}`;
+    const cardText = await (await fetch(`${base}/schedule`)).text();
+    assert.ok(!/本板不提供解除入口|需求确认单经用户确认后/.test(cardText), "长文案不在排期页卡面");
+    const res = await fetch(`${base}/features/LOCKED/schedule`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { origin: base, "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({ version: "v0.9.9" }).toString(),
+    });
+    assert.equal(res.status, 409);
+    const text = await res.text();
+    assert.match(text, /board_schedule_state_locked/);
+    assert.match(text, /需求确认单经用户确认后（stage 迁「改造方案」\/ approval 过门）该需求的排期即不可在本板改动/, "409 错误卡携完整为何锁说明");
+    assert.match(text, /主需求 cancel 后从 Step 0 新建[\s\S]*本板不提供解除入口/, "409 错误卡携去处");
+  } finally {
+    await handle.close();
+  }
 });
 
 test("N4-④ HTTP 面：config 登记的已发版版本在 /schedule 列头显示「已发版」；未登记版标「进行中」（增补 ②）", async () => {

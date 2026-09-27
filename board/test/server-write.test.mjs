@@ -392,12 +392,14 @@ test("BD7-⑥（负向）：读面路径的非 GET 一律仍 405；写路径只�
         assert.match(res.text, /仅支持 GET/);
         assert.match(res.text, /\/requirements/, "405 文案须点明放开的写路径");
       }
-      const getOnWritePath = await req(base, "/requirements", { method: "GET" });
-      // REQ-v0.9.2 N1：GET/POST 同路径双义（GET = 需求页读面，POST = 提需求写面）—— 宿主微裁接受
-      assert.equal(getOnWritePath.status, 200, "GET /requirements = 需求页读面");
+      const getOnWritePath = await fetch(`${base}/requirements`, { method: "GET", redirect: "manual" });
+      // REQ-2026-09-26-04 Q2：同路径双义已终结 —— GET = 303 回首页（列表页退役），POST 仍是提需求写面
+      assert.equal(getOnWritePath.status, 303, "GET /requirements = 303 回首页");
+      assert.equal(getOnWritePath.headers.get("location"), "/");
+      await getOnWritePath.body?.cancel();
       const putOnWritePath = await req(base, "/requirements", { method: "PUT" });
-      assert.equal(putOnWritePath.status, 405, "N1 双义路径：PUT 不落写面（只认 POST），落读面方法门 ⇒ 405");
-      assert.deepEqual(calls, ["getFeatures"], "GET /requirements 渲染需求页恰一次触桥；方法门判定本身不触桥");
+      assert.equal(putOnWritePath.status, 405, "退役路径的其它方法不放开（只认 POST），落读面方法门 ⇒ 405");
+      assert.deepEqual(calls, [], "GET 重定向与 405 均不触桥（写面方法门判定本身不触桥）");
     },
     { defaultGroup: "g" },
   );
@@ -456,10 +458,10 @@ test("BD11-⑥（负向锚）：板不写状态机迁移 —— approve/cancel �
   );
 });
 
-test("BD7-⑦（BD11 反转）：需求页表单**含**组织名字段；只读渲染与 CSP 均未变", async () => {
+test("BD7-⑦（BD11 反转）：提需求表单**含**组织名字段（REQ-04 Q2 起在首页弹窗内）；只读渲染与 CSP 均未变", async () => {
   // 未配默认组织 ⇒ 组织名带 required（前端便利；硬校验仍在服务端）
   await withServer(async (base, calls) => {
-    const res = await req(base, "/requirements");
+    const res = await req(base, "/");
     assert.equal(res.status, 200);
     assert.match(res.text, /<form method="post" action="\/requirements"/);
     assert.match(res.text, /name="title"/);
@@ -469,13 +471,18 @@ test("BD7-⑦（BD11 反转）：需求页表单**含**组织名字段；只读�
     assert.match(res.text, /首次填写即创建该组织/, "表单须说明「首次使用该组织名 = 创建该组织」");
     // N3：本文件默认未装配宿主面 ⇒ 首页表单旁如实标 orgsDir 未装配
     assert.match(res.text, /组织目录根（orgsDir）未装配/);
-    // 收口轨 14：页面引入**唯一一段同源内联提交守卫**（无外源 src=）
+    // 收口轨 14：页面引入**同源内联脚本**（提交守卫等，无外源 src=）；
+    // 增补② 起排期页另挂**同源 vendored** 资产（/static/mermaid.min.js，浮层换入依赖图补渲）⇒
+    // 「零 src=」放宽为「src= 只许同源相对 /static/」，外源仍封死（CSP script-src 两档 + 下方主机面断言）。
     assert.match(res.text, /<script>/);
-    assert.doesNotMatch(res.text, /<script[^>]*src=/, "不得引入外源脚本");
+    for (const m of res.text.matchAll(/<script[^>]*src="([^"]*)"/g)) {
+      assert.match(m[1], /^\/static\//, `src= 只许同源 /static/（实际 ${m[1]}）`);
+    }
+    assert.doesNotMatch(res.text, /<script[^>]*src="(https?:|\/\/)/, "不得引入外源脚本");
     assert.match(res.text, /data-submit=/, "写表单须带提交守卫的就地反馈文案");
-    // 既有只读渲染照旧
+    // 既有只读渲染照旧（REQ-04 Q2：列表页退役后由排期看板承载同一份 features 读面）
     assert.match(res.text, /需求甲/);
-    assert.match(res.text, /<td>4<\/td>/);
+    assert.match(res.text, /任务数：4/);
     assert.deepEqual(calls, ["getFeatures"]);
     // CSP（收口轨 14 + BD14 + 增补轨 2 明示口径）：default-src 仍 'none'、form-action 仍限同源；
     // script-src = 'unsafe-inline'（页面内字面量脚本）+ 'self'（同源 vendored /static 资产），
@@ -496,26 +503,26 @@ test("BD7-⑦（BD11 反转）：需求页表单**含**组织名字段；只读�
   });
   // 配了默认组织 ⇒ 组织名可不填，且把默认值如实显示在字段旁（不伪装成必填）
   await withServer(async (base) => {
-    const res = await req(base, "/requirements");
+    const res = await req(base, "/");
     assert.match(res.text, /name="group"/);
     assert.doesNotMatch(res.text, /name="group"[^>]*required/, "有默认组织 ⇒ 该字段允许留空");
     assert.match(res.text, /留空 = 用板级默认 board-default-org/);
   }, { defaultGroup: "board-default-org" });
 });
 
-test("N3（真 HTTP）：需求页表单旁 orgsDir 提示随宿主面状态三档渲染（就绪 / 配了但不可用）", async () => {
+test("N3（真 HTTP）：提需求表单旁 orgsDir 提示随宿主面状态三档渲染（就绪 / 配了但不可用）", async () => {
   const faceWith = (orgsDir, problem) => ({
     configView: () => ({ orgsDir, defaultOrg: null, kind: "claude" }),
     orgsDirProblem: () => problem,
   });
   await withServer(async (base) => {
-    const res = await req(base, "/requirements");
+    const res = await req(base, "/");
     assert.equal(res.status, 200);
     assert.match(res.text, /组织目录根（orgsDir）<b>就绪<\/b>/);
     assert.match(res.text, /C:\/orgs\/live/);
   }, { hostFace: faceWith("C:/orgs/live", null) });
   await withServer(async (base) => {
-    const res = await req(base, "/requirements");
+    const res = await req(base, "/");
     assert.match(res.text, /class="hint err"/, "不可用档须走红字错误样式");
     assert.match(res.text, /board_orgs_dir_missing/);
     assert.match(res.text, /组织目录根不存在：C:\\orgs\\gone/);

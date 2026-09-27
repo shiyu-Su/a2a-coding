@@ -496,7 +496,6 @@ async function startTraceWeb(): Promise<number> {
     core,
     host: "127.0.0.1",
     port: 0,
-    readiness: () => ({ role: "owner", pid: 1, startedAt: "2026-09-22T00:00:00Z" }),
     version: "0.8.8-test",
   });
   assert.equal(outcome.enabled, true, "网页接面应启用");

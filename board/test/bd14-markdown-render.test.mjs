@@ -272,6 +272,41 @@ test("BD16 CSS：data-rendered=1 隐藏源文本 PRE（兜底不显示）+ SVG �
 });
 
 // ---------------------------------------------------------------------------
+// ④c v0.9.3 增补 ②：依赖图渲染修复（幂等补渲钩子 + 加载时机 + 可见容器不变式）
+// ---------------------------------------------------------------------------
+
+test("增补② 渲染脚本：幂等扫描（跳过 data-rendered=1）+ 全局补渲钩子 a2aRenderMermaid", () => {
+  const script = mermaidRenderScript();
+  assert.match(
+    script,
+    /querySelectorAll\('\.mermaid-block\[data-src\]:not\(\[data-rendered="1"\]\)'\)/,
+    "扫描须排除已渲染块（钩子可反复调用、不重复渲染）",
+  );
+  assert.match(script, /window\.a2aRenderMermaid = renderBlocks/, "钩子单点暴露（浮层换入 <main> 后补渲）");
+  assert.match(script, /addEventListener\("DOMContentLoaded", renderBlocks\)/, "defer 库先于 DOMContentLoaded ⇒ DC 首渲");
+  assert.match(script, /addEventListener\("load", renderBlocks\)/, "window load 兜底（幂等补试，防库迟就绪）");
+});
+
+test("增补② 容器可见性不变式：补渲钩子只在 showModal 之后调用（防「渲染进 display:none 容器」复发，98c39da1 前科）", async () => {
+  const { FEATURE_DETAIL_OVERLAY_SCRIPT } = await import("../dist/web/layout.js");
+  const showModalAt = FEATURE_DETAIL_OVERLAY_SCRIPT.indexOf("dlg.showModal()");
+  const hookAt = FEATURE_DETAIL_OVERLAY_SCRIPT.indexOf("a2aRenderMermaid");
+  assert.ok(showModalAt > 0 && hookAt > 0, "浮层含 showModal 与补渲钩子两处");
+  assert.ok(hookAt > showModalAt, "钩子调用在 showModal 之后（容器已可见才渲染）");
+  assert.match(
+    FEATURE_DETAIL_OVERLAY_SCRIPT,
+    /if \(typeof window\.a2aRenderMermaid === "function"\)/,
+    "无 mermaid 页（未挂渲染脚本）⇒ 钩子缺席不报错",
+  );
+});
+
+test("增补② 落点结构：SVG 容器插为 PRE 之前的可见兄弟（不落隐藏 PRE 子孙）", () => {
+  const script = mermaidRenderScript();
+  assert.match(script, /host\.insertBefore\(out, pre\)/, "落点 = host 直接子节点、PRE 的兄弟");
+  assert.doesNotMatch(script, /pre\.appendChild\(|pre\.innerHTML\s*=/, "不得把 SVG 塞进（会被隐藏的）源文本 PRE");
+});
+
+// ---------------------------------------------------------------------------
 // ⑤ 双档切换（视图层；HTTP 档见 bd14-docs-face.test.mjs）
 // ---------------------------------------------------------------------------
 

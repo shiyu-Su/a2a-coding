@@ -3,7 +3,6 @@ import assert from "node:assert/strict";
 
 import { renderPage, escapeHtml, BOARD_CSP, BOARD_REFERRER_POLICY, SUBMIT_GUARD_SCRIPT } from "../dist/web/layout.js";
 import {
-  renderFeaturesList,
   renderFeatureDetail,
   renderTasksPick,
   renderTasks,
@@ -19,9 +18,7 @@ import {
   renderAnswerForm,
   renderNextStepGuide,
   renderAcceptanceSection,
-  parseFeaturesFilter,
-  featuresFilterActive,
-  applyFeaturesFilter,
+  renderNewRequirementDialog,
   VIEW_NOTES,
 } from "../dist/web/views.js";
 
@@ -40,14 +37,33 @@ test("escapeHtml: 五字符全转义；null/undefined 为空串", () => {
 test("renderPage: 标题转义 + 导航高亮 + 口径脚注逐条渲染", () => {
   const html = renderPage({
     title: `页 <x>`,
-    active: "features",
+    active: "schedule",
     bodyHtml: "<p>正文</p>",
     notes: ["注 A", "注 <B>"],
   });
   assert.match(html, /<title>页 &lt;x&gt; · board<\/title>/);
-  assert.match(html, /<a href="\/requirements" class="on">需求<\/a>/);
+  assert.match(html, /<a href="\/schedule" class="on">排期<\/a>/);
   assert.match(html, /<li>注 A<\/li>/);
   assert.match(html, /<li>注 &lt;B&gt;<\/li>/);
+});
+
+test("REQ-04 Q2：导航「需求」项退役 ⇒ 页面不含 /requirements 链接（v0.9.3 B-T3 增 Agent = 闭集六项；增补 ③ Timeline 退役）", () => {
+  const html = renderPage({ title: "t", active: "schedule", bodyHtml: "<p>b</p>" });
+  assert.doesNotMatch(html, /href="\/requirements"/);
+  assert.doesNotMatch(html, /\/timeline|Timeline/, "Timeline 导航已退役（增补 ③）");
+  for (const [href, text] of [
+    ["/schedule", "排期"],
+    ["/tasks", "任务"],
+    ["/projects", "项目 / 机器"],
+    ["/agents", "Agent"],
+    ["/orgs", "组织"],
+    ["/host", "宿主桥"],
+  ]) {
+    assert.ok(html.includes(`<a href="${href}"`), `导航含 ${href}`);
+    assert.ok(html.includes(`>${text}</a>`), `导航含 ${text}`);
+  }
+  // 正文为纯 <p> ⇒ 全页锚点 = 导航闭集，多一枚即「需求」退役不彻底
+  assert.equal((html.match(/<a href=/g) ?? []).length, 6, "导航闭集 = 6 项（需求页退役 + Timeline 退役 + v0.9.3 Agent）");
 });
 
 test("BOARD_CSP: 无外部资源（default-src none + 仅内联 style + 同源表单）", () => {
@@ -253,112 +269,61 @@ test("轨14-页面骨架：提交后的就地提示有样式（.submit-pending�
 });
 
 // ---------------------------------------------------------------------------
-// 需求列表（V1）
+// 新增需求弹窗（REQ-v0.9.3-2026-09-26-04 Q1 · 需求列表页 V1 已退役 Q2/Q3，表单进弹窗）
 // ---------------------------------------------------------------------------
 
-const listFixture = {
-  features: [
-    {
-      featureId: "F1-long-uuid",
-      state: "executing",
-      title: "改造 <甲>",
-      taskCount: 7,
-      ownerGroup: "g",
-      stage: "改造方案",
-      version: "v0.9.0",
-      approval: "已通过",
-      createdAt: "c",
-      updatedAt: "u",
-      stateCounts: { completed: 5, working: 2 },
-    },
-    {
-      featureId: "F2",
-      state: "waiting_approval",
-      title: "乙",
-      taskCount: null,
-      ownerGroup: null,
-      stage: "需求分析",
-      version: "",
-      approval: "未发起",
-      createdAt: null,
-      updatedAt: null,
-      stateCounts: {},
-    },
-  ],
-  stateCounts: { completed: 5, working: 2 },
-};
-
-test("renderFeaturesList: 派生阶段 + 登记列 + version + taskCount（列表自带、无二次查询）", () => {
-  const html = renderFeaturesList(listFixture);
-  assert.match(html, /改造中 <span class="muted">派生<\/span>/);
-  assert.match(html, /需求分析 <span class="muted">登记<\/span>/);
-  assert.match(html, /v0\.9\.0/);
-  assert.match(html, /<td>7<\/td>/);
-  assert.match(html, /改造 &lt;甲&gt;/);
+test("REQ-04 renderNewRequirementDialog：dialog 骨架 + 关闭钮 + 表单区 = renderRequirementForm 逐字节复用", () => {
+  const form = renderRequirementForm("flow", null, ["v0.9.0"]);
+  const html = renderNewRequirementDialog("flow", null, ["v0.9.0"]);
+  assert.match(html, /^<dialog class="fd" id="new-req-dialog">/, "骨架 = dialog.fd（错误卡叠加规则同款生效）");
+  assert.match(html, /<button type="button" id="new-req-close">关闭<\/button>/);
+  assert.match(html, /<div class="fd-body"><h2>提需求<\/h2>/, "表单区在 .fd-body 内");
+  assert.ok(html.includes(form), "表单不重建：与 renderRequirementForm 输出逐字节一致");
+  assert.ok(html.endsWith("</dialog>"), "骨架自封闭：错误卡由脚本 append 为 dialog 直接子节点");
 });
 
-test("renderFeaturesList: stateCounts = null（老桥字段整体缺失）⇒ 如实降级，无 TODO 文案", () => {
-  const html = renderFeaturesList({ ...listFixture, stateCounts: null });
-  assert.match(html, /各态分布：/);
-  assert.match(html, /未透出 per-feature/);
-  assert.ok(!/TODO/.test(html));
+test("REQ-04 renderNewRequirementDialog：字段/校验/组织选择器/锁版警示原样在弹窗内", () => {
+  const html = renderNewRequirementDialog("flow-team", { tier: "ready", orgsDir: "C:/tmp/orgs" }, ["v0.9.0"]);
+  assert.match(html, /name="group"/);
+  assert.doesNotMatch(html, /name="group"[^>]*required/, "有默认组织 ⇒ 组织名允许留空（选择器逻辑不变）");
+  assert.match(html, /留空 = 用板级默认 flow-team/);
+  assert.match(html, /name="title" required/);
+  assert.match(html, /name="version"/);
+  assert.match(html, /name="requirement"/);
+  assert.match(html, /<form method="post" action="\/requirements"/, "提交端点仍是 POST /requirements（Q2 保留）");
+  assert.match(html, /data-submit="已提交，建需求中…"/);
+  assert.match(html, /排期锁定.*v0\.9\.0/s, "已发版锁警示随表单进弹窗");
+  assert.match(html, /组织目录根（orgsDir）<b>就绪<\/b>/, "orgsDir 三档提示随表单进弹窗");
 });
 
-test("renderFeaturesList: stateCounts 有值 ⇒ 渲染聚合后的分布", () => {
-  const html = renderFeaturesList({ ...listFixture, stateCounts: { executing: 2, completed: 5 } });
-  assert.match(html, /各态分布：executing=2 · completed=5/);
-  assert.match(html, /本地聚合/);
-  assert.ok(!/TODO/.test(html));
+test("REQ-04 renderNewRequirementDialog：未配默认组织 ⇒ 组织名必填；不传 orgsStatus ⇒ 无 orgsDir 行（同表单口径）", () => {
+  const bare = renderNewRequirementDialog(null);
+  assert.match(bare, /name="group" required/, "未配默认 ⇒ 必填（校验规则未变）");
+  assert.doesNotMatch(bare, /组织目录根/);
 });
 
-test("renderFeaturesList: stateCounts = {} ⇒ 显示空分布，不得报缺位（BD6 回归锚）", () => {
-  const html = renderFeaturesList({ ...listFixture, stateCounts: {} });
-  assert.match(html, /各态分布：（空分布 · 无任务）/);
-  assert.ok(!/未透出/.test(html));
-  assert.ok(!/TODO/.test(html));
+test("REQ-04 renderPage：headerActions 随标题渲染（页头「＋ 新增需求」按钮位）；缺省不出该元素", () => {
+  const withBtn = renderPage({
+    title: "排期看板",
+    active: "schedule",
+    bodyHtml: "<p>b</p>",
+    headerActions: '<button type="button" id="new-req-open" class="header-actions">＋ 新增需求</button>',
+  });
+  assert.match(withBtn, /<h1>排期看板<\/h1><button type="button" id="new-req-open"/, "按钮紧随标题在页头");
+  const plain = renderPage({ title: "t", active: "schedule", bodyHtml: "<p>b</p>" });
+  assert.doesNotMatch(plain, /new-req-open/, "其它页无该按钮（不注入按钮位）");
 });
 
-// ---------------------------------------------------------------------------
-// 列表过滤纯函数（REQ-v0.9.2 N4：桥无过滤参数 ⇒ 板内存过滤）
-// ---------------------------------------------------------------------------
-
-const filterTargets = [
-  { state: "executing", approval: "已通过", version: "v0.9.0" },
-  { state: "completed", approval: "已通过", version: "v0.9.1" },
-  { state: "waiting_approval", approval: "待审批", version: null },
-  { state: "completed", approval: null, version: "" },
-];
-
-test("parseFeaturesFilter: 空值 / 缺键不算条件；trim；非法值容错（不抛）", () => {
-  assert.deepEqual(parseFeaturesFilter(new URLSearchParams("")), {});
-  assert.deepEqual(parseFeaturesFilter(new URLSearchParams("state=&approval=%20")), {});
-  assert.deepEqual(parseFeaturesFilter(new URLSearchParams("state=completed&foo=bar")), { state: "completed" });
-  assert.deepEqual(parseFeaturesFilter(new URLSearchParams("state=no_such")), { state: "no_such" });
-  assert.deepEqual(parseFeaturesFilter(new URLSearchParams("state=a&state=b")), { state: "a" }); // 重复键取首值（URLSearchParams 语义）
-});
-
-test("featuresFilterActive / applyFeaturesFilter：正负用例", () => {
-  assert.equal(featuresFilterActive({}), false);
-  assert.equal(featuresFilterActive({ state: "completed" }), true);
-  assert.deepEqual(applyFeaturesFilter(filterTargets, {}), filterTargets);
-  assert.deepEqual(applyFeaturesFilter(filterTargets, { state: "completed" }).map((f) => f.approval), ["已通过", null]);
-  assert.deepEqual(applyFeaturesFilter(filterTargets, { approval: "待审批" }).map((f) => f.state), ["waiting_approval"]);
-  assert.deepEqual(applyFeaturesFilter(filterTargets, { version: "v0.9.0" }).map((f) => f.state), ["executing"]);
-  assert.deepEqual(applyFeaturesFilter(filterTargets, { state: "completed", approval: "已通过" }).length, 1);
-  assert.deepEqual(applyFeaturesFilter(filterTargets, { state: "no_such_state" }), []);
-  // version null / "" 不匹配任何给定值
-  assert.deepEqual(applyFeaturesFilter(filterTargets, { version: "" + "x" }), []);
-});
-
-test("renderFeaturesList：过滤表单渲染 + 当前值保留 selected + 过滤计数行", () => {
-  const plain = renderFeaturesList(listFixture);
-  assert.match(plain, /<form method="get" action="\/requirements"/, "REQ-v0.9.2 增补④：`/` 已改看板，过滤 GET 必须回需求页");
-  assert.ok(!/selected/.test(plain));
-  assert.ok(!/过滤后/.test(plain));
-  const filtered = renderFeaturesList({ ...listFixture, features: [listFixture.features[1]] }, { state: "waiting_approval" }, 2);
-  assert.match(filtered, /<option value="waiting_approval" selected>/);
-  assert.match(filtered, /过滤后 1 \/ 共 2 条/);
-  assert.match(filtered, /清除过滤/);
+test("B1 renderFeatureDetail: parentFeatureId 非空 ⇒ 标题徽标 + 深链；null ⇒ 无", () => {
+  const html = renderFeatureDetail(
+    { ...detailFixture, feature: { ...detailFixture.feature, parentFeatureId: "P1" } },
+    null,
+    "trace 关闭",
+    NOW,
+  );
+  const head = html.slice(0, html.indexOf("</h2>"));
+  assert.match(head, /增补 · 父需求 <a class="fl" href="\/features\/P1">P1<\/a>/);
+  assert.doesNotMatch(renderFeatureDetail(detailFixture, traceFixture, null, NOW), /增补 · 父需求/);
 });
 
 // ---------------------------------------------------------------------------
@@ -442,6 +407,60 @@ test("renderFeatureDetail: trace 读取失败 ⇒ 可见错误，不静默", () 
   const html = renderFeatureDetail(detailFixture, null, "桥返回 HTTP 500", NOW);
   assert.match(html, /class="hint err"/);
   assert.match(html, /trace 读取失败：桥返回 HTTP 500/);
+});
+
+// --- B-T4（3300 收编补差）：详情页任务行「三时刻 + 排队/执行时长」 --------------------------
+
+const timingsTask = {
+  taskId: "t9",
+  projectId: "p",
+  state: "completed",
+  lane: "write",
+  failureKind: null,
+  retryCount: null,
+  dependencies: null,
+  createdAt: "2026-09-26T00:00:00Z",
+  startedAt: "2026-09-26T00:01:30Z",
+  finishedAt: "2026-09-26T00:06:30Z",
+  queueState: "settled",
+  queuedAt: "2026-09-26T00:00:00Z",
+  claimedAt: "2026-09-26T00:01:00Z",
+  claimedBy: "m1",
+};
+
+test("renderFeatureDetail: 任务行三时刻 + 排队时长（queuedAt→claimedAt）/ 执行时长（startedAt→finishedAt）", () => {
+  const html = renderFeatureDetail(
+    { ...detailFixture, tasks: [timingsTask] },
+    null,
+    "trace 关闭",
+    NOW,
+  );
+  assert.match(html, /<th>创建<\/th><th>开始<\/th><th>结束<\/th><th>排队时长<\/th><th>执行时长<\/th>/);
+  assert.match(html, /2026-09-26T00:01:30Z/);
+  assert.match(html, /<td>1m 0s<\/td>/); // 排队时长 queuedAt→claimedAt = 60s
+  assert.match(html, /<td>5m 0s<\/td>/); // 执行时长 startedAt→finishedAt = 300s
+});
+
+test("renderFeatureDetail: 任务行时刻/时长缺字段 ⇒ 新增 5 列全容错为 —（老桥容错，不炸页、不推算）", () => {
+  const html = renderFeatureDetail(detailFixture, null, "trace 关闭", NOW);
+  const start = html.indexOf('<tr><td class="mono">t1</td>');
+  const end = html.indexOf("</tr>", start);
+  const row = html.slice(start, end);
+  const cells = row.slice("<tr>".length).split("</td>").slice(0, -1);
+  assert.equal(cells.length, 12, "任务行固定 12 列（7 原有 + 三时刻 + 两时长）");
+  assert.deepEqual(cells.slice(-5), ["<td>—", "<td>—", "<td>—", "<td>—", "<td>—"], "末 5 列（创建/开始/结束/排队/执行）缺字段 ⇒ 全 —");
+});
+
+test("renderFeatureDetail: 在飞任务（有 startedAt 无 finishedAt）执行时长如实 —（不做至 now 推算）", () => {
+  const html = renderFeatureDetail(
+    { ...detailFixture, tasks: [{ ...timingsTask, state: "working", finishedAt: null }] },
+    null,
+    "trace 关闭",
+    NOW,
+  );
+  assert.doesNotMatch(html, /<td>5m 0s<\/td>/);
+  assert.match(html, /<td>1m 0s<\/td>/); // 排队时长 queuedAt→claimedAt 不受在飞影响
+  assert.ok(html.includes("<td>—</td></tr>"), "末列执行时长 = —");
 });
 
 test("VIEW_NOTES: 每页统一挂 B13 三条 + 并行度文案", () => {
