@@ -22,6 +22,7 @@
  * | `/api/tasks?project=&state=&limit=` | `core.tasks(...)`（= `handleTasks`） | `project` 必填（缺 → 400） |
  * | `/api/tasks/:taskId` | `store.getQueuedTask`（本地库只读） | 单任务详情（含三时刻 + 队列四字段；见下「已知偏离」） |
  * | `/api/events?since=&limit=&featureId=` | `store.listEvents({ since, limit, featureId })` | **直连 store**；游标由前端传参；`featureId` = 按需求收窄（v0.9.0 B3″，仍纯读） |
+ * | `/api/groups` | `loadMachinesConfig(configPath).groups`（每请求现读） | **全组枚举**（v0.9.4 O2）：组结构声明面（`projectGroup` 段），与 `/api/projects`（运行态）语义不同，刻意不合并；配置坏 → 500 `machines_config_error` |
  *
  * ## 硬约束：读事件**绝不移动宿主收件箱游标**
  *
@@ -68,7 +69,14 @@ import { createServer as createHttpServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
 import { getQueuedTask, listEvents } from "../../session/store.js";
 import type { QueueState, QueuedTaskRecord } from "../../session/store.js";
-import type { EventRecord, ProjectStatus, TaskRecord, TaskState } from "../../types.js";
+import type {
+  EventRecord,
+  ProjectGroup,
+  ProjectStatus,
+  TaskRecord,
+  TaskState,
+} from "../../types.js";
+import { getWarnedConfigTexts, loadMachinesConfig, memberKey } from "../../config.js";
 import { bridgeLog } from "../bridge-log.js";
 import { handleFeatureTrace } from "../feature-tools.js";
 import type { FeatureTaskSummary } from "../feature-tools.js";
@@ -98,6 +106,7 @@ const PROJECTS_SOURCE = "桥注册表（Runner 上报快照）";
 const PROJECTS_NOTE =
   "快照语义：由桥注册表（Runner 上报投影 runners / runner_projects）派生 + 观测时间；非实时在线";
 const EVENTS_NOTE = "游标由前端传参（since）；本接面不读写宿主 a2a_events 收件箱游标";
+const GROUPS_SOURCE = "config.json `projectGroup` 段（每请求现读，热改即时生效）";
 
 /** 网页端最小内核依赖（`Pick<BridgeCore, …>`：N4 直接传完整 core，结构性兼容） */
 export type WebCore = Pick<BridgeCore, "projects" | "tasks" | "featureStatus">;
@@ -112,6 +121,11 @@ export interface WebTransportOptions {
   version: string;
   /** 自动刷新间隔（ms；< 15000 一律抬到 15000） */
   refreshMs?: number;
+  /**
+   * orch 机器清单 `config.json` 路径（`GET /api/groups` 数据源；v0.9.4 O2）。
+   * 由接线方注入 `MACHINES_CONFIG_PATH`；缺省 ⇒ `/api/groups` 回 500 `machines_config_error`（无源可读）。
+   */
+  configPath?: string;
 }
 
 export type WebDisabledReason = "non_loopback_host" | "listen_failed";
@@ -185,6 +199,21 @@ export type FeatureTaskView = FeatureTaskSummary & {
   claimedBy: string | null;
 };
 
+/** `GET /api/groups` 成员行（渲染层白名单：`machineId` 按**不透明字符串**处理，勿拆格式） */
+export interface GroupMemberView {
+  machineId: string;
+  projectId: string;
+}
+
+/** `GET /api/groups` 单组行（组结构声明面；运行态归 `/api/projects`，二者刻意不合并） */
+export interface GroupView {
+  /** 配置态组名（`projectGroup[]` 段内必填；`null` 仅出现在非配置态，本端点实际恒为字符串） */
+  name: string | null;
+  /** 去重后成员数（声明序；与 `members[]` 长度一致） */
+  memberCount: number;
+  members: GroupMemberView[];
+}
+
 // ---------------------------------------------------------------------------
 // 启动入口
 // ---------------------------------------------------------------------------
@@ -234,7 +263,7 @@ export async function startWebTransport(
     bridgeLog.error("a2a-bridge", `网页接面错误：${toMessage(err)}`);
   });
   bridgeLog.info("a2a-bridge", `只读网页接面已监听 http://${host}:${boundPort}/`, {
-    api: "/api/projects, /api/features, /api/tasks, /api/events",
+    api: "/api/projects, /api/features, /api/tasks, /api/events, /api/groups",
     refreshMs: resolveRefreshMs(options.refreshMs),
   });
 
@@ -315,7 +344,8 @@ type WebRoute =
   | { kind: "features"; featureId: string | null }
   | { kind: "featureTrace"; featureId: string }
   | { kind: "tasks"; taskId: string | null }
-  | { kind: "events" };
+  | { kind: "events" }
+  | { kind: "groups" };
 
 const FEATURES_PREFIX = "/api/features/";
 const TRACE_SUFFIX = "/trace";
@@ -340,6 +370,7 @@ function matchRoute(path: string): WebRoute | null {
     return raw.length > 0 && !raw.includes("/") ? { kind: "tasks", taskId: raw } : null;
   }
   if (path === "/api/events") return { kind: "events" };
+  if (path === "/api/groups") return { kind: "groups" };
   return null;
 }
 
@@ -411,6 +442,9 @@ async function handleRequest(
     }
     case "events":
       sendEvents(res, url);
+      return;
+    case "groups":
+      sendGroups(res, options);
       return;
   }
 }
@@ -663,6 +697,64 @@ function sendEvents(res: ServerResponse, url: URL): void {
 
   const events: EventRecord[] = listEvents({ since, limit, featureId });
   respondJson(res, 200, { ok: true, since, count: events.length, events, note: EVENTS_NOTE });
+}
+
+/**
+ * `GET /api/groups`：**全组枚举只读投影**（v0.9.4 O2，板 C 档数据源）。
+ *
+ * - 数据源 = `loadMachinesConfig(configPath).groups` —— **每请求现读、不缓存**（与 `loadMachines()`
+ *   同纪律：组增删 / 成员增删热改即时生效）；出参是**组结构声明**，与 `/api/projects`（运行态）
+ *   语义不同，刻意不合并；
+ * - **无身份参数**：3300 是运维全量视图、非身份面（§2.7 纪律不变，照 `createCore(null)` 同款口径）；
+ * - `warnings[]` = warn-once 配置瑕疵文案快照（`getWarnedConfigTexts`），板侧只如实呈现、不入判定；
+ * - **未配组 ⇒ `groups: []`**（= 全量接纳语义，板据此显示「无组」）；不输出 `selective` 等派生集合；
+ * - 配置读失败 / 非法 ⇒ 500 `machines_config_error`（**绝不 fail-open**，与 `loadMachines()` 的
+ *   I2 口径一致）；错误经 `error` 字段透出（含配置路径），不抛穿服务器。
+ */
+function sendGroups(res: ServerResponse, options: WebTransportOptions): void {
+  const observedAt = new Date().toISOString();
+  const configPath = options.configPath;
+  let groups;
+  try {
+    if (configPath === undefined) {
+      throw new Error("网页接面未注入 configPath（MACHINES_CONFIG_PATH）");
+    }
+    groups = loadMachinesConfig(configPath).groups ?? [];
+  } catch (err) {
+    respondJson(res, 500, {
+      ...failure(
+        "machines_config_error",
+        `加载机器清单失败（${configPath ?? "未注入"}）：${toMessage(err)}`,
+      ),
+      source: GROUPS_SOURCE,
+      observedAt,
+    });
+    return;
+  }
+  respondJson(res, 200, {
+    ok: true,
+    source: GROUPS_SOURCE,
+    observedAt,
+    note: "声明面投影：config.json 项目组结构（运行态见 /api/projects）；warnings 为配置瑕疵文案，仅供呈现",
+    groups: groups.map(toGroupView),
+    warnings: getWarnedConfigTexts(),
+  });
+}
+
+/**
+ * 单组 → 渲染层视图（逐字段显式取值：`memberKeys` / `memberMachineIds` / `selective`
+ * 等派生态一律不出口）。`memberCount` 与去重后 `members[]` 同源，防板上计数与列表打架。
+ */
+function toGroupView(group: ProjectGroup): GroupView {
+  const seen = new Set<string>();
+  const members: GroupMemberView[] = [];
+  for (const m of group.members) {
+    const key = memberKey(m.machineId, m.projectId);
+    if (seen.has(key)) continue; // 组内重复项：集合去重（与 parseProjectGroups 同口径）
+    seen.add(key);
+    members.push({ machineId: m.machineId, projectId: m.projectId });
+  }
+  return { name: group.name, memberCount: members.length, members };
 }
 
 // ---------------------------------------------------------------------------

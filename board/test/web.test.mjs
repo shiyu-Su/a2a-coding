@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { renderPage, escapeHtml, BOARD_CSP, BOARD_REFERRER_POLICY, SUBMIT_GUARD_SCRIPT } from "../dist/web/layout.js";
+import { renderPage, escapeHtml, BOARD_CSP, BOARD_REFERRER_POLICY, SUBMIT_GUARD_SCRIPT, FEATURE_DETAIL_OVERLAY_SCRIPT, NEW_REQUIREMENT_DIALOG_SCRIPT } from "../dist/web/layout.js";
 import {
   renderFeatureDetail,
   renderTasksPick,
@@ -19,6 +19,9 @@ import {
   renderNextStepGuide,
   renderAcceptanceSection,
   renderNewRequirementDialog,
+  renderOrgSpaceManagePage,
+  renderOrgPortal,
+  buildOrgPortalCards,
   VIEW_NOTES,
 } from "../dist/web/views.js";
 
@@ -47,23 +50,24 @@ test("renderPage: 标题转义 + 导航高亮 + 口径脚注逐条渲染", () =>
   assert.match(html, /<li>注 &lt;B&gt;<\/li>/);
 });
 
-test("REQ-04 Q2：导航「需求」项退役 ⇒ 页面不含 /requirements 链接（v0.9.3 B-T3 增 Agent = 闭集六项；增补 ③ Timeline 退役）", () => {
+test("REQ-04 Q2：导航「需求」项退役 ⇒ 页面不含 /requirements 链接（v0.9.3 B-T3 增 Agent；§9-b 增首页；§9-c 摘 /orgs = 闭集六项）", () => {
   const html = renderPage({ title: "t", active: "schedule", bodyHtml: "<p>b</p>" });
   assert.doesNotMatch(html, /href="\/requirements"/);
   assert.doesNotMatch(html, /\/timeline|Timeline/, "Timeline 导航已退役（增补 ③）");
+  assert.doesNotMatch(html, /href="\/orgs"/, "§9-c：组织管理页退役 ⇒ NAV「组织」项摘除（管理职能迁空间内 /org/<名>/manage）");
   for (const [href, text] of [
+    ["/", "首页"],
     ["/schedule", "排期"],
     ["/tasks", "任务"],
     ["/projects", "项目 / 机器"],
     ["/agents", "Agent"],
-    ["/orgs", "组织"],
     ["/host", "宿主桥"],
   ]) {
     assert.ok(html.includes(`<a href="${href}"`), `导航含 ${href}`);
     assert.ok(html.includes(`>${text}</a>`), `导航含 ${text}`);
   }
   // 正文为纯 <p> ⇒ 全页锚点 = 导航闭集，多一枚即「需求」退役不彻底
-  assert.equal((html.match(/<a href=/g) ?? []).length, 6, "导航闭集 = 6 项（需求页退役 + Timeline 退役 + v0.9.3 Agent）");
+  assert.equal((html.match(/<a href=/g) ?? []).length, 6, "导航闭集 = 6 项（需求页退役 + Timeline 退役 + v0.9.3 Agent + §9-b 首页门户 + §9-c 摘组织）");
 });
 
 test("BOARD_CSP: 无外部资源（default-src none + 仅内联 style + 同源表单）", () => {
@@ -122,6 +126,66 @@ test("轨14-守卫脚本：一段内联 · 零外源 · 零求值 · 只作用�
   assert.match(SUBMIT_GUARD_SCRIPT, /"post"/, "非 POST 表单不得被动（读面表单不受影响）");
   assert.match(SUBMIT_GUARD_SCRIPT, /getAttribute\("data-submit"\)/, "就地文案 = 表单自带的 data-submit");
   assert.match(SUBMIT_GUARD_SCRIPT, /\.disabled = true/, "禁用的是提交按钮");
+});
+
+// --- v0.9.4 增补二 §9.1-②：data-ov 写表单的 fetch 报错呈现（闭集六元内扩写，不新枚） -------
+
+test("增补二/五-守卫脚本扩写：data-ov 表单 = fetch 提交 · 成功按 data-ov-redirect 跳转（缺省 reload）· 4xx 抽 .err-ov-card 浮层不跳页 · 让位已拦截事件", () => {
+  const s = SUBMIT_GUARD_SCRIPT;
+  assert.match(s, /getAttribute\("data-ov"\)/, "按表单标记分流（无标记表单路径逐字节不变）");
+  assert.match(s, /method:\s*"POST",\s*\n\s*body: data,\s*\n\s*credentials: "same-origin",\s*\n\s*headers: \{ Accept: "text\/html" \}/, "urlencoded 同源 fetch（Accept 必带，服务端按档分流）");
+  assert.match(s, /var redirect = form\.getAttribute\("data-ov-redirect"\) \|\| "";/, "增补五 §9.4-②：成功路径读取 data-ov-redirect");
+  assert.match(s, /if \(r\.ok\) \{ gotoAfterSubmit\(redirect\); return; \}/, "成功 ⇒ 走 gotoAfterSubmit（有 redirect 跳目标、无则 reload）");
+  assert.match(s, /if \(redirect !== ""\) \{ window\.location\.href = redirect; return; \}\s*\n\s*window\.location\.reload\(\);/, "有该属性 ⇒ location.href 目标；无 ⇒ 维持整页刷新");
+  assert.match(s, /querySelector\("\.err-ov-card"\)/, "失败 = 抽错误卡浮层呈现");
+  assert.match(s, /ovShowCard\(card\)/, "失败不跳页：卡叠加为 body 直接子元素");
+  assert.match(s, /e\.defaultPrevented/, "详情浮层 / 新增需求弹窗已拦截时让位（不抢事件）");
+  assert.match(s, /data-ov-pending/, "提交标记防连点双发");
+  assert.doesNotMatch(s, /getElementById\("(feat-dialog|new-req-dialog|schedule-board|err-ov)"\)/, "不踩其它五枚常量的单点标记（N3-⑦ 闭集归类唯一）");
+});
+
+// --- v0.9.4 增补三 §9.2：form.action 同名遮蔽修复（双锚 = 正向取属性 + 负向禁直读） -------
+
+test("增补三-ovSubmit 目标 URL = getAttribute(\"action\") 属性值 · 空 ⇒ form.submit() 原生回落", () => {
+  const s = SUBMIT_GUARD_SCRIPT;
+  // 定向锚（fixture 形态 = 含 name="action" 隐藏字段的成员/停用表单：views.ts 三枚表单均带，
+  // 遮蔽只对属性读取成立 ⇒ 断言脚本取的是属性值即覆盖该形态；本仓测试基建为字符串锚，无 DOM 运行器）
+  assert.match(s, /var action = form\.getAttribute\("action"\) \|\| "";/, "提交目标经属性读取取得（同名字段遮蔽不了 getAttribute）");
+  assert.match(s, /fetch\(action, \{/, "fetch 直接用该属性值（不另拼端点、不回读 form.action）");
+  assert.match(s, /if \(data === null \|\| action === ""\) \{ ovRestore\(form\); form\.submit\(\); return; \}/, "action 属性缺失 ⇒ 回落原生提交（不劣化）");
+});
+
+// --- v0.9.4 增补四 §9.3：浮层卡「知道了」委托关闭（闭集六元内扩写，不新枚） -------
+
+test("增补四-守卫脚本扩写：document 级委托摘 .err-ov-card「知道了」（closest 口径对齐 /schedule 侧）", () => {
+  const s = SUBMIT_GUARD_SCRIPT;
+  assert.match(s, /document\.addEventListener\("click"/, "document 级委托（动态注入卡天然覆盖，非直接绑定）");
+  assert.match(s, /closest\("#err-ov-close"\)/, "只认「知道了」按钮（与 /schedule 侧浮层脚本同款 id 判据）");
+  assert.match(s, /closest\("\.err-ov-card"\)/, "委托关闭 = closest + err-ov-card 组合");
+  assert.match(s, /card\.parentNode\.removeChild\(card\)/, "命中 ⇒ 从 DOM 摘除该卡片");
+  // 闭集六元不扩：不引入其它五枚常量的单点标记
+  assert.doesNotMatch(s, /getElementById\("(feat-dialog|new-req-dialog|schedule-board|err-ov)"\)/, "不踩其余五枚常量归类标记（N3-⑦ 闭集唯一）");
+});
+
+test("增补三-负向锚：三枚 fetch 拦截常量直读 form.action 零出现（遮蔽缺陷防复发）", () => {
+  for (const [label, s] of [
+    ["SUBMIT_GUARD_SCRIPT", SUBMIT_GUARD_SCRIPT],
+    ["FEATURE_DETAIL_OVERLAY_SCRIPT", FEATURE_DETAIL_OVERLAY_SCRIPT],
+    ["NEW_REQUIREMENT_DIALOG_SCRIPT", NEW_REQUIREMENT_DIALOG_SCRIPT],
+  ]) {
+    assert.doesNotMatch(s, /form\.action/, `${label} 不得直读 form.action（name="action" 字段会遮蔽该属性 ⇒ 伪 URL 405）`);
+  }
+});
+
+test("增补二-表单标记：manage 成员增删 / 停用 + 门户建组织带 data-ov=\"1\"（其余写表单不扩）", () => {
+  const manage = renderOrgSpaceManagePage({ org: "alpha", features: [], projectsOutcome: null, groupsOutcome: null });
+  assert.equal((manage.match(/data-ov="1"/g) ?? []).length, 3, "加 / 删 / 停用三枚表单");
+  assert.match(manage, /action="\/orgs\/alpha\/members"[^>]*data-ov="1"/);
+  assert.match(manage, /action="\/orgs" class="inline" data-submit="已提交，停用中…" data-ov="1" data-ov-redirect="\/"/, "停用表单带 data-ov-redirect=/（§9.4-② 成功跳门户）");
+  const portal = renderOrgPortal(buildOrgPortalCards(["甲"], []));
+  assert.match(portal, /action="\/orgs" class="w"[^>]*data-ov="1"/, "门户建组织同口径");
+  assert.doesNotMatch(renderRequirementForm("flow"), /data-ov/, "提需求弹窗自带脚本，不经本通道");
+  assert.doesNotMatch(renderTurnForm("F1"), /data-ov/, "触发一轮（长任务整页档）不扩标记");
 });
 
 test("轨14-页面：每类写表单都带 data-submit 文案（提需求 / 触发一轮 / 确认 / 回答 / 停桥）", () => {
@@ -300,6 +364,50 @@ test("REQ-04 renderNewRequirementDialog：未配默认组织 ⇒ 组织名必填
   const bare = renderNewRequirementDialog(null);
   assert.match(bare, /name="group" required/, "未配默认 ⇒ 必填（校验规则未变）");
   assert.doesNotMatch(bare, /组织目录根/);
+});
+
+// ---------------------------------------------------------------------------
+// BD8（v0.9.4 D 档）提需求免选组织：只读展示 + hidden 值必发 + action 带空间前缀
+// ---------------------------------------------------------------------------
+
+test("BD8 renderRequirementForm（空间免选）：hidden group 值必发 + 只读展示 + action = /org/<名>/requirements", () => {
+  const html = renderRequirementForm("组织乙", null, [], "组织甲");
+  assert.match(html, /<form method="post" action="\/org\/%E7%BB%84%E7%BB%87%E7%94%B2\/requirements"/, "action 带组织前缀（无 JS 原生 POST 同路命中归一层）");
+  assert.match(html, /<input type="hidden" name="group" value="组织甲">/, "hidden 值必须仍发出（回落链不可绕过）");
+  assert.doesNotMatch(html, /<input name="group"/, "免选态不出可编辑组织输入");
+  assert.doesNotMatch(html, /placeholder="如 flow-team"/, "placeholder 一并不出（非可填字段）");
+  assert.match(html, /组织 = <b>组织甲<\/b>/, "只读展示路径组织");
+  assert.match(html, /board_org_mismatch/, "mismatch 执法提示在表单内");
+  assert.doesNotMatch(html, /留空 = 用板级默认/, "空间档不提示板级默认");
+});
+
+test("BD8 renderRequirementForm（空间免选）：hidden 值随 FormData 发出（URLSearchParams 形状钉）", () => {
+  const html = renderRequirementForm(null, null, [], "组织甲");
+  const m = html.match(/<input type="hidden" name="(\w+)" value="([^"]*)">/);
+  assert.ok(m !== null, "hidden 字段形状 = name/value 字面量");
+  const data = new URLSearchParams();
+  data.append(m[1], m[2]);
+  assert.equal(data.get("group"), "组织甲", "组织值可被表单序列化携带");
+});
+
+test("BD8 renderRequirementForm（空间免选）：组织名 HTML 转义进 hidden/展示（含引号与尖括号不出结构）", () => {
+  const html = renderRequirementForm(null, null, [], 'a"b<c>');
+  assert.match(html, /value="a&quot;b&lt;c&gt;"/);
+  assert.doesNotMatch(html, /value="a"b/);
+});
+
+test("BD8 renderRequirementForm（全局档零改动）：spaceOrg 缺省/空白 ⇒ 与既有可编辑组织字段逐字节同形", () => {
+  const before = renderRequirementForm("flow");
+  assert.match(before, /<form method="post" action="\/requirements"/, "全局页 action 不带前缀");
+  assert.match(before, /<label>组织名 <input name="group" placeholder="如 flow-team"><\/label>/);
+  assert.equal(renderRequirementForm("flow", null, [], null), before, "spaceOrg=null 显式传 ⇒ 与缺省一致");
+  assert.equal(renderRequirementForm("flow", null, [], "   "), before, "纯空白 spaceOrg ⇒ 视同全局档");
+});
+
+test("BD8 renderNewRequirementDialog：spaceOrg 透传表单区（骨架其余不变）", () => {
+  const html = renderNewRequirementDialog("组织乙", null, [], "组织甲");
+  assert.ok(html.includes(renderRequirementForm("组织乙", null, [], "组织甲")), "表单不重建：逐字节复用");
+  assert.match(html, /^<dialog class="fd" id="new-req-dialog">/);
 });
 
 test("REQ-04 renderPage：headerActions 随标题渲染（页头「＋ 新增需求」按钮位）；缺省不出该元素", () => {

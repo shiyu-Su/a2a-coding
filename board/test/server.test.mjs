@@ -135,9 +135,9 @@ test("GET /requirements ⇒ 303 回首页（REQ-04 Q2 列表页退役；不触�
   });
 });
 
-test("GET / 首页需求卡：渲染派生阶段徽标 + taskCount；桥一次调用（无 N+1）", async () => {
+test("GET /schedule 看板需求卡：渲染派生阶段徽标 + taskCount；桥一次调用（无 N+1）", async () => {
   await withServer(async (base, calls) => {
-    const res = await get(base, "/");
+    const res = await get(base, "/schedule");
     assert.equal(res.status, 200);
     assert.match(res.text, /需求甲/);
     assert.match(res.text, /改造中/);
@@ -146,16 +146,16 @@ test("GET / 首页需求卡：渲染派生阶段徽标 + taskCount；桥一次�
   });
 });
 
-test("过滤参数随列表页退役：`/` 与 `/requirements` 均不消费 query（REQ-04 Q3）", async () => {
+test("过滤参数随列表页退役：`/schedule` 与 `/requirements` 均不消费 query（REQ-04 Q3）", async () => {
   await withServer(async (base, calls) => {
-    const res = await get(base, "/?state=completed");
+    const res = await get(base, "/schedule?state=completed");
     assert.equal(res.status, 200);
     assert.match(res.text, /<title>排期看板 · board<\/title>/, "看板恒全量渲染，过滤参数无效果");
     assert.doesNotMatch(res.text, /过滤后|filter-form/, "过滤表单已随列表页删除");
     const redirected = await fetch(`${base}/requirements?state=completed`, { redirect: "manual" });
     assert.equal(redirected.status, 303, "带 query 的旧深链同样 303 回首页");
     await redirected.body?.cancel();
-    assert.deepEqual(calls, ["getFeatures"], "仅首页渲染触桥一次，重定向零触达");
+    assert.deepEqual(calls, ["getFeatures"], "仅看板页渲染触桥一次，重定向零触达");
   });
 });
 

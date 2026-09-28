@@ -24,7 +24,7 @@ import { fileURLToPath } from "node:url";
 import { realpathSync } from "node:fs";
 import { dirname, resolve } from "node:path";
 import { createBoardServer } from "./server.js";
-import { loadConfig, CONFIG_PATH_ENV } from "./config.js";
+import { loadConfig, CONFIG_PATH_ENV, readLegacyReleasedVersions } from "./config.js";
 import {
   HostBridgeManager,
   defaultMcpUrlForOrg,
@@ -32,6 +32,8 @@ import {
 } from "./host-bridge.js";
 import { HostTurnManager, createHostBridgeGateway } from "./host-turn.js";
 import { createHostFace, orgBridgeConfig, type BoardHostFace } from "./host-face.js";
+import { OrgsLedgerStore, defaultOrgsLedgerFile, isOrgDisabled as ledgerIsOrgDisabled } from "./orgs-ledger.js";
+import { VersionsLedgerStore, defaultVersionsLedgerFile, migrateReleasedVersions, releasedVersionNames } from "./versions-ledger.js";
 import { readVersion } from "./version.js";
 import { patchStreamTimestamp } from "./log.js";
 import { createFatalRecorder, defaultFatalLogPath } from "./fatal-log.js";
@@ -85,6 +87,12 @@ export function buildHostFace(input: {
   mcpBaseUrl: string;
   machineDist: string;
   turnTimeoutMs?: number;
+  /**
+   * **停用闸判据**（v0.9.4 A4 · BD3）：注入 `isOrgDisabled` ⇒ {@link orgBridgeConfig} 命中停用台账即拒
+   * （不起桥、不 spawn）。事实源 = 板组织台账（由 main 建单一 {@link OrgsLedgerStore} 后注入），
+   * 与板 HTTP 写面读同一份文件；未注入 ⇒ 不判停用（保持 BD1–BD2 期间行为）。
+   */
+  isOrgDisabled?: (org: string) => boolean;
 }): { face: BoardHostFace; bridges: HostBridgeManager } | null {
   if (input.orgsDir === null) return null;
   const faceDeps = {
@@ -92,6 +100,7 @@ export function buildHostFace(input: {
     defaultOrg: input.defaultOrg,
     kind: input.kind,
     ...(input.turnTimeoutMs !== undefined ? { turnTimeoutMs: input.turnTimeoutMs } : {}),
+    ...(input.isOrgDisabled !== undefined ? { isOrgDisabled: input.isOrgDisabled } : {}),
     mcpUrlFor: (org: string) => defaultMcpUrlForOrg(org, input.mcpBaseUrl),
   };
   const bridges = new HostBridgeManager({ machineDistDir: input.machineDist });
@@ -117,6 +126,29 @@ async function main(): Promise<void> {
   const cfg = loadConfig();
   const group = cfg.group;
   const orgsDir = cfg.orgsDir;
+  // 板组织台账（v0.9.4 A1/A3）：单进程单写手 ⇒ 建 ONE store，宿主面停用闸与 HTTP 写面读同一份文件。
+  const orgsLedgerFile = defaultOrgsLedgerFile();
+  const orgsLedger = new OrgsLedgerStore(orgsLedgerFile);
+  // 板版本台账（v0.9.4 N1）：一次性迁移 config `releasedVersions` → 台账 released（启动前置、fail-fast）。
+  // 灌入失败 ⇒ 抛出 ⇒ failStartup 拒起板（防已发版锁静默消失）；台账已存在 ⇒ 残留键一次性 warn、不双读。
+  // v0.9.4 N3：`releasedVersions` 已从 BoardConfig 退役（运行时锁改读台账）⇒ 迁移输入经 `readLegacyReleasedVersions`
+  // 直接从配置文件读历史键（唯一读取点）。
+  fatal.setPhase("版本台账迁移");
+  const versionsLedgerFile = defaultVersionsLedgerFile();
+  const versionsLedger = new VersionsLedgerStore(versionsLedgerFile);
+  const versionMigration = migrateReleasedVersions({
+    releasedVersions: readLegacyReleasedVersions(cfg.sourcePath),
+    store: versionsLedger,
+    now: new Date().toISOString(),
+  });
+  if (versionMigration.warning !== null) {
+    process.stderr.write(`警告：${versionMigration.warning}\n`);
+  }
+  if (versionMigration.migrated.length > 0) {
+    process.stdout.write(
+      `版本台账一次性迁移：config releasedVersions（${versionMigration.migrated.join(" · ")}）已灌入 ${versionsLedgerFile}（status=released）\n`,
+    );
+  }
   fatal.setPhase("宿主面装配");
   const hostFace = buildHostFace({
     orgsDir,
@@ -125,6 +157,7 @@ async function main(): Promise<void> {
     mcpBaseUrl: cfg.mcpBaseUrl,
     machineDist: cfg.machineDist,
     ...(cfg.turnTimeoutMs !== null ? { turnTimeoutMs: cfg.turnTimeoutMs } : {}),
+    isOrgDisabled: (org) => ledgerIsOrgDisabled(orgsLedger.load().ledger, org),
   });
   fatal.setPhase("HTTP 监听");
   const handle = await createBoardServer({
@@ -135,7 +168,8 @@ async function main(): Promise<void> {
     mcpBaseUrl: cfg.mcpBaseUrl,
     hostFace: hostFace?.face ?? null,
     docs: { repoRoot: cfg.repoRoot, orgsDir: cfg.orgsDir },
-    releasedVersions: cfg.releasedVersions,
+    orgsLedgerFile,
+    versionsLedgerFile,
     onShutdown: () => shutdown("POST /shutdown"),
   });
   process.stdout.write(
@@ -144,9 +178,10 @@ async function main(): Promise<void> {
   process.stdout.write(
     `生效值：port = ${cfg.port} · host = ${cfg.host} · 读面桥 = ${cfg.bridgeUrl} · MCP 基址 = ${cfg.mcpBaseUrl} · hostKind = ${cfg.hostKind} · machineDist = ${cfg.machineDist} · turnTimeoutMs = ${cfg.turnTimeoutMs ?? "未配置（下游缺省 10 min）"}\n`,
   );
-  if (cfg.releasedVersions.length > 0) {
+  const releasedNow = releasedVersionNames(versionsLedger.load().ledger);
+  if (releasedNow.length > 0) {
     process.stdout.write(
-      `已发版锁定：${cfg.releasedVersions.join(" · ")}（config.json 的 releasedVersions）⇒ 提需求排入这些版本、以及排期写改入 / 改出（含清空）这些版本一律 409 board_version_released 拒绝（同锁版重提放行）；改动须重启板生效\n`,
+      `已发版锁定：${releasedNow.join(" · ")}（版本台账 ${versionsLedgerFile} 的 released 条目）⇒ 提需求排入这些版本、以及排期写改入 / 改出（含清空）这些版本一律 409 board_version_released 拒绝（同锁版重提放行）；后台 POST /versions setStatus 直投标记 released / 重开为进行中实时生效（前台已撤该入口 · 增补十一 E3）\n`,
     );
   }
   if (group === null) {

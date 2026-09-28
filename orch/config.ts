@@ -48,6 +48,17 @@ export function resetWarnOnceCache(): void {
   warnedTexts.clear();
 }
 
+/**
+ * 「已发 warn 文案」集合的**只读快照**（v0.9.4 O2：`GET /api/groups` 的 `warnings[]` 透传源）。
+ *
+ * 语义边界：这是**进程级 warn-once 副产物**（解析宽容的配置瑕疵文案，如 `launcherUrl` 缺省），
+ * **不是配置校验失败清单**（校验失败一律 `fail()` 抛错）；消费方（板 3300 聚合面）只如实呈现、
+ * 不入判定逻辑。
+ */
+export function getWarnedConfigTexts(): readonly string[] {
+  return [...warnedTexts];
+}
+
 function asRecord(v: unknown, ctx: string): Record<string, unknown> {
   if (typeof v !== "object" || v === null || Array.isArray(v)) {
     fail(`${ctx} 必须是对象`);

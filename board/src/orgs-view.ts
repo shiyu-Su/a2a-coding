@@ -1,11 +1,14 @@
 /**
  * 组织视角页的数据面（REQ-v0.9.2 板界面打磨 · N6）—— **只读**：
- * 组织清单归并（磁盘枚举 ∪ 板托管台账 ∪ 需求归属 ∪ 板级默认）+ 逐组项目查询 + 需求按组归组。
+ * 组织清单归并（磁盘枚举 ∪ 板托管台账 ∪ 需求归属 ∪ 板级默认）+ 逐组项目查询 + 需求按组归组
+ * + **全组枚举消费**（v0.9.4 C 档 · BD5：只读 `GET <3300>/api/groups`，组结构**声明面**）。
  *
  * 硬口径（改造文档 §3.1 N6「不做什么」）：
- * - **零写面**：不写任何配置、不写状态机；逐组查询 = 只读 MCP 调用（`a2a_projects`，非三工具名写面）；
- * - **零新增存储、不缓存**：每次渲染现查（盘 + 各组桥），板不落任何中间账；
+ * - **零写面**：不写任何配置、不写状态机；逐组查询 = 只读 MCP 调用（`a2a_projects`，非三工具名写面）、
+ *   全组枚举 = 只读 HTTP GET（3300 聚合面）；
+ * - **零新增存储、不缓存**：每次渲染现查（盘 + 各组桥 + 3300），板不落任何中间账；
  * - **单组失败不炸页**：失败 / 超时的组织如实标「不可达」（灰化），其余组织照常呈现；
+ * - **3300 宕机不炸页**：全组枚举失败 / 超时 ⇒ 如实标「组数据不可用」（灰化），页面其余照常；
  * - **无归属需求不丢弃、不回落板级默认组**：`ownerGroup = null` 归「（无归属）」伪分组如实呈现。
  */
 import { readdirSync } from "node:fs";
@@ -52,6 +55,41 @@ export function mergeOrgNames(sources: OrgNameSources): string[] {
   return [...names].sort((a, b) => (a < b ? -1 : a > b ? 1 : 0));
 }
 
+/**
+ * 门户卡清单 ∩ 顶栏切换器清单的**共用口径**（v0.9.4 §9-b/§9-d · REQ-2026-09-27-06 · 纯函数）：
+ * **台账未停用 ∪ 需求归属（ownerGroup）**（另并入板级默认与当前空间组织两个无争议源），
+ * 停用名一票否决。**磁盘一级目录枚举不进本口径** —— 盘遗留目录与外机组（本板无需求归属）
+ * 都不构成板可见的组织（BD7 的「本地三源」形态由本函数取代，两处清单自此同源单点）。
+ *
+ * `current` = 当前空间组织：其空间路由已由存在性 universe 放行才可能出现在这里，
+ * 故保证进清单（顶栏「当前组织」高亮不因源缺席而丢失）；停用名不接受（点了必 410）。
+ */
+export interface PortalOrgSources {
+  /** 台账在用名（板组织台账 ∪ 宿主桥托管）。 */
+  ledger: readonly string[];
+  /** 需求列表的 `ownerGroup`（null / 空白由调用方滤除）。 */
+  featureGroups: readonly string[];
+  /** 板级默认组织（可空）。 */
+  defaultGroup: string | null;
+  /** 台账停用名（唯一判据 = `orgs-ledger.isOrgDisabled` 的集合形态）。 */
+  disabled?: readonly string[];
+  /** 当前空间组织（非空间页 ⇒ null / 省略）。 */
+  current?: string | null;
+}
+
+export function portalOrgNames(sources: PortalOrgSources): string[] {
+  const disabled = new Set((sources.disabled ?? []).map((n) => n.trim()).filter((n) => n !== ""));
+  const merged = mergeOrgNames({
+    disk: [],
+    ledger: sources.ledger,
+    featureGroups: sources.featureGroups,
+    defaultGroup: sources.defaultGroup,
+  }).filter((n) => !disabled.has(n));
+  const current = (sources.current ?? "").trim();
+  if (current === "" || disabled.has(current) || merged.includes(current)) return merged;
+  return mergeOrgNames({ disk: [current], ledger: merged, featureGroups: [], defaultGroup: null });
+}
+
 /** 需求按 `ownerGroup` 归组（纯函数）：null / 空白归属 ⇒ 归「（无归属）」伪分组，不丢弃。 */
 export function groupFeaturesByOwner(features: readonly FeatureListItem[]): Map<string, FeatureListItem[]> {
   const groups = new Map<string, FeatureListItem[]>();
@@ -63,6 +101,16 @@ export function groupFeaturesByOwner(features: readonly FeatureListItem[]): Map<
     else bucket.push(f);
   }
   return groups;
+}
+
+/**
+ * 组织空间过滤（v0.9.4 D 档 / BD6 · 纯函数）：保留 `ownerGroup` trim 后 == org 的项
+ * （trim-vs-trim 口径同 {@link groupFeaturesByOwner}）；null / 空白归属不进任何组织空间。
+ */
+export function featuresOfOrg(features: readonly FeatureListItem[], org: string): FeatureListItem[] {
+  const target = org.trim();
+  if (target === "") return [];
+  return features.filter((f) => (f.ownerGroup ?? "").trim() === target);
 }
 
 /** 组内项目行（`a2a_projects` 出参 `machines[].projects[]` 的白名单字段投影）。 */
@@ -179,4 +227,131 @@ export function listOrgDirs(orgsDir: string | null, probe: DirKindProbeFn = stat
   } catch {
     return [];
   }
+}
+
+// ---------------------------------------------------------------------------
+// 全组枚举消费（v0.9.4 C 档 · BD5，改造文档 §2.4）
+// ---------------------------------------------------------------------------
+//
+// 数据源 = **3300 只读聚合面** `GET /api/groups`（orch O2）—— 全组事实源本来就在聚合面，
+// **不走 MCP 单组连接拼合**（逐组连接只能看到本组，拼合出来的「全组」是假象）。
+// 与逐组 `a2a_projects` 的关系 = **并存、不替代**：前者是**组结构声明面**（谁挂在哪组），
+// 后者是**运行态**（该组当前有哪些项目）。
+
+/** 全组枚举端点路径（3300 只读面，v0.9.4 O2 交付）。 */
+export const GROUPS_QUERY_PATH = "/api/groups";
+
+/** 声明面的一条成员项（`machineId` 按**不透明字符串**处理，板不拆格式）。 */
+export interface GroupMemberRow {
+  machineId: string;
+  projectId: string;
+}
+
+/** 声明面的一个组（桥 `GroupView` 的白名单投影）。 */
+export interface GroupRow {
+  name: string;
+  memberCount: number;
+  members: GroupMemberRow[];
+}
+
+/**
+ * 全组枚举查询结果（fetcher 出口）。
+ * `ok=false` = 3300 不可达 / 配置坏（`machines_config_error`）⇒ 视图层整块灰化「组数据不可用」，
+ * **不得阻断页面其余渲染**。`warnings` = 桥的 warn-once 配置瑕疵文案，**只如实呈现、不入任何判定**。
+ */
+export type OrgGroupsOutcome =
+  | { ok: true; groups: GroupRow[]; warnings: string[]; observedAt: string | null }
+  | { ok: false; code: string; error: string };
+
+/**
+ * `GET /api/groups` 原始负载 → 归一投影（纯函数）。
+ * 桥契约：成功 = `{ok:true, groups[], warnings[]}`（未配组 ⇒ `groups: []` = 全量接纳语义，
+ * 是**真实空**不是缺位）；失败 = `{ok:false, code, error}`（500 `machines_config_error`）。
+ * 形状不合 ⇒ `response_invalid`（不臆造空清单）；`name` 非字符串的组条目跳过（无法归组身份）。
+ */
+export function normalizeGroupsOutcome(json: unknown): OrgGroupsOutcome {
+  if (!isRecord(json)) return { ok: false, code: "response_invalid", error: "全组枚举响应不是 JSON 对象" };
+  if (json.ok !== true) {
+    return {
+      ok: false,
+      code: str(json.code) ?? "response_invalid",
+      error: str(json.error) ?? "全组枚举查询未成功",
+    };
+  }
+  if (!Array.isArray(json.groups)) {
+    return { ok: false, code: "response_invalid", error: "全组枚举响应缺 groups 数组" };
+  }
+  const groups: GroupRow[] = [];
+  for (const entry of json.groups) {
+    if (!isRecord(entry)) continue;
+    const name = str(entry.name);
+    if (name === null) continue;
+    const rawMembers = Array.isArray(entry.members) ? entry.members : [];
+    const members: GroupMemberRow[] = [];
+    for (const me of rawMembers) {
+      if (!isRecord(me)) continue;
+      const machineId = str(me.machineId);
+      const projectId = str(me.projectId);
+      if (machineId === null || projectId === null) continue;
+      members.push({ machineId, projectId });
+    }
+    const declared = num(entry.memberCount);
+    groups.push({ name, memberCount: declared !== null ? declared : members.length, members });
+  }
+  const warnings = Array.isArray(json.warnings) ? json.warnings.filter((w): w is string => typeof w === "string") : [];
+  return { ok: true, groups, warnings, observedAt: str(json.observedAt) };
+}
+
+/** 全组枚举查询注入面（单测喂假端点；缺省 = 经 3300 只读面真查）。 */
+export type OrgGroupsFetcher = () => Promise<OrgGroupsOutcome>;
+
+export interface OrgGroupsFetcherOptions {
+  /** 3300 只读运维视图基址（config `bridgeUrl`；缺省同 `bridge-client` 的 `DEFAULT_BRIDGE_BASE_URL`）。 */
+  baseUrl: string;
+  timeoutMs?: number;
+  fetchImpl?: typeof fetch;
+}
+
+/**
+ * 构造全组枚举查询器：`GET <3300>/api/groups`（只读、零鉴权、loopback）。
+ * 传输失败 / 超时 / 非 2xx / 非法 JSON ⇒ 一律收口 `ok=false`，**不外抛**（宕机不阻断页面渲染）；
+ * 非 2xx 时优先取响应体的 `code`（如 `machines_config_error`），取不到才落 `http_<status>`。
+ */
+export function createOrgGroupsFetcher(options: OrgGroupsFetcherOptions): OrgGroupsFetcher {
+  const base = options.baseUrl.replace(/\/+$/, "");
+  const timeoutMs = options.timeoutMs ?? ORG_QUERY_TIMEOUT_MS;
+  return async (): Promise<OrgGroupsOutcome> => {
+    const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+    if (typeof fetchImpl !== "function") return { ok: false, code: "no_fetch", error: "运行环境无 fetch 实现" };
+    try {
+      const res = await fetchImpl(`${base}${GROUPS_QUERY_PATH}`, {
+        method: "GET",
+        signal: AbortSignal.timeout(timeoutMs),
+        headers: { accept: "application/json" },
+      });
+      const raw = await res.text();
+      if (!res.ok) {
+        let code = `http_${res.status}`;
+        try {
+          const body: unknown = JSON.parse(raw);
+          code = (isRecord(body) ? str(body.code) : null) ?? code;
+        } catch {
+          /* 错误体非 JSON ⇒ 用 HTTP 状态码收口，原文照常带出 */
+        }
+        return { ok: false, code, error: `桥返回 HTTP ${res.status}：${raw.slice(0, 200)}` };
+      }
+      let parsed: unknown;
+      try {
+        parsed = JSON.parse(raw);
+      } catch {
+        return { ok: false, code: "response_invalid", error: `全组枚举响应不是合法 JSON：${raw.slice(0, 200)}` };
+      }
+      return normalizeGroupsOutcome(parsed);
+    } catch (err) {
+      const message = err instanceof Error ? err.message : String(err);
+      // 超时与「连不上」分开收口：AbortSignal.timeout 触发的中止在 Node 侧是 TimeoutError / abort 文案
+      const timedOut = err instanceof Error && (err.name === "TimeoutError" || /abort|timed? ?out/i.test(`${err.name} ${message}`));
+      return { ok: false, code: timedOut ? "groups_timeout" : "groups_unreachable", error: message };
+    }
+  };
 }

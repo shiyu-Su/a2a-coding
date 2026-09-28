@@ -20,6 +20,6 @@
   "_repoRootComment": "主仓根（BD10 · 读文档面**源 A** 的锚点）。「阶段产出」区双源合并 = 主仓 <repoRoot>/doc/{version}/ ∪ 组织 <orgsDir>/<org>/doc/{version}/，本键只管前者。缺省 = 板根上一级（由模块位置反推，源码运行与 dist 运行落同一仓根，如 <仓根>/board ⇒ 缺省 <仓根>）。不填 = 用推导缺省；填写 = 字符串路径（相对值按进程 cwd 解析）。类型错（非字符串）⇒ `[config] repoRoot` fail-fast。⚠ **目录不存在不是错误**：列目录时按空清单降级（B3 口径），板不代建、也不在启动期报错 —— 但「阶段产出」区会如实显示无该源内容。",
   "turnTimeoutMs": 600000,
   "_turnTimeoutMsComment": "宿主对话单轮的**有界等待**上限（毫秒；BD4b）。缺省 = 不配置本键 ⇒ 交下游 DEFAULT_TURN_TIMEOUT_MS（600000 = 10 min）。**fail-fast**：非正整数（0 / 负数 / 小数 / 字符串）⇒ `[config] turnTimeoutMs` 拒绝启动（不再像旧 env 通道那样静默忽略非法值）。到点落 timeout 终态，绝不无限等。",
-  "releasedVersions": ["v0.9.0", "v0.9.1"],
-  "_releasedVersionsComment": "**已发版版本号清单 = 板前台版本锁的唯一事实源**（REQ-v0.9.2 N1）。发版流程收尾时由宿主把版本号登记进来（flow §8「登记已发版版本」）。**锁判据** = trim 后**精确串匹配**（**不做前缀匹配** ⇒ 登记 `v0.9.0` 不连坐 `v0.9.0-probe`；**不做 semver 归一**）。命中即锁：提需求带该 version / 排期改入或改出该 version ⇒ 结构化 409 `board_version_released`（N2/N3）；未排期（空串）永不参与锁。**缺省 = 整键删除或空数组 ⇒ 无锁版**。类型错（非数组）或元素错（非字符串 / 空串 / 纯空白）⇒ `[config] releasedVersions` fail-fast；元素 trim 后自动去重。⚠ **只锁板前台**：宿主经 MCP 直写 version 是已知后门（靠 flow 纪律句约束），真全局锁待 v0.10.x 引擎 version 闭集。**改动须重启板进程才生效**（本文件启动期读一次）。"
+  "releasedVersions": [],
+  "_releasedVersionsComment": "**退役键（v0.9.4 N3）**：已发版锁的事实源已改为**板版本台账** `.data/versions.json`（板上维护 · 热生效免重启，见 `版本的 released 标记`）。本键**不再承载运行时锁**，保留仅为**历史配置的一次性迁移输入**：启动时若台账文件不存在 ⇒ 读入本键并灌成台账 `status=released`（灌入失败 ⇒ 拒起板，防已发版锁静默消失）；台账已存在 ⇒ 本键为**残留键**，一次性 warn、**不双读**（请整键删除）。**新部署请勿设置本键**（留空数组 / 整键删除皆可）。锁判据 = trim 后**精确串匹配**（不做前缀匹配 / 不做 semver 归一）；未排期（空串）永不参与锁。历史键非法形态（非数组 / 元素非字符串 / 空串 / 纯空白）仍 `[config] releasedVersions` fail-fast。⚠ **只锁板前台**：宿主经 MCP 直写 version 是已知后门（靠 flow 纪律句约束），真全局锁待 v0.10.x 引擎 version 闭集。"
 }

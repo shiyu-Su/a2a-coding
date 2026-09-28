@@ -32,7 +32,23 @@ test("buildScheduleAdvanceArgs: 出参键集合恰好 = {featureId,to,version}",
 
 test("buildScheduleAdvanceArgs: to 恒等传入的当前态（不加工、不回落）", () => {
   for (const to of ["waiting_approval", "executing", "integrating", "testing", "reviewing", "completed"]) {
-    assert.equal(buildScheduleAdvanceArgs({ featureId: "F1", to, version: "v1" }).to, to);
+    assert.equal(buildScheduleAdvanceArgs({ featureId: "F1", to, version: "v0.9.2" }).to, to);
+  }
+});
+
+// v0.9.4 N4 semver 收口（改造文档 §2.5）：排期写口三态 —— 合法放行 / 非法拒 / 清空 \"\" 放行（取消排期）。
+test("buildScheduleAdvanceArgs（N4 · 三态）: 合法 x.y.z 放行；清空 \"\" = 取消排期放行；非 x.y.z 抛 FeatureScheduleConfigError", () => {
+  assert.equal(buildScheduleAdvanceArgs({ featureId: "F1", to: "executing", version: "v0.9.4" }).version, "v0.9.4");
+  assert.equal(buildScheduleAdvanceArgs({ featureId: "F1", to: "executing", version: "  v0.10.0  " }).version, "v0.10.0");
+  // 清空 = 取消排期的合法值 ⇒ 放行（键仍在）
+  assert.equal(buildScheduleAdvanceArgs({ featureId: "F1", to: "executing", version: "" }).version, "");
+  // 非法（含验收点名 v0.9.1-probe 类）⇒ 先于网络拒
+  for (const bad of ["v0.9.1-probe", "1.0", "v1", "v0.9", "^0.9.4", "latest", "0.9.4.1"]) {
+    assert.throws(
+      () => buildScheduleAdvanceArgs({ featureId: "F1", to: "executing", version: bad }),
+      FeatureScheduleConfigError,
+      `expected ${JSON.stringify(bad)} rejected`,
+    );
   }
 });
 
@@ -54,8 +70,8 @@ test("buildScheduleAdvanceArgs: version 键缺失 = 编程错误抛出（类型�
 });
 
 test("buildScheduleAdvanceArgs: 空 featureId / 空 to 抛出", () => {
-  assert.throws(() => buildScheduleAdvanceArgs({ featureId: "  ", to: "executing", version: "v1" }), FeatureScheduleConfigError);
-  assert.throws(() => buildScheduleAdvanceArgs({ featureId: "F1", to: "  ", version: "v1" }), FeatureScheduleConfigError);
+  assert.throws(() => buildScheduleAdvanceArgs({ featureId: "  ", to: "executing", version: "v0.9.2" }), FeatureScheduleConfigError);
+  assert.throws(() => buildScheduleAdvanceArgs({ featureId: "F1", to: "  ", version: "v0.9.2" }), FeatureScheduleConfigError);
 });
 
 // ---------------------------------------------------------------------------
@@ -90,7 +106,7 @@ test("scheduleFeature: 清空排期出网 version === \"\"", async () => {
 
 test("scheduleFeature: 桥拒（如态漂移）结构化透传、不吞", async () => {
   const out = await scheduleFeature(
-    { featureId: "F1", to: "executing", version: "v1" },
+    { featureId: "F1", to: "executing", version: "v0.9.2" },
     { group: "g", fetchImpl: async () => new Response(JSON.stringify(okEnvelope({ ok: false, code: "feature_illegal_transition", error: "to 非当前态" })), { status: 200 }) },
   );
   assert.equal(out.ok, false);

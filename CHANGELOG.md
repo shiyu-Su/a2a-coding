@@ -2,6 +2,31 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.9.4] - 2026-09-28
+
+> 主题：**板上组织管理（组织可管 · 组织空间）+ 版本管理面（排期看板新增版本入口）**（两条主需求 + 十一条验收增补轨 + 一条数据清理需求；验收原话「两个需求 都没问题了」「可以了」「那这个需求 就算是完成了」）。过程沉淀：**验收期「缺陷由真机实测驱动」的完整闭环**（建组织首成员死锁 / `form.action` 同名遮蔽 405 / 停用不摘编排成员 三例均由用户在板上亲手点出来）；宿主两处失误当场留痕更正（擅自挪版、虚构卡片 id）。
+
+### Added
+
+- **板上组织管理与组织空间**（`REQ-2026-09-26-01`，主需求 Feature `a5772e85`，13 节点 + 六条增补轨）：**组织台账写面**（新建 / 停用 / 删除；建组织即自动供给工作区目录）· **成员写面经桥 O1 受控写**——跨单元新增 MCP 工具 **`a2a_config_write_group`**（`orch/bridge/config-write.ts`：`projectGroup` 段五操作指令 `group.add` / `group.update` / `group.remove` / `group.member.add` / `group.member.remove`；`read → mutate → dry-run 同源校验 → backup → tmp+rename 原子替换`；六码闭集错误；配置面写不受连接身份视野限制、写后热生效）· **首页改为组织门户**（组织卡摘要 + 「＋ 建组织」按钮弹窗）· **组织空间归一层 `/org/<组织名>/…`**（排期 / 需求 / 管理三页）· **停用 = 台账标记 + 同步摘除编排成员登记**（原子：O1 `group.remove` 失败即整体失败、组段缺失幂等放行）· **独立组织页 `/orgs` 退役**（成员与停用迁 `/org/<名>/manage`）。三条真机实测缺陷收口：**建组织首成员加不进**（新组织无组段 ⇒ 409 `config_write_group_not_found` 鸡生蛋死锁 ⇒ 成员写遇组不存在改发 `group.add` 建组带首成员）· **`form.action` 被 `<input name="action">` 遮蔽**（`LegacyOverrideBuiltIns` ⇒ fetch 打到 `/org/<名>/[object%20HTMLInputElement]` 得 405 ⇒ 改 `form.getAttribute("action")`）· **写表单报错不跳页**（fetch + 浮层错误卡，口径对齐排期表单；「知道了」委托关闭补齐）。业务化文案：末位成员删除 ⇒「组织内仅剩一项目时，无法删除项目，请选择停用组织」。
+- **排期看板「新增版本」入口 → 版本管理面**（`REQ-2026-09-27-05`，Feature `5d07f595`，11 节点 + 五条增补轨）：板侧**版本台账** `board/.data/versions.json`（三态闭集 未开始 / 进行中 / 已发版；含 `releasedVersions` 配置键迁移）· 排期列 = **台账 ∪ 卡片 `version` 派生的并集**（列头三态徽标；派生态按卡片阶段判定——名下存在 `stage ≠ 需求分析` 的卡才算「进行中」，否则「未开始」）· **发版闸执法**（标记已发版 = 名下 `completed === total ∧ total > 0`）· **已发版锁换源**（`config.json` 的 `releasedVersions` 退役，改由台账承载；两个排期写口 409 `board_version_released`）· **建版本单一入口 = 「＋ 新版本」按钮 + 弹窗**（原生 `prompt()` 与拖拽虚列两条旧路退役）· **删除版本入口移到版本框头**（× 仅在「该版本名下无已过 Step 0 确认门的卡」时出现；删含想法卡的版本 ⇒ 卡自动回需求池、不丢卡）· **已发版列纯只读**（前台撤「标记已发版」与「重开」入口；后台 `POST /versions` 的 `setStatus` 保留为数据订正通道）· semver 复用既有 `parseVersion`。flow 侧三笔：`需求流程.md` §7 已发版锁措辞改「板版本台账」、§8 两条尾注顺序对调（板标记 `released` 前置）、`引擎映射.md` §3.5 版本状态事实源改为台账。
+- **需求池历史数据清理**（`REQ-2026-09-28-05`，Feature `e173b139`）：宿主侧一次性数据清理（**真删**，非板侧隐藏）——池内「未排期 ∧ 终态」Feature **174 张**及其引用面（tasks / artifacts / events / integration_ops / tracks，≈ **1.54 万行**）；**先 `VACUUM INTO` 备份 + 单事务按子→父删除 + 复核**（快照 `orch/data/sessions.sqlite.bak-2026-09-28T05-33-04-648Z`）。板侧「池列隐藏终态」（防增量）经用户裁定不做，设计留痕于本版改造文档。
+
+### Changed
+
+- 版本号四处 `package.json` + 三处 lock 同升 **0.9.4**；`flow/spec` 三份文件「规范版本戳」统一 v0.9.4。
+- **README 对齐**（含 v0.9.0 起的滞后一并修正）：补入**板（`board/`）单元**（架构说明 + 目录结构树 + 功能特性一条）· 修正 3300 **HTML 页面已于 v0.9.3 退役**（仅 `/api/*` 数据面保留）· MCP 工具面计数与条目补齐（Feature 工具组 5 → 6，补 `a2a_feature_trace`；新增「配置写工具」`a2a_config_write_group`）· 目录树删掉 v0.9.3 已删除的 `bridge/web/html.ts` · 移除 README 里过期的版本号自述（版本历史归本文件）。
+- `.gitignore` 增补配置写口自动备份（`*/config/config.json.bak-*`）——`config-write` 每次写前留档、累积产物不入库（现存 15 份）。
+- 宿主侧清理：删除权限探针遗留的空文件 `orch/opencode.json`（内容 `{}`，此前触根回归一条红项）与板侧一次性冒烟脚本 `board/scratch-n3-smoke.mjs`（首行自述「跑完即删」、零引用）。
+
+### 门禁与验收
+
+- board **965/965** · orch **423 pass / 1 skip / 0 fail**（424 项；skip = POSIX 真 SIGKILL 集成，win32 不适用）· machine **559/560**（唯一红项 = `test/acp-bridge-m2.test.ts:130` 既有时间耦合 fixture：硬编码 `2026-09-19` + 7 天保留 TTL，自 2026-09-26 起随日历必红，**非本版引入**；按 §6 不擅改，另立待办）· flow = `node --check install/{install,uninstall}.mjs` 各 exit 0 · 根回归 **1363/1363**（`reports/v0.9.4/`；宿主侧 4 条 machine 版本 pin 随发版翻向 0.9.4：`test-v0.8.4-key-layout` / `test-v0.8.5-codex-claude-acp`）。
+- 真机 = 桥 / 板均 bring-up 新代码；用户真浏览器多轮点验（建组织 → 管成员 → 停用 → 切组织；建版本 → 删版本 → 三态徽标），形成 11 条验收增补轨。
+- **发版收尾（Feature `dd5d7022`）**：板服务与编排桥各重启一次，`/health` 均报 `status=ok` + **版本横幅 0.9.4**（桥重启后 pid 45908 / startedAt 2026-09-28T07:11:57Z；**Launcher 未重启** —— 本版 machine 零行为改动，重启会触发启动补结算把该机在飞任务判 `failed`）。早前「单元本地 opencode 配置能否自解封权限」探针遗留的配置文件共四份：`orch/opencode.json`（`{}`）与 `machine/opencode.json`（BOM + `{}` + CRLF）**已删**；`board/opencode.json` 与 `flow/opencode.json` 实测**均非空**（两者同形：`{"$schema": "https://opencode.ai/config.json",}`，**多一个尾随逗号 ⇒ 非法 JSON**）⇒ 按「非空不删」判据**原样保留待裁**（若要保留，建议删掉那个尾随逗号 —— 现形态下以 `board/` 或 `flow/` 为工作区启动 opencode 会因解析失败报错）。
+- **过程注记（下次发版沿用）**：收尾节点把「重启所属服务」与「清理文件 + 回报结果」放在同一节点 ⇒ 重启打断了该节点自身的回执（`running_remote` 悬挂 15 分钟），宿主按超时下发 `a2a_cancel`、该任务最终以 **`failed`**（`failureKind=runner`）结算（**非 `cancelled`**），随后改用只读核实补齐事实。**重启所属服务与回报结果不要放同一节点。**
+- **遗留待裁（板标记 `released` 未执行）**：v0.9.4 名下 18 张卡 = 14 completed + 3 cancelled（满窗判死→拆节点重建的废弃轨）+ 1 张发版准备卡；而闸判据把 `cancelled` 计入 `total`、却不计入 `completed`，且 `cancelled` 在状态机上**无后继边** ⇒ 该闸对「曾有取消轨的版本」**不可满足**（实测 409 `board_version_transition_release_incomplete`，`completed 14 / total 18`）。待用户裁决处理方式后补登台账条目与 `released` 标记。
+
 ## [v0.9.3] - 2026-09-27
 
 > 主题：**flow 规范修订 + 板多视图与 3300 收编 + 排期页弹窗**（三条需求 + 三条验收增补轨；验收原话「可以吧」「验收通过」「图现在展示的可以了」）。过程沉淀：**「主需求最后完成」与「增补轨挂主需求」首次完整实战**（第一例真实增补链 REQ-2026-09-27-01/03/04，REQ-ID 新格式首用）；planlog 本版起**退役归档**（需求事实源 = 引擎 + 板，登记类改道改造文档 §6）。

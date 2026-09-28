@@ -55,7 +55,37 @@ export function escapeHtml(value: unknown): string {
     .replace(/'/g, "&#39;");
 }
 
-export type NavKey = "features" | "schedule" | "tasks" | "projects" | "agents" | "orgs" | "host";
+export type NavKey = "home" | "features" | "schedule" | "tasks" | "projects" | "agents" | "host";
+
+/**
+ * **组织上下文（v0.9.4 D 档 · BD7）**：`renderPage` 的 NAV 组织感知与顶栏组织切换器的唯一输入。
+ *
+ * - `org` = 当前页面所处的组织空间（`null` ⇒ 全局页面，NAV 落全局路径）；
+ * - `orgs` = 顶栏切换器的组织清单（**服务端渲染的链接列表**，跳转 = 全页刷新 ⇒
+ *   零新脚本，内联脚本闭集保持六元，见 {@link PageParams.orgNav}）。
+ */
+export interface PageOrgNav {
+  org: string | null;
+  orgs: readonly string[];
+}
+
+/** NAV 全局路径 → 组织空间路径（`/org/<名>/…`，名段一律 `encodeURIComponent`）。 */
+const ORG_SPACE_VIEWS: Partial<Record<NavKey, string>> = {
+  schedule: "schedule",
+  tasks: "tasks",
+};
+
+/**
+ * NAV 单条链接的落点（BD7 组织感知）：空间内且该页有空间对应面 ⇒ 落 `/org/<名>/<面>`；
+ * 其余（projects / agents / orgs / host 无空间对应面，`home` 恒为全局门户，以及全局页面）
+ * 保持全局路径。
+ */
+export function navHrefFor(orgNav: PageOrgNav | undefined, key: NavKey, globalHref: string): string {
+  const org = orgNav?.org;
+  const view = org === undefined || org === null ? undefined : ORG_SPACE_VIEWS[key];
+  if (view === undefined || org === undefined || org === null) return globalHref;
+  return `/org/${encodeURIComponent(org)}/${view}`;
+}
 
 /**
  * **提交守卫**（收口轨 14 ①）：页面全部写表单共用的**一段内联脚本**。
@@ -67,13 +97,94 @@ export type NavKey = "features" | "schedule" | "tasks" | "projects" | "agents" |
  * `board_turn_busy` 409 硬闸），CSRF 判定也不依赖本脚本（表单档同源 Origin/Referer 照旧成立）。
  *
  * 与页面同字面量渲染（不含用户数据 ⇒ 无注入面；脚本内不得出现 `</script` 字面量）。
+ *
+ * **增补二 §9.1-② 的扩写（闭集六元不扩，在本常量体内扩）**：带 `data-ov="1"` 标记的写表单
+ * （manage 成员增删 / 停用 + 门户建组织）改 **fetch 提交 + 浮层报错**，口径对齐改版排期表单：
+ * - **2xx/3xx（303 被 fetch 自动跟随 ⇒ 最终页 ok）⇒ 整页刷新**（成功回执以服务端重渲染为事实源）；
+ * - **4xx/5xx ⇒ 页面不跳**：抽错误页 `.err-ov-card` 叠加为 `document.body` 直接子元素
+ *   （`.ov-err-overlay` = 与拖拽错误卡同款 fixed 居中 + 遮罩），「知道了」由错误页自带脚本摘除；
+ *   抽不到卡 ⇒ 刷新兜底（错误可见，不静默）；
+ * - fetch 网络异常 ⇒ 刷新（同拖拽口径）；`e.defaultPrevented` ⇒ 让位（详情浮层 / 新增需求弹窗
+ *   各有自己的 submit 委托，先注册先处理，本守卫不抢）；
+ * - 提交标记 `data-ov-pending` 防连点双发（原生 `form.submit()` 路径不派发 submit 事件 ⇒ 天然不双提交）；
+ * - **无 JS / 脚本失效 = 原生 PRG 整页回显**（标记只是体验层，回退面不劣化、不扩内联脚本闭集）。
+ *
+ * **增补三 §9.2（form.action 遮蔽修复）**：fetch 目标 URL 一律读**属性**
+ * `form.getAttribute("action")`，**不得直读 `form.action`** —— 成员/停用表单带
+ * `name="action"` 隐藏字段，`HTMLFormElement` 的 `[LegacyOverrideBuiltIns]` 使同名字段
+ * 遮蔽 `action` 属性，直读拿到的是 input 元素 ⇒ 强转成伪 URL（405 实证根因）；
+ * 属性读为空 ⇒ 回落 `form.submit()` 原生提交（不劣化）。负向锚见 `test/web.test.mjs`。
+ *
+ * **增补四 §9.3 的扩写（闭集六元不扩，在本常量体内扩）**：注入卡上的「知道了」按钮点了不关
+ * —— 关闭逻辑原靠「错误页自带脚本」（`renderErrorOverlay` 的直接绑定），而卡片是经
+ * `DOMParser` 惰性文档摘入本文档的：**搬运节点不跑 `<script>`** ⇒ 按钮无处理器
+ * （manage / 门户两页各只注入本枚脚本，没有 /schedule 侧三枚浮层脚本的委托兜底）。
+ * 补一条 **document 级 click 委托**：命中 `#err-ov-close` ⇒ `closest(".err-ov-card")` 摘除该卡
+ * （动态注入天然覆盖），口径对齐 /schedule 侧 `closest(...err-ov-card...)` 委托先例。
+ *
+ * **增补五 §9.4-② 的扩写（闭集六元不扩，在本常量体内扩）**：成功路径支持 `data-ov-redirect` 属性
+ * —— 停用表单提交成功后**当前页就是刚被关掉的空间页**，`reload()` 必落 410 ⇒ 有该属性则
+ * `location.href = 该值`（停用表单给 `/` = 门户，与服务端 303 落点同口径），
+ * 无该属性 ⇒ 维持原 reload 行为（建组织 / 成员增删的成功页就在本处）。
+ * **只在成功（2xx/3xx）路径生效**：4xx/5xx 与网络异常仍留在本页出浮层（失败不跳走）。
  */
 export const SUBMIT_GUARD_SCRIPT = `<script>
 (function () {
+  function ovShowCard(card) {
+    var old = document.querySelectorAll("body > .err-ov-card.ov-err-overlay");
+    for (var i = 0; i < old.length; i += 1) { if (old[i].parentNode !== null) { old[i].parentNode.removeChild(old[i]); } }
+    card.classList.add("ov-err-overlay");
+    document.body.appendChild(card);
+  }
+  function ovRestore(form) {
+    form.removeAttribute("data-ov-pending");
+    var btns = form.querySelectorAll("button[disabled]");
+    for (var i = 0; i < btns.length; i += 1) {
+      btns[i].disabled = false;
+      btns[i].removeAttribute("aria-disabled");
+    }
+    var p = form.querySelector(".submit-pending");
+    if (p !== null && p.parentNode !== null) { p.parentNode.removeChild(p); }
+  }
+  function ovSubmit(form) {
+    var data;
+    try { data = new URLSearchParams(new FormData(form)); } catch (err) { data = null; }
+    // 增补三 §9.2：必须 getAttribute —— 成员/停用表单带 name="action" 字段，
+    // HTMLFormElement 的 [LegacyOverrideBuiltIns] 会让同名字段遮蔽 action 属性直读。
+    var action = form.getAttribute("action") || "";
+    if (data === null || action === "") { ovRestore(form); form.submit(); return; }
+    fetch(action, {
+      method: "POST",
+      body: data,
+      credentials: "same-origin",
+      headers: { Accept: "text/html" }
+    }).then(function (res) {
+      return res.text().then(function (text) { return { ok: res.ok, text: text }; });
+    }).then(function (r) {
+      // 增补五 §9.4-②：表单带 data-ov-redirect 时成功改跳该落点（停用后刷新当前空间页必 410），
+      // 无该属性 ⇒ 维持原 reload 口径。
+      var redirect = form.getAttribute("data-ov-redirect") || "";
+      if (r.ok) { gotoAfterSubmit(redirect); return; }
+      var doc = new DOMParser().parseFromString(r.text, "text/html");
+      var card = doc.querySelector(".err-ov-card");
+      if (card === null) { window.location.reload(); return; }
+      ovRestore(form);
+      ovShowCard(card);
+    }).catch(function () { gotoAfterSubmit(""); });
+  }
+  function gotoAfterSubmit(redirect) {
+    if (redirect !== "") { window.location.href = redirect; return; }
+    window.location.reload();
+  }
   document.addEventListener("submit", function (e) {
     var form = e.target;
     if (!form || typeof form.querySelectorAll !== "function") return;
     if ((form.getAttribute("method") || "").toLowerCase() !== "post") return;
+    if (e.defaultPrevented) return;
+    if ((form.getAttribute("data-ov") || "") === "1") {
+      if (form.getAttribute("data-ov-pending") === "1") { e.preventDefault(); return; }
+      form.setAttribute("data-ov-pending", "1");
+    }
     var note = form.getAttribute("data-submit") || "已提交，处理中…";
     var btns = form.querySelectorAll("button[type=submit]");
     for (var i = 0; i < btns.length; i += 1) {
@@ -86,6 +197,17 @@ export const SUBMIT_GUARD_SCRIPT = `<script>
       p.textContent = note;
       form.appendChild(p);
     }
+    if (form.getAttribute("data-ov") === "1") { e.preventDefault(); ovSubmit(form); }
+  });
+  // 增补四 §9.3：document 级委托摘「知道了」（DOMParser 搬入的卡不跑自带脚本；
+  // 委托天然覆盖动态注入卡，口径对齐 /schedule 侧 closest(...err-ov-card...) 先例）。
+  document.addEventListener("click", function (e) {
+    var t = e.target;
+    if (t === null || typeof t.closest !== "function") return;
+    var btn = t.closest("#err-ov-close");
+    if (btn === null) return;
+    var card = btn.closest(".err-ov-card");
+    if (card !== null && card.parentNode !== null) { card.parentNode.removeChild(card); }
   });
 })();
 </script>`;
@@ -114,7 +236,8 @@ export const SUBMIT_GUARD_SCRIPT = `<script>
  *
  * **浮层内表单提交 = 浮层内完成**（增补轨 · 推翻旧「不拦截」口径）：委托 `submit` 事件，
  * **只拦 `#feat-dialog` 内的 POST 表单**（触发一轮 / 发送确认指令 / 澄清回答 / 保存排期）→
- * `preventDefault()` → `fetch(form.action, POST, body)`。响应分两档：
+ * `preventDefault()` → `fetch(form.getAttribute("action"), POST, body)`（属性读取防同名字段遮蔽，
+ * 见 {@link SUBMIT_GUARD_SCRIPT} 注记；增补三 §9.2）。响应分两档：
  * **2xx/3xx（含 303 自动跟随后的最终页）⇒ 抽 `<main>` 换入浮层 body**（详情在浮层内刷新）；
  * **4xx/5xx ⇒ 不替换 body**（保表单与已填输入），只抽 `.err-ov-card` **作为 dialog 的直接子元素
  * 叠加**（`position: fixed` 居中 + 超大 spread shadow 当遮罩 ⇒ 悬浮在浮层内容之上，**不挤占
@@ -209,9 +332,11 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
   function postForm(form) {
     var data;
     try { data = new URLSearchParams(new FormData(form)); } catch (err) { data = null; }
-    if (data === null) { nativeSubmit(form); return; }
+    // 增补三 §9.2：action 走 getAttribute（同名字段遮蔽属性直读），空 ⇒ 原生提交回落
+    var action = form.getAttribute("action") || "";
+    if (data === null || action === "") { nativeSubmit(form); return; }
     dlg.returnValue = "";
-    fetch(form.action, {
+    fetch(action, {
       method: "POST",
       body: data,
       credentials: "same-origin",
@@ -274,9 +399,14 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
 </script>`;
 
 /**
- * **新增需求弹窗脚本**（REQ-2026-09-26-04 Q1）：排期页页头「＋ 新增需求」按钮 →
- * `showModal()` 打开 `#new-req-dialog`（骨架由 `views.renderNewRequirementDialog` 渲染，
- * 内嵌 `views.renderRequirementForm` 的表单（字段/校验/组织选择器原样复用）。
+ * **弹窗开/关脚本**（REQ-2026-09-26-04 Q1 起为「新增需求弹窗」；v0.9.4 增补六 §9.5 泛化为
+ * **两枚 dialog 共用**）：页头按钮 → `showModal()` 打开对应 dialog ——
+ * - `#new-req-dialog`（骨架 = `views.renderNewRequirementDialog`，内嵌 `views.renderRequirementForm`；
+ *   宿主 = `/schedule` 页头「＋ 新增需求」）；
+ * - `#new-org-dialog`（§9.5；骨架 = `views.renderCreateOrgDialog`，内嵌 `views.renderCreateOrgForm`；
+ *   宿主 = 门户 `/` 页头「＋ 建组织」，无 JS 回退 = 门户内联表单 `#new-org-inline`）。
+ *
+ * 字段/校验均由各自表单函数复用，不改写。
  *
  * **提交 = 同源 fetch POST `/requirements`**（照 {@link FEATURE_DETAIL_OVERLAY_SCRIPT}
  * 增补轨 `65cd03e1` 的先例口径）：
@@ -297,96 +427,135 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
  * CSRF 不依赖本脚本：同源 fetch 自动带 `Origin`（`Referrer-Policy: same-origin` 下另带同源
  * `Referer`），`checkWriteAuth` 两档原样工作。脚本字面量不含用户数据 ⇒ 无注入面
  * （与 {@link SUBMIT_GUARD_SCRIPT} 同规格：单点常量、纯内联、无 `src=`、无 `</script` 字面量）。
+ *
+ * **v0.9.4 增补六 §9.5 的泛化（闭集六元不扩，在本常量体内泛化）**：门户页 `/` 的「＋ 建组织」按钮
+ * 需另一枚 `<dialog id="new-org-dialog">`（表单同 `renderCreateOrgForm`）—— 本常量由「单 dialog」
+ * 泛化为**一个 `wire(dlg, openBtn, inline)` 同时接两枚 dialog**（`new-req-dialog` / `new-org-dialog`），
+ * **不新增第七枚脚本常量、CSP 一律不动**。原 `new-req-*` 行为逐条不变；新增两点：
+ * - **按钮服务端 `hidden`、脚本显形**：门户「＋ 建组织」按钮初始 `hidden`（无 JS 不显死按钮），
+ *   `openBtn.hidden = false` 显形；`inline` 非空（门户内联回退表单 `#new-org-inline`）⇒ 脚本隐藏之；
+ * - **关闭钮改按 dialog 自身子按钮绑定**（`dlg.querySelector("button")` = 骨架上第一枚 `*-close`），
+ *   「知道了」摘卡委托按 `dlgId` 派生选择器（替换原写死的 `#new-req-dialog #err-ov-close`）。
+ *
+ * **v0.9.4 W6（§2.6）入口交互扩写（仍在闭集六元内，不新枚；增补七 a §9.1-a 把落点由门户迁到排期看板；
+ * 增补八 §9.3 把交互由原生 `prompt()` 改为同款弹窗）**：
+ * 排期看板页头挂一枚 `#new-version-open` 按钮（server 渲染、服务端 `hidden`；无 JS 不显死按钮），
+ * `wireNewVersion` 经 `wire()` 接第三枚 `#new-version-dialog`（骨架 = `views.renderNewVersionDialog`，
+ * 结构对齐 `#new-req-dialog`）：点击 ⇒ `showModal()`；表单提交同走本常量既有 fetch 通路
+ * ⇒ `POST /versions`（隐藏字段 `action=create` + `version`，urlencoded 同源 fetch，零新端点）⇒ 台账落
+ * `notstart` 条目、看板出现空列；成功 ⇒ 关弹窗整页刷新；失败抽 `.err-ov-card` 叠加为 dialog 直接子元素
+ * （弹窗不关、「知道了」委托摘卡）。无 JS 回落 = 表单原生 POST（整页 PRG）。
+ * **v0.9.4 增补十一 E1（§9.6）**：看板尾虚列拖拽 `prompt()` 入口一并撤除 ⇒ 本按钮 + 弹窗是
+ * 创建版本的**唯一入口**。「＋ 建组织」两枚 dialog 行为逐条不变。
  */
 export const NEW_REQUIREMENT_DIALOG_SCRIPT = `<script>
 (function () {
-  var dlg = document.getElementById("new-req-dialog");
-  var openBtn = document.getElementById("new-req-open");
-  if (dlg === null || typeof dlg.showModal !== "function") return;
-  var form = dlg.querySelector("form");
-  function restoreForm() {
-    if (form === null) return;
-    var btns = form.querySelectorAll("button[disabled]");
-    for (var i = 0; i < btns.length; i += 1) {
-      btns[i].disabled = false;
-      btns[i].removeAttribute("aria-disabled");
+  function wire(dlg, openBtn, inline) {
+    if (dlg === null || typeof dlg.showModal !== "function") return;
+    var dlgId = dlg.getAttribute("id") || "";
+    var form = dlg.querySelector("form");
+    function restoreForm() {
+      if (form === null) return;
+      var btns = form.querySelectorAll("button[disabled]");
+      for (var i = 0; i < btns.length; i += 1) {
+        btns[i].disabled = false;
+        btns[i].removeAttribute("aria-disabled");
+      }
+      var p = form.querySelector(".submit-pending");
+      if (p !== null && p.parentNode !== null) { p.parentNode.removeChild(p); }
     }
-    var p = form.querySelector(".submit-pending");
-    if (p !== null && p.parentNode !== null) { p.parentNode.removeChild(p); }
-  }
-  function closeAndReload() { dlg.close(); dlg.returnValue = ""; window.location.reload(); }
-  function dropCard() {
-    var kids = dlg.children;
-    for (var i = kids.length - 1; i >= 0; i -= 1) {
-      if (kids[i].classList.contains("err-ov-card") && kids[i].parentNode !== null) { kids[i].parentNode.removeChild(kids[i]); }
+    function closeAndReload() { dlg.close(); dlg.returnValue = ""; window.location.reload(); }
+    function dropCard() {
+      var kids = dlg.children;
+      for (var i = kids.length - 1; i >= 0; i -= 1) {
+        if (kids[i].classList.contains("err-ov-card") && kids[i].parentNode !== null) { kids[i].parentNode.removeChild(kids[i]); }
+      }
     }
-  }
-  function showCard(card) {
-    dropCard();
-    dlg.appendChild(card);
-    if (!dlg.open) dlg.showModal();
-  }
-  function submitNative() {
-    if (form === null) return;
-    restoreForm();
-    form.submit();
-  }
-  if (openBtn !== null) {
-    openBtn.addEventListener("click", function () {
+    function showCard(card) {
       dropCard();
-      dlg.returnValue = "";
-      dlg.showModal();
-    });
-  }
-  document.addEventListener("click", function (e) {
-    var t = e.target;
-    if (t === null || typeof t.closest !== "function") return;
-    var dismiss = t.closest("#new-req-dialog #err-ov-close");
-    if (dismiss !== null) {
+      dlg.appendChild(card);
+      if (!dlg.open) dlg.showModal();
+    }
+    function submitNative() {
+      if (form === null) return;
+      restoreForm();
+      form.submit();
+    }
+    var closeBtn = dlg.querySelector("button");
+    if (closeBtn !== null) {
+      closeBtn.addEventListener("click", function () { dlg.close(); dlg.returnValue = ""; });
+    }
+    if (openBtn !== null) {
+      openBtn.hidden = false;
+      openBtn.addEventListener("click", function () {
+        dropCard();
+        dlg.returnValue = "";
+        dlg.showModal();
+      });
+    }
+    if (inline !== null) inline.hidden = true;
+    document.addEventListener("click", function (e) {
+      var t = e.target;
+      if (t === null || typeof t.closest !== "function") return;
+      var dismiss = dlgId === "" ? null : t.closest("#" + dlgId + " #err-ov-close");
+      if (dismiss === null) return;
       e.preventDefault();
       var card = dismiss.closest(".err-ov-card");
       if (card !== null && card.parentNode !== null) { card.parentNode.removeChild(card); }
-      return;
+    });
+    if (form !== null) {
+      form.addEventListener("submit", function (e) {
+        e.preventDefault();
+        var data;
+        try { data = new URLSearchParams(new FormData(form)); } catch (err) { data = null; }
+        // 增补三 §9.2：action 走 getAttribute（同名字段遮蔽属性直读），空 ⇒ 原生提交回落
+        var action = form.getAttribute("action") || "";
+        if (data === null || action === "") { submitNative(); return; }
+        dlg.returnValue = "";
+        fetch(action, {
+          method: "POST",
+          body: data,
+          credentials: "same-origin",
+          headers: { Accept: "text/html" },
+        }).then(function (res) {
+          return res.text().then(function (text) { return { ok: res.ok, text: text }; });
+        }).then(function (r) {
+          if (!r.ok) {
+            var doc = new DOMParser().parseFromString(r.text, "text/html");
+            var card = doc.querySelector(".err-ov-card");
+            if (card === null) { closeAndReload(); return; }
+            showCard(card);
+            restoreForm();
+            return;
+          }
+          closeAndReload();
+        }).catch(function () { closeAndReload(); });
+      });
     }
-    if (t.closest("#new-req-close") === null) return;
-    e.preventDefault();
-    dlg.close();
-    dlg.returnValue = "";
-  });
-  if (form !== null) {
-    form.addEventListener("submit", function (e) {
-      e.preventDefault();
-      var data;
-      try { data = new URLSearchParams(new FormData(form)); } catch (err) { data = null; }
-      if (data === null) { submitNative(); return; }
-      dlg.returnValue = "";
-      fetch(form.action, {
-        method: "POST",
-        body: data,
-        credentials: "same-origin",
-        headers: { Accept: "text/html" },
-      }).then(function (res) {
-        return res.text().then(function (text) { return { ok: res.ok, text: text }; });
-      }).then(function (r) {
-        if (!r.ok) {
-          var doc = new DOMParser().parseFromString(r.text, "text/html");
-          var card = doc.querySelector(".err-ov-card");
-          if (card === null) { closeAndReload(); return; }
-          showCard(card);
-          restoreForm();
-          return;
-        }
-        closeAndReload();
-      }).catch(function () { closeAndReload(); });
+    dlg.addEventListener("cancel", function () { dlg.returnValue = ""; });
+    dlg.addEventListener("click", function (e) {
+      if (e.target !== dlg) return;
+      var rect = dlg.getBoundingClientRect();
+      var inBox = e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom;
+      if (!inBox) { dlg.close(); dlg.returnValue = ""; }
     });
   }
-  dlg.addEventListener("cancel", function () { dlg.returnValue = ""; });
-  dlg.addEventListener("click", function (e) {
-    if (e.target !== dlg) return;
-    var rect = dlg.getBoundingClientRect();
-    var inBox = e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom;
-    if (!inBox) { dlg.close(); dlg.returnValue = ""; }
-  });
+  wire(document.getElementById("new-req-dialog"), document.getElementById("new-req-open"), null);
+  wire(document.getElementById("new-org-dialog"), document.getElementById("new-org-open"), document.getElementById("new-org-inline"));
+  // 增补七 a（§9.1-a）+ 增补八（§9.3）+ 增补十一 E1（§9.6）：「＋ 新版本」按钮**在排期看板页头**
+  // （原门户首页那处已撤除；看板尾虚列拖拽建版本入口已撤 ⇒ 本按钮是全站唯一创建入口）——
+  // 点击 ⇒ showModal() 打开 #new-version-dialog（与「＋ 新增需求」同款弹窗）；
+  // 表单提交复用 wire()：POST /versions(action=create) → 新版本空列出现。
+  // 成功（303 跟随后 ok）⇒ 关弹窗整页刷新（本页即 /schedule，语义同跳看板）；失败抽 .err-ov-card
+  // 叠加为 dialog 直接子元素（弹窗不关、「知道了」委托摘卡、表单值保留可改后重提）。
+  // 无 JS ⇒ 按钮服务端 hidden 且表单原生 POST 回落（整页 PRG，不显死按钮）；非排期页无此按钮 ⇒ 早退空转。
+  function wireNewVersion(btn) {
+    if (btn === null) return;
+    var dlg = document.getElementById("new-version-dialog");
+    if (dlg === null || typeof dlg.showModal !== "function") { btn.hidden = false; return; }
+    wire(dlg, btn, null);
+  }
+  wireNewVersion(document.getElementById("new-version-open"));
 })();
 </script>`;
 
@@ -405,6 +574,10 @@ export const NEW_REQUIREMENT_DIALOG_SCRIPT = `<script>
  * 目标列与卡片现版本相同 ⇒ 不发请求（同版重提本为幂等，省一跳）。
  * `dragover` 需 `preventDefault()` 才能落地；版本列与池列都带 `data-version`，
  * 以属性存在而非 class 判定，避免与列头徽标样式耦合。
+ *
+ * **v0.9.4 增补十一 E1（§9.6）**：尾列「新版本」虚列的 drop-建版本分支（含 `window.prompt()`
+ * 输入路径）已随虚列一并撤除 —— 创建版本的唯一入口 = 页头「＋ 新版本」按钮 + 弹窗
+ * （{@link NEW_REQUIREMENT_DIALOG_SCRIPT}）；本脚本只做「拖到已有版本列 / 池列 = 改排期」一件事。
  *
  * 与 {@link FEATURE_DETAIL_OVERLAY_SCRIPT} / {@link NEW_REQUIREMENT_DIALOG_SCRIPT}
  * 同规格：单点常量、纯内联、无 `src=`、不含用户数据、体内无 `</script` 字面量；
@@ -479,8 +652,8 @@ export const DRAG_SCHEDULE_SCRIPT = `<script>
     var id = e.dataTransfer.getData("text/plain");
     if (id === "") return;
     var card = document.querySelector('.kcard[data-feature="' + id + '"]');
-    var target = col.getAttribute("data-version");
     if (card === null) return;
+    var target = col.getAttribute("data-version");
     if ((card.getAttribute("data-version") || "") === (target || "")) return;
     submitDrag(id, target === null ? "" : target);
   });
@@ -493,15 +666,33 @@ export const DRAG_SCHEDULE_SCRIPT = `<script>
 })();
 </script>`;
 
+/** 导航单点（六条 = 全局路径单点事实源；组织空间下的落点经 {@link navHrefFor} 派生，不另立一份）。 */
 const NAV: ReadonlyArray<{ key: NavKey; href: string; text: string }> = [
+  // v0.9.4 §9-b（首页形态 B→A）：「首页」= 组织门户 `/`（不再是排期看板）；「排期」= `/schedule` 正本。
+  // v0.9.4 §9-c：「组织」/orgs 链接摘除 —— 页退役（GET /orgs ⇒ 303 /），管理职能迁空间内 `/org/<名>/manage`。
+  { key: "home", href: "/", text: "首页" },
   { key: "schedule", href: "/schedule", text: "排期" },
   { key: "tasks", href: "/tasks", text: "任务" },
   { key: "projects", href: "/projects", text: "项目 / 机器" },
   // v0.9.3 B-T3：Agent View（机器表 + 逐项目在飞任务 + 3300 收编的桥身份头）
   { key: "agents", href: "/agents", text: "Agent" },
-  { key: "orgs", href: "/orgs", text: "组织" },
   { key: "host", href: "/host", text: "宿主桥" },
 ];
+
+/**
+ * **顶栏组织切换器**（BD7 · §9-d 起清单口径与组织门户同源 = 台账未停用 ∪ 需求归属）：
+ * 各组织 → `/org/<名>/` 的**服务端渲染链接**（跳转即全页刷新）⇒ **零新脚本**，
+ * 不扩内联脚本闭集；清单为空 ⇒ 整块不渲染（无组织可切时不留空占位）。
+ */
+function renderOrgSwitcher(orgNav: PageOrgNav): string {
+  const items = orgNav.orgs
+    .map(
+      (o) =>
+        `<a href="/org/${encodeURIComponent(o)}/"${o === orgNav.org ? ' class="on"' : ""}>${escapeHtml(o)}</a>`,
+    )
+    .join("");
+  return `<span class="org-switch"> <span class="muted">组织</span> ${items}</span>`;
+}
 
 export interface PageParams {
   title: string;
@@ -514,6 +705,12 @@ export interface PageParams {
   headerActions?: string;
   /** 错误浮层（REQ 弹窗化 · 表单档错误出口专用；全部字段在本函数内 escapeHtml，调用方传原始值） */
   errorOverlay?: ErrorOverlayParams;
+  /**
+   * **组织上下文（BD7）**：给出当前组织空间（可空）+ 切换器组织清单。
+   * 切换器 = **纯服务端渲染的链接列表**（各组织 → `/org/<名>/` 整页跳转）⇒
+   * 零新脚本，内联脚本闭集保持**六元**（N3-⑦/⑧ 纪律锚）。
+   */
+  orgNav?: PageOrgNav;
 }
 
 export interface ErrorOverlayField {
@@ -532,6 +729,11 @@ export interface ErrorOverlayParams {
   hint?: string;
   /** 回填字段（REQ-v0.9.2 N1）：表单写路径失败时回显用户刚提交值，逐字段转义（空值由调用方省略） */
   fields?: readonly ErrorOverlayField[];
+  /**
+   * 可选**出路链接**（v0.9.4 增补五 §9.4-③④）：跨组织成员互斥 ⇒ 指向所属组织管理页；
+   * 停用空间的 410 ⇒ 指向门户。`href` 与 `label` 均转义（不接收未转义 HTML）。
+   */
+  link?: { href: string; label: string };
 }
 
 function renderErrorOverlay(o: ErrorOverlayParams): string {
@@ -551,6 +753,7 @@ function renderErrorOverlay(o: ErrorOverlayParams): string {
 <h2>${escapeHtml(o.family)}</h2>
 <p>${escapeHtml(o.error)}</p>
 ${o.hint === undefined ? "" : `<p class="hint">${escapeHtml(o.hint)}</p>`}
+${o.link === undefined ? "" : `<p class="err-ov-link"><a href="${escapeHtml(o.link.href)}">${escapeHtml(o.link.label)}</a></p>`}
 <p class="err-ov-code mono">${escapeHtml(o.code)}</p>
 ${fields}<button type="button" id="err-ov-close">知道了</button>
 </div>
@@ -567,10 +770,11 @@ ${fields}<button type="button" id="err-ov-close">知道了</button>
 }
 
 export function renderPage(params: PageParams): string {
-  const nav = NAV.map(
-    (n) =>
-      `<a href="${n.href}"${n.key === params.active ? ' class="on"' : ""}>${escapeHtml(n.text)}</a>`,
-  ).join("");
+  const nav = NAV.map((n) => {
+    const href = navHrefFor(params.orgNav, n.key, n.href);
+    return `<a href="${href}"${n.key === params.active ? ' class="on"' : ""}>${escapeHtml(n.text)}</a>`;
+  }).join("");
+  const switcher = params.orgNav === undefined || params.orgNav.orgs.length === 0 ? "" : renderOrgSwitcher(params.orgNav);
   const notes =
     params.notes && params.notes.length > 0
       ? `<ul class="notes">${params.notes.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>`
@@ -592,6 +796,9 @@ export function renderPage(params: PageParams): string {
   nav { display: flex; gap: 12px; margin: 0 0 14px; }
   nav a { color: #567; text-decoration: none; padding: 2px 8px; border-radius: 4px; }
   nav a.on { background: #8882; color: inherit; }
+  .org-switch { margin-left: 8px; font-size: 12px; }
+  .org-switch a { color: #567; text-decoration: none; padding: 1px 6px; border-radius: 4px; }
+  .org-switch a.on { background: #5b86a8; color: #fff; }
   .hint { color: #777; margin: 6px 0; }
   .hint.err { color: #b42318; }
   .hint.warn { color: #b26a00; }
@@ -651,18 +858,25 @@ export function renderPage(params: PageParams): string {
   .err-ov-card button { margin-top: 10px; }
   .kanban { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; padding-bottom: 6px; }
   .kcol { flex: 0 0 260px; border: 1px solid #8884; border-radius: 6px; background: #8881; padding: 6px 8px 8px; }
-  .kcol > h3 { font-size: 13px; margin: 2px 0 8px; border-bottom: 1px solid #8884; padding-bottom: 4px; }
+  .kcol > h3 { font-size: 13px; margin: 2px 0 8px; border-bottom: 1px solid #8884; padding-bottom: 4px; position: relative; padding-right: 22px; }
   .kcard { border: 1px solid #8884; border-radius: 6px; background: Canvas; padding: 6px 8px; margin: 0 0 6px; font-size: 12px; }
   .kcard[draggable="true"] { cursor: grab; }
   .kcard.draglocked { opacity: .55; }
   .kcard .draglock { color: #b26a00; border-color: #b26a0088; }
   .kcol.dragover { outline: 2px dashed #5b86a8; outline-offset: -2px; }
   .err-ov-card.drag-err-overlay { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; width: min(560px, 92vw); z-index: 70; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }
+  /* 增补二 §9.1-②：data-ov 写表单 fetch 报错的浮层卡（与拖拽错误卡同款版式，不跳页） */
+  .err-ov-card.ov-err-overlay { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; width: min(560px, 92vw); z-index: 70; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }
   .kbadge { float: right; margin-left: 6px; font-size: 11px; color: #567; border: 1px solid #8886; border-radius: 8px; padding: 0 6px; white-space: nowrap; }
   .vbadge { float: none; cursor: help; }
   .vbadge.locked { color: #654321; border-color: #a67c52; background: #f3e5d0; font-weight: 600; }
   .vbadge.wip { color: #25567a; border-color: #5b86a8; background: #e3eef7; }
   .vbadge.closed { color: #3a5a40; border-color: #6b8f71; background: #e6f0e8; }
+  .vbadge.notstart { color: #666; border-color: #9996; background: #ddd4; }
+  /* 增补十一 E2（§9.6）：删除入口 × 钉在版本框头右上角（仅未开始版本渲染本表单）
+     —— E3 撤除列头操作行（.vops / form.vop）后，版本列头仅剩本一处写入口 */
+  .kcol > h3 form.vdel { position: absolute; top: -2px; right: 0; margin: 0; }
+  .kcol > h3 form.vdel button { font-size: 12px; line-height: 1; padding: 0 5px; color: #a33; background: transparent; border: 1px solid #a336; border-radius: 4px; }
   .kmeta { margin: 4px 0 0; color: #667; font-size: 11px; }
   .tpoints { margin: 4px 0 0; padding-left: 16px; color: #667; font-size: 11px; }
   .tpoints li { margin: 1px 0; }
@@ -678,7 +892,7 @@ export function renderPage(params: PageParams): string {
 <body>
 <header>
   <h1>${escapeHtml(params.title)}</h1>${params.headerActions ?? ""}
-  <nav>${nav} <span class="muted mono">board v${escapeHtml(readVersion())} · 只读 + 提需求</span></header>
+  <nav>${nav}${switcher} <span class="muted mono">board v${escapeHtml(readVersion())} · 只读 + 提需求</span></header>
 <main>
 ${params.bodyHtml}
 ${notes}

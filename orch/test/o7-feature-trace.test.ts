@@ -450,7 +450,7 @@ test("O-N3 MCP 面：a2a_feature_trace 已注册（工具组 6 / 泛型仍 7）�
     0,
     "不得以第 8 个泛型工具形态出现（网页/泛型面不另开编排入口）",
   );
-  assert.equal(listed.length, 13, "泛型 7 + Feature 6");
+  assert.equal(listed.length, 14, "泛型 7 + Feature 6 + 配置面 1（v0.9.4 O1 a2a_config_write_group）");
 
   const res = await client.callTool({ name: "a2a_feature_trace", arguments: { featureId: "f-o7m" } });
   assert.notEqual(res.isError, true, "只读出口应成功");

@@ -18,6 +18,10 @@ machine/config/config.json
 orch/config/config.json
 board/config/config.json
 
+# 配置写口的自动备份（v0.9.4 起 config-write 每次写前留档，累积产物不入库）
+orch/config/config.json.bak-*
+board/config/config.json.bak-*
+
 # 本地保留（不推送公开仓库）：内部流程/设计与回归工具
 /CLAUDE.md
 /planlog.md

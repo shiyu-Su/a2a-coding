@@ -13,6 +13,8 @@
  * approve / cancel 两个真·状态机迁移工具名在 `src/**` 仍恒为 0 命中 —— 排期不是迁移，
  * 故只借 advance 的登记字段通道，且**在 TS 类型层封死**：入参类型 {@link ScheduleAdvanceInput}
  * 不接受 `stage` / `approval` 键，`version` 必填 `string`（类型上无法省略；清空排期显式发 `""`）。
+ * **v0.9.4 N4 起**再叠一层 semver 收口：`version` 非空值必须命中 `x.y.z`（复用 `parseVersion`，
+ * 空串 = 取消排期放行），见 {@link buildScheduleAdvanceArgs}。
  *
  * **不实现端点**：本文件只提供封装骨架（M3 才接线 `POST /features/:id/schedule`）；
  * `to` 由调用方（M3 先 `getFeature` 取当前态）传入，本封装不自取、不猜。
@@ -23,6 +25,7 @@
 
 import * as mcpClient from "./mcp-client.js";
 import { callTool, McpConfigError } from "./mcp-client.js";
+import { parseVersion } from "./version-order.js";
 
 /** 排期写复用的 MCP 端点缺省基址（与 requirement.ts 同源，8787 = 编排桥 MCP 面）。 */
 export const DEFAULT_MCP_BASE_URL = "http://127.0.0.1:8787";
@@ -39,7 +42,11 @@ export interface ScheduleAdvanceInput {
   featureId: string;
   /** 当前态（`to` = 现态 ⇒ advance 走登记字段特例，不迁移状态机）。 */
   to: string;
-  /** 目标版本号；空串 = 取消排期（回「未排期」）。必填，类型上无法省略。 */
+  /**
+   * 目标版本号；空串 = 取消排期（回「未排期」）。必填，类型上无法省略。
+   * **v0.9.4 N4 起**：非空值必须命中 `x.y.z`（可带 `v` 前缀），否则先于网络抛
+   * {@link FeatureScheduleConfigError}（空串照旧放行 = 取消排期）。
+   */
   version: string;
   /**
    * **改版自动善后登记追加**（v0.9.3 B-T6）：`decisions` 数组（append 语义，桥侧逐条追加），
@@ -118,6 +125,9 @@ export function buildMcpEndpoint(baseUrl: string, group: string): string {
  * - **绝不携带 `stage` / `approval`**（TS 类型层已封死，装配也不补）；
  * - `to` **恒等**于调用方传入的当前态（不加工、不回落）；
  * - `version` **键始终存在**（清空 = 显式 `""`），缺失即编程错误抛出；
+ * - **semver 收口（v0.9.4 N4 / 改造文档 §2.5）**：`trim()` 后**空串 = 取消排期 ⇒ 放行**（合法值），
+ *   非空必须命中 `version-order.parseVersion` 的 `x.y.z`（可带 `v` 前缀）—— 复用现成 `parseVersion`、
+ *   **零新增第二枚 regex**；不合法先于网络抛 {@link FeatureScheduleConfigError}。存量脏值只拦新写、读面保留。
  * - `decisions` 逐条 trim、空条剔除；含非字符串元素 = 编程错误抛出（不静默吞登记项）。
  * 纯函数，供纪律与契约断言。
  */
@@ -136,7 +146,14 @@ export function buildScheduleAdvanceArgs(input: ScheduleAdvanceInput): Record<st
   if (typeof input.version !== "string") {
     throw new FeatureScheduleConfigError("version 必须是字符串（清空 = 空串）");
   }
-  const args: Record<string, unknown> = { featureId, to, version: input.version };
+  const version = input.version.trim();
+  if (version !== "" && parseVersion(version) === null) {
+    throw new FeatureScheduleConfigError(
+      `版本号 ${version} 不是 x.y.z 形式（可带 v 前缀）⇒ 拒绝排期写：` +
+        "空串 = 取消排期（合法）；非空必须 x.y.z（读面存量脏值保留，只拦新写）",
+    );
+  }
+  const args: Record<string, unknown> = { featureId, to, version };
   if (input.decisions !== undefined && input.decisions !== null) {
     if (!Array.isArray(input.decisions)) {
       throw new FeatureScheduleConfigError("decisions 必须是字符串数组（善后登记逐条 append）");

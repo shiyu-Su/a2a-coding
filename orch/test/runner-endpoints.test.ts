@@ -82,6 +82,7 @@ function fakeCore(): BridgeCore {
     featureApprove: () => unused("featureApprove"),
     featureCancel: () => unused("featureCancel"),
     featureTrace: () => unused("featureTrace"),
+    configWriteGroup: async () => unused("configWriteGroup"),
     kickScheduler: () => unused("kickScheduler"),
   };
 }

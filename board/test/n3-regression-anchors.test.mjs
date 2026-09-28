@@ -2,9 +2,10 @@
  * REQ-v0.9.2-2026-09-26-02 增补 ④ · N3 回归补钉（纯测试锚，不动生产代码）——
  * REQ-v0.9.3-2026-09-26-04（排期页新增需求弹窗）同步：需求列表页退役，`GET /requirements` ⇒ 303 回首页。
  *
- * ① 路由面（N1）：`GET /` = 排期看板结构 + 「排期」高亮 + 新增需求弹窗（页头按钮 + dialog 表单）；
- *    `GET /requirements` = 303 重定向（Q2，退役不 404、不触桥）；`GET /schedule` 与 `GET /` 同构渲染
- *    （别名兼容）；桥不可达 502 页面语义随迁（`/` 与 `/schedule` 高亮「排期」）。
+ * ① 路由面（N1）：`GET /schedule` = 排期看板结构 + 「排期」高亮 + 新增需求弹窗（页头按钮 + dialog 表单）；
+ *    `GET /requirements` = 303 重定向（Q2，退役不 404、不触桥）；`GET /` = **组织门户**（§9-b 起首页形态
+ *    B→A，不再与 `/schedule` 同构；§9.5 起门户注入**泛化后的弹窗脚本**承载建组织 dialog，但看板专属的
+ *    浮层 / 拖拽 / mermaid 三枚不跟）；桥不可达 502 页面语义随迁（`/` 高亮「首页」、`/schedule` 高亮「排期」）。
  * ② 浮层三锚（N2）：排期页含 `<dialog` 骨架（详情浮层 + 新增需求弹窗）；开关脚本 = 单点内联字面量
  *    常量（`^<script>`、无 `src=`、不含用户数据）；卡片保留 `<a href="/features/:id">` 无 JS 回退。
  * ③ 纪律钉（本需求最重要的长效锚，BD14 mermaid 白名单先例模式复制）：
@@ -14,7 +15,8 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync, statSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -75,25 +77,40 @@ async function withServer(client, run) {
   }
 }
 
+/** 已发版锁夹具（v0.9.4 N3）：锁改读版本台账 ⇒ 预置临时台账文件喂入（`versionsLedgerFile`）。 */
+function releasedLedgerFixture(versions) {
+  const dir = mkdtempSync(join(tmpdir(), "board-locked-"));
+  const file = join(dir, "versions.json");
+  const entries = versions.map((raw) => ({
+    version: String(raw).trim(),
+    status: "released",
+    createdAt: "2026-09-27T00:00:00.000Z",
+    updatedAt: "2026-09-27T00:00:00.000Z",
+    note: null,
+  }));
+  writeFileSync(file, JSON.stringify({ version: 1, versions: entries }, null, 2) + "\n", "utf8");
+  return { file, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
 async function getHtml(base, path) {
   const res = await fetch(`${base}${path}`);
   return { status: res.status, text: await res.text() };
 }
 
 // ---------------------------------------------------------------------------
-// ① 路由面：GET / = 排期看板首页
+// ① 路由面：GET /schedule = 排期看板（§9-b 起唯一宿主）
 // ---------------------------------------------------------------------------
 
-test("N3-① GET / = 排期看板结构 + 「排期」高亮（浮层 dialog 骨架与 `<a>` 无 JS 回退随首页在；REQ-04 起弹窗也在首页）", async () => {
+test("N3-① GET /schedule = 排期看板结构 + 「排期」高亮（浮层 dialog 骨架与 `<a>` 无 JS 回退随看板在；REQ-04 起弹窗也在）", async () => {
   const client = fakeClient([
     feature("F1", "v0.9.2"),
     feature("F2", "v0.10.0"),
     feature("F3", null),
   ]);
   await withServer(client, async (base) => {
-    const res = await getHtml(base, "/");
+    const res = await getHtml(base, "/schedule");
     assert.equal(res.status, 200);
-    assert.match(res.text, /<title>排期看板 · board<\/title>/, "首页标题 = 排期看板");
+    assert.match(res.text, /<title>排期看板 · board<\/title>/, "看板标题 = 排期看板");
     assert.match(res.text, /<a href="\/schedule" class="on">排期<\/a>/, "「排期」导航高亮");
     assert.doesNotMatch(res.text, /<a href="\/requirements"[^>]*>需求<\/a>/, "「需求」导航入口已删（REQ-04 Q2）");
     assert.ok(
@@ -102,37 +119,47 @@ test("N3-① GET / = 排期看板结构 + 「排期」高亮（浮层 dialog 骨
     );
     assert.match(res.text, /<h3>需求池 <span class="muted">\(1\)<\/span><\/h3>/, "未排期 F3 进需求池列");
     assert.doesNotMatch(res.text, /<h2>需求列表<\/h2>/, "列表页已退役：不再随任何页渲染");
-    assert.match(res.text, /<dialog class="fd" id="feat-dialog">/, "浮层骨架在首页");
+    assert.match(res.text, /<dialog class="fd" id="feat-dialog">/, "浮层骨架在看板页");
     assert.match(res.text, /<button type="button" id="new-req-open"[^>]*>＋ 新增需求<\/button>/, "页头「＋ 新增需求」按钮（REQ-04 Q1）");
-    assert.match(res.text, /<dialog class="fd" id="new-req-dialog">/, "新增需求弹窗骨架在首页");
+    assert.match(res.text, /<dialog class="fd" id="new-req-dialog">/, "新增需求弹窗骨架在看板页");
     assert.match(res.text, /<h2>提需求<\/h2>/, "提需求表单进弹窗（自列表页迁入）");
     assert.match(res.text, /<form method="post" action="\/requirements"/, "弹窗表单仍同源 POST /requirements");
     assert.ok(
       res.text.includes(FEATURE_DETAIL_OVERLAY_SCRIPT),
-      "浮层脚本随 schedule kind 页注入（首页不例外 · 增补轨锚）",
+      "浮层脚本随 schedule kind 页注入（看板页 · 增补轨锚）",
     );
     assert.ok(
       res.text.includes(NEW_REQUIREMENT_DIALOG_SCRIPT),
-      "新增需求弹窗脚本随首页注入（单点常量经 extraScripts 通路）",
+      "新增需求弹窗脚本随看板页注入（单点常量经 extraScripts 通路）",
     );
     assert.match(res.text, /<a class="fl" href="\/features\/F1">/, "卡片真链接（无 JS 回退）");
   });
 });
 
-test("N3-② GET /schedule 与 GET / 同构渲染（别名兼容，深链零红面）", async () => {
+test("N3-②（§9-b 翻向 · §9.5 泛化）`/schedule` = 看板 · `/` = 组织门户：两页不再同构；看板专属脚本只在 `/schedule`", async () => {
   const client = fakeClient([feature("F1", "v0.9.2"), feature("F3", null)]);
   await withServer(client, async (base) => {
     const root = await getHtml(base, "/");
     const alias = await getHtml(base, "/schedule");
     assert.equal(alias.status, 200, "深链 /schedule 不红");
-    assert.equal(alias.text, root.text, "两个 URL 渲染逐字节同构（同 kind 同页）");
-    // 同构必须是「正向」同构：逐字节相等也可以是「两页都没有浮层脚本」⇒ 单独钉脚本段与骨架段都在
-    for (const [label, html] of [["/", root.text], ["/schedule", alias.text]]) {
-      assert.ok(html.includes(FEATURE_DETAIL_OVERLAY_SCRIPT), `${label} 含浮层脚本`);
-      assert.match(html, /<dialog class="fd" id="feat-dialog">/, `${label} 含 dialog 骨架`);
-      assert.ok(html.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), `${label} 含新增需求弹窗脚本`);
-      assert.match(html, /<dialog class="fd" id="new-req-dialog">/, `${label} 含新增需求 dialog 骨架`);
+    assert.equal(root.status, 200, "首页不红（形态换义，不 303 不改地址）");
+    assert.match(root.text, /<title>组织门户 · board<\/title>/, "`/` = 组织门户");
+    assert.match(alias.text, /<title>排期看板 · board<\/title>/, "`/schedule` = 排期看板");
+    assert.notEqual(alias.text, root.text, "同构已翻向：门户不复用看板正文");
+    // 看板专属（浮层脚本 + 浮层骨架）只在 `/schedule`（门户不得白名单扩集）
+    for (const [label, html, want] of [["/", root.text, false], ["/schedule", alias.text, true]]) {
+      assert.equal(html.includes(FEATURE_DETAIL_OVERLAY_SCRIPT), want, `${label} 浮层脚本${want ? "在" : "不在"}`);
+      assert.equal(html.includes('<dialog class="fd" id="feat-dialog">'), want, `${label} 浮层 dialog 骨架${want ? "在" : "不在"}`);
+      assert.equal(html.includes('<button type="button" id="new-req-open"'), want, `${label} 新增需求按钮${want ? "在" : "不在"}`);
     }
+    // §9.5：弹窗脚本泛化为两枚 dialog 共用 ⇒ 两页注入同一枚常量；骨架按页各自形态
+    assert.ok(root.text.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), "门户注入泛化弹窗脚本（接 #new-org-dialog）");
+    assert.ok(alias.text.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), "看板注入同一枚弹窗脚本（接 #new-req-dialog）");
+    assert.match(root.text, /<dialog class="fd" id="new-org-dialog">/, "门户 = 建组织弹窗骨架");
+    assert.match(alias.text, /<dialog class="fd" id="new-req-dialog">/, "看板 = 新增需求弹窗骨架");
+    assert.doesNotMatch(root.text, /id="new-req-dialog"/, "门户不渲染新增需求骨架（提需求在 /schedule）");
+    assert.doesNotMatch(alias.text, /id="new-org-dialog"/, "看板不渲染建组织骨架");
+    assert.doesNotMatch(root.text, /<script[^>]*src=/, "门户无外源脚本（CSP 未动；闭集仍六元）");
   });
 });
 
@@ -145,14 +172,14 @@ test("N3-③（REQ-04 Q2）GET /requirements ⇒ 303 回 /（不 404、不触桥
   await withServer(client, async (base) => {
     const res = await fetch(`${base}/requirements`, { redirect: "manual" });
     assert.equal(res.status, 303, "旧深链 303（板惯例，留反悔余地；R1 裁决替代 301）");
-    assert.equal(res.headers.get("location"), "/", "303 目标 = 首页（排期看板 + 弹窗）");
+    assert.equal(res.headers.get("location"), "/", "303 目标 = 首页（§9-b 起 = 组织门户；提需求弹窗在 /schedule）");
     assert.equal(res.headers.get("cache-control"), "no-store");
     await res.body?.cancel();
     assert.deepEqual(client.calls, [], "重定向不触桥");
     const followed = await fetch(`${base}/requirements`);
     assert.equal(followed.status, 200);
     const text = await followed.text();
-    assert.match(text, /<title>排期看板 · board<\/title>/, "跟随后落在首页");
+    assert.match(text, /<title>组织门户 · board<\/title>/, "跟随后落在首页（门户形态）");
     assert.doesNotMatch(text, /<h2>需求列表<\/h2>|class="filter-form"/, "列表页与过滤表单已彻底退役");
   });
 });
@@ -160,12 +187,13 @@ test("N3-③（REQ-04 Q2）GET /requirements ⇒ 303 回 /（不 404、不触桥
 test("N3-④（REQ-04 Q2）POST /requirements 保留断言：端点仍放开 · 已发版锁 409 原样执法（错误卡进响应页供弹窗叠加）", async () => {
   const client = fakeClient([]);
   const seen = [];
+  const seed = releasedLedgerFixture(["v0.9.0"]);
   const handle = await createBoardServer({
     host: "127.0.0.1",
     port: 0,
     client,
     defaultGroup: "g",
-    releasedVersions: ["v0.9.0"],
+    versionsLedgerFile: seed.file,
     createRequirementImpl: async (input) => {
       seen.push(input);
       return {
@@ -203,6 +231,7 @@ test("N3-④（REQ-04 Q2）POST /requirements 保留断言：端点仍放开 · 
     assert.equal(seen.length, 1, "未撞锁的提交才触达写封装（端点未被退役误伤）");
   } finally {
     await handle.close();
+    seed.cleanup();
   }
 });
 
@@ -226,10 +255,10 @@ test("N3-④b（REQ-04 Q3）退役三函数零引用：src/** 不残留 parseFea
 // ① 路由面：桥不可达 502 语义随迁
 // ---------------------------------------------------------------------------
 
-test("N3-⑤ 桥不可达 502：`/` 与 `/schedule` 高亮「排期」（宕页高亮随发起页；「需求」导航已随 REQ-04 Q2 退役）", async () => {
+test("N3-⑤ 桥不可达 502：`/` 高亮「首页」、`/schedule` 高亮「排期」（宕页高亮随发起页；「需求」导航已随 REQ-04 Q2 退役）", async () => {
   await withServer(BROKEN_CLIENT, async (base) => {
     for (const [path, nav, href] of [
-      ["/", "排期", "/schedule"],
+      ["/", "首页", "/"],
       ["/schedule", "排期", "/schedule"],
     ]) {
       const res = await getHtml(base, path);
@@ -261,17 +290,34 @@ test("N3-⑥ 浮层/弹窗/拖拽脚本 = 单点内联字面量常量（规格�
   // 「单点」的事实源在下面的 N3-⑧ 全站扫描：字面量在 src/** 恰好出现 1 次。
 });
 
-test("N3-⑥b（REQ-04 Q1）新增需求弹窗脚本行为锚：开关委托 · fetch 同源 POST · 成功关弹窗刷新 · 4xx 错误卡叠加 · 表单恢复 · urlencoded · 无 JS 降级", () => {
+test("N3-⑥b（REQ-04 Q1 · §9.5 泛化）弹窗脚本行为锚：两枚 dialog 共用一条 wire · 开关委托 · fetch 同源 POST · 成功关弹窗刷新 · 4xx 错误卡叠加 · 表单恢复 · urlencoded · 无 JS 降级", () => {
   const s = NEW_REQUIREMENT_DIALOG_SCRIPT;
-  // 开关：页头按钮 showModal / 关闭钮 + backdrop + cancel 关弹窗
+  // §9.5：单函数泛化覆盖两枚 dialog（不新增第七枚常量）
+  assert.match(s, /function wire\(dlg, openBtn, inline\) \{/, "一个 wire 接两枚 dialog");
+  assert.match(
+    s,
+    /wire\(document\.getElementById\("new-req-dialog"\), document\.getElementById\("new-req-open"\), null\);/,
+    "第一枚 = 新增需求 dialog（无内联回退）",
+  );
+  assert.match(
+    s,
+    /wire\(document\.getElementById\("new-org-dialog"\), document\.getElementById\("new-org-open"\), document\.getElementById\("new-org-inline"\)\);/,
+    "第二枚 = 建组织 dialog（含 #new-org-inline 内联回退）",
+  );
+  // 开关：页头按钮 showModal / 关闭钮（dialog 自身第一枚按钮）+ backdrop + cancel 关弹窗
   assert.match(s, /getElementById\("new-req-open"\)/, "页头按钮委托");
   assert.match(s, /dlg\.showModal\(\)/);
-  assert.match(s, /getElementById\("new-req-close"\)|closest\("#new-req-close"\)/, "关闭钮委托");
+  assert.match(s, /var closeBtn = dlg\.querySelector\("button"\);/, "关闭钮 = dialog 自身第一枚 button（两枚通用）");
+  assert.match(s, /closeBtn\.addEventListener\("click"/, "关闭钮委托绑定");
   assert.match(s, /addEventListener\("cancel"/, "Esc 关闭清 returnValue");
-  // 提交：只拦本弹窗表单，fetch POST form.action（= /requirements）+ 同源凭据 + Accept
+  // §9.5 显隐：按钮服务端 hidden ⇒ 脚本显形；内联回退表单在 JS 下隐去
+  assert.match(s, /openBtn\.hidden = false;/, "按钮显形（无 JS 时服务端 hidden，不显死按钮）");
+  assert.match(s, /if \(inline !== null\) inline\.hidden = true;/, "内联回退表单让位（无 JS 仍可用）");
+  // 提交：只拦本弹窗表单，fetch POST **属性读取**的 action + 同源凭据 + Accept
   assert.match(s, /form\.addEventListener\("submit"/, "表单 submit 拦截（非 document 委托 ⇒ 不碰 #feat-dialog 分支）");
   assert.match(s, /e\.preventDefault\(\)/);
-  assert.match(s, /fetch\(form\.action, \{/);
+  assert.match(s, /var action = form\.getAttribute\("action"\) \|\| "";/, "action 走属性读取（增补三 §9.2）");
+  assert.match(s, /fetch\(action, \{/);
   assert.match(s, /method: "POST"/);
   assert.match(s, /credentials: "same-origin"/);
   assert.match(s, /headers: \{ Accept: "text\/html" \},/, "错误页整页档须含 text/html ⇒ .err-ov-card 可摘");
@@ -283,17 +329,17 @@ test("N3-⑥b（REQ-04 Q1）新增需求弹窗脚本行为锚：开关委托 · 
   assert.match(s, /if \(!r\.ok\) \{/, "响应两档分流");
   // 4xx/5xx ⇒ 错误卡叠加为 dialog 直接子元素（65cd03e1 先例），弹窗不关、「知道了」委托摘卡
   assert.match(s, /querySelector\("\.err-ov-card"\)/, "错误卡单独可摘");
-  assert.match(s, /function showCard\(card\) \{\n    dropCard\(\);\n    dlg\.appendChild\(card\);/, "错误卡 = dialog 直接子元素（覆盖层，不进内容流）");
-  assert.match(s, /closest\("#new-req-dialog #err-ov-close"\)/, "弹窗内「知道了」有委托处理");
+  assert.match(s, /function showCard\(card\) \{\n      dropCard\(\);\n      dlg\.appendChild\(card\);/, "错误卡 = dialog 直接子元素（覆盖层，不进内容流）");
+  assert.match(s, /t\.closest\("#" \+ dlgId \+ " #err-ov-close"\)/, "「知道了」委托选择器按 dlgId 派生（两枚通用）");
   // 提交后表单状态恢复（提交守卫禁用态无人复位 ⇒ 本脚本主动恢复，错误路径可改后重提）
   assert.match(s, /function restoreForm\(\) \{/, "恢复收口 restoreForm");
   assert.match(s, /querySelectorAll\("button\[disabled\]"\)/);
   assert.match(s, /querySelector\("\.submit-pending"\)/);
-  assert.match(s, /showCard\(card\);\n          restoreForm\(\);/, "错误卡路径 = 叠卡后恢复表单（可重提交）");
+  assert.match(s, /showCard\(card\);\n            restoreForm\(\);/, "错误卡路径 = 叠卡后恢复表单（可重提交）");
   // 降级面：无卡 / fetch 异常 ⇒ 关弹窗刷新（错误整页可见，不静默）；FormData 不可构造 ⇒ 原生提交
   assert.match(s, /if \(card === null\) \{ closeAndReload\(\); return; \}/);
   assert.match(s, /\}\)\.catch\(function \(\) \{ closeAndReload\(\); \}\);/, "fetch 网络异常 ⇒ 不静默");
-  assert.match(s, /if \(data === null\) \{ submitNative\(\); return; \}/, "极端环境降级原生提交（无 JS 回退面同旧表单）");
+  assert.match(s, /if \(data === null \|\| action === ""\) \{ submitNative\(\); return; \}/, "极端环境 / action 属性缺失 ⇒ 降级原生提交（无 JS 回退面同旧表单）");
   assert.match(s, /form\.submit\(\)/);
 });
 
@@ -423,4 +469,26 @@ test("N3-⑧（纪律钉·单点钉）四枚导出常量：声明唯一、render
     2,
     "mermaid 资产+渲染脚本常量注入 = pageSchedule（浮层补渲）与 pageFeatureDetail（整页档）两处",
   );
+});
+
+// v0.9.4 增补三 §9.2：全站内联脚本负向锚 —— HTMLFormElement [LegacyOverrideBuiltIns] 使
+// name="action" 同名字段遮蔽 form.action 属性（真机 405 实证根因）⇒ 提交目标只许属性读取。
+test("N3-⑨（增补三 · 负向锚）全站可执行内联脚本零 `form.action` 直读（fetch 目标只许 getAttribute(\"action\")）", () => {
+  for (const script of [
+    SUBMIT_GUARD_SCRIPT,
+    FEATURE_DETAIL_OVERLAY_SCRIPT,
+    NEW_REQUIREMENT_DIALOG_SCRIPT,
+    DRAG_SCHEDULE_SCRIPT,
+  ]) {
+    assert.doesNotMatch(script, /form\.action/, "运行时常量不得直读 form.action（同名字段遮蔽 ⇒ 伪 URL [object HTMLInputElement]）");
+  }
+  const blocks = collectInlineScriptBlocks();
+  assert.ok(blocks.length > 0, "扫描器必须真的见到字面量（0 = 扫描失效，本锚不许空转）");
+  for (const b of blocks) {
+    assert.equal(
+      (b.body.match(/form\.action/g) ?? []).length,
+      0,
+      `${b.rel} 的内联脚本含 form.action 直读（增补三负向锚）`,
+    );
+  }
 });

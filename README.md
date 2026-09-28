@@ -1,6 +1,6 @@
 # a2a-coding
 
-> 基于 A2A 的分布式 Code Agent 协作：以 orch Agent 为统一入口，按「项目」组织 Code Agent，三端均支持（OpenCode / Codex / Claude Code），让需求讨论留在 orch、执行交给各项目自己的 Agent。（当前版本 v0.8.8；Runner ⇄ Bridge 线协议 2.3）
+> 基于 A2A 的分布式 Code Agent 协作：以 orch Agent 为统一入口，按「项目」组织 Code Agent，三端均支持（OpenCode / Codex / Claude Code），让需求讨论留在 orch、执行交给各项目自己的 Agent。（Runner ⇄ Bridge 线协议 2.3）
 
 <!-- badges 待补充：仓库暂无 LICENSE 文件、无 CI 状态、无发布版本，可在此补充 License / Build Status / Version 徽章 -->
 
@@ -38,7 +38,7 @@ a2a-coding 让开发协作时 orch 只管派发任务；目标项目的执行 Ag
 ```mermaid
 flowchart TD
     USER([用户]) -->|需求讨论 / 任务派发| ORCH["orch Agent<br/>任意 MCP host（示例 opencode）"]
-    ORCH -->|"MCP remote（Streamable HTTP）<br/>泛型工具 7 + Feature 工具组 5"| BRIDGE["MCP 薄桥 · orch/<br/>项目 → 机器解析 · 启动编排 · A2A Client · 任务态落库"]
+    ORCH -->|"MCP remote（Streamable HTTP）<br/>泛型工具 7 + Feature 工具组 6 + 配置写工具 1"| BRIDGE["MCP 薄桥 · orch/<br/>项目 → 机器解析 · 启动编排 · A2A Client · 任务态落库"]
     BRIDGE -->|"HTTP 长轮询（Runner ⇄ 桥）<br/>POST /runner/register · /runner/connect · /runner/result"| LAUNCHER["每机 Launcher→Runner · machine/<br/>本机项目自持 · Agent 生命周期 · 心跳/拉取"]
     LAUNCHER -->|"拉起 ACP 桥（全 kind 同构）"| WRAP["仓内 ACP 桥 · machine/acp-bridge<br/>+ 各 kind 适配器 / 后端 CLI"]
     WRAP -->|" ACP over stdio → 适配器 → 后端 CLI<br/>codex / claude / opencode / qoder-cn"| WS["目标 workspace 执行"]
@@ -85,7 +85,8 @@ flowchart TD
 - ✅ **失败上收与重派（v0.6.1）**：任务失败**不判死整单、不自动重试** —— 引擎只冻结其依赖闭包下游（`blocked`），把还能干的干完；收敛（无可派发 && 无在飞）且有失败 ⇒ Feature 保持 `executing` 自然**静止**，发一条 **`feature.failure_report`** 事件（账单 = 失败节点 `text`/`taskId`/`contextId` + 冻结集），宿主经 **`a2a_feature_advance(..., retryTaskIds?)`** 裁量重派（重派失败节点 + 自动解冻其下游）。**配套同 project 串行 + 静止期禁 `ensure`**（不顶掉空闲回收窗口）。
 - ✅ **孤儿进程回收（v0.4.1）**：Launcher 启动时**对账清理**进程账本里的无主孤儿 —— 这是唯一能修「孤儿占住 `a2aPort` ⇒ 新 Launcher 自检 `EADDRINUSE` ⇒ 服务起不来」的动作；另提供只读兜底 `npm run reap`（默认只列不杀，`--clean` 才清，红线：pidfile 存活一律禁清）。
 
-- ✅ **只读工作台（网页端）**：orch 侧常驻桥可另起一个**只读 HTTP 服务**（默认仅常驻形态、仅 `owner`、绑 `127.0.0.1`、端口 **3300**），以「当前宿主下的项目成员（含在线态）」+「任务引擎内的任务情况（Feature / Task 状态）」两面板呈现实时进度；数据只读自桥的 SQLite 与 Launcher `GET /projects`，**不改线协议、不做第二编排入口**。
+- ✅ **只读数据面（HTTP API，orch 侧）**：orch 侧常驻桥可另起一个**只读 HTTP 服务**（默认仅常驻形态、仅 `owner`、绑 `127.0.0.1`、端口 **3300**），暴露 `/api/*`（项目成员含在线态 · Feature / Task 状态 · 事件流增量）；数据只读自桥的 SQLite 与 Launcher `GET /projects`，**不改线协议、不做第二编排入口**。**v0.9.3 起 3300 的 HTML 页面已退役**（原「两面板单页」下线、`GET /` 不再提供），**`/api/*` 数据面全保留**，主要消费方转为板（`board/`）。
+- ✅ **板（`board/`，v0.9.0 起 · 可选）**：架在 orch agent 前面的 **Web 操作端**——人是唯一入口（选组织 / 提需求 / 触发一轮对话 / 点方案确认 / 排期），板为每个需求驱动一个编排 agent，人不直接使用 agent。形态 = 组织门户（`/`）+ 组织空间（`/org/<组织名>/…`：排期看板 · 需求池 · 需求详情 · 时间轴 · 依赖图 · Agent 视图）+ 组织与项目成员管理（写面经桥的 O1 受控写工具落 `projectGroup`）+ 板侧版本台账（`.data/versions.json`：未开始 / 进行中 / 已发版三态与已发版排期锁）。**板不写状态机迁移**——状态机的唯一写入口仍是引擎的 Feature 工具面；板只写登记字段（`version` 等）与自身台账。启停与配置见 [board/README.md](board/README.md)。
 
 ## 演示 / 截图
 
@@ -189,7 +190,7 @@ npm run status               # 查看 pid / host:port / health / startedAt（确
 
 ## 使用示例
 
-工具面为「**泛型工具 7 + Feature 工具组 5**」，在 orch 里直接调用：
+工具面为「**泛型工具 7 + Feature 工具组 6 + 配置写工具 1**」，在 orch 里直接调用：
 
 ```text
 a2a_projects()
@@ -429,17 +430,16 @@ Launcher 按 `machine/config/config.json` 监听（模板见 `machine/config/con
 
 Bridge ⇄ Launcher 的线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单一事实源（端点 / 字段、版本规则、握手语义、演进记录表）。
 
-### 只读工作台 HTTP 接口（orch 侧，可选）
+### 只读数据面 HTTP 接口（orch 侧，可选）
 
 | 接口 | 作用 |
 |------|------|
-| `GET /` | 单页工作台（两面板：当前宿主下的项目成员含在线态 · 任务引擎内的任务情况） |
 | `GET /api/projects` | 项目成员（machine × project + 在线态 + `observedAt`；**字段白名单**，不含 `workspace` / `agentConfig`） |
 | `GET /api/features` | Feature 列表与状态 |
 | `GET /api/tasks` | 任务列表（含耗时 = `finished_at - started_at`，任一端为 `NULL` 则不显示耗时） |
 | `GET /api/events?since=` | 事件流增量（**不影响宿主收件箱游标**） |
 
-默认仅常驻（`transport.mode=http`）形态、仅 `owner` 实例、绑 `127.0.0.1`、端口 `3300`；**只读**，不改线协议、**不是第二编排入口**（审批 / 澄清 / cancel 等操作端留后续版本）。
+默认仅常驻（`transport.mode=http`）形态、仅 `owner` 实例、绑 `127.0.0.1`、端口 `3300`；**只读**，不改线协议、**不是第二编排入口**（审批 / 澄清 / cancel 等操作端留后续版本）。**v0.9.3 起 HTML 页面退役**：原 `GET /` 单页工作台（两面板）已下线，仅保留上表的 `/api/*` 数据面（消费方 = 板 `board/`）。
 
 ### MCP 工具面
 
@@ -453,15 +453,20 @@ Bridge ⇄ Launcher 的线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单�
 - `a2a_events(since?)`：读取事件收件箱增量（任务结算 / 阻塞、Feature 流转）。省略 `since` 则自进程读游标起；无变化时廉价空返回。
 - `a2a_wait(timeoutMs?)`：长轮询等待新事件（推送优先唤醒 + 定时对账），最多 `timeoutMs`（内部上限低于同步预算）；超时无事件则 `timedOut=true`。
 
-#### Feature 工具组（5 个）
+#### Feature 工具组（6 个）
 
 把一个需求作为 Feature 编排：`a2a_feature_create` 建 Feature → orch 组织各项目分析、汇总方案 → `a2a_feature_advance` 推进到 `waiting_approval` 停下 → 用户 `a2a_feature_approve` 放行 → 桥内 Task DAG 调度器（**同 project 串行、跨 project 并行**）按 `dependencies` 自动派发各项目任务并推进至完成；任务需澄清时 Feature 停 `needs_input`，`a2a_feature_advance(..., answer=…)` 续推；**任务失败时** Feature 保持 `executing` 静止（`a2a_events` 发一次 `feature.failure_report` 账单），宿主 `a2a_feature_advance(..., retryTaskIds=[…])` 重派并解冻。
 
-- `a2a_feature_create(title, requirement?, contextId?)`：新建 Feature，**初态即 `waiting_approval`**（= 改造文档确认门停靠点，**引擎只做需求实现**），返回 `featureId`。
-- `a2a_feature_status(featureId?)`：查看 Feature 详情 / 列表（state + tasks 摘要，含 `failureKind` / `retryCount`）。
-- `a2a_feature_advance(featureId, to, note?, answer?, retryTaskIds?)`：推进状态机主链（校验合法后继，非法流转被拒）；**`to="executing"` 在 `waiting_approval` 会被拒**（`feature_approval_required`，请用 `approve`）；`answer` 用于 `needs_input` 补齐后续推；**`retryTaskIds`（v0.6.1）用于失败重派**（仅静止失败场景：重派指定未处置 `failed` 节点并自动解冻其被冻下游；不传/非法/与 `answer` 同传 ⇒ 结构化错误拒绝且 Feature 态不变）。
+- `a2a_feature_create(title, requirement?, stage?, version?, approval?, contextId?, parentFeatureId?)`：新建 Feature，**初态即 `waiting_approval`**（= 改造文档确认门停靠点，**引擎只做需求实现**），返回 `featureId`。`stage` / `version` / `approval` 是**登记字段（观测面，不是状态机态）**，缺省 `stage=改造方案` + `approval=待审批`；`parentFeatureId` 用于验收增补轨挂主需求。
+- `a2a_feature_status(featureId?)`：查看 Feature 详情 / 列表（state + tasks 摘要，含 `failureKind` / `retryCount`；省略 `featureId` 列出全部）。
+- `a2a_feature_trace(featureId)`：**只读**回答「这个 Feature 为什么还没完成」——逐非终态节点给 `waitReason` / `position` / `waitedSince` / `projectBusy` / `lane` / `readOccupants[]`。用于区分「在排队」与「真在跑」（**两个时钟不得相加**：orch 领取队列的等待 ≠ machine 本机闸内等待）。纯读，不落库、不触发调度。
+- `a2a_feature_advance(featureId, to, note?, answer?, retryTaskIds?, stage?, version?, approval?, decisions?, contracts?)`：推进状态机主链（校验合法后继，非法流转被拒）；**`to="executing"` 在 `waiting_approval` 会被拒**（`feature_approval_required`，请用 `approve`）；`answer` 用于 `needs_input` 补齐后续推；**`retryTaskIds`（v0.6.1）用于失败重派**（仅静止失败场景：重派指定未处置 `failed` 节点并自动解冻其被冻下游；不传/非法/与 `answer` 同传 ⇒ 结构化错误拒绝且 Feature 态不变）；**`to` = 当前态 ∧ 仅带登记字段 = 只写登记、不动主链**（`stage` / `version` / `approval` / `decisions` 走这条，`decisions` 为 append 语义）。
 - `a2a_feature_approve(featureId)`：**唯一准入**——`waiting_approval → executing`。语义 = **记录已发生的用户确认（一对一映射：不可预领、不可补领）**：宿主在收到用户确认后**立即**调用，**不是新增一次用户决策**；禁止在用户未确认方案前调用。
 - `a2a_feature_cancel(featureId)`：任意非终态 → `cancelled`（**执行中途"方案整体回炉"只能走这条**：主链无回边）。
+
+#### 配置写工具（1 个）
+
+- `a2a_config_write_group(op, groupName, members?)`：**受控写** orch `config.json` 的 `projectGroup` 段——它是项目组台账的**唯一机器写手**。**单组操作指令五操作**：`group.add` / `group.update`（members 整集替换）/ `group.remove` / `group.member.add` / `group.member.remove`（增删成员各带 `members=[{machineId, projectId}]`；组在 config 的出现由成员条目派生，改名语义不做，挪成员 = `member.remove` + `member.add` 组合）。写路径 = 互斥内 read → mutate → **dry-run（同源校验，坏写不落盘）→ backup → tmp+rename 原子替换**，成功出参带 `backedUpTo`（写前备份路径）。**错误码闭集**：`config_write_dry_run_rejected` / `config_write_unknown_machine` / `config_write_group_not_found` / `config_write_duplicate_member` / `config_write_concurrent_modification` / `config_write_io_failed`。配置面写**不受调用方连接身份的组可见性限制**，写后**热生效**（桥 per-call 现读，无需重启）。⚠ 拒绝全文替换整个文档。
 
 `a2a_call` 的 `mode` **对偶校验**：`mode="execute"` 必带 `featureId`（否则 `feature_required_for_execute`）；`mode="inquiry"` **不得**带 `featureId`（否则 `feature_not_allowed_for_inquiry`）—— 由桥侧强制，**保证"执行必走引擎"**。
 
@@ -471,7 +476,7 @@ A2A 任务态统一使用 `working` / `completed` / `failed` / `input-required`�
 
 ## 目录结构
 
-代码按部署单元组织，`orch/` 与 `machine/` 各自完全自包含（各自的 `package.json` / `tsconfig.json` / `node_modules/` / `dist/` / `config/`）。`flow/` 是需求流程规范包（项目无关，不参与 `npm` 构建），宿主经 `instructions` 加载其 `spec/` 内核。单元之间只通过线协议耦合：线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单一事实源，类型两侧各自声明、由契约测试（`test-protocol-version`）锁定一致；修改协议时先改 PROTOCOL.md 再同步两侧实现。
+代码按部署单元组织，`orch/`、`machine/`、`board/` 各自是独立部署单元（各有自己的 `package.json` / `tsconfig.json` / `node_modules/` / `dist/` / `config/`，彼此不跨单元 import、只经 HTTP / MCP 面耦合）。`flow/` 是需求流程规范包（项目无关，不参与 `npm` 构建），宿主经 `instructions` 加载其 `spec/` 内核。单元之间只通过线协议耦合：线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单一事实源，类型两侧各自声明、由契约测试（`test-protocol-version`）锁定一致；修改协议时先改 PROTOCOL.md 再同步两侧实现。
 
 ```text
 a2a-coding/
@@ -482,16 +487,16 @@ a2a-coding/
 │  ├─ config/config.json.default  # 机器清单模板（入库）
 │  ├─ opencode.json.example       # 样例：把 mcp.a2a 配进 orch 的 opencode
 │  ├─ types.ts  config.ts  app-root.ts
-│  ├─ bridge/index.ts             # MCP 薄桥：泛型 7 + Feature 工具组 5；派发主链 dispatchTask
+│  ├─ bridge/index.ts             # MCP 薄桥：泛型 7 + Feature 工具组 6 + 配置写 1；派发主链 dispatchTask
 │  ├─ bridge/register-tools.ts    # 工具注册：createServer(core) 工厂 + registerTools(server, core)
-│  ├─ bridge/transports/{http,web}.ts  # 接入面：stateless Streamable HTTP（/mcp /health /shutdown）/ 只读工作台 HTTP（/ · /api/*）（stdio 已于 v0.7.1 退役）
-│  ├─ bridge/web/html.ts          # 只读工作台单页（两面板，纯函数渲染）
+│  ├─ bridge/transports/{http,web}.ts  # 接入面：stateless Streamable HTTP（/mcp /health /shutdown）/ 只读数据面 HTTP（/api/*；页面 v0.9.3 退役）（stdio 已于 v0.7.1 退役）
+│  ├─ bridge/config-write.ts      # O1 受控写：projectGroup 段五操作指令（dry-run + backup + 原子替换）
 │  ├─ runtime/{lifecycle,core-lease}.ts  # 启停编排与排空 + core 租约（单调度权，role owner/follower）
 │  ├─ scripts/bridgectl.mjs       # 桥启停脚本（start/stop/restart/status/logs）
 │  ├─ tools/mcp-http-probe.mjs    # 独立 MCP HTTP 探测客户端
 │  ├─ bridge/task-watcher.ts      # 任务后台看护（轮询 + 续约至终态落库；onSettled 供调度器接驳）
 │  ├─ bridge/scheduler.ts         # 拓扑并行 Task DAG 调度器（失败传播 blocked / 启动恢复）
-│  ├─ bridge/feature-tools.ts     # Feature 工具组 handler（create / status / advance / approve / cancel）
+│  ├─ bridge/feature-tools.ts     # Feature 工具组 handler（create / status / trace / advance / approve / cancel）
 │  ├─ feature/state-machine.ts    # Feature 状态机（9 主态 + 异常态；纯函数，非法流转 fail-fast）
 │  ├─ session/store.ts            # 会话/任务库（node:sqlite；sessions + tasks + features + artifacts + events）
 │  └─ data/                       # 运行态：sessions.sqlite（git 忽略）
@@ -506,8 +511,21 @@ a2a-coding/
 │  ├─ acp-bridge/                 # 仓内 ACP 桥（A2A 服务面 + ACP over stdio client；四条 kind 同构）
 │  ├─ scripts/                    # （wrapper 契约 / 会话落盘补丁三个验证脚本已随 v0.8.5 退役）
 │  └─ .a2a/                       # 运行态：ACP 桥会话 .a2a/acp-sessions/（git 忽略）
+├─ board/                         # 部署单元 3（可选）：Web 操作端（板，端口 3400）
+│  ├─ package.json                # @a2a-coding/board
+│  ├─ config/config.json          # 板配置（实际，git 忽略；模板 config.json.default 入库）
+│  ├─ src/server.ts               # 路由与页面入口（组织门户 / 组织空间 / 排期看板 / 需求 / 版本写口）
+│  ├─ src/web/{layout,views}.ts   # 页面骨架与视图（页面内联脚本 = 白名单常量闭集）
+│  ├─ src/{org-space,orgs-view,orgs-ledger,group-admin}.ts  # 组织空间视图 / 组织视角 / 组织台账 / 成员写面
+│  ├─ src/{versions-ledger,version-status,version-transition}.ts  # 版本台账 / 三态徽标 / 自动转换
+│  ├─ src/feature-schedule.ts     # 排期写点（板侧 MCP 写：登记字段 version）
+│  ├─ src/derive.ts  write-guard.ts  # 终态判定单一事实源 / 写路由白名单与 Origin 守卫
+│  ├─ scripts/boardctl.mjs        # 板启停脚本（start / stop / restart / status / logs）
+│  └─ README.md                   # 板单元说明（配置与命令的唯一锚点）
 ├─ scripts/                       # 宿主侧编排辅助脚本（**非部署单元**；宿主直接维护/执行，在单元 deny 面之外）
-│  └─ watch-feature.mjs           # 只读监视一个 Feature 至「需宿主动作」时点（完成/失败收敛静止/needs_input/终态），经 orch 只读 web API
+│  ├─ watch-feature.mjs           # 只读监视一个 Feature 至「需宿主动作」时点（完成/失败收敛静止/needs_input/终态）
+│  ├─ watch-feature-loud.mjs      # 同上的「叫醒版」（收敛静止即非零退出，便于后台看护）
+│  └─ watch-task.mjs              # 只读等待常规任务 taskId 至终态（退出码 0 / 20 / 1，只打印状态行）
 ├─ flow/                          # 需求流程规范包：spec 内核 / hosts 适配 / install 旁路引入（不参与 npm 构建）
 ├─ package.json                   # 仓级 dev manifest（version / type）
 └─ CHANGELOG.md  README.md

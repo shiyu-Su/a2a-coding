@@ -16,6 +16,7 @@ import { z } from "zod";
 import { BRIDGE_VERSION } from "../version.js";
 import type { BridgeCore } from "./index.js";
 import type { FeatureState } from "../types.js";
+import { CONFIG_WRITE_GROUP_OPS } from "./config-write.js";
 
 function toMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
@@ -123,6 +124,32 @@ export const a2aCallSchema = {
     ),
 };
 
+/**
+ * `a2a_config_write_group` 入参形状（导出以便单测直接断言 schema：op 闭集收窄、
+ * members 项 `{machineId, projectId}` 必填非空）。成员集对 add/update/member.* 必带
+ * ——「哪_op_需要_成员」的按-op 校验在 `config-write.ts`（闭集错误码 `..._dry_run_rejected`），
+ * schema 层不做 union 收窄以保持错误面单一。
+ */
+export const configWriteGroupSchema = {
+  op: z
+    .enum(CONFIG_WRITE_GROUP_OPS)
+    .describe(
+      "**必填**，单组操作闭集：group.add / group.update（members 整集替换）/ group.remove / group.member.add / group.member.remove",
+    ),
+  groupName: z.string().min(1).describe("目标组名（group.add = 新组名，字符集 [A-Za-z0-9_-]+）"),
+  members: z
+    .array(
+      z.object({
+        machineId: z.string().min(1).describe("成员机器 id（必须 ∈ config.machines[]）"),
+        projectId: z.string().min(1).describe("成员项目 id"),
+      }),
+    )
+    .optional()
+    .describe(
+      "成员集：group.add / group.update（整集替换）/ group.member.add / group.member.remove 必带非空；group.remove 不消费",
+    ),
+};
+
 /** 准入判定结果：通过 → `{ ok: true }`；拒绝 → 结构化错误（桥转 `errorResult`） */
 export type CallAdmission = { ok: true } | { ok: false; code: string; error: string };
 
@@ -162,7 +189,8 @@ export function validateCallMode(args: {
 }
 
 /**
- * 把全部工具（泛型 7 + Feature 工具组 6，v0.8.10 O-N3 起）注册进给定 server。
+ * 把全部工具（泛型 7 + Feature 工具组 6 + 配置面 1〔v0.9.4 O1 `a2a_config_write_group`〕，
+ * 共 14）注册进给定 server。
  *
  * **既有工具名 / 描述 / 入参 schema 与原实现逐字一致**；静态注册、不发 `tools/list_changed`（零重连）。
  * 新增的 `a2a_feature_trace` 是**只读**出口（v0.8.10 O-N3）：复用 `feature-tools.ts` 的
@@ -571,6 +599,41 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     async (args) => {
       try {
         const outcome = core.featureTrace({ featureId: args.featureId });
+        return outcome.ok ? textResult(outcome) : errorResult(outcome);
+      } catch (err) {
+        return internalError(err);
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // 配置面工具组（v0.9.4 O1；**全组面** —— 不受调用方组可见性限制，静态注册零重连）
+  // -------------------------------------------------------------------------
+
+  server.registerTool(
+    "a2a_config_write_group",
+    {
+      description:
+        "**受控写** orch config.json 的 `projectGroup` 段（项目组台账的唯一机器写手）。" +
+        "**单组操作指令五操作**（拒绝整文档替换）：group.add / group.update（members 整集替换）/ group.remove / " +
+        "group.member.add / group.member.remove（增删成员各带 members=[{machineId, projectId}]；" +
+        "组在 config 的出现由成员条目派生，改名语义不做，挪成员 = member.remove + member.add 组合）。" +
+        "**写路径**：互斥内 read → mutate → dry-run（parseProjectGroups 同源校验，坏写不落盘）→ backup → tmp+rename 原子替换；" +
+        "成功出参带 `backedUpTo`（写前备份路径）。" +
+        "**错误码闭集**（板侧映射 HTTP 状态）：`config_write_dry_run_rejected`→422（带校验原 message）/ " +
+        "`config_write_unknown_machine`→422 / `config_write_group_not_found`→409 / `config_write_duplicate_member`→409 / " +
+        "`config_write_concurrent_modification`→409（config 处理途中被外部改动，调用方可重读后重试一次）/ " +
+        "`config_write_io_failed`→500（当前 config 原样）。" +
+        "**全组面语义**：配置面写不受调用方连接身份的组可见性限制（写后热生效：桥 per-call 现读，无需重启）。",
+      inputSchema: configWriteGroupSchema,
+    },
+    async (args) => {
+      try {
+        const outcome = await core.configWriteGroup({
+          op: args.op,
+          groupName: args.groupName,
+          members: args.members,
+        });
         return outcome.ok ? textResult(outcome) : errorResult(outcome);
       } catch (err) {
         return internalError(err);

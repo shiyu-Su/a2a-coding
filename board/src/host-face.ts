@@ -69,6 +69,12 @@ export const ORG_NOT_RESOLVED = "board_org_not_resolved";
 /** 组织名不能安全落为目录（拒绝分隔符 / `..` / 盘符 ⇒ 防逃逸出组织根）。 */
 export const ORG_NAME_INVALID = "board_org_name_invalid";
 
+/**
+ * 组织台账里该组织**已停用**（v0.9.4 A3/A4 · BD3）⇒ 不起桥、不供给 workspace、不提新需求。
+ * 与 {@link ORGS_DIR_MISSING} 同族（都是「落点/台账事实」问题，不是「桥断了」）⇒ 一律 `config_error` 档。
+ */
+export const ORG_DISABLED = "board_org_disabled";
+
 /** 触发一轮的入参不合法。 */
 export const TURN_REQUEST_INVALID = "board_turn_request_invalid";
 
@@ -160,6 +166,15 @@ export function isBridgeDownCode(code: string | null | undefined): boolean {
 /** 桥状态是否属于「已断」（`unreachable` / `exited` / `failed`）。 */
 export function isBridgeDownState(state: HostBridgeStatus["state"]): boolean {
   return state === "unreachable" || state === "exited" || state === "failed";
+}
+
+/**
+ * 桥状态是否属于「活跃」（v0.9.4 A3 · BD3 拒删前置闸判据）：`running` / `starting` / `unreachable`。
+ * **刻意把 `unreachable` 也算活跃**（进程可能仍在、只是端口暂时连不上）—— 宁可多拦（引导用户先逐桥 stop）
+ * 也不漏拦（漏拦会把「还有宿主桥的组织」标记停用，违背「不做隐式连带停桥」）。`exited` / `failed` = 已终，不拦。
+ */
+export function isActiveBridgeState(state: HostBridgeStatus["state"]): boolean {
+  return state === "running" || state === "starting" || state === "unreachable";
 }
 
 /**
@@ -374,6 +389,12 @@ export interface HostFaceDeps {
    * 目的是让「配了但不存在」在**触发前**就是结构化错误，而不是等 spawn 撞出一个负 errno。
    */
   dirKind?: DirKindProbeFn;
+  /**
+   * **停用闸判据**（v0.9.4 A4 · BD3）：组织在板台账里被标记停用 ⇒ 该组织的 spawn/ensure 一律结构化拒绝。
+   * 事实源 = 板组织台账 `.data/orgs.json`（`orgs-ledger.ts`），由装配方注入读取口径（本文件不碰文件）；
+   * 未注入 ⇒ 不判停用（等价于「台账没有停用概念」，保持 BD1–BD2 期间的宿主面行为）。
+   */
+  isOrgDisabled?: (org: string) => boolean;
 }
 
 // ---------------------------------------------------------------------------
@@ -385,9 +406,13 @@ export interface HostFaceDeps {
  * `createHostBridgeGateway`（对话轮侧的起桥口）—— 两侧必须算出**同一个** workspace，
  * 否则「触发时的组织目录」与「轮内重拉桥时的目录」会分家。
  * workspace 落点在此决定，**无兜底路径**（§3.8 裁定 9）。
+ *
+ * **A4 停用闸也在这一层**（v0.9.4 · BD3）：本函数是 spawn/ensure 的**唯一配置入口**
+ * （`BoardHostFace.bridgeConfigFor` 与 `index.ts` 的轮内重拉桥口都走它）⇒ 命中停用台账即结构化拒绝，
+ * 「触发一轮」与「轮内重拉」两条路同闸。**`prepareWorkspace` 纯函数不动**（mkdir 供给语义保持无组织状态知识）。
  */
 export function orgBridgeConfig(
-  deps: Pick<HostFaceDeps, "orgsDir" | "kind" | "idleStopMs" | "mcpUrlFor">,
+  deps: Pick<HostFaceDeps, "orgsDir" | "kind" | "idleStopMs" | "mcpUrlFor" | "isOrgDisabled">,
   org: string,
 ): HostBridgeConfig | { error: { code: string; message: string } } {
   if (deps.orgsDir === null) {
@@ -400,6 +425,14 @@ export function orgBridgeConfig(
   }
   const ws = resolveOrgWorkspace(deps.orgsDir, org);
   if (!ws.ok) return { error: { code: ws.code, message: ws.error } };
+  if (deps.isOrgDisabled?.(org.trim()) === true) {
+    return {
+      error: {
+        code: ORG_DISABLED,
+        message: `组织 ${org.trim()} 已在板台账停用 ⇒ 不起桥、不 spawn 任何后端进程；恢复 = 用同名重新建组织（零迁移）`,
+      },
+    };
+  }
   const config: HostBridgeConfig = {
     org,
     workspace: ws.workspace,
@@ -731,6 +764,20 @@ export class BoardHostFace {
    */
   managedOrgs(): string[] {
     return this.deps.bridges.statuses().map((s) => s.org);
+  }
+
+  /**
+   * **该组织名下当前活跃的宿主桥状态清单**（v0.9.4 A3 · BD3 拒删前置闸判据）：
+   * 只收 {@link isActiveBridgeState} 为真的条目（`running` / `starting` / `unreachable`）。
+   * 返回**非空** ⇒ 组织还有活跃宿主桥，「删除（标记停用）」必须 409 拒绝并引导「先逐桥 stop 再删」；
+   * 本方法**不探活、不改状态、不停桥**（连带停桥明确不做，停桥是 `POST /host/{org}/stop` 的独立职责）。
+   */
+  activeBridgesFor(org: string): HostBridgeStatus[] {
+    const name = org.trim();
+    if (name === "") return [];
+    return this.deps.bridges
+      .statuses()
+      .filter((s) => s.org === name && isActiveBridgeState(s.state));
   }
 
   /**

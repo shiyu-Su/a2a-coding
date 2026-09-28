@@ -49,6 +49,23 @@ test("buildFeatureCreateArgs（M6）: version 发送前 trim；空 / 纯空白 �
   assert.equal(buildFeatureCreateArgs({ title: "甲", version: "   " }).version, "");
 });
 
+// v0.9.4 N4 semver 收口（改造文档 §2.5）：提需求写口三态 —— 合法放行 / 非法拒 / 清空放行。
+test("buildFeatureCreateArgs（N4 · 三态）: 合法 x.y.z（可带 v 前缀）放行；清空 \"\" 放行；非 x.y.z 抛 RequirementConfigError", () => {
+  // 合法：有 v 前缀 / 无 v 前缀都放行，出网值 = trim 后的原样
+  assert.equal(buildFeatureCreateArgs({ title: "甲", version: "v0.9.4" }).version, "v0.9.4");
+  assert.equal(buildFeatureCreateArgs({ title: "甲", version: "0.10.0" }).version, "0.10.0");
+  // 清空：未排期的合法值 ⇒ 放行（不抛）
+  assert.equal(buildFeatureCreateArgs({ title: "甲", version: "" }).version, "");
+  // 非法：预发布段 / 半截版 / 自由文本 / 范围符 —— 复用 parseVersion 判据，一律拒（先于网络）
+  for (const bad of ["v0.9.1-probe", "1.0", "v1", "v0.9", "^0.9.4", "latest", "0.9.4.1"]) {
+    assert.throws(
+      () => buildFeatureCreateArgs({ title: "甲", version: bad }),
+      RequirementConfigError,
+      `expected ${JSON.stringify(bad)} rejected`,
+    );
+  }
+});
+
 test("createRequirement: 出网 body 的 arguments 确实携带 stage/approval（端到端捕获）", async () => {
   let capturedBody = null;
   const fetchImpl = async (_url, init) => {
@@ -64,7 +81,7 @@ test("createRequirement: 出网 body 的 arguments 确实携带 stage/approval�
 });
 
 test("buildFeatureCreateArgs: 空标题即抛 RequirementConfigError（先于网络）", () => {
-  assert.throws(() => buildFeatureCreateArgs({ title: "   ", version: "v1" }), RequirementConfigError);
+  assert.throws(() => buildFeatureCreateArgs({ title: "   ", version: "v0.9.0" }), RequirementConfigError);
 });
 
 // ---------------------------------------------------------------------------
@@ -138,11 +155,11 @@ test("parseToolCallEnvelope: 成功回显三登记字段；缺列容错 null", (
 });
 
 test("createRequirement: HTTP 非 2xx / 传输异常均结构化上报（不吞成成功）", async () => {
-  const http = await createRequirement({ title: "甲", version: "v1" }, { group: "g", fetchImpl: async () => new Response("boom", { status: 503 }) });
+  const http = await createRequirement({ title: "甲", version: "v0.9.0" }, { group: "g", fetchImpl: async () => new Response("boom", { status: 503 }) });
   assert.equal(http.ok, false);
   assert.equal(http.code, "http_503");
 
-  const thrown = await createRequirement({ title: "甲", version: "v1" }, { group: "g", fetchImpl: async () => { throw new Error("ECONNREFUSED"); } });
+  const thrown = await createRequirement({ title: "甲", version: "v0.9.0" }, { group: "g", fetchImpl: async () => { throw new Error("ECONNREFUSED"); } });
   assert.equal(thrown.ok, false);
   assert.equal(thrown.code, "transport_error");
   assert.match(thrown.error, /ECONNREFUSED/);
@@ -201,4 +218,13 @@ test("纪律扫描：a2a_feature_advance 命中文件集合 == [feature-schedule
     .filter((f) => readFileSync(f, "utf8").includes("a2a_feature_advance"))
     .map(relFromSrc);
   assert.deepEqual(hits, ["feature-schedule.ts"], "advance 工具名必须收敛在唯一排期封装文件");
+});
+
+// v0.9.4 B 档（BD4）· 同形扫描：第三个 MCP 写封装（组织成员写）的工具名同样收敛于唯一文件。
+// 「绝不直写 orch/config.json」的机制含义 = 板上只有这一条受控写通路 ⇒ 命中集合扩一个文件即出声。
+test("纪律扫描：src/** 中 a2a_config_write_group 仅出现在 group-admin.ts", () => {
+  const hits = walkTs(SRC_DIR)
+    .filter((f) => readFileSync(f, "utf8").includes("a2a_config_write_group"))
+    .map(relFromSrc);
+  assert.deepEqual(hits, ["group-admin.ts"], "配置面写工具名必须收敛在唯一成员写封装文件");
 });

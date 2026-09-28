@@ -26,6 +26,7 @@
 
 import * as mcpClient from "./mcp-client.js";
 import { callTool, McpConfigError } from "./mcp-client.js";
+import { parseVersion } from "./version-order.js";
 
 /** 桥 MCP 端点缺省基址（8787 = 编排桥 streamable-HTTP 面；只读运维视图另在 3300）。 */
 export const DEFAULT_MCP_BASE_URL = "http://127.0.0.1:8787";
@@ -40,7 +41,11 @@ export const FEATURE_CREATE_TOOL = "a2a_feature_create";
 export interface CreateRequirementInput {
   /** Feature 标题（需求的简短摘要）—— 桥侧必填。 */
   title: string;
-  /** 版本号（如 `v0.9.0`）—— 由调用方给出；v0.9.2 M6 起可留空（= 未排期），本封装发送前 `trim()`。 */
+  /**
+   * 版本号（如 `v0.9.0`）—— 由调用方给出；v0.9.2 M6 起可留空（= 未排期），本封装发送前 `trim()`。
+   * **v0.9.4 N4 起**：非空值必须命中 `x.y.z`（可带 `v` 前缀），否则先于网络抛
+   * {@link RequirementConfigError}（空串放行 = 未排期）。
+   */
   version: string;
   /** 需求原文（可选）。 */
   requirement?: string;
@@ -118,16 +123,29 @@ export function buildMcpEndpoint(baseUrl: string, group: string): string {
 /**
  * 组装 `a2a_feature_create` 的入参对象 —— **始终显式带上** `stage` / `approval` / `version`。
  * 这是「板建的需求停在『需求分析 + 审批门未发起』」的机制落点（纯函数，供断言①）。
+ *
+ * **semver 收口（v0.9.4 N4 / 改造文档 §2.5）**：`version` 发送前 `trim()`；**空串 = 未排期 ⇒ 放行**
+ * （M6 合法路径），非空则必须命中 `version-order.parseVersion` 的 `x.y.z`（可带 `v` 前缀）——
+ * 复用现成 `parseVersion`，**零新增第二枚 regex**；不合法先于网络抛 {@link RequirementConfigError}。
+ * `normalizeVersion` 不加校验（读面 / 排序 / docs-move 共用的 trim-only 归一入口，加校验会伤存量脏值读面）
+ * ⇒ 存量脏值只拦新写、读面保留。
  */
 export function buildFeatureCreateArgs(input: CreateRequirementInput): Record<string, unknown> {
   const title = input.title.trim();
   if (title === "") {
     throw new RequirementConfigError("需求标题（title）不可为空");
   }
+  // M6 起 version 可留空（未排期）；发送前 trim —— orch 无 trim，空白串会「自成一列」。
+  const version = input.version.trim();
+  if (version !== "" && parseVersion(version) === null) {
+    throw new RequirementConfigError(
+      `版本号 ${version} 不是 x.y.z 形式（可带 v 前缀）⇒ 拒绝建需求：` +
+        "留空 = 未排期（合法）；非空必须 x.y.z（读面存量脏值保留，只拦新写）",
+    );
+  }
   const args: Record<string, unknown> = {
     title,
-    // M6 起 version 可留空（未排期）；发送前 trim —— orch 无 trim，空白串会「自成一列」。
-    version: input.version.trim(),
+    version,
     stage: REQUIREMENT_STAGE,
     approval: REQUIREMENT_APPROVAL,
   };

@@ -22,10 +22,14 @@ process.env["SESSION_DB"] = ":memory:"; // 必须在首次触碰 store 之前（
 
 import { after, test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import type { Server } from "node:http";
 import { appendEvent, createFeature, createTask, latestEventId } from "../session/store.js";
 import type { ProjectStatus } from "../types.js";
+import { resetWarnOnceCache } from "../config.js";
 import { handleFeatureStatus, projectTaskVisibility } from "../bridge/feature-tools.js";
 import type { TaskState } from "../types.js";
 import { startWebTransport } from "../bridge/transports/web.js";
@@ -142,6 +146,7 @@ function baseOptions(
     version: overrides.version ?? "0.5.0-test",
   };
   if (overrides.refreshMs !== undefined) options.refreshMs = overrides.refreshMs;
+  if (overrides.configPath !== undefined) options.configPath = overrides.configPath;
   return options;
 }
 
@@ -237,6 +242,22 @@ interface EventsBody {
     taskId: string | null;
     createdAt: string;
   }>;
+}
+
+/** `GET /api/groups` 出参（v0.9.4 O2；仅声明测试用到的字段） */
+interface GroupsBody {
+  ok: boolean;
+  source: string;
+  note: string;
+  observedAt: string;
+  groups: Array<{
+    name: string | null;
+    memberCount: number;
+    members: Array<{ machineId: string; projectId: string }>;
+  }>;
+  warnings: string[];
+  code?: string;
+  error?: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -637,6 +658,121 @@ test("GET /api/events?featureId= → store.listEvents 只读收窄（B3″：不
 
   const all = json<EventsBody>(await get(handle.port, `/api/events?since=${base}`));
   assert.equal(all.count, 4, "不传 featureId ⇒ 行为与改前逐字一致（本用例四条事件全回，不加过滤）");
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/groups（v0.9.4 O2：全组枚举只读端点）
+// ---------------------------------------------------------------------------
+
+const testTmpDir = mkdtempSync(join(tmpdir(), "orch-web-groups-"));
+
+/** 写一份临时 `config.json` 夹具，返回路径（`loadMachinesConfig` 的真解析路径，不打桩） */
+function writeGroupsFixture(config: unknown): string {
+  const path = join(testTmpDir, `config-${String(Math.random()).slice(2)}.json`);
+  writeFileSync(path, JSON.stringify(config));
+  return path;
+}
+
+/** 最小合法 machines 段（组成员 machineId 校验依赖它） */
+function machinesSection(...machineIds: string[]): Array<Record<string, unknown>> {
+  return machineIds.map((machineId) => ({
+    machineId,
+    launcherUrl: "http://127.0.0.1:9000",
+  }));
+}
+
+test("GET /api/groups → 全组声明投影：name / memberCount / members 白名单（派生态与敏感键不出口；组内重复项去重）", async () => {
+  const path = writeGroupsFixture({
+    machines: machinesSection("m1", "m2"),
+    projectGroup: [
+      {
+        name: "alpha",
+        members: [
+          { machineId: "m1", projectId: "p1" },
+          { machineId: "m2", projectId: "p2" },
+          // 组内重复项（parseProjectGroups 不判跨组互斥）：投影须集合去重，计数与列表同源
+          { machineId: "m1", projectId: "p1" },
+        ],
+      },
+      { name: "beta", members: [{ machineId: "m2", projectId: "p3" }] },
+    ],
+  });
+  const handle = await startWeb(fakeCore(), { configPath: path });
+
+  const res = await get(handle.port, "/api/groups");
+  assert.equal(res.status, 200);
+  const body = json<GroupsBody>(res);
+  assert.equal(body.ok, true);
+  assert.match(body.source, /projectGroup/);
+  assert.match(body.observedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+  assert.deepEqual(body.groups, [
+    {
+      name: "alpha",
+      memberCount: 2,
+      members: [
+        { machineId: "m1", projectId: "p1" },
+        { machineId: "m2", projectId: "p2" },
+      ],
+    },
+    { name: "beta", memberCount: 1, members: [{ machineId: "m2", projectId: "p3" }] },
+  ]);
+  const raw = JSON.stringify(body);
+  for (const leaked of ["memberKeys", "memberMachineIds", "selective", "token"]) {
+    assert.ok(!raw.includes(leaked), `派生态 / 敏感键不得出口：${leaked}`);
+  }
+});
+
+test("GET /api/groups → 未配组回 groups: []（全量接纳语义的声明态），不 404 不报错", async () => {
+  const path = writeGroupsFixture({ machines: machinesSection("m1") });
+  const handle = await startWeb(fakeCore(), { configPath: path });
+
+  const res = await get(handle.port, "/api/groups");
+  assert.equal(res.status, 200);
+  const body = json<GroupsBody>(res);
+  assert.deepEqual(body.groups, []);
+});
+
+test("GET /api/groups → warnings[] 透传 warn-once 配置瑕疵文案（解析宽容项，不入判定）", async () => {
+  resetWarnOnceCache(); // 用例级隔离（与 config.test.ts 同纪律）
+  const path = writeGroupsFixture({
+    machines: [{ machineId: "m1" }], // launcherUrl 缺省 ⇒ warn-once 文案
+    projectGroup: [{ name: "alpha", members: [{ machineId: "m1", projectId: "p1" }] }],
+  });
+  const handle = await startWeb(fakeCore(), { configPath: path });
+
+  const res = await get(handle.port, "/api/groups");
+  assert.equal(res.status, 200);
+  const body = json<GroupsBody>(res);
+  assert.equal(body.groups.length, 1, "宽容告警不影响投影结果");
+  assert.ok(
+    body.warnings.some((w) => w.includes("machines[0].launcherUrl 缺省")),
+    `warnings 应含 launcherUrl 缺省文案，实际：${JSON.stringify(body.warnings)}`,
+  );
+});
+
+test("GET /api/groups → 配置坏 / 无源：500 machines_config_error；非 GET 405；其它路由不受影响", async () => {
+  const badPath = writeGroupsFixture({ machines: "not-an-array" });
+  const bad = await startWeb(fakeCore(), { configPath: badPath });
+  const badRes = await get(bad.port, "/api/groups");
+  assert.equal(badRes.status, 500);
+  const badBody = json<GroupsBody>(badRes);
+  assert.equal(badBody.code, "machines_config_error");
+  assert.ok(String(badBody.error).includes(badPath), "错误文案须含配置路径，便于归因");
+
+  // 未注入 configPath ⇒ 无源可读，同样 machines_config_error（绝不 fail-open 成空清单）
+  const noSource = await startWeb(fakeCore());
+  const noSourceRes = await get(noSource.port, "/api/groups");
+  assert.equal(noSourceRes.status, 500);
+  assert.equal(json<GroupsBody>(noSourceRes).code, "machines_config_error");
+
+  // 命中注册路径的非 GET ⇒ 405（整面只读纪律的又一颗钉）
+  const notGet = await get(bad.port, "/api/groups", "POST");
+  assert.equal(notGet.status, 405);
+  assert.equal(json<ErrorBody>(notGet).code, "method_not_allowed");
+
+  // 坏配置只影响 groups 路由，不回伤 core 数据面
+  const okProjects = await get(bad.port, "/api/projects");
+  assert.equal(okProjects.status, 200);
 });
 
 test("非 loopback host ⇒ 拒起（不 throw，返回未启用）", async () => {

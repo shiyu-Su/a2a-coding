@@ -390,8 +390,10 @@ test("N2-⑦ 浮层内表单提交锚（真浏览器反馈 ②③）：只拦 di
   assert.match(s, /addEventListener\("submit"/, "document 级 submit 委托");
   assert.match(s, /form\.closest\("#feat-dialog"\) === null\) return;/, "dialog 外表单直接放行（不拦）");
   assert.match(s, /toLowerCase\(\)\ !== "post"\) return;/, "非 POST 不拦（同提交守卫判据）");
-  // 提交走 fetch，POST + form.action + 同源凭据；成功（303 自动跟随后）与 4xx/5xx 共用换入通路
-  assert.match(s, /fetch\(form\.action, \{/, "fetch 表单 action（不另拼端点）");
+  // 提交走 fetch，POST + **属性读取**的 action + 同源凭据；成功（303 自动跟随后）与 4xx/5xx 共用换入通路
+  // （增补三 §9.2：不得直读 form.action —— 表单带 name="action" 字段时同名字段遮蔽该属性）
+  assert.match(s, /var action = form\.getAttribute\("action"\) \|\| "";/, "提交目标 = getAttribute(\"action\")（属性读取防遮蔽）");
+  assert.match(s, /fetch\(action, \{/, "fetch 表单 action 属性值（不另拼端点）");
   assert.match(s, /method: "POST"/);
   assert.match(s, /credentials: "same-origin"/);
   assert.match(s, /e\.preventDefault\(\);\n    postForm\(form\);/, "拦下 submit 后进浮层提交通路");
@@ -422,7 +424,7 @@ test("N2-⑦ 浮层内表单提交锚（真浏览器反馈 ②③）：只拦 di
   assert.match(s, /if \(!swapPage\(r\.text\)\) \{ nativeSubmit\(form\); \}\n    \}\)\.then\(function \(\) \{\n      restoreForm\(form\);\n    \}\)/, "响应处理完之后恢复表单（成功 / 错误叠加两档共用一个落点）");
   // 降级面：结构不可解析 / fetch 异常 ⇒ 原生提交（此前不动 body ⇒ 表单仍在文档内可 submit）
   assert.match(s, /function nativeSubmit\(form\) \{ restoreForm\(form\); form\.submit\(\); \}/, "降级 = 先恢复表单再原生 form.submit()");
-  assert.match(s, /if \(data === null\) \{ nativeSubmit\(form\); return; \}/);
+  assert.match(s, /if \(data === null \|\| action === ""\) \{ nativeSubmit\(form\); return; \}/, "FormData 不可构造 / action 属性缺失 ⇒ 降级原生提交（不劣化）");
   assert.match(s, /if \(!swapPage\(r\.text\)\) \{ nativeSubmit\(form\); \}/, "响应不可解析 ⇒ 降级原生提交");
   assert.match(s, /\.catch\(function \(\) \{ nativeSubmit\(form\); \}\)/, "fetch 网络异常 ⇒ 降级原生提交");
   // 提交期间不改 body ⇒ 降级时表单仍是活节点（form.submit() 对未连接表单是空操作）
@@ -474,7 +476,7 @@ test("N4-① renderSchedule: 锁版列头标「🔒 已发版」（title 提示�
   assert.doesNotMatch(openH3, /vbadge locked|🔒/, "进行中不加锁样式、不显示锁标");
 });
 
-test("N4-② renderSchedule: 未锁版全终态且有 completed ⇒「已收尾」徽标（仅提示）；缺省 releasedVersions=[] 无锁", () => {
+test("N4-② renderSchedule: 派生列（台账无该版）全终态卡 ⇒ 按阶段判「进行中」，不再出「已收尾」徽标（§9.4 增补九）", () => {
   const cols = groupFeaturesByVersion([
     feature("F1", "v0.9.0", { state: "completed" }),
     feature("F2", "v0.9.0", { state: "cancelled" }),
@@ -482,8 +484,9 @@ test("N4-② renderSchedule: 未锁版全终态且有 completed ⇒「已收尾�
   ]);
   const html = renderSchedule(cols);
   const closedH3 = html.slice(html.indexOf("<h3>v0.9.0"), html.indexOf("</h3>", html.indexOf("<h3>v0.9.0")));
-  assert.match(closedH3, /<span class="kbadge vbadge closed"[^>]*>已收尾<\/span>/);
-  assert.doesNotMatch(closedH3, /locked/, "已收尾不加锁样式（未登记 releasedVersions ⇒ 不锁）");
+  assert.match(closedH3, /<span class="kbadge vbadge wip"[^>]*>进行中<\/span>/, "已确认卡在场 ⇒ 进行中");
+  assert.doesNotMatch(closedH3, /vbadge closed|已收尾/, "派生徽标闭集不再含「已收尾」（收尾与否由台账 released 表达）");
+  assert.doesNotMatch(closedH3, /locked/, "未登记 releasedVersions ⇒ 不加锁样式");
 });
 
 test("N4-③ renderSchedule: 徽标不吞版本号与卡片数（列头判据原样），需求池列无徽标", () => {
@@ -552,9 +555,9 @@ test("M4-⑥ GET /schedule: 200 + 导航「排期」高亮 + 版本列有序；�
   });
 });
 
-test("N2-④ 注入面 = schedule kind 页：`/` 与 `/schedule` 都注入；非看板页不注入（REQ-04：新增需求弹窗脚本同注入面）", async () => {
+test("N2-④ 注入面：`/schedule` = 看板四枚脚本；门户 `/` 只多一枚泛化弹窗脚本（§9.5）；其余页零页面脚本", async () => {
   await withScheduleServer(fakeClient([feature("F1", "v0.9.2"), feature("F3", null)]), async (base) => {
-    for (const path of ["/", "/schedule"]) {
+    for (const path of ["/schedule"]) {
       const text = await (await fetch(`${base}${path}`)).text();
       assert.ok(text.includes(FEATURE_DETAIL_OVERLAY_SCRIPT), `${path} 含浮层脚本`);
       assert.match(text, /<dialog class="fd" id="feat-dialog">/, `${path} 含 dialog 骨架`);
@@ -562,12 +565,20 @@ test("N2-④ 注入面 = schedule kind 页：`/` 与 `/schedule` 都注入；非
       assert.match(text, /<dialog class="fd" id="new-req-dialog">/, `${path} 含新增需求 dialog 骨架`);
       assert.match(text, /<button type="button" id="new-req-open"/, `${path} 页头有「＋ 新增需求」按钮`);
     }
-    for (const path of ["/tasks", "/projects", "/orgs", "/host"]) {
+    for (const path of ["/tasks", "/projects", "/host"]) {
       const text = await (await fetch(`${base}${path}`)).text();
       assert.ok(!text.includes(FEATURE_DETAIL_OVERLAY_SCRIPT), `${path} 不注入浮层脚本`);
       assert.ok(!text.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), `${path} 不注入弹窗脚本`);
     }
-    // 退役页 = 303 回 `/`（跟随后落看板 ⇒ 脚本随首页注入，但重定向本身不渲染正文）
+    // §9.5：门户 = 提交守卫 + 泛化弹窗脚本两枚（建组织 dialog）；看板专属浮层 / 拖拽 / mermaid 三枚仍不跟
+    const portal = await (await fetch(`${base}/`)).text();
+    assert.ok(portal.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), "门户注入泛化弹窗脚本（接 #new-org-dialog）");
+    assert.doesNotMatch(portal, /getElementById\("feat-dialog"\)/, "门户不含浮层脚本");
+    assert.doesNotMatch(portal, /getElementById\("schedule-board"\)/, "门户不含排期拖拽脚本");
+    assert.doesNotMatch(portal, /window\.mermaid\.render\(/, "门户不含 mermaid 渲染脚本");
+    assert.doesNotMatch(portal, /<script[^>]*src=/, "门户无外源脚本（CSP 未动）");
+    assert.equal((portal.match(/<script>/g) ?? []).length, 2, "门户可执行内联脚本 = 提交守卫 + 泛化弹窗脚本两枚");
+    // 退役页 = 303 回 `/`（跟随后落门户；重定向本身不渲染正文）
     const redicted = await fetch(`${base}/requirements`, { redirect: "manual" });
     assert.equal(redicted.status, 303);
     assert.equal(redicted.headers.get("location"), "/");
@@ -612,7 +623,11 @@ test("增补① 锁定说明归属：409 服务端文案完整保留（卡面降
       };
     },
   });
-  const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client });
+  // 空版本台账注入：本用例断的是「排期状态锁」，不得被本机真实台账的已发版锁抢判
+  const lockFree = mkdtempSync(join(tmpdir(), "board-locked-"));
+  const lockFreeFile = join(lockFree, "versions.json");
+  writeFileSync(lockFreeFile, JSON.stringify({ version: 1, versions: [] }, null, 2) + "\n", "utf8");
+  const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client, versionsLedgerFile: lockFreeFile });
   try {
     const base = `http://127.0.0.1:${handle.port}`;
     const cardText = await (await fetch(`${base}/schedule`)).text();
@@ -630,18 +645,31 @@ test("增补① 锁定说明归属：409 服务端文案完整保留（卡面降
     assert.match(text, /主需求 cancel 后从 Step 0 新建[\s\S]*本板不提供解除入口/, "409 错误卡携去处");
   } finally {
     await handle.close();
+    rmSync(lockFree, { recursive: true, force: true });
   }
 });
 
-test("N4-④ HTTP 面：config 登记的已发版版本在 /schedule 列头显示「已发版」；未登记版标「进行中」（增补 ②）", async () => {
+test("N4-④ HTTP 面：版本台账 released 条目在 /schedule 列头显示「已发版」；未登记版标「进行中」（v0.9.4 N3 锁读台账，config releasedVersions 退役）", async () => {
   const client = fakeClient([feature("F1", "v0.9.1"), feature("F2", "v0.9.2")]);
-  const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client, releasedVersions: ["v0.9.1"] });
+  const dir = mkdtempSync(join(tmpdir(), "board-locked-"));
+  const ledgerFile = join(dir, "versions.json");
+  writeFileSync(
+    ledgerFile,
+    JSON.stringify(
+      { version: 1, versions: [{ version: "v0.9.1", status: "released", createdAt: "c", updatedAt: "u", note: null }] },
+      null,
+      2,
+    ) + "\n",
+    "utf8",
+  );
+  const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client, versionsLedgerFile: ledgerFile });
   try {
     const text = await (await fetch(`http://127.0.0.1:${handle.port}/schedule`)).text();
     assert.match(text, /<h3>v0\.9\.1 <span class="kbadge vbadge locked"[^>]*>🔒 已发版<\/span>/);
     assert.match(text, /<h3>v0\.9\.2 <span class="kbadge vbadge wip"[^>]*>进行中<\/span>/, "未登记版列头 = 进行中徽标");
   } finally {
     await handle.close();
+    rmSync(dir, { recursive: true, force: true });
   }
 });
 

@@ -123,6 +123,12 @@ import {
   type HttpTransportHandle,
 } from "./transports/http.js";
 import { startWebTransport, type WebTransportOutcome } from "./transports/web.js";
+// v0.9.4 O1：配置面受控写工具落点（全组面，不吃连接身份）
+import {
+  writeGroupConfig,
+  type ConfigWriteGroupArgs,
+  type ConfigWriteGroupOutcome,
+} from "./config-write.js";
 // 挂载态常量（单一事实源在 register-tools.ts）：index → register-tools 的运行时 import 安全
 // （register-tools 对 index 仅 **type-only** 引用，擦除后无环）
 import { MOUNTABLE_FEATURE_STATES } from "./register-tools.js";
@@ -1922,6 +1928,12 @@ export interface BridgeCore {
    * 纯读、不落库、不触发调度 ⇒ 与其它五口同样**按连接身份做归属校验**（谁建谁见）。
    */
   featureTrace(args: FeatureTraceArgs): FeatureTraceSuccess | FeatureToolFailure;
+  /**
+   * **O1 受控写**（v0.9.4 REQ-2026-09-26-01 §2.3）：`config.json` 的 `projectGroup` 段
+   * 单组操作（五操作闭集；拒绝整文档替换）。**全组面工具**：配置面写**不受**调用方组
+   * 可见性限制（identity=null 运维连接语义，边界 R2 冻结口径）⇒ 装配**不吃身份**。
+   */
+  configWriteGroup(args: ConfigWriteGroupArgs): Promise<ConfigWriteGroupOutcome>;
   /** 工具返回后统一 kick 调度器（Feature 工具组用） */
   kickScheduler(): void;
 }
@@ -1964,6 +1976,9 @@ export function createCore(identity: string | null = null): BridgeCore {
     // 只读面同样按身份做归属校验（他组 Feature 不可见）；无身份 ⇒ 全量放行（与五口同判据）
     featureTrace: (args): FeatureTraceSuccess | FeatureToolFailure =>
       handleFeatureTrace(args, identity),
+    // O1 配置面写：**全组面**，刻意不吃 identity（R2 冻结：配置面写不受组可见性限制）
+    configWriteGroup: (args): Promise<ConfigWriteGroupOutcome> =>
+      writeGroupConfig(MACHINES_CONFIG_PATH, args),
     kickScheduler: (): void => scheduler.kick(),
   };
 }
@@ -2118,8 +2133,11 @@ async function startWebIfEnabled(mode: TransportMode, readiness: RuntimeReadines
       // ⇒ `resolveGroup` 走全组聚合视图）。3300 是**运维全量视图**，**不作为 orch agent 的
       // 身份面**（agent 身份只经 MCP 端点的 URL 路径段 `/<组名>/mcp` 承载，§2.2）；
       // 组不是鉴权边界（`/mcp` 零鉴权，真边界归「安全与治理」）。
-      // `web.ts` 内部零改动：五条路由经 `WebCore = Pick<BridgeCore, …>` 间接转发。
+      // `web.ts` 内部零改动：各条路由经 `WebCore = Pick<BridgeCore, …>` 间接转发
+      // （例外：v0.9.4 O2 `GET /api/groups` 直读 `configPath` 的配置声明面，不经 core）。
       core: createCore(null),
+      // v0.9.4 O2：`GET /api/groups` 数据源路径（每请求现读，热改即时生效）
+      configPath: MACHINES_CONFIG_PATH,
       host: web.host,
       port: web.port,
       version: BRIDGE_VERSION,

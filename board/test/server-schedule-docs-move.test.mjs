@@ -105,8 +105,11 @@ async function withDocsServer(
   client,
   scheduleFeatureImpl,
   run,
-  releasedVersions = [],
 ) {
+  // 空版本台账恒注入：缺省会读开发机真实 `.data/versions.json`，排期写锁随本机状态漂移
+  const ledgerDir = mkdtempSync(join(tmpdir(), "board-locked-"));
+  const ledgerFile = join(ledgerDir, "versions.json");
+  writeFileSync(ledgerFile, JSON.stringify({ version: 1, versions: [] }, null, 2) + "\n", "utf8");
   const handle = await createBoardServer({
     host: "127.0.0.1",
     port: 0,
@@ -114,13 +117,14 @@ async function withDocsServer(
     now: () => NOW,
     defaultGroup: "g",
     docs: { repoRoot, orgsDir: null },
-    releasedVersions,
     scheduleFeatureImpl,
+    versionsLedgerFile: ledgerFile,
   });
   try {
     await run(`http://127.0.0.1:${handle.port}`);
   } finally {
     await handle.close();
+    rmSync(ledgerDir, { recursive: true, force: true });
   }
 }
 

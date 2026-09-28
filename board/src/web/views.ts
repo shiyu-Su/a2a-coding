@@ -39,7 +39,9 @@ import {
 import type { OccupantTurnView } from "../host-turn.js";
 import type { HostStatusEntry, StopBridgeOutcome, TriggerDisposition, TriggerTurnOutcome } from "../host-face.js";
 import { NO_OWNER_GROUP_LABEL } from "../orgs-view.js";
-import type { OrgProjectsOutcome } from "../orgs-view.js";
+import { orgSpaceLink } from "../org-space.js";
+import type { GroupRow, OrgGroupsOutcome, OrgProjectsOutcome } from "../orgs-view.js";
+import { CONFIG_WRITE_GROUP_TOOL, MEMBER_ADD_RESIDENCY_NOTE } from "../group-admin.js";
 import type {
   AgentInflightModel,
   AgentInflightProject,
@@ -47,7 +49,10 @@ import type {
   BridgeIdentityOutcome,
 } from "../agent-view.js";
 import { compareVersionOrder, isUnscheduled, normalizeVersion, sortPoolEntries } from "../version-order.js";
-import { deriveVersionStatus, isVersionLocked } from "../version-status.js";
+import { isVersionLocked } from "../version-status.js";
+import { isConfirmedCard } from "../version-transition.js";
+import { findVersionRecord, type VersionLedgerStatus, type VersionsLedger } from "../versions-ledger.js";
+import { VERSION_ACTION_REMOVE } from "../write-guard.js";
 import { emptyRow, escapeHtml } from "./layout.js";
 import type { ErrorOverlayParams } from "./layout.js";
 
@@ -310,9 +315,13 @@ export function renderDocPage(
  * **组织名进表单（BD11）**：它是身份链 S1 的**来源**（= MCP URL 首段 = 组织目录名），由用户在板上
  * 创建/指定 —— 首次填写某组织名即在板上创建该组织。板级配置只是**可选默认**：配置了则占位提示、
  * 允许留空；未配置则该字段 `required`（服务端另在请求期硬校验，缺 ⇒ 400，**不猜不回落**）。
+ *
+ * **组织空间免选（BD8）**：传 `spaceOrg`（= 路径组织）⇒ 组织字段改**只读展示 + hidden 字段**，
+ * hidden 的 `value` 照常发出（回落链「表单 > 板级默认 ⇒ 皆空 400」不可绕过）；表单 `action`
+ * 带组织前缀 `/org/<名>/requirements`，无 JS 原生 POST 同路命中归一层，服务端 mismatch 409 照执法。
  */
 /**
- * 首页提需求表单旁的**组织目录根（orgsDir）配置状态**（REQ-v0.9.2 N3 · 三档）：
+ * 提需求弹窗旁（`/schedule` 看板与空间页；§9-b 起门户 `/` 另有自己的一行）的**组织目录根（orgsDir）配置状态**（REQ-v0.9.2 N3 · 三档）：
  * - `not_configured` —— 本板进程未装配宿主面（config.json 无 orgsDir，无缺省值）；
  * - `problem` —— 配了但目录此刻不可用（code/message 沿用 `host-face.diagnoseOrgsDir` 闭集）；
  * - `ready` —— 就绪，`orgsDir` 为 configView 的绝对/原样路径。
@@ -326,16 +335,24 @@ export function renderRequirementForm(
   defaultGroup: string | null,
   orgsStatus?: OrgsDirStatus | null,
   releasedVersions: readonly string[] = [],
+  spaceOrg: string | null = null,
 ): string {
+  const space = spaceOrg !== null && spaceOrg.trim() !== "";
   const cfg = (defaultGroup ?? "").trim();
-  const orgHint =
-    cfg === ""
-      ? "组织名 *（必填：本板未配默认组织 · 首次填写即创建该组织）"
-      : `组织名（留空 = 用板级默认 ${cfg}；填写其它名字 = 在板上创建该组织）`;
+  const orgHintHtml = space
+    ? `组织 = <b>${escapeHtml(spaceOrg as string)}</b>（组织空间路径决定，免选；服务端以路径为准，不一致 ⇒ 409 <code>board_org_mismatch</code>）`
+    : escapeHtml(
+        cfg === ""
+          ? "组织名 *（必填：本板未配默认组织 · 首次填写即创建该组织）"
+          : `组织名（留空 = 用板级默认 ${cfg}；填写其它名字 = 在板上创建该组织）`,
+      );
+  const orgField = space
+    ? `<label>组织（免选 · 空间路径决定）<input type="hidden" name="group" value="${escapeHtml(spaceOrg as string)}"><span class="muted"> ${escapeHtml(spaceOrg as string)}</span></label>`
+    : `<label>组织名 ${cfg === "" ? "*" : ""}<input name="group" ${cfg === "" ? "required " : ""}placeholder="如 flow-team"></label>`;
   const versionHint =
     releasedVersions.length === 0
       ? ""
-      : `<p class="hint warn">已发版版本（config <code>releasedVersions</code> 登记）<b>排期锁定</b>：${releasedVersions.map((v) => `<code>${escapeHtml(v)}</code>`).join(" · ")} —— 已发版版本不可排入新需求（服务端 409 拒绝；登记/解锁改 config.json 后重启生效）。字段仍可输入，执法在服务端。</p>`;
+      : `<p class="hint warn">已发版版本（版本台账标记 <code>released</code>）<b>排期锁定</b>：${releasedVersions.map((v) => `<code>${escapeHtml(v)}</code>`).join(" · ")} —— 已发版版本不可排入新需求（服务端 409 拒绝；在板上把版本标记 released / 重开为进行中即实时生效）。字段仍可输入，执法在服务端。</p>`;
   const orgsLine =
     orgsStatus === undefined || orgsStatus === null
       ? ""
@@ -346,14 +363,14 @@ export function renderRequirementForm(
           : `<p class="hint warn"><code>board_orgs_dir_not_configured</code> 组织目录根（orgsDir）未装配：提需求本身不受影响，但触发一轮 / 起宿主桥将结构化 503，请配置 config.json 的 orgsDir 后重启板。</p>`;
   return `<h2>提需求</h2>
 ${orgsLine}
-<p class="hint">建一条需求 = 以<b>表单所填组织名</b>（留空则板级默认）经唯一写封装（<code>requirement.ts</code>）在桥侧建 Feature，落初态 <code>waiting_approval</code>（登记 <code>stage=需求分析</code> · <code>approval=未发起</code>）。板<b>不写状态机</b>：审批 / 推进 / 取消一律归编排 agent。</p>
-<form method="post" action="/requirements" class="w" data-submit="已提交，建需求中…">
-<label>组织名 ${cfg === "" ? "*" : ""}<input name="group" ${cfg === "" ? "required " : ""}placeholder="如 flow-team"></label>
+<p class="hint">建一条需求 = 以<b>${space ? "空间路径组织（免选）" : "表单所填组织名"}</b>${space ? "" : "（留空则板级默认）"}经唯一写封装（<code>requirement.ts</code>）在桥侧建 Feature，落初态 <code>waiting_approval</code>（登记 <code>stage=需求分析</code> · <code>approval=未发起</code>）。板<b>不写状态机</b>：审批 / 推进 / 取消一律归编排 agent。</p>
+<form method="post" action="${space ? escapeHtml(orgSpaceLink(spaceOrg as string) + "requirements") : "/requirements"}" class="w" data-submit="已提交，建需求中…">
+${orgField}
 <label>标题 *<input name="title" required placeholder="需求的简短摘要"></label>
 <label>版本<input name="version" placeholder="如 v0.9.2；留空 = 未排期（进需求池）"></label>
 ${versionHint}
 <label>需求原文<textarea name="requirement" rows="3" placeholder="可选"></textarea></label>
-<p class="hint">${escapeHtml(orgHint)}</p>
+<p class="hint">${orgHintHtml}</p>
 <button type="submit">提交需求</button>
 </form>`;
 }
@@ -369,10 +386,35 @@ export function renderNewRequirementDialog(
   defaultGroup: string | null,
   orgsStatus?: OrgsDirStatus | null,
   releasedVersions: readonly string[] = [],
+  spaceOrg: string | null = null,
 ): string {
   return `<dialog class="fd" id="new-req-dialog">
 <button type="button" id="new-req-close">关闭</button>
-<div class="fd-body">${renderRequirementForm(defaultGroup, orgsStatus, releasedVersions)}</div>
+<div class="fd-body">${renderRequirementForm(defaultGroup, orgsStatus, releasedVersions, spaceOrg)}</div>
+</dialog>`;
+}
+
+/**
+ * **新增版本弹窗骨架**（v0.9.4 增补八 §9.3 · REQ-2026-09-28-02）：`/schedule` 页注入的
+ * `<dialog id="new-version-dialog">`，与 {@link renderNewRequirementDialog} **同款结构**
+ * （`dialog.fd` + 首枚「关闭」按钮 + `.fd-body` 内表单）；开/关与 fetch 提交由
+ * `layout.NEW_REQUIREMENT_DIALOG_SCRIPT` 的 `wire()` 承载（闭集六元不扩、CSP 不动）。
+ * 表单 = SSR 原生可提交（无 JS 回落整页 PRG）：`POST /versions` 隐藏字段 `action=create`
+ * 分流 —— **服务端写口与闸零改动**；semver 收口（`x.y.z`）执法在服务端，字段仍可输入。
+ * 复用 `dialog.fd` 样式类 ⇒ 4xx 错误卡叠加规则（`dialog.fd > .err-ov-card`）同款生效。
+ * 骨架只嵌字面量（placeholder 文案，无用户数据）⇒ 无注入面。
+ * **仅全局排期页渲染**：入口按钮 `#new-version-open` 只在全局页头（空间页无 ⇒ 弹窗不渲染）。
+ */
+export function renderNewVersionDialog(): string {
+  return `<dialog class="fd" id="new-version-dialog">
+<button type="button" id="new-version-close">关闭</button>
+<div class="fd-body"><h2>新版本</h2>
+<p class="hint">在版本台账（<code>.data/versions.json</code>）登记一个空版本 ⇒ 看板出现新列；初态 <code>notstart</code>，首张卡过确认门后自动转 <code>active</code>。</p>
+<form method="post" action="/versions" class="w" data-submit="已提交，建版本中…" data-ov="1">
+<input type="hidden" name="action" value="create">
+<label>版本号 *<input name="version" required placeholder="如 v0.10.0（x.y.z，可带 v 前缀）"></label>
+<button type="submit">创建版本</button>
+</form></div>
 </dialog>`;
 }
 
@@ -393,8 +435,8 @@ export function renderScheduleForm(
   const current = (version ?? "").trim();
   const currentLocked = isVersionLocked(current, releasedVersions);
   const lockHint = currentLocked
-    ? `<p class="hint warn">本需求现排期版本 <code>${escapeHtml(current)}</code> <b>已发版（🔒 锁定）</b>：不可移出、取消排期或改入其它版本（服务端 409 拒绝；同版本无变化提交放行）。登记/解锁改 config.json 的 <code>releasedVersions</code> 后重启生效。</p>`
-    : `<p class="hint">已发版版本（config <code>releasedVersions</code> 登记 = 列头标 🔒 已发版）不可改入 / 移出（服务端 409 执法）；字段仍可输入，执法在服务端。</p>`;
+    ? `<p class="hint warn">本需求现排期版本 <code>${escapeHtml(current)}</code> <b>已发版（🔒 锁定）</b>：不可移出、取消排期或改入其它版本（服务端 409 拒绝；同版本无变化提交放行）。在版本台账把该版重开为进行中即实时生效。</p>`
+    : `<p class="hint">已发版版本（版本台账标记 <code>released</code> = 列头标 🔒 已发版）不可改入 / 移出（服务端 409 执法）；字段仍可输入，执法在服务端。</p>`;
   return `<h2>排期</h2>
 <p class="hint">排期写 = 板唯一放开的登记字段写（经 <code>feature-schedule.ts</code> 走 advance「<code>to</code> = 当前态 ∧ 仅 <code>version</code>」特例，<b>不写状态机迁移</b>）；留空提交 = 删除排期（回需求池）。改版前先看「阶段产出」区的失联警示。</p>
 ${lockHint}
@@ -490,13 +532,15 @@ export function renderFeatureDetail(
 // 任务视图（复用 GET /api/tasks，project 必填）
 // ---------------------------------------------------------------------------
 
-export function renderTasksPick(projects: ProjectsView | null, pickError: string | null): string {
+export function renderTasksPick(projects: ProjectsView | null, pickError: string | null, org: string | null = null): string {
+  // D 档/BD6：空间内（org 非 null）选单与表单落 `/org/<名>/tasks`（链接仍指全局深链口径）
+  const tasksBase = org === null ? "/tasks" : orgSpaceLink(org, "tasks");
   const list =
     projects !== null
       ? projects.machines
           .flatMap((m) => m.projects.map((p) => p.projectId))
           .sort()
-          .map((pid) => `<li><a class="fl" href="/tasks?project=${encodeURIComponent(pid)}">${escapeHtml(pid)}</a></li>`)
+          .map((pid) => `<li><a class="fl" href="${escapeHtml(tasksBase)}?project=${encodeURIComponent(pid)}">${escapeHtml(pid)}</a></li>`)
           .join("")
       : "";
   const hint =
@@ -509,7 +553,7 @@ export function renderTasksPick(projects: ProjectsView | null, pickError: string
   return `<h2>任务视图</h2>
 ${hint}
 <p class="hint">桥 <code>GET /api/tasks</code> 以 <code>project</code> 为必填参数 ⇒ 先选/输项目；<code>state</code>/<code>limit</code> 经桥服务端过滤（REQ-v0.9.2 N4）。</p>
-<form method="get" action="/tasks">
+<form method="get" action="${escapeHtml(tasksBase)}">
 <label>projectId <input name="project" placeholder="项目 id"></label>
 <label>状态 <select name="state">${stateSelect}</select></label>
 <label>limit <input name="limit" type="number" min="1" step="1" placeholder="不限"></label>
@@ -518,7 +562,7 @@ ${hint}
 ${list === "" ? "" : `<p class="hint">当前快照中的项目：</p><ul>${list}</ul>`}`;
 }
 
-export function renderTasks(view: ProjectTasksView, filter: { state?: string; limit?: number } = {}): string {
+export function renderTasks(view: ProjectTasksView, filter: { state?: string; limit?: number } = {}, org: string | null = null): string {
   const rows = view.tasks.map((t) => {
     return (
       "<tr>" +
@@ -543,7 +587,7 @@ export function renderTasks(view: ProjectTasksView, filter: { state?: string; li
             .join(" · "),
         )}</span> <span class="muted">（桥服务端过滤）</span>`;
   return `<h2>任务 · 项目 <span class="mono">${escapeHtml(view.projectId)}</span></h2>
-<p class="hint"><a class="fl" href="/tasks">换项目</a> · 共 ${view.tasks.length} 条${filterNote}</p>
+<p class="hint"><a class="fl" href="${escapeHtml(org === null ? "/tasks" : orgSpaceLink(org, "tasks"))}">换项目</a> · 共 ${view.tasks.length} 条${filterNote}</p>
 ${reach}
 <table><thead><tr><th>taskId</th><th>contextId</th><th>状态</th><th>stale</th><th>更新</th><th>prompt 摘要</th></tr></thead>
 <tbody>${rows.length === 0 ? emptyRow(6, "（无任务）") : rows.join("")}</tbody></table>
@@ -728,34 +772,25 @@ ${sections === "" ? `<p class="hint">（各项目当前均无在飞任务；查�
 }
 
 // ---------------------------------------------------------------------------
-// 组织视角页（REQ-v0.9.2 N6 · 只读）
+// 组织空间管理页（v0.9.4 §9-c · REQ-2026-09-27-06 N3：`/orgs` 页退役后的承接位）
 // ---------------------------------------------------------------------------
 
-/** 组织视角页的一行 = 一个组织（归并后的清单 + 逐组查询结果 + 该组需求）。 */
-export interface OrgsRow {
+/**
+ * `GET /org/<名>/manage` 的入参（**一页一组织**，故不再有「逐组织行」的表结构）。
+ * 三块数据各自的缺席口径见 {@link renderOrgSpaceManagePage}。
+ */
+export interface OrgSpaceManageInput {
   org: string;
-  /** 伪分组（无归属）不进组织清单、只进需求表：其项目查询面恒 `null`。 */
-  pseudo: boolean;
-  /** 逐组 `a2a_projects` 结果；`null` = 未查询（伪分组 / 查询器未装配）。 */
+  /** 本组织的需求投影（归一层已持有，`ownerGroup` 精确匹配，零新触桥面）。 */
+  features: readonly FeatureListItem[];
+  /** 本组运行态项目（只读 `a2a_projects`）；`null` = 查询器未装配 ⇒ 如实标「未查询」。 */
   projectsOutcome: OrgProjectsOutcome | null;
-  features: FeatureListItem[];
-}
-
-export interface OrgsPageInput {
-  rows: OrgsRow[];
-  /** 组织目录根（`<orgsDir>`）；`null` = 未配置 ⇒ 磁盘枚举源缺席，页上如实标注。 */
-  orgsDir: string | null;
-  /** 组织目录根不可用结论（沿用 host-face 闭集）；可用 / 未配置 ⇒ null。 */
-  orgsDirProblem?: { code: string; message: string } | null;
-  /** 查询器未装配时的说明（如页级降级），null ⇒ 正常逐组查询。 */
-  queryDisabledNote?: string | null;
-}
-
-/** 逐组查询状态单元格：ok = 正常；fail = 「不可达」+ 结构化错误码（灰化行，不炸页）。 */
-function orgProjectsStatusCell(outcome: OrgProjectsOutcome | null): string {
-  if (outcome === null) return '<td class="muted">未查询</td>';
-  if (outcome.ok) return "<td>可达</td>";
-  return `<td class="muted">不可达 <span class="mono">${escapeHtml(outcome.code)}</span></td>`;
+  /**
+   * 全组枚举结论（3300 只读 `GET <3300>/api/groups`，组结构**声明面** = 本组成员清单的事实源）。
+   * `null` = 查询器未装配 ⇒ 标「未查询」；`ok=false` = 3300 宕机 / 配置坏 ⇒ 成员区**灰化**，
+   * **本页其余照常渲染**（宕机不得阻断管理页）。与逐组 `a2a_projects`（运行态）**并存、不替代**。
+   */
+  groupsOutcome: OrgGroupsOutcome | null;
 }
 
 function renderOrgFeaturesTable(features: readonly FeatureListItem[]): string {
@@ -779,7 +814,7 @@ function renderOrgFeaturesTable(features: readonly FeatureListItem[]): string {
 
 function renderOrgProjectsTable(outcome: OrgProjectsOutcome | null): string {
   if (outcome === null) {
-    return `<h3>项目</h3><p class="hint muted">（本组不查询项目：无归属需求不构成组织连接身份）</p>`;
+    return `<h3>项目</h3><p class="hint muted"><b>未查询</b>：项目查询器未装配 ⇒ 本区不查询任何组织的项目（不编造「无项目」）。</p>`;
   }
   if (!outcome.ok) {
     return `<h3>项目</h3><p class="hint warn">不可达（<code>${escapeHtml(outcome.code)}</code>）：${escapeHtml(outcome.error)} —— 项目清单未知（灰化不炸页；刷新本页重查）。</p>`;
@@ -803,53 +838,270 @@ function renderOrgProjectsTable(outcome: OrgProjectsOutcome | null): string {
 }
 
 /**
- * `GET /orgs` 组织视角页（N6 · 纯函数）：总表一行一组织（可达性 / 项目数 / 需求数），
- * 其下逐组织小节 = 需求表 ∪ 项目表。「（无归属）」伪分组如实呈现（不丢弃、不回落板级默认组）；
- * 不可达组织灰化（`.muted` + 「不可达」+ 错误码），其余组织照常。
+ * `POST /orgs` 建组织表单（v0.9.4 A5/BD2 · 纯 SSR，零新脚本常量）：
+ * 同源提交（CSRF 防线 = 同源 Origin 档，与提需求表单同规格）；名字校验闭集的服务端
+ * 单一事实源 = `write-guard.validateOrgName`，此处 hint 只做人读口径复述；
+ * 写失败经既有 errorPage/错误浮层回填原输入（`orgBackfillFields`），成功 = 303 回 `/orgs`（PRG；
+ * §9-c 起 `/orgs` 本身是「退役 ⇒ 303 回门户」的一跳，浏览器跟随两跳落回 `/`，**写口 `Location` 不改**）。
+ * **A3（BD3）**：对**已停用**的同名组织，本表单即「同名重建 = 复活」（零迁移，三源查重豁免停用名）。
+ * **§9-b 起唯一宿主 = 组织门户 `/`**；**§9-c 起 `/orgs` 页整页退役**（管理职能迁 `/org/<名>/manage`）。
+ * **增补二 §9.1-②**：`data-ov="1"` ⇒ 提交守卫改 fetch 提交 + `.err-ov-card` 浮层报错（不跳错误页，
+ * 成功 reload）；无 JS / 脚本失效 = 原生 PRG 整页回显，回退面不劣化、不扩内联脚本闭集。
  */
-export function renderOrgsPage(input: OrgsPageInput): string {
-  const dirLine =
-    input.orgsDir === null
-      ? `<p class="hint warn"><code>board_orgs_dir_not_configured</code> 组织目录根（orgsDir）未配置 ⇒ 磁盘枚举源缺席，组织清单 = 板托管台账 ∪ 板级默认 ∪ 需求归属三源归并。</p>`
-      : input.orgsDirProblem
-        ? `<p class="hint err"><code>${escapeHtml(input.orgsDirProblem.code)}</code> ${escapeHtml(input.orgsDirProblem.message)}</p>`
-        : `<p class="hint">组织目录根：<code>${escapeHtml(input.orgsDir)}</code>（磁盘枚举 ∪ 板托管台账 ∪ 板级默认 ∪ 需求归属，四源归并）</p>`;
-  const disabled =
-    input.queryDisabledNote === undefined || input.queryDisabledNote === null
-      ? ""
-      : `<p class="hint warn">${escapeHtml(input.queryDisabledNote)}</p>`;
-  const summaryRows = input.rows.map((r) => {
-    const outcome = r.projectsOutcome;
-    const projCell =
-      outcome === null
-        ? '<td class="muted">—</td>'
-        : outcome.ok
-          ? `<td>${String(outcome.projects.length)}</td>`
-          : `<td class="muted">未知</td>`;
+export function renderCreateOrgForm(): string {
+  return `<h3>建组织</h3>
+<p class="hint">写板侧组织台账 <code>.data/orgs.json</code>（纯新建 · <b>不触桥、不写状态机、不写 machine 配置</b>）；名称闭集 = 中文 / 字母（Latin）/ 数字 / <code>-</code> <code>_</code> <code>.</code>，禁空格与 <code>#</code> <code>?</code> <code>%</code> <code>/</code>（服务端 <code>validateOrgName</code> 单一事实源）；与<b>磁盘一级目录 / 在用台账 / 需求归属</b>三源重名 ⇒ 409 拒绝（<b>已停用</b>名不判重，同名提交即复活）。</p>
+<form method="post" action="/orgs" class="w" data-submit="已提交，建组织中…" data-ov="1">
+<label>组织名 *<input name="org" required placeholder="如 flow-team"></label>
+<button type="submit">建组织</button>
+</form>`;
+}
+
+/**
+ * `POST /orgs` 建组织**弹窗骨架**（v0.9.4 增补六 §9.5 · 纯 SSR，零新脚本常量）：
+ * 门户页 `/` 页头「＋ 建组织」按钮（{@link renderOrgPortal} 宿主页的 `headerActions`，**无 JS 时服务端
+ * 即以 `hidden` 隐藏**）点击后由 `layout.NEW_REQUIREMENT_DIALOG_SCRIPT`（已泛化为**两枚 dialog 共用**
+ * 开/关逻辑）`showModal()` 打开本骨架；表单区 = {@link renderCreateOrgForm} 原样复用
+ * （字段 / 校验 / `action="POST /orgs"` **零变化**）。
+ * **无 JS 回退**（渐进增强）：门户正文仍保留内联表单 `#new-org-inline`，脚本可用时把它隐藏；
+ * 本 dialog 关闭态不渲染 ⇒ 无 JS 用户照常走内联表单原生 POST。
+ * 复用 `dialog.fd` 样式类 ⇒ 4xx 错误卡叠加规则（`dialog.fd > .err-ov-card`）同款生效。
+ */
+export function renderCreateOrgDialog(): string {
+  return `<dialog class="fd" id="new-org-dialog">
+<button type="button" id="new-org-close">关闭</button>
+<div class="fd-body">${renderCreateOrgForm()}</div>
+</dialog>`;
+}
+
+/**
+ * 逐组织的「停用」操作表单（v0.9.4 A3 · BD3 · 纯 SSR，零新脚本常量）：提交到**同一条** `POST /orgs`，
+ * 靠隐藏字段 <code>action=disable</code> 分流（写路由白名单不扩条）。删除语义 = <b>台账标记停用</b>，
+ * <b>不物理删目录、不隐式连带停桥</b>：名下仍有活跃宿主桥时服务端 409 拒绝并引导「先逐桥 stop 再删」。
+ * 恢复 = 用同名再走一次建组织（复活，零迁移）。`org` 值经 `escapeHtml`（盘 / 需求归属源可能含任意字符）。
+ * **增补二 §9.1-②**：`data-ov="1"` ⇒ 浮层报错不跳页（同建组织表单）。
+ * **增补五 §9.4-②**：`data-ov-redirect="/"` ⇒ 停用成功后 `ovSubmit` 跳组织门户 `/`，
+ * 而非 reload 当前空间页（该组织刚被停用，刷新必落 410）；与服务端 303 落点同口径。
+ */
+function renderDisableOrgForm(org: string): string {
+  return `<form method="post" action="/orgs" class="inline" data-submit="已提交，停用中…" data-ov="1" data-ov-redirect="/">
+<input type="hidden" name="action" value="disable">
+<input type="hidden" name="org" value="${escapeHtml(org)}">
+<button type="submit">停用</button>
+</form>`;
+}
+
+/**
+ * 逐组织的**成员写表单**（v0.9.4 B 档 · BD4 · 纯 SSR，零新脚本常量）：增 / 删各一枚，
+ * 都提交到**同一条**路由 `POST /orgs/{org}/members`，靠隐藏字段 <code>action</code> 分流
+ * （与 A 档 `POST /orgs` 的 create/disable 同款口径）。落点是 **orch 的 `projectGroup` 段**
+ * （经板第三个 MCP 写封装 `group-admin.ts` → O1 受控写工具），**不是板台账、不是 machine 配置**。
+ * `machineId` 是否合法**不在板上判**（判据唯一在桥的 dry-run，二处立规则必漂移）。
+ * **增补二 §9.1**：删成员的「末位不可删」由板写前闸业务化拒绝（`board_last_member_remove`）；
+ * `data-ov="1"` ⇒ 两枚表单浮层报错不跳页（无 JS = 原生 PRG 不劣化）。
+ */
+function renderMemberForms(org: string): string {
+  const action = escapeHtml(`/orgs/${encodeURIComponent(org)}/members`);
+  const pairFields = `<label>machineId *<input name="machineId" required placeholder="如 win-a"></label>
+<label>projectId *<input name="projectId" required placeholder="如 board"></label>`;
+  return `<h3>成员（项目组台账）</h3>
+<p class="hint">写 <b>orch <code>config.json</code> 的 <code>projectGroup</code> 段</b>（唯一通路 = 受控写工具 <code>${CONFIG_WRITE_GROUP_TOOL}</code>，<b>板不直写该文件、桥不可达也不降级本地直写</b>）；成员项 = <code>{machineId, projectId}</code> 对（可参考本页下方项目表）。写后<b>热生效</b>（无需重启桥）；<b>新增</b> project 若目标机尚未登记，仍须<b>人工重启该机 Launcher</b>。</p>
+<form method="post" action="${action}" class="w" data-submit="已提交，加成员中…" data-ov="1">
+<input type="hidden" name="action" value="add">
+${pairFields}
+<button type="submit">加成员</button>
+</form>
+<form method="post" action="${action}" class="w" data-submit="已提交，删成员中…" data-ov="1">
+<input type="hidden" name="action" value="remove">
+${pairFields}
+<button type="submit">删成员</button>
+</form>`;
+}
+
+/** {@link renderMemberWriteCard} 的入参（成员写成功回执，表单档整页顶部卡片）。 */
+export interface MemberWriteCardInput {
+  org: string;
+  action: "add" | "remove";
+  machineId: string;
+  projectId: string;
+  /** false = 幂等零写入（删本不在组内的成员），此时无备份文件。 */
+  changed: boolean;
+  /** 操作后该组声明态成员；桥未回列 ⇒ null（不臆造清单）。 */
+  members: readonly { machineId: string; projectId: string }[] | null;
+  /** 本次实际写入前的备份路径（**仅展示，板不解析**）。 */
+  backedUpTo: string | null;
+  /** 是否消费了并发冲突那唯一一次自动重读重试。 */
+  retriedOnce: boolean;
+}
+
+/**
+ * 成员写成功卡（v0.9.4 B 档 · BD4）：表单档成功回执**有内容**（备份路径 + 驻留引导），
+ * 故出整页而非 303（口径同 REQ-v0.9.2 N7「有内容回执的档仍出整页」）。
+ */
+export function renderMemberWriteCard(input: MemberWriteCardInput): string {
+  const verb = input.action === "add" ? "加入" : "移出";
+  const rows =
+    input.members === null
+      ? '<p class="hint muted">（桥未回列操作后的成员清单 ⇒ 不臆造；刷新本页重查）</p>'
+      : `<p class="hint">该组现有成员 ${String(input.members.length)} 项：` +
+        (input.members.length === 0
+          ? "<i>（空组）</i>"
+          : input.members
+              .map((m) => `<code>${escapeHtml(m.machineId)}/${escapeHtml(m.projectId)}</code>`)
+              .join(" · ")) +
+        "</p>";
+  return `<h2>成员写成功</h2>
+<p>组织 <code>${escapeHtml(input.org)}</code>：成员 <code>${escapeHtml(input.machineId)}/${escapeHtml(input.projectId)}</code> 已${verb}。<b>${input.changed ? "已写入" : "零写入（幂等：该成员本不在组内）"}</b>${input.retriedOnce ? " · 曾遇并发冲突，已自动重读重试一次" : ""}</p>
+${rows}
+<p class="hint">备份：<code>${escapeHtml(input.backedUpTo ?? "—（本次未产生写入，无备份文件）")}</code>（桥写前自动备份，板只展示不解析）</p>
+${input.action === "add" ? `<p class="hint warn">${escapeHtml(MEMBER_ADD_RESIDENCY_NOTE)}</p>` : ""}`;
+}
+
+/**
+ * 本组的**声明态成员清单**（v0.9.4 C 档/BD5 数据 + §9-c 承接位）：取自 3300 全组枚举
+ * `GET <3300>/api/groups` 的只读投影（**声明面** = orch `config.json` 的 `projectGroup` 段，
+ * 与运行态逐组 `a2a_projects` 语义不同、刻意并存不替代）。
+ * 四档如实降级：查询器未装配 ⇒「未查询」；3300 宕机 / 配置坏 ⇒「组数据不可用」整块灰化
+ * （**不阻断本页其余渲染**）；声明面无该组 ⇒「未声明」（盘 / 台账 / 需求归属源可先于 orch 组存在，不是错误）；
+ * `warnings[]` 只作小字呈现，**不参与任何判定逻辑**。
+ */
+function renderOrgMemberSection(org: string, outcome: OrgGroupsOutcome | null): string {
+  const head = `<h3>成员（声明态 · <code>GET /api/groups</code> 该组投影）</h3>`;
+  if (outcome === null) {
+    return `${head}<p class="hint muted">全组枚举查询器未装配 ⇒ 本区不呈现声明数据（不编造「无成员」）。</p>`;
+  }
+  if (!outcome.ok) {
+    return `${head}<p class="hint warn muted"><b>组数据不可用</b>（<code>${escapeHtml(outcome.code)}</code>）：${escapeHtml(outcome.error)} —— 3300 聚合面查询失败 ⇒ 本区整块灰化，<b>本页其余部分照常渲染</b>（刷新本页重查）。</p>`;
+  }
+  const row = outcome.groups.find((g) => g.name === org);
+  if (row === undefined) {
+    return `${head}<p class="hint muted"><b>未声明</b>：orch 的 <code>projectGroup</code> 段尚无名为 <code>${escapeHtml(org)}</code> 的组 —— 盘目录 / 板台账 / 需求归属可以先于组存在，不是错误；下方「加成员」首次写入即建组带首成员（一次写入）。</p>`;
+  }
+  const rows = row.members.map((m) => {
     return (
-      `<tr${r.pseudo || (outcome !== null && !outcome.ok) ? ' class="muted"' : ""}>` +
-      `<td>${escapeHtml(r.org)}${r.pseudo ? ' <span class="muted">（伪分组）</span>' : ""}</td>` +
-      (r.pseudo ? '<td class="muted">不适用</td>' : orgProjectsStatusCell(outcome)) +
-      projCell +
-      `<td>${String(r.features.length)}</td>` +
+      "<tr>" +
+      `<td>${escapeHtml(m.machineId)}</td>` +
+      `<td>${escapeHtml(m.projectId)}</td>` +
       "</tr>"
     );
   });
-  const sections = input.rows
-    .map((r) => {
-      const warn = r.projectsOutcome !== null && !r.projectsOutcome.ok;
-      return `<h2${warn ? ' class="muted"' : ""}>${escapeHtml(r.org)}${warn ? " · 不可达" : ""}</h2>
-${renderOrgFeaturesTable(r.features)}
-${renderOrgProjectsTable(r.projectsOutcome)}`;
-    })
-    .join("\n");
-  return `<h2>组织视角</h2>
-${dirLine}
-${disabled}
-<p class="hint">数据 = 需求列表 <code>ownerGroup</code> 板内存归并 + 逐组织以<b>组身份</b>只读查询 <code>a2a_projects</code>（单组超时即降级为「不可达」，不缓存、不落新存储；项目清单沿用快照口径，无「实时在线」语义）。文档入口 = 需求详情链（阶段产出在详情页呈现）。</p>
-<table><thead><tr><th>组织</th><th>项目查询</th><th>项目数</th><th>需求数</th></tr></thead>
-<tbody>${summaryRows.length === 0 ? emptyRow(4, "（无任何组织：盘 / 台账 / 默认 / 需求归属四源皆空）") : summaryRows.join("")}</tbody></table>
-${sections}`;
+  const observed = outcome.observedAt === null ? "" : ` <span class="muted">（观测时刻 ${escapeHtml(outcome.observedAt)}）</span>`;
+  const warnings =
+    outcome.warnings.length === 0
+      ? ""
+      : `<p class="hint muted">配置瑕疵文案（桥 warn-once 快照，<b>仅供呈现、不参与任何判定</b>）：</p><ul class="hint muted">${outcome.warnings
+          .map((w) => `<li>${escapeHtml(w)}</li>`)
+          .join("")}</ul>`;
+  return `${head}
+${observed}
+<p class="hint">该组声明成员 ${String(row.memberCount)} 项。</p>
+<table><thead><tr><th>machineId</th><th>projectId</th></tr></thead>
+<tbody>${rows.length === 0 ? emptyRow(2, "（无成员：该组已声明但成员清单为空）") : rows.join("")}</tbody></table>
+${warnings}`;
+}
+
+/**
+ * `GET /org/<名>/manage` **空间内管理页**（v0.9.4 §9-c · REQ-2026-09-27-06 N3）：
+ * `/orgs` 组织管理页退役后，逐组织的管理职能落到该组织空间内（复用归一层上下文：
+ * 组织不存在 404 / **已停用 410** 同 `org-space.resolveOrgSpaceRoute` 口径，本页只在「在用」组织上渲染）。
+ * 页内四块（**全部复用既有写口，服务端零改动**）：
+ * - **成员区**（声明态清单，取自 3300 全组枚举）+ 增 / 删表单 → `POST /orgs/{org}/members`（隐藏 `action`）；
+ * - **停用操作** → `POST /orgs`（隐藏 `action=disable`，同写口分流；台账标记不物理删目录，恢复 = 同名重建）；
+ * - **需求表** = 归一层已持有的该组需求投影（零新触桥面）；
+ * - **项目表** = 逐组只读 `a2a_projects`（运行态，与声明态成员并存）。
+ * **纯 SSR**：不挂任何可执行内联脚本（内联脚本闭集六元不动，纪律锚 N3-⑦/⑧）。
+ */
+export function renderOrgSpaceManagePage(input: OrgSpaceManageInput): string {
+  return `<h2>管理 · ${escapeHtml(input.org)}</h2>
+<p class="hint">本页 = <b>${escapeHtml(input.org)}</b> 组织空间内的管理面（§9-c：<code>/orgs</code> 页退役，管理职能随组织走）。写口全部复用既有端点（<code>POST /orgs/{org}/members</code> 成员增删 · <code>POST /orgs</code> 停用），服务端零改动。建组织在<b>组织门户 <code>/</code></b>。</p>
+${renderOrgMemberSection(input.org, input.groupsOutcome)}
+${renderMemberForms(input.org)}
+<h3>停用本组织</h3>
+<p class="hint">「停用」= 板台账标记 <b>+ 同步摘除该项目组在编排配置中的成员登记</b>（项目不再归属任何组织、可被其它组织接管；<b>不物理删目录、不隐式连带停桥</b>）：名下仍有活跃宿主桥 ⇒ <b>409 先停桥</b>（须先逐桥 stop）；成员登记摘除失败 ⇒ 停用整体失败（不留半态）。停用后本空间不再可达（410）、不可提新需求、不再起桥；恢复 = 到门户用<b>同名</b>再建一次（复活，零迁移）。</p>
+${renderDisableOrgForm(input.org)}
+${renderOrgFeaturesTable(input.features)}
+${renderOrgProjectsTable(input.projectsOutcome)}`;
+}
+
+// ---------------------------------------------------------------------------
+// 组织门户（v0.9.4 §9-b · 首页形态 B→A · 纯 SSR 零脚本）
+// ---------------------------------------------------------------------------
+
+/** 门户的一张组织卡（计数摘要 = `getFeatures()` 既有数据派生，**零新触桥面**）。 */
+export interface OrgPortalCard {
+  org: string;
+  /** 排期中 = 该组织名下 `version` 非空的需求数（判据与需求池互补，单一事实源 {@link isUnscheduled}）。 */
+  scheduled: number;
+  /** 需求 = 该组织名下需求总数。 */
+  features: number;
+  /** 任务 = 该组织名下各需求 `taskCount` 之和；有需求但无一携带 taskCount ⇒ `null`（不臆造 0）。 */
+  tasks: number | null;
+}
+
+/**
+ * 门户卡数据（纯函数）：给定组织清单 × 需求列表 ⇒ 逐组织计数。
+ * 归属匹配 = `ownerGroup` trim 后精确相等（口径同 `orgs-view.featuresOfOrg`）；
+ * 清单外的需求（无归属 / 盘遗留组织）不进任何卡，不丢弃判据也不反查扩清单。
+ */
+export function buildOrgPortalCards(
+  orgs: readonly string[],
+  features: readonly FeatureListItem[],
+): OrgPortalCard[] {
+  const tally = new Map<string, { scheduled: number; total: number; tasks: number | null }>();
+  for (const f of features) {
+    const owner = (f.ownerGroup ?? "").trim();
+    if (owner === "") continue;
+    let cell = tally.get(owner);
+    if (cell === undefined) {
+      cell = { scheduled: 0, total: 0, tasks: null };
+      tally.set(owner, cell);
+    }
+    cell.total += 1;
+    if (!isUnscheduled(f.version)) cell.scheduled += 1;
+    if (f.taskCount !== null) cell.tasks = (cell.tasks ?? 0) + f.taskCount;
+  }
+  return orgs.map((org) => {
+    const cell = tally.get(org);
+    return { org, scheduled: cell?.scheduled ?? 0, features: cell?.total ?? 0, tasks: cell?.tasks ?? null };
+  });
+}
+
+/**
+ * `GET /` 组织门户（§9-b · 用户实测后推翻 B 案的首页形态）：
+ * 一行一组织的卡（复用看板 `.kanban` / `.kcol` 样式，无新 CSS 类）+ 计数摘要 +
+ * 点卡头进空间 `/org/<名>/`；建组织 = **页头按钮 + 弹窗**（§9.5）：本视图渲染 `#new-org-inline`
+ * 内联回退表单（无 JS 用）+ {@link renderCreateOrgDialog} 骨架（JS 用），按钮由宿主页 `headerActions` 给。
+ * **零外源脚本**：本视图自身不挂可执行内联脚本；页头按钮的开/关由**已泛化**的
+ * `NEW_REQUIREMENT_DIALOG_SCRIPT`（页面脚本闭集**六元**内既有常量，非新增第七枚）随宿主页注入承载。
+ */
+export function renderOrgPortal(cards: readonly OrgPortalCard[], orgsStatus?: OrgsDirStatus | null): string {
+  const orgsLine =
+    cards.length === 0
+      ? `<p class="hint">（暂无组织：台账与需求归属两源皆空 —— 先用下方「建组织」建一个，或直接到<code>/schedule</code> 提未排期需求）</p>`
+      : `<div class="kanban" id="org-portal">
+${cards
+  .map(
+    (c) => `<div class="kcol">
+<h3><a class="fl" href="${escapeHtml(orgSpaceLink(c.org))}">${escapeHtml(c.org)}</a></h3>
+<p class="kmeta">排期中 ${String(c.scheduled)} · 需求 ${String(c.features)} · 任务 ${c.tasks === null ? "—" : String(c.tasks)}</p>
+</div>`,
+  )
+  .join("\n")}
+</div>`;
+  const statusLine =
+    orgsStatus === undefined || orgsStatus === null
+      ? ""
+      : orgsStatus.tier === "ready"
+        ? `<p class="hint">组织目录根（orgsDir）<b>就绪</b>：<code>${escapeHtml(orgsStatus.orgsDir)}</code></p>`
+        : orgsStatus.tier === "problem"
+          ? `<p class="hint err"><code>${escapeHtml(orgsStatus.code)}</code> 组织目录根已配置但不可用：${escapeHtml(orgsStatus.message)}</p>`
+          : `<p class="hint warn"><code>board_orgs_dir_not_configured</code> 组织目录根（orgsDir）未装配：门户照常展示，但<b>建组织 / 触发一轮 / 起宿主桥</b>将结构化 503，请配置 config.json 的 orgsDir 后重启板。</p>`;
+  return `<h2>组织门户</h2>
+<p class="hint">一页一入口：点组织名进<b>该组织的空间</b>（<code>/org/&lt;名&gt;/</code> 排期 / 需求 / 任务）；全局排期看板在 <code>/schedule</code>（提需求与拖拽排期都在那一页）。口径 = <b>台账未停用 ∪ 需求归属（ownerGroup）</b>（与顶栏切换器同一纯函数 <code>portalOrgNames</code>）—— 盘遗留目录与外机组不进门户。计数为需求列表 <code>getFeatures()</code> 板内存派生（排期中 = <code>version</code> 非空 · 需求 = 名下总数 · 任务 = 各需求 <code>taskCount</code> 之和，「—」= 列表未带任务数），无新桥接口、零缓存。</p>
+${statusLine}
+${orgsLine}
+<div id="new-org-inline">${renderCreateOrgForm()}</div>
+${renderCreateOrgDialog()}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -867,8 +1119,16 @@ export interface ScheduleColumn {
  * 需求列表 → 版本列（纯函数）：未排期（`trim() === ""` 单一判据，含 null）直接滤除；
  * 列序 = `version-order.ts` 比较器（semver 数值序、非 `x.y.z` 字典序垫底）；
  * 列内保持入参顺序（不做列内二次排序 —— 抖动排序键会让卡片跳位）。
+ *
+ * **并集（REQ-2026-09-27-05 §2.2 N2）**：列 = **台账条目 ∪ 需求卡派生** ——
+ * 台账独有版本（尚无卡的「空列」= 新版本入口的落点）与卡独有版本（台账无登记的**历史脏列**）
+ * **都保留显示**；同名去重并作一列（交集）。本函数**纯读、零写**（台账只贡献版本名、不携状态，
+ * `notstart → active` 惰性转换在渲染前由 `server.ts` 的 `syncAutoVersionTransitions` 完成）⇒ 读面不突变。
  */
-export function groupFeaturesByVersion(features: readonly FeatureListItem[]): ScheduleColumn[] {
+export function groupFeaturesByVersion(
+  features: readonly FeatureListItem[],
+  ledgerVersions: readonly string[] = [],
+): ScheduleColumn[] {
   const byVersion = new Map<string, FeatureListItem[]>();
   for (const f of features) {
     if (isUnscheduled(f.version)) continue;
@@ -876,6 +1136,11 @@ export function groupFeaturesByVersion(features: readonly FeatureListItem[]): Sc
     const bucket = byVersion.get(v);
     if (bucket === undefined) byVersion.set(v, [f]);
     else bucket.push(f);
+  }
+  for (const raw of ledgerVersions) {
+    const v = normalizeVersion(raw);
+    if (v === "" || byVersion.has(v)) continue; // 空串忽略；交集已在卡派生侧建桶
+    byVersion.set(v, []); // 台账独有 ⇒ 空列占位（此版本已建、尚无卡）
   }
   return [...byVersion.entries()]
     .sort(([a], [b]) => compareVersionOrder(a, b))
@@ -889,7 +1154,7 @@ export function groupFeaturesByVersion(features: readonly FeatureListItem[]): Sc
  * （供 {@link DRAG_SCHEDULE_SCRIPT} 拖拽提交）；闸锁 ⇒ 置灰 + 紧凑标记「🔒 排期已锁」
  * （完整说明只在 409 错误卡呈现），**卡片仍可点击**（拖不动 ≠ 打不开）。detail 页/池卡同用本函数，闸口径一致。
  */
-function renderScheduleCard(f: FeatureListItem, withRequirement = false): string {
+export function renderScheduleCard(f: FeatureListItem, withRequirement = false): string {
   const d = deriveDisplayStage(f.state, f.stage);
   const reqLine =
     withRequirement && f.requirement !== null && f.requirement !== ""
@@ -921,32 +1186,128 @@ export function selectRequirementPool(features: readonly FeatureListItem[]): Fea
 }
 
 /**
- * 列头版本状态徽标（REQ-v0.9.2 增补 ⑤ N4 · **仅显示，不执法**）：
- * 锁版（config `releasedVersions` 命中）⇒「🔒 已发版」（tooltip = 派生 note）；
- * 未锁 ⇒ 按派生态渲染「进行中」/「已收尾」（增补 ② 补渲染，样式与锁徽标区分）；
- * 「未排期」不进版本列，无需处理。（v0.9.3 增补 ③ Timeline 退役后仅排期看板使用本枚。）
+ * 台账三态 → 列头徽标投影（REQ-2026-09-27-05 §2.2 N2 · 单一映射点）：
+ * `notstart`=未开始 / `active`=进行中 / `released`=🔒 已发版。样式与既有派生徽标分立可辨
+ * （灰 / 蓝 / 棕），`note` 作 tooltip。
  */
-export function renderVersionBadge(version: string, features: readonly FeatureListItem[], releasedVersions: readonly string[]): string {
-  const st = deriveVersionStatus(version, features, releasedVersions);
-  if (st.status === "未排期") return "";
-  const text = st.status === "已发版" ? "🔒 已发版" : st.status;
-  const variant = st.status === "已发版" ? "locked" : st.status === "进行中" ? "wip" : "closed";
-  return ` <span class="kbadge vbadge ${variant}" title="${escapeHtml(st.note)}">${escapeHtml(text)}</span>`;
+const LEDGER_BADGE: Readonly<Record<VersionLedgerStatus, { text: string; variant: string; note: string }>> = {
+  notstart: { text: "未开始", variant: "notstart", note: "版本台账状态：未开始。" },
+  active: { text: "进行中", variant: "wip", note: "版本台账状态：进行中。" },
+  released: { text: "🔒 已发版", variant: "locked", note: "版本台账状态：已发版。" },
+};
+
+/** 派生徽标（台账无该版）· 锁版命中：与台账 released 同一显示，tooltip 说明锁来源。 */
+const DERIVED_RELEASED_BADGE = {
+  text: "🔒 已发版",
+  variant: "locked",
+  note: "该版已登记为已发版 ⇒ 排期锁定（不可排入 / 改入 / 改出）。",
+} as const;
+
+/**
+ * 派生徽标（台账无该版）· 按卡片阶段判定（§9.4 增补九）：口径与台账三态的显示投影一致，
+ * 差别只在 tooltip 说明「本枚由卡片阶段派生、非台账态」。
+ */
+const DERIVED_STAGE_BADGE: Readonly<Record<"active" | "notstart", { text: string; variant: string; note: string }>> = {
+  active: {
+    text: "进行中",
+    variant: "wip",
+    note: "台账未登记该版，徽标由卡片阶段派生：名下存在已确认卡（stage ≠ 需求分析）⇒ 进行中。",
+  },
+  notstart: {
+    text: "未开始",
+    variant: "notstart",
+    note: "台账未登记该版，徽标由卡片阶段派生：名下全是想法卡（stage = 需求分析）或无卡 ⇒ 未开始。",
+  },
+};
+
+/**
+ * 台账**无该版**（由卡片 `version` 派生的列）时的徽标态（§9.4 增补九）：
+ * 判据与迁移矩阵「`notstart → active` 触发 = 首卡过 Step 0 确认门」同源 ——
+ * 名下**存在已确认卡**（`stage ≠ 需求分析`）⇒ `active`；全是想法卡 / 名下无卡 ⇒ `notstart`。
+ * 锁版（已发版集命中）优先，由调用方判定。
+ */
+export function deriveVersionBadgeStatus(features: readonly FeatureListItem[]): "active" | "notstart" {
+  return features.some((f) => isConfirmedCard(f.stage)) ? "active" : "notstart";
+}
+
+/**
+ * 列头版本状态徽标（REQ-v0.9.2 增补 ⑤ N4 · **仅显示，不执法**）：
+ * - **N2 起**（REQ-2026-09-27-05 §2.2）：版本在**台账**中 ⇒ 按台账三态渲染
+ *   （`notstart`=未开始 / `active`=进行中 / `released`=🔒 已发版）—— 台账状态优先于卡片派生；
+ * - 台账无该版（历史脏列 / 老桥）⇒ 回落**按卡片阶段派生**（§9.4 增补九）：锁版命中「🔒 已发版」优先，
+ *   其余「有已确认卡 ⇒ 进行中 / 全想法卡或无卡 ⇒ 未开始」（**读面不突变**）；
+ * - 「未排期」不进版本列，无需处理。（v0.9.3 增补 ③ Timeline 退役后仅排期看板使用本枚。）
+ */
+export function renderVersionBadge(
+  version: string,
+  features: readonly FeatureListItem[],
+  releasedVersions: readonly string[],
+  ledger: VersionsLedger | null = null,
+): string {
+  const rec = ledger === null ? null : findVersionRecord(ledger, normalizeVersion(version));
+  const b =
+    rec !== null
+      ? LEDGER_BADGE[rec.status]
+      : isVersionLocked(version, releasedVersions)
+        ? DERIVED_RELEASED_BADGE
+        : DERIVED_STAGE_BADGE[deriveVersionBadgeStatus(features)];
+  return ` <span class="kbadge vbadge ${b.variant}" title="${escapeHtml(b.note)}">${escapeHtml(b.text)}</span>`;
+}
+
+/**
+ * 版本框头**删除入口 ×**（v0.9.4 增补十一 E2 · 父改造文档 §9.6；**替代**增补七 b 的
+ * 「操作行里的删除版本按钮」· 纯 SSR，零新脚本常量）：提交到既有的那一条
+ * `POST /versions`（隐藏字段 `action=remove`），`data-ov="1"` 沿用「fetch 提交 +
+ * `.err-ov-card` 浮层报错」口径（无 JS = 原生 PRG 整页回显）。
+ *
+ * 可见性 = **仅未开始的版本**：判据与「首卡过确认门才转 active」同源 ——
+ * 名下**没有任何已过 Step 0 确认门的卡**（`isConfirmedCard(stage)` 全假）。
+ * 由此前台 × 的出现与服务端可删闸（released + 有已确认卡 ⇒ 拒）一一对应，不出必 409 的死按钮。
+ *
+ * 台账无该版（历史脏列 = 只由卡片派生）⇒ 不出 ×（台账里没有可删的条目）；
+ * `released` 条目 ⇒ 不出 ×（已发版为终态、服务端不可删，同增补十的纯只读口径）。
+ * 删除类操作不走脚本二次确认（内联脚本闭集六元不扩），由 `title` + `data-submit` 明确文案承担。
+ */
+function renderVersionDelete(
+  version: string,
+  features: readonly FeatureListItem[],
+  ledger: VersionsLedger | null,
+): string {
+  const rec = ledger === null ? null : findVersionRecord(ledger, normalizeVersion(version));
+  if (rec === null || rec.status === "released") return "";
+  if (features.some((f) => isConfirmedCard(f.stage))) return "";
+  return `<form method="post" action="/versions" class="inline vdel" data-submit="已提交，删除版本中…" data-ov="1" title="删除 ${escapeHtml(rec.version)}（仅未开始的版本可删；名下想法卡自动回需求池，已确认需求存在则服务端拒绝）">
+<input type="hidden" name="action" value="${escapeHtml(VERSION_ACTION_REMOVE)}">
+<input type="hidden" name="version" value="${escapeHtml(rec.version)}">
+<button type="submit" aria-label="删除版本 ${escapeHtml(rec.version)}">×</button>
+</form>`;
 }
 
 /**
  * `GET /schedule` 排期看板（纯函数）：版本列从左到右按 semver 数值序（M1 比较器），
- * 列头 = 版本号 + 状态徽标（N4：锁版「🔒 已发版」/ 未锁「进行中」/「已收尾」，仅显示）+ 卡片数；
+ * 列头 = 版本号 + 状态徽标（N4 / N2：**台账三态** notstart=未开始 / active=进行中 / released=🔒；
+ * 台账无该版回落**按卡片阶段派生**：有已确认卡=进行中 / 全想法卡或无卡=未开始 / 锁版=🔒，仅显示）+ 卡片数；
  * 未排期卡不占版本列，集中在末列「需求池」（池序 = 入参已排，见 {@link selectRequirementPool}）。
+ * `columns` 由 {@link groupFeaturesByVersion} 给出（已含台账 ∪ 卡派生并集），`ledger` 供列头徽标取态。
+ * **v0.9.4 增补十一 E1（§9.6）**：看板尾「新版本」拖拽**虚列已撤**（§2.6 形态作废）⇒ 创建版本
+ * 的唯一入口 = 排期页页头「＋ 新版本」按钮 + `#new-version-dialog` 弹窗。
+ * **v0.9.4 增补十一 E2（§9.6）**：删除入口由操作行的「删除版本」按钮**上框**为列头右上角
+ * {@link renderVersionDelete} 的 ×（仅未开始版本出现）。
+ * **v0.9.4 增补十一 E3（§9.6）**：列头**操作行整体撤除**（含「标记已发版」，其原属增补七 b 形态）
+ * ⇒ 前台不再渲染任何 `setStatus` 入口；版本状态维护只留后台 `POST /versions` `setStatus` 直投
+ * （数据纠错通道，**写口与迁移矩阵闸零改动**），真发版动作待「发版」按钮（另立需求 · 归 v0.9.5）。
+ * **v0.9.4 增补十（§9.5）**：`released` 列**不再渲染任何操作入口**（去「重开」）⇒ 已发版列 UI =
+ * 纯只读（仅 🔒 徽标）。
  */
 export function renderSchedule(
   columns: readonly ScheduleColumn[],
   pool: readonly FeatureListItem[] = [],
   releasedVersions: readonly string[] = [],
+  ledger: VersionsLedger | null = null,
 ): string {
   const cols = columns.map(
     (c) => `<div class="kcol" data-version="${escapeHtml(c.version)}">
-<h3>${escapeHtml(c.version)}${renderVersionBadge(c.version, c.features, releasedVersions)} <span class="muted">(${String(c.features.length)})</span></h3>
+<h3>${escapeHtml(c.version)}${renderVersionBadge(c.version, c.features, releasedVersions, ledger)} <span class="muted">(${String(c.features.length)})</span>${renderVersionDelete(c.version, c.features, ledger)}</h3>
 ${c.features.map((f) => renderScheduleCard(f)).join("\n")}
 </div>`,
   );
@@ -963,13 +1324,26 @@ ${pool.length === 0 ? `<p class="hint">（无未排期需求）</p>` : pool.map(
   // 搬入详情页 <main> 节点，骨架恒空、不嵌任何用户数据；脚本随 renderPage 每页注入，
   // 无 dialog（其它页）或禁 JS 时不生效 ⇒ 卡片 <a> 即整页详情回退。
   return `<h2>排期看板</h2>
-<p class="hint">数据 = 需求列表 <code>getFeatures()</code> 板内存按 <code>version</code> 归组（无新桥接口）；列从左到右 = semver 数值序（<code>v0.9.0 &lt; v0.10.0</code>），非 <code>x.y.z</code> 串字典序垫底；未排期（version 空）不进版本列，集中末列「需求池」（<code>createdAt</code> 降序）。状态作卡片徽标，不按状态分列；版本列头徽标（🔒 已发版 / 进行中 / 已收尾）仅为显示提示，执法在服务端写口；点卡片标题 = 浮层打开详情（禁 JS 时回退整页）。</p>
+<p class="hint">数据 = 需求列表 <code>getFeatures()</code> 板内存按 <code>version</code> 归组（无新桥接口）；列从左到右 = semver 数值序（<code>v0.9.0 &lt; v0.10.0</code>），非 <code>x.y.z</code> 串字典序垫底；未排期（version 空）不进版本列，集中末列「需求池」（<code>createdAt</code> 降序）。状态作卡片徽标，不按状态分列；版本列头徽标（未开始 / 进行中 / 🔒 已发版）仅为显示提示，执法在服务端写口；台账未登记的版本按卡片阶段派生（名下有已确认卡=进行中，全是需求分析阶段的想法卡或无卡=未开始）；<b>删除版本</b> = 版本框头右上角的 <b>×</b>（<b>仅未开始的版本出现</b> = 名下没有任何已过需求确认门的卡；删除时其下<b>想法卡自动回需求池</b>，名下有已确认需求则服务端拒绝），提交到 <code>POST /versions</code>，被拒时浮层给出原因；<b>本版撤除「标记已发版」前台入口</b>（增补十一 E3）⇒ 版本列<b>不提供任何状态操作</b>：<b>已发版（🔒）列为纯只读</b>，进行中 / 未开始列同样无发版与重开按钮；版本状态维护走后台 <code>POST /versions</code> <code>setStatus</code> 直投（数据纠错通道，不经前台），真发版动作待「发版」按钮（另立需求 · 归 v0.9.5）；点卡片标题 = 浮层打开详情（禁 JS 时回退整页）。</p>
 <p class="hint"><b>拖拽调整排期</b>（v0.9.3）：把卡片拖到目标版本列（或需求池列 = 清空排期）⇒ 提交排期写。仅「想法挪版」可拖（<code>stage=需求分析 ∧ approval=未发起</code>）；需求已确认的卡片置灰不可拖，服务端 409 执法（与已发版锁叠加）。改版时该需求已登记的 <code>doc/{旧版本}/</code> 产出文档会<b>自动搬迁</b>至 <code>doc/{新版本}/</code> 并追加登记（组织工作区文档不自动搬，回执列出交宿主手工）。</p>
 ${emptyNote}${board}
 <dialog class="fd" id="feat-dialog">
 <button type="button" id="feat-dialog-close">关闭</button>
 <div class="fd-body"></div>
 </dialog>`;
+}
+
+// ---------------------------------------------------------------------------
+// 组织空间需求列表（v0.9.4 D 档 · BD6）—— 全局列表页（REQ-04 Q2 退役）不复活，
+// 本视图只服务 `/org/<名>/features`；卡复用看板 kcard（renderScheduleCard），
+// 点标题 = 全局深链 `/features/:id`（深链策略：不强制 303 回空间）
+// ---------------------------------------------------------------------------
+
+export function renderOrgSpaceFeaturesList(org: string, features: readonly FeatureListItem[]): string {
+  const pool = sortPoolEntries(features);
+  return `<h2>需求 · 组织空间 <span class="mono">${escapeHtml(org)}</span></h2>
+<p class="hint">数据 = 需求列表 <code>getFeatures()</code> 按 <code>ownerGroup = ${escapeHtml(org)}</code> 板内存过滤（无新桥接口；trim 后精确匹配，null / 空白归属不进任何组织空间）。排序 = 未排期在前、其余 <code>createdAt</code> 降序（同需求池口径）；点标题 = 全局深链详情页。</p>
+${pool.length === 0 ? `<p class="hint">（该组织名下暂无需求）</p>` : pool.map((f) => renderScheduleCard(f, true)).join("\n")}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1377,11 +1751,34 @@ const ERROR_FAMILY_LABELS: Readonly<Record<string, string>> = {
   board_orgs_dir_missing: "组织目录根不可用",
   board_org_not_resolved: "归属组织无法确定",
   board_org_name_invalid: "组织名不合法",
+  board_org_exists: "组织已存在",
+  board_org_action_invalid: "组织写动作不合法",
+  board_org_disabled: "组织已停用",
+  board_org_space_not_found: "组织空间不存在",
+  board_org_space_gone: "组织空间已关闭（组织停用）",
+  board_org_mismatch: "组织空间归属不一致",
+  board_org_has_active_bridge: "组织名下仍有宿主桥",
+  board_member_action_invalid: "成员写动作不合法",
+  board_member_pair_missing: "成员项不完整",
+  board_last_member_remove: "组织仅剩一项目",
+  config_write_dry_run_rejected: "桥拒写（配置校验未过）",
+  config_write_unknown_machine: "机器不在桥配置",
+  config_write_group_not_found: "目标组不存在",
+  config_write_duplicate_member: "成员重复",
+  config_write_concurrent_modification: "配置并发冲突",
+  config_write_io_failed: "桥写盘失败",
   board_turn_request_invalid: "本轮入参不合法",
   board_no_awaiting_turn: "无可回答的澄清轮",
   board_turn_busy: "本轮已在进行",
   board_feature_terminal: "需求已终态",
   board_version_released: "版本已发版锁定",
+  board_version_action_invalid: "版本写动作不合法",
+  board_version_form_invalid: "版本写字段校验失败",
+  board_version_exists: "版本已存在",
+  board_version_not_found: "版本不在台账",
+  board_version_remove_released: "已发版版本不可删",
+  board_version_remove_confirmed_cards: "该版本下还有已确认需求",
+  board_version_remove_pool_back_failed: "想法卡回需求池失败",
   org_workspace_missing: "组织工作区缺失",
   bridge_unavailable: "宿主桥不可达",
   bridge_exited: "宿主桥已退出",

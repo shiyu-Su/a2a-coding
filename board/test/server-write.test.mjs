@@ -1,6 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { readFileSync, readdirSync } from "node:fs";
+import { mkdtempSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { fileURLToPath } from "node:url";
 
@@ -53,19 +54,42 @@ function fakeClient() {
   };
 }
 
+/**
+ * 已发版锁夹具（v0.9.4 N3）：`releasedVersions` 已退役出服务端配置（运行时锁改读版本台账）
+ * ⇒ 测试把「这些版本已发版」预置为临时台账文件喂入（`versionsLedgerFile`）。
+ * **恒注入**（未声明锁版时喂空台账）：否则缺省会读开发机真实 `.data/versions.json`，锁随本机状态漂移。
+ */
+function releasedLedgerFixture(versions = []) {
+  const dir = mkdtempSync(join(tmpdir(), "board-locked-"));
+  const file = join(dir, "versions.json");
+  const entries = versions.map((raw) => ({
+    version: String(raw).trim(),
+    status: "released",
+    createdAt: "2026-09-24T00:00:00.000Z",
+    updatedAt: "2026-09-24T00:00:00.000Z",
+    note: null,
+  }));
+  writeFileSync(file, JSON.stringify({ version: 1, versions: entries }, null, 2) + "\n", "utf8");
+  return { file, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
 async function withServer(run, serverOptions = {}) {
   const { client, calls } = fakeClient();
+  const { releasedVersions, ...rest } = serverOptions;
+  const seed = releasedLedgerFixture(releasedVersions ?? []);
   const handle = await createBoardServer({
     host: "127.0.0.1",
     port: 0,
     client,
     now: () => NOW,
-    ...serverOptions,
+    ...rest,
+    versionsLedgerFile: seed.file,
   });
   try {
     await run(`http://127.0.0.1:${handle.port}`, calls);
   } finally {
     await handle.close();
+    seed.cleanup();
   }
 }
 
@@ -193,10 +217,10 @@ test("BD11-③：表单留空 ⇒ 回落板级默认组织；201 回显与出网
   const { fn, captured } = realCreateCapturing(okEnvelope({ ok: true, featureId: "F-3" }));
   await withServer(
     async (base) => {
-      const res = await post(base, { title: "甲", version: "v1" }, { ...WRITE_HEADERS, accept: "application/json" });
+      const res = await post(base, { title: "甲", version: "v0.9.0" }, { ...WRITE_HEADERS, accept: "application/json" });
       assert.equal(res.status, 201);
       assert.equal(JSON.parse(res.text).group, "board-default-org");
-      const viaBlank = await post(base, { title: "乙", version: "v1", group: "  " }, { ...WRITE_HEADERS, accept: "application/json" });
+      const viaBlank = await post(base, { title: "乙", version: "v0.9.0", group: "  " }, { ...WRITE_HEADERS, accept: "application/json" });
       assert.equal(viaBlank.status, 201, "纯空白等同未填（与配置面同口径）");
       assert.deepEqual(captured.urls, [
         "http://127.0.0.1:8787/board-default-org/mcp",
@@ -215,11 +239,11 @@ test("BD7-②：成功回显 featureId —— 表单档 303 跳详情页（PRG�
   const { fn } = realCreateCapturing(okEnvelope({ ok: true, featureId: "F-42" }));
   await withServer(
     async (base) => {
-      const viaForm = await post(base, { title: "甲", version: "v1" }, { origin: base });
+      const viaForm = await post(base, { title: "甲", version: "v0.9.0" }, { origin: base });
       assert.equal(viaForm.status, 303);
       assert.equal(viaForm.headers.get("location"), "/features/F-42");
       assert.equal(viaForm.headers.get("cache-control"), "no-store");
-      const viaApi = await post(base, { title: "甲", version: "v1" }, { ...WRITE_HEADERS, accept: "application/json" });
+      const viaApi = await post(base, { title: "甲", version: "v0.9.0" }, { ...WRITE_HEADERS, accept: "application/json" });
       assert.equal(viaApi.status, 201);
       const json = JSON.parse(viaApi.text);
       assert.equal(json.ok, true);
@@ -238,7 +262,7 @@ test("BD7-③：桥错误码原样透传（feature_invalid_stage / project_not_a
     const { fn } = realCreateCapturing(okEnvelope({ ok: false, code, error: `透传说明-${code}` }));
     await withServer(
       async (base) => {
-        const res = await post(base, { title: "甲", version: "v1" }, { ...WRITE_HEADERS, accept: "application/json" });
+        const res = await post(base, { title: "甲", version: "v0.9.0" }, { ...WRITE_HEADERS, accept: "application/json" });
         assert.equal(res.status, 502);
         const json = JSON.parse(res.text);
         assert.equal(json.ok, false);
@@ -458,10 +482,10 @@ test("BD11-⑥（负向锚）：板不写状态机迁移 —— approve/cancel �
   );
 });
 
-test("BD7-⑦（BD11 反转）：提需求表单**含**组织名字段（REQ-04 Q2 起在首页弹窗内）；只读渲染与 CSP 均未变", async () => {
+test("BD7-⑦（BD11 反转）：提需求表单**含**组织名字段（REQ-04 Q2 起在看板页弹窗内；§9-b 起看板宿主 = /schedule）；只读渲染与 CSP 均未变", async () => {
   // 未配默认组织 ⇒ 组织名带 required（前端便利；硬校验仍在服务端）
   await withServer(async (base, calls) => {
-    const res = await req(base, "/");
+    const res = await req(base, "/schedule");
     assert.equal(res.status, 200);
     assert.match(res.text, /<form method="post" action="\/requirements"/);
     assert.match(res.text, /name="title"/);
@@ -503,7 +527,7 @@ test("BD7-⑦（BD11 反转）：提需求表单**含**组织名字段（REQ-04 
   });
   // 配了默认组织 ⇒ 组织名可不填，且把默认值如实显示在字段旁（不伪装成必填）
   await withServer(async (base) => {
-    const res = await req(base, "/");
+    const res = await req(base, "/schedule");
     assert.match(res.text, /name="group"/);
     assert.doesNotMatch(res.text, /name="group"[^>]*required/, "有默认组织 ⇒ 该字段允许留空");
     assert.match(res.text, /留空 = 用板级默认 board-default-org/);
@@ -710,6 +734,31 @@ test("N2-⑦（缺省不锁）：未注入 releasedVersions ⇒ 任何版本都�
       const res = await post(base, { title: "甲", version: "v0.9.1" }, { ...WRITE_HEADERS, accept: "application/json" });
       assert.equal(res.status, 201);
       assert.equal(seen.length, 1);
+    },
+    { defaultGroup: "g", createRequirementImpl: fn },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.4 N4 semver 收口（HTTP 面 · 提需求）：非法 version ⇒ 400 零出网；空串放行（未排期）
+// ---------------------------------------------------------------------------
+
+test("N4-①（提需求 semver 收口）：非法 version ⇒ 400 requirement_form_invalid 且零出网；空串 = 未排期放行", async () => {
+  const { fn, captured } = realCreateCapturing(
+    okEnvelope({ ok: true, featureId: "F-N4", state: "waiting_approval", version: "v0.9.4" }),
+  );
+  await withServer(
+    async (base) => {
+      for (const bad of ["v0.9.1-probe", "v0.9", "latest"]) {
+        const res = await post(base, { title: "探针", version: bad }, { ...WRITE_HEADERS, accept: "application/json" });
+        assert.equal(res.status, 400, `${bad} 应被拒`);
+        assert.equal(JSON.parse(res.text).code, "requirement_form_invalid");
+      }
+      assert.deepEqual(captured.bodies, [], "非法版本先于网络被拒（零出网）");
+      // 空串 = 未排期 ⇒ 放行（走真实封装 + 注入 fetch）
+      const ok = await post(base, { title: "进池", version: "" }, { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(ok.status, 201);
+      assert.equal(captured.bodies[0].params.arguments.version, "");
     },
     { defaultGroup: "g", createRequirementImpl: fn },
   );

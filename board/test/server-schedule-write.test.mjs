@@ -1,5 +1,8 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { tmpdir } from "node:os";
+import { join } from "node:path";
 
 import { createBoardServer } from "../dist/server.js";
 import { scheduleFeature } from "../dist/feature-schedule.js";
@@ -53,18 +56,41 @@ function fakeClient(featureOver = {}) {
   };
 }
 
+/**
+ * 已发版锁夹具（v0.9.4 N3）：`releasedVersions` 已退役出服务端配置（运行时锁改读版本台账）
+ * ⇒ 测试把「这些版本已发版」预置为临时台账文件喂入（`versionsLedgerFile`）。
+ * **恒注入**（未声明锁版时喂空台账）：否则缺省会读开发机真实 `.data/versions.json`，锁随本机状态漂移。
+ */
+function releasedLedgerFixture(versions = []) {
+  const dir = mkdtempSync(join(tmpdir(), "board-locked-"));
+  const file = join(dir, "versions.json");
+  const entries = versions.map((raw) => ({
+    version: String(raw).trim(),
+    status: "released",
+    createdAt: "2026-09-25T00:00:00.000Z",
+    updatedAt: "2026-09-25T00:00:00.000Z",
+    note: null,
+  }));
+  writeFileSync(file, JSON.stringify({ version: 1, versions: entries }, null, 2) + "\n", "utf8");
+  return { file, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+}
+
 async function withServer(run, serverOptions = {}, client) {
+  const { releasedVersions, ...rest } = serverOptions;
+  const seed = releasedLedgerFixture(releasedVersions ?? []);
   const handle = await createBoardServer({
     host: "127.0.0.1",
     port: 0,
     client,
     now: () => NOW,
-    ...serverOptions,
+    ...rest,
+    versionsLedgerFile: seed.file,
   });
   try {
     await run(`http://127.0.0.1:${handle.port}`);
   } finally {
     await handle.close();
+    seed.cleanup();
   }
 }
 
@@ -708,4 +734,29 @@ test("G-⑦（表单档）：闸拒 ⇒ 错误浮层族名「排期状态锁定�
     client,
   );
   assert.deepEqual(seen, []);
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.4 N4 semver 收口（HTTP 面 · 排期写）：非法 version ⇒ 400 零出网；空串 = 取消排期放行
+// ---------------------------------------------------------------------------
+
+test("N4-②（排期写 semver 收口）：非法 version ⇒ 400 schedule_request_invalid 且零出网；空串 = 取消排期放行", async () => {
+  const { fn, captured } = realScheduleCapturing(
+    okEnvelope({ ok: true, featureId: "F1", state: "executing", version: "" }),
+  );
+  const { client } = fakeClient({ version: "v0.9.2" });
+  await withServer(
+    async (base) => {
+      const bad = await schedulePost(base, "version=v0.9.1-probe", { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(bad.status, 400, "非 x.y.z ⇒ 400（验收点名的 v0.9.1-probe 类）");
+      assert.equal(JSON.parse(await bad.text()).code, "schedule_request_invalid");
+      assert.deepEqual(captured.bodies, [], "非法版本先于网络被拒（零出网）");
+      // 空串 = 取消排期（合法）⇒ 放行，且出网 version === ""
+      const clear = await schedulePost(base, "version=", { ...WRITE_HEADERS, accept: "application/json" });
+      assert.equal(clear.status, 200);
+      assert.equal(captured.bodies[0].params.arguments.version, "");
+    },
+    { defaultGroup: "g", scheduleFeatureImpl: fn },
+    client,
+  );
 });

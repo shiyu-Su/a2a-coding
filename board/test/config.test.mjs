@@ -19,6 +19,7 @@ import {
   DEFAULT_HOST,
   DEFAULT_PORT,
   loadConfig,
+  parseLegacyReleasedVersions,
   resolveConfigPath,
   validateConfig,
 } from "../dist/config.js";
@@ -60,7 +61,6 @@ test("①完整配置：逐键生效，`_` 前缀注释键（_comment 族）被�
       mcpBaseUrl: "http://10.0.0.5:9000",
       machineDist: "D:/custom/machine-dist",
       turnTimeoutMs: 123456,
-      releasedVersions: ["v0.9.0", "v0.9.1"],
     });
     assert.equal(cfg.port, 4599);
     assert.equal(cfg.host, "::1");
@@ -71,7 +71,6 @@ test("①完整配置：逐键生效，`_` 前缀注释键（_comment 族）被�
     assert.equal(cfg.mcpBaseUrl, "http://10.0.0.5:9000");
     assert.equal(cfg.machineDist, "D:/custom/machine-dist");
     assert.equal(cfg.turnTimeoutMs, 123456);
-    assert.deepEqual(cfg.releasedVersions, ["v0.9.0", "v0.9.1"]);
     assert.ok(cfg.sourcePath.endsWith("config.json"));
   } finally {
     rmSync(orgs, { recursive: true, force: true });
@@ -89,7 +88,6 @@ test("①b缺省值逐项与 BD12″ 之前一致（空对象 = 全缺省）", (
   assert.equal(cfg.mcpBaseUrl, "http://127.0.0.1:8787");
   assert.equal(cfg.machineDist, resolveMachineDistDir({}));
   assert.equal(cfg.turnTimeoutMs, null);
-  assert.deepEqual(cfg.releasedVersions, []);
 });
 
 test("②（负向）缺 config.json ⇒ [config] 明确文案 + 提示从模板复制，不裸崩", () => {
@@ -136,15 +134,24 @@ test("⑤未知键 ⇒ 忽略、不影响解析", () => {
   assert.equal(cfg.orgsDir, null);
 });
 
-test("⑤b releasedVersions（REQ-v0.9.2 N1）：缺省 = []；合法登记 trim + 去重后原样生效", () => {
-  assert.deepEqual(validateConfig({}, "t://x").releasedVersions, [], "整键缺失 ⇒ 缺省空 = 无锁版");
-  assert.deepEqual(validateConfig({ releasedVersions: null }, "t://x").releasedVersions, [], "null 同缺省");
-  assert.deepEqual(validateConfig({ releasedVersions: [] }, "t://x").releasedVersions, []);
-  const cfg = validateConfig({ releasedVersions: ["v0.9.0", " v0.9.1 ", "v0.9.0", "v0.9.2 "] }, "t://x");
-  assert.deepEqual(cfg.releasedVersions, ["v0.9.0", "v0.9.1", "v0.9.2"], "元素 trim 后保序去重（先到先得）");
+test("⑤b releasedVersions（退役键 · v0.9.4 N3）：parseLegacyReleasedVersions 缺省 = []；合法登记 trim + 去重后原样生效", () => {
+  assert.deepEqual(parseLegacyReleasedVersions({}), [], "整键缺失 ⇒ 缺省空 = 无锁版");
+  assert.deepEqual(parseLegacyReleasedVersions({ releasedVersions: null }), [], "null 同缺省");
+  assert.deepEqual(parseLegacyReleasedVersions({ releasedVersions: [] }), []);
+  assert.deepEqual(
+    parseLegacyReleasedVersions({ releasedVersions: ["v0.9.0", " v0.9.1 ", "v0.9.0", "v0.9.2 "] }),
+    ["v0.9.0", "v0.9.1", "v0.9.2"],
+    "元素 trim 后保序去重（先到先得）",
+  );
+  // 运行时锁改读版本台账 ⇒ 该键不再进入 BoardConfig（validateConfig 只作未知键忽略）
+  assert.equal(
+    "releasedVersions" in validateConfig({ releasedVersions: ["v0.9.0"] }, "t://x"),
+    false,
+    "退役后运行时配置面不再承载 releasedVersions（仅一次性迁移读取）",
+  );
 });
 
-test("⑤c（负向）releasedVersions 非法 ⇒ `[config] releasedVersions` fail-fast", () => {
+test("⑤c（负向）退役键 releasedVersions 非法 ⇒ parseLegacyReleasedVersions 抛 `[config] releasedVersions` fail-fast", () => {
   const cases = [
     { releasedVersions: "v0.9.1" },
     { releasedVersions: 42 },
@@ -156,7 +163,7 @@ test("⑤c（负向）releasedVersions 非法 ⇒ `[config] releasedVersions` fa
   ];
   for (const obj of cases) {
     assert.throws(
-      () => validateConfig(obj, "t://x"),
+      () => parseLegacyReleasedVersions(obj),
       (err) => err instanceof Error && /^\[config\] releasedVersions/.test(err.message),
       `非法 ${JSON.stringify(obj)} 必须被拒（不静默降级）`,
     );

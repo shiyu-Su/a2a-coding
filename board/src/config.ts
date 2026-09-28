@@ -16,6 +16,9 @@
  * `hostKind` `claude` · `bridgeUrl` `http://127.0.0.1:3300` · `mcpBaseUrl` `http://127.0.0.1:8787` ·
  * `machineDist` 按仓根推导（`<仓根>/machine/dist`）· `repoRoot` 缺省 = 板根上一级（BD10 读文档面）·
  * `turnTimeoutMs` 未配 ⇒ 交 BD4b 缺省。
+ *
+ * **v0.9.4 N3**：`releasedVersions` 已退役出本加载器（运行时版本锁改读**版本台账**）——
+ * 历史键仍由 {@link parseLegacyReleasedVersions} / {@link readLegacyReleasedVersions} 读取，**仅供一次性迁移**。
  */
 import { readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
@@ -52,11 +55,6 @@ export interface BoardConfig {
   readonly repoRoot: string;
   /** 单轮有界等待毫秒；`null` = 未配置 ⇒ 交下游 `DEFAULT_TURN_TIMEOUT_MS`。 */
   readonly turnTimeoutMs: number | null;
-  /**
-   * 已发版版本号清单（REQ-v0.9.2 N1）：**「已发版」事实源**，板前台版本锁的判据
-   * （`version-status.isVersionLocked` trim 后精确匹配）。缺省 = `[]`（未登记 ⇒ 无锁）。
-   */
-  readonly releasedVersions: readonly string[];
 }
 
 /** 缺省配置文件落点：`<board>/config/config.json`（源码与 `dist/` 运行都落到同一处）。 */
@@ -92,7 +90,7 @@ function optString(raw: Record<string, unknown>, key: string): string | null {
 }
 
 /**
- * 可选字符串数组键（REQ-v0.9.2 N1 `releasedVersions`）：未配置（键缺失 / null）⇒ `[]`；
+ * 可选字符串数组键（**退役键 `releasedVersions` 专用**，v0.9.4 N3）：未配置（键缺失 / null）⇒ `[]`；
  * 非数组 / 元素非字符串 / 元素 trim 后空串 ⇒ `[config] <字段>` fail-fast；
  * 元素统一 trim 并按 trim 后值去重（保序，先到先得）。
  */
@@ -178,13 +176,40 @@ export function validateConfig(parsed: unknown, sourcePath: string): BoardConfig
     turnTimeoutMs = v;
   }
 
-  const releasedVersions = optStringArray(
-    raw,
+  return { sourcePath, port, host, orgsDir, group, hostKind, bridgeUrl, mcpBaseUrl, machineDist, repoRoot, turnTimeoutMs };
+}
+
+/**
+ * **退役键读取**（v0.9.4 N3，纯函数）：`releasedVersions` 已从 {@link BoardConfig} 退役 ——
+ * 运行时版本锁改读**版本台账**（`.data/versions.json` 的 `status=released`）。但启动期
+ * **一次性迁移**（config → 台账）仍需读取历史键（含「台账已存在 ⇒ 残留键一次性 warn」检测），
+ * 故保留本函数为**唯一读取点**，不进入 BoardConfig。
+ *
+ * 语义与退役前逐字节一致：未配置（键缺失 / null）⇒ `[]`；非法形态 ⇒ `[config] releasedVersions` fail-fast
+ * （防已发版锁静默消失）；元素 trim 后保序去重。
+ */
+export function parseLegacyReleasedVersions(parsed: unknown): string[] {
+  if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return [];
+  return optStringArray(
+    parsed as Record<string, unknown>,
     "releasedVersions",
     '改成如 ["v0.9.0","v0.9.1"] 的字符串数组，或整键删除（缺省 = 空 = 无锁版）',
   );
+}
 
-  return { sourcePath, port, host, orgsDir, group, hostKind, bridgeUrl, mcpBaseUrl, machineDist, repoRoot, turnTimeoutMs, releasedVersions };
+/**
+ * 一次性迁移入口（`index.ts` 的 `main` 调用）：从配置文件读取退役键 `releasedVersions`。
+ * `loadConfig` 已保证该文件存在且为合法 JSON ⇒ 这里只做 JSON.parse + {@link parseLegacyReleasedVersions}
+ * （非法键形态照旧向上抛 ⇒ 拒起板）。读取失败（理论上不可达）⇒ 空数组（迁移无输入）。
+ */
+export function readLegacyReleasedVersions(sourcePath: string): string[] {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(readFileSync(sourcePath, "utf8"));
+  } catch {
+    return [];
+  }
+  return parseLegacyReleasedVersions(parsed);
 }
 
 /**
