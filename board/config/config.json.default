@@ -10,6 +10,8 @@
   "_groupComment": "板级**默认组织**（BD11 起 = 可选默认，非必填）。组织名的**主来源是提需求表单**的 group 字段（第一次填写某组织名 = 在板上创建该组织）；本键仅当**表单留空**时兜底。缺失 / 空串 ⇒ **不是错误**、不报错：此时表单组织名变必填，留空 ⇒ POST /requirements 请求期结构化 400 board_group_required（不猜、不回落兜底组名 —— 静默猜组名会把需求建到别的组）。它同时是宿主面「桥侧无 ownerGroup」时的回退组织名（身份链 S1）。空串 / 纯空白一律按未配置算。",
   "hostKind": "claude",
   "_hostKindComment": "宿主后端 kind（§3.8 裁定 #4 已裁 = claude）。仅作为**新建桥的缺省 kind**（kind → 后端命令的映射唯一事实源在 machine 侧 getAdapter()，板不自拼 argv；组织级可覆盖）。缺省 claude；空串 / 不填 = 用缺省；非字符串 ⇒ `[config] hostKind` fail-fast。kind 值本身不被 getAdapter() 认识时是**起桥期**报错（不在配置期猜）。",
+  "hostModel": "<optional; backend model, e.g. opencode-go/deepseek-v4.1-flash>",
+  "_hostModelComment": "宿主后端**模型**（v0.9.5 · 本次仅开 model 一键）。起桥时经 agentConfig 原样透传给后端（machine 侧四适配器 resolveAcpModel 解析），板**不校验取值**（非法值由后端自行处置）。缺省 / 空串 / 纯空白 = **未配置 ⇒ 不透传**，模型由后端自身缺省决定（现行为保持）。仅对**新建桥**生效（已在线的桥复用、不受影响）；本键为启动期读一次 ⇒ **改动须重启板进程**。非字符串 ⇒ `[config] hostModel` fail-fast。",
   "bridgeUrl": "http://127.0.0.1:3300",
   "_bridgeUrlComment": "读面（只读视图 /api/*）连接的**编排桥 web 基址**。缺省 http://127.0.0.1:3300（orch 只读工作台端口）。**fail-fast**：非 http(s):// 绝对地址（无协议 / 无主机 / 乱串）⇒ `[config] bridgeUrl` 拒绝启动。不填 = 用缺省。桥不可达时页面如实显示 502，不缓存旧数据。",
   "mcpBaseUrl": "http://127.0.0.1:8787",

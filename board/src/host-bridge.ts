@@ -359,6 +359,12 @@ export interface HostBridgeDeps {
   startTimeoutMs?: number;
   /** 子进程环境基址（缺省 = `process.env`，再前置 machine 的 `node_modules/.bin`）。 */
   baseEnv?: NodeJS.ProcessEnv;
+  /**
+   * 平台判定（缺省 = `process.platform`）—— 与 {@link createNodeSpawnBridge} / {@link createTreeKiller}
+   * 的 `platform` 参数同风格：可注入 ⇒ 单测能在**任一平台**上钉住 win32 / POSIX 两条停桥分支
+   * （win32 走「先整树杀」、POSIX 保持「先 SIGTERM 超时才树杀」原序）。
+   */
+  platform?: NodeJS.Platform;
 }
 
 interface ManagedBridge {
@@ -719,6 +725,11 @@ export class HostBridgeManager {
     return this.deps.dirKind ?? statDirKind;
   }
 
+  /** 平台判定（缺省 `process.platform`；可注入 ⇒ 单测钉住停桥两条分支）。 */
+  private platform(): NodeJS.Platform {
+    return this.deps.platform ?? process.platform;
+  }
+
   private async probe(port: number): Promise<boolean> {
     const probePort: ProbePortFn = this.deps.probePort ?? ((p: number) => probeTcpPort(p));
     return probePort(port);
@@ -737,9 +748,13 @@ export class HostBridgeManager {
   // -- 停 -------------------------------------------------------------------
 
   /**
-   * **停**：先 `SIGTERM`（桥有优雅停机），`termGraceMs` 内没退 ⇒ **树杀**。
-   * ⚠ 板 spawn 的是「**桥 + 后端**」两级进程（Windows 上还多一层 `cmd.exe`），
-   * **只杀桥会留后端孤儿** ⇒ 兜底必须覆盖整棵树。
+   * **停**：win32 / POSIX 两条停法（平台可注入，见 {@link HostBridgeDeps.platform}）。
+   *
+   * - **win32**：板 spawn 的是 `cmd.exe → 桥 → 后端` 三层，`SIGTERM` 只够到 cmd 壳
+   *   （壳一走 `waitExit` 立即为真，父链消失后真正的 node 孙与后端树全成孤儿 —— 2026-09-28 T3 真机实测）。
+   *   ⇒ **放弃 SIGTERM 宽限窗**（修法 A）：先 `killTree(pid)` 整树杀（复用 {@link createTreeKiller}），
+   *   再 `child.kill` 补一刀，最后 `waitExit` **确认退出**；**确认后才记台账** `exited/pid:null`。
+   * - **POSIX**：原语义逐字不动（`detached:true` 进程组语义与 Windows 不同，组杀本就能覆盖后端孙进程）。
    */
   async stop(org: string, reason = "manual"): Promise<HostBridgeStatus | null> {
     const b = this.bridges.get(org.trim());
@@ -752,12 +767,19 @@ export class HostBridgeManager {
     const child = b.child;
     const pid = b.pid;
     if (child !== null && !child.exited() && pid !== null) {
-      const graceMs = this.deps.termGraceMs ?? DEFAULT_TERM_GRACE_MS;
-      child.kill("SIGTERM"); // 优雅优先
-      if (!(await this.waitExit(child, graceMs))) {
-        const killTree: KillTreeFn = this.deps.killTree ?? createTreeKiller();
-        await killTree(pid); // 超时 ⇒ 树杀（覆盖后端那一层）
-        await this.waitExit(child, graceMs);
+      if (this.platform() === "win32") {
+        // win32：整树杀在前（此时父 cmd 壳还活着，`taskkill /T` 才够得到 node 孙与后端）。
+        const confirmed = await this.stopWin32(child, pid);
+        if (!confirmed) {
+          // 未确认退出 ⇒ **不记** `exited/pid:null`（否则台账谎报「已收」，残余孤儿无人追；不新增状态）。
+          b.error = {
+            code: "bridge_stop_unconfirmed",
+            message: `整树杀与信号已发，但桥进程（pid=${String(pid)}）未确认退出 ⇒ 台账不记为已收`,
+          };
+          return;
+        }
+      } else {
+        await this.stopPosix(child, pid);
       }
     }
     b.child = null;
@@ -766,6 +788,26 @@ export class HostBridgeManager {
     b.state = "exited";
     b.inFlightRounds = 0;
     this.writeLedger(b, { stoppedAt: toIso(this.now()), stopReason: reason });
+  }
+
+  /** win32 停法：先整树杀 → 补一刀 → 确认；返回「是否确认退出」。 */
+  private async stopWin32(child: BridgeChildHandle, pid: number): Promise<boolean> {
+    const graceMs = this.deps.termGraceMs ?? DEFAULT_TERM_GRACE_MS;
+    const killTree: KillTreeFn = this.deps.killTree ?? createTreeKiller(this.platform());
+    await killTree(pid); // 父链活着时整树杀（覆盖 cmd 壳 → node 桥 → 后端）
+    child.kill("SIGTERM"); // 补一刀
+    return this.waitExit(child, graceMs); // 确认退出后才记台账
+  }
+
+  /** POSIX 停法（**原语义逐字不动**）：先 `SIGTERM` 优雅优先，`termGraceMs` 内没退才树杀。 */
+  private async stopPosix(child: BridgeChildHandle, pid: number): Promise<void> {
+    const graceMs = this.deps.termGraceMs ?? DEFAULT_TERM_GRACE_MS;
+    child.kill("SIGTERM"); // 优雅优先
+    if (!(await this.waitExit(child, graceMs))) {
+      const killTree: KillTreeFn = this.deps.killTree ?? createTreeKiller();
+      await killTree(pid); // 超时 ⇒ 树杀（覆盖后端那一层）
+      await this.waitExit(child, graceMs);
+    }
   }
 
   private async waitExit(child: BridgeChildHandle, timeoutMs: number): Promise<boolean> {

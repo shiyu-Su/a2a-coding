@@ -12,11 +12,12 @@ import {
   renderScheduleForm,
   renderVersionSwitchWarningLine,
   registeredDecisionDocVersions,
-  renderConfirmForm,
-  renderTurnForm,
+  renderActionArea,
   renderTurnProgress,
+  renderTurnOutcome,
   renderAnswerForm,
   renderNextStepGuide,
+  renderTurnTrace,
   renderAcceptanceSection,
   renderNewRequirementDialog,
   renderOrgSpaceManagePage,
@@ -26,6 +27,14 @@ import {
 } from "../dist/web/views.js";
 
 const NOW = Date.parse("2026-09-24T12:00:00Z");
+
+/**
+ * v0.9.5 C5：动作区唯一入参构造（档位化前的 `renderTurnForm` / `renderConfirmForm` 两形态已合并）。
+ * 缺省 = 预审闲置档（approval 未发起 ∧ 无产出 ∧ 无占用）。
+ */
+function actionInput(over = {}) {
+  return { hostFaceAssembled: true, awaitingAnswer: false, approval: "未发起", state: "waiting_approval", ...over };
+}
 
 // ---------------------------------------------------------------------------
 // layout
@@ -185,13 +194,17 @@ test("增补二-表单标记：manage 成员增删 / 停用 + 门户建组织带
   const portal = renderOrgPortal(buildOrgPortalCards(["甲"], []));
   assert.match(portal, /action="\/orgs" class="w"[^>]*data-ov="1"/, "门户建组织同口径");
   assert.doesNotMatch(renderRequirementForm("flow"), /data-ov/, "提需求弹窗自带脚本，不经本通道");
-  assert.doesNotMatch(renderTurnForm("F1"), /data-ov/, "触发一轮（长任务整页档）不扩标记");
+  assert.doesNotMatch(renderActionArea("F1", actionInput()), /data-ov/, "动作区（长任务整页档）不扩浮层标记");
 });
 
-test("轨14-页面：每类写表单都带 data-submit 文案（提需求 / 触发一轮 / 确认 / 回答 / 停桥）", () => {
+test("轨14-页面（v0.9.5 C5 档位化）：每类写表单都带 data-submit 文案（提需求 / 动作区两档 / 回答 / 停桥）", () => {
   assert.match(renderRequirementForm("flow"), /data-submit="[^"]+"/);
-  assert.match(renderTurnForm("F1"), /action="\/features\/F1\/turn"[^>]*data-submit="[^"]+"/);
-  assert.match(renderConfirmForm("F1", "待审批"), /action="\/features\/F1\/confirm"[^>]*data-submit="[^"]+"/);
+  assert.match(renderActionArea("F1", actionInput()), /action="\/features\/F1\/turn"[^>]*data-submit="[^"]+"/);
+  assert.match(
+    renderActionArea("F1", actionInput({ approval: "待审批" })),
+    /action="\/features\/F1\/confirm"[^>]*data-submit="[^"]+"/,
+    "确认档仍发向既有 /confirm 路由（写路由零改动）",
+  );
   assert.match(renderAnswerForm("F1", "问题"), /action="\/features\/F1\/answer"[^>]*data-submit="[^"]+"/);
   const host = renderHostPage({
     entries: [
@@ -206,52 +219,51 @@ test("轨14-页面：每类写表单都带 data-submit 文案（提需求 / 触�
   assert.match(host, /action="\/host\/flow\/stop"[^>]*data-submit="[^"]+"/);
 });
 
-test("轨14-页面（渲染禁用）：占用轮 ⇒ 触发一轮 disabled + 原因；无占用 ⇒ 原样可点", () => {
-  const busy = { turnId: "turn-run", requirementId: "F1", org: "flow", contextId: "c", round: 4, state: "running", queuedAt: "q", startedAt: "s" };
-  const html = renderTurnForm("F1", busy);
-  assert.match(html, /<button type="submit" disabled aria-disabled="true">触发一轮/);
+test("轨14-页面（v0.9.5 C5 渲染禁用）：占用轮 ⇒ 当前档位按钮 disabled + 原因（不撤档）；无占用 ⇒ 可点", () => {
+  const busyTurn = { turnId: "turn-run", requirementId: "F1", org: "flow", contextId: "c", round: 4, state: "running", queuedAt: "q", startedAt: "s" };
+  const html = renderActionArea("F1", actionInput({ turnBusy: true, busyTurn }));
+  assert.match(html, /<button type="submit" disabled aria-disabled="true">让 agent 继续/);
   assert.match(html, /本轮进行中（第 4 轮 · turn-run）/);
-  assert.match(html, /action="\/features\/F1\/turn"/, "禁用不隐藏入口");
-  assert.doesNotMatch(renderTurnForm("F1", null), /disabled/);
+  assert.match(html, /action="\/features\/F1\/turn"/, "禁用不隐藏入口（占用只置灰，不改档）");
+  assert.doesNotMatch(renderActionArea("F1", actionInput()), /disabled/);
 
-  // confirm：占用原因优先于 approval 判据（它直接对应「点了会白点」）
-  const conf = renderConfirmForm("F1", "待审批", busy);
+  // 确认档：占用原因优先于 approval 判据（它直接对应「点了会白点」）
+  const conf = renderActionArea("F1", actionInput({ approval: "待审批", turnBusy: true, busyTurn }));
   assert.match(conf, /disabled/);
   assert.match(conf, /本轮进行中/);
+  assert.match(conf, /aria-disabled="true">确认改造文档 → 放行执行<\/button>/, "占用时按钮文案仍是确认档");
+  assert.match(conf, /action="\/features\/F1\/confirm"/);
   assert.doesNotMatch(conf, /审批门 = 待审批/, "占用时不显示 approval 那条原因");
-  assert.match(renderConfirmForm("F1", "待审批", null), /<button type="submit">发送确认指令给 agent/);
+  assert.match(renderActionArea("F1", actionInput({ approval: "待审批" })), /<button type="submit">确认改造文档 → 放行执行/);
 });
 
-test("轨17-页面（渲染禁用）：引擎终态 ⇒ 两按钮 disabled + 原因行，入口不隐藏", () => {
-  const turn = renderTurnForm("F1", null, "completed");
-  assert.match(turn, /<button type="submit" disabled aria-disabled="true">触发一轮/);
-  assert.match(turn, /<p class="hint warn">本需求已完成（引擎态 completed），板上无需再操作/);
-  assert.match(turn, /action="\/features\/F1\/turn"/, "禁用不隐藏入口");
-
-  const conf = renderConfirmForm("F1", "待审批", null, "cancelled");
-  assert.match(conf, /<button type="submit" disabled aria-disabled="true">发送确认指令给 agent/);
-  assert.match(conf, /本需求已取消（终态），板上无需再操作/);
-  assert.doesNotMatch(conf, /审批门 = 待审批/, "终态时不展示 approval 原因");
-
-  assert.match(renderTurnForm("F1", null, "failed"), /本需求已进入失败终态/);
+test("轨17-页面（v0.9.5 C5 墓碑）：引擎终态 ⇒ 动作区整体不渲染，终态事实由引导行承载（原「灰态按钮 + 原因」定向推翻）", () => {
+  for (const [state, re] of [
+    ["completed", /本需求已完成（引擎态 completed），板上无需再操作/],
+    ["cancelled", /本需求已取消（终态），板上无需再操作/],
+    ["failed", /本需求已进入失败终态，板上无需再操作/],
+  ]) {
+    assert.equal(renderActionArea("F1", actionInput({ approval: "待审批", state })), "", `${state} 终态不得出现动作区`);
+    assert.match(renderNextStepGuide(actionInput({ state })), re, `${state} 终态结论仍看得见`);
+  }
 });
 
-test("轨17-页面：终态判据优先于占用（占用文案被终态文案覆盖）", () => {
-  const busy = { turnId: "turn-run", requirementId: "F1", org: "flow", contextId: "c", round: 4, state: "running", queuedAt: "q", startedAt: "s" };
-  const turn = renderTurnForm("F1", busy, "completed");
-  assert.match(turn, /本需求已完成/);
-  assert.doesNotMatch(turn, /本轮进行中/);
-  const conf = renderConfirmForm("F1", "待审批", busy, "completed");
-  assert.match(conf, /本需求已完成/);
-  assert.doesNotMatch(conf, /本轮进行中/);
+test("轨17-页面：终态判据优先于占用（终态需求不渲染动作区，也不出占用文案）", () => {
+  const busyTurn = { turnId: "turn-run", requirementId: "F1", org: "flow", contextId: "c", round: 4, state: "running", queuedAt: "q", startedAt: "s" };
+  assert.equal(renderActionArea("F1", actionInput({ approval: "待审批", state: "completed", turnBusy: true, busyTurn })), "");
+  const guide = renderNextStepGuide(actionInput({ state: "completed", turnBusy: true, busyTurn }));
+  assert.match(guide, /本需求已完成/);
+  assert.doesNotMatch(guide, /本轮进行中/, "陈旧占用台账不得解释终态需求的显示");
 });
 
-test("轨17-页面（正向锚）非终态 / null / 未知态 ⇒ 两表单回到既有判据（轨14/BD18 语义不回归）", () => {
-  const busy = { turnId: "turn-run", requirementId: "F1", org: "flow", contextId: "c", round: 4, state: "running", queuedAt: "q", startedAt: "s" };
-  assert.doesNotMatch(renderTurnForm("F1", null, "executing"), /disabled/);
-  assert.match(renderConfirmForm("F1", "待审批", null, "executing"), /<button type="submit">发送确认指令给 agent/);
-  assert.match(renderTurnForm("F1", busy, "some-future-state"), /本轮进行中/, "未知态按非终态放行 ⇒ 占用判据照常");
-  assert.match(renderConfirmForm("F1", "未发起", null, null), /方案未就绪/, "缺省参数不改变 approval 判据");
+test("轨17-页面（正向锚）非终态 / null / 未知态 ⇒ 动作区回到既有档位判据（轨14/BD18 语义不回归）", () => {
+  const busyTurn = { turnId: "turn-run", requirementId: "F1", org: "flow", contextId: "c", round: 4, state: "running", queuedAt: "q", startedAt: "s" };
+  assert.doesNotMatch(renderActionArea("F1", actionInput({ state: "executing" })), /disabled/);
+  assert.match(renderActionArea("F1", actionInput({ approval: "待审批", state: "executing" })), /<button type="submit">确认改造文档 → 放行执行/);
+  assert.match(renderActionArea("F1", actionInput({ state: "some-future-state", turnBusy: true, busyTurn })), /本轮进行中/, "未知态按非终态放行 ⇒ 占用判据照常");
+  const idle = renderActionArea("F1", actionInput({ approval: null, state: null }));
+  assert.match(idle, /<button type="submit">让 agent 继续<\/button>/, "approval 缺值 ⇒ 走闲置档，不渲染确认块");
+  assert.doesNotMatch(idle, /触发一轮|方案未就绪/, "底层机制词与旧灰态文案一律不出");
 });
 
 // ---------------------------------------------------------------------------
@@ -275,11 +287,19 @@ test("N7-页面 排队轮 ⇒ 「第 N 轮 排队中 · 队列第 K 位」；位
   assert.doesNotMatch(noPos, /队列第/);
 });
 
-test("N7-页面（负向）无在飞 / 排队轮 ⇒ 整行不渲染；文案不做自动刷新（自动刷新不在页面脚本白名单闭集）", () => {
+test("N7-页面（负向）无在飞 / 排队轮 ⇒ 整行不渲染；进度行自带零刷新（刷新全在浮层脚本侧）", () => {
   assert.equal(renderTurnProgress(null), "");
   const html = renderTurnProgress({ turnId: "turn-run", round: 1, state: "running", position: null });
   assert.doesNotMatch(html, /http-equiv|setTimeout|location\.reload/i, "进度行不得自带刷新");
-  assert.match(html, /刷新本页看最新/);
+});
+
+// REQ-2026-09-29-02 件D：口径行由「板不自动刷新」改为准确两档表述（动作区自动刷新 / 其余不自动刷新）。
+test("N7-页面（件D 新口径文案锚）动作区提交后自动刷新进度至本轮收口，其余内容仍需重载本页", () => {
+  const html = renderTurnProgress({ turnId: "turn-run", round: 4, state: "running", position: null });
+  assert.match(html, /轮次进度：<b>第 4 轮 在飞<\/b>/, "在飞档主体不变（既有口径不弱化）");
+  assert.match(html, /浮层内提交后动作区自动刷新进度至本轮收口/, "自动档 = 浮层动作区");
+  assert.match(html, /其余内容重载本页看最新/, "静态档 = 其余内容仍须重载");
+  assert.doesNotMatch(html, /板不自动刷新/, "旧的笼统表述已退役（与件B 行为矛盾的根因文案）");
 });
 
 // --- REQ-v0.9.2 N8：详情页验收轨迹块（消费 acceptance，板不重算） ---------------- --------
@@ -515,6 +535,153 @@ test("renderFeatureDetail: trace 读取失败 ⇒ 可见错误，不静默", () 
   const html = renderFeatureDetail(detailFixture, null, "桥返回 HTTP 500", NOW);
   assert.match(html, /class="hint err"/);
   assert.match(html, /trace 读取失败：桥返回 HTTP 500/);
+});
+
+// --- v0.9.5 C4：需求原文上详情页（常驻层 · 120 字截断 + 原生 details 展开全文，零脚本） ------
+
+test("C4 renderFeatureDetail: 需求原文常驻层 —— 短文本直显 / 超长截断进 details / 转义 / 缺值不渲染", () => {
+  const short = renderFeatureDetail(
+    { ...detailFixture, feature: { ...detailFixture.feature, requirement: "要一个只读的排期导出" } },
+    traceFixture,
+    null,
+    NOW,
+  );
+  assert.match(short, /<h2>需求原文<\/h2>\n<pre class="result">要一个只读的排期导出<\/pre>/);
+  assert.doesNotMatch(short, /<details class="req-src">/, "不超长 ⇒ 不套折叠层（一眼看完的东西不该多点一下）");
+
+  const long = renderFeatureDetail(
+    { ...detailFixture, feature: { ...detailFixture.feature, requirement: "甲".repeat(200) } },
+    traceFixture,
+    null,
+    NOW,
+  );
+  assert.match(long, /<details class="req-src"><summary>甲{120}…<\/summary><pre class="result">甲{200}<\/pre>/, "折叠态 = 截断 120 字，展开 = 全文");
+
+  const unsafe = renderFeatureDetail(
+    { ...detailFixture, feature: { ...detailFixture.feature, requirement: '<img src=x onerror="alert(1)">' } },
+    traceFixture,
+    null,
+    NOW,
+  );
+  assert.doesNotMatch(unsafe, /<img src=x/, "原文一律转义（用户可控文本不得出结构）");
+  assert.match(unsafe, /&lt;img src=x/);
+
+  for (const requirement of [null, undefined, "", "  \n "]) {
+    const html = renderFeatureDetail(
+      { ...detailFixture, feature: { ...detailFixture.feature, requirement } },
+      traceFixture,
+      null,
+      NOW,
+    );
+    assert.equal(html.includes("<h2>需求原文</h2>"), false, `${JSON.stringify(requirement)} ⇒ 整区不渲染（C2 空区块不渲染同款）`);
+  }
+});
+
+// --- v0.9.5 T2 正锚：C1 第一屏拼接序 / C2 空区块短路 / C6 轮留痕 ---------------------------
+
+test("C1 renderFeatureDetail 第一屏：字段表 → 引导行 → 需求原文（拼接序即「第一屏可见」的结构锚）", () => {
+  const html = renderFeatureDetail(
+    { ...detailFixture, feature: { ...detailFixture.feature, requirement: "要一个只读的排期导出" } },
+    traceFixture,
+    null,
+    NOW,
+    false,
+    [],
+    { nextStepHtml: '<p class="hint nextstep">下一步：等你 —— 测试引导行</p>' },
+  );
+  const marks = [
+    html.indexOf("<h2>甲"),
+    html.indexOf('<p class="hint nextstep">'),
+    html.indexOf("<h2>需求原文</h2>"),
+    html.indexOf('<details class="fold"'),
+  ];
+  assert.equal(marks.every((i) => i >= 0), true, "四层都在场");
+  assert.deepEqual(
+    [...marks].sort((a, b) => a - b),
+    marks,
+    "拼接序 = 字段表 → 引导行 → 需求原文 → 折叠层（引导行不上第一屏即回归）",
+  );
+});
+
+test("C2 renderFeatureDetail 空区块短路：任务 0 ⇒ 任务表不出；trace 空节点 ⇒ 三面表不出；trace 读失败 ⇒ 不短路", () => {
+  const empty = renderFeatureDetail({ ...detailFixture, tasks: [] }, { ...traceFixture, nodes: [] }, null, NOW);
+  assert.equal(empty.includes("<h2>任务（"), false, "任务 0 ⇒ 任务表整节不渲染");
+  assert.equal(empty.includes('<td class="mono">read_lane_running</td>'), false, "trace 成功但空 ⇒ 三面表不出");
+  assert.equal(empty.includes("执行明细"), false, "任务 0 ∧ trace 空 ⇒ 执行明细区整体消失（C2 的验收面）");
+
+  const withTask = renderFeatureDetail(detailFixture, traceFixture, null, NOW);
+  assert.match(withTask, /<h2>任务（1）<\/h2>/, "对照：有任务照常渲染");
+  assert.match(withTask, /<td class="mono">read_lane_running<\/td>/, "对照：trace 有非终态节点照常渲染");
+
+  const failed = renderFeatureDetail(detailFixture, null, "桥返回 HTTP 500", NOW);
+  assert.match(failed, /进展三面.*trace 读取失败/s, "读失败不属短路范围（不静默，既有锚同款）");
+});
+
+test("C2 renderAcceptanceSection 短路④：单段 ∧ 零失败 ⇒ 整节不渲染；多段或有失败 ⇒ 照渲染", () => {
+  assert.equal(
+    renderAcceptanceSection({
+      stages: [{ state: "waiting_approval", enteredAt: "e0", leftAt: null }],
+      failures: [],
+      stateCounts: {},
+    }),
+    "",
+    "单段零失败 = 零信息量 ⇒ 不渲染",
+  );
+  assert.match(
+    renderAcceptanceSection({
+      stages: [
+        { state: "waiting_approval", enteredAt: "e0", leftAt: "e1" },
+        { state: "executing", enteredAt: "e1", leftAt: null },
+      ],
+      failures: [],
+      stateCounts: {},
+    }),
+    /验收轨迹/,
+    "对照：多段轨迹照常渲染",
+  );
+  assert.match(
+    renderAcceptanceSection({
+      stages: [{ state: "executing", enteredAt: "e0", leftAt: null }],
+      failures: [{ eventId: 7, at: "e1", payload: null }],
+      stateCounts: {},
+    }),
+    /验收轨迹/,
+    "对照：有失败账单 ⇒ 单段也不短路",
+  );
+});
+
+test("C6 renderTurnTrace 轮留痕：state/轮 id/时间一行 + 摘要折叠展开全文；null ⇒ 不渲染；未知态原样", () => {
+  assert.equal(renderTurnTrace(null), "", "从未起轮 / 宿主面未装配 ⇒ 整行缺席（缺席不是错误）");
+
+  const html = renderTurnTrace({
+    turnId: "turn-0123456789abcdef",
+    state: "succeeded",
+    summary: "本轮结论：门禁全绿",
+    at: "2026-09-29T08:00:00Z",
+    errorCode: null,
+  });
+  assert.match(html, /<h2>最近一轮<\/h2>/);
+  assert.match(html, /class="hint turn-trace"><b>有结论（succeeded）<\/b>/, "state = 中文（原值）双语口径");
+  assert.match(html, /<span class="mono">turn-012<\/span>/, "轮 id 短形可核对");
+  assert.match(html, /2026-09-29T08:00:00Z/, "时间 = 该轮最近一次时刻原样");
+  assert.match(html, /<details class="fold turn-summary"><summary>本轮结论：门禁全绿<\/summary><pre class="result">本轮结论：门禁全绿<\/pre><\/details>/, "摘要折叠层展开 = 全文");
+  assert.equal(html.includes("触发一轮"), false, "留痕行不得带回底层机制词");
+
+  const long = renderTurnTrace({
+    turnId: "t2",
+    state: "failed",
+    summary: "故".repeat(200),
+    at: "2026-09-29T09:00:00Z",
+    errorCode: "turn_upstream_unreachable",
+  });
+  assert.match(long, /<summary>故{120}…<\/summary><pre class="result">故{200}<\/pre>/, "折叠态 = 截断 120 字");
+  assert.match(long, /失败（failed）/);
+  assert.match(long, /<span class="mono">turn_upstream_unreachable<\/span>/, "失败轮带结构化错误码");
+
+  const noTime = renderTurnTrace({ turnId: "t3", state: "已重试", summary: null, at: null, errorCode: null });
+  assert.match(noTime, /<b>已重试<\/b>/, "未知轮态原样显示，不吞不猜");
+  assert.match(noTime, /· —/, "at 缺 ⇒ 时间如实 —（不推算）");
+  assert.equal(noTime.includes("turn-summary"), false, "无摘要 ⇒ 不套空折叠层");
 });
 
 // --- B-T4（3300 收编补差）：详情页任务行「三时刻 + 排队/执行时长」 --------------------------
@@ -764,35 +931,74 @@ test("BD11 renderHostPage 配置行：默认组织未配置时如实显示「由
 
   const withDefault = renderHostPage({ entries: [], config: { orgsDir: null, defaultOrg: "flow-team", kind: "claude" }, notice: null });
   assert.match(withDefault, /默认组织 = <code>flow-team<\/code>/);
-  assert.match(withDefault, /组织目录根 = <code>（未配置 ⇒ 触发一轮将结构化 503）<\/code>/);
+  assert.match(withDefault, /组织目录根 = <code>（未配置 ⇒ 详情页动作区提交将结构化 503）<\/code>/);
+  // v0.9.5 C5：底层机制词从 UI 退场（本页与详情页同一个动作，说法必须一致）
+  assert.doesNotMatch(bare, /触发一轮/);
+  assert.doesNotMatch(withDefault, /触发一轮/);
+});
+
+test("C5 renderTurnOutcome：display 缺省时标题落「本轮结果：<结局>」，全页无「触发一轮」", () => {
+  const outcome = (over = {}) => ({
+    ok: true,
+    org: "flow-team",
+    featureId: "F1",
+    disposition: "completed",
+    queued: false,
+    turnId: "turn-1",
+    contextId: "ctx-1",
+    round: 2,
+    state: "completed",
+    display: "",
+    summary: "产出摘要",
+    question: null,
+    error: null,
+    bridge: { pid: 4242, port: 8790, kind: "claude" },
+    ...over,
+  });
+  const plain = renderTurnOutcome(outcome());
+  assert.match(plain, /<h2>本轮结果：completed<\/h2>/, "display 为空 ⇒ 标题用「本轮结果」");
+  assert.match(plain, /产出摘要/);
+  assert.doesNotMatch(plain, /触发一轮/, "结果页与详情页同一个动作，说法不得回退");
+
+  const withDisplay = renderTurnOutcome(outcome({ display: "需要你回答", disposition: "awaiting_answer" }));
+  assert.match(withDisplay, /<h2>需要你回答<\/h2>/, "display 有值 ⇒ 如实显示，不被兜底覆盖");
+  assert.doesNotMatch(withDisplay, /触发一轮/);
 });
 
 // ---------------------------------------------------------------------------
-// BD18：确认按钮按 approval 条件化 + 「下一步」引导行（视图层）
+// BD18 → v0.9.5 C5 档位化：确认档只在审批门出现 + 「下一步」引导行（视图层）
 // ---------------------------------------------------------------------------
 
-test("BD18 renderConfirmForm：待审批 ⇒ 按钮可点（无 disabled）+ 状态行指向 agent 核对", () => {
-  const html = renderConfirmForm("F1", "待审批");
-  assert.match(html, /<button type="submit">发送确认指令给 agent/);
+test("BD18（档位化）：待审批 ⇒ 确认档按钮可点（无 disabled）+ 诚实口径仍在折叠层 + 无补充框", () => {
+  const html = renderActionArea("F1", actionInput({ approval: "待审批" }));
+  assert.match(html, /<button type="submit">确认改造文档 → 放行执行<\/button>/);
   assert.doesNotMatch(html, /disabled/, "待审批档不得出现 disabled");
-  assert.match(html, /审批门 = 待审批/);
-  assert.match(html, /不存在「板上批准」/, "既有的诚实文案不丢");
+  assert.match(html, /action="\/features\/F1\/confirm"/);
+  assert.match(html, /不存在「板上批准」/, "既有的诚实文案不丢（折叠层里，展开可见）");
+  assert.match(html, /feature_approval_not_ready/, "文案仍明说 agent 可能不放行的例子");
+  assert.doesNotMatch(html, /name="supplement"/, "确认档是固定指令模板通道，不掺自由文本");
 });
 
-test("BD18 renderConfirmForm（负向）：未发起 ⇒ 按钮禁用 + 可见原因（看得见、明确不可用、给下一步）", () => {
-  const html = renderConfirmForm("F1", "未发起");
-  assert.match(html, /<button type="submit" disabled aria-disabled="true">/, "禁用而非隐藏");
-  assert.match(html, /action="\/features\/F1\/confirm"/, "入口仍在（不隐藏）");
-  assert.match(html, /class="hint warn">方案未就绪/, "原因行走 .warn 样式");
-  assert.match(html, /触发一轮/, "说明里给出下一步");
+test("BD18（负向 · 原「禁用不隐藏」定向推翻）：未发起 ⇒ 不出现确认入口，改出闲置档（可点 + 补充框）", () => {
+  const html = renderActionArea("F1", actionInput({ approval: "未发起" }));
+  assert.doesNotMatch(html, /action="\/features\/F1\/confirm"/, "非确认门不渲染确认块");
+  assert.doesNotMatch(html, /disabled/, "闲置档不是灰态");
+  assert.match(html, /<button type="submit">让 agent 继续<\/button>/);
+  assert.match(html, /<textarea name="supplement"/, "turn 档带补充框");
+  assert.doesNotMatch(html, /触发一轮/, "UI 不出现底层机制词");
 });
 
-test("BD18 renderConfirmForm：已通过 / 未知值 ⇒ 同样禁用并说明（未知值原样透出）", () => {
-  assert.match(renderConfirmForm("F1", "已通过"), /disabled/);
-  assert.match(renderConfirmForm("F1", "已通过"), /无需再次确认/);
-  const odd = renderConfirmForm("F1", "X<Y");
-  assert.match(odd, /disabled/);
-  assert.match(odd, /X&lt;Y/, "approval 原值经转义透出");
+test("BD18（档位化）：已通过 / 未知 approval 值 ⇒ 一律不渲染确认块（门只开一次，未知值不猜）", () => {
+  for (const approval of ["已通过", "X<Y"]) {
+    const html = renderActionArea("F1", actionInput({ approval, state: "executing" }));
+    assert.doesNotMatch(html, /action="\/features\/F1\/confirm"/, `${approval} 不得出现确认入口`);
+    assert.doesNotMatch(html, /X<Y|X&lt;Y/, "未知 approval 值不进动作区文案（不自造解释）");
+  }
+});
+
+test("BD18（负向）：宿主面未装配 ⇒ 动作区不渲染（无 turn/confirm 入口），引导行说明原因", () => {
+  assert.equal(renderActionArea("F1", actionInput({ hostFaceAssembled: false, approval: "待审批" })), "");
+  assert.match(renderNextStepGuide(actionInput({ hostFaceAssembled: false })), /宿主面未装配/);
 });
 
 test("BD18 renderNextStepGuide：渲染 derive 引导行为 .nextstep 行且转义", () => {

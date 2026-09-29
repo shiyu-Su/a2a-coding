@@ -3,18 +3,20 @@ import assert from "node:assert/strict";
 
 import {
   deriveDisplayStage,
-  deriveConfirmAffordance,
+  deriveActionAffordance,
   deriveTurnBusyAffordance,
-  deriveTerminalFeatureAffordance,
   deriveNextStepHint,
   deriveTurnProgress,
   formatWaitedSince,
   traceWaitDisplay,
+  terminalFeatureNote,
   UNKNOWN_STAGE_LABEL,
   B13_CALIBRATION_NOTES,
   PARALLELISM_NOTE,
   INFLIGHT_CALIBRATION_NOTE,
   FEATURE_TERMINAL_STATES,
+  TURN_STALL_AFTER_MS,
+  LATEST_TURN_SUMMARY_MAX,
   isTerminalFeatureState,
 } from "../dist/derive.js";
 
@@ -162,46 +164,66 @@ test("口径脚注常量齐备（B13 三条 + 在跑数口径 + 并行度）", (
 });
 
 // ---------------------------------------------------------------------------
-// BD18 ①：确认按钮可用性（按 approval 三态 + 缺值/未知值）
+// v0.9.5 C5（改写 BD18 ① + 收口轨 17）：动作区档位 = 唯一规则源
+// 「approval 三态各配一个灰按钮」的旧形态**定向推翻**：一次只出一档一个按钮，
+// 终态 / 宿主面未装配 ⇒ `null`（整个动作区不渲染）；轮占用 ⇒ 同档 disabled + 原因。
 // ---------------------------------------------------------------------------
 
-test("BD18-derive 确认态：待审批 ⇒ 唯一可点档（note 指向 agent 核对语义）", () => {
-  const a = deriveConfirmAffordance("待审批");
+const ACT = { hostFaceAssembled: true, awaitingAnswer: false, approval: "未发起", state: "waiting_approval" };
+
+test("C5-derive 确认档：approval = 待审批 ⇒ 唯一出确认按钮（去向 confirm · 文案点名「放行执行」）", () => {
+  const a = deriveActionAffordance({ ...ACT, approval: "待审批" });
+  assert.equal(a.kind, "confirm");
+  assert.equal(a.label, "确认改造文档 → 放行执行");
   assert.equal(a.enabled, true);
-  assert.match(a.note, /待审批/);
-  assert.match(a.note, /agent 核对/);
+  assert.equal(a.quiet, false, "确认档是主按钮，不低调");
 });
 
-test("BD18-derive 确认态（负向）：未发起 ⇒ 禁用 + 原因「方案未就绪」+ 下一步指向触发一轮", () => {
-  const a = deriveConfirmAffordance("未发起");
-  assert.equal(a.enabled, false);
-  assert.match(a.note, /方案未就绪/);
-  assert.match(a.note, /触发一轮/);
-  assert.match(a.note, /待审批/);
-});
-
-test("BD18-derive 确认态：已通过 ⇒ 禁用 + 说明已放行、无回边", () => {
-  const a = deriveConfirmAffordance("已通过");
-  assert.equal(a.enabled, false);
-  assert.match(a.note, /已通过/);
-  assert.match(a.note, /无需再次确认/);
-});
-
-test("BD18-derive 确认态：null / 未知值 ⇒ 禁用且原样透出当前值（不吞不猜）", () => {
-  for (const v of [null, "", "某种未知档"]) {
-    const a = deriveConfirmAffordance(v);
-    assert.equal(a.enabled, false, `approval=${JSON.stringify(v)} 不得可点`);
-    assert.match(a.note, /待审批/);
-    if (v !== null) assert.ok(a.note.includes(v), "未知值须原样出现在说明里");
+test("C5-derive（负向）无「触发一轮」字样：任何档的按钮文案都是意图句", () => {
+  for (const input of [
+    { ...ACT, approval: "待审批" },
+    { ...ACT, state: "executing", approval: "已通过" },
+    { ...ACT, approval: "已通过", state: "reviewing" },
+    { ...ACT, registeredDocs: ["甲-需求确认单.md"] },
+  ]) {
+    assert.doesNotMatch(deriveActionAffordance(input).label, /触发一轮/);
   }
 });
 
-// ---------------------------------------------------------------------------
-// 收口轨 14 ②：写按钮的「轮占用」可用性（在飞 / 排队 ⇒ 禁用 + 原因；无占用 ⇒ null）
-// ---------------------------------------------------------------------------
+test("C5-derive 闲置档：预审卡无任何产出 ⇒「让 agent 继续」（不渲染确认块）", () => {
+  const a = deriveActionAffordance({ ...ACT, approval: "未发起" });
+  assert.equal(a.kind, "turn");
+  assert.equal(a.label, "让 agent 继续");
+  assert.equal(a.enabled, true);
+});
 
-test("轨14-derive 占用（在飞）⇒ 禁用 + 原因含轮次与轮 id（看得见、说明为什么白点）", () => {
-  const a = deriveTurnBusyAffordance({ turnId: "turn-7", round: 3, state: "running" });
+test("C5-derive 提交档：有待裁待答（awaiting / 已登记产出 / 已有轮次）⇒「提交给 agent」", () => {
+  assert.equal(deriveActionAffordance({ ...ACT, awaitingAnswer: true }).label, "提交给 agent");
+  assert.equal(deriveActionAffordance({ ...ACT, registeredDocs: ["甲-需求确认单.md"] }).label, "提交给 agent");
+  assert.equal(deriveActionAffordance({ ...ACT, latestTurn: { state: "succeeded", summary: "已落文档", at: "x" } }).label, "提交给 agent");
+});
+
+test("C5-derive 验收档：reviewing / testing ⇒「反馈验收结论」；executing 的兜底档低调（quiet）", () => {
+  assert.equal(deriveActionAffordance({ ...ACT, approval: "已通过", state: "reviewing" }).label, "反馈验收结论");
+  assert.equal(deriveActionAffordance({ ...ACT, approval: "已通过", state: "testing" }).label, "反馈验收结论");
+  const exec = deriveActionAffordance({ ...ACT, approval: "已通过", state: "executing", latestTurn: null });
+  assert.equal(exec.label, "让 agent 继续");
+  assert.equal(exec.quiet, true, "执行中的兜底按钮低调保留");
+  assert.equal(deriveActionAffordance({ ...ACT, approval: "已通过", state: "integrating" }).quiet, true);
+});
+
+test("C5-derive（负向）终态 / 宿主面未装配 ⇒ null：整个动作区不渲染（原「灰态按钮 + 原因」退役）", () => {
+  for (const s of FEATURE_TERMINAL_STATES) {
+    assert.equal(deriveActionAffordance({ ...ACT, state: s, approval: "待审批" }), null, `${s} 不出动作区`);
+  }
+  assert.equal(deriveActionAffordance({ ...ACT, hostFaceAssembled: false }), null);
+});
+
+test("C5-derive 轮占用 ⇒ 同档 disabled + 原因（占用优先于档位，但**不换按钮文案**）", () => {
+  const busy = { turnId: "turn-7", round: 3, state: "running" };
+  const a = deriveActionAffordance({ ...ACT, approval: "待审批", turnBusy: true, busyTurn: busy });
+  assert.equal(a.kind, "confirm", "仍是确认档");
+  assert.equal(a.label, "确认改造文档 → 放行执行");
   assert.equal(a.enabled, false);
   assert.match(a.note, /本轮进行中/);
   assert.match(a.note, /第 3 轮/);
@@ -209,39 +231,24 @@ test("轨14-derive 占用（在飞）⇒ 禁用 + 原因含轮次与轮 id（看
   assert.match(a.note, /防连点重复排队/);
 });
 
-test("轨14-derive 占用（排队）⇒ 禁用 + 原因说「排队中」（与在飞文案可分辨）", () => {
-  const a = deriveTurnBusyAffordance({ turnId: "turn-8", round: 1, state: "queued" });
-  assert.equal(a.enabled, false);
-  assert.match(a.note, /本轮排队中/);
-  assert.doesNotMatch(a.note, /本轮进行中/);
+test("C5-derive 轮占用（排队）⇒ 原因说「排队中」；占用为真却无轮本体 ⇒ 兜底原因不空", () => {
+  const q = deriveActionAffordance({ ...ACT, turnBusy: true, busyTurn: { turnId: "turn-8", round: 1, state: "queued" } });
+  assert.match(q.note, /本轮排队中/);
+  assert.doesNotMatch(q.note, /本轮进行中/);
+  const bare = deriveActionAffordance({ ...ACT, turnBusy: true, busyTurn: null });
+  assert.equal(bare.enabled, false);
+  assert.match(bare.note, /本轮未结束前不可再次提交/);
 });
 
-test("轨14-derive（正向锚）无占用轮 ⇒ null：不越权覆盖各按钮自身的既有判据（approval 等）", () => {
+test("轨14-derive 占用判据本体保留（在飞 / 排队文案可分辨 · 无占用 ⇒ null 不越权）", () => {
+  assert.equal(deriveTurnBusyAffordance({ turnId: "turn-7", round: 3, state: "running" }).enabled, false);
+  assert.equal(deriveTurnBusyAffordance({ turnId: "turn-8", round: 1, state: "queued" }).enabled, false);
   assert.equal(deriveTurnBusyAffordance(null), null);
 });
 
 // ---------------------------------------------------------------------------
-// 收口轨 17：终态需求的写按钮可用性（判据单一源 = isTerminalFeatureState；非终态 ⇒ null）
-// ---------------------------------------------------------------------------
-
-test("轨17-derive 引擎终态三值 ⇒ 禁用 + 与引导行同一份终态文案（两处不得漂移）", () => {
-  for (const s of FEATURE_TERMINAL_STATES) {
-    const a = deriveTerminalFeatureAffordance(s);
-    assert.equal(a.enabled, false, `${s} 终态不得可点`);
-    assert.match(a.note, /板上无需再操作/);
-    assert.equal(a.note, deriveNextStepHint({ hostFaceAssembled: true, awaitingAnswer: true, approval: "待审批", state: s }), `${s} 原因行 = 引导行文案`);
-  }
-  assert.match(deriveTerminalFeatureAffordance("completed").note, /引擎态 completed/);
-});
-
-test("轨17-derive（正向锚）非终态 / null / 未知态 ⇒ null：交回占用与 approval 既有判据", () => {
-  for (const s of ["waiting_approval", "executing", "integrating", "needs_input", null, "some-future-state"]) {
-    assert.equal(deriveTerminalFeatureAffordance(s), null, `${s} 非终态不越权`);
-  }
-});
-
-// ---------------------------------------------------------------------------
-// BD18 ②：「下一步」引导行（判序：宿主面 > 终态 > 待澄清 > approval；轨16 起终态压过待澄清）
+// BD18 ②（v0.9.5 C1 升级）：「下一步」引导行
+// 判序：宿主面 > 终态 > 待澄清 > approval（轨16 起终态压过待澄清）；卡滞档最低，只在 executing 切
 // ---------------------------------------------------------------------------
 
 const NS = { hostFaceAssembled: true, awaitingAnswer: false, approval: "未发起", state: "waiting_approval" };
@@ -250,6 +257,8 @@ test("BD18-derive 下一步：宿主面未装配 ⇒ 明示配 orgsDir（优先�
   const hint = deriveNextStepHint({ ...NS, hostFaceAssembled: false, approval: "待审批" });
   assert.match(hint, /宿主面未装配/);
   assert.match(hint, /orgsDir/);
+  assert.match(hint, /动作区/, "文案指向新的动作区（不再说「触发一轮」）");
+  assert.doesNotMatch(hint, /触发一轮/);
 });
 
 test("BD18-derive 下一步：存在 awaiting_answer 轮 ⇒ 回答优先（压过 approval 分支）", () => {
@@ -257,16 +266,87 @@ test("BD18-derive 下一步：存在 awaiting_answer 轮 ⇒ 回答优先（压�
   assert.match(hint, /回答上方问题/);
 });
 
-test("BD18-derive 下一步：approval 三态逐条", () => {
-  assert.match(deriveNextStepHint({ ...NS, approval: "未发起" }), /点「触发一轮」.*需求访谈/);
-  assert.match(deriveNextStepHint({ ...NS, approval: "待审批" }), /核对改造文档后点「确认」/);
-  assert.match(deriveNextStepHint({ ...NS, approval: "已通过" }), /引擎.*接管执行/);
+test("C1-derive 下一步：approval 各态一句「卡在哪 + 等谁 + 做什么」（档位文案表，无术语堆叠）", () => {
+  assert.match(deriveNextStepHint({ ...NS, approval: "未发起" }), /点「让 agent 继续」.*需求访谈/);
+  assert.match(deriveNextStepHint({ ...NS, approval: "待审批" }), /核对后点「确认改造文档 → 放行执行」/);
+  assert.match(deriveNextStepHint({ ...NS, approval: "已通过", state: "executing" }), /已通过.*引擎.*自动接力/);
+  assert.match(deriveNextStepHint({ ...NS, approval: "已通过", state: "reviewing" }), /等你验收.*反馈验收结论/);
+  assert.match(deriveNextStepHint({ ...NS, approval: "已通过", state: "testing" }), /等 agent 回归/);
+});
+
+test("C1-derive 下一步：未发起 ∧ 已有产出（登记文档 / 轮次留痕）⇒ 切「等你裁定 · 提交给 agent」档", () => {
+  assert.match(deriveNextStepHint({ ...NS, registeredDocs: ["甲-需求确认单.md"] }), /等你 ——.*点「提交给 agent」/);
+  assert.match(deriveNextStepHint({ ...NS, latestTurn: { state: "succeeded", summary: "已落确认单", at: "2026-09-29T10:00:00Z" } }), /等你 ——.*提交给 agent/);
+});
+
+test("C1-derive 下一步：事实段（登记产出 / 任务计数 / 最近一轮摘要）有哪项说哪项，全缺 ⇒ 不硬凑", () => {
+  const withAll = deriveNextStepHint({
+    ...NS,
+    registeredDocs: ["甲-需求确认单.md", "甲-改造文档.md"],
+    taskCounts: { total: 5, completed: 2, failed: 1 },
+    latestTurn: { state: "succeeded", summary: "本轮结论：门禁全绿", at: "2026-09-29T10:00:00Z" },
+  });
+  assert.match(withAll, /已登记产出 甲-需求确认单\.md · 甲-改造文档\.md/);
+  assert.match(withAll, /任务 2\/5 完成 · 失败 1/);
+  assert.match(withAll, /最近一轮.*本轮结论：门禁全绿/);
+  assert.doesNotMatch(deriveNextStepHint({ ...NS }), /已登记产出|任务 \d+\/\d+|最近一轮/, "无事实 ⇒ 事实段整体缺席");
+});
+
+test("C1-derive 下一步：产出 > 3 份只列前三 + 计数；摘要超上限 ⇒ 截断", () => {
+  const many = deriveNextStepHint({
+    ...NS,
+    registeredDocs: ["a.md", "b.md", "c.md", "d.md", "e.md"],
+    latestTurn: { state: "succeeded", summary: "长".repeat(LATEST_TURN_SUMMARY_MAX + 30), at: null },
+  });
+  assert.match(many, /a\.md · b\.md · c\.md 等 5 份/);
+  assert.match(many, new RegExp(`长{${String(LATEST_TURN_SUMMARY_MAX)}}…`), "摘要按上限截断，不整段刷页");
+});
+
+test("C1-derive 卡滞档：executing ∧ 无在飞轮 ∧ 最近一轮超阈值 ⇒ 建议手动「让 agent 继续」（含距今）", () => {
+  const at = "2026-09-29T10:00:00Z";
+  const then = Date.parse(at);
+  const hint = deriveNextStepHint({
+    ...NS,
+    approval: "已通过",
+    state: "executing",
+    latestTurn: { state: "succeeded", summary: "已派下一节点", at },
+    turnBusy: false,
+    nowMs: then + TURN_STALL_AFTER_MS + 60_000,
+  });
+  assert.match(hint, /agent 好像没接上/);
+  assert.match(hint, /没有进行中的轮/);
+  assert.match(hint, /距今 11min/, "「距今」= nowMs - at 单时钟差值（derive 内不读时钟）");
+  assert.match(hint, /点动作区的「让 agent 继续」/);
+});
+
+test("C1-derive 卡滞档（负向四闸）：阈值内 / 有在飞轮 / 无轮次 / 未给 nowMs ⇒ 一律不切卡滞档", () => {
+  const at = "2026-09-29T10:00:00Z";
+  const then = Date.parse(at);
+  const base = { ...NS, approval: "已通过", state: "executing", latestTurn: { state: "succeeded", summary: "s", at } };
+  assert.doesNotMatch(deriveNextStepHint({ ...base, nowMs: then + TURN_STALL_AFTER_MS - 1000 }), /好像没接上/);
+  assert.doesNotMatch(deriveNextStepHint({ ...base, nowMs: then + 999 * 3600_000, turnBusy: true }), /好像没接上/);
+  assert.doesNotMatch(deriveNextStepHint({ ...base, nowMs: then + 999 * 3600_000, latestTurn: null }), /好像没接上/);
+  assert.doesNotMatch(deriveNextStepHint({ ...base, nowMs: undefined }), /好像没接上/, "未下传 nowMs ⇒ 不可判，不猜");
+});
+
+test("C1-derive 卡滞阈值 = 定死 10 分钟（本版不引配置键）", () => {
+  assert.equal(TURN_STALL_AFTER_MS, 10 * 60 * 1000);
 });
 
 test("BD18-derive 下一步：终态先行（completed / cancelled / failed 不再引导点按钮）", () => {
   assert.match(deriveNextStepHint({ ...NS, state: "completed" }), /已完成.*无需再操作/);
   assert.match(deriveNextStepHint({ ...NS, state: "cancelled" }), /已取消.*无需再操作/);
   assert.match(deriveNextStepHint({ ...NS, state: "failed" }), /失败终态.*无需再操作/);
+});
+
+test("轨17-derive 终态文案两处不漂移：引导行 = terminalFeatureNote（墓碑行的唯一事实源）", () => {
+  for (const s of FEATURE_TERMINAL_STATES) {
+    assert.equal(
+      deriveNextStepHint({ hostFaceAssembled: true, awaitingAnswer: true, approval: "待审批", state: s }),
+      terminalFeatureNote(s),
+      `${s} 引导行直接复用终态文案，不另写一份`,
+    );
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -304,7 +384,8 @@ test("轨16-derive isTerminalFeatureState：三值闭集；null / 未知态 ⇒ 
 test("BD18-derive 下一步：approval 缺值 ⇒ 兜底行透出原值（不臆造分支）", () => {
   const hint = deriveNextStepHint({ ...NS, approval: null });
   assert.match(hint, /审批门值（当前 = 缺失）/);
-  assert.match(hint, /触发一轮/);
+  assert.doesNotMatch(hint, /触发一轮/, "兜底行不再引导一个不存在的按钮名");
+  assert.match(deriveNextStepHint({ ...NS, approval: "某种未知档" }), /当前 = 某种未知档/);
 });
 
 // ---------------------------------------------------------------------------

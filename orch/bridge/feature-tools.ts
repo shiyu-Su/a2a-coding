@@ -16,7 +16,8 @@
  *                          跳过 `canTransition`（转移表零改动、无自环）、重派指定 `failed` 节点 +
  *                          解冻闭包**外**的 `blocked` 下游，**不改 Feature 态**
  * - `handleFeatureApprove` 审批门：`waiting_approval → executing`
- * - `handleFeatureCancel`  任意非终态 → `cancelled`
+ * - `handleFeatureCancel`  非收口态 → `cancelled`；**`failed` 亦可经此归档为 `cancelled`**
+ *                          （v0.9.5 O1：仅迁 Feature 态、不动节点账面；`completed`/`cancelled` 拒）
  * - `handleFeatureTrace`   **只读**投影「这个 Feature 为什么还没完成」（在等谁 / 排队位次 / 占位档）；
  *                          **v0.8.10 O-N3 起挂成 MCP 工具 `a2a_feature_trace`**（Feature 工具组 5→6），
  *                          与工作台端点 `/api/features/:id/trace` 复用**同一实现**（两出口零第二套判据）
@@ -1049,11 +1050,15 @@ export function handleFeatureCancel(
   // 归属校验（谁建谁见）：非本组 ⇒ 拒绝（取消只能由归属组驱动）
   const denied = ownershipFailure(feature, identity);
   if (denied !== null) return denied;
-  if (isTerminalFeatureState(feature.state)) {
+  // v0.9.5（REQ-2026-09-28-10 O1）：`failed` 放行 —— cancel 是 failed 的唯一收口归档口
+  // （迁 `cancelled`，仅改 Feature 态、不动节点账面）。`completed` / `cancelled` 照旧拒绝；
+  // 转移表 `failed: []` 不改（本守卫直写放行，不经 canTransition）。
+  // **与 :905 retry 守卫刻意分叉**：那里仍拒全部三终态（终态节点不会被调度），不得顺手同步。
+  if (feature.state === "completed" || feature.state === "cancelled") {
     return {
       ok: false,
       code: "feature_terminal",
-      error: `Feature 已终态（${feature.state}），不可取消`,
+      error: `Feature 已收口（${feature.state}），不可取消（failed 可经 cancel 归档为 cancelled）`,
     };
   }
   const updated = updateFeatureState(feature.featureId, "cancelled");

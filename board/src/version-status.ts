@@ -22,7 +22,7 @@ export function isVersionLocked(version: string | null | undefined, releasedVers
   return releasedVersions.some((raw) => typeof raw === "string" && raw.trim() === v);
 }
 
-/** 版本状态闭集（显示用）：未排期 / 已发版（锁）/ 已收尾（全部终态且至少一条 completed）/ 进行中。 */
+/** 版本状态闭集（显示用）：未排期 / 已发版（锁）/ 已收尾（完成集合覆盖全部名下卡且至少一条 completed）/ 进行中。 */
 export type VersionStatus = "未排期" | "已发版" | "已收尾" | "进行中";
 
 export interface VersionStatusView {
@@ -31,9 +31,9 @@ export interface VersionStatusView {
   note: string;
   /** 该版需求总数。 */
   total: number;
-  /** 其中 completed 数。 */
+  /** 其中 completed 数（完成集合的正项）。 */
   completed: number;
-  /** 其中终态（completed / failed / cancelled）数。 */
+  /** 其中终态（completed / failed / cancelled）数 —— **只作显示计数，不参与「已收尾」判据**。 */
   terminal: number;
 }
 
@@ -43,12 +43,14 @@ export interface VersionFeatureEntry {
   version?: string | null | undefined;
 }
 
+/** 终态集合（显示计数用）：`terminal` 含 failed，**不等于完成集合**（完成集合 = completed + cancelled）。 */
 const TERMINAL_STATES: readonly string[] = ["completed", "failed", "cancelled"];
 
 /**
  * 版本状态派生（**仅显示用提示，不参与执法**）：
- * 锁 > 未排期 > 空版「进行中」 > 全终态且有 completed ⇒「已收尾」 > 其余「进行中」。
- * 判不出（存在非终态 / 空集）一律回落「进行中」，不猜。
+ * 锁 > 未排期 > 空版「进行中」 > 完成集合覆盖全部名下卡且至少一条 completed ⇒「已收尾」 > 其余「进行中」。
+ * 判据与 {@link decideVersionTransition} 的发版闸**同口径**（`completed + cancelled === total ∧ completed > 0`）；
+ * `failed` 呈现为未收口（回落「进行中」）。判不出（存在非终态 / 空集）一律回落「进行中」，不猜。
  */
 export function deriveVersionStatus(
   version: string | null | undefined,
@@ -59,9 +61,11 @@ export function deriveVersionStatus(
   const members = features.filter((f) => f.version === undefined || normalizeVersion(f.version) === v);
   const total = members.length;
   let completed = 0;
+  let cancelled = 0;
   let terminal = 0;
   for (const f of members) {
     if (f.state === "completed") completed++;
+    if (f.state === "cancelled") cancelled++;
     if (f.state !== null && f.state !== undefined && TERMINAL_STATES.includes(f.state)) terminal++;
   }
   const base = { total, completed, terminal };
@@ -71,8 +75,8 @@ export function deriveVersionStatus(
   if (v === "") {
     return { ...base, status: "未排期", note: "未排期不参与版本锁。" };
   }
-  if (total > 0 && terminal === total && completed > 0) {
-    return { ...base, status: "已收尾", note: "该版需求全部到达终态且至少一条 completed ⇒ 可发版（显示提示，不执法；在版本台账标记 released 才加锁）。" };
+  if (total > 0 && completed + cancelled === total && completed > 0) {
+    return { ...base, status: "已收尾", note: "该版需求全部收尾（completed + cancelled）且至少一条 completed ⇒ 可发版（显示提示，不执法；在版本台账标记 released 才加锁）。" };
   }
-  return { ...base, status: "进行中", note: "该版仍有未到终态的需求，或未登记已发版。" };
+  return { ...base, status: "进行中", note: "该版仍有未收尾（非终态或 failed）的需求，或未登记已发版。" };
 }

@@ -42,11 +42,21 @@ import {
 } from "./host-bridge.js";
 import {
   type BridgeQueueView,
+  type CancelTurnResult,
   type OccupantTurnView,
   type SubmittedTurn,
   type SubmitTurnInput,
   type TurnResult,
 } from "./host-turn.js";
+import {
+  type EngineStateProbe,
+  type RelayMonitorNotice,
+  type SuspendMarker,
+  HostRelay,
+  buildRelayPrompt,
+  createHostRelay,
+} from "./host-relay.js";
+import type { ChainStateSnapshot } from "./derive.js";
 import { type TurnRecord, type TurnState } from "./host-turn-ledger.js";
 
 // ---------------------------------------------------------------------------
@@ -108,6 +118,12 @@ export const TURN_BUSY = "board_turn_busy";
  * 一律拒收（收口轨 16 ③，409）。防「绕过页面直调 API」为一个已结束的需求白烧一轮。
  */
 export const FEATURE_TERMINAL = "board_feature_terminal";
+
+/**
+ * **v0.9.5 C4 · T3**：自动接力驱动器未装配（宿主面在、但 `startRelay` 未起 / 轮管理器不支持收口回调）
+ * ⇒ 按需求停链口无链可停（无内存标志可置），如实结构化 503，**不假装已停**。
+ */
+export const RELAY_NOT_ASSEMBLED = "board_relay_not_assembled";
 
 // ---------------------------------------------------------------------------
 // 纯函数
@@ -180,12 +196,21 @@ export function isActiveBridgeState(state: HostBridgeStatus["state"]): boolean {
 /**
  * 首轮提示词（纯函数）。**不出现任何 MCP 工具全名**（§3.6：claude / qoder / opencode / codex 各家不同），
  * 也不指示 agent 去「点确认」—— 门与推进的表述停在「需要人决策 ⇒ input-required」。
+ *
+ * **v0.9.5 C2**：`supplement` = 用户在板上**补充口**随本轮一起发来的自由文本（可选）；
+ * `trim` 后非空才追加一段显式标注来源的补充块，空 / 缺省 ⇒ 逐字节等同既有纯触发提示词（零行为变更）。
  */
-export function buildTurnPrompt(input: { featureId: string; org: string; version?: string | null }): string {
+export function buildTurnPrompt(input: {
+  featureId: string;
+  org: string;
+  version?: string | null;
+  /** v0.9.5 C2：用户随本轮附加的**可选**补充文本（空 / 缺省 ⇒ 不追加）。 */
+  supplement?: string | null;
+}): string {
   const versionLine = input.version !== undefined && input.version !== null && input.version !== ""
     ? ` · 版本 ${input.version}`
     : "";
-  return [
+  const lines = [
     `${TURN_PROMPT_TITLE} 需求 ${input.featureId}${versionLine} · 组织 ${input.org}`,
     "",
     "你是这条需求的**推进者**（需求实体已由板以本组织身份创建，初态停在审批门前）。",
@@ -194,7 +219,19 @@ export function buildTurnPrompt(input: { featureId: string; org: string; version
     "2. 按所处阶段产出该阶段的文档（需求确认单 / 改造文档等），写入本组织目录的 doc/{版本}/；",
     "3. 需要人决策就用 A2A 的 input-required 结束本轮，不要自问自答；",
     "4. 状态机推进（审批 / 推进 / 取消）只能经编排桥的能力做，板不代劳。",
-  ].join("\n");
+    // v0.9.5 C9（R2 定稿，board 侧一行指针）：本轮若下发子任务，先调挂起口再退出，见 workspace 纪律。
+    "5. 本轮若下发子任务，先调板侧挂起口登记 pending 清单再退出本轮（勿空占本轮预算干等）；挂起口地址与 schema 见本组织 workspace 的 AGENTS.md。",
+  ];
+  const supplement = (input.supplement ?? "").trim();
+  if (supplement !== "") {
+    lines.push(
+      "",
+      "【用户补充（本轮随附，来自板上补充口）】",
+      supplement,
+      "⇒ 请把上述补充纳入本轮判断与产出。",
+    );
+  }
+  return lines.join("\n");
 }
 
 /**
@@ -298,8 +335,19 @@ export interface TurnOps {
   findAwaitingTurn(requirementId: string): TurnRecord | null;
   /** 该需求当前在飞 / 排队的一轮（收口轨 14 防重 + 渲染禁用判据）；无 ⇒ null。 */
   busyTurnOf(requirementId: string): OccupantTurnView | null;
+  /**
+   * **v0.9.5 C4 · T3 停一轮**（按 `turnId`）：排队 ⇒ 出队落 `canceled`（**一条也不发**）；
+   * 在飞 ⇒ `tasks/cancel` 收口 `canceled`。停链口用它清该需求占闸的那一轮。
+   * 窄接口替身未实现 ⇒ 停链口只置标志、不取消（既有行为不变）。
+   */
+  cancelTurn?(turnId: string): Promise<CancelTurnResult>;
   queueView(org: string): BridgeQueueView;
   activeTurns(org?: string): TurnResult[];
+  /**
+   * **v0.9.5 C1**：装 / 换轮收口回调（自动接力的信号源）。轮管理器可选实现；
+   * 未实现（窄接口替身）⇒ `startRelay` 不装（既有行为零变更）。
+   */
+  setTurnSettledHandler?(handler: ((result: TurnResult) => void) | null): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -366,6 +414,33 @@ export interface StopBridgeOutcome {
   display: string;
 }
 
+/**
+ * **v0.9.5 C4 · T3** 按需求停链的收口形状（`POST /features/:id/stop-chain` 的落点）。
+ * 停链 = 置**内存**停链标志（接力决策器见标志即停、此后不再点火）+ 清该需求占闸的那一轮。
+ */
+export interface StopChainOutcome {
+  ok: boolean;
+  featureId: string;
+  /** 停链标志是否已置（未起接力 / 标识缺失 ⇒ false）。 */
+  chainStopped: boolean;
+  /** 被清的那一轮 `turnId`（无在飞 / 排队轮，或替身未实现 `cancelTurn` ⇒ null）。 */
+  cancelledTurnId: string | null;
+  /** 取消动作的显示文案（无取消 ⇒ null）。 */
+  cancelDisplay: string | null;
+  error: { code: string; message: string } | null;
+  display: string;
+}
+
+/** **v0.9.5 C8 · T8** 心跳唤醒点火的收口（`BoardHostFace.wakeTurn`；计数归接力驱动器）。 */
+export interface WakeFireOutcome {
+  ok: boolean;
+  reason: string;
+  turnId?: string;
+  round?: number;
+  /** 撞车的占用轮 `turnId`（仅撞 occupant 时有值）；供心跳结构化留痕。 */
+  occupantTurnId?: string | null;
+}
+
 export interface HostFaceDeps {
   bridges: BridgeOps;
   turns: TurnOps;
@@ -382,6 +457,11 @@ export interface HostFaceDeps {
   idleStopMs?: number;
   /** 单轮有界等待上限（ms）；缺省 ⇒ 交给 BD4b 的缺省。 */
   turnTimeoutMs?: number;
+  /**
+   * **宿主后端模型**（v0.9.5 · 本次仅开 `model` 一键）：有值 ⇒ 起桥时透传 `agentConfig.model`；
+   * `null` / 缺省 / 空串 ⇒ 不注入（后端自身缺省）。**板不校验取值**（非法值由后端处置）。
+   */
+  hostModel?: string | null;
   /** 注入给后端的 MCP 端点推导（缺省由 BD4a 的 `defaultMcpUrlForOrg` 口径给出）。 */
   mcpUrlFor?: (org: string) => string;
   /**
@@ -395,6 +475,21 @@ export interface HostFaceDeps {
    * 未注入 ⇒ 不判停用（等价于「台账没有停用概念」，保持 BD1–BD2 期间的宿主面行为）。
    */
   isOrgDisabled?: (org: string) => boolean;
+  /**
+   * **v0.9.5 C3 只读引擎态探针**（自动接力点火判据）：轮收口后一跳 `getFeature` 重取
+   * `state/stage/approval`。由装配方（`index.ts`，`BridgeClient` 的所有者）注入只读实现；
+   * 未注入 ⇒ 接力决策判不了引擎态 ⇒ **保守停链、不点火**（既有行为不变）。
+   */
+  engineProbe?: EngineStateProbe | null;
+  /**
+   * **v0.9.5 增补二 · D2 链状态只读快照**（详情页「链状态」一行的事实源）：
+   * `featureId → { chainState, reason, source, pendingCount }`。由装配层（`index.ts`）把
+   * 接力驱动器（停链标志 + 来源）、挂起台账（pending 条数）、心跳（自动 armed）三处内存态**归一成一个只读闭包**
+   * 注入 —— 本文件拿不到 heartbeat / 台账，故走注入而非自造第二套事实。
+   * **只读**：实现不得写任何链状态。未注入 ⇒ {@link BoardHostFace.chainSnapshotOf} 回落接力驱动器
+   * 内存态给出最小快照（`pendingCount = null`）；接力也未起 ⇒ `null`（读面不渲染该行）。
+   */
+  chainSnapshot?: (featureId: string) => ChainStateSnapshot | null;
 }
 
 // ---------------------------------------------------------------------------
@@ -412,7 +507,7 @@ export interface HostFaceDeps {
  * 「触发一轮」与「轮内重拉」两条路同闸。**`prepareWorkspace` 纯函数不动**（mkdir 供给语义保持无组织状态知识）。
  */
 export function orgBridgeConfig(
-  deps: Pick<HostFaceDeps, "orgsDir" | "kind" | "idleStopMs" | "mcpUrlFor" | "isOrgDisabled">,
+  deps: Pick<HostFaceDeps, "orgsDir" | "kind" | "idleStopMs" | "mcpUrlFor" | "isOrgDisabled" | "hostModel">,
   org: string,
 ): HostBridgeConfig | { error: { code: string; message: string } } {
   if (deps.orgsDir === null) {
@@ -440,6 +535,8 @@ export function orgBridgeConfig(
     idleStopMs: deps.idleStopMs ?? DEFAULT_IDLE_STOP_MS,
   };
   if (deps.mcpUrlFor !== undefined) config.mcpUrl = deps.mcpUrlFor(org);
+  // v0.9.5 C2：宿主后端模型透传 —— **有值才带**，只放 `model` 一键（`backendCmd` 等不在本次范围）。
+  if (deps.hostModel != null && deps.hostModel !== "") config.agentConfig = { model: deps.hostModel };
   return config;
 }
 
@@ -449,9 +546,200 @@ export function orgBridgeConfig(
  */
 export class BoardHostFace {
   private readonly deps: HostFaceDeps;
+  /** v0.9.5 C1：接力驱动器（`startRelay` 装配；未装配 ⇒ `null`，人工动作钩子与停链口为空操作）。 */
+  private relay: HostRelay | null = null;
 
   constructor(deps: HostFaceDeps) {
     this.deps = deps;
+  }
+
+  // -- v0.9.5 C1：自动接力入口 / 停链口 ---------------------------------------
+
+  /**
+   * **起接力**（幂等）：建 {@link HostRelay} 并把轮收口回调接到轮管理器。
+   *
+   * 回调是接力的**唯一信号源**（`HostTurnManager.onTurnSettled`，在交闸与落计数之后触发）；
+   * 轮管理器未实现 `setTurnSettledHandler`（窄接口替身 / 既有测试）⇒ 本方法返 `null`、**不装**，
+   * 既有行为零变更。探针来自 `HostFaceDeps.engineProbe`（C3）；未注入 ⇒ 决策保守停链。
+   */
+  startRelay(input?: {
+    chainLimit?: number;
+    log?: (line: string) => void;
+    /**
+     * **v0.9.5 C7/C8** 显式挂起条目查询（返 `null` = 无条目）：供决策器分辨
+     * 「显式挂起（MON1）」与「忘调挂起口的自动 armed（MON2，⑤ 兜底适用）」。
+     */
+    suspendLookup?: (requirementId: string) => SuspendMarker | null;
+    /**
+     * **v0.9.5 C8** 监视归属通知（只读告知）：心跳据此维护自动 armed 注册表。
+     */
+    onMonitor?: (notice: RelayMonitorNotice) => void;
+  }): HostRelay | null {
+    if (this.deps.turns.setTurnSettledHandler === undefined) return null;
+    if (this.relay !== null) return this.relay;
+    const deps: Parameters<typeof createHostRelay>[0] = {
+      submitTurn: (i) => this.deps.turns.submitTurn(i),
+      buildPrompt: buildRelayPrompt,
+      probe: this.deps.engineProbe ?? null,
+    };
+    if (input?.chainLimit !== undefined) deps.chainLimit = input.chainLimit;
+    if (input?.log !== undefined) deps.log = input.log;
+    if (input?.suspendLookup !== undefined) deps.suspendLookup = input.suspendLookup;
+    if (input?.onMonitor !== undefined) deps.onMonitor = input.onMonitor;
+    const relay = createHostRelay(deps);
+    this.relay = relay;
+    this.deps.turns.setTurnSettledHandler((result) => relay.handleTurnSettled(result));
+    return relay;
+  }
+
+  /** 已装配的接力驱动器（未起 ⇒ `null`）。 */
+  relayOf(): HostRelay | null {
+    return this.relay;
+  }
+
+  /** **按需求停链**（T3 停链口写面）：置内存停链标志（来源 `user`），此后该需求任何收口都不再点火。 */
+  requestStopChain(featureId: string): boolean {
+    if (this.relay === null) return false;
+    this.relay.requestStop(featureId, "route", "user");
+    return true;
+  }
+
+  /** 解停链标志（「新起接力」）。 */
+  clearStopChain(featureId: string): boolean {
+    if (this.relay === null) return false;
+    this.relay.clearStop(featureId, "route");
+    return true;
+  }
+
+  /** 该需求是否已置停链标志（未起接力 ⇒ `false`）。 */
+  chainStopped(featureId: string): boolean {
+    return this.relay?.isChainStopped(featureId) ?? false;
+  }
+
+  /** 该需求停链标志的**来源与原因**（未置 / 未起接力 ⇒ `null`）。只读，不改任何链状态。 */
+  chainStopView(featureId: string): { reason: string; source: "user" | "auto" } | null {
+    return this.relay?.stopView(featureId) ?? null;
+  }
+
+  /**
+   * **详情页「链状态」一行的事实源**（v0.9.5 增补二 · D2，只读）：
+   * ① 装配层注入的快照闭包优先（含挂起台账 pending 条数 / 心跳自动 armed）；
+   * ② 未注入 ⇒ 回落接力驱动器的内存停链标志（`pendingCount = null` = 读不到就不显示个数）；
+   * ③ 两者都拿不到 ⇒ `null` ⇒ 读面**不渲染该行、不报错**；
+   * ④ 取值**抛错** ⇒ 一行留痕 + `null`（同样不崩详情页）。
+   * 本方法**不写任何状态**（既有的「人工动作只清 auto」解冻只发生在 `noteManualAction` 路径）。
+   */
+  chainSnapshotOf(featureId: string): ChainStateSnapshot | null {
+    const id = featureId.trim();
+    if (id === "") return null;
+    try {
+      const injected = this.deps.chainSnapshot;
+      if (injected !== undefined) return injected(id) ?? null;
+      const stop = this.relay?.stopView(id);
+      if (stop !== undefined && stop !== null) {
+        return { chainState: "stopped", reason: stop.reason, source: stop.source, pendingCount: null };
+      }
+      if (this.relay === null) return null;
+      return { chainState: "monitoring", reason: null, source: null, pendingCount: null };
+    } catch (err: unknown) {
+      this.relay?.noteSnapshotFailure(id, err instanceof Error ? err.message : String(err));
+      return null;
+    }
+  }
+
+  /**
+   * **按需求停链**（v0.9.5 C4 · T3 写路由 `POST /features/:id/stop-chain` 的落点）：
+   * ① 置内存停链标志（接力决策器**判定序①** 见标志即停 ⇒ 此后任何收口都不再点火）；
+   * ② 复用 {@link TurnOps.cancelTurn} 清该需求占闸的那一轮（排队 ⇒ 出队落 `canceled`、**一条也不发**；
+   *    在飞 ⇒ `tasks/cancel` 收口 `canceled`）—— 被取消的收口**必然触发收口回调**，但标志已先置
+   *    ⇒ 判定序① 短路，不会「停链 → 取消 → 回调 → 又点一发」自激。
+   *
+   * **不落 `.data/` 台账、不跨重启持久**（改造文档 §2-C4 显式钉）：接力链本身是进程内 Promise 链，
+   * 重启即无链可停。未起接力（`startRelay` 返 null）⇒ 结构化 {@link RELAY_NOT_ASSEMBLED}，不假装已停。
+   */
+  async stopChain(featureId: string): Promise<StopChainOutcome> {
+    const id = featureId.trim();
+    if (id === "") {
+      return {
+        ok: false,
+        featureId: id,
+        chainStopped: false,
+        cancelledTurnId: null,
+        cancelDisplay: null,
+        error: { code: TURN_REQUEST_INVALID, message: "需求标识缺失：停链按需求定位" },
+        display: "停链失败：需求标识缺失",
+      };
+    }
+    if (this.relay === null) {
+      return {
+        ok: false,
+        featureId: id,
+        chainStopped: false,
+        cancelledTurnId: null,
+        cancelDisplay: null,
+        error: {
+          code: RELAY_NOT_ASSEMBLED,
+          message: "自动接力驱动器未装配（宿主面在、但接力未起）⇒ 无内存链可停，不假装已停",
+        },
+        display: "停链失败：自动接力未装配",
+      };
+    }
+    // 先置标志再取消：取消触发的收口回调据此短路（判定序①），不会自激。
+    // 来源 = `user`（用户在停链口主动停）⇒ 人工动作（补充 / 回答）不解冻，见增补二 D2。
+    this.relay.requestStop(id, "route", "user");
+    const busy = this.deps.turns.busyTurnOf(id);
+    const busyTurnId = busy === null ? null : busy.turnId;
+    const busyRound = busy === null ? null : busy.round;
+    let cancelledTurnId: string | null = null;
+    let cancelDisplay: string | null = null;
+    if (busy !== null && this.deps.turns.cancelTurn !== undefined) {
+      const result = await this.deps.turns.cancelTurn(busy.turnId);
+      cancelledTurnId = result.turnId;
+      cancelDisplay = result.display;
+    }
+    let display: string;
+    if (cancelledTurnId !== null) {
+      const roundLabel = busyRound === null ? "" : `第 ${String(busyRound)} 轮`;
+      display = `已停链：已取消该需求${roundLabel}（${cancelledTurnId}）；此后不再自动点火（重启板进程即恢复）`;
+    } else if (busyTurnId !== null) {
+      display = `已停链：该需求有在飞 / 排队轮（${busyTurnId}）但取消能力不可用 ⇒ 仅置停链标志`;
+    } else {
+      display = "已停链：该需求无在飞 / 排队轮，此后不再自动点火（重启板进程即恢复）";
+    }
+    return { ok: true, featureId: id, chainStopped: true, cancelledTurnId, cancelDisplay, error: null, display };
+  }
+
+  /**
+   * **心跳唤醒点火**（v0.9.5 C8 · T8）：把心跳命中的**结构化事实提示词**经接力驱动器发一轮
+   * （同 `contextId` 新一轮由 `openSession` 按需求自动完成，不显式传 round/contextId）。
+   *
+   * **计数 / 刹车归接力驱动器**：`fireWake` 复用与自动接力**同一套刹车**（停链标志 / 链内计数触顶）与
+   * **同一链内连续点火计数** —— 板面**不另造**第二套 guard（R2 规格④）。
+   * **撞 occupant 的分诊也在接力驱动器**（D1：唤醒不再一撞即停，按占用者身份跳过 / 退让 / 超限停链）；
+   * 板面只透传 `turnId`（分诊的身份键）与 `occupantTurnId`（留痕）。
+   * 未起接力 ⇒ `ok:false`（不假装已点火）；提交抛错 ⇒ `ok:false`（保守不记去重位，下拍可重试）。
+   */
+  wakeTurn(input: { featureId: string; org: string; prompt: string; turnId?: string | null }): WakeFireOutcome {
+    const featureId = input.featureId.trim();
+    const org = this.resolveOrg(input.org);
+    if (featureId === "") return { ok: false, reason: "request_invalid" };
+    if (org === "") return { ok: false, reason: "org_not_resolved" };
+    if (this.relay === null) return { ok: false, reason: "relay_not_assembled" };
+    const result = this.relay.fireWake({
+      requirementId: featureId,
+      org,
+      prompt: input.prompt,
+      turnId: input.turnId ?? null,
+    });
+    if (!result.ok) {
+      const failed: WakeFireOutcome = { ok: false, reason: result.reason };
+      if (result.occupantTurnId !== undefined) failed.occupantTurnId = result.occupantTurnId;
+      return failed;
+    }
+    const outcome: WakeFireOutcome = { ok: true, reason: result.reason };
+    if (result.turnId !== undefined) outcome.turnId = result.turnId;
+    if (result.round !== undefined) outcome.round = result.round;
+    return outcome;
   }
 
   /** 配置面（状态页如实显示「组织目录未配置 ⇒ 宿主面不可用」，不得静默）。 */
@@ -489,12 +777,17 @@ export class BoardHostFace {
    * `org` 传桥侧的 `ownerGroup`；为空时**只**回退到板级组织名配置（两者皆无 ⇒ 结构化
    * {@link ORG_NOT_RESOLVED}，**不猜组织**）。不抛异常：一切失败都是 `ok = false` + 结构化错误。
    * `kind = "confirm"` 与缺省走**同一条通道**，只是提示词换成 {@link buildConfirmPrompt}。
+   *
+   * **v0.9.5 C2**：`supplement` = 板上触发一轮表单随附的**可选**补充文本，仅对 `kind = "trigger"`
+   * 生效（拼接见 {@link buildTurnPrompt}）；`confirm` 是固定指令模板、表单无该字段，故忽略。
    */
   async triggerTurn(input: {
     featureId: string;
     org: string | null;
     version?: string | null;
     kind?: "trigger" | "confirm";
+    /** v0.9.5 C2：本轮随附补充文本（仅 trigger 通道消费；空 / 缺省 = 纯触发）。 */
+    supplement?: string | null;
   }): Promise<TriggerTurnOutcome> {
     const featureId = input.featureId.trim();
     const org = this.resolveOrg(input.org);
@@ -520,8 +813,17 @@ export class BoardHostFace {
     const up = await this.startBridge(org, base);
     if (up.early !== null) return up.early;
 
-    const promptInput = { featureId, org, ...(input.version !== undefined ? { version: input.version } : {}) };
+    const promptInput: { featureId: string; org: string; version?: string | null; supplement?: string } = {
+      featureId,
+      org,
+    };
+    if (input.version !== undefined) promptInput.version = input.version;
+    // v0.9.5 C2：补充文本只走 trigger 通道（confirm 是固定指令模板，表单无该字段）。
+    const supplement = input.kind === "confirm" ? "" : (input.supplement ?? "").trim();
+    if (supplement !== "") promptInput.supplement = supplement;
     const text = input.kind === "confirm" ? buildConfirmPrompt(promptInput) : buildTurnPrompt(promptInput);
+    // v0.9.5 C1：人工动作（补充 / 确认）⇒ 链内连续自动点火计数清零（接力链从人这里重新起算）。
+    this.relay?.noteManualAction(featureId, input.kind === "confirm" ? "confirm" : "supplement");
     const submitted = this.deps.turns.submitTurn({
       org,
       requirementId: featureId,
@@ -586,6 +888,8 @@ export class BoardHostFace {
     if (busy !== null) return this.busyOutcome({ ...base, org }, null, busy, "回答");
     const up = await this.startBridge(org, { ...base, org });
     if (up.early !== null) return up.early;
+    // v0.9.5 C1：人工动作（澄清回答）⇒ 链内连续自动点火计数清零。
+    this.relay?.noteManualAction(featureId, "answer");
     const submitted = this.deps.turns.answerTurn({
       org,
       requirementId: featureId,
@@ -601,6 +905,15 @@ export class BoardHostFace {
    */
   awaitingTurnOf(requirementId: string): TurnRecord | null {
     return this.deps.turns.findAwaitingTurn(requirementId);
+  }
+
+  /**
+   * 该需求**最近一条板发轮记录**（v0.9.5 C7 · T7 挂起口 `turnId` 归属判据的唯一事实源）：
+   * 挂起口要求 `turnId` 必须等于本值（R2 定稿：**不设时间窗**，旧轮一律拒）。
+   * 台账 / 内存都以轮管理器为单点 —— 本方法只是透传，不另立第二套轮账。
+   */
+  latestTurnOf(requirementId: string): TurnRecord | null {
+    return this.deps.turns.latestTurnOf(requirementId);
   }
 
   /**

@@ -16,17 +16,17 @@ import {
   AGENT_VIEW_CALIBRATION_NOTE,
   B13_CALIBRATION_NOTES,
   INFLIGHT_CALIBRATION_NOTE,
+  LATEST_TURN_SUMMARY_MAX,
   PARALLELISM_NOTE,
-  deriveConfirmAffordance,
+  deriveActionAffordance,
   deriveDisplayStage,
   deriveNextStepHint,
   deriveScheduleGateOpen,
-  deriveTerminalFeatureAffordance,
-  deriveTurnBusyAffordance,
   formatDurationBetween,
+  isTerminalFeatureState,
   traceWaitDisplay,
 } from "../derive.js";
-import type { ConfirmAffordance, NextStepInput, TurnProgressView } from "../derive.js";
+import type { ChainStateLine, NextStepInput, TurnProgressView } from "../derive.js";
 import type { DocsSource } from "../docs-read.js";
 import {
   MERMAID_ASSET,
@@ -36,7 +36,6 @@ import {
   renderMarkdown,
   vendoredAssetExists,
 } from "../docs-render.js";
-import type { OccupantTurnView } from "../host-turn.js";
 import type { HostStatusEntry, StopBridgeOutcome, TriggerDisposition, TriggerTurnOutcome } from "../host-face.js";
 import { NO_OWNER_GROUP_LABEL } from "../orgs-view.js";
 import { orgSpaceLink } from "../org-space.js";
@@ -204,6 +203,19 @@ export function registeredDecisionDocVersions(decisions: string | null | undefin
 }
 
 /**
+ * decisions 登记里的**产出文件清单**（保序去重，v0.9.5 C1 引导行的事实源之一）：
+ * 只收 `extractRegisteredDocPath` 命中的条目并取**文件名段**（与「阶段产出」区同一提取口径）。
+ */
+export function registeredDecisionDocFiles(decisions: string | null | undefined): string[] {
+  const seen = new Set<string>();
+  for (const item of parseDecisionItems(decisions)) {
+    const hit = extractRegisteredDocPath(item);
+    if (hit !== null && hit.file !== "") seen.add(hit.file);
+  }
+  return [...seen];
+}
+
+/**
  * M6 改版失联警示行（纯文案警示 ⇒ 不新增页面脚本，白名单内联字面量常量闭集（N3 纪律钉）不动）：
  * 「阶段产出」里存在版本段 ≠ 当前版本的文档登记 ⇒ 该文档的读锚 `doc/{旧版本}/` 已随改版失联
  * （打开端点按当前版本定位，改版不搬文档 = 板零本地写 ⇒ 点开 404，失联为已知语义）。
@@ -220,12 +232,23 @@ export function renderVersionSwitchWarningLine(
 }
 
 /**
+ * 折叠层的一节（v0.9.5 C3）：原生 `<details>`（服务端渲染、**零脚本**，不碰页面脚本六元闭集锚）·
+ * 默认收起 ⇒ summary 只给「这是什么 + 有多少」，正文（含口径长文）展开才见。
+ * `content` 为空 ⇒ 整节不渲染（C2 空区块短路的落点）。
+ */
+function foldSection(summary: string, content: string): string {
+  if (content === "") return "";
+  return `<details class="fold"><summary>${escapeHtml(summary)}</summary><div class="fold-body">${content}</div></details>`;
+}
+
+/**
  * 详情页「阶段产出」区（REQ-v0.9.2 按需求归约：与旧「产出登记」合并为单区）：
  * 数据源 = 本需求 `decisions` 逐条 —— 含 `doc/…/*.md` 路径的条目即产出条目（**单链接、链接文字 = 剥去
  * `doc/{版本}/` 后的文件名**，复用 `GET /features/:id/docs` 守卫端点；版本取当前值，登记路径不进链接）；
  * 其余条目原样保留（登记即产出记录，不再两处重复）。
  * 无含 doc 路径的条目 ⇒ 「无（本需求未登记产出）」+ 口径一句；不回落版本目录清单（用户裁决）。
  * `currentVersion` 传入时（排期表单在本页渲染）区首追加 M6 改版失联警示行，不传 ⇒ 行为不变。
+ * v0.9.5 C3：本区整体在折叠层内（{@link foldSection}），口径长文再套一层 {@link foldCalibration}。
  */
 function renderStageOutputs(
   featureId: string,
@@ -246,8 +269,21 @@ function renderStageOutputs(
   const warning =
     currentVersion === undefined ? "" : renderVersionSwitchWarningLine(decisions, currentVersion);
   return `<h2>阶段产出</h2>
-<p class="hint">数据 = 本需求 Feature Context 的 <code>decisions</code>（宿主 agent 经 <code>advance</code> 逐轮 append）：条目 = <code>decisions</code> 登记的文档文件名（剥去 <code>doc/{版本}/</code> 前缀作链接文字，登记路径不再展示），含 <code>doc/…&#47;*.md</code> 路径的条目即产出条目，打开经板读文档面守卫（版本白名单 / 根内收 / 仅 .md，版本取当前排期值）。链接不带 src ⇒ 服务端先查主仓、未命中自动回落组织工作区（实际来源在文档页头标注）。</p>
+${foldCalibration(
+  "口径：产出从哪来、怎么打开",
+  `<p class="hint">数据 = 本需求 Feature Context 的 <code>decisions</code>（宿主 agent 经 <code>advance</code> 逐轮 append）：条目 = <code>decisions</code> 登记的文档文件名（剥去 <code>doc/{版本}/</code> 前缀作链接文字，登记路径不再展示），含 <code>doc/…&#47;*.md</code> 路径的条目即产出条目，打开经板读文档面守卫（版本白名单 / 根内收 / 仅 .md，版本取当前排期值）。链接不带 src ⇒ 服务端先查主仓、未命中自动回落组织工作区（实际来源在文档页头标注）。</p>`,
+)}
 ${warning}${body}`;
+}
+
+/**
+ * 口径长文折叠（v0.9.5 C3）：把「说明数据从哪来 / 执法在哪」的长句包进原生 `<details>`（默认收起）。
+ * **零脚本** —— 展开收起是 `<details>` 的原生行为，不新增页面脚本（N3 闭集锚不动）。
+ * 传入空串 ⇒ 空串（调用方条件化时不必再判）。
+ */
+export function foldCalibration(summary: string, content: string): string {
+  if (content === "") return "";
+  return `<details class="calib"><summary>${escapeHtml(summary)}</summary><div class="calib-body">${content}</div></details>`;
 }
 
 /** 文档页双档（BD14）：render = markdown 子集渲染；raw = 现行 `<pre>` 原文视图。 */
@@ -360,7 +396,7 @@ export function renderRequirementForm(
         ? `<p class="hint">组织目录根（orgsDir）<b>就绪</b>：<code>${escapeHtml(orgsStatus.orgsDir)}</code></p>`
         : orgsStatus.tier === "problem"
           ? `<p class="hint err"><code>${escapeHtml(orgsStatus.code)}</code> 组织目录根已配置但不可用：${escapeHtml(orgsStatus.message)}</p>`
-          : `<p class="hint warn"><code>board_orgs_dir_not_configured</code> 组织目录根（orgsDir）未装配：提需求本身不受影响，但触发一轮 / 起宿主桥将结构化 503，请配置 config.json 的 orgsDir 后重启板。</p>`;
+          : `<p class="hint warn"><code>board_orgs_dir_not_configured</code> 组织目录根（orgsDir）未装配：提需求本身不受影响，但<b>详情页动作区</b>提交 / 起宿主桥将结构化 503，请配置 config.json 的 orgsDir 后重启板。</p>`;
   return `<h2>提需求</h2>
 ${orgsLine}
 <p class="hint">建一条需求 = 以<b>${space ? "空间路径组织（免选）" : "表单所填组织名"}</b>${space ? "" : "（留空则板级默认）"}经唯一写封装（<code>requirement.ts</code>）在桥侧建 Feature，落初态 <code>waiting_approval</code>（登记 <code>stage=需求分析</code> · <code>approval=未发起</code>）。板<b>不写状态机</b>：审批 / 推进 / 取消一律归编排 agent。</p>
@@ -436,9 +472,13 @@ export function renderScheduleForm(
   const currentLocked = isVersionLocked(current, releasedVersions);
   const lockHint = currentLocked
     ? `<p class="hint warn">本需求现排期版本 <code>${escapeHtml(current)}</code> <b>已发版（🔒 锁定）</b>：不可移出、取消排期或改入其它版本（服务端 409 拒绝；同版本无变化提交放行）。在版本台账把该版重开为进行中即实时生效。</p>`
-    : `<p class="hint">已发版版本（版本台账标记 <code>released</code> = 列头标 🔒 已发版）不可改入 / 移出（服务端 409 执法）；字段仍可输入，执法在服务端。</p>`;
+    : "";
   return `<h2>排期</h2>
-<p class="hint">排期写 = 板唯一放开的登记字段写（经 <code>feature-schedule.ts</code> 走 advance「<code>to</code> = 当前态 ∧ 仅 <code>version</code>」特例，<b>不写状态机迁移</b>）；留空提交 = 删除排期（回需求池）。改版前先看「阶段产出」区的失联警示。</p>
+${foldCalibration(
+  "口径：排期写改什么、锁在哪",
+  `<p class="hint">排期写 = 板唯一放开的登记字段写（经 <code>feature-schedule.ts</code> 走 advance「<code>to</code> = 当前态 ∧ 仅 <code>version</code>」特例，<b>不写状态机迁移</b>）；留空提交 = 删除排期（回需求池）。改版前先看「阶段产出」区的失联警示。</p>
+<p class="hint">已发版版本（版本台账标记 <code>released</code> = 列头标 🔒 已发版）不可改入 / 移出（服务端 409 执法）；字段仍可输入，执法在服务端。</p>`,
+)}
 ${lockHint}
 <form method="post" action="/features/${encodeURIComponent(featureId)}/schedule" class="w" data-submit="已提交，排期写入中…">
 <label>版本<input name="version" value="${escapeHtml(current)}" placeholder="如 v0.9.2；留空 = 删除排期"></label>
@@ -457,6 +497,48 @@ ${lockHint}
 // 需求详情（单 Feature + 任务 + trace 三面）
 // ---------------------------------------------------------------------------
 
+/**
+ * 详情页组装的**上层件**（v0.9.5 C1/C5/C6 · 由 `server.ts` 按宿主面数据渲染后下传）：
+ * 三层骨架 = 常驻层（字段表 → 引导行 → 需求原文）→ 阶段工作区（轮留痕 / 轮次进度 / 动作区 / 回答框）
+ * → 折叠层（阶段产出 · 执行明细 · 验收轨迹 · 排期）。
+ * 缺省 `{}` ⇒ 这些件不渲染（未接线调用方行为不变）。
+ */
+export interface FeatureDetailExtras {
+  /** C1 引导行（字段表之后第一屏） */
+  nextStepHtml?: string;
+  /** C5 单动作区（补充框 + 状态感知按钮；终态 / 未装配 ⇒ 空串） */
+  actionAreaHtml?: string;
+  /** 待澄清回答框（BD9，仅存在 awaiting 轮时非空） */
+  answerFormHtml?: string;
+  /** C6 最近一轮留痕（state / 摘要 / 时间） */
+  turnTraceHtml?: string;
+  /** 轮次进度行（REQ-v0.9.2 N7） */
+  turnProgressHtml?: string;
+  /** 链状态行（v0.9.5 增补二 · D2：监视中 / 链已停 · 快照缺席 ⇒ 空串不渲染） */
+  chainStateHtml?: string;
+  /** 依赖图正文（graph-view 产出；无任务 ⇒ 空串，C2） */
+  graphHtml?: string;
+  /** 验收轨迹（`renderAcceptanceSection` 产出；单段零失败 ⇒ 空串，C2） */
+  acceptanceHtml?: string;
+}
+
+/** 需求原文的截断口径（C4 · 复用 {@link truncate} 的板侧单点）。 */
+const REQUIREMENT_TRUNCATE_MAX = 120;
+
+/**
+ * C4 需求原文上详情页（head 区常驻，与字段表同屏）：
+ * 120 字截断 + 展开全文 = 原生 `<details>`（零脚本）；老桥 / 未填 ⇒ 不渲染该区块。
+ */
+function renderRequirementOrigin(requirement: string | null | undefined): string {
+  const text = (requirement ?? "").trim();
+  if (text === "") return "";
+  if (text.length <= REQUIREMENT_TRUNCATE_MAX) {
+    return `<h2>需求原文</h2>\n<pre class="result">${escapeHtml(text)}</pre>`;
+  }
+  return `<h2>需求原文</h2>
+<details class="req-src"><summary>${escapeHtml(truncate(text, REQUIREMENT_TRUNCATE_MAX))}</summary><pre class="result">${escapeHtml(text)}</pre></details>`;
+}
+
 export function renderFeatureDetail(
   detail: FeatureDetailView,
   trace: FeatureTraceView | null,
@@ -464,6 +546,7 @@ export function renderFeatureDetail(
   nowMs: number,
   withScheduleForm: boolean = false,
   releasedVersions: readonly string[] = [],
+  extras: FeatureDetailExtras = {},
 ): string {
   const f = detail.feature;
   const d = deriveDisplayStage(f.state, f.stage);
@@ -493,12 +576,20 @@ export function renderFeatureDetail(
       "</tr>"
     );
   });
-  const tasks = `<h2>任务（${detail.tasks.length}）</h2>
+  // C2 空区块短路①：任务 0 ⇒ 任务表整节不渲染（空表也是噪声，Step 0 卡尤甚）。
+  const tasks =
+    taskRows.length === 0
+      ? ""
+      : `<h2>任务（${detail.tasks.length}）</h2>
 <table><thead><tr><th>taskId</th><th>项目</th><th>状态</th><th>档</th><th>失败类</th><th>重派</th><th>依赖</th><th>创建</th><th>开始</th><th>结束</th><th>排队时长</th><th>执行时长</th></tr></thead>
-<tbody>${taskRows.length === 0 ? emptyRow(12, "（无任务）") : taskRows.join("")}</tbody></table>`;
+<tbody>${taskRows.join("")}</tbody></table>`;
   let traceHtml: string;
   if (trace === null) {
+    // C2 执行注记（R1）：**trace 读取失败不属短路范围** —— 读失败仍如实显示（不静默）。
     traceHtml = `<h2>进展三面（在等谁 / 位次 / 为什么没跑）</h2><p class="hint err">trace 读取失败：${escapeHtml(traceError ?? "未知错误")}（桥 trace 接口不可达时如实显示，不静默）</p>`;
+  } else if (trace.nodes.length === 0) {
+    // C2 空区块短路②：trace 成功但无非终态节点（无在飞 / 无排队 / 无失败可等）⇒ 整节不渲染。
+    traceHtml = "";
   } else {
     const rows = trace.nodes.map((n) => {
       const w = traceWaitDisplay(n, nowMs);
@@ -518,14 +609,33 @@ export function renderFeatureDetail(
       );
     });
     traceHtml = `<h2>进展三面（在等谁 / 位次 / 为什么没跑）</h2>
-<p class="hint">数据 = <code>GET /api/features/:id/trace</code> 原样复用；<code>waitReason</code> 为八值闭集，原样显示。</p>
+${foldCalibration(
+  "口径：trace 数据从哪来",
+  `<p class="hint">数据 = <code>GET /api/features/:id/trace</code> 原样复用；<code>waitReason</code> 为八值闭集，原样显示。</p>`,
+)}
 <table><thead><tr><th>taskId</th><th>项目</th><th>状态</th><th>档</th><th>waitReason</th><th>写门（projectBusy）</th><th>读档占位（readOccupants）</th><th>位次</th><th>已等待（只取 waitedSince）</th><th>在等谁</th></tr></thead>
-<tbody>${rows.length === 0 ? emptyRow(10, "（无非终态节点）") : rows.join("")}</tbody></table>`;
+<tbody>${rows.join("")}</tbody></table>`;
   }
+  // C2 空区块短路③：无任务 ⇒ 依赖图不渲染（graph-view 侧同判据；此处再兜一层，未接线调用方也不出空节）。
+  const graph = (extras.graphHtml ?? "").trim() === "" ? "" : `\n${extras.graphHtml}`;
+  const execution = foldSection("执行明细（任务 / 进展三面 / 依赖图）", `${tasks}${traceHtml}${graph}`);
   const stageOutputsSection = renderStageOutputs(f.featureId, f.decisions, f.version ?? null);
   // M6：排期表单上详情页（GET 面）；缺省不渲染 ⇒ 未接线的调用方保持旧行为。
   const scheduleForm = withScheduleForm ? renderScheduleForm(f.featureId, f.version, releasedVersions) : "";
-  return `${head}\n${stageOutputsSection}\n${tasks}\n${traceHtml}\n${scheduleForm}`;
+  // C5 终态墓碑：终态需求**不出动作区与回答框**（调用方误传也不渲染）—— 一行结论摘要 = 引导行 +
+  // 最近一轮留痕，其余区块本就默认折叠。
+  const terminal = isTerminalFeatureState(f.state);
+  const workspace = `${extras.turnTraceHtml ?? ""}${extras.turnProgressHtml ?? ""}${
+    extras.chainStateHtml ?? ""
+  }${terminal ? "" : `${extras.actionAreaHtml ?? ""}${extras.answerFormHtml ?? ""}`}`;
+  return `${head}
+${extras.nextStepHtml ?? ""}
+${renderRequirementOrigin(f.requirement)}
+${workspace}
+${foldSection("阶段产出", stageOutputsSection)}
+${execution}
+${foldSection("验收轨迹", extras.acceptanceHtml ?? "")}
+${foldSection("排期", scheduleForm)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -1095,7 +1205,7 @@ ${cards
         ? `<p class="hint">组织目录根（orgsDir）<b>就绪</b>：<code>${escapeHtml(orgsStatus.orgsDir)}</code></p>`
         : orgsStatus.tier === "problem"
           ? `<p class="hint err"><code>${escapeHtml(orgsStatus.code)}</code> 组织目录根已配置但不可用：${escapeHtml(orgsStatus.message)}</p>`
-          : `<p class="hint warn"><code>board_orgs_dir_not_configured</code> 组织目录根（orgsDir）未装配：门户照常展示，但<b>建组织 / 触发一轮 / 起宿主桥</b>将结构化 503，请配置 config.json 的 orgsDir 后重启板。</p>`;
+          : `<p class="hint warn"><code>board_orgs_dir_not_configured</code> 组织目录根（orgsDir）未装配：门户照常展示，但<b>建组织 / 详情页动作区提交 / 起宿主桥</b>将结构化 503，请配置 config.json 的 orgsDir 后重启板。</p>`;
   return `<h2>组织门户</h2>
 <p class="hint">一页一入口：点组织名进<b>该组织的空间</b>（<code>/org/&lt;名&gt;/</code> 排期 / 需求 / 任务）；全局排期看板在 <code>/schedule</code>（提需求与拖拽排期都在那一页）。口径 = <b>台账未停用 ∪ 需求归属（ownerGroup）</b>（与顶栏切换器同一纯函数 <code>portalOrgNames</code>）—— 盘遗留目录与外机组不进门户。计数为需求列表 <code>getFeatures()</code> 板内存派生（排期中 = <code>version</code> 非空 · 需求 = 名下总数 · 任务 = 各需求 <code>taskCount</code> 之和，「—」= 列表未带任务数），无新桥接口、零缓存。</p>
 ${statusLine}
@@ -1178,11 +1288,15 @@ ${lockedLine}${reqLine}</div>`;
 }
 
 /**
- * 未排期需求 → 池序（纯函数）：判据单一 `trim(version) === ""`；
+ * 未排期需求 → 池序（纯函数）：判据两条 `trim(version) === ""` ∧ 非引擎终态
+ * （`completed` / `failed` / `cancelled` 不进池，历史读面 = 组织空间需求列表；
+ * `state` 为 null / 未知态按非终态放行）；显示过滤不改事实源，不得用作任何计数闸数据源。
  * 排序不依赖 orch 列表序（改排期会前进 `updated_at`、列表序可变），池序见 `version-order.ts`。
  */
 export function selectRequirementPool(features: readonly FeatureListItem[]): FeatureListItem[] {
-  return sortPoolEntries(features.filter((f) => isUnscheduled(f.version)));
+  return sortPoolEntries(
+    features.filter((f) => isUnscheduled(f.version) && !isTerminalFeatureState(f.state)),
+  );
 }
 
 /**
@@ -1313,18 +1427,18 @@ ${c.features.map((f) => renderScheduleCard(f)).join("\n")}
   );
   const poolCol = `<div class="kcol" data-version="">
 <h3>需求池 <span class="muted">(${String(pool.length)})</span></h3>
-${pool.length === 0 ? `<p class="hint">（无未排期需求）</p>` : pool.map((f) => renderScheduleCard(f, true)).join("\n")}
+${pool.length === 0 ? `<p class="hint">（无未排期的在途需求 · 终态卡不进需求池）</p>` : pool.map((f) => renderScheduleCard(f, true)).join("\n")}
 </div>`;
   const board = `<div class="kanban" id="schedule-board">${[...cols, poolCol].join("\n")}</div>`;
   const emptyNote =
     cols.length === 0
-      ? `<p class="hint">（无已排期需求：全部需求 version 为空 ⇒ 都在需求池列）</p>`
+      ? `<p class="hint">（无已排期需求：未排期的在途需求都在需求池列）</p>`
       : "";
   // 详情浮层骨架（REQ-v0.9.2 增补 ④）：dialog 内容运行时由 FEATURE_DETAIL_OVERLAY_SCRIPT
   // 搬入详情页 <main> 节点，骨架恒空、不嵌任何用户数据；脚本随 renderPage 每页注入，
   // 无 dialog（其它页）或禁 JS 时不生效 ⇒ 卡片 <a> 即整页详情回退。
   return `<h2>排期看板</h2>
-<p class="hint">数据 = 需求列表 <code>getFeatures()</code> 板内存按 <code>version</code> 归组（无新桥接口）；列从左到右 = semver 数值序（<code>v0.9.0 &lt; v0.10.0</code>），非 <code>x.y.z</code> 串字典序垫底；未排期（version 空）不进版本列，集中末列「需求池」（<code>createdAt</code> 降序）。状态作卡片徽标，不按状态分列；版本列头徽标（未开始 / 进行中 / 🔒 已发版）仅为显示提示，执法在服务端写口；台账未登记的版本按卡片阶段派生（名下有已确认卡=进行中，全是需求分析阶段的想法卡或无卡=未开始）；<b>删除版本</b> = 版本框头右上角的 <b>×</b>（<b>仅未开始的版本出现</b> = 名下没有任何已过需求确认门的卡；删除时其下<b>想法卡自动回需求池</b>，名下有已确认需求则服务端拒绝），提交到 <code>POST /versions</code>，被拒时浮层给出原因；<b>本版撤除「标记已发版」前台入口</b>（增补十一 E3）⇒ 版本列<b>不提供任何状态操作</b>：<b>已发版（🔒）列为纯只读</b>，进行中 / 未开始列同样无发版与重开按钮；版本状态维护走后台 <code>POST /versions</code> <code>setStatus</code> 直投（数据纠错通道，不经前台），真发版动作待「发版」按钮（另立需求 · 归 v0.9.5）；点卡片标题 = 浮层打开详情（禁 JS 时回退整页）。</p>
+<p class="hint">数据 = 需求列表 <code>getFeatures()</code> 板内存按 <code>version</code> 归组（无新桥接口）；列从左到右 = semver 数值序（<code>v0.9.0 &lt; v0.10.0</code>），非 <code>x.y.z</code> 串字典序垫底；未排期（version 空）不进版本列，集中末列「需求池」（<code>createdAt</code> 降序）；<b>终态卡不进需求池</b>（<code>completed</code> / <code>failed</code> / <code>cancelled</code>；已排期的仍在其版本列显示，未排期的板上不再显示 · 历史读面 = 组织空间需求列表）。状态作卡片徽标，不按状态分列；版本列头徽标（未开始 / 进行中 / 🔒 已发版）仅为显示提示，执法在服务端写口；台账未登记的版本按卡片阶段派生（名下有已确认卡=进行中，全是需求分析阶段的想法卡或无卡=未开始）；<b>删除版本</b> = 版本框头右上角的 <b>×</b>（<b>仅未开始的版本出现</b> = 名下没有任何已过需求确认门的卡；删除时其下<b>想法卡自动回需求池</b>，名下有已确认需求则服务端拒绝），提交到 <code>POST /versions</code>，被拒时浮层给出原因；<b>本版撤除「标记已发版」前台入口</b>（增补十一 E3）⇒ 版本列<b>不提供任何状态操作</b>：<b>已发版（🔒）列为纯只读</b>，进行中 / 未开始列同样无发版与重开按钮；版本状态维护走后台 <code>POST /versions</code> <code>setStatus</code> 直投（数据纠错通道，不经前台），真发版动作待「发版」按钮（另立需求 · 归 v0.9.5）；点卡片标题 = 浮层打开详情（禁 JS 时回退整页）。</p>
 <p class="hint"><b>拖拽调整排期</b>（v0.9.3）：把卡片拖到目标版本列（或需求池列 = 清空排期）⇒ 提交排期写。仅「想法挪版」可拖（<code>stage=需求分析 ∧ approval=未发起</code>）；需求已确认的卡片置灰不可拖，服务端 409 执法（与已发版锁叠加）。改版时该需求已登记的 <code>doc/{旧版本}/</code> 产出文档会<b>自动搬迁</b>至 <code>doc/{新版本}/</code> 并追加登记（组织工作区文档不自动搬，回执列出交宿主手工）。</p>
 ${emptyNote}${board}
 <dialog class="fd" id="feat-dialog">
@@ -1347,77 +1461,101 @@ ${pool.length === 0 ? `<p class="hint">（该组织名下暂无需求）</p>` : 
 }
 
 // ---------------------------------------------------------------------------
-// 触发一轮（BD8 · 宿主桥写控件；同源 POST，服务器端渲染）
+// 动作区（v0.9.5 C5 · 档位化意图按钮；同源 POST，服务器端渲染）
 // ---------------------------------------------------------------------------
 
 /**
- * 需求详情页上的「触发一轮」表单：`POST /features/:id/turn`。
- * 表单只有一个提交按钮，无字段；澄清回答入口见 {@link renderAnswerForm}（BD9）。
+ * 详情页**单动作区**（v0.9.5 C5 · 合并原「触发一轮」与「人工确认」两个表单）。
  *
- * **收口轨 14 ②**：`busy`（该需求已有在飞 / 排队轮）⇒ 按钮渲染为 disabled + 原因
- * （规则源 = {@link deriveTurnBusyAffordance}；服务端另有 409 `board_turn_busy` 硬闸）。
- * **收口轨 17**：`featureState` 为引擎终态 ⇒ 同样 disabled + 原因，且**优先于**占用判据
- * （规则源 = {@link deriveTerminalFeatureAffordance}；服务端 409 `board_feature_terminal` 兜底直调）。
+ * **档位化口径（定向推翻 BD18 / 收口轨 14 ② / 收口轨 17 的「禁用不隐藏」旧写法）**：按钮文案与
+ * 提交去向由 {@link deriveActionAffordance} 按「用户此刻想做什么」给唯一档位 ——
+ * agent 闲置 = 「让 agent 继续」· 有待裁待答 = 「提交给 agent」· `approval` = 待审批 =
+ * 「确认改造文档 → 放行执行」（**唯一**出现确认档的地方）；**终态 / 宿主面未装配 ⇒ 整个动作区不渲染**
+ * （不再摆三个 573 字灰态按钮让人猜哪个能点）。轮占用仍渲染但 disabled + 原因（点了会白点，入口须可见）。
+ * **写路由与语义零改动**：`form action` 仍一对一指 `/features/:id/turn` 与 `/features/:id/confirm`；
+ * 服务端 409 硬闸（`board_turn_busy` / `board_feature_terminal`）全保留 —— 本区只控**显示**。
  */
-export function renderTurnForm(
-  featureId: string,
-  busy: OccupantTurnView | null = null,
-  featureState: string | null = null,
-): string {
-  const a =
-    deriveTerminalFeatureAffordance(featureState) ??
-    deriveTurnBusyAffordance(busy) ?? { enabled: true, note: "" };
+export function renderActionArea(featureId: string, input: NextStepInput): string {
+  const a = deriveActionAffordance(input);
+  if (a === null) return "";
+  const target =
+    a.kind === "confirm"
+      ? `/features/${encodeURIComponent(featureId)}/confirm`
+      : `/features/${encodeURIComponent(featureId)}/turn`;
+  const submitNote = a.kind === "confirm" ? "已提交，处理中…" : "已提交，本轮可能跑数分钟…";
+  // 补充框只随 turn 档走（confirm 档是固定指令模板通道，不掺自由文本）。
+  const supplementField =
+    a.kind === "confirm"
+      ? ""
+      : `<label class="hint">补充（可选 · 随本轮一起发给 agent；留空 = 只说「继续」）<textarea name="supplement" rows="3" placeholder="例：需求里那点理解不对，应该是…"></textarea></label>`;
+  const cls = a.quiet ? ' class="quiet"' : "";
   const button = a.enabled
-    ? `<button type="submit">触发一轮</button>`
-    : `<button type="submit" disabled aria-disabled="true">触发一轮</button>`;
+    ? `<button type="submit"${cls}>${escapeHtml(a.label)}</button>`
+    : `<button type="submit"${cls} disabled aria-disabled="true">${escapeHtml(a.label)}</button>`;
   const reasonLine = a.enabled ? "" : `<p class="hint warn">${escapeHtml(a.note)}</p>`;
-  return `<h2>宿主轮</h2>
-<p class="hint">触发一轮 = 板按该需求的<b>归属组织</b>起（或复用）宿主桥，以<b>本需求 id 对应的 contextId</b> 发一轮提示词；板的推进只是「投消息给 agent」，<b>状态机仍由 agent 经 MCP 走</b>。同组织一时刻只跑一轮 ⇒ 被占用时本轮排队。</p>
-${reasonLine}<form method="post" action="/features/${encodeURIComponent(featureId)}/turn" class="w" data-submit="已提交，本轮可能跑数分钟…">
+  return `<h2>动作</h2>
+${foldCalibration(
+  "口径：这个按钮做了什么、没做什么",
+  `<p class="hint">点按钮 = 板按该需求的<b>归属组织</b>起（或复用）宿主桥，以<b>本需求 id 对应的 contextId</b> 发一轮消息给 agent；<b>板不写引擎状态机</b>——推进仍由 agent 经 MCP 走。同组织一时刻只跑一轮 ⇒ 被占用时本轮排队。<b>确认档</b>（<code>approval</code> = 待审批）发的是「用户已确认改造文档，请核对后执行放行」这一轮<b>指令</b>：agent 会先只读核对（文档是否落文件、审批门是否「待审批」），条件不满足（例如 <code>approval</code> 非「待审批」⇒ 桥侧回 <code>feature_approval_not_ready</code>）时它<b>有权不放行</b>并在本轮结论里说明缺什么 —— 板上不存在「批准」这个动作，也不存在「板上批准」。卡住了（无进行中的轮却久无进展）⇒ 本区按钮就是手动接一轮的入口。</p>`,
+)}
+${reasonLine}<form method="post" action="${target}" class="w" data-submit="${escapeHtml(submitNote)}">
+${supplementField}
 ${button}
 </form>`;
 }
 
 /**
- * 需求详情页上的「人工确认」表单：`POST /features/:id/confirm`（BD9）。
- * **文案必须诚实**：按钮 = 给宿主 agent 的一轮<b>指令消息</b>，不是板上批准；
- * 放不放行由 agent 核对后判断（条件不满足它会拒绝放行并回报原因）。
- *
- * **BD18：按钮按 `approval` 条件化** —— 仅「待审批」可点；其余档位**禁用/灰态 + 一行原因**
- * （刻意不隐藏：看不到入口更迷惑）。规则源 = {@link deriveConfirmAffordance}。
- * **收口轨 14 ②：再叠加轮状态判据** —— 该需求已有在飞 / 排队轮时同样禁用（占用原因优先展示，
- * 因为它直接对应「点了会白点」）。端点语义不变（板不写状态机；禁用只是可用性层，
- * 服务端防重由 `board_turn_busy` 409 承担）。
- * **收口轨 17**：引擎终态判据**优先于**占用与 approval —— 终态需求两按钮一律 disabled + 原因
- * （规则源 = {@link deriveTerminalFeatureAffordance}，与引导行、服务端 409 同一判据）。
- */
-export function renderConfirmForm(
-  featureId: string,
-  approval: string | null,
-  busy: OccupantTurnView | null = null,
-  featureState: string | null = null,
-): string {
-  const busyA = deriveTurnBusyAffordance(busy);
-  const a: ConfirmAffordance =
-    deriveTerminalFeatureAffordance(featureState) ?? busyA ?? deriveConfirmAffordance(approval);
-  const button = a.enabled
-    ? `<button type="submit">发送确认指令给 agent（由 agent 核对后决定是否放行）</button>`
-    : `<button type="submit" disabled aria-disabled="true">发送确认指令给 agent（由 agent 核对后决定是否放行）</button>`;
-  const stateLine = `<p class="hint${a.enabled ? "" : " warn"}">${escapeHtml(a.note)}</p>`;
-  return `<h2>人工确认（给 agent 的指令）</h2>
-${stateLine}
-<p class="hint">点击 = 板把「用户已确认改造文档，请核对后执行放行（approve 语义）」作为<b>一轮消息投给该需求的宿主 agent</b>。<b>板不写引擎状态机，不存在「板上批准」</b>：agent 会先只读核对（改造文档是否落文件、审批门是否处于「待审批」），条件不满足（例如 approval 非「待审批」）时它<b>有权不放行</b>并在本轮结论里说明缺什么 —— 结果如实回显。同组织一时刻只跑一轮 ⇒ 被占用时排队。</p>
-<form method="post" action="/features/${encodeURIComponent(featureId)}/confirm" class="w" data-submit="已提交，处理中…">
-${button}
-</form>`;
-}
-
-/**
- * 详情页「下一步」引导行（BD18 ②）：一行可操作提示，判序与文案规则见
- * {@link deriveNextStepHint}。放在正文按钮区之前，让用户先看到"该点哪个"。
+ * 详情页「下一步」引导行（BD18 ② · v0.9.5 C1 升级）：一行可操作提示（卡在哪 / 等谁 / 做什么），
+ * 判序与文案规则见 {@link deriveNextStepHint}；**上移到字段表之后的第一屏**。
+ * 终态需求的这一行即「墓碑」结论摘要（{@link renderFeatureDetail} 对终态不渲染动作区）。
  */
 export function renderNextStepGuide(input: NextStepInput): string {
   return `<p class="hint nextstep">${escapeHtml(deriveNextStepHint(input))}</p>`;
+}
+
+// ---------------------------------------------------------------------------
+// 轮结果留痕（v0.9.5 C6 · 最近一轮的 state / 摘要 / 时间）
+// ---------------------------------------------------------------------------
+
+/** 轮态中文（`TurnState` 七值闭集；未命中 ⇒ 原样显示，不吞不猜）。 */
+const TURN_STATE_LABELS: Readonly<Record<string, string>> = {
+  queued: "排队中",
+  running: "进行中",
+  awaiting_answer: "等你回答",
+  succeeded: "有结论",
+  failed: "失败",
+  canceled: "已取消",
+  timeout: "超时",
+};
+
+/** 最近一轮的留痕入参（`BoardHostFace.latestTurnOf` 归一后的最小面）。 */
+export interface TurnTraceInput {
+  turnId: string;
+  state: string;
+  summary: string | null;
+  /** 该轮最近一次时刻（ISO 原文）；`null` ⇒ 不显示时间。 */
+  at: string | null;
+  /** 结构化错误码（非失败轮 ⇒ `null`）。 */
+  errorCode: string | null;
+}
+
+/**
+ * 详情页「最近一轮」留痕行（C6）：预审段与 executing 段都显示 —— 用户看得懂「上一轮跑到哪、
+ * 说了什么」。`null` = 该需求从未起过轮 / 宿主面未装配 ⇒ 不渲染（缺席不是错误，不带崩页面）。
+ */
+export function renderTurnTrace(turn: TurnTraceInput | null): string {
+  if (turn === null) return "";
+  const summary =
+    turn.summary !== null && turn.summary !== ""
+      ? `<details class="fold turn-summary"><summary>${escapeHtml(truncate(turn.summary, LATEST_TURN_SUMMARY_MAX))}</summary><pre class="result">${escapeHtml(turn.summary)}</pre></details>`
+      : "";
+  const errBit =
+    turn.errorCode === null || turn.errorCode === ""
+      ? ""
+      : ` · <span class="mono">${escapeHtml(turn.errorCode)}</span>`;
+  return `<h2>最近一轮</h2>
+<p class="hint turn-trace"><b>${escapeHtml(label(TURN_STATE_LABELS, turn.state))}</b> · <span class="mono">${escapeHtml(shortId(turn.turnId))}</span> · ${escapeHtml(stamp(turn.at))}${errBit}</p>
+${summary}`;
 }
 
 /**
@@ -1427,9 +1565,13 @@ export function renderNextStepGuide(input: NextStepInput): string {
  *
  * 消费纪律：`state` 值域**非封闭**（存量库有退役值 analyzing/planning）⇒ 未命中标签表原样显示 + 灰化；
  * **末段** `leftAt === null` = 当前停留态（非缺字段）；同态重复段不合并。
+ *
+ * **v0.9.5 C2 空区块短路④**：`stages` 至多一段（= 从未迁出过态）∧ 失败账单 0 条 ⇒ 整节不渲染
+ * —— 「waiting_approval 一张卡 + 失败 0 条」这种轨迹没有任何信息量。
  */
 export function renderAcceptanceSection(acceptance: AcceptanceView | null | undefined): string {
   if (acceptance === null || acceptance === undefined) return "";
+  if (acceptance.stages.length <= 1 && acceptance.failures.length === 0) return "";
   const stageRows = acceptance.stages.map((s, i) => {
     const known = Object.prototype.hasOwnProperty.call(FEATURE_STATE_LABELS, s.state);
     const stateCell = known
@@ -1490,7 +1632,10 @@ function acceptancePayloadSummary(payload: string | null): string {
  * 详情页「轮次进度」行（REQ-v0.9.2 N7）：该需求有在飞 / 排队的轮时显示「第 N 轮 · 在飞 / 排队中（位次）」，
  * 无 ⇒ 空串（不渲染）。触发一轮受理成功后 303 回本页，这一行就是它该有的落点。
  *
- * **不做自动刷新**（自动刷新不在页面脚本白名单闭集〔内联字面量常量 · N3 纪律钉〕内 + 与调度拍错拍）：文案直接写明刷新方式 = 重载本页。
+ * **自动刷新的准确口径（REQ-2026-09-29-02 件D）**：整页**不自动刷新**，唯一的自动更新面 =
+ * **浮层动作区** —— 在浮层里提交一轮后，板侧有界轮询复用本详情读面把动作区刷成真实「第 N 轮 在飞」，
+ * 本轮收口即停（见 `layout.ts` `FEATURE_DETAIL_OVERLAY_SCRIPT` 的件B 注记）；**其余区域**（含整页形态、
+ * 其它页）仍须重载本页才见最新。故这一行的收尾提示按两档写清，不再笼统说「板不自动刷新」。
  */
 export function renderTurnProgress(view: TurnProgressView | null): string {
   if (view === null) return "";
@@ -1498,7 +1643,30 @@ export function renderTurnProgress(view: TurnProgressView | null): string {
     view.state === "running"
       ? "在飞"
       : `排队中${view.position === null ? "" : ` · 队列第 ${String(view.position)} 位`}`;
-  return `<p class="hint turn-progress">轮次进度：<b>第 ${String(view.round)} 轮 ${where}</b> · <span class="mono">${escapeHtml(view.turnId)}</span> · 刷新本页看最新（板不自动刷新）</p>`;
+  return `<p class="hint turn-progress">轮次进度：<b>第 ${String(view.round)} 轮 ${where}</b> · <span class="mono">${escapeHtml(view.turnId)}</span> · 浮层内提交后动作区自动刷新进度至本轮收口；其余内容重载本页看最新</p>`;
+}
+
+/**
+ * 详情页「链状态」一行（v0.9.5 增补二 · D2）：自动接力 / 心跳监视的内存态如实回显，紧跟轮次进度。
+ * - `监视中（等 N 个子任务）`：链未被停、正由板侧监视（N = 挂起台账 pending 条数；读不到 ⇒ 不说个数，0 ⇒ 按 DAG 监视）；
+ * - `链已停（原因 · 来源）`：来源 = 用户（停链口）⇒ **人工动作不解冻**（一点即停、不再复活）；
+ *   来源 = 自动（撞 occupant / 退让超上限）⇒ 补充或回答即解冻。
+ * 入参 `null`（快照缺席 / 取值失败）⇒ 空串：整行不渲染、不报错。
+ */
+export function renderChainStateLine(view: ChainStateLine | null): string {
+  if (view === null) return "";
+  if (view.state === "monitoring") {
+    const waiting =
+      view.pendingCount === null ? "" : view.pendingCount === 0 ? "（无待回子任务 · 按 DAG 监视）" : `（等 ${String(view.pendingCount)} 个子任务）`;
+    return `<p class="hint chain-state">链状态：<b>监视中</b>${waiting}</p>`;
+  }
+  const source =
+    view.source === "user"
+      ? "来源：用户（停链口）· 人工动作不解冻"
+      : view.source === "auto"
+        ? "来源：自动 · 补充 / 回答可解冻"
+        : "来源：未知";
+  return `<p class="hint chain-state">链状态：<b>链已停</b>（${escapeHtml(view.reason ?? "原因未记录")} · ${source}）</p>`;
 }
 
 /**
@@ -1561,7 +1729,7 @@ export function renderTurnOutcome(o: TriggerTurnOutcome): string {
           ? `<p class="hint">本轮<b>排队中</b>（同组织一时刻只跑一轮）⇒ 本响应未等它的终态；到<a class="fl" href="/host">宿主桥状态</a>页刷新可看队列。本轮记录已落板侧台账。</p>`
           : `<p class="hint">本轮终态与摘要已落板侧台账，板<b>不写引擎状态机</b>（审批 / 推进 / 取消归编排 agent）。</p>`;
   const back = `<p class="hint"><a class="fl" href="/features/${encodeURIComponent(o.featureId)}">回到需求详情</a> · <a class="fl" href="/host">宿主桥状态</a></p>`;
-  return `<h2>${escapeHtml(o.display === "" ? `触发一轮：${o.disposition}` : o.display)}</h2>
+  return `<h2>${escapeHtml(o.display === "" ? `本轮结果：${o.disposition}` : o.display)}</h2>
 <p class="${hintClass}">结局 = <code>${escapeHtml(o.disposition)}</code>${o.queued ? " · 未开跑（排队）" : ""}</p>
 ${error}
 ${question}
@@ -1666,7 +1834,7 @@ export interface HostPageInput {
  */
 export function renderHostPage(input: HostPageInput): string {
   const cfg = input.config;
-  const cfgLine = `<p class="hint">组织目录根 = <code>${escapeHtml(cfg.orgsDir ?? "（未配置 ⇒ 触发一轮将结构化 503）")}</code> · 默认组织 = <code>${escapeHtml(cfg.defaultOrg ?? "（未配置 ⇒ 组织名由提需求表单给出）")}</code> · 缺省 kind = <code>${escapeHtml(cfg.kind)}</code></p>`;
+  const cfgLine = `<p class="hint">组织目录根 = <code>${escapeHtml(cfg.orgsDir ?? "（未配置 ⇒ 详情页动作区提交将结构化 503）")}</code> · 默认组织 = <code>${escapeHtml(cfg.defaultOrg ?? "（未配置 ⇒ 组织名由提需求表单给出）")}</code> · 缺省 kind = <code>${escapeHtml(cfg.kind)}</code></p>`;
   const problem = input.orgsDirProblem ?? null;
   const problemLine =
     problem === null
@@ -1679,7 +1847,7 @@ export function renderHostPage(input: HostPageInput): string {
 ${cfgLine}
 ${problemLine}
 ${notice}
-<p class="hint">当前进程未托管任何宿主桥 ⇒ 无状态可显示（本页面<b>不编造数据</b>）。到需求详情页「触发一轮」即会按组织起桥。</p>`;
+<p class="hint">当前进程未托管任何宿主桥 ⇒ 无状态可显示（本页面<b>不编造数据</b>）。到需求详情页<b>动作区</b>点一次按钮即会按组织起桥。</p>`;
   }
   const rows = input.entries.map((e) => {
     const s = e.status;

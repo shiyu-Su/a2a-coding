@@ -68,6 +68,9 @@ function fakeFace() {
     busyTurnOf() {
       return null;
     },
+    latestTurnOf() {
+      return null;
+    },
     async statusView() {
       return [];
     },
@@ -455,6 +458,9 @@ function faceReturning(outcome) {
       return null;
     },
     busyTurnOf() {
+      return null;
+    },
+    latestTurnOf() {
       return null;
     },
     async statusView() {

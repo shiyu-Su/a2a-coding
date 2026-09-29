@@ -222,19 +222,17 @@ export interface DependencyGraphSection {
 }
 
 /**
- * 详情页「依赖图」区块（`tasks` = 详情出参任务清单）。无任务 ⇒ 一行提示；
- * 有任务 ⇒ 标题 + 图例 + mermaid 块（application/json 数据通道）+ 悬空/环边提示行。
- * `idSeq` = 页内序号（数据通道载体 id 后缀，详情页固定 1）。
+ * 详情页「依赖图」区块（`tasks` = 详情出参任务清单）。
+ * **v0.9.5 C2 空区块短路③**：无任务 ⇒ 整节不渲染（空图与「（无任务，暂无依赖图）」一行同样零信息量，
+ * Step 0 卡上纯属噪声；与任务表 / trace 的短路同一判据）。有任务 ⇒ 标题 + 图例 + mermaid 块
+ * （application/json 数据通道）+ 悬空/环边提示行。`idSeq` = 页内序号（数据通道载体 id 后缀，详情页固定 1）。
  */
 export function renderDependencyGraphSection(
   tasks: readonly FeatureTaskItem[],
   idSeq: number = 1,
 ): DependencyGraphSection {
   if (tasks.length === 0) {
-    return {
-      html: `<h2>依赖图</h2>\n<p class="hint">（无任务，暂无依赖图）</p>`,
-      needsMermaid: false,
-    };
+    return { html: "", needsMermaid: false };
   }
   const graph = buildTaskGraph(tasks);
   const src = taskGraphMermaidSource(graph);

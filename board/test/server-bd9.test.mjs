@@ -79,6 +79,7 @@ function fakeFace(outcomes = {}) {
     confirmTurn: [],
     answerRequirement: [],
     awaitingTurnOf: [],
+    latestTurnOf: [],
     queueView: [],
   };
   const face = {
@@ -98,8 +99,15 @@ function fakeFace(outcomes = {}) {
       calls.awaitingTurnOf.push(requirementId);
       return outcomes.awaiting ?? null;
     },
+    latestTurnOf(requirementId) {
+      calls.latestTurnOf.push(requirementId);
+      return outcomes.latest ?? null;
+    },
     busyTurnOf() {
       return outcomes.busy ?? null;
+    },
+    latestTurnOf() {
+      return outcomes.latest ?? null;
     },
     queueView(org) {
       calls.queueView.push(org);
@@ -350,17 +358,30 @@ test("BD9-④s answer：有内容 ⇒ 交 answerRequirement（同 contextId 续�
 // 页面：确认按钮（文案诚实）+ 回答框（仅在适用时出现）
 // ---------------------------------------------------------------------------
 
-test("BD9-页面：详情页恒有确认指令入口（文案 = 给 agent 的指令，非「板上批准」）；无 awaiting 轮 ⇒ 不显示回答框", async () => {
+test("BD9-页面（v0.9.5 C5 档位化）：approval = 待审批 ⇒ 动作区出确认档（文案诚实 = 给 agent 的指令，非「板上批准」）；无 awaiting 轮 ⇒ 不显示回答框", async () => {
   await withServer(async (base) => {
     const page = await req(base, "/features/F1");
     assert.equal(page.status, 200);
     assert.match(page.text, /action="\/features\/F1\/confirm"/);
-    assert.match(page.text, /发送确认指令给 agent（由 agent 核对后决定是否放行）/);
-    assert.match(page.text, /给 agent 的指令/);
-    assert.match(page.text, /不存在「板上批准」/);
+    assert.match(page.text, /<button type="submit">确认改造文档 → 放行执行<\/button>/);
+    assert.match(page.text, /不存在「板上批准」/, "口径长文仍在（折叠层里，展开可见）");
     assert.match(page.text, /feature_approval_not_ready|approval 非「待审批」/, "文案须明说 agent 可能不放行的例子");
     assert.equal(page.text.includes('action="/features/F1/answer"'), false, "无 awaiting 轮不得显示回答框");
   });
+});
+
+test("C5-页面（负向）approval ≠ 待审批 ⇒ 不渲染确认块（原「恒有确认入口 · 禁用不隐藏」定向推翻）", async () => {
+  for (const approval of ["未发起", "已通过"]) {
+    await withServer(
+      async (base) => {
+        const page = await req(base, "/features/F1");
+        assert.equal(page.status, 200);
+        assert.equal(page.text.includes('action="/features/F1/confirm"'), false, `${approval} 不得出确认表单`);
+        assert.match(page.text, /<h2>动作<\/h2>/, "动作区本体仍在（换档不换区）");
+      },
+      { feature: { approval } },
+    );
+  }
 });
 
 test("BD9-页面b：存在 awaiting_answer 轮 ⇒ 显示回答框（textarea name=answer + 问题原文 + 同 contextId 提示）", async () => {

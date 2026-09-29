@@ -19,12 +19,14 @@ import {
 // A1/A2 路由白名单 6→7：POST /orgs 精确放行，近似路径不放行
 // ---------------------------------------------------------------------------
 
-test("A1-WRITE_ROUTES 六→七→八→九：新增 POST /orgs 与 POST /orgs/{org}/members，及版本台账写 POST /versions（405 文案单点共用此清单）", () => {
+test("A1-WRITE_ROUTES 六→七→八→九→十→十一：新增 POST /orgs 与 POST /orgs/{org}/members，版本台账写 POST /versions，v0.9.5 停链口 POST /features/{id}/stop-chain 与挂起口 POST /features/{id}/suspend（405 文案单点共用此清单）", () => {
   // BD4（v0.9.4 B 档）在 BD1 的第七条之外再扩一条成员写路由；v0.9.4 版本管理面（REQ-2026-09-27-05 §2.4）
-  // 再扩一条版本台账写路由 ⇒ 九条；405 文案与 methods.ts 共用同一清单
-  assert.equal(WRITE_ROUTES.length, 9, JSON.stringify(WRITE_ROUTES));
+  // 再扩一条版本台账写路由 ⇒ 九条；v0.9.5 C4（T3）再扩一条停链口 ⇒ 十条；v0.9.5 C7（T7）再扩一条挂起口 ⇒ 十一条。
+  assert.equal(WRITE_ROUTES.length, 11, JSON.stringify(WRITE_ROUTES));
   assert.ok(WRITE_ROUTES.includes("POST /orgs"));
-  assert.ok(WRITE_ROUTES.includes("POST /versions"), "版本台账写路由在清单内（V4 ⇒ 7→8 叠加后共九条）");
+  assert.ok(WRITE_ROUTES.includes("POST /versions"), "版本台账写路由在清单内");
+  assert.ok(WRITE_ROUTES.includes("POST /features/{id}/stop-chain"), "v0.9.5 停链口在清单内");
+  assert.ok(WRITE_ROUTES.includes("POST /features/{id}/suspend"), "v0.9.5 挂起口在清单内");
   assert.deepEqual(parseWriteRoute("POST", ORGS_WRITE_PATH), { kind: "orgs" });
   for (const [method, path] of [
     ["GET", "/orgs"],

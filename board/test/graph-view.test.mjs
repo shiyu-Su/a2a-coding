@@ -74,13 +74,11 @@ test("T2-①空依赖：全无依赖 ⇒ 全孤立节点、零边、出图不为
   assert.ok(!src.includes(" --> "), "无依赖 ⇒ 零边");
 });
 
-test("T2-①空任务集 ⇒ 源为 null、区块退化为提示行且不挂 mermaid", () => {
+test("T2-①空任务集（v0.9.5 C2 短路③）⇒ 源为 null、依赖图整节不渲染且不挂 mermaid", () => {
   assert.equal(taskGraphMermaidSource(buildTaskGraph([])), null);
   const s = renderDependencyGraphSection([]);
   assert.equal(s.needsMermaid, false);
-  assert.match(s.html, /<h2>依赖图<\/h2>/);
-  assert.match(s.html, /无任务/);
-  assert.ok(!s.html.includes("<script"));
+  assert.equal(s.html, "", "空图连「（无任务，暂无依赖图）」的提示行都不出（Step 0 卡零信息量）");
 });
 
 // ---------------------------------------------------------------------------

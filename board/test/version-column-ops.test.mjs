@@ -5,7 +5,7 @@
  * - 排期看板**版本列头**下挂一行操作（纯 SSR 小表单），三操作全部提交到**既有的那条**
  *   `POST /versions`，靠隐藏字段 `action` 分流 ⇒ 服务端写口与闸语义**零改动**（本件只接线）；
  *   1. 删除版本 = `action=remove`（增补十一 E2 起 = 框头 ×，闸 = 名下无已确认卡；想法卡自动回池）；
- *   2. 标记已发版 = `action=setStatus` + `status=released`（闸 = 名下全部 completed，板既有执法；
+ *   2. 标记已发版 = `action=setStatus` + `status=released`（闸 = 名下全部收尾〔completed+cancelled〕∧ completed > 0，板既有执法；
  *      **增补十一 E3 起前台不出入口，仅后台表单直投**）；
  *   3. 重开 = `setStatus` + `status=active`（**增补十起前台不出入口，仅后台表单直投**）；
  * - 入口可见性与迁移矩阵同源（`notstart → released` 矩阵禁止 ⇒ 该列不出「标记已发版」）；
@@ -381,14 +381,14 @@ test("D1-⑩ 服务端零改动：前台无重开入口，后台 setStatus 直�
   );
 });
 
-test("E3-⑪ 前台撤「标记已发版」后，后台 setStatus 正向仍通（active → released，名下全 completed）", async () => {
+test("E3-⑪ 前台撤「标记已发版」后，后台 setStatus 正向仍通（active → released，名下全收尾且有交付）", async () => {
   const ledger = ledgerWith([["v0.9.6", "active"]]);
   await withBoard(
     async (base, file) => {
       const text = await (await fetch(`${base}/schedule`)).text();
       assert.doesNotMatch(text, /name="status" value="released"|标记已发版<\/button>/, "负向锚：前台无 status=released 表单");
       const res = await postVersions(base, { action: "setStatus", version: "v0.9.6", status: "released" });
-      assert.equal(res.status, 303, "后台入口在位：active → released 直投放行（闸 = 名下全 completed，本例满足）");
+      assert.equal(res.status, 303, "后台入口在位：active → released 直投放行（闸 = 名下全部收尾〔completed+cancelled〕∧ completed > 0，本例满足）");
       assert.equal(res.headers.get("location"), "/schedule");
       assert.match(readFileSync(file, "utf8"), /"version": "v0\.9\.6",\s*"status": "released"/, "直投落台账（发版锁随之生效）");
     },

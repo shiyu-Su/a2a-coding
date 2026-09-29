@@ -7,7 +7,8 @@
  * + 错误浮层关闭 + mermaid 渲染 + 排期页详情浮层 {@link FEATURE_DETAIL_OVERLAY_SCRIPT}
  * + 新增需求弹窗 {@link NEW_REQUIREMENT_DIALOG_SCRIPT}
  * + 排期拖拽 {@link DRAG_SCHEDULE_SCRIPT}（v0.9.3 B-T5，闭集五→六元；与弹窗常量分立、不可共置））；
- * 刷新 = 浏览器重载。
+ * 刷新 = 浏览器重载；**唯一例外** = 浮层动作区提交后的**有界进度轮询**（复用既有详情读面 +
+ * 既有 {@link FEATURE_DETAIL_OVERLAY_SCRIPT} 的 `swapPage` 通路，零新端点、零新枚脚本，见该常量注记）。
  */
 import { readVersion } from "../version.js";
 
@@ -254,15 +255,38 @@ export const SUBMIT_GUARD_SCRIPT = `<script>
  * （`new URLSearchParams(new FormData(form))`）—— 服务端写面用 `new URLSearchParams(raw)` 解析，
  * `FormData` 直投会发成 `multipart/form-data` ⇒ 字段全丢。fetch 网络异常 / 响应结构不可解析
  * ⇒ 降级 `form.submit()` 原生提交（行为同无 JS；此前不动 body，表单仍在文档内，submit 可执行）。
- * **提交后的表单状态恢复**（{@link restoreForm}）：{@link SUBMIT_GUARD_SCRIPT} 在 submit 时禁用
- * 提交按钮并挂 `.submit-pending` 提示行，其复位依赖「整页跳转后新页面自然复位」—— 浮层内提交
- * **不跳页**，故本脚本在响应处理完之后对该 form 主动恢复（重新启用 `button[disabled]` + 摘提示行）；
+ * **提交后的表单状态恢复**（{@link restoreForm}）：浮层分支自行完成 SUBMIT_GUARD 的同款两动作
+ * （禁用提交按钮 + 挂 `.submit-pending` 提示行，见下「提交即时反馈」条），其复位在本脚本响应处理
+ * 完之后主动执行（重新启用 `button[disabled]` + 摘提示行）；
  * 错误路径必须恢复（用户要改后重提），成功路径 body 已被替换 ⇒ 恢复落在已摘走的表单上，自然无效。
  * 降级 `form.submit()` **之前**同样先恢复（防「禁用态提交」与后续 UI 卡在灰态）。
+ *
+ * **浮层内提交的连点防护归属（REQ-2026-09-29-02 件D 改述，替换旧的「连点防护仍靠 SUBMIT_GUARD」表述）**：
+ * 本分支已 `preventDefault()` ⇒ {@link SUBMIT_GUARD_SCRIPT} 的 submit 委托按 `e.defaultPrevented`
+ * **早退**（其语义未动，整页档行为零变化），故浮层内 POST 的防护**不经过**提交守卫，由本分支自带：
+ * `data-ov-pending` 挂起标记拦下二次提交 + 按钮即时禁用 + 服务端 409 `board_turn_busy` 硬闸。
  * CSRF 不因此改变：同源 fetch 自动带 `Origin`（`Referrer-Policy: same-origin` 下另带同源
- * `Referer`），`checkWriteAuth` 两档原样工作；连点防护仍靠 {@link SUBMIT_GUARD_SCRIPT}
- * （与本脚本同事件、不同注册点，`preventDefault()` 不互相阻断）+ 服务端 409 硬闸。
+ * `Referer`），`checkWriteAuth` 两档原样工作。
  * 卡片分支与浮层外一切表单**不变**（无 JS 回退面保持整页 POST）。
+ *
+ * **提交即时反馈 + 第 N 轮进度轮询（REQ-2026-09-29-02 增补，件A / 件B / 件C）**：
+ * - **件A（就地反馈）**：submit 委托在 `preventDefault()` 之后、发 fetch **之前**复刻整页档
+ *   SUBMIT_GUARD 的两动作（{@link markPending}：提交按钮置灰禁用 + 就地挂 `.submit-pending` 提示行，
+ *   文案取表单自带 `data-submit`，动作区档位即「已提交，本轮可能跑数分钟…」）。旧形态下点击后
+ *   直到 fetch 返回（触发一轮可数分钟）界面毫无反应 ⇒ 用户以为没生效而连点。提示行的使命到
+ *   响应回来为止：成功档整个动作区被服务端重渲染换新（禁用态与提示行随之离场），此后进度由件B 承载；
+ *   失败档（409 等）由 `restoreForm` 复位表单供改后重提。
+ * - **件B（真实进度）**：成功换页后若回包动作区仍含 `.turn-progress`（= 本轮仍 `running` / `queued`），
+ *   起一条**有界**轮询（{@link POLL_INTERVAL_MS} × {@link POLL_MAX_TICKS}，20 分钟量级 = 与宿主 turn
+ *   窗口同量级），每拍 `GET` 本详情 URL（带 `Accept: "text/html"`，与 `open()` 同规格）经 `swapPage`
+ *   刷回动作区，用户看到真实「第 N 轮 在飞 / 排队中」。收口判据 = 回包**不再**含在飞 / 排队的
+ *   `.turn-progress` ⇒ 停；浮层已关 / 窗口耗尽 ⇒ 同样停。**零新增端点、零新增写面**：复用
+ *   `GET /features/:id` 读面与既有 `swapPage` 渲染通路；轮询只活在浮层脚本内（无 `#feat-dialog`
+ *   的页面整段空转），故不存在「整页自动刷新」。
+ * - **件C（竞态）**：`swapPage(html, reopen)` 增第二参 —— 后台轮询传 `false`，**浮层已被用户关闭时
+ *   不得 `showModal()` 把它重新弹开**（原实现每次 `swapPage` 末尾无条件补弹，与关闭动作竞态）；
+ *   轮询命中「已关浮层」时只 `stopPoll`，不改 `dlg.open`、不落渲染。
+ *
  * 脚本字面量本身不含用户数据 ⇒ 无注入面
  * （与 {@link SUBMIT_GUARD_SCRIPT} 同规格：单点常量、纯内联、无 `src=`、无 `</script` 字面量）。
  */
@@ -281,6 +305,71 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
     }
     var p = form.querySelector(".submit-pending");
     if (p !== null && p.parentNode !== null) { p.parentNode.removeChild(p); }
+    form.removeAttribute("data-ov-pending");
+  }
+  // 件A：浮层分支自行完成整页档 SUBMIT_GUARD 的两动作（该守卫对本表单已 defaultPrevented 早退）。
+  // 按钮判定走 .type 属性而非选择器串 —— 提交守卫的闭集归类标记正是那个选择器字面量（N3-⑦ 每枚
+  // 恰好 1 处），本常量体内再写一遍会造成两枚脚本归类歧义；属性口径也天然盖住「隐式提交」的单按钮表单。
+  function markPending(form) {
+    if (form.querySelector(".submit-pending") !== null) return false;
+    var note = form.getAttribute("data-submit") || "已提交，处理中…";
+    var all = form.querySelectorAll("button");
+    for (var i = 0; i < all.length; i += 1) {
+      if (all[i].type !== "submit") continue;
+      all[i].disabled = true;
+      all[i].setAttribute("aria-disabled", "true");
+    }
+    var p = document.createElement("p");
+    p.className = "hint submit-pending";
+    p.textContent = note;
+    form.appendChild(p);
+    return true;
+  }
+  // 件B：有界进度轮询 —— 复用既有详情读面 GET + swapPage 通路，零新端点、零新写面。
+  // 上界 5s × 240 = 20 分钟 = 与宿主 turn 窗口同量级（窗上限 10min、含结构余量的最坏总框 25min）；
+  // 收口 / 关浮层任一命中即提前停，故这只是一个"漏停 also 停"的兜底天花板。
+  var POLL_INTERVAL_MS = 5000;
+  var POLL_MAX_TICKS = 240;
+  var pollTimer = null;
+  var pollTicks = 0;
+  var pollUrl = "";
+  function stopPoll() {
+    if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
+    pollTicks = 0;
+  }
+  function stillBusy(main) {
+    var m = main.querySelector(".turn-progress");
+    return m !== null && (m.textContent.indexOf("在飞") !== -1 || m.textContent.indexOf("排队中") !== -1);
+  }
+  function schedulePoll() {
+    if (pollTicks >= POLL_MAX_TICKS) { stopPoll(); return; }
+    pollTimer = setTimeout(pollOnce, POLL_INTERVAL_MS);
+  }
+  function pollOnce() {
+    pollTimer = null;
+    // 件C：浮层已被用户关闭 ⇒ 停轮即可，**不得 showModal 把它重新弹开**，也不改 dlg.open。
+    if (!dlg.open || pollUrl === "") { stopPoll(); return; }
+    pollTicks += 1;
+    fetch(pollUrl, { credentials: "same-origin", headers: { Accept: "text/html" } }).then(function (res) {
+      return res.text().then(function (text) { return { ok: res.ok, text: text }; });
+    }).then(function (r) {
+      if (!r.ok) { schedulePoll(); return; }
+      // 读面不可解析（拿不到 main）⇒ 无从判收口，保守续轮，窗口耗尽自然停
+      var main = parsePage(r.text).main;
+      // 件C：这一拍之间用户可能已关浮层 ⇒ 只停轮，收口渲染不落 showModal
+      if (!dlg.open || pollUrl === "") { stopPoll(); return; }
+      // 收口（本轮不再在飞 / 排队）⇒ 停轮，末次真实进度已由服务端渲染留在动作区
+      if (main === null || !stillBusy(main)) { stopPoll(); return; }
+      swapPage(r.text, false);
+      schedulePoll();
+    }).catch(function () { schedulePoll(); });
+  }
+  function startPoll(main) {
+    stopPoll();
+    if (main === null || !stillBusy(main)) return;
+    pollUrl = lastHref;
+    pollTicks = 1;
+    schedulePoll();
   }
   function nativeSubmit(form) { restoreForm(form); form.submit(); }
   function parsePage(html) {
@@ -298,7 +387,7 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
     dlg.appendChild(card);
     if (!dlg.open) dlg.showModal();
   }
-  function swapPage(html) {
+  function swapPage(html, reopen) {
     var parsed = parsePage(html);
     var main = parsed.main;
     var card = parsed.card;
@@ -309,7 +398,8 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
       if (card !== null) { body.appendChild(card); }
       if (main !== null) { while (main.firstChild !== null) { body.appendChild(main.firstChild); } }
     }
-    if (!dlg.open) { dlg.showModal(); }
+    // 件C：reopen 传 false（后台轮询）时**绝不**把已关闭的浮层重新弹开。
+    if (reopen !== false && !dlg.open) { dlg.showModal(); }
     // 搬运节点不跑内联 script（DOMParser 惰性文档）⇒ 详情页依赖图/文档 mermaid 换入后
     // 须主动补渲（钩子由 docs-render.mermaidRenderScript 暴露；无该全局 = 本页未挂 mermaid，跳过）。
     // showModal 在先：渲染不得落在 display:none 容器（98c39da1 前科口径）。
@@ -319,6 +409,7 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
   function open(a, toggle) {
     var href = a.getAttribute("href") || "";
     if (toggle && href === lastHref && dlg.open) { dlg.close(); dlg.returnValue = ""; return; }
+    stopPoll();
     dlg.returnValue = "";
     if (body !== null) body.textContent = "加载中…";
     fetch(href, { credentials: "same-origin", headers: { Accept: "text/html" } }).then(function (res) {
@@ -347,12 +438,17 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
     }).then(function (r) {
       if (r.err) {
         var parsed = parsePage(r.text);
-        if (parsed.card !== null) { showCard(parsed.card); return; }
-        if (!swapPage(r.text)) { nativeSubmit(form); }
+        if (parsed.card !== null) { showCard(parsed.card); restoreForm(form); return; }
+        if (swapPage(r.text)) { restoreForm(form); } else { nativeSubmit(form); }
         return;
       }
-      if (!swapPage(r.text)) { nativeSubmit(form); }
-    }).then(function () {
+      // 成功（303 跟随后即详情页）：抽 main 换入 body ⇒ 旧表单连同禁用态与提示行一并离场。
+      var okMain = parsePage(r.text).main;
+      if (!swapPage(r.text)) { nativeSubmit(form); return; }
+      // 件B：换入页动作区仍是「在飞 / 排队」⇒ 交棒有界轮询（读面 = 本表单的详情 URL）；
+      // 已收口 / 摘不到 main ⇒ 不起轮，静态读面即最新事实。startPoll 内先 stopPoll ⇒ 恒只一条链。
+      lastHref = action;
+      startPoll(okMain);
       restoreForm(form);
     }).catch(function () { nativeSubmit(form); });
   }
@@ -384,16 +480,21 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
     if (form.closest("#feat-dialog") === null) return;
     if ((form.getAttribute("method") || "").toLowerCase() !== "post") return;
     e.preventDefault();
+    // 件A：就地即时反馈（禁用提交按钮 + 挂提示行）+ 连点拦截（挂起标记二次到达即吞掉）。
+    // 整页档的 SUBMIT_GUARD 因本行 preventDefault 而早退（defaultPrevented 语义未动）。
+    if (form.getAttribute("data-ov-pending") === "1") return;
+    if (!markPending(form)) return;
+    form.setAttribute("data-ov-pending", "1");
     postForm(form);
   });
   var closeBtn = document.getElementById("feat-dialog-close");
-  if (closeBtn !== null) closeBtn.addEventListener("click", function () { dlg.close(); dlg.returnValue = ""; });
-  dlg.addEventListener("cancel", function () { dlg.returnValue = ""; });
+  if (closeBtn !== null) closeBtn.addEventListener("click", function () { stopPoll(); dlg.close(); dlg.returnValue = ""; });
+  dlg.addEventListener("cancel", function () { stopPoll(); dlg.returnValue = ""; });
   dlg.addEventListener("click", function (e) {
     if (e.target !== dlg) return;
     var r = dlg.getBoundingClientRect();
     var inBox = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
-    if (!inBox) { dlg.close(); dlg.returnValue = ""; }
+    if (!inBox) { stopPoll(); dlg.close(); dlg.returnValue = ""; }
   });
 })();
 </script>`;
@@ -821,6 +922,20 @@ export function renderPage(params: PageParams): string {
   p.nextstep { border-left: 3px solid #5678; padding: 4px 10px; background: #8881; border-radius: 0 6px 6px 0; }
   p.turn-progress { border-left: 3px solid #b26a0088; padding: 4px 10px; background: #8881; border-radius: 0 6px 6px 0; color: #b26a00; }
   textarea { resize: vertical; }
+  /* v0.9.5 C3/C5/C6：原生 details 折叠（零脚本）+ 档位化动作区按钮 */
+  details.fold { margin: 10px 0; border: 1px solid #8884; border-radius: 6px; padding: 6px 10px; background: #8881; }
+  details.fold > summary { cursor: pointer; font-size: 14px; font-weight: 600; color: #567; }
+  details.fold[open] > summary { margin-bottom: 6px; border-bottom: 1px solid #8884; padding-bottom: 4px; }
+  details.fold h2 { display: inline; font-size: 14px; margin: 0; border: none; }
+  details.fold h3 { font-size: 13px; margin: 14px 0 6px; }
+  details.calib { margin: 6px 0; font-size: 11px; color: #888; }
+  details.calib > summary { cursor: pointer; font-style: italic; }
+  details.req-src { margin: 6px 0; }
+  details.req-src > summary { cursor: pointer; color: #667; background: #8881; border: 1px dashed #8884; border-radius: 6px; padding: 6px 10px; white-space: pre-wrap; word-break: break-word; }
+  button.quiet { align-self: flex-start; font-size: 12px; padding: 2px 10px; opacity: .7; }
+  p.turn-trace { color: #667; }
+  details.turn-summary { margin: 4px 0 0; }
+  details.turn-summary > summary { cursor: pointer; color: #667; background: #8881; border: 1px solid #8884; border-radius: 6px; padding: 4px 8px; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
   code { background: #8881; padding: 0 3px; border-radius: 3px; }
   .md h1 { font-size: 17px; margin: 18px 0 6px; }
   .md h2 { font-size: 15px; }

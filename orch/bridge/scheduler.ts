@@ -1042,7 +1042,8 @@ export class FeatureScheduler {
    *
    * v0.6.1 REQ-05 §2.1（N3）**收窄后的唯一调用面 = `validateDag` 失败**（结构性不可恢复）；
    * 业务失败改由静止收敛叙事承载（`propagateFailure` + `EVENT_FAILURE_REPORT`），
-   * 显式取消走 `a2a_feature_cancel`（`state-machine` 的「any 非终态 → cancelled」）。
+   * 显式取消走 `a2a_feature_cancel`（`state-machine` 的「any 非终态 → cancelled」）；
+   * `failed` 的收口归档亦走此口（表外 —— 转移表 `failed: []` 不变，由 cancel 守卫直写放行）。
    */
   private failFeature(feature: FeatureRecord, reason: string): boolean {
     const current = getFeature(feature.featureId);

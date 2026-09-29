@@ -32,6 +32,11 @@ import {
 } from "./host-bridge.js";
 import { HostTurnManager, createHostBridgeGateway } from "./host-turn.js";
 import { createHostFace, orgBridgeConfig, type BoardHostFace } from "./host-face.js";
+import { createBridgeClient } from "./bridge-client.js";
+import type { ChainStateSnapshot } from "./derive.js";
+import type { EngineStateProbe, HostRelay } from "./host-relay.js";
+import { SuspendLedgerStore, defaultSuspendLedgerFile } from "./suspend-ledger.js";
+import { type Heartbeat, createHeartbeat } from "./heartbeat.js";
 import { OrgsLedgerStore, defaultOrgsLedgerFile, isOrgDisabled as ledgerIsOrgDisabled } from "./orgs-ledger.js";
 import { VersionsLedgerStore, defaultVersionsLedgerFile, migrateReleasedVersions, releasedVersionNames } from "./versions-ledger.js";
 import { readVersion } from "./version.js";
@@ -77,6 +82,39 @@ function installBootstrapGuards(): void {
 
 
 /**
+ * 链状态快照的**内存态源**（v0.9.5 增补二 · D2）。三者在装配序列里都晚于宿主面诞生，
+ * 故用一个可变盒晚绑定（闭包在渲染时才读 ⇒ 装配期顺序无关）。
+ */
+export interface ChainSnapshotSources {
+  relay: HostRelay | null;
+  ledger: SuspendLedgerStore | null;
+  heartbeat: Heartbeat | null;
+}
+
+/**
+ * **组装详情页「链状态」一行的只读快照**（D2 · 件2）：三处内存态归一，**不写任何状态**。
+ * - 停链标志在 ⇒ `stopped`（带原因 + 来源；`pendingCount` 取挂起条目，读不到 ⇒ `null`）；
+ * - 无停链标志但有挂起条目 / 自动 armed 目标 ⇒ `monitoring`（`pendingCount` = 条目 pending 条数；
+ *   自动 armed 无条目 ⇒ `0` = 纯 DAG 监视）；
+ * - 三者皆无该需求的知识 ⇒ `null` ⇒ 读面**不渲染该行**（不臆造「监视中」）。
+ */
+export function composeChainSnapshot(
+  sources: ChainSnapshotSources,
+  featureId: string,
+): ChainStateSnapshot | null {
+  const id = featureId.trim();
+  if (id === "") return null;
+  const entry = sources.ledger?.get(id) ?? null;
+  const pendingCount = entry === null ? null : entry.pending.length;
+  const stop = sources.relay?.stopView(id) ?? null;
+  if (stop !== null) {
+    return { chainState: "stopped", reason: stop.reason, source: stop.source, pendingCount };
+  }
+  if (entry === null && sources.heartbeat?.isAutoArmed(id) !== true) return null;
+  return { chainState: "monitoring", reason: null, source: null, pendingCount: pendingCount ?? 0 };
+}
+
+/**
  * 装配宿主面（BD8）：BD4a 托管器 + BD4b 轮次 + {@link BoardHostFace} 接线。
  * `orgsDir = null` ⇒ 直接返 `null`（不建任何托管器 ⇒ 板不会去 spawn 任何进程）。
  */
@@ -88,11 +126,27 @@ export function buildHostFace(input: {
   machineDist: string;
   turnTimeoutMs?: number;
   /**
+   * **宿主后端模型**（v0.9.5 hostModel）：可选；有值 ⇒ 经 faceDeps 透传为起桥 `agentConfig.model`。
+   * 缺省 / `null` ⇒ 不注入（后端自身缺省）。既有调用方不传 ⇒ 零改动。
+   */
+  hostModel?: string | null;
+  /**
    * **停用闸判据**（v0.9.4 A4 · BD3）：注入 `isOrgDisabled` ⇒ {@link orgBridgeConfig} 命中停用台账即拒
    * （不起桥、不 spawn）。事实源 = 板组织台账（由 main 建单一 {@link OrgsLedgerStore} 后注入），
    * 与板 HTTP 写面读同一份文件；未注入 ⇒ 不判停用（保持 BD1–BD2 期间行为）。
    */
   isOrgDisabled?: (org: string) => boolean;
+  /**
+   * **v0.9.5 C3 只读引擎态探针**：接力的点火判据（收口后一跳 `getFeature` 重取
+   * `state/stage/approval`）。由 `main()` 用读面 `BridgeClient` 装配后传入；
+   * 未注入 ⇒ 接力决策判不了引擎态 ⇒ 保守停链（既有行为不变）。
+   */
+  engineProbe?: EngineStateProbe | null;
+  /**
+   * **v0.9.5 增补二 · D2 链状态只读快照**：详情页「链状态」一行的事实源（relay + 挂起台账 + 心跳
+   * 三处内存态归一）。由 `main()` 传入晚绑定闭包；未注入 ⇒ 宿主面回落 relay 内存态（更小快照）。
+   */
+  chainSnapshot?: (featureId: string) => ChainStateSnapshot | null;
 }): { face: BoardHostFace; bridges: HostBridgeManager } | null {
   if (input.orgsDir === null) return null;
   const faceDeps = {
@@ -100,7 +154,10 @@ export function buildHostFace(input: {
     defaultOrg: input.defaultOrg,
     kind: input.kind,
     ...(input.turnTimeoutMs !== undefined ? { turnTimeoutMs: input.turnTimeoutMs } : {}),
+    ...(input.hostModel !== undefined ? { hostModel: input.hostModel } : {}),
     ...(input.isOrgDisabled !== undefined ? { isOrgDisabled: input.isOrgDisabled } : {}),
+    ...(input.engineProbe !== undefined ? { engineProbe: input.engineProbe } : {}),
+    ...(input.chainSnapshot !== undefined ? { chainSnapshot: input.chainSnapshot } : {}),
     mcpUrlFor: (org: string) => defaultMcpUrlForOrg(org, input.mcpBaseUrl),
   };
   const bridges = new HostBridgeManager({ machineDistDir: input.machineDist });
@@ -150,6 +207,22 @@ async function main(): Promise<void> {
     );
   }
   fatal.setPhase("宿主面装配");
+  // v0.9.5 C3：只读引擎态探针 = 读面 BridgeClient 的一跳 getFeature（GET-only 硬约束不动）。
+  // 与 HTTP 读面共用同一客户端实例（同一 baseUrl），不新增出网面。
+  const readClient = createBridgeClient({ baseUrl: cfg.bridgeUrl });
+  const engineProbe: EngineStateProbe = {
+    async fetchEngineState(featureId: string) {
+      const detail = await readClient.getFeature(featureId);
+      return {
+        state: detail.feature.state,
+        stage: detail.feature.stage,
+        approval: detail.feature.approval,
+      };
+    },
+  };
+  // v0.9.5 增补二 · D2：链状态快照的三处内存态源（宿主面 → 台账 → 接力 → 心跳 的装配顺序里
+  // 后三者都晚于宿主面诞生 ⇒ 用可变盒晚绑定，闭包在页面渲染时才读）。
+  const chainSources: ChainSnapshotSources = { relay: null, ledger: null, heartbeat: null };
   const hostFace = buildHostFace({
     orgsDir,
     defaultOrg: group,
@@ -157,12 +230,50 @@ async function main(): Promise<void> {
     mcpBaseUrl: cfg.mcpBaseUrl,
     machineDist: cfg.machineDist,
     ...(cfg.turnTimeoutMs !== null ? { turnTimeoutMs: cfg.turnTimeoutMs } : {}),
+    ...(cfg.hostModel !== null ? { hostModel: cfg.hostModel } : {}),
     isOrgDisabled: (org) => ledgerIsOrgDisabled(orgsLedger.load().ledger, org),
+    engineProbe,
+    // v0.9.5 增补二 · D2：链状态行只读快照（relay / 台账 / 心跳晚绑定，故用可变盒）
+    chainSnapshot: (featureId) => composeChainSnapshot(chainSources, featureId),
   });
+  fatal.setPhase("自动接力装配");
+  // v0.9.5 C7/C8：suspended 台账**单进程单实例** —— 在起接力前建，供「挂起口写入（HTTP 侧）、
+  // 接力决策查条目、心跳扫台账 / 记去重位」三处共用同一份内存事实源（`.data/suspended.json` 仅供取证）。
+  const suspendLedger = new SuspendLedgerStore(defaultSuspendLedgerFile());
+  chainSources.ledger = suspendLedger;
+  // v0.9.5 C8：心跳实例（在 HTTP 监听后 start()；停机链**先 stop() 再 stopAll()**）。
+  // 变量提前声明：接力的 onMonitor 通知是异步到达的，闭包经 `heartbeat?.` 晚绑定，避免构造期循环依赖。
+  let heartbeat: Heartbeat | null = null;
+  // v0.9.5 C1：起接力（幂等）——把轮收口回调接到接力驱动器。宿主面未装配 ⇒ 不起（不 spawn 任何进程）。
+  // 接力日志经板日志出口留痕（决策 / 点火 / 停链）。
+  const relayLog = (line: string): void => void process.stdout.write(`${line}\n`);
+  const relay = hostFace?.face.startRelay({
+    log: relayLog,
+    // C8 规格④：显式挂起条目的查询只读挂接（分辨 MON1 显式挂起 / MON2 忘调挂起的自动 armed）。
+    suspendLookup: (requirementId) => {
+      const entry = suspendLedger.get(requirementId);
+      return entry === null ? null : { pendingCount: entry.pending.length };
+    },
+    // C8：监视归属通知 ⇒ 心跳维护自动 armed 注册表（⑤ 兜底只对 auto 目标适用）。
+    onMonitor: (notice) => heartbeat?.noteMonitor(notice),
+  });
+  chainSources.relay = relay ?? null;
+  if (relay !== null && relay !== undefined) {
+    process.stdout.write(
+      "自动接力已装配：轮收口后按判定表决策（succeeded+执行中⇒进监视，不立即点火；awaiting/failed/timeout/canceled/reviewing/终态⇒交人停链）；链内连续点火上限 10（人工动作清零）；停链标志落内存、不跨重启\n",
+    );
+  }
   fatal.setPhase("HTTP 监听");
+  // v0.9.5 C10：组织种子化 —— 建组织链落 `AGENTS.md`（模板渲染）+ `flow/spec` 两份规范快照，
+  // 并在 createBoardServer 内 listen 前做幂等回填（只补缺不覆盖、逐组织 fail-open、跳过停用组织）。
+  // `orgSeed` 省略 ⇒ 不种子化；生产入口（本文件）显式启用。
+  process.stdout.write(
+    "组织种子化已装配（v0.9.5 C10）：建组织落 AGENTS.md + flow/spec 快照；板启动幂等回填（只补缺不覆盖、逐组织 fail-open、跳过停用组织）\n",
+  );
   const handle = await createBoardServer({
     host: cfg.host,
     port: cfg.port,
+    client: readClient,
     bridge: { baseUrl: cfg.bridgeUrl },
     defaultGroup: group,
     mcpBaseUrl: cfg.mcpBaseUrl,
@@ -170,6 +281,8 @@ async function main(): Promise<void> {
     docs: { repoRoot: cfg.repoRoot, orgsDir: cfg.orgsDir },
     orgsLedgerFile,
     versionsLedgerFile,
+    suspendLedgerStore: suspendLedger,
+    orgSeed: { hostKind: cfg.hostKind },
     onShutdown: () => shutdown("POST /shutdown"),
   });
   process.stdout.write(
@@ -218,6 +331,43 @@ async function main(): Promise<void> {
   // 之后的崩溃不再单开 `board.fatal.log`（那条通道只服务「logger 之前死掉」这一段）。
   fatal.markLoggerReady();
 
+  // v0.9.5 C8 · T8：**心跳监视 + 唤醒点火**（板首个常驻句柄）——HTTP 监听后 start()，停机链先 stop()。
+  // 依赖全为既有只读面：读面 BridgeClient（引擎态 / 子任务结果）+ suspended 台账 + 接力驱动器（只读链状态）
+  // + host-bridge 的 sweepIdle（补其全仓无调用点的欠账，同拍驱动空闲回收）。
+  // R2 规格③：心跳只读调用走 3300 只读运维面，**不调 beginRound / ensureStarted** —— 不刷新桥 lastActivityAt
+  // （只有命中真正点火时经接力发轮，那是真实轮、理应刷新活动时间），故 idle 回收不被心跳干扰。
+  if (relay !== null && relay !== undefined && hostFace !== null) {
+    heartbeat = createHeartbeat({
+      ledger: handle.suspendLedger,
+      readEngine: async (featureId) => {
+        const detail = await readClient.getFeature(featureId);
+        return {
+          state: detail.feature.state,
+          stage: detail.feature.stage,
+          approval: detail.feature.approval,
+          ownerGroup: detail.feature.ownerGroup,
+          // 发起改造轨：DAG 节点挂 Feature 下、引擎轨可见 ⇒ 直接投影 node state 供定条件评估。
+          tasks: detail.tasks.map((t) => ({ taskId: t.taskId, state: t.state })),
+        };
+      },
+      readTaskState: async (taskId) => {
+        const task = await readClient.getTask(taskId);
+        return task === null ? null : task.state;
+      },
+      fire: (input) => hostFace.face.wakeTurn(input),
+      relay,
+      sweepIdle: () => hostFace.bridges.sweepIdle(),
+      defaultOrg: group,
+      log: relayLog,
+    });
+    chainSources.heartbeat = heartbeat;
+    heartbeat.start();
+    process.stdout.write(
+      "心跳监视已装配（v0.9.5 C8）：单 setInterval 扫 suspended 台账 + 自动 armed 目标；命中经接力点火" +
+        "（同 contextId 新一轮，计入链内计数）；同条件只唤一次；顺带驱动 sweepIdle 空闲回收\n",
+    );
+  }
+
   // BD13″ 优雅停机（SIGINT / SIGTERM 与 POST /shutdown **共用一条链**，重入幂等）：
   // 链的实现见 `lifecycle.createShutdownChain`（先停宿主桥 → 关卡口 → 删 pidfile）。
   //
@@ -229,6 +379,9 @@ async function main(): Promise<void> {
   // 启动失败那条 `process.exit(1)`（{@link failStartup}）是另一条路径，不是本闸。
   const shutdown = createShutdownChain({
     stopBridges: async () => {
+      // R2 规格①（先后写死）：**先停心跳（clearInterval）再停桥（stopAll）** —— 否则停机途中心跳仍可能
+      // 命中点火、把刚停的桥复活（`runJob → ensureBridge` 会重拉），只剩「等它自己停」的竞态。
+      heartbeat?.stop();
       await hostFace?.bridges.stopAll("shutdown");
     },
     closeServer: () => handle.close(),

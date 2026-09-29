@@ -13,7 +13,7 @@
  * `port` 3400 · `host` 127.0.0.1（loopback 守卫仍在 `server.assertLoopbackHost`）·
  * `orgsDir` **无缺省**（留空 = 未配置 ⇒ 宿主面不装配，§3.8 裁定 9 严禁回落）·
  * `group` **可选默认**（缺失不报错，BD11 形态：表单 > 默认，皆无 ⇒ 请求期 400）·
- * `hostKind` `claude` · `bridgeUrl` `http://127.0.0.1:3300` · `mcpBaseUrl` `http://127.0.0.1:8787` ·
+ * `hostKind` `claude`（`hostModel` **无缺省**，留空 = 不透传、后端自身缺省）· `bridgeUrl` `http://127.0.0.1:3300` · `mcpBaseUrl` `http://127.0.0.1:8787` ·
  * `machineDist` 按仓根推导（`<仓根>/machine/dist`）· `repoRoot` 缺省 = 板根上一级（BD10 读文档面）·
  * `turnTimeoutMs` 未配 ⇒ 交 BD4b 缺省。
  *
@@ -48,6 +48,8 @@ export interface BoardConfig {
   /** 板级默认组织：**可选默认**；`null` = 未配置（BD11 起不是错误，表单留空才请求期 400）。 */
   readonly group: string | null;
   readonly hostKind: string;
+  /** 宿主后端模型（v0.9.5 hostModel · 本次仅开 model 一键）：透传为起桥 `agentConfig.model`；`null` = 不透传 ⇒ 后端自身缺省。 */
+  readonly hostModel: string | null;
   readonly bridgeUrl: string;
   readonly mcpBaseUrl: string;
   readonly machineDist: string;
@@ -151,6 +153,8 @@ export function validateConfig(parsed: unknown, sourcePath: string): BoardConfig
 
   const host = optString(raw, "host") ?? DEFAULT_HOST;
   const hostKind = optString(raw, "hostKind") ?? DEFAULT_HOST_AGENT_KIND;
+  // hostModel（v0.9.5）：可选模型名；缺省 / 空串 ⇒ null = 不透传（后端自身缺省）。板不校验取值。
+  const hostModel = optString(raw, "hostModel");
   const bridgeUrl = requireUrl(optString(raw, "bridgeUrl") ?? DEFAULT_BRIDGE_BASE_URL, "bridgeUrl");
   const mcpBaseUrl = requireUrl(optString(raw, "mcpBaseUrl") ?? DEFAULT_MCP_BASE_URL, "mcpBaseUrl");
 
@@ -176,7 +180,7 @@ export function validateConfig(parsed: unknown, sourcePath: string): BoardConfig
     turnTimeoutMs = v;
   }
 
-  return { sourcePath, port, host, orgsDir, group, hostKind, bridgeUrl, mcpBaseUrl, machineDist, repoRoot, turnTimeoutMs };
+  return { sourcePath, port, host, orgsDir, group, hostKind, hostModel, bridgeUrl, mcpBaseUrl, machineDist, repoRoot, turnTimeoutMs };
 }
 
 /**

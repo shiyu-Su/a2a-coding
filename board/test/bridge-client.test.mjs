@@ -308,6 +308,31 @@ test("parseFeatureDetail: 登记字段透出（桥未给 ⇒ null，不臆造缺
   assert.equal(without.feature.version, null);
 });
 
+// --- v0.9.5 C4：需求原文上详情页 —— 详情出参的 requirement 键（数据面单点） --------------
+
+test("parseFeatureDetail: requirement 透出（v0.9.5 C4）—— 原文照抄、缺列 / 非字符串容错 null", () => {
+  const withText = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "waiting_approval", requirement: "  闸判据对取消轨版本失真  " },
+    tasks: [],
+  });
+  assert.equal(withText.feature.requirement, "  闸判据对取消轨版本失真  ", "原样透传（不 trim 不改写 —— 截断与空白判定归显示层）");
+
+  const legacy = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "waiting_approval" },
+    tasks: [],
+  });
+  assert.equal(legacy.feature.requirement, null, "老桥缺列 ⇒ null 容错（口径同列表面）");
+
+  const weird = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "waiting_approval", requirement: 42 },
+    tasks: [],
+  });
+  assert.equal(weird.feature.requirement, null, "非字符串 ⇒ null，不字符串化脏值");
+});
+
 // --- REQ-v0.9.2 N8：详情出参**顶层** acceptance 块（老桥缺键 ⇒ null ⇒ 详情页现行为） --------
 
 test("parseFeatureDetail: acceptance 顶层键透传（stages/failures/stateCounts）", () => {

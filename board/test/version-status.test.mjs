@@ -46,7 +46,7 @@ test("④ deriveVersionStatus：锁优先（已发版），只显示不执法", 
   assert.equal(locked.terminal, 2);
 
   const closed = deriveVersionStatus("v0.9.1", feats, []);
-  assert.equal(closed.status, "已收尾", "全部终态且至少一条 completed ⇒ 已收尾（仅提示，未登记 releasedVersions 不加锁）");
+  assert.equal(closed.status, "已收尾", "完成集合（completed + cancelled）覆盖全部且至少一条 completed ⇒ 已收尾（仅提示，未登记 releasedVersions 不加锁）");
 
   const running = deriveVersionStatus("v0.9.1", [...feats, { state: "executing", version: "v0.9.1" }], []);
   assert.equal(running.status, "进行中");
@@ -54,7 +54,13 @@ test("④ deriveVersionStatus：锁优先（已发版），只显示不执法", 
   assert.equal(running.total, 3);
 
   const allFailed = deriveVersionStatus("v1.0.0", [{ state: "failed", version: "v1.0.0" }], []);
-  assert.equal(allFailed.status, "进行中", "全终态但无 completed ⇒ 判不出，回落进行中");
+  assert.equal(allFailed.status, "进行中", "failed 不计入完成集合 ⇒ 呈现为未收口，回落进行中");
+
+  const allCancelled = deriveVersionStatus("v1.0.1", [
+    { state: "cancelled", version: "v1.0.1" },
+    { state: "cancelled", version: "v1.0.1" },
+  ], []);
+  assert.equal(allCancelled.status, "进行中", "completed > 0 不丢：全 cancelled 版零交付 ⇒ 不显示「已收尾」");
 
   const empty = deriveVersionStatus("v1.1.0", [], []);
   assert.equal(empty.status, "进行中", "空版 ⇒ 进行中，不猜已收尾");

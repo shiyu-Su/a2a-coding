@@ -20,10 +20,12 @@ import {
   FEATURE_STATES,
   allowedTransitions,
   isFeatureState,
+  isTerminalFeatureState,
 } from "../feature/state-machine.js";
 import {
   handleFeatureAdvance,
   handleFeatureApprove,
+  handleFeatureCancel,
   handleFeatureCreate,
   type FeatureCreateSuccess,
   type FeatureStateChangeSuccess,
@@ -161,11 +163,82 @@ test("B 步 §4.1.6：主链收敛 —— 枚举 9 态（6 主态 + 3 异常态�
   // 转移表**键集**由类型约束保证（`Record<FeatureState, …>`）：枚举一收缩，任何多余键即编译错误
   // （typecheck 即证明）；表中亦无三态出边（见上方 FEATURE_STATES / FEATURE_MAIN_CHAIN 断言）。
 
-  // 唯一准入边保留在转移表（`approve` 实际不经 canTransition，但表必须与行为一致）
+  // 唯一准入边保留在转移表（`approve` 实际不经 canTransition，但表必须与行为一致）。
+  // **`cancelled` 是例外**（v0.9.5 O1）：`failed → cancelled` 由 cancel 守卫放行、**不经表**
+  // （表内 `failed: []` 不变 —— 见下方「负锚」用例把「不加边」钉成断言）。
   assert.deepEqual(
     [...allowedTransitions("waiting_approval")],
     ["executing", "cancelled", "failed"],
   );
   assert.deepEqual([...allowedTransitions("needs_input")], ["executing", "cancelled", "failed"]);
   assert.deepEqual([...allowedTransitions("completed")], []);
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.5（REQ-2026-09-28-10 O1）—— `failed` 的收口归档路径（cancel 守卫放行，表零改动）
+// ---------------------------------------------------------------------------
+
+test("O1 正例：handleFeatureCancel 可将 failed Feature 归档为 cancelled（发版收口路径）", () => {
+  close();
+  createFeature({ featureId: "f-cancel", title: "DAG 非法后归档", state: "failed" });
+  // 节点账面：一个 failed、一个被冻结的 blocked —— cancel 只迁 Feature 态，二者须原样保留
+  createTask({ taskId: "N-failed", projectId: "p1", contextId: "c1", state: "failed", featureId: "f-cancel" });
+  createTask({ taskId: "N-blocked", projectId: "p1", contextId: "c2", state: "blocked", featureId: "f-cancel" });
+
+  const cancelled = mustChange(handleFeatureCancel({ featureId: "f-cancel" }));
+  assert.equal(cancelled.from, "failed", "出参 from 反映归档前的真实态");
+  assert.equal(cancelled.state, "cancelled");
+  assert.equal(getFeature("f-cancel")?.state, "cancelled", "落库态已归档为 cancelled");
+
+  assert.equal(getTask("N-failed")?.state, "failed", "本件不重派：failed 节点账面不动");
+  assert.equal(getTask("N-blocked")?.state, "blocked", "冻结中的 blocked 节点账面不动");
+  close();
+});
+
+test("O1 负例：completed / cancelled 调 cancel 仍被拒（feature_terminal，仅错误文案变化）", () => {
+  close();
+  createFeature({ featureId: "f-done", title: "已完成", state: "completed" });
+  createFeature({ featureId: "f-gone", title: "已取消", state: "cancelled" });
+
+  for (const [id, state] of [
+    ["f-done", "completed"],
+    ["f-gone", "cancelled"],
+  ] as const) {
+    const fail = mustFail(handleFeatureCancel({ featureId: id }));
+    assert.equal(fail.code, "feature_terminal", `${state} 照旧拒 feature_terminal（错误码不变）`);
+    assert.equal(getFeature(id)?.state, state, `${state} 被拒时不得改态`);
+  }
+  // 谓词口径：三终态判定本身不变（`isTerminalFeatureState` 仍认三态）—— 只有 cancel 放行面收窄
+  assert.equal(isTerminalFeatureState("failed"), true, "failed 仍是终态（枚举/集合零改动）");
+  close();
+});
+
+test("O1 负锚「不改边」：转移表 failed 出边恒空 + advance(failed → cancelled) 被拒", () => {
+  close();
+  createFeature({ featureId: "f-advance", title: "advance 面无归档路径", state: "failed" });
+
+  // ① 表事实：`failed: []` 未被改动
+  assert.deepEqual([...allowedTransitions("failed")], [], "转移表不得因 O1 加边");
+  // ② 行为事实：归档只走 `a2a_feature_cancel` 操作口，advance 直推被状态机拒
+  const fail = mustFail(handleFeatureAdvance({ featureId: "f-advance", to: "cancelled" }));
+  assert.equal(fail.code, "feature_transition_invalid", "advance 面不得出现 failed → cancelled");
+  assert.equal(getFeature("f-advance")?.state, "failed", "被拒时不得改态");
+  close();
+});
+
+test("O1 分叉守卫：retry 路径（advance + retryTaskIds）对 failed 仍拒 feature_terminal", () => {
+  close();
+  createFeature({ featureId: "f-retry", title: "重派守卫不受影响", state: "failed" });
+  createTask({ taskId: "R-failed", projectId: "p1", contextId: "c1", state: "failed", featureId: "f-retry" });
+
+  const fail = mustFail(
+    handleFeatureAdvance({ featureId: "f-retry", to: "executing", retryTaskIds: ["R-failed"] }),
+  );
+  assert.equal(
+    fail.code,
+    "feature_terminal",
+    "与 cancel 守卫**刻意分叉**：终态 Feature 的节点不会被调度 ⇒ retry 仍拒三终态",
+  );
+  assert.equal(getTask("R-failed")?.state, "failed", "被拒时零写入（不抖振）");
+  close();
 });

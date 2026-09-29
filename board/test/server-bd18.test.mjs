@@ -1,8 +1,16 @@
 /**
- * BD18 服务端用例（离线）：详情页可用性 —— **「确认」按钮按 `approval` 条件化**（禁用/灰态
- * + 原因，不隐藏）与**「下一步」引导行**逐态断言；负向：`approval = 未发起` 时确认按钮
- * 不可点且给出理由；宿主面未装配时不给 turn/confirm 入口并说明原因。
- * **只测渲染与可用性**：端点语义不变（confirm POST 仍原样经宿主面，由 agent 核对）。
+ * BD18 服务端用例（离线）：详情页可用性 —— **v0.9.5 C5 档位化改写**。
+ *
+ * **定向推翻记录（用户裁定 2026-09-29，改造文档 §2 C5）**：BD18 原口径「确认按钮恒显示、仅按
+ * `approval` 置灰 + 原因（不隐藏：看不到入口更迷惑）」与收口轨 14 ② / 17 的「灰态按钮 + 原因行」
+ * 一并改为**按档位收合** —— 「确认改造文档 → 放行执行」只在 `approval = 待审批` 出现；
+ * 终态 / 宿主面未装配 ⇒ **整个动作区不渲染**（墓碑档）；轮占用仍渲染但 disabled + 原因。
+ * 「触发一轮」这一底层机制词从 UI 消失（本文件页级负锚钉住）。
+ *
+ * **不变的判据（不得弱化）**：① 服务端 409 硬闸一条未减（`board_turn_busy` / `board_feature_terminal`
+ * 由轨 16 ③ 与写面用例钉，本文件只测显示）；② 写路由一对一（`/turn` 与 `/confirm`）不变；
+ * ③ 档位规则源在 `derive.ts`（本文件断言**页面真的按那张档位表渲染**）；④ 内联提交守卫 +
+ * data-submit 就地反馈仍在位（无外源脚本）。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -11,7 +19,7 @@ import { createBoardServer } from "../dist/server.js";
 
 const NOW = Date.parse("2026-09-24T12:00:00Z");
 
-function fakeClient(featureOver = {}) {
+function fakeClient(featureOver = {}, traceReturn = undefined) {
   return {
     client: {
       baseUrl: "http://fake",
@@ -36,9 +44,9 @@ function fakeClient(featureOver = {}) {
         };
       },
       async getFeatureTrace(featureId) {
+        if (traceReturn !== undefined) return traceReturn;
         throw new Error(`trace 不可用：${featureId}`);
-      },
-      async getProjects() {
+      },      async getProjects() {
         throw new Error("不该被本文件触达");
       },
       async getTasks() {
@@ -48,14 +56,20 @@ function fakeClient(featureOver = {}) {
   };
 }
 
-/** 最小假宿主面：页面只触 `awaitingTurnOf` / `busyTurnOf`；`awaiting` / `busyTurn` 可控。 */
-function fakeFace(awaiting = null, busyTurn = null) {
+/**
+ * 最小假宿主面：详情页只触 `awaitingTurnOf` / `busyTurnOf` / `latestTurnOf`（C6 留痕行）；
+ * 三者可控，缺省全空 ⇒ 页面无在飞轮、无待澄清、无历史轮次。
+ */
+function fakeFace(awaiting = null, busyTurn = null, latest = null) {
   return {
     awaitingTurnOf() {
       return awaiting;
     },
     busyTurnOf() {
       return busyTurn;
+    },
+    latestTurnOf() {
+      return latest;
     },
     async triggerTurn(input) {
       return { ok: true, featureId: input.featureId };
@@ -81,11 +95,11 @@ function fakeFace(awaiting = null, busyTurn = null) {
   };
 }
 
-async function withServer(run, { feature, hostFace } = {}) {
+async function withServer(run, { feature, hostFace, trace } = {}) {
   const handle = await createBoardServer({
     host: "127.0.0.1",
     port: 0,
-    client: fakeClient(feature ?? {}).client,
+    client: fakeClient(feature ?? {}, trace).client,
     now: () => NOW,
     defaultGroup: "g",
     ...(hostFace === undefined ? { hostFace: fakeFace() } : hostFace === null ? {} : { hostFace }),
@@ -102,42 +116,65 @@ async function detail(base) {
   return { status: res.status, text: await res.text() };
 }
 
-const CONFIRM_DISABLED = /<button type="submit" disabled aria-disabled="true">发送确认指令给 agent/;
-const CONFIRM_ENABLED = /<button type="submit">发送确认指令给 agent/;
+/**
+ * 详情页的**动作区块**（`<h2>动作</h2>` 起、至第一个折叠区〔阶段产出〕止 = 动作区 + 回答框）；
+ * 无动作区（终态 / 宿主面未装配）⇒ `null`。按钮可用性断言一律在本块内做 —— 整页文本里
+ * 「disabled」还会命中样式表与内联守卫脚本，拿整页断言等于没断。
+ */
+function actionBlock(text) {
+  const start = text.indexOf("<h2>动作</h2>");
+  if (start < 0) return null;
+  const rest = text.slice(start);
+  const end = rest.indexOf('<details class="fold"');
+  return end < 0 ? rest : rest.slice(0, end);
+}
+
+// 档位按钮的确切形状（可点 / 低调 / 禁用）—— 与 `renderActionArea` 的渲染式一一对应。
+const CONFIRM_TIER = /<button type="submit">确认改造文档 → 放行执行<\/button>/;
+const IDLE_TIER = /<button type="submit">让 agent 继续<\/button>/;
+const IDLE_TIER_QUIET = /<button type="submit" class="quiet">让 agent 继续<\/button>/;
+const SUBMIT_TIER = /<button type="submit">提交给 agent<\/button>/;
+const CONFIRM_DISABLED =
+  /<button type="submit" disabled aria-disabled="true">确认改造文档 → 放行执行<\/button>/;
+const IDLE_DISABLED = /<button type="submit" disabled aria-disabled="true">让 agent 继续<\/button>/;
 
 // ---------------------------------------------------------------------------
-// approval 三态逐态断言（按钮可用性 + 提示文案）
+// approval 三态逐态断言（档位 + 引导行文案）
 // ---------------------------------------------------------------------------
 
-test("BD18-页面（负向）：approval = 未发起 ⇒ 确认按钮禁用但入口不隐藏 + 原因「方案未就绪」+ 下一步指向「触发一轮」", async () => {
+test("C5-页面（原「禁用不隐藏」定向推翻）：approval = 未发起 ⇒ 不出确认块 · 出可点闲置档 + 补充框", async () => {
   await withServer(async (base) => {
     const { status, text } = await detail(base);
     assert.equal(status, 200);
-    assert.match(text, /action="\/features\/F1\/confirm"/, "不得隐藏入口（看不见更迷惑）");
-    assert.match(text, CONFIRM_DISABLED);
-    assert.doesNotMatch(text, CONFIRM_ENABLED);
-    assert.match(text, /方案未就绪（approval = 未发起）/);
-    assert.match(text, /<p class="hint nextstep">下一步：点「触发一轮」/);
-    assert.match(text, /<button type="submit">触发一轮<\/button>/, "触发一轮不受影响");
+    assert.equal(text.includes('/features/F1/confirm'), false, "非确认门不得渲染确认块");
+    assert.match(text, /<h2>动作<\/h2>/, "动作区本体在（换档不换区）");
+    assert.match(text, /action="\/features\/F1\/turn"/);
+    assert.match(text, IDLE_TIER);
+    assert.doesNotMatch(actionBlock(text), /disabled/, "闲置档不是灰态");
+    assert.match(text, /<textarea name="supplement"/, "turn 档带补充框");
+    assert.match(text, /<p class="hint nextstep">下一步：等你 —— 本卡尚无产出 ⇒ 点「让 agent 继续」/);
+    assert.doesNotMatch(text, /方案未就绪/, "旧灰态原因行随 BD18 一并退役");
   }, { feature: { approval: "未发起" } });
 });
 
-test("BD18-页面：approval = 待审批 ⇒ 确认按钮可点 + 下一步「核对改造文档后点确认」", async () => {
+test("C5-页面：approval = 待审批 ⇒ 唯一出现确认档（可点 · 去向 confirm · 无补充框）+ 引导行点名放行档位", async () => {
   await withServer(async (base) => {
     const { text } = await detail(base);
-    assert.match(text, CONFIRM_ENABLED);
-    assert.doesNotMatch(text, CONFIRM_DISABLED);
-    assert.match(text, /审批门 = 待审批/);
-    assert.match(text, /nextstep">下一步：核对改造文档后点「确认」/);
+    assert.match(text, CONFIRM_TIER);
+    assert.doesNotMatch(actionBlock(text), /disabled/, "待审批档不得出现 disabled");
+    assert.match(text, /action="\/features\/F1\/confirm"/);
+    assert.doesNotMatch(text, /name="supplement"/, "确认档走固定指令模板通道");
+    assert.match(text, /<p class="hint nextstep">下一步：等你 —— 改造文档已落文件 ⇒ 核对后点「确认改造文档 → 放行执行」/);
   }, { feature: { approval: "待审批", stage: "改造方案" } });
 });
 
-test("BD18-页面：approval = 已通过 ⇒ 确认按钮禁用（已放行无回边）+ 下一步指向引擎执行", async () => {
+test("C5-页面：approval = 已通过 + executing ⇒ 无确认块 · 兜底档低调（quiet）+ 引导行指向引擎接力", async () => {
   await withServer(async (base) => {
     const { text } = await detail(base);
-    assert.match(text, CONFIRM_DISABLED);
-    assert.match(text, /审批门已是「已通过」[^<]*无需再次确认/);
-    assert.match(text, /nextstep">下一步：审批门已通过，引擎/);
+    assert.equal(text.includes('/features/F1/confirm'), false, "审批门单向无回边 ⇒ 不再出确认入口");
+    assert.match(text, IDLE_TIER_QUIET, "执行中的手动入口低调保留（卡滞兜底，永久在位）");
+    assert.doesNotMatch(actionBlock(text), /disabled/, "兜底档是可点的低调档，不是灰态");
+    assert.match(text, /审批门已通过，引擎按 DAG 自动接力/);
   }, { feature: { approval: "已通过", state: "executing", stage: "改造" } });
 });
 
@@ -145,60 +182,60 @@ test("BD18-页面：approval = 已通过 ⇒ 确认按钮禁用（已放行无�
 // awaiting_answer 有/无 × 引导优先级
 // ---------------------------------------------------------------------------
 
-test("BD18-页面：存在 awaiting_answer 轮 ⇒ 引导行 = 回答（优先于 approval 分支），确认按钮仍按 approval 禁用", async () => {
-  const awaiting = {
-    turnId: "turn-old",
-    requirementId: "F1",
-    org: "g",
-    contextId: "ctx-1",
-    taskId: "t-old",
-    state: "awaiting_answer",
-    summary: null,
-    question: "改造文档以哪个版本落？",
-    error: null,
-    bridgeNote: null,
-    queuedAt: "q",
-    startedAt: "s",
-    finishedAt: null,
-    updatedAt: "u",
-  };
+const AWAITING = {
+  turnId: "turn-old",
+  requirementId: "F1",
+  org: "g",
+  contextId: "ctx-1",
+  taskId: "t-old",
+  state: "awaiting_answer",
+  summary: null,
+  question: "改造文档以哪个版本落？",
+  error: null,
+  bridgeNote: null,
+  queuedAt: "q",
+  startedAt: "s",
+  finishedAt: null,
+  updatedAt: "u",
+};
+
+test("C5-页面：存在 awaiting_answer 轮 ⇒ 引导行 = 回答（优先于 approval 分支）· 按钮换提交档（不撤回答框）", async () => {
   await withServer(async (base) => {
     const { text } = await detail(base);
-    assert.match(text, /<p class="hint nextstep">下一步：回答上方问题/);
+    assert.match(text, /<p class="hint nextstep">下一步：等你回答上方问题/);
     assert.match(text, /action="\/features\/F1\/answer"/);
-    assert.match(text, CONFIRM_DISABLED, "待澄清不改变确认按钮的 approval 判据");
-  }, { feature: { approval: "未发起" }, hostFace: fakeFace(awaiting) });
+    assert.match(text, SUBMIT_TIER, "有待答 ⇒ 档位换「提交给 agent」，不是确认档也不是灰态");
+    assert.equal(text.includes('/features/F1/confirm'), false, "未发起仍不出确认块");
+  }, { feature: { approval: "未发起" }, hostFace: fakeFace(AWAITING) });
 });
 
-test("BD18-页面：无 awaiting 轮 ⇒ 不显示回答框，引导行走 approval 分支（对照锚）", async () => {
+test("C5-页面：无 awaiting 轮 ⇒ 不显示回答框，引导行走 approval 分支（对照锚）", async () => {
   await withServer(async (base) => {
     const { text } = await detail(base);
     assert.equal(text.includes('action="/features/F1/answer"'), false);
-    assert.match(text, /nextstep">下一步：点「触发一轮」/);
+    assert.match(text, /nextstep">下一步：等你 —— 本卡尚无产出 ⇒ 点「让 agent 继续」/);
   }, { feature: { approval: "未发起" } });
 });
 
 // ---------------------------------------------------------------------------
-// 宿主面未装配（负向：不给 turn/confirm 入口并说明原因）
+// 宿主面未装配（负向：不给任何动作入口并说明原因）
 // ---------------------------------------------------------------------------
 
-test("BD18-页面（负向）：宿主面未装配 ⇒ 无触发一轮/确认入口 + 明示「宿主面未装配，需先配 orgsDir」", async () => {
+test("C5-页面（负向）：宿主面未装配 ⇒ 动作区整体不渲染 + 明示「宿主面未装配，需先配 orgsDir」", async () => {
   await withServer(async (base) => {
     const { status, text } = await detail(base);
-    assert.equal(status, 200, "只缺引导，页面其余只读面不坏");
+    assert.equal(status, 200, "只缺动作区，页面其余只读面不坏");
     assert.equal(text.includes('/features/F1/turn'), false, "未装配不得出现 turn 入口");
     assert.equal(text.includes('/features/F1/confirm'), false, "未装配不得出现 confirm 入口");
+    assert.equal(text.includes("<h2>动作</h2>"), false, "未装配 ⇒ 整区不渲染（不再摆灰按钮）");
     assert.match(text, /<p class="hint nextstep">下一步：宿主面未装配/);
     assert.match(text, /需先在 config.json 配 orgsDir/);
   }, { hostFace: null });
 });
 
 // ---------------------------------------------------------------------------
-// 收口轨 14 ②：详情页写按钮叠加「轮占用」判据（在飞 / 排队 ⇒ disabled + 原因）
+// 收口轨 14 ② → C5：轮占用 = 当前档 disabled + 原因（不换档、不撤入口）
 // ---------------------------------------------------------------------------
-
-const TURN_BUTTON_DISABLED = /<button type="submit" disabled aria-disabled="true">触发一轮/;
-const TURN_BUTTON_ENABLED = /<button type="submit">触发一轮<\/button>/;
 
 const BUSY_RUNNING = {
   turnId: "turn-run",
@@ -211,16 +248,15 @@ const BUSY_RUNNING = {
   startedAt: "s",
 };
 
-test("轨14-页面（负向）在飞轮占用 ⇒ 「触发一轮」也禁用（原先只有 confirm 判）+ 原因含轮次与轮 id", async () => {
+test("轨14-页面（负向）在飞轮占用 ⇒ 当前档按钮 disabled + 原因含轮次与轮 id · 入口不隐藏", async () => {
   await withServer(async (base) => {
     const { status, text } = await detail(base);
     assert.equal(status, 200);
-    assert.match(text, TURN_BUTTON_DISABLED);
-    assert.doesNotMatch(text, TURN_BUTTON_ENABLED);
+    assert.match(text, CONFIRM_DISABLED, "占用只把当前档置灰，不改档");
+    assert.doesNotMatch(text, CONFIRM_TIER);
     assert.match(text, /本轮进行中（第 2 轮 · turn-run）/);
-    assert.match(text, /action="\/features\/F1\/turn"/, "入口不隐藏（看不见更迷惑）");
-    assert.match(text, CONFIRM_DISABLED, "同一占用判据同样挡确认入口");
-    assert.match(text, /本轮进行中/, "confirm 的原因行显示占用（优先于 approval 判据）");
+    assert.match(text, /action="\/features\/F1\/confirm"/, "占用期的入口必须可见（点了会白点 ⇒ 灰 + 原因）");
+    assert.equal(text.includes('action="/features/F1/turn"'), false, "确认门期不出 turn 表单（一区一档）");
   }, { feature: { approval: "待审批" }, hostFace: fakeFace(null, BUSY_RUNNING) });
 });
 
@@ -229,41 +265,26 @@ test("轨14-页面：排队轮占用 ⇒ 文案说「排队中」，与在飞可
     const { text } = await detail(base);
     assert.match(text, /本轮排队中（第 2 轮 · turn-run）/);
     assert.doesNotMatch(text, /本轮进行中/);
-    assert.match(text, TURN_BUTTON_DISABLED);
+    assert.match(text, CONFIRM_DISABLED);
   }, { feature: { approval: "待审批" }, hostFace: fakeFace(null, { ...BUSY_RUNNING, state: "queued", startedAt: null }) });
 });
 
-test("轨14-页面（正向锚）无占用轮 ⇒ 两按钮回到各自既有判据（approval 档不受本轨影响）", async () => {
+test("轨14-页面（正向锚）无占用轮 ⇒ 档位回到 approval 判据，不出现占用原因行", async () => {
   await withServer(async (base) => {
     const { text } = await detail(base);
-    assert.match(text, TURN_BUTTON_ENABLED);
-    assert.match(text, CONFIRM_ENABLED);
+    assert.match(text, CONFIRM_TIER);
+    assert.doesNotMatch(actionBlock(text), /disabled/, "无占用 ⇒ 档位可点");
     assert.doesNotMatch(text, /本轮进行中|本轮排队中/);
   }, { feature: { approval: "待审批" } });
 });
 
-test("轨14-页面：awaiting_answer 轮不算占用 ⇒ 触发一轮仍可点（否则澄清链路被锁死）", async () => {
-  const awaiting = {
-    turnId: "turn-old",
-    requirementId: "F1",
-    org: "g",
-    contextId: "ctx-1",
-    taskId: "t-old",
-    state: "awaiting_answer",
-    summary: null,
-    question: "以哪个版本落？",
-    error: null,
-    bridgeNote: null,
-    queuedAt: "q",
-    startedAt: "s",
-    finishedAt: null,
-    updatedAt: "u",
-  };
+test("轨14-页面：awaiting_answer 轮不算占用 ⇒ 动作区按钮仍可点（否则澄清链路被锁死）", async () => {
   await withServer(async (base) => {
     const { text } = await detail(base);
-    assert.match(text, TURN_BUTTON_ENABLED, "等人回答不占闸位 ⇒ 按钮不锁");
+    assert.match(text, CONFIRM_TIER, "等人回答不占闸位 ⇒ 按钮不锁");
+    assert.doesNotMatch(actionBlock(text), /disabled/, "待澄清不算占用 ⇒ 动作区无 disabled");
     assert.match(text, /action="\/features\/F1\/answer"/);
-  }, { feature: { approval: "待审批" }, hostFace: fakeFace(awaiting, null) });
+  }, { feature: { approval: "待审批" }, hostFace: fakeFace(AWAITING, null) });
 });
 
 // ---------------------------------------------------------------------------
@@ -271,18 +292,22 @@ test("轨14-页面：awaiting_answer 轮不算占用 ⇒ 触发一轮仍可点�
 // ---------------------------------------------------------------------------
 
 test("轨14-页面：写表单带 data-submit 就地反馈文案 + 页面含一段内联提交守卫（无外源脚本）", async () => {
+  // 一区一档 ⇒ 两条通道的 data-submit 分两页各钉一次（档位不同，路由不变）。
   await withServer(async (base) => {
     const { text } = await detail(base);
     assert.match(text, /action="\/features\/F1\/turn"[^>]*data-submit="已提交，本轮可能跑数分钟…"/);
-    assert.match(text, /action="\/features\/F1\/confirm"[^>]*data-submit="已提交，处理中…"/);
     assert.match(text, /<script>/);
     assert.doesNotMatch(text, /<script[^>]*src=/, "不得引入外源脚本");
     assert.match(text, /querySelectorAll\("button\[type=submit\]"\)/, "守卫的落点 = 禁用提交按钮");
-  });
+  }, { feature: { approval: "未发起" } });
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.match(text, /action="\/features\/F1\/confirm"[^>]*data-submit="已提交，处理中…"/);
+  }, { feature: { approval: "待审批", stage: "改造方案" } });
 });
 
 // ---------------------------------------------------------------------------
-// 收口轨 17：引擎终态需求 ⇒「触发一轮 / 发送确认指令」渲染禁用（服务端 409 已由轨 16 ③ 钉）
+// 收口轨 17 → C5 墓碑：引擎终态 ⇒ 动作区整体不渲染，终态事实由引导行一行承载
 // ---------------------------------------------------------------------------
 
 for (const [terminalState, note] of [
@@ -290,19 +315,16 @@ for (const [terminalState, note] of [
   ["cancelled", "本需求已取消（终态），板上无需再操作"],
   ["failed", "本需求已进入失败终态，板上无需再操作"],
 ]) {
-  test(`轨17-页面（负向）引擎态 ${terminalState} ⇒ 两按钮 disabled + 原因行「${note.slice(0, 12)}…」`, async () => {
+  test(`轨17-页面（C5 墓碑）引擎态 ${terminalState} ⇒ 动作区不渲染（原两枚灰态按钮退役）+ 一行终态摘要`, async () => {
     await withServer(async (base) => {
       const { status, text } = await detail(base);
       assert.equal(status, 200);
-      assert.match(text, TURN_BUTTON_DISABLED);
-      assert.doesNotMatch(text, TURN_BUTTON_ENABLED);
-      assert.match(text, CONFIRM_DISABLED);
-      assert.doesNotMatch(text, CONFIRM_ENABLED);
-      assert.match(text, new RegExp(note.replace(/[（）]/g, "[（）]")), "原因行含终态文案");
-      assert.equal((text.match(new RegExp(note.slice(0, 6), "g")) ?? []).length >= 2, true, "两表单各一行原因");
-      assert.match(text, /action="\/features\/F1\/turn"/, "入口不隐藏（看不见更迷惑）");
-      assert.match(text, /action="\/features\/F1\/confirm"/);
-      assert.doesNotMatch(text, /审批门 = 待审批/, "终态时不再展示 approval 那条原因");
+      assert.equal(text.includes("/features/F1/turn"), false, "终态不得留 turn 入口");
+      assert.equal(text.includes("/features/F1/confirm"), false, "终态不得留 confirm 入口");
+      assert.equal(actionBlock(text), null, "终态 = 墓碑，无操作区");
+      assert.doesNotMatch(text, /<button[^>]*aria-disabled/, "终态不再摆灰按钮");
+      assert.match(text, new RegExp(`<p class="hint nextstep">${note}`), "一行终态摘要（引导位）");
+      assert.equal(text.includes('action="/features/F1/answer"'), false, "终态不渲染回答框");
     }, { feature: { state: terminalState, approval: "待审批" } });
   });
 }
@@ -310,20 +332,144 @@ for (const [terminalState, note] of [
 test("轨17-页面：终态判据优先于轮占用（终态需求的陈旧占用台账不再解释按钮）", async () => {
   await withServer(async (base) => {
     const { text } = await detail(base);
-    assert.match(text, TURN_BUTTON_DISABLED);
-    assert.match(text, CONFIRM_DISABLED);
+    assert.equal(text.includes("<h2>动作</h2>"), false, "终态 ⇒ 整区不渲染");
     assert.match(text, /本需求已完成（引擎态 completed）/);
     assert.doesNotMatch(text, /本轮进行中/, "终态原因覆盖占用原因");
   }, { feature: { state: "completed", approval: "待审批" }, hostFace: fakeFace(null, BUSY_RUNNING) });
 });
 
-test("轨17-页面（正向锚）非终态 + 未知态 ⇒ 两按钮回到既有判据，不出现终态原因行", async () => {
+test("轨17-页面（正向锚）非终态 + 未知态 ⇒ 动作区回到档位判据，不出现终态摘要", async () => {
   for (const state of ["executing", "some-future-state"]) {
     await withServer(async (base) => {
       const { text } = await detail(base);
-      assert.match(text, TURN_BUTTON_ENABLED, `${state} 非终态 ⇒ 触发一轮可点`);
-      assert.match(text, CONFIRM_ENABLED, `${state} 非终态 ⇒ 确认可点（approval = 待审批）`);
+      assert.match(text, /<h2>动作<\/h2>/, `${state} 非终态 ⇒ 动作区在位`);
+      assert.match(text, CONFIRM_TIER, `${state} 非终态 + 待审批 ⇒ 出确认档（可点）`);
       assert.doesNotMatch(text, /板上无需再操作/, `${state} 不得套终态文案`);
     }, { feature: { state, approval: "待审批" } });
   }
+});
+
+// ---------------------------------------------------------------------------
+// C5 页级负锚：底层机制词「触发一轮」整页零出现（按钮文案是意图，不是机制）
+// ---------------------------------------------------------------------------
+
+test("C5-页面（负锚）任何档位的详情页都不出现「触发一轮」字样", async () => {
+  for (const feature of [
+    { approval: "未发起" },
+    { approval: "待审批", stage: "改造方案" },
+    { approval: "已通过", state: "executing", stage: "改造" },
+    { approval: "已通过", state: "reviewing", stage: "改造" },
+    { approval: "已通过", state: "completed", stage: "发版" },
+  ]) {
+    await withServer(async (base) => {
+      const { status, text } = await detail(base);
+      assert.equal(status, 200);
+      assert.doesNotMatch(text, /触发一轮/, `${feature.approval}/${feature.state ?? "waiting_approval"} 档`);
+    }, { feature });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// C4 页级：需求原文上详情页（第一屏 · 引导行之后 · 动作区之前）
+// ---------------------------------------------------------------------------
+
+test("C4-页面：桥详情出参含 requirement ⇒ 常驻层显示需求原文（截断 + 展开全文）；缺字段 ⇒ 整区不渲染", async () => {
+  const long = "板「标记 released」的闸判据对曾有取消轨的版本永久失真：".repeat(6);
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.match(text, /<h2>需求原文<\/h2>/);
+    assert.match(text, /<details class="req-src">/, "超长原文走原生 details（零脚本）");
+    const block = text.slice(text.indexOf("<h2>需求原文</h2>"), text.indexOf("<h2>动作</h2>"));
+    assert.ok(block.indexOf("</summary>") < block.indexOf("<pre class=\"result\">"), "折叠态 = 截断、展开态 = 全文");
+    assert.ok(block.indexOf("nextstep") < block.indexOf("<h2>需求原文</h2>"), "位于引导行之后的常驻层");
+  }, { feature: { requirement: long } });
+
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.match(text, /<h2>需求原文<\/h2>\n<pre class="result">要一个只读的排期导出<\/pre>/, "短原文直显，不套 details");
+  }, { feature: { requirement: "要一个只读的排期导出" } });
+
+  for (const requirement of [undefined, null, "", "   "]) {
+    await withServer(async (base) => {
+      const { text } = await detail(base);
+      assert.equal(text.includes("<h2>需求原文</h2>"), false, `${String(requirement)} ⇒ 不渲染空区块`);
+    }, { feature: { requirement } });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// C1 页级正锚：引导行上移第一屏（字段表之后 · 需求原文之前 · 动作区之前）
+// ---------------------------------------------------------------------------
+
+test("C1-页面（正锚）：第一屏拼接序 = 字段表 → 引导行 → 需求原文 → 动作区/轮留痕", async () => {
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    const marks = [
+      text.indexOf("<th>审批门（approval）</th>"),
+      text.indexOf('<p class="hint nextstep">'),
+      text.indexOf("<h2>需求原文</h2>"),
+      text.indexOf("<h2>最近一轮</h2>"),
+      text.indexOf("<h2>动作</h2>"),
+    ];
+    assert.equal(marks.every((i) => i >= 0), true, "五处结构锚都在场");
+    assert.deepEqual([...marks].sort((a, b) => a - b), marks, "引导行不在第一屏（字段表后、原文/动作区前）即回归");
+  }, {
+    feature: { approval: "待审批", requirement: "要一个只读的排期导出" },
+    hostFace: fakeFace(null, null, {
+      turnId: "turn-page-1",
+      state: "succeeded",
+      summary: "本轮结论：锚已合入",
+      finishedAt: "2026-09-29T08:00:00Z",
+      updatedAt: "2026-09-29T08:00:00Z",
+      error: null,
+    }),
+  });
+});
+
+// ---------------------------------------------------------------------------
+// C2 页级正锚：空区块短路（Step 0 卡瘦一屏的落点）
+// ---------------------------------------------------------------------------
+
+test("C2-页面（正锚）：任务 0 ⇒ 任务表不出 · trace 空节点 ⇒ 三面表不出 · trace 读失败 ⇒ 不短路照出", async () => {
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.equal(text.includes("<h2>任务（"), false, "默认桥 tasks=[] ⇒ 任务表整节不渲染");
+    assert.match(text, /trace 读取失败/, "读失败不属短路范围（R1 执行注记：不静默）");
+  });
+
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.equal(text.includes("<h2>任务（"), false, "任务 0 ⇒ 不出");
+    assert.equal(text.includes("执行明细"), false, "trace 空 + 任务 0 ⇒ 执行明细区整体消失");
+  }, { trace: { featureId: "F1", featureState: "waiting_approval", nodes: [] } });
+});
+
+// ---------------------------------------------------------------------------
+// C6 页级正锚：最近一轮留痕（state / 轮 id / 时间 / 摘要，重载不丢）
+// ---------------------------------------------------------------------------
+
+test("C6-页面（正锚）：latestTurnOf 有轮 ⇒ 详情页显示最近一轮 state+轮 id+时间+摘要；无轮 ⇒ 整行不渲染", async () => {
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.match(text, /<h2>最近一轮<\/h2>/);
+    assert.match(text, /<p class="hint turn-trace"><b>失败（failed）<\/b>/, "轮态 = 中文（原值）");
+    assert.match(text, /<span class="mono">turn-012<\/span>/, "轮 id 短形可核对");
+    assert.match(text, /2026-09-29T08:30:00Z/, "时间 = finishedAt 原样");
+    assert.match(text, /<span class="mono">turn_upstream_unreachable<\/span>/, "失败轮带结构化错误码");
+    assert.match(text, /<details class="fold turn-summary"><summary>本轮结论：锚已合入<\/summary>/, "摘要进折叠层");
+  }, {
+    hostFace: fakeFace(null, null, {
+      turnId: "turn-0123456789abcdef",
+      state: "failed",
+      summary: "本轮结论：锚已合入",
+      finishedAt: "2026-09-29T08:30:00Z",
+      updatedAt: "2026-09-29T08:31:00Z",
+      error: { code: "turn_upstream_unreachable" },
+    }),
+  });
+
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.equal(text.includes("<h2>最近一轮</h2>"), false, "默认 fakeFace latest=null ⇒ 留痕行缺席（缺席不是错误）");
+  });
 });

@@ -29,6 +29,12 @@ export interface BridgeClient {
   getFeatureTrace(featureId: string): Promise<FeatureTraceView>;
   getProjects(): Promise<ProjectsView>;
   getTasks(projectId: string, options?: GetTasksOptions): Promise<ProjectTasksView>;
+  /**
+   * **单任务 state 只读探针**（v0.9.5 C8 · T8）：`GET /api/tasks/:taskId`（与宿主 `watch-task.mjs`
+   * 同一只读面），供心跳判 `pending` 子任务是否就绪。**未知 id（404 / `task_not_found`）⇒ `null`**，
+   * 其余传输 / 格式错误照常抛（保守侧不假唤醒由调用方处理）。仍满足 GET-only 硬约束。
+   */
+  getTask(taskId: string): Promise<TaskStateView | null>;
 }
 
 // ---------------------------------------------------------------------------
@@ -148,6 +154,8 @@ export interface FeatureDetailView {
     approval: string | null;
     /** 增补 Feature 的父需求 id（v0.9.3 B1 读面标注）；老桥无此列 ⇒ null 容错，口径同 {@link FeatureListItem.parentFeatureId} */
     parentFeatureId: string | null;
+    /** 需求原文（v0.9.5 C4 上详情页）：桥详情出参照列表面透出该键；老桥缺列 ⇒ null 容错，口径同 {@link FeatureListItem.requirement}。 */
+    requirement: string | null;
     /**
      * Feature Context（BD11 · 阶段产出上板）：桥侧存的是 JSON 字符串（数组归一化属渲染层），
      * 老桥 / 未登记 ⇒ null。
@@ -218,6 +226,15 @@ export interface ProjectTasksView {
   reachable: boolean;
   notice: string | null;
   tasks: ProjectTaskItem[];
+}
+
+/**
+ * `GET /api/tasks/:taskId` 的归一视图（v0.9.5 C8 · T8 心跳的子任务就绪探针）：
+ * 只取 `state`（原样透传，值域归桥，板不自造中文词）；`taskId` 容错为 `null`（桥出参未必带）。
+ */
+export interface TaskStateView {
+  taskId: string | null;
+  state: string;
 }
 
 export interface TraceProjectBusy {
@@ -384,6 +401,7 @@ export function parseFeatureDetail(json: unknown): FeatureDetailView {
       version: str(feature.version),
       approval: str(feature.approval),
       parentFeatureId: str(feature.parentFeatureId),
+      requirement: str(feature.requirement),
       decisions: str(feature.decisions),
       contracts: str(feature.contracts),
       createdAt: str(feature.createdAt),
@@ -521,6 +539,16 @@ export function parseTasks(json: unknown): ProjectTasksView {
   return { projectId, reachable: body.reachable !== false, notice: str(body.notice), tasks };
 }
 
+/**
+ * `GET /api/tasks/:taskId` → 单任务 state（纯函数）。出参形状 = `{ ok:true, task:{ taskId?, state } }`
+ * （与 `watch-task.mjs#fetchTaskState` 同源）；`state` 缺失 ⇒ `"unknown"`（保守：未知 state 一律按未就绪）。
+ */
+export function parseTaskState(json: unknown): TaskStateView {
+  const body = expectOk(json, "子任务详情");
+  const task = isRecord(body.task) ? body.task : {};
+  return { taskId: str(task.taskId), state: str(task.state) ?? "unknown" };
+}
+
 // ---------------------------------------------------------------------------
 // 客户端（网络层，仅 GET）
 // ---------------------------------------------------------------------------
@@ -586,6 +614,17 @@ export function createBridgeClient(options: BridgeClientOptions = {}): BridgeCli
       if (options.state !== undefined && options.state.length > 0) qs.set("state", options.state);
       if (options.limit !== undefined) qs.set("limit", String(options.limit));
       return parseTasks(await getJson(opts, `/api/tasks?${qs.toString()}`));
+    },
+    async getTask(taskId: string): Promise<TaskStateView | null> {
+      try {
+        return parseTaskState(await getJson(opts, `/api/tasks/${encodeURIComponent(taskId)}`));
+      } catch (err: unknown) {
+        // 未知 id = 404 / `task_not_found` ⇒ null（与 watch-task 同口径）；其余照常抛（不静默吞）。
+        if (err instanceof BridgeResponseError && (err.code === "http_404" || err.code === "task_not_found")) {
+          return null;
+        }
+        throw err;
+      }
     },
   };
 }

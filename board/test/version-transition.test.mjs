@@ -3,8 +3,10 @@
  *
  * 判据（改造文档 §2.3 / 需求确认单 v5）：
  * - 手动写面闸（五条边）：`notstart → active`（正例）· `active → notstart`（有已确认卡 ⇒ 拒）·
- *   `active → released`（判据 `completed === total ∧ total > 0`，**不复用** terminal 计数 ——
- *   failed/cancelled 反例必须拒）· `released → active`（重开）· `notstart → released`（状态机拒）；
+ *   `active → released`（判据 `total > 0 ∧ completed + cancelled === total ∧ completed > 0`，
+ *   **完成集合 = completed + cancelled**（cancelled 轨已终止、无遗留待办 ⇒ 计入），`failed` 不计入
+ *   ⇒ 含 failed 反例必须拒；**全 cancelled（无任何交付）同样必须拒**）·
+ *   `released → active`（重开）· `notstart → released`（状态机拒）；
  * - 自动转换唯一一处 = 渲染前惰性比对「台账 notstart 条目 × 名下存在 stage ≠ 需求分析 的卡」，
  *   三护栏：幂等 / 写失败不阻断渲染（回落派生态） / 进程内节流（≥30s）；
  * - 自动写留 `note='auto:first-card-confirmed'`。
@@ -40,9 +42,9 @@ const WRITE_HEADERS = { "x-board-write": "1", accept: "application/json" };
 // 纯判定：迁移矩阵（五条边 + 自环 + 未列边）
 // ---------------------------------------------------------------------------
 
-/** 构造迁移事实（缺省 = 无已确认卡、空版）。 */
+/** 构造迁移事实（缺省 = 无已确认卡、空版；计数面 = raw 四桶）。 */
 function facts(over = {}) {
-  return { version: "v0.9.4", hasConfirmedCard: false, total: 0, completed: 0, ...over };
+  return { version: "v0.9.4", hasConfirmedCard: false, total: 0, completed: 0, cancelled: 0, failed: 0, ...over };
 }
 
 test("W3-① 已确认卡判据 = stage ≠ 需求分析（含 null 老桥缺列 ⇒ 已确认，fail-closed）", () => {
@@ -69,20 +71,41 @@ test("W3-③ active → notstart：无已确认卡（仅想法卡 / 无卡）⇒
   assert.equal(r.code, "board_version_transition_confirmed_cards");
 });
 
-test("W3-④ active → released：`completed === total ∧ total > 0` 才放行", () => {
+test("W3-④ active → released 正锚：`total > 0 ∧ completed + cancelled === total ∧ completed > 0` 才放行", () => {
+  // 纯函数正锚：全 completed
   assert.equal(decideVersionTransition("active", "released", facts({ total: 2, completed: 2 })).ok, true);
+  // 正锚（完成集合含 cancelled 轨）：1 completed + 1 cancelled ⇒ 放行
+  assert.equal(
+    decideVersionTransition("active", "released", facts({ total: 2, completed: 1, cancelled: 1 })).ok,
+    true,
+    "completed + cancelled === total ∧ completed > 0 ⇒ 放行",
+  );
   assert.equal(
     decideVersionTransition("active", "released", facts({ total: 0, completed: 0 })).ok,
     false,
     "空版（total=0）不放行",
   );
+  // 非终态在途（total=3 只收尾 2）⇒ 拒
   const r = decideVersionTransition("active", "released", facts({ total: 3, completed: 2 }));
+  assert.equal(r.ok, false);
   assert.equal(r.code, "board_version_transition_release_incomplete");
 });
 
-test("W3-⑤ active → released 反例（不复用 terminal 计数）：failed / cancelled 不计入 completed", () => {
-  // 名下 3 张 = 1 completed + 1 failed + 1 cancelled ⇒ terminal 计数会是 3（误放行），completed=1 ⇒ 必须拒。
-  const r = decideVersionTransition("active", "released", facts({ total: 3, completed: 1 }));
+test("W3-④b active → released 负锚：全 cancelled（无任何交付）⇒ 拒（用户裁决 A）", () => {
+  const r = decideVersionTransition("active", "released", facts({ total: 2, completed: 0, cancelled: 2 }));
+  assert.equal(r.ok, false, "completed + cancelled === total 但 completed = 0 ⇒ 该版零交付，不得标记 released");
+  assert.equal(r.code, "board_version_transition_release_incomplete");
+});
+
+test("W3-④c active → released 负锚：非终态在途（executing）⇒ 拒", () => {
+  const r = decideVersionTransition("active", "released", facts({ total: 3, completed: 2, cancelled: 0 }));
+  assert.equal(r.ok, false, "名下仍有一张未到终态 ⇒ 未收口");
+  assert.equal(r.code, "board_version_transition_release_incomplete");
+});
+
+test("W3-⑤ active → released 负锚：failed 不计入完成集合（含 failed ⇒ 拒，须先经 cancel 归档）", () => {
+  // 名下 3 张 = 1 completed + 1 failed + 1 cancelled ⇒ 完成集合 2 ≠ total 3 ⇒ 必须拒。
+  const r = decideVersionTransition("active", "released", facts({ total: 3, completed: 1, cancelled: 1, failed: 1 }));
   assert.equal(r.ok, false);
   assert.equal(r.code, "board_version_transition_release_incomplete");
 });
@@ -300,7 +323,7 @@ test("W3-⑩ HTTP active → notstart：有已确认卡 ⇒ 409；仅想法卡 �
   );
 });
 
-test("W3-⑪ HTTP active → released：全 completed ⇒ 200；含 failed/cancelled ⇒ 409（terminal 反例）", async () => {
+test("W3-⑪ HTTP active → released：全 completed ⇒ 200；完成集合缩影（16 completed + 3 cancelled）⇒ 200；含 failed ⇒ 409", async () => {
   await withServer(
     async (base, env) => {
       const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "released" });
@@ -310,6 +333,21 @@ test("W3-⑪ HTTP active → released：全 completed ⇒ 200；含 failed/cance
     {
       seed: [rec("v0.9.4", "active")],
       features: [feature("F1", "v0.9.4", { state: "completed" }), feature("F2", "v0.9.4", { state: "completed" })],
+    },
+  );
+  // 正向缩影（v0.9.4 名下 16 completed + 3 cancelled = 19 全收尾）⇒ 放行
+  await withServer(
+    async (base, env) => {
+      const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "released" });
+      assert.equal(res.status, 200, "completed + cancelled === total ∧ completed > 0 ⇒ 放行");
+      assert.equal(readLedger(env.versionsFile)[0].status, "released");
+    },
+    {
+      seed: [rec("v0.9.4", "active")],
+      features: [
+        ...Array.from({ length: 16 }, (_, i) => feature(`C${i}`, "v0.9.4", { state: "completed" })),
+        ...Array.from({ length: 3 }, (_, i) => feature(`X${i}`, "v0.9.4", { state: "cancelled" })),
+      ],
     },
   );
   await withServer(
@@ -325,6 +363,39 @@ test("W3-⑪ HTTP active → released：全 completed ⇒ 200；含 failed/cance
         feature("F1", "v0.9.4", { state: "completed" }),
         feature("F2", "v0.9.4", { state: "failed" }),
         feature("F3", "v0.9.4", { state: "cancelled" }),
+      ],
+    },
+  );
+});
+
+test("W3-⑪b HTTP active → released 负锚：全 cancelled ⇒ 409（零交付版不得发版）；非终态在途 ⇒ 409", async () => {
+  await withServer(
+    async (base, env) => {
+      const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "released" });
+      assert.equal(res.status, 409, "completed = 0 ⇒ 拒（用户裁决 A）");
+      assert.equal((await res.json()).code, "board_version_transition_release_incomplete");
+      assert.equal(readLedger(env.versionsFile)[0].status, "active", "拒绝即零写");
+    },
+    {
+      seed: [rec("v0.9.4", "active")],
+      features: [
+        feature("F1", "v0.9.4", { state: "cancelled" }),
+        feature("F2", "v0.9.4", { state: "cancelled" }),
+      ],
+    },
+  );
+  await withServer(
+    async (base) => {
+      const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "released" });
+      assert.equal(res.status, 409, "名下仍有 executing 在途 ⇒ 未收口");
+      assert.equal((await res.json()).code, "board_version_transition_release_incomplete");
+    },
+    {
+      seed: [rec("v0.9.4", "active")],
+      features: [
+        feature("F1", "v0.9.4", { state: "completed" }),
+        feature("F2", "v0.9.4", { state: "completed" }),
+        feature("F3", "v0.9.4", { state: "executing" }),
       ],
     },
   );

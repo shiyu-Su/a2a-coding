@@ -97,7 +97,7 @@
  *   不经 CSRF 写面守卫（它是运维停机口，不是业务写面），来源门 = `socket.remoteAddress` 必须 loopback，
  *   非 loopback 一律 403 `loopback_only`（负向用例钉住）。
  *
- * **方法门**：读面仅 GET；写面只放开上面八条业务路径（白名单 = `write-guard.parseWriteRoute`）+
+ * **方法门**：读面仅 GET；写面只放开上面十条业务路径（白名单 = `write-guard.parseWriteRoute`）+
  * `/shutdown` 一条运维路径（本文件内处理），其余路径的非 GET 一律 405。写端点另受 CSRF 守卫（自定义头或同源 Origin/Referer，见 `write-guard.ts`）。
  * 板**不写状态机迁移**：approve / cancel 与「advance 到非当前态」的主链推进均无路径（确认与回答都只是给宿主 agent 的一轮消息，推进归 agent）；唯一放开的是 `version` 排期写（经 `feature-schedule.ts` 用 advance「`to` = 当前态」特例，M3 已接线 `POST /features/:id/schedule`）。
  *
@@ -121,12 +121,20 @@ import { join } from "node:path";
 import {
   createBridgeClient,
   DEFAULT_BRIDGE_BASE_URL,
+  type AcceptanceView,
   type BridgeClient,
   type BridgeClientOptions,
   type FeatureListItem,
 } from "./bridge-client.js";
 import { dispositionHttpStatus, terminalTurnRejection, diagnoseOrgsDir, ORGS_DIR_NOT_CONFIGURED, ORG_DISABLED, type BoardHostFace, type TriggerTurnOutcome } from "./host-face.js";
-import { deriveTurnProgress, isTerminalFeatureState } from "./derive.js";
+import {
+  deriveChainStateLine,
+  deriveTurnProgress,
+  isTerminalFeatureState,
+  type ChainStateSnapshot,
+  type NextStepInput,
+  type NextStepTaskCounts,
+} from "./derive.js";
 import {
   createRequirement,
   DEFAULT_MCP_BASE_URL,
@@ -148,7 +156,9 @@ import {
   parseMemberForm,
   parseRequirementForm,
   parseScheduleForm,
+  parseTurnForm,
   parseVersionActionForm,
+  parseSuspendForm,
   parseWriteRoute,
   validateOrgName,
   WRITE_ROUTES,
@@ -160,6 +170,7 @@ import {
   VERSION_ACTION_REMOVE,
   VERSION_ACTION_SET_STATUS,
   VERSION_FORM_INVALID_CODE,
+  SUSPEND_TURN_MISMATCH_CODE,
   ScheduleFormProgrammingError,
   type OrgNameConflictSource,
 } from "./write-guard.js";
@@ -182,6 +193,7 @@ import {
 } from "./group-admin.js";
 import { OrgsLedgerStore, defaultOrgsLedgerFile, enabledOrgNames, ledgerOrgNames, disabledOrgNames, isOrgDisabled } from "./orgs-ledger.js";
 import { VersionsLedgerStore, defaultVersionsLedgerFile, findVersionRecord, ledgerVersionNames, releasedVersionNames, type VersionsLedger } from "./versions-ledger.js";
+import { SuspendLedgerStore, defaultSuspendLedgerFile, type SuspendedEntry } from "./suspend-ledger.js";
 import {
   applyAutoVersionTransitions,
   decideVersionTransition,
@@ -216,6 +228,15 @@ import {
   type OrgSpaceRoute,
   type OrgSpaceView,
 } from "./org-space.js";
+import {
+  backfillOrgWorkspaces,
+  resolveOrgSeedOptions,
+  seedOrgWorkspace,
+  summarizeSeedResults,
+  type OrgSeedOptions,
+  type OrgSeedWarning,
+  type ResolvedOrgSeedOptions,
+} from "./org-seed.js";
 import type { AgentsPageInput, OrgsDirStatus } from "./web/views.js";
 import { deriveScheduleGateOpen } from "./derive.js";
 import {
@@ -248,11 +269,12 @@ import {
   errorFamilyLabel,
   groupFeaturesByVersion,
   renderAcceptanceSection,
+  renderActionArea,
   renderAgentsPage,
   renderAnswerForm,
-  renderConfirmForm,
   renderFeatureDetail,
   renderHostNotice,
+  renderChainStateLine,
   renderMemberWriteCard,
   renderHostPage,
   renderNewRequirementDialog,
@@ -266,9 +288,10 @@ import {
   renderSchedule,
   renderTasks,
   renderTasksPick,
-  renderTurnForm,
   renderTurnOutcome,
   renderTurnProgress,
+  renderTurnTrace,
+  registeredDecisionDocFiles,
   selectRequirementPool,
   stopBridgeErrorOverlay,
   turnOutcomeErrorOverlay,
@@ -278,6 +301,11 @@ export interface BoardServerHandle {
   readonly host: string;
   readonly port: number;
   close(): Promise<void>;
+  /**
+   * **v0.9.5 C8 · T8**：本服务持有的 suspended 台账实例（内存为事实源）。
+   * 装配层（`index.ts`）用它驱动心跳的挂起条目扫描与去重位写入 —— **单进程单实例**，不另建第二份。
+   */
+  readonly suspendLedger: SuspendLedgerStore;
 }
 
 export interface CreateBoardServerOptions {
@@ -387,6 +415,25 @@ export interface CreateBoardServerOptions {
    * （`.data/` 已 gitignore）；测试注入 tmp 路径离线自证。`POST /versions` 写口只动本文件。
    */
   versionsLedgerFile?: string;
+  /**
+   * **suspended 台账文件**（v0.9.5 C7 · T7）：缺省 `<板 cwd>/.data/suspended.json`（`.data/` 已 gitignore）；
+   * 测试注入 tmp 路径离线自证。⚠ **内存为事实源、启动即清空重写**，本文件仅供崩溃取证。
+   */
+  suspendLedgerFile?: string;
+  /**
+   * **suspended 台账实例注入**（v0.9.5 C8 · T8）：提供 ⇒ 直接复用该实例（**单进程单实例**），
+   * 使装配层（`index.ts` 的心跳）与服务共用**同一份**内存台账；缺省 ⇒ 按 `suspendLedgerFile` 新建。
+   */
+  suspendLedgerStore?: SuspendLedgerStore;
+  /**
+   * **组织种子化注入面**（v0.9.5 C10 · REQ-2026-09-28-09）：建组织链（`POST /orgs`）落 `AGENTS.md`
+   * + `flow/spec` 快照，并在 **listen 前**做幂等回填。
+   * - **省略 / null ⇒ 不种子化**（既有行为逐字节不变；既有测试默认即此档）；
+   * - 传对象 ⇒ 启用，字段皆可注入（fixture 模板 / 规范根 / 版本 / kind / 文件清单），
+   *   缺省按板内真实资产推导（`templates/org` + `<repoRoot>/flow/spec`）。
+   * `index.ts`（唯一生产入口）显式传 `{}` 启用。
+   */
+  orgSeed?: OrgSeedOptions | null;
 }
 
 /** 仅接受 loopback（127.0.0.1 / ::1 / localhost）；否则抛错，拒绝绑定非本机地址 */
@@ -504,6 +551,15 @@ interface Ctx extends PageCtx {
   /** v0.9.4 N1：板侧版本台账存取（`.data/versions.json`；`POST /versions` 写口唯一落点，亦为版本锁唯一事实源）。 */
   versionsLedger: VersionsLedgerStore;
   /**
+   * v0.9.5 C7 · T7：板侧 **suspended 台账**（内存为事实源；`.data/suspended.json` 仅供崩溃取证、启动清空重写）。
+   * 挂起口写、停链口清；心跳监视（C8）读本实例。
+   */
+  suspendLedger: SuspendLedgerStore;
+  /**
+   * v0.9.5 C10：组织种子化配置（`null` ⇒ 不种子化）。建组织链与启动回填共用同一份解析结果。
+   */
+  orgSeed: ResolvedOrgSeedOptions | null;
+  /**
    * v0.9.4 W3：自动转换（`notstart → active`）的**进程内节流表**（版本 → 上次尝试时刻 ms）——
    * 跨请求复用；板进程内单实例（护栏③）。
    */
@@ -543,6 +599,16 @@ function sendPage(res: ServerResponse, page: Page): void {
 
 function errText(err: unknown): string {
   return err instanceof Error ? err.message : String(err);
+}
+
+/**
+ * 组织种子化的结构化告警出口（v0.9.5 C10）：**fail-open 可见** —— 落盘失败 / 模板 / 规范缺失
+ * 一律打一行结构化 stderr（含码 + 组织 + 目标 + 根因），但**绝不因此改状态码或回滚**。
+ */
+function logOrgSeedWarnings(warnings: readonly OrgSeedWarning[]): void {
+  for (const w of warnings) {
+    process.stderr.write(`[org-seed] ${w.code} org=${w.org} target=${w.target} :: ${w.message}\n`);
+  }
 }
 
 function wantsJson(accept: string | undefined): boolean {
@@ -771,31 +837,45 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
   } catch (err) {
     traceError = errText(err);
   }
-  // BD9：宿主面装配了才显示轮触发与确认入口；回答框**仅在存在 `awaiting_answer` 轮时出现**。
-  // BD18：确认按钮按 approval 条件化（禁用/灰态 + 原因），并给整页一行「下一步」引导。
-  // 收口轨 14 ②：再叠加轮状态判据 —— 该需求已有在飞 / 排队轮 ⇒ 「触发一轮 / 发送确认指令」禁用 + 原因。
+  // BD9：宿主面装配了才显示动作区；回答框**仅在存在 `awaiting_answer` 轮时出现**。
+  // v0.9.5 C1/C5：引导行与动作区**共用同一份事实**（`nextStepInput`）—— 档位规则源在 `derive.ts`，
+  // 服务端只归一输入，不在这里判档（收口轨 16 ①/② 的终态优先口径不变：终态不渲染回答框）。
   const f = detail.feature;
-  // 收口轨 16 ①：引擎终态优先 —— 终态需求不渲染回答表单（台账里的陈旧 awaiting 残留不再作数），
-  // 引导行也走 deriveNextStepHint 的终态文案（两处共用 isTerminalFeatureState 同一判据）。
-  // 收口轨 17：同一终态事实下传两个写表单 ⇒「触发一轮 / 发送确认指令」渲染为 disabled + 原因。
   const terminal = isTerminalFeatureState(f.state);
   const awaiting = ctx.host === null || terminal ? null : ctx.host.awaitingTurnOf(f.featureId);
   const busy = ctx.host === null ? null : ctx.host.busyTurnOf(f.featureId);
+  // C6：最近一轮留痕（宿主面未装配 ⇒ 缺席不渲染、不带崩；`at` = 该轮最近一次时刻）。
+  const latest = ctx.host === null ? null : ctx.host.latestTurnOf(f.featureId);
+  const latestTurn =
+    latest === null
+      ? null
+      : {
+          turnId: latest.turnId,
+          state: latest.state,
+          summary: latest.summary,
+          at: latest.finishedAt ?? latest.updatedAt,
+          errorCode: latest.error?.code ?? null,
+        };
   // REQ-v0.9.2 N7：轮次进度行 —— 排队位次取该桥队列可见面（在飞不查、查不到 ⇒ 不显示位次，
   // 队列面异常也不该把详情页带崩 ⇒ 兜成 null）。
   const queuePosition =
     busy !== null && busy.state === "queued" ? hostQueuePositionOf(ctx, busy.org, busy.turnId) : null;
-  const hostForms =
-    ctx.host === null
-      ? ""
-      : renderTurnForm(f.featureId, busy, f.state) + renderConfirmForm(f.featureId, f.approval, busy, f.state);
-  const nextStep = renderNextStepGuide({
+  const nextStepInput: NextStepInput = {
     hostFaceAssembled: ctx.host !== null,
     awaitingAnswer: awaiting !== null,
     approval: f.approval,
     state: f.state,
-  });
+    registeredDocs: registeredDecisionDocFiles(f.decisions),
+    taskCounts: taskCountsOf(detail.acceptance),
+    latestTurn: latest === null ? null : { state: latest.state, summary: latest.summary, at: latest.finishedAt ?? latest.updatedAt },
+    turnBusy: busy !== null,
+    busyTurn: busy,
+    nowMs: ctx.now(),
+  };
   const turnProgress = renderTurnProgress(deriveTurnProgress(busy, queuePosition));
+  // v0.9.5 增补二 · D2：链状态行（监视中 / 链已停 + 来源）。读面**只取快照、不写状态**；
+  // 快照缺席（宿主面未装配 / 假面未实现该方法 / 取值抛错）⇒ 空串不渲染，绝不带崩详情页。
+  const chainState = renderChainStateLine(deriveChainStateLine(hostChainSnapshotOf(ctx, f.featureId)));
   const answerForm = awaiting === null ? "" : renderAnswerForm(f.featureId, awaiting.question);
   // T2 依赖图：mermaid 源经 application/json 数据通道注入（非可执行脚本、不入 n3 闭集）；
   // 渲染脚本只在区块存在且 vendored 资产在盘时挂（缺资产 ⇒ 源文本降级可见，不 404 静默）。
@@ -807,16 +887,36 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
   return {
     title: `需求 ${featureId.slice(0, 8)}`,
     active: "features",
-    bodyHtml:
-      renderFeatureDetail(detail, trace, traceError, ctx.now(), true, releasedVersionNames(ctx.versionsLedger.load().ledger)) +
-      graph.html +
-      "\n" +
-      nextStep +
-      renderAcceptanceSection(detail.acceptance) +
-      turnProgress +
-      hostForms +
-      answerForm,
+    bodyHtml: renderFeatureDetail(
+      detail,
+      trace,
+      traceError,
+      ctx.now(),
+      true,
+      releasedVersionNames(ctx.versionsLedger.load().ledger),
+      {
+        nextStepHtml: renderNextStepGuide(nextStepInput),
+        actionAreaHtml: renderActionArea(f.featureId, nextStepInput),
+        turnTraceHtml: renderTurnTrace(latestTurn),
+        turnProgressHtml: turnProgress,
+        chainStateHtml: chainState,
+        answerFormHtml: answerForm,
+        graphHtml: graph.html,
+        acceptanceHtml: renderAcceptanceSection(detail.acceptance),
+      },
+    ),
     extraScripts,
+  };
+}
+
+/** C1 引导行的任务计数事实（取自桥详情顶层 `acceptance.stateCounts`，板不重算；老桥 / 缺块 ⇒ 不说）。 */
+function taskCountsOf(acceptance: AcceptanceView | null | undefined): NextStepTaskCounts | undefined {
+  if (acceptance === null || acceptance === undefined) return undefined;
+  const counts = acceptance.stateCounts;
+  return {
+    total: Object.values(counts).reduce((a, b) => a + b, 0),
+    completed: counts["completed"] ?? 0,
+    failed: counts["failed"] ?? 0,
   };
 }
 
@@ -827,6 +927,20 @@ function hostQueuePositionOf(ctx: Ctx, org: string, turnId: string): number | nu
   try {
     const index = face.queueView(org).waiting.findIndex((w) => w.turnId === turnId);
     return index < 0 ? null : index + 1;
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * 详情页链状态快照（v0.9.5 增补二 · D2）：**只读取**宿主面的内存态；宿主面未装配 /
+ * 未提供该口 / 取值抛错 ⇒ `null`（该行不渲染，口径同上「队列面异常也不该把详情页带崩」）。
+ */
+function hostChainSnapshotOf(ctx: Ctx, featureId: string): ChainStateSnapshot | null {
+  const face = ctx.host;
+  if (face === null) return null;
+  try {
+    return face.chainSnapshotOf(featureId) ?? null;
   } catch {
     return null;
   }
@@ -1081,8 +1195,38 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
         : options.bridgeIdentityFetcher,
     orgsLedger: new OrgsLedgerStore(options.orgsLedgerFile ?? defaultOrgsLedgerFile()),
     versionsLedger: new VersionsLedgerStore(options.versionsLedgerFile ?? defaultVersionsLedgerFile()),
+    suspendLedger: options.suspendLedgerStore ?? new SuspendLedgerStore(options.suspendLedgerFile ?? defaultSuspendLedgerFile()),
+    orgSeed: options.orgSeed === undefined || options.orgSeed === null
+      ? null
+      : resolveOrgSeedOptions(options.orgSeed, { repoRoot: options.docs?.repoRoot }),
     versionAutoThrottle: new Map<string, number>(),
   };
+  // v0.9.5 C10：启动幂等回填 —— **listen 前** best-effort（只补缺不覆盖、逐组织 fail-open、
+  // 跳过已停用组织）。任何异常都不得阻断板启动；`orgSeed === null` ⇒ 整段跳过（既有行为不变）。
+  if (ctx.orgSeed !== null) {
+    try {
+      const { ledger } = ctx.orgsLedger.load();
+      const backfill = backfillOrgWorkspaces({
+        orgsDir: ctx.docs.orgsDir,
+        disk: listOrgDirs(ctx.docs.orgsDir),
+        ledger: enabledOrgNames(ledger),
+        disabled: disabledOrgNames(ledger),
+        options: ctx.orgSeed,
+      });
+      logOrgSeedWarnings(backfill.warnings);
+      if (backfill.orgs.length > 0) {
+        const stats = summarizeSeedResults(backfill.results);
+        process.stdout.write(
+          `组织种子化回填（v0.9.5 C10）：扫描 ${String(backfill.orgs.length)} 个在用组织，` +
+            `补建 ${String(stats.created)} 个文件、跳过 ${String(stats.skipped)} 个已存在文件` +
+            `（只补缺不覆盖；逐组织 fail-open）\n`,
+        );
+      }
+    } catch (err) {
+      // backfillOrgWorkspaces 自身零抛；本条为最后兜底 —— 绝不因回填把板挡在 listen 之前。
+      process.stderr.write(`[org-seed] 启动回填意外失败（已忽略，不阻断板启动）：${errText(err)}\n`);
+    }
+  }
   const server: Server = createServer((req, res) => {
     void handle(req, res, server, ctx).catch((err: unknown) => {
       if (res.headersSent) {
@@ -1101,6 +1245,7 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
         host: options.host,
         port: boundPort,
         close: () => closeServer(server),
+        suspendLedger: ctx.suspendLedger,
       });
     });
   });
@@ -1136,7 +1281,7 @@ function isSafeStaticName(name: string): boolean {
 /** 宿主面未装配（板进程未接 BD4a / BD4b）时的统一码与文案。 */
 const HOST_FACE_DISABLED_CODE = "host_face_disabled";
 const HOST_FACE_DISABLED_DISPLAY =
-  "宿主面未装配：本板进程未接上「组织目录根」（config.json 的 orgsDir 未配置，无缺省值）⇒ 不起桥、不触发一轮";
+  "宿主面未装配：本板进程未接上「组织目录根」（config.json 的 orgsDir 未配置，无缺省值）⇒ 不起桥、详情页动作区不可用";
 
 type PageRoute = { kind: "feature" | "feature-docs"; id: string } | { kind: Exclude<NavKey, "features"> } | null;
 
@@ -1209,7 +1354,7 @@ async function handle(
     });
     return;
   }
-  /** 方法门 = 读面白名单 ∪ 写面白名单（八条 POST，见 `write-guard.parseWriteRoute`）；其余非 GET 一律 405 */
+  /** 方法门 = 读面白名单 ∪ 写面白名单（十条 POST，见 `write-guard.parseWriteRoute`）；其余非 GET 一律 405 */
   // v0.9.4 D 档（BD6）归一层：`/org/<名>/…` 前缀在方法门**之前**识别、剥离并校验
   // （组织不存在 404 / 已停用 410）；写路由保持全局唯一集合 —— 剥前缀后原样过
   // parseWriteRoute，空间组织经 spaceOrg 注入 handler（提需求的 mismatch 409 见 handleWriteRequirement）。
@@ -1302,6 +1447,10 @@ async function handle(
       await handleWriteTurn(req, res, ctx, writeRoute.featureId, "confirm");
     } else if (writeRoute.kind === "answer") {
       await handleWriteAnswer(req, res, ctx, writeRoute.featureId);
+    } else if (writeRoute.kind === "stop_chain") {
+      await handleWriteStopChain(req, res, ctx, writeRoute.featureId);
+    } else if (writeRoute.kind === "suspend") {
+      await handleWriteSuspend(req, res, ctx, writeRoute.featureId);
     } else if (writeRoute.kind === "schedule") {
       await handleWriteSchedule(req, res, ctx, writeRoute.featureId);
     } else if (writeRoute.kind === "orgs") {
@@ -1765,6 +1914,9 @@ async function handleWriteRequirement(
     );
     return;
   }
+  // ④b v0.9.5 增补三「建卡即自动首轮」：建卡成功后**只点火、不等收口**（见 {@link fireAutoFirstTurn}）
+  //     —— 落在 ⑤ 两条回显档之前点火，JSON 档 201 与表单档 303 共用同一次点火。
+  fireAutoFirstTurn(ctx, outcome.featureId, form.group, form.version);
   // ⑤ 回显：浏览器表单 ⇒ 303 跳详情页（PRG，刷新不重复建）；声明 accept: application/json ⇒ 201 JSON
   const accept = headers.accept ?? "";
   if (accept.includes("application/json")) {
@@ -1782,6 +1934,46 @@ async function handleWriteRequirement(
   }
   res.writeHead(303, { location: `/features/${encodeURIComponent(outcome.featureId)}`, "cache-control": "no-store" });
   res.end();
+}
+
+/** 自动首轮的留痕标签（可 grep 前缀；建卡日志里点名是这条轨点的火，不是人工触发）。 */
+const AUTO_FIRST_TURN_TAG = "[auto-first-turn]";
+
+/**
+ * **建卡即自动首轮**（v0.9.5 增补三）：以本条实际生效的组织名为 {@link BoardHostFace.triggerTurn}
+ * 点一发**纯触发**（无补充文本 ⇒ 提示词与动作区「留空 = 只说『继续』」同档；不扩表单字段）。
+ *
+ * - **不等收口**：`triggerTurn` 对在飞轮要等 `submitted.done`（至多 `turnTimeoutMs` = 10 分钟）⇒
+ *   本函数**不 await**，建卡响应的时延与语义（201 / 303）与点火成败无关；收口结论迟到即日志。
+ * - **不污染建卡**：宿主面未装配 / 桥不可达 / 起桥抛错一律留一行结构化日志后吞掉，绝不上抛。
+ * - **防重**：复用宿主面既有同需求 occupant 判定（在飞 / 排队轮 ⇒ `disposition=busy`，不入队），
+ *   故连点与「先手工点过再建卡」都不产生两轮并发。
+ */
+function fireAutoFirstTurn(ctx: Ctx, featureId: string, org: string, version: string): void {
+  const face = ctx.host;
+  if (face === null) {
+    process.stderr.write(
+      `${timestampPrefix("board")}${AUTO_FIRST_TURN_TAG} 放弃 featureId=${featureId} org=${org} 结果=未点火 :: 宿主面未装配（hostFace=null，无桥可起）\n`,
+    );
+    return;
+  }
+  void face
+    .triggerTurn({ featureId, org, version })
+    .then((outcome) => {
+      const verb = outcome.disposition === "busy" ? "放弃" : outcome.ok ? "已点火" : "失败";
+      const reason = outcome.error === null ? "" : ` :: ${outcome.error.code} ${outcome.error.message}`;
+      // 「放弃」是防重命中的正常分流（不是故障）⇒ 与成功同用 board 档，仅真失败落 error 档
+      const tag = outcome.ok || outcome.disposition === "busy" ? "board" : "error";
+      process.stderr.write(
+        `${timestampPrefix(tag)}${AUTO_FIRST_TURN_TAG} ${verb} featureId=${featureId} org=${org}` +
+          ` 结果=${outcome.disposition} 轮=${outcome.turnId ?? "-"}${reason}\n`,
+      );
+    })
+    .catch((err: unknown) => {
+      process.stderr.write(
+        `${timestampPrefix("error")}${AUTO_FIRST_TURN_TAG} 失败 featureId=${featureId} org=${org} 结果=throw :: ${errText(err)}\n`,
+      );
+    });
 }
 
 // ---------------------------------------------------------------------------
@@ -1935,6 +2127,12 @@ async function handleWriteOrg(req: IncomingMessage, res: ServerResponse, ctx: Ct
       orgBackfillFields(body),
     );
     return;
+  }
+  // ⑥′ 组织种子化（v0.9.5 C10）：`AGENTS.md`（模板渲染）+ `flow/spec` 两份规范快照落组织目录。
+  //     **fail-open**：任一步失败只记结构化告警，**不回滚组织创建、不改回显**（缺失由启动幂等回填自愈）；
+  //     `seedOrgWorkspace` 自身零抛。无独立写路由 —— 本步不是 HTTP 端点，白名单保持 11 条不动。
+  if (ctx.orgSeed !== null) {
+    logOrgSeedWarnings(seedOrgWorkspace(orgDir, form.name, ctx.orgSeed).warnings);
   }
   // ⑦ 回显：浏览器表单 ⇒ 303 回组织页（PRG，刷新不重复建）；声明 accept: application/json ⇒ 201 JSON
   const accept = headers.accept ?? "";
@@ -2252,6 +2450,8 @@ async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ct
       let hasConfirmedCard = false;
       let total = 0;
       let completed = 0;
+      let cancelled = 0;
+      let failed = 0;
       if (rec.status === "active" && (target === "notstart" || target === "released")) {
         let mine: readonly FeatureListItem[];
         try {
@@ -2271,14 +2471,18 @@ async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ct
         }
         hasConfirmedCard = mine.some((f) => isConfirmedCard(f.stage));
         total = mine.length;
-        // 只计 completed（**不复用** terminal 计数：其含 failed / cancelled 会误放行发版闸）。
+        // raw 三桶计数：完成集合 = completed + cancelled（由 decideVersionTransition 合成），failed 不入。
         completed = mine.filter((f) => f.state === "completed").length;
+        cancelled = mine.filter((f) => f.state === "cancelled").length;
+        failed = mine.filter((f) => f.state === "failed").length;
       }
       const decision = decideVersionTransition(rec.status, target, {
         version: form.version,
         hasConfirmedCard,
         total,
         completed,
+        cancelled,
+        failed,
       });
       if (!decision.ok) {
         respondError(res, headers.accept, 409, decision.code, decision.error, undefined, versionBackfillFields(body));
@@ -2619,6 +2823,13 @@ async function handleWriteTurn(
   const headers = lowerHeaders(req);
   const gate = await hostWriteGate(req, res, ctx);
   if (gate === null) return;
+  // v0.9.5 C2：turn 表单的**可选**补充文本（缺键 / 空 / 纯空白 = 纯触发，合法语义）——
+  // 超限 8 KiB ⇒ 结构化 400，先于一切读面 / 出网动作收口（不静默、不白烧）。
+  const form = parseTurnForm(gate.body);
+  if (!form.ok) {
+    respondError(res, headers.accept, form.status, form.code, form.error);
+    return;
+  }
   // 归属组织取桥侧 `ownerGroup`（身份链 S1）；读面失败 ⇒ 交宿主面回退**板级**组织名，
   // 两者皆无时宿主面返回结构化 503 —— 编排桥不可读不该让触发凭空猜一个组织。
   let org: string | null = null;
@@ -2638,15 +2849,15 @@ async function handleWriteTurn(
     respondTurnOutcome(
       res,
       headers.accept,
-      kind === "confirm" ? "确认指令" : "触发一轮",
+      kind === "confirm" ? "确认指令" : "本轮结果",
       terminalTurnRejection(featureId, engineState),
     );
     return;
   }
   const outcome = kind === "confirm"
     ? await gate.face.confirmTurn({ featureId, org, version })
-    : await gate.face.triggerTurn({ featureId, org, version });
-  respondTurnOutcome(res, headers.accept, kind === "confirm" ? "确认指令" : "触发一轮", outcome);
+    : await gate.face.triggerTurn({ featureId, org, version, supplement: form.supplement });
+  respondTurnOutcome(res, headers.accept, kind === "confirm" ? "确认指令" : "本轮结果", outcome);
 }
 
 // ---------------------------------------------------------------------------
@@ -2687,6 +2898,130 @@ async function handleWriteAnswer(
   }
   const outcome = await gate.face.answerRequirement({ featureId, answer });
   respondTurnOutcome(res, headers.accept, "澄清回答", outcome);
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.5 C4 · T3 写面：POST /features/:id/stop-chain（按需求停链）
+// ---------------------------------------------------------------------------
+
+/**
+ * **按需求停链**（v0.9.5 C4 · T3）：置**内存**停链标志（接力决策器判定序① 见标志即停）并复用
+ * `cancelTurn` 清该需求的在飞 / 排队轮（排队 ⇒ 一条也不发）。**不落 `.data/` 台账、不跨重启持久**
+ * （接力链本身是进程内 Promise 链）。一切失败结构化透出：未起接力 ⇒ 503 `board_relay_not_assembled`。
+ * JSON 档出结构化载荷；表单档出简短结果页（本路由无板内表单入口，主要为 API / 编排侧调用）。
+ */
+async function handleWriteStopChain(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: Ctx,
+  featureId: string,
+): Promise<void> {
+  const headers = lowerHeaders(req);
+  const gate = await hostWriteGate(req, res, ctx);
+  if (gate === null) return;
+  const outcome = await gate.face.stopChain(featureId);
+  // v0.9.5 C7 · T7 清条目挂接：停链 ⇒ 该需求的 suspended 条目同生死（挂起条目与停链标志同口径）。
+  // 载体（停链标志 / 链内计数）归 T2/T3 单一定义，本节点只做「清条目」，不另造任何链状态。
+  const suspendCleared = ctx.suspendLedger.clear(featureId);
+  const status = outcome.ok ? 200 : outcome.error?.code === "board_relay_not_assembled" ? 503 : 400;
+  if (wantsJson(headers.accept)) {
+    respondJson(res, status, { ...outcome, suspendCleared });
+    return;
+  }
+  const bodyHtml = [
+    `<p>${escapeHtml(outcome.display)}</p>`,
+    suspendCleared ? "<p>已同步清除该需求的挂起条目（停链与挂起同生死）。</p>" : "",
+    outcome.error === null
+      ? ""
+      : `<p class="mono">${escapeHtml(outcome.error.code)}：${escapeHtml(outcome.error.message)}</p>`,
+  ].join("");
+  sendPage(res, {
+    title: `停链 · ${outcome.featureId.slice(0, 8)}`,
+    active: "features",
+    status,
+    bodyHtml,
+  });
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.5 C7 · T7 写面：POST /features/:id/suspend（挂起口 —— 登记 suspended 台账）
+// ---------------------------------------------------------------------------
+
+/**
+ * **挂起口**（v0.9.5 C7 · T7）：宿主下发子任务后带本轮 `turnId` + `pending[]` 清单调本口，
+ * 登记 suspended 台账即退出本轮；板心跳（C8）按 pending / DAG 定条件评估、命中后同 `contextId` 唤醒。
+ *
+ * 前置与同族写端点同规格（复用 {@link hostWriteGate}：CSRF 两档 → capped body → 宿主面 null 503）；
+ * 表单解析纯函数 {@link parseSuspendForm}（超限 413 / 校验不过结构化 400）。
+ *
+ * **turnId 归属判据（R2 定稿）**：`providedTurnId === latestTurnOf(featureId).turnId`
+ * （轮管理器为唯一事实源）—— 不匹配（旧轮 / 非板发 / 该需求无板发轮）一律 **400**，**不设时间窗**。
+ * 这从根上把「agent 客户端触发的任务」挡在板链之外（它们没有板发 turnId）。
+ *
+ * **台账语义**：内存为事实源、`.data` 仅供崩溃取证、不跨重启（见 `suspend-ledger.ts`）。
+ */
+async function handleWriteSuspend(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: Ctx,
+  featureId: string,
+): Promise<void> {
+  const headers = lowerHeaders(req);
+  const gate = await hostWriteGate(req, res, ctx);
+  if (gate === null) return;
+  const form = parseSuspendForm(gate.body);
+  if (!form.ok) {
+    respondError(res, headers.accept, form.status, form.code, form.error);
+    return;
+  }
+  // 归属校验：必须等于该需求最新板发轮的 turnId（唯一事实源 = 轮管理器；不设时间窗）。
+  const latest = gate.face.latestTurnOf(featureId);
+  if (latest === null || latest.turnId !== form.turnId) {
+    const why =
+      latest === null
+        ? "该需求没有板发轮记录（agent 客户端任务没有板发 turnId，天然进不了板链）"
+        : `给定 turnId ${form.turnId} 不是该需求最新板发轮（最新 = ${latest.turnId}）`;
+    respondError(
+      res,
+      headers.accept,
+      400,
+      SUSPEND_TURN_MISMATCH_CODE,
+      `挂起归属校验不过：${why} ⇒ 旧轮 / 非板发一律拒（不设时间窗）`,
+    );
+    return;
+  }
+  const entry: SuspendedEntry = ctx.suspendLedger.arm(
+    {
+      featureId,
+      turnId: latest.turnId,
+      contextId: latest.contextId,
+      pending: form.pending,
+      wakeCond: form.wakeCond,
+    },
+    new Date(ctx.now()).toISOString(),
+  );
+  const display =
+    `已挂起：登记 suspended 台账（pending ${String(entry.pending.length)} 项${entry.pending.length === 0 ? " = 纯 DAG 监视" : ""}）；` +
+    `板心跳按条件评估，命中后同 contextId 唤醒（重启板进程即无链）`;
+  if (wantsJson(headers.accept)) {
+    respondJson(res, 200, {
+      ok: true,
+      featureId,
+      turnId: entry.turnId,
+      contextId: entry.contextId,
+      pending: entry.pending,
+      wakeCond: entry.wakeCond,
+      createdAt: entry.createdAt,
+      display,
+    });
+    return;
+  }
+  const bodyHtml = [
+    `<p>${escapeHtml(display)}</p>`,
+    entry.pending.length > 0 ? `<p class="mono">pending：${escapeHtml(entry.pending.join(" · "))}</p>` : "",
+    entry.wakeCond !== null ? `<p class="mono">wakeCond：${escapeHtml(entry.wakeCond)}</p>` : "",
+  ].join("");
+  sendPage(res, { title: `挂起 · ${featureId.slice(0, 8)}`, active: "features", status: 200, bodyHtml });
 }
 
 // ---------------------------------------------------------------------------

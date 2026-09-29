@@ -531,6 +531,13 @@ export interface HostTurnDeps {
   idFactory?: () => string;
   turnTimeoutMs?: number;
   pollIntervalMs?: number;
+  /**
+   * **v0.9.5 C1 轮收口回调**（可选）：每轮**交闸与落计数之后**、`done` 解决之后回调一次。
+   * 缺省 no-op ⇒ 既有行为与既有测试**零变更**。收口回调是自动接力的**唯一信号源**
+   * （脱离请求路径：调用方 await 的 `done` 与接力决策互不阻塞）。
+   * 也可在构造后经 {@link HostTurnManager.setTurnSettledHandler} 装。
+   */
+  onTurnSettled?: (result: TurnResult) => void;
 }
 
 // ---------------------------------------------------------------------------
@@ -624,6 +631,8 @@ export class HostTurnManager {
   private readonly idFactory: () => string;
   private readonly turnTimeoutMs: number;
   private readonly pollIntervalMs: number;
+  /** v0.9.5 C1：收口回调（缺省 no-op）；构造后仍可经 {@link setTurnSettledHandler} 装。 */
+  private onTurnSettled: (result: TurnResult) => void;
 
   private readonly channels = new Map<string, BridgeChannel>();
   private readonly jobs = new Map<string, TurnJob>();
@@ -641,6 +650,15 @@ export class HostTurnManager {
     this.idFactory = deps.idFactory ?? randomUUID;
     this.turnTimeoutMs = deps.turnTimeoutMs ?? DEFAULT_TURN_TIMEOUT_MS;
     this.pollIntervalMs = deps.pollIntervalMs ?? DEFAULT_POLL_INTERVAL_MS;
+    this.onTurnSettled = deps.onTurnSettled ?? (() => undefined);
+  }
+
+  /**
+   * **v0.9.5 C1**：装 / 换轮收口回调（`null` = 卸回 no-op）。
+   * 供装配层在 `HostTurnManager` 构造之后接线接力驱动器（避免构造期循环依赖）。
+   */
+  setTurnSettledHandler(handler: ((result: TurnResult) => void) | null): void {
+    this.onTurnSettled = handler ?? (() => undefined);
   }
 
   // -- 发一轮 ---------------------------------------------------------------
@@ -1055,7 +1073,16 @@ export class HostTurnManager {
       // `done` 在**交闸与落计数之后**才解决 ⇒ 调用方看到的「本轮结束」必然对应闸位已空
       const outcome = job.outcome;
       job.outcome = null;
-      if (outcome !== null) job.settle(outcome);
+      if (outcome !== null) {
+        job.settle(outcome);
+        // v0.9.5 C1：收口信号在**最后**发出（交闸 → 落计数 → `done` → 回调）⇒ 回调内起新轮时闸位已空、
+        // 请求路径（若有 await `done`）也已拿到结果，两边互不阻塞。回调异常**不得**影响轮收口。
+        try {
+          this.onTurnSettled(outcome);
+        } catch {
+          // 接力回调是旁路：吞掉异常，轮收口与调用方结果不受牵连
+        }
+      }
     }
   }
 

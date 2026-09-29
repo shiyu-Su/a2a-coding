@@ -6,11 +6,15 @@ import {
   checkWriteAuth,
   parseRequirementForm,
   parseScheduleForm,
+  parseTurnForm,
   GROUP_REQUIRED_CODE,
   WRITE_GUARD_HEADER,
   WRITE_GUARD_HEADER_VALUE,
   REQUIREMENTS_WRITE_PATH,
   MAX_REQUIREMENT_BODY_BYTES,
+  MAX_TURN_SUPPLEMENT_BYTES,
+  TURN_FORM_SUPPLEMENT_FIELD,
+  TURN_SUPPLEMENT_TOO_LARGE_CODE,
   ScheduleFormProgrammingError,
 } from "../dist/write-guard.js";
 
@@ -290,4 +294,43 @@ test("M3 parseScheduleForm：超限体 ⇒ 413（口径同 parseRequirementForm�
   const byBytes = parseScheduleForm("version=" + "甲".repeat(200_000));
   assert.equal(byBytes.ok, false);
   assert.equal(byBytes.status, 413);
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.5 C2：触发一轮表单的**可选**补充文本（POST /features/{id}/turn）
+// ---------------------------------------------------------------------------
+
+test("C2 parseTurnForm：缺键 / 空串 / 纯空白 ⇒ 纯触发（合法语义，不做缺键报错）", () => {
+  for (const raw of ["", "unrelated=x", `${TURN_FORM_SUPPLEMENT_FIELD}=`, `${TURN_FORM_SUPPLEMENT_FIELD}=%20%20`]) {
+    assert.deepEqual(parseTurnForm(raw), { ok: true, supplement: "" }, JSON.stringify(raw));
+  }
+});
+
+test("C2 parseTurnForm：正常补充去空白后原样返回（拼入本轮 prompt 由 host-face 负责）", () => {
+  const raw = new URLSearchParams({ [TURN_FORM_SUPPLEMENT_FIELD]: "  理解不对，方向应是 B  " }).toString();
+  assert.deepEqual(parseTurnForm(raw), { ok: true, supplement: "理解不对，方向应是 B" });
+});
+
+test("C2 parseTurnForm：字段独立上限 8 KiB（按 utf8 字节）⇒ 超限结构化 400（不是 413）", () => {
+  assert.ok(MAX_TURN_SUPPLEMENT_BYTES < MAX_REQUIREMENT_BODY_BYTES, "字段上限须远小于 body 上限（256 KiB）");
+  // 恰好不越界：8192 / 3 个 3 字节汉字 = 8190 字节 ⇒ ok
+  const atLimit = new URLSearchParams({
+    [TURN_FORM_SUPPLEMENT_FIELD]: "甲".repeat(Math.floor(MAX_TURN_SUPPLEMENT_BYTES / 3)),
+  }).toString();
+  assert.equal(parseTurnForm(atLimit).ok, true);
+  const over = new URLSearchParams({
+    [TURN_FORM_SUPPLEMENT_FIELD]: "甲".repeat(MAX_TURN_SUPPLEMENT_BYTES),
+  }).toString();
+  const out = parseTurnForm(over);
+  assert.equal(out.ok, false);
+  assert.equal(out.status, 400, "字段超限是 400（body 仍在上限内）");
+  assert.equal(out.code, TURN_SUPPLEMENT_TOO_LARGE_CODE);
+  assert.match(out.error, /8 KiB/);
+});
+
+test("C2 parseTurnForm：body 超 256 KiB ⇒ 413（口径同其它解析函数；正常路径已被 hostWriteGate 提前拦）", () => {
+  const byLength = parseTurnForm("supplement=x", MAX_REQUIREMENT_BODY_BYTES + 1);
+  assert.equal(byLength.ok, false);
+  assert.equal(byLength.status, 413);
+  assert.equal(byLength.code, "payload_too_large");
 });

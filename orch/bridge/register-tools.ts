@@ -566,7 +566,8 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
   server.registerTool(
     "a2a_feature_cancel",
     {
-      description: "取消 Feature（任意非终态 → cancelled）；调度器随之停止该 Feature。",
+      description:
+        "取消 Feature（非收口态 → cancelled；failed 亦可经此归档为 cancelled，completed/cancelled 拒绝）；调度器随之停止该 Feature。",
       inputSchema: {
         featureId: z.string().min(1).describe("Feature ID"),
       },

@@ -64,21 +64,42 @@ function fakeAdaptersModule(adapter, log) {
   };
 }
 
-/** 假子进程：退出时机由测试决定（`exitOnTerm` = 桥有优雅停机的形态）。 */
+/**
+ * 假子进程：退出时机由测试决定（`exitOnTerm` = 桥有优雅停机的形态）。
+ *
+ * **Windows 现实建模（板 stop 孤儿根因）**：板 spawn 的直接子进程 = `cmd.exe` 壳，
+ * 真正的桥 `node` 是它的**孙**（句柄看不见孙）⇒ `tree` 分两层记录：
+ * `shellAlive`（句柄可见的直接子）/ `nodeAlive`（孙，只有整树杀够得到）。
+ * 壳遇到 `SIGTERM` 会**先退**（`exitOnTerm`），但**孙 node 仍存活** —— 这正是漏孤儿的那条路径。
+ */
 function fakeChild({ pid = 4242, exitOnTerm = false } = {}) {
   const state = { exited: false, code: null, signal: null, signals: [] };
+  const tree = { shellAlive: true, nodeAlive: true };
   const listeners = [];
+  const fire = (signal) => {
+    for (const l of [...listeners]) l({ code: null, signal });
+  };
   return {
     pid,
     state,
+    tree,
     kill(signal = "SIGTERM") {
       state.signals.push(signal);
       if (exitOnTerm) {
         state.exited = true;
         state.signal = signal;
-        for (const l of [...listeners]) l({ code: null, signal });
+        tree.shellAlive = false; // 壳退；孙 node 仍活着（Windows 孤儿根因）
+        fire(signal);
       }
       return true;
+    },
+    /** 整树杀替身：连带收掉孙 node（只有 killTree 到得了孙）。 */
+    killWholeTree(signal = "SIGKILL-TREE") {
+      state.exited = true;
+      state.signal = signal;
+      tree.shellAlive = false;
+      tree.nodeAlive = false;
+      fire(signal);
     },
     exited: () => state.exited,
     exitInfo: () => (state.exited ? { code: state.code, signal: state.signal } : null),
@@ -86,6 +107,9 @@ function fakeChild({ pid = 4242, exitOnTerm = false } = {}) {
     die(code = 1) {
       state.exited = true;
       state.code = code;
+      state.signal = null;
+      tree.shellAlive = false;
+      tree.nodeAlive = false;
       for (const l of [...listeners]) l({ code, signal: null });
     },
   };
@@ -126,6 +150,9 @@ function makeManager({ adapter = fakeAdapter("claude"), child = fakeChild(), pro
   const manager = new HostBridgeManager({
     machineDistDir: "MACHINE/DIST",
     ledger: null,
+    // 缺省钉 POSIX 档：存量停桥断言按「先 SIGTERM、超时才树杀」原序保留；
+    // win32「先整树杀」分支由本文件新增用例（显式传 platform:"win32"）覆盖。
+    platform: "posix",
     termGraceMs: 1_000,
     startTimeoutMs: 1_000,
     artifactCheck: () => STUB_ARTIFACTS,
@@ -143,9 +170,7 @@ function makeManager({ adapter = fakeAdapter("claude"), child = fakeChild(), pro
     },
     killTree: async (pid) => {
       log.killTree.push(pid);
-      child.state.exited = true;
-      child.state.signal = "SIGKILL-TREE";
-      void 0;
+      child.killWholeTree();
     },
     ...rest,
   });
@@ -328,12 +353,12 @@ test("纪律扫描：板不复制 kind→argv 映射（后端命令与权限模�
 });
 
 // ---------------------------------------------------------------------------
-// 停：先 SIGTERM，超时才树杀（覆盖「桥 + 后端」两级）
+// 停：两条分支 —— POSIX 先 SIGTERM 超时才树杀（原序）· win32 先整树杀
 // ---------------------------------------------------------------------------
 
-test("stop: 桥在 SIGTERM 内优雅退出 ⇒ 不触发树杀", async () => {
+test("stop(POSIX): 桥在 SIGTERM 内优雅退出 ⇒ 不触发树杀", async () => {
   const child = fakeChild({ exitOnTerm: true });
-  const { manager, log } = makeManager({ child });
+  const { manager, log } = makeManager({ child, platform: "posix" });
   await manager.ensureStarted(ORG_CFG);
   const status = await manager.stop("alpha", "manual");
   assert.deepEqual(child.state.signals, ["SIGTERM"]);
@@ -342,15 +367,67 @@ test("stop: 桥在 SIGTERM 内优雅退出 ⇒ 不触发树杀", async () => {
   assert.equal(status.pid, null);
 });
 
-test("stop: SIGTERM 满宽限无回应 ⇒ 才树杀（板管两级进程，只杀桥会留后端孤儿）", async () => {
+test("stop(POSIX): SIGTERM 满宽限无回应 ⇒ 才树杀（板管两级进程，只杀桥会留后端孤儿）", async () => {
   const child = fakeChild({ pid: 4242, exitOnTerm: false });
-  const { manager, log } = makeManager({ child });
+  const { manager, log } = makeManager({ child, platform: "posix" });
   await manager.ensureStarted(ORG_CFG);
   await manager.stop("alpha", "manual");
   // 顺序断言：先 SIGTERM，后树杀（killTree 替身里才把进程标成已退）
   assert.deepEqual(child.state.signals, ["SIGTERM"]);
   assert.deepEqual(log.killTree, [4242]);
   assert.equal(manager.statusOf("alpha").pid, null);
+});
+
+test("stop(win32): 父 cmd 壳先退也仍以 pid 调 killTree（Windows 孤儿根因）", async () => {
+  // 父壳遇 SIGTERM 即退（旧码先 SIGTERM ⇒ waitExit 立即为真、树杀永远走不到 = 漏孤儿）
+  const child = fakeChild({ pid: 4242, exitOnTerm: true });
+  const { manager, log } = makeManager({ child, platform: "win32" });
+  await manager.ensureStarted(ORG_CFG);
+  const status = await manager.stop("alpha", "manual");
+  assert.deepEqual(log.killTree, [4242], "win32 必须先整树杀，不得因父壳先退而跳过");
+  assert.ok(child.state.signals.includes("SIGTERM"), "整树杀后仍补一刀 SIGTERM");
+  assert.equal(child.tree.nodeAlive, false, "孙 node 桥必须随整树杀一起收掉（否则留孤儿）");
+  assert.equal(status.state, "exited");
+  assert.equal(status.pid, null);
+});
+
+test("stop(win32): 仅确认退出后才记台账 exited/pid:null；未确认退出不得谎报已收", async () => {
+  // ① 整树杀确实收掉孙 node ⇒ 确认退出 ⇒ 记 exited/pid:null
+  const okChild = fakeChild({ pid: 5001 });
+  const ok = makeManager({ child: okChild, platform: "win32" });
+  await ok.manager.ensureStarted(ORG_CFG);
+  const okStatus = await ok.manager.stop("alpha", "manual");
+  assert.equal(okStatus.state, "exited");
+  assert.equal(okStatus.pid, null);
+  assert.equal(okChild.tree.nodeAlive, false);
+
+  // ② 信号与整树杀都发不出退出（顽固孙仍在）⇒ 不得记 exited/pid:null（否则孤儿无人追）
+  const stuckChild = fakeChild({ pid: 5002 });
+  const stuckLog = { getAdapterCalls: [], spawn: [], probePorts: [], killTree: [] };
+  const clock = fakeClock();
+  const stuck = new HostBridgeManager({
+    machineDistDir: "MACHINE/DIST",
+    ledger: null,
+    platform: "win32",
+    termGraceMs: 1_000,
+    startTimeoutMs: 1_000,
+    artifactCheck: () => STUB_ARTIFACTS,
+    dirKind: STUB_DIR_OK,
+    ...clock.deps,
+    adapters: fakeAdaptersModule(fakeAdapter("claude"), stuckLog),
+    allocatePort: async () => 18901,
+    spawnBridge: () => stuckChild,
+    probePort: async () => true,
+    killTree: async (pid) => {
+      stuckLog.killTree.push(pid); // 整树杀发出去了，但进程（含孙）就是不走
+    },
+  });
+  await stuck.ensureStarted(ORG_CFG);
+  const stuckStatus = await stuck.stop("alpha", "manual");
+  assert.deepEqual(stuckLog.killTree, [5002], "win32 仍应尝试整树杀");
+  assert.notEqual(stuckStatus.state, "exited", "未确认退出不得记 exited");
+  assert.equal(stuckStatus.pid, 5002, "未确认退出须保留 pid（残余孤儿可追）");
+  assert.equal(stuckStatus.error.code, "bridge_stop_unconfirmed");
 });
 
 test("stop: 未托管的组织 ⇒ null（不抛、不臆造记录）", async () => {
@@ -367,6 +444,7 @@ test("stopAll: 收尾停掉所有在线桥（不留常驻进程）", async () =>
   const manager = new HostBridgeManager({
     machineDistDir: "MACHINE/DIST",
     ledger: null,
+    platform: "posix", // 存量断言按 POSIX 原序保留（子进程 SIGTERM 即退 ⇒ 不树杀）
     artifactCheck: () => STUB_ARTIFACTS,
     dirKind: STUB_DIR_OK,
     ...clock.deps,
@@ -518,6 +596,7 @@ test("ensureStarted 复用前探活：端口不通 ⇒ 判桥已断、重拉并�
   const manager = new HostBridgeManager({
     machineDistDir: "MACHINE/DIST",
     ledger: null,
+    platform: "posix", // 存量断言按 POSIX 原序保留（本条只验重拉，不验停桥分支）
     artifactCheck: () => STUB_ARTIFACTS,
     dirKind: STUB_DIR_OK,
     ...clock.deps,

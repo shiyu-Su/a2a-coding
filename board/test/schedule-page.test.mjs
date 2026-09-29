@@ -1,7 +1,7 @@
 /**
  * REQ-v0.9.2-2026-09-25-02 · M4 排期看板页 `/schedule`（只读）+ M5 需求池 ——
  * 分组纯函数（version-order 数值序 + 未排期滤除）/ 卡片渲染（状态徽标 · 无按状态分列）/
- * 需求池（判据单一、池序 createdAt 降序 null 落底 featureId 兜底、卡上需求原文截断转义）/
+ * 需求池（判据 = 未排期 ∧ 非终态（三终态不进池）、池序 createdAt 降序 null 落底 featureId 兜底、卡上需求原文截断转义）/
  * HTTP 面（GET 200 + 导航高亮 / 方法门 405 / 桥不可达 502）/ 导航闭集六项。
  * REQ-v0.9.2-2026-09-26-02 增补 ④ —— 详情浮层：dialog 骨架 + 内联脚本常量规格 + `<a>` 回退。
  * REQ-2026-09-26-02 T5 —— 拖拽排期视图闸：可拖属性仅「想法挪版」态出、锁态置灰 + 紧凑标记（增补 ①
@@ -23,6 +23,7 @@ import {
   DRAG_SCHEDULE_SCRIPT,
   FEATURE_DETAIL_OVERLAY_SCRIPT,
   NEW_REQUIREMENT_DIALOG_SCRIPT,
+  SUBMIT_GUARD_SCRIPT,
   renderPage,
 } from "../dist/web/layout.js";
 import { createBoardServer } from "../dist/server.js";
@@ -120,7 +121,7 @@ test("M4-⑤ renderSchedule: 空看板如实文案（未排期不进本页，归
 // M5 需求池
 // ---------------------------------------------------------------------------
 
-test("M5-① selectRequirementPool: 判据单一 trim()===\"\"；池序 createdAt 降序、null 落底、featureId 兜底稳定", () => {
+test("M5-① selectRequirementPool: 判据 = 未排期 trim()===\"\"（且非终态，见 M5-④）；池序 createdAt 降序、null 落底、featureId 兜底稳定", () => {
   const pool = selectRequirementPool([
     feature("F-b", null, { createdAt: "2026-09-01T00:00:00Z" }),
     feature("F-d", "  ", { createdAt: null }),
@@ -160,18 +161,52 @@ test("M5-② renderSchedule 池卡: 需求原文截断 120 字 + 转义 + 链详
   assert.doesNotMatch(versionCol, /需求：/, "版本列卡不出需求原文行（池卡专属）");
 });
 
-test("M5-③ renderSchedule 池列恒在: 空池如实「无未排期需求」；无版本列时提示都在池", () => {
+test("M5-③ renderSchedule 池列恒在: 空池如实提示（含终态卡不进池）；无版本列时提示都在池", () => {
   assert.match(renderSchedule([], []), /<h3>需求池 <span class="muted">\(0\)<\/span><\/h3>/);
-  assert.match(renderSchedule([], []), /（无未排期需求）/);
+  assert.match(renderSchedule([], []), /（无未排期的在途需求 · 终态卡不进需求池）/);
   const html = renderSchedule([], selectRequirementPool([feature("F1", null)]));
   assert.match(html, /无已排期需求.*都在需求池列/s);
   assert.match(html, /\/features\/F1/);
 });
 
+test("M5-④ selectRequirementPool: 三终态（completed/failed/cancelled）不进池；非终态与 state=null 照入", () => {
+  const pool = selectRequirementPool([
+    feature("F-done", "", { state: "completed" }),
+    feature("F-fail", null, { state: "failed" }),
+    feature("F-cancel", "  ", { state: "cancelled" }),
+    feature("F-wait", "", { state: "waiting_approval" }),
+    feature("F-run", "", { state: "executing" }),
+    feature("F-int", "", { state: "integrating" }),
+    feature("F-input", "", { state: "needs_input" }),
+    feature("F-rev", "", { state: "reviewing" }),
+    feature("F-null", "", { state: null }),
+    feature("F-unknown", "", { state: "some-future-state" }),
+  ]);
+  assert.deepEqual(
+    pool.map((f) => f.featureId).sort(),
+    ["F-input", "F-int", "F-null", "F-rev", "F-run", "F-unknown", "F-wait"],
+    "终态三卡被滤；非终态、state=null 与未知态一律放行（不吞不猜）",
+  );
+});
+
+test("M5-⑤ 终态过滤只管池列：已排终态卡仍占版本列（不改 groupFeaturesByVersion）；页头 hint 含「终态卡不进需求池」", () => {
+  const features = [
+    feature("F-done", "v0.9.4", { state: "completed" }),
+    feature("F-cancel", "v0.9.4", { state: "cancelled" }),
+    feature("F-open", "", { state: "executing" }),
+  ];
+  const html = renderSchedule(
+    groupFeaturesByVersion(features),
+    selectRequirementPool(features),
+  );
+  assert.match(html, /\/features\/F-done/, "版本列仍显示 completed 卡");
+  assert.match(html, /\/features\/F-cancel/, "版本列仍显示 cancelled 卡");
+  assert.match(html, /<b>终态卡不进需求池<\/b>/, "页头 hint 已改述过滤口径");
+});
+
 // ---------------------------------------------------------------------------
 // v0.9.3 B1 增补徽标（排期卡 / 池卡 · fixture 自构造，不依赖真桥 O1）
 // ---------------------------------------------------------------------------
-
 test("B1-① renderSchedule 卡: parentFeatureId 非空 ⇒「增补 · 父需求」徽标 + 单跳深链", () => {
   const html = renderSchedule(
     groupFeaturesByVersion([feature("A1", "v0.9.3", { parentFeatureId: "P1" })]),
@@ -368,9 +403,9 @@ test("N2-⑥ 根因锚（真浏览器反馈 ①）：文档读面按 Accept 双�
       assert.match(htmlRes.headers.get("content-type") ?? "", /^text\/html/, "Accept 含 text/html ⇒ 整页档");
       assert.ok(htmlText.includes("<main>"), "HTML 档含 <main> ⇒ 浮层可摘");
 
-      // 脚本侧：两处 fetch（链接导航 + 浮层内提交）都显式声明 HTML 档 ⇒ 缺一条即回归跳页缺陷
+      // 脚本侧：三处 fetch（链接导航 + 浮层内提交 + 件B 进度轮询）都显式声明 HTML 档 ⇒ 缺一条即回归跳页缺陷
       const accepts = FEATURE_DETAIL_OVERLAY_SCRIPT.match(/Accept: "text\/html"/g) ?? [];
-      assert.equal(accepts.length, 2, "open() 与 postForm() 两处 fetch 均须发 Accept: text/html");
+      assert.equal(accepts.length, 3, "open() / postForm() / pollOnce() 三处 fetch 均须发 Accept: text/html");
       assert.match(FEATURE_DETAIL_OVERLAY_SCRIPT, /headers: \{ Accept: "text\/html" \} \}\)/, "链接分支带 Accept");
       assert.match(FEATURE_DETAIL_OVERLAY_SCRIPT, /headers: \{ Accept: "text\/html" \},/, "提交分支带 Accept");
       // DOMParser 只在 parsePage 一处使用 ⇒ 换入/叠加两档共用同一摘取通路
@@ -396,7 +431,12 @@ test("N2-⑦ 浮层内表单提交锚（真浏览器反馈 ②③）：只拦 di
   assert.match(s, /fetch\(action, \{/, "fetch 表单 action 属性值（不另拼端点）");
   assert.match(s, /method: "POST"/);
   assert.match(s, /credentials: "same-origin"/);
-  assert.match(s, /e\.preventDefault\(\);\n    postForm\(form\);/, "拦下 submit 后进浮层提交通路");
+  assert.match(s, /e\.preventDefault\(\);[\s\S]{0,400}?postForm\(form\);/, "拦下 submit 后进浮层提交通路（件A 的就地反馈插在两者之间）");
+  // 件A（REQ-2026-09-29-02）：浮层分支**自带**就地反馈（整页档 SUBMIT_GUARD 对本表单 defaultPrevented 早退）
+  assert.match(s, /function markPending\(form\) \{/, "件A 落点：markPending（浮层侧复刻提交守卫两动作）");
+  assert.match(s, /if \(form\.getAttribute\("data-ov-pending"\) === "1"\) return;/, "件A 连点拦截：挂起标记二次到达即吞掉");
+  assert.match(s, /if \(!markPending\(form\)\) return;/, "件A 反馈未落地（无提示行）⇒ 不发请求");
+  assert.match(s, /form\.setAttribute\("data-ov-pending", "1"\);\n    postForm\(form\);/, "件A 顺序：先反馈后置挂起并派发（fetch 前完成）");
   // 编码钉：服务端写面用 new URLSearchParams(raw) 解析 ⇒ 必须 urlencoded，FormData 直投会发 multipart
   assert.match(s, /new URLSearchParams\(new FormData\(form\)\)/, "表单体 = urlencoded（非 multipart）");
   assert.doesNotMatch(s, /body: new FormData\(form\)/, "不得把 FormData 直接当 body（multipart ⇒ 字段全丢）");
@@ -407,13 +447,13 @@ test("N2-⑦ 浮层内表单提交锚（真浏览器反馈 ②③）：只拦 di
   assert.match(s, /querySelector\("\.err-ov-card"\)/, "错误页 errorOverlay 卡单独可摘");
   assert.match(s, /if \(!res\.ok\) \{ return res\.text\(\)\.then/, "4xx/5xx 先取响应文本再走叠加通路（不再无脑换 body）");
   assert.match(s, /if \(r\.err\) \{/, "提交响应两档分流：err 分支存在");
-  assert.match(s, /if \(parsed\.card !== null\) \{ showCard\(parsed\.card\); return; \}/, "抽到卡 ⇒ 只叠加，不替换 body");
+  assert.match(s, /if \(parsed\.card !== null\) \{ showCard\(parsed\.card\); restoreForm\(form\); return; \}/, "抽到卡 ⇒ 只叠加并复位表单（不替换 body）");
   assert.match(s, /function dropCard\(\) \{\n    var kids = dlg\.children;/, "摘卡只扫 dialog 直接子元素（不碰 .fd-body）");
   assert.match(s, /function showCard\(card\) \{\n    dropCard\(\);\n    dlg\.appendChild\(card\);/, "错误卡 = dialog 直接子元素（覆盖层，非内容流），重提交前摘旧卡");
   assert.doesNotMatch(s, /body\.insertBefore\(card/, "不再把错误卡前置进 .fd-body 文档流（反馈 ① 的根因）");
   assert.match(CSS, /dialog\.fd > \.err-ov-card \{[^}]*position: fixed/, "错误卡 fixed 定位（盖在浮层内容之上）");
   assert.match(CSS, /dialog\.fd > \.err-ov-card \{[^}]*box-shadow: 0 0 0 100vmax/, "半透明遮罩 = 超大 spread shadow（不用 transform，避免打断 fixed 包含块）");
-  assert.match(s, /if \(!swapPage\(r\.text\)\) \{ nativeSubmit\(form\); \}\n        return;/, "抽不到卡 ⇒ 回退换入错误页 main（现行为）");
+  assert.match(s, /if \(swapPage\(r\.text\)\) \{ restoreForm\(form\); \} else \{ nativeSubmit\(form\); \}\n        return;/, "抽不到卡 ⇒ 回退换入错误页 main（现行为）+ 复位表单；换不入才降级原生");
   assert.match(s, /closest\("#feat-dialog #err-ov-close"\)/, "浮层内「知道了」有委托处理");
   assert.match(s, /card\.parentNode\.removeChild\(card\);/, "点「知道了」= 摘掉错误卡（浮层不关）");
   // 反馈 ②：浮层内提交不跳页 ⇒ 提交守卫的禁用/提示行无人复位，本脚本处理完响应后主动恢复表单
@@ -421,11 +461,11 @@ test("N2-⑦ 浮层内表单提交锚（真浏览器反馈 ②③）：只拦 di
   assert.match(s, /querySelectorAll\("button\[disabled\]"\)/, "重新启用被守卫禁用的提交按钮");
   assert.match(s, /btns\[i\]\.removeAttribute\("aria-disabled"\);/, "连 aria-disabled 一起摘（否则读屏仍报禁用）");
   assert.match(s, /querySelector\("\.submit-pending"\)/, "摘掉「已提交，排期写入中」提示行");
-  assert.match(s, /if \(!swapPage\(r\.text\)\) \{ nativeSubmit\(form\); \}\n    \}\)\.then\(function \(\) \{\n      restoreForm\(form\);\n    \}\)/, "响应处理完之后恢复表单（成功 / 错误叠加两档共用一个落点）");
+  assert.match(s, /      startPoll\(okMain\);\n      restoreForm\(form\);/, "成功档：交棒轮询后复位表单（件B 起轮在前，复位不抢跑）");
   // 降级面：结构不可解析 / fetch 异常 ⇒ 原生提交（此前不动 body ⇒ 表单仍在文档内可 submit）
   assert.match(s, /function nativeSubmit\(form\) \{ restoreForm\(form\); form\.submit\(\); \}/, "降级 = 先恢复表单再原生 form.submit()");
   assert.match(s, /if \(data === null \|\| action === ""\) \{ nativeSubmit\(form\); return; \}/, "FormData 不可构造 / action 属性缺失 ⇒ 降级原生提交（不劣化）");
-  assert.match(s, /if \(!swapPage\(r\.text\)\) \{ nativeSubmit\(form\); \}/, "响应不可解析 ⇒ 降级原生提交");
+  assert.match(s, /if \(!swapPage\(r\.text\)\) \{ nativeSubmit\(form\); return; \}/, "响应不可解析 ⇒ 降级原生提交");
   assert.match(s, /\.catch\(function \(\) \{ nativeSubmit\(form\); \}\)/, "fetch 网络异常 ⇒ 降级原生提交");
   // 提交期间不改 body ⇒ 降级时表单仍是活节点（form.submit() 对未连接表单是空操作）
   assert.doesNotMatch(s, /body\.textContent = "提交中…"/, "提交前不清空 body（否则降级路径的表单已被摘走）");
@@ -440,17 +480,80 @@ test("N2-⑧ 浮层 409 错误卡去重（用户裁决 (a)）：有卡路径不�
   assert.ok(at !== -1, "postForm 的 4xx/5xx err 分支在位");
   const errBranch = s.slice(at, s.indexOf("return;\n      }", at));
   assert.ok(errBranch.length > 50, "err 分支体可切取");
-  const cardPath = errBranch.slice(0, errBranch.indexOf("showCard(parsed.card); return;") + "showCard(parsed.card); return;".length);
+  const cardPath = errBranch.slice(0, errBranch.indexOf("showCard(parsed.card); restoreForm(form); return;") + "showCard(parsed.card); restoreForm(form); return;".length);
   assert.doesNotMatch(cardPath, /swapPage/, "抽到卡的路径不整体替换 body（重复内容缺陷的根因已除）");
-  assert.match(cardPath, /showCard\(parsed\.card\); return;/, "有卡 ⇒ 唯一动作 = 叠加错误卡后立即返回");
+  assert.match(cardPath, /showCard\(parsed\.card\); restoreForm\(form\); return;/, "有卡 ⇒ 动作 = 叠加错误卡 + 复位表单后立即返回（不换 body）");
   // swapPage 只允许出现在无卡的回退位（卡判之后）
-  assert.match(errBranch.slice(errBranch.indexOf("showCard")), /if \(!swapPage\(r\.text\)\)/, "无卡 ⇒ 回退才换入错误页 main");
+  assert.match(errBranch.slice(errBranch.indexOf("showCard")), /if \(swapPage\(r\.text\)\) \{ restoreForm\(form\); \} else \{ nativeSubmit\(form\); \}/, "无卡 ⇒ 回退才换入错误页 main（换入后复位表单）");
   // 成功分支维持现状：抽最终页 main 换入 body（详情在浮层内刷新）
   const okBranch = s.slice(s.indexOf("if (r.err) {") + 10, s.indexOf("}).catch(function () { nativeSubmit(form); });"));
-  assert.match(okBranch, /if \(!swapPage\(r\.text\)\) \{ nativeSubmit\(form\); \}/, "2xx/3xx 成功分支 = swapPage 换入（维持现状）");
+  assert.match(okBranch, /if \(!swapPage\(r\.text\)\) \{ nativeSubmit\(form\); return; \}/, "2xx/3xx 成功分支 = swapPage 换入（换不入 ⇒ 降级原生提交后立即返回，不再走轮询）");
+});
+
+// REQ-2026-09-29-02 增补 · 件A：浮层提交就地反馈（整页档两动作复刻到浮层分支）
+test("件A 浮层提交就地反馈锚：preventDefault 后 · fetch 前禁用提交钮并挂提示行（文案取 data-submit）", () => {
+  const s = FEATURE_DETAIL_OVERLAY_SCRIPT;
+  assert.match(s, /function markPending\(form\) \{/, "件A 落点 = markPending");
+  assert.match(s, /if \(all\[i\]\.type !== "submit"\) continue;/, "只禁提交按钮（.type 属性判定）");
+  assert.doesNotMatch(s, /button\[type=submit\]/, "浮层脚本内不得出现提交守卫的归类标记串（N3-⑦ 每枚恰好 1 处）");
+  assert.match(s, /all\[i\]\.disabled = true;\n      all\[i\]\.setAttribute\("aria-disabled", "true"\);/, "禁用 + aria-disabled 同步（读屏一致）");
+  assert.match(s, /p\.className = "hint submit-pending";/, "提示行 class 与整页档同名（restoreForm 一处摘净）");
+  assert.match(s, /var note = form\.getAttribute\("data-submit"\)/, "提示文案取服务端 data-submit（动作区档 = 本轮可能跑数分钟）");
+  // 时序钉：反馈必须在发 fetch 之前完成（否则数分钟窗口内仍无回执 = 本件要修的缺陷）
+  const preventAt = s.indexOf("e.preventDefault();\n    // 件A");
+  const markAt = s.indexOf("if (!markPending(form)) return;");
+  const dispatchAt = s.indexOf("postForm(form);");
+  const fetchAt = s.indexOf("fetch(action, {");
+  assert.ok(preventAt > 0, "拦下 submit 的锚点在位（防被无声改写）");
+  assert.ok(markAt > preventAt && markAt < dispatchAt, "先 preventDefault → 挂反馈 → 再进 postForm");
+  assert.ok(s.indexOf("function postForm(form) {") < fetchAt, "fetch(action) 在 postForm 体内 ⇒ 只可能在挂载之后执行");
+  // 连点防护归本分支（挂起标记 + 服务端 409）；整页档 SUBMIT_GUARD 的 defaultPrevented 早退语义不动
+  assert.match(s, /if \(form\.getAttribute\("data-ov-pending"\) === "1"\) return;/, "二次提交直接吞掉（浮层侧自带）");
+  assert.match(SUBMIT_GUARD_SCRIPT, /if \(e\.defaultPrevented\) return;/, "整页档守卫仍对已拦下的事件早退（整页行为零变化）");
+  assert.match(s, /if \(parsed\.card !== null\) \{ showCard\(parsed\.card\); restoreForm\(form\); return; \}/, "失败档复位表单（可改后重提）");
+});
+
+// REQ-2026-09-29-02 增补 · 件B：就地进度轮询（复用既有详情读面，零新端点、有界、收口即停）
+test("件B 就地进度轮询锚：提交成功后交棒轮询 · 读面 = GET 既有详情 URL · 有界 · 收口即停 · 零新端点", () => {
+  const s = FEATURE_DETAIL_OVERLAY_SCRIPT;
+  assert.match(s, /var POLL_INTERVAL_MS = \d+;/, "轮询间隔为常量（有界之一）");
+  assert.match(s, /var POLL_MAX_TICKS = \d+;/, "轮数上限为常量（有界之二：窗口耗尽自然停）");
+  assert.match(s, /if \(pollTicks >= POLL_MAX_TICKS\) \{ stopPoll\(\); return; \}/, "到顶即停，不再排下一拍");
+  assert.match(s, /pollTicks \+= 1;/, "每拍计数（上限据此生效）");
+  // 挂载：成功换页后按回包动作区决定起轮
+  assert.match(s, /lastHref = action;\n      startPoll\(okMain\);/, "件B 挂载点 = 提交成功档（读面 URL 对齐本需求详情）");
+  assert.match(s, /function startPoll\(main\) \{\n    stopPoll\(\);/, "起轮前先停旧轮 ⇒ 恒只一条链（连点不叠加）");
+  assert.match(s, /if \(main === null \|\| !stillBusy\(main\)\) return;/, "回包已收口 ⇒ 根本不起轮");
+  // 收口判据 = 读面动作区不再显示在飞 / 排队的轮次进度行
+  assert.match(s, /function stillBusy\(main\) \{[\s\S]{0,160}\.turn-progress[\s\S]{0,80}在飞[\s\S]{0,40}排队中/, "收口判据取自 .turn-progress 文案（在飞 / 排队中）");
+  assert.match(s, /if \(main === null \|\| !stillBusy\(main\)\) \{ stopPoll\(\); return; \}/, "收口 ⇒ 停轮（轮收口即停，不空转）");
+  assert.match(s, /swapPage\(r\.text, false\);\n      schedulePoll\(\);/, "未收口 ⇒ 经既有 swapPage 刷真实进度后续排");
+  // 零新增端点 / 零新增写面：轮询只用 GET 详情读面
+  const poll = s.slice(s.indexOf("function pollOnce()"), s.indexOf("function startPoll("));
+  assert.match(poll, /fetch\(pollUrl, \{ credentials: "same-origin", headers: \{ Accept: "text\/html" \} \}\)/, "轮询 = 同源 GET 既有详情读面（带 Accept ⇒ 与 open() 同规格）");
+  assert.doesNotMatch(poll, /method: "POST"/, "轮询不得是写面（不重复起轮）");
+  assert.doesNotMatch(s, /fetch\("\/api|fetch\(`\/|new WebSocket|EventSource|setInterval/, "零新端点、零新通道、零常驻定时器（闭集内自限）");
+});
+
+// REQ-2026-09-29-02 增补 · 件C：收口渲染不得把已关闭的浮层重新弹开
+test("件C 竞态锚：swapPage 收 reopen 第二参 · 轮询传 false · 关浮层只 stopPoll 不 showModal · 关闭三路径停轮", () => {
+  const s = FEATURE_DETAIL_OVERLAY_SCRIPT;
+  assert.match(s, /function swapPage\(html, reopen\) \{/, "swapPage 增第二参 reopen");
+  assert.match(s, /if \(reopen !== false && !dlg\.open\) \{ dlg\.showModal\(\); \}/, "仅显式 false 才抑制自弹开（用户动作档行为不变）");
+  assert.match(s, /swapPage\(r\.text, false\);/, "后台轮询档 = reopen false");
+  const poll = s.slice(s.indexOf("function pollOnce()"), s.indexOf("function startPoll("));
+  assert.equal((poll.match(/dlg\.showModal\(\)/g) ?? []).length, 0, "轮询路径内零 showModal");
+  assert.match(poll, /if \(!dlg\.open \|\| pollUrl === ""\) \{ stopPoll\(\); return; \}/, "浮层已关 ⇒ 停轮（发请求前与回包后各一道）");
+  assert.ok((poll.match(/!dlg\.open/g) ?? []).length >= 2, "在飞期间被关闭也覆盖（回包后二次判定）");
+  // 三条关闭路径都须停轮，防关窗后仍有后台 GET 打点
+  assert.match(s, /closeBtn\.addEventListener\("click", function \(\) \{ stopPoll\(\); dlg\.close\(\);/, "关闭钮 ⇒ 先停轮");
+  assert.match(s, /dlg\.addEventListener\("cancel", function \(\) \{ stopPoll\(\);/, "Esc ⇒ 先停轮");
+  assert.match(s, /if \(!inBox\) \{ stopPoll\(\); dlg\.close\(\);/, "点遮罩 ⇒ 先停轮");
+  assert.match(s, /if \(toggle && href === lastHref && dlg\.open\) \{ dlg\.close\(\);/, "卡片二次点击关闭的既有语义未动");
 });
 
 test("N2-③ renderSchedule：dialog 骨架恒空（不嵌用户数据）+ 卡片 <a href> 回退仍在", () => {
+
   const html = renderSchedule(
     groupFeaturesByVersion([feature("F1", "v0.9.2", { title: '<img src=x onerror="1">' })]),
     selectRequirementPool([feature("F2", null)]),

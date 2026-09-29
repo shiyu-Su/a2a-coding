@@ -2,11 +2,15 @@
  * 板写面守卫与入参解析（BD7 · BD8 扩两条 · BD9 再扩两条 · BD16 修「来源不可知」误判 · v0.9.2 M3 再扩一条 ·
  * v0.9.4 A1/A3 再扩一条 · BD4 再扩一条）—— **纯函数**（不依赖 http 类型，便于离线单测）。
  *
- * 放开的写路径共九条，方法**恒为 POST**： * - `POST /requirements`          —— 提需求（BD7）；
+ * 放开的写路径共十一条，方法**恒为 POST**： * - `POST /requirements`          —— 提需求（BD7）；
  * - `POST /features/:id/turn`     —— 触发宿主桥的一轮（BD8）；
  * - `POST /host/:org/stop`        —— 停桥（BD8，**与上两条同规格**：守卫头 / 同源校验）；
  * - `POST /features/:id/confirm`  —— 人工确认指令（BD9，投消息给 agent，**板不批准**）；
  * - `POST /features/:id/answer`   —— 澄清回答（BD9，仅当最新轮 `awaiting_answer` 可续推）；
+ * - `POST /features/:id/stop-chain` —— **按需求停链**（v0.9.5 C4 · T3）：置内存停链标志（接力决策器见标志即
+ *   停）+ 复用 `cancelTurn` 清该需求的在飞 / 排队轮（取消先于开跑 ⇒ 一条也不发）；**不落 `.data/`、不跨重启**；
+ * - `POST /features/:id/suspend` —— **挂起口**（v0.9.5 C7 · T7）：宿主下发子任务后登记 suspended 台账
+ *   （`turnId` 验归属 + `pending[]` 清单 + 可选 `wakeCond`）后退出本轮；**内存为事实源、不跨重启**；
  * - `POST /features/:id/schedule` —— 排期写（v0.9.2 M3，唯一放开的登记字段写，经 `feature-schedule.ts` 封装）；
  * - `POST /orgs`                  —— 组织写（v0.9.4 A 档 / BD1 建组织 + BD3 停用，`action` 字段分流；写板侧组织台账 `.data/orgs.json`；**不触桥、不写状态机、不写 machine 配置**）；
  * - `POST /orgs/{org}/members`    —— 成员写（v0.9.4 B 档 / BD4，**一条路由**靠 `action` 分「增 / 删」）：经 `group-admin.ts`
@@ -22,6 +26,8 @@
  *   ⇒ 结构化 400；v0.9.2 M6 起 `version` **不再必填**，留空 = 未排期）；
  * - {@link parseScheduleForm}：urlencoded 表单 → 排期写入参（M3；`version` **键必须显式存在**，
  *   空串 = 删除排期；缺键 = 编程错误抛出 {@link ScheduleFormProgrammingError}，不做缺键语义）；
+ * - {@link parseTurnForm}：urlencoded 表单 → 触发一轮的**可选**补充文本（v0.9.5 C2；`supplement`
+ *   缺键 / 空串 / 纯空白 ⇒ 纯触发，**合法语义**，不做缺键报错；该字段**独立上限** 8 KiB ⇒ 超限结构化 400）；
  * - {@link validateOrgName} / {@link findOrgNameConflict} / {@link parseOrgForm}：组织名校验
  *   **单一纯函数**（字符集闭集）+ 三源重名闸（停用名豁免）+ `POST /orgs` 表单（v0.9.4 A2/A3，
  *   `action` 字段分「建 / 停用」，一条路由不扩白名单；D 档归一层复用同一校验函数）；
@@ -29,7 +35,10 @@
  *   `action` **必须显式给出且落在闭集**（`add` / `remove`，不猜动作）+ 成员对 `{machineId, projectId}` 非空；
  * - {@link parseVersionActionForm}：`POST /versions` 表单（v0.9.4 N1）—— `action` 三值闭集
  *   （`create` / `remove` / `setStatus`，**未知 action fail-closed 拒**）+ `version` 非空 +
- *   `setStatus` 时 `status` 落在三态闭集。
+ *   `setStatus` 时 `status` 落在三态闭集；
+ * - {@link parseSuspendForm}：`POST /features/:id/suspend` 表单（v0.9.5 C7 · T7）—— `turnId` 必填 +
+ *   `pending[]` 清单（可重复键，逐项非空；空 = 纯 DAG 监视）+ 可选 `wakeCond`（有界不透明串）。
+ *   **归属校验（turnId 必须等于该需求最新板发轮）不在本函数**，落 handler（需读轮管理器）。
  *
  * **组织名的校验点在请求期，不在启动期**（BD11 反转 BD10）：组织名由**用户在前台创建/指定**
  * （提需求表单 `group` 字段），板级 `config.json` 的 `group` 只是**可选默认组织**（BD12″ 起无 argv/env 通道）。
@@ -59,6 +68,20 @@ export const HOST_STOP_WRITE_PATH_TEMPLATE = "/host/{org}/stop";
 export const CONFIRM_WRITE_PATH_TEMPLATE = "/features/{id}/confirm";
 export const ANSWER_WRITE_PATH_TEMPLATE = "/features/{id}/answer";
 
+/**
+ * v0.9.5 C4 · T3 写路径模板（**按需求停链**）：置内存停链标志（接力决策器见标志即停）+ 复用
+ * `cancelTurn` 清该需求的在飞 / 排队轮。**不落 `.data/` 台账、不跨重启持久**（接力链本身是进程内
+ * Promise 链，重启即无链可停）⇒ `WRITE_ROUTES` 九→十。
+ */
+export const STOP_CHAIN_WRITE_PATH_TEMPLATE = "/features/{id}/stop-chain";
+
+/**
+ * v0.9.5 C7 · T7 写路径模板（**挂起口**）：宿主下发子任务后经此口登记 suspended 台账
+ * （`turnId` 验归属 + `pending[]` 清单 + 可选 `wakeCond`），随后退出本轮；板心跳按 pending / DAG
+ * 定条件评估、命中后同 `contextId` 唤醒。**内存为事实源、不跨重启**（与停链同口径）⇒ `WRITE_ROUTES` 十→十一。
+ */
+export const SUSPEND_WRITE_PATH_TEMPLATE = "/features/{id}/suspend";
+
 /** v0.9.2 M3 写路径模板（排期写 = 唯一放开的登记字段 `version` 写，按需求定位）。 */
 export const SCHEDULE_WRITE_PATH_TEMPLATE = "/features/{id}/schedule";
 
@@ -86,6 +109,8 @@ export const WRITE_ROUTES: readonly string[] = [
   `POST ${HOST_STOP_WRITE_PATH_TEMPLATE}`,
   `POST ${CONFIRM_WRITE_PATH_TEMPLATE}`,
   `POST ${ANSWER_WRITE_PATH_TEMPLATE}`,
+  `POST ${STOP_CHAIN_WRITE_PATH_TEMPLATE}`,
+  `POST ${SUSPEND_WRITE_PATH_TEMPLATE}`,
   `POST ${SCHEDULE_WRITE_PATH_TEMPLATE}`,
   "POST " + ORGS_WRITE_PATH,
   `POST ${ORG_MEMBERS_WRITE_PATH_TEMPLATE}`,
@@ -99,6 +124,8 @@ export type WriteRoute =
   | { kind: "host_stop"; org: string }
   | { kind: "confirm"; featureId: string }
   | { kind: "answer"; featureId: string }
+  | { kind: "stop_chain"; featureId: string }
+  | { kind: "suspend"; featureId: string }
   | { kind: "schedule"; featureId: string }
   | { kind: "orgs" }
   | { kind: "org_members"; org: string }
@@ -136,6 +163,10 @@ export function parseWriteRoute(method: string | undefined, pathname: string): W
   if (confirmId !== null) return { kind: "confirm", featureId: confirmId };
   const answerId = paramSegment(pathname, "/features/", "/answer");
   if (answerId !== null) return { kind: "answer", featureId: answerId };
+  const stopChainId = paramSegment(pathname, "/features/", "/stop-chain");
+  if (stopChainId !== null) return { kind: "stop_chain", featureId: stopChainId };
+  const suspendId = paramSegment(pathname, "/features/", "/suspend");
+  if (suspendId !== null) return { kind: "suspend", featureId: suspendId };
   const scheduleId = paramSegment(pathname, "/features/", "/schedule");
   if (scheduleId !== null) return { kind: "schedule", featureId: scheduleId };
   const org = paramSegment(pathname, "/host/", "/stop");
@@ -362,6 +393,66 @@ export function parseScheduleForm(raw: string, contentLength?: number): Schedule
     );
   }
   return { ok: true, version: (f.get(SCHEDULE_FORM_VERSION_FIELD) ?? "").trim() };
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.5 C2：触发一轮表单的**可选补充文本**（POST /features/:id/turn）
+// ---------------------------------------------------------------------------
+
+/**
+ * turn 表单的补充文本字段（v0.9.5 C2）：自由文本，随本轮 prompt 一起投给宿主 agent
+ * （拼入见 `host-face.ts#buildTurnPrompt`）。**留空 / 缺键 = 纯触发**（合法语义）。
+ */
+export const TURN_FORM_SUPPLEMENT_FIELD = "supplement";
+
+/**
+ * 补充文本的**独立上限**（v0.9.5 C2）：8 KiB。**刻意远小于**请求体上限
+ * {@link MAX_REQUIREMENT_BODY_BYTES}（256 KiB）—— 单轮 prompt 的补充说明不该吃满整个 body 预算。
+ * 超限 ⇒ 结构化 **400**（不是 413：body 本身仍在上限内，超的是**这一个字段**）。
+ */
+export const MAX_TURN_SUPPLEMENT_BYTES = 8_192;
+
+/** 补充文本超限的结构化错误码（400）。 */
+export const TURN_SUPPLEMENT_TOO_LARGE_CODE = "board_turn_supplement_too_large";
+
+export type TurnFormOk = {
+  ok: true;
+  /** 已 `trim()` 的补充文本；空串 = 纯触发（缺键 / 空 / 纯空白同值，不做缺键报错）。 */
+  supplement: string;
+};
+export type TurnFormFail = { ok: false; status: 400 | 413; code: string; error: string };
+export type TurnFormResult = TurnFormOk | TurnFormFail;
+
+/**
+ * urlencoded 表单 → 补充文本（纯函数，判别联合口径同 {@link parseScheduleForm}）：
+ * - `supplement` **可选**：缺键 / 空串 / 纯空白一律 ⇒ `{ ok: true, supplement: "" }`（= 纯触发，**合法语义**，
+ *   不做缺键编程错误 —— 这是与 {@link parseScheduleForm}「`version` 必须显式传」的**刻意差异**：
+ *   补充是可选增强，不是必填业务语义）；
+ * - 该字段**独立上限** {@link MAX_TURN_SUPPLEMENT_BYTES}：按 `Buffer.byteLength(..., "utf8")` 计（中文按 3 字节），
+ *   超限 ⇒ 结构化 **400** {@link TURN_SUPPLEMENT_TOO_LARGE_CODE}；正常路径下 body 级 256 KiB 上限已由
+ *   `server.ts#hostWriteGate` 的 `readBodyCapped` 提前拦成 413，此处仅作同规格兜底。
+ */
+export function parseTurnForm(raw: string, contentLength?: number): TurnFormResult {
+  if (
+    (contentLength !== undefined && contentLength > MAX_REQUIREMENT_BODY_BYTES) ||
+    Buffer.byteLength(raw, "utf8") > MAX_REQUIREMENT_BODY_BYTES
+  ) {
+    return { ok: false, status: 413, code: "payload_too_large", error: "请求体超过板写面上限（256 KiB）" };
+  }
+  const f = new URLSearchParams(raw);
+  const supplement = (f.get(TURN_FORM_SUPPLEMENT_FIELD) ?? "").trim();
+  const bytes = Buffer.byteLength(supplement, "utf8");
+  if (bytes > MAX_TURN_SUPPLEMENT_BYTES) {
+    return {
+      ok: false,
+      status: 400,
+      code: TURN_SUPPLEMENT_TOO_LARGE_CODE,
+      error:
+        `补充文本超过上限：${String(bytes)} 字节 > ${String(MAX_TURN_SUPPLEMENT_BYTES)} 字节（约 8 KiB）` +
+        "⇒ 请精简本轮补充说明；留空 = 纯触发",
+    };
+  }
+  return { ok: true, supplement };
 }
 
 // ---------------------------------------------------------------------------
@@ -646,4 +737,99 @@ export function parseVersionActionForm(raw: string, contentLength?: number): Ver
     return { ok: true, action: rawAction, version, status: rawStatus };
   }
   return { ok: true, action: rawAction, version, status: null };
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.5 C7 · T7：挂起口表单（POST /features/:id/suspend）
+// ---------------------------------------------------------------------------
+
+/**
+ * 挂起口表单的字段（v0.9.5 C7）：
+ * - `turnId` —— **本轮板发轮标识**（归属校验的唯一键：必须等于该需求最新板发轮）；
+ * - `pending` —— inquiry 子任务 id 清单（**可重复键**，逐项非空；缺省 / 空 = **纯 DAG 监视**，合法语义）；
+ * - `wakeCond` —— **可选**唤醒条件（有界不透明串；解释权归 C8 评估器，本层只做卫生与承载）。
+ */
+export const SUSPEND_FORM_TURN_ID_FIELD = "turnId";
+export const SUSPEND_FORM_PENDING_FIELD = "pending";
+export const SUSPEND_FORM_WAKE_COND_FIELD = "wakeCond";
+
+/** `turnId` 缺失 / 空白，或 `pending` 任一项为空白的结构化错误码（400）—— fail-closed，不猜。 */
+export const SUSPEND_FORM_INVALID_CODE = "board_suspend_form_invalid";
+
+/**
+ * **turnId 归属不符**的结构化错误码（400，落 handler）：不是该需求**最新板发轮**
+ * （旧轮 / agent 客户端任务天然无板发 turnId / 该需求根本没开过轮）⇒ 一律拒，**不设时间窗**（R2 定稿）。
+ */
+export const SUSPEND_TURN_MISMATCH_CODE = "board_suspend_turn_mismatch";
+
+/**
+ * `wakeCond` 的**独立上限**（400 字节）：唤醒条件是宿主侧的简短表述，不该吃满整个 body 预算
+ * （与 `parseTurnForm` 的补充文本同理，但更小 —— 它是条件 token，不是自由文本）。
+ */
+export const MAX_SUSPEND_WAKE_COND_BYTES = 400;
+
+export type SuspendFormOk = {
+  ok: true;
+  /** 已 `trim()` 的本轮板发轮标识（非空）。 */
+  turnId: string;
+  /** inquiry 子任务 id 清单（已 `trim()`、去重保序；空数组 = 纯 DAG 监视）。 */
+  pending: string[];
+  /** 可选唤醒条件（已 `trim()`；缺省 / 空白 ⇒ null）。 */
+  wakeCond: string | null;
+};
+export type SuspendFormFail = { ok: false; status: 400 | 413; code: string; error: string };
+export type SuspendFormResult = SuspendFormOk | SuspendFormFail;
+
+/**
+ * urlencoded 表单 → 挂起入参（**严格仿 {@link parseMemberForm}** 的 fail-closed 规格：超限 413、
+ * 校验不过结构化 400、判别联合）：
+ * - `turnId` **必须显式给出**且 `trim()` 后非空（缺 / 空 ⇒ {@link SUSPEND_FORM_INVALID_CODE}）——
+ *   它是归属校验的键，没有它无法分辨「板发轮」与「agent 客户端任务」；
+ * - `pending` 取**重复键全量**（`getAll`），逐项 `trim()` 后非空（任一项空白 ⇒ 400）、去重保序；
+ *   一项都不给 = **纯 DAG 监视**（合法语义，与 `parseTurnForm` 的「留空 = 纯触发」同款）；
+ * - `wakeCond` 可选，`trim()` 后空 ⇒ null；超 {@link MAX_SUSPEND_WAKE_COND_BYTES} ⇒ 400（超的是该字段，不是 body）。
+ *   **turnId 归属（是否等于最新板发轮）不在本函数**：纯函数不读轮管理器，判据落 handler。
+ */
+export function parseSuspendForm(raw: string, contentLength?: number): SuspendFormResult {
+  if (
+    (contentLength !== undefined && contentLength > MAX_REQUIREMENT_BODY_BYTES) ||
+    Buffer.byteLength(raw, "utf8") > MAX_REQUIREMENT_BODY_BYTES
+  ) {
+    return { ok: false, status: 413, code: "payload_too_large", error: "请求体超过板写面上限（256 KiB）" };
+  }
+  const f = new URLSearchParams(raw);
+  const turnId = (f.get(SUSPEND_FORM_TURN_ID_FIELD) ?? "").trim();
+  if (turnId === "") {
+    return {
+      ok: false,
+      status: 400,
+      code: SUSPEND_FORM_INVALID_CODE,
+      error: `turnId 缺失或空白：挂起必须带本轮板发轮标识（归属校验的唯一键）⇒ 不得空提交`,
+    };
+  }
+  const pending: string[] = [];
+  for (const item of f.getAll(SUSPEND_FORM_PENDING_FIELD)) {
+    const v = item.trim();
+    if (v === "") {
+      return {
+        ok: false,
+        status: 400,
+        code: SUSPEND_FORM_INVALID_CODE,
+        error: `pending 清单含空白项：每一项必须是 inquiry 子任务 id（不得以空项占位；空清单 = 纯 DAG 监视）`,
+      };
+    }
+    if (!pending.includes(v)) pending.push(v);
+  }
+  const wakeCondRaw = (f.get(SUSPEND_FORM_WAKE_COND_FIELD) ?? "").trim();
+  if (Buffer.byteLength(wakeCondRaw, "utf8") > MAX_SUSPEND_WAKE_COND_BYTES) {
+    return {
+      ok: false,
+      status: 400,
+      code: SUSPEND_FORM_INVALID_CODE,
+      error:
+        `wakeCond 超过上限：${String(Buffer.byteLength(wakeCondRaw, "utf8"))} 字节 > ${String(MAX_SUSPEND_WAKE_COND_BYTES)} 字节` +
+        `⇒ 请精简唤醒条件；留空 = 按 pending / DAG 默认评估`,
+    };
+  }
+  return { ok: true, turnId, pending, wakeCond: wakeCondRaw === "" ? null : wakeCondRaw };
 }

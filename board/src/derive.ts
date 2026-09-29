@@ -8,6 +8,10 @@
  *   写门没挡却没开工时看 `readOccupants[]`；`waitReason` 原样（八值闭集，不自造中文词）；
  * - §2.2-13（并行度口径）：编排侧并行 ≠ 改造侧并行；写串行不变；读并行需
  *   「节点 read 档 ∧ machine `maxConcurrentReads ≥ 2`」（缺省 1/1）⇒ DAG 拆宽 ≠ 并行。
+ *
+ * **v0.9.5 C1/C5**（`doc/v0.9.5/需求详情页读面精简-改造文档.md`）：详情页规则源集中到本文件 ——
+ * 引导行（{@link deriveNextStepHint}，含卡滞档）与动作区档位（{@link deriveActionAffordance}）
+ * 共用同一入参 {@link NextStepInput} = 同一事实源；两者只判显示，不写状态机（写端点与 409 硬闸不变）。
  */
 import type { TraceNode } from "./bridge-client.js";
 
@@ -145,48 +149,89 @@ export function traceWaitDisplay(node: TraceNode, nowMs: number): TraceWaitDispl
 }
 
 // ---------------------------------------------------------------------------
-// BD18 ①：「确认」按钮可用性（按 approval 条件化）
+// BD18 ①（v0.9.5 C5 档位化改写）：详情页动作区的唯一档位判据
+//
+// **定向推翻记录**（用户裁定 2026-09-29，改造文档 §2 C5）：BD18 原口径「确认按钮恒显示、
+// 仅按 `approval` 置灰」刻意写明「不隐藏：看不到入口更迷惑」。C5 把它改为**按档位收合** ——
+// 「确认」只在确认门（`approval = 待审批`）出现，其余档位不渲染确认块；「触发一轮」这一底层
+// 机制词从 UI 消失，改为意图化按钮。服务端 409 硬闸一条未减。
 // ---------------------------------------------------------------------------
 
-/** 确认按钮的一次可用性判定：可点与否 + 面向用户的一行说明（禁用时含原因与下一步）。 */
+/** 一次可用性判定：可点与否 + 面向用户的一行说明（禁用时含原因与下一步）。 */
 export interface ConfirmAffordance {
   enabled: boolean;
   note: string;
 }
 
-/** 审批门「待审批」是唯一可点确认的档位（与桥侧 `approve` 门同口径）。 */
+/** 审批门「待审批」= 确认档唯一档位（与桥侧 `approve` 门同口径）。 */
 const APPROVAL_PENDING = "待审批";
 
 /**
- * 「发送确认指令给 agent」按钮的可用性规则（纯函数，**只控显示可用性，不写状态机**）。
- *
- * 背景（v0.9.0 收口轨 13）：板建需求初态 = `approval = 未发起`，此前按钮恒显示 ⇒
- * 用户自然先点「确认」，agent 核对不通过只回报缺什么 —— 行为正确但按钮在误导。
- * 刻意**不隐藏**（看不到入口更迷惑）：禁用 + 说明原因与下一步。
+ * v0.9.5 C5 动作区档位（**只控显示，不写状态机**）：kind = 提交去向（与两个既有写路由一对一）·
+ * label = 面向用户的意图文案 · enabled=false 时 note 给原因 · quiet = 低调档（卡滞兜底用，不抢视觉）。
  */
-export function deriveConfirmAffordance(approval: string | null): ConfirmAffordance {
-  switch (approval) {
-    case APPROVAL_PENDING:
-      return {
-        enabled: true,
-        note: "审批门 = 待审批：核对改造文档后可发送确认指令（放不放行仍由 agent 核对后决定）。",
-      };
-    case "未发起":
-      return {
-        enabled: false,
-        note: "方案未就绪（approval = 未发起）：需先「触发一轮」让 agent 产出需求确认单与改造文档、并把审批门置「待审批」，此按钮才会变为可点。",
-      };
-    case "已通过":
-      return {
-        enabled: false,
-        note: "审批门已是「已通过」：放行已完成，无需再次确认（approval 单向、无回边）。",
-      };
-    default:
-      return {
-        enabled: false,
-        note: `仅当审批门 = 「${APPROVAL_PENDING}」时确认按钮可点（当前值 = ${approval ?? "缺失"}）；方案未就绪时先「触发一轮」让 agent 产出改造文档。`,
-      };
+export interface ActionAffordance {
+  kind: "turn" | "confirm";
+  label: string;
+  enabled: boolean;
+  note: string;
+  quiet: boolean;
+}
+
+/**
+ * 动作区唯一档位判据（纯函数，与 {@link deriveNextStepHint} 共用同一入参 = 同一事实源）。
+ *
+ * 判序：终态 / 宿主面未装配 ⇒ `null`（**不渲染动作区**，见文件头 C5 口径）> 轮占用（disabled）
+ * > `approval = 待审批`（确认档，唯一出现「确认」按钮的地方）> 验收段 > 待裁待答 > 闲置。
+ */
+export function deriveActionAffordance(input: NextStepInput): ActionAffordance | null {
+  if (!input.hostFaceAssembled || isTerminalFeatureState(input.state)) return null;
+  const base = actionTierBase(input);
+  const busy = input.turnBusy === true;
+  if (!busy) return base;
+  return {
+    ...base,
+    enabled: false,
+    note:
+      input.busyTurn !== null && input.busyTurn !== undefined
+        ? deriveTurnBusyAffordance(input.busyTurn)?.note ?? "本轮未结束前不可再次提交（防连点重复排队）。"
+        : "本轮未结束前不可再次提交（防连点重复排队）。",
+  };
+}
+
+function actionTierBase(input: NextStepInput): ActionAffordance {
+  if (input.approval === APPROVAL_PENDING) {
+    return {
+      kind: "confirm",
+      label: "确认改造文档 → 放行执行",
+      enabled: true,
+      note: "",
+      quiet: false,
+    };
   }
+  if (input.state === "reviewing" || input.state === "testing") {
+    return { kind: "turn", label: "反馈验收结论", enabled: true, note: "", quiet: false };
+  }
+  if (hasPendingUserInput(input)) {
+    return { kind: "turn", label: "提交给 agent", enabled: true, note: "", quiet: false };
+  }
+  const executing = input.state === "executing" || input.state === "integrating";
+  return {
+    kind: "turn",
+    label: "让 agent 继续",
+    enabled: true,
+    note: "",
+    quiet: executing,
+  };
+}
+
+/** 「有待裁待答」的显示层判据：待澄清轮 / 已登记产出 / 已有轮次留痕（板不解析待裁项结构，见改造文档 §6）。 */
+function hasPendingUserInput(input: NextStepInput): boolean {
+  return (
+    input.awaitingAnswer === true ||
+    (input.registeredDocs?.length ?? 0) > 0 ||
+    input.latestTurn !== null && input.latestTurn !== undefined
+  );
 }
 
 // ---------------------------------------------------------------------------
@@ -209,7 +254,7 @@ export function deriveScheduleGateOpen(stage: string | null, approval: string | 
 }
 
 // ---------------------------------------------------------------------------
-// 收口轨 14 ②：写按钮的「轮占用」可用性（在飞 / 排队轮渲染为禁用 + 原因）
+// 收口轨 14 ②（v0.9.5 C5 档位化改写）：动作区按钮的「轮占用」判据（在飞 / 排队轮 ⇒ disabled + 原因）
 // ---------------------------------------------------------------------------
 
 /** 占用轮的最小视图（与 `host-turn.ts` 的 `OccupantTurnView` 结构兼容，视图层不自造字段）。 */
@@ -220,9 +265,9 @@ export interface BusyTurnView {
 }
 
 /**
- * 「触发一轮 / 发送确认指令」按钮的**轮状态判据**（纯函数，只管显示可用性）：
+ * 动作区按钮的**轮状态判据**（纯函数，只管显示可用性）：
  * 该需求已有在飞 / 排队轮 ⇒ 禁用 + 原因（防连点重复烧一轮；服务端另有 409 `board_turn_busy` 硬闸）。
- * 无占用轮 ⇒ enabled = `null`，交回各按钮自身的既有判据（approval 等），不在此处越权。
+ * 无占用轮 ⇒ enabled = `null`，交回档位判据（{@link deriveActionAffordance}），不在此处越权。
  */
 export function deriveTurnBusyAffordance(busy: BusyTurnView | null): ConfirmAffordance | null {
   if (busy === null) return null;
@@ -271,6 +316,63 @@ export function deriveTurnProgress(
 }
 
 // ---------------------------------------------------------------------------
+// v0.9.5 推进流程精简 · 增补二 T3（Feature fbaa15aa）：详情页「链状态」一行
+// ---------------------------------------------------------------------------
+
+/**
+ * **停链标志的来源**（v0.9.5 增补二）：`user` = 用户经按需求停链口显式停链（人工动作**不得**清除）；
+ * `auto` = 板侧自动置位（唤醒退让超上限 / 接力点火撞 occupant 等），人工动作可解冻。
+ * 事实源 = `host-relay.ts` 的内存停链记录；本文件只做**只读派生**。
+ */
+export type ChainStopSource = "user" | "auto";
+
+/** 链状态快照（读面注入的最小只读面；`host-face.ts` / `index.ts` 装配，读面不得据此写状态）。 */
+export interface ChainStateSnapshot {
+  /** `stopped` = 停链标志已置；`monitoring` = 链在监视中。 */
+  chainState: "monitoring" | "stopped";
+  /** 停链原因（`monitoring` ⇒ `null`）。 */
+  reason: string | null;
+  /** 停链来源（`monitoring` ⇒ `null`）。 */
+  source: ChainStopSource | null;
+  /** 等待回传的子任务条数（读不到 ⇒ `null`，不臆造）。 */
+  pendingCount: number | null;
+}
+
+/** 详情页链状态行（`null` ⇒ 整行不渲染）。 */
+export interface ChainStateLine {
+  state: ChainStateSnapshot["chainState"];
+  /** 监视档：等待的子任务条数；`null` ⇒ 不显示个数。 */
+  pendingCount: number | null;
+  /** 停链档：原因；`null` ⇒ 显示「原因未记录」。 */
+  reason: string | null;
+  /** 停链档：来源；`null` ⇒ 显示「来源未知」。 */
+  source: ChainStopSource | null;
+}
+
+/**
+ * 链状态行（纯函数）：快照缺席 / 形状不合闭集 ⇒ `null`（**不渲染、不报错**）；
+ * `pendingCount` 非有限非负整数 ⇒ 按「读不到」处理（照轮次进度行「查不到不臆造位次」的口径）。
+ */
+export function deriveChainStateLine(snapshot: ChainStateSnapshot | null | undefined): ChainStateLine | null {
+  if (snapshot === null || snapshot === undefined) return null;
+  const state = snapshot.chainState;
+  if (state !== "monitoring" && state !== "stopped") return null;
+  const count =
+    typeof snapshot.pendingCount === "number" && Number.isInteger(snapshot.pendingCount) && snapshot.pendingCount >= 0
+      ? snapshot.pendingCount
+      : null;
+  if (state === "monitoring") {
+    return { state, pendingCount: count, reason: null, source: null };
+  }
+  return {
+    state,
+    pendingCount: count,
+    reason: typeof snapshot.reason === "string" && snapshot.reason.trim() !== "" ? snapshot.reason : null,
+    source: snapshot.source === "user" || snapshot.source === "auto" ? snapshot.source : null,
+  };
+}
+
+// ---------------------------------------------------------------------------
 // 收口轨 16 ①：引擎终态闭集（详情渲染与写面兜底共用同一判据）
 // ---------------------------------------------------------------------------
 
@@ -297,54 +399,156 @@ export function terminalFeatureNote(state: string | null): string {
 }
 
 /**
- * 收口轨 17：终态需求的「触发一轮 / 发送确认指令」可用性（纯函数，只管显示可用性）。
- * 判据单一源 = {@link isTerminalFeatureState}；服务端另有 409 `board_feature_terminal` 硬闸（轨 16 ③）。
- * 非终态 ⇒ `null`，交回各按钮自身的既有判据（占用 / approval），不在此处越权。
+ * 收口轨 17 → v0.9.5 C5 档位化：终态需求**不再渲染任何动作区**（原「灰态按钮 + 原因」的定向推翻，
+ * 用户裁定修订二）。终态事实由 {@link deriveNextStepHint} 的终态档 + 详情页墓碑行承载；
+ * 服务端 409 `board_feature_terminal` 硬闸不动（轨 16 ③）。
  */
-export function deriveTerminalFeatureAffordance(state: string | null): ConfirmAffordance | null {
-  if (state === null || !isTerminalFeatureState(state)) return null;
-  return { enabled: false, note: terminalFeatureNote(state) };
+
+// ---------------------------------------------------------------------------
+// BD18 ②（v0.9.5 C1 升级）：详情页「下一步」引导行
+// ---------------------------------------------------------------------------
+
+/**
+ * 卡滞阈值（v0.9.5 C1 · 用户裁定 2026-09-29：**定死 10 分钟、不引配置键**）：
+ * `state = executing` ∧ 无在飞 / 排队轮 ∧ 最近一轮距今超过本值 ⇒ 引导行切「建议手动继续」档。
+ */
+export const TURN_STALL_AFTER_MS = 10 * 60 * 1000;
+
+/** 最近一轮摘要的显示上限（超出截断；全文在轮台账 / 结果页，引导行与详情页留痕行共用同一口径）。 */
+export const LATEST_TURN_SUMMARY_MAX = 120;
+
+/** 任务计数（详情出参 `tasks` 归一，板不额外触桥）。 */
+export interface NextStepTaskCounts {
+  total: number;
+  completed: number;
+  failed: number;
 }
 
-// ---------------------------------------------------------------------------
-// BD18 ②：详情页「下一步」引导行
-// ---------------------------------------------------------------------------
+/** 最近一轮留痕（`latestTurnOf` 的最小视图；`at` = 该轮最近一次时刻的 ISO 原文）。 */
+export interface NextStepLatestTurn {
+  state: string;
+  summary: string | null;
+  at: string | null;
+}
 
-/** 引导行的输入（全部来自既有只读数据：宿主面装配与否 / 待澄清轮 / 登记字段 / 引擎态）。 */
+/**
+ * 引导行的输入（全部来自既有只读数据：宿主面装配与否 / 待澄清轮 / 登记字段 / 引擎态 /
+ * v0.9.5 C1 新增的 decisions 产出清单、任务计数、最近一轮、占用轮与当前时刻）。
+ *
+ * **v0.9.5 C1 纪律**：`nowMs` 由调用方下传（derive 内**不读时钟**，「距今」= `nowMs - Date.parse(at)`
+ * 单时钟差值，与 {@link formatWaitedSince} 同口径）；新增字段全部可选 ⇒ 未接线的调用方保持旧行为。
+ */
 export interface NextStepInput {
   hostFaceAssembled: boolean;
   awaitingAnswer: boolean;
   approval: string | null;
   state: string | null;
+  /** v0.9.5 C1：`decisions` 已登记的产出文件名清单（`parseDecisionItems` + `extractRegisteredDocPath` 归一） */
+  registeredDocs?: readonly string[];
+  /** v0.9.5 C1：任务计数 */
+  taskCounts?: NextStepTaskCounts;
+  /** v0.9.5 C1：最近一轮摘要（无轮次记录 ⇒ `null`） */
+  latestTurn?: NextStepLatestTurn | null;
+  /** v0.9.5 C1：该需求是否已有在飞 / 排队轮（卡滞判据的「无在飞轮」条件） */
+  turnBusy?: boolean;
+  /** v0.9.5 C1：占用轮本体（动作区 disabled 原因行复用，可缺省） */
+  busyTurn?: BusyTurnView | null;
+  /** v0.9.5 C1：当前时刻（毫秒）；缺省 ⇒ 卡滞档不可判（不猜） */
+  nowMs?: number;
+}
+
+/** 卡滞判据（纯函数）：executing ∧ 无在飞 / 排队轮 ∧ 最近一轮距今 > {@link TURN_STALL_AFTER_MS}。 */
+function isStalled(input: NextStepInput): boolean {
+  if (input.state !== "executing") return false;
+  if (input.turnBusy === true) return false;
+  const at = input.latestTurn?.at ?? null;
+  const nowMs = input.nowMs ?? null;
+  if (at === null || nowMs === null) return false;
+  const then = Date.parse(at);
+  if (!Number.isFinite(then)) return false;
+  return nowMs - then > TURN_STALL_AFTER_MS;
+}
+
+/** 「距今」一行事实（单时钟差值；不可判 ⇒ 空串）。 */
+function sinceTurnLine(input: NextStepInput): string {
+  const at = input.latestTurn?.at ?? null;
+  const nowMs = input.nowMs ?? null;
+  if (at === null || nowMs === null) return "";
+  const then = Date.parse(at);
+  if (!Number.isFinite(then)) return "";
+  return `（最近一轮距今 ${formatElapsed(nowMs - then)}）`;
+}
+
+function formatElapsed(ms: number): string {
+  const sec = Math.floor(ms / 1000);
+  if (sec < 60) return `${String(sec)}s`;
+  const min = Math.floor(sec / 60);
+  if (min < 60) return `${String(min)}min`;
+  return `${String(Math.floor(min / 60))}h ${String(min % 60)}min`;
+}
+
+/** 本卡事实段（产出 / 任务 / 最近一轮）：有哪项说哪项，全缺 ⇒ 空串。 */
+function factsLine(input: NextStepInput): string {
+  const parts: string[] = [];
+  const docs = input.registeredDocs ?? [];
+  if (docs.length > 0) parts.push(`已登记产出 ${docs.slice(0, 3).join(" · ")}${docs.length > 3 ? ` 等 ${String(docs.length)} 份` : ""}`);
+  const c = input.taskCounts;
+  if (c !== undefined && c.total > 0) parts.push(`任务 ${String(c.completed)}/${String(c.total)} 完成 · 失败 ${String(c.failed)}`);
+  const turn = input.latestTurn;
+  if (turn !== null && turn !== undefined) {
+    const summary =
+      turn.summary !== null && turn.summary !== ""
+        ? `：${turn.summary.length > LATEST_TURN_SUMMARY_MAX ? `${turn.summary.slice(0, LATEST_TURN_SUMMARY_MAX)}…` : turn.summary}`
+        : "";
+    parts.push(`最近一轮 ${turn.state}${summary}`);
+  }
+  return parts.length === 0 ? "" : `（${parts.join(" · ")}` + "）";
 }
 
 /**
- * 详情页「下一步」一行提示（纯函数）。判序：宿主面未装配 > **终态** > 待澄清回答 > approval 三态。
- * 文案必须指向**页面上真实存在的入口**（触发一轮 / 确认 / 回答框 / config.json）。
+ * 详情页「下一步」一行提示（纯函数；v0.9.5 C1 升级为「本卡状态 + 该做的一件事」）。
  *
- * **收口轨 16 ①**：终态判序**先于**待澄清 —— Feature 已 completed / failed / cancelled 时，
- * 台账里哪怕还残留陈旧的 `awaiting_answer` 轮，也不得再引导用户「回答上方问题」
- * （详情页同时不渲染回答表单，两侧同判据 = {@link isTerminalFeatureState}）。
+ * **判序纪律保留**：宿主面未装配 > **终态** > 待澄清回答 > approval 三态；**卡滞档最低**
+ * （只在 executing 段内生效，覆盖「已通过 · 等引擎」文案）。每档一句「卡在哪 + 等谁 + 做什么」，
+ * 文案只指向**页面上真实存在的入口**（动作区按钮 / 回答框 / config.json）。
+ *
+ * **v0.9.5 C5 口径**：UI 不再出现「触发一轮」字样（它是底层机制），故本行不得使用该词。
  */
 export function deriveNextStepHint(input: NextStepInput): string {
+  const facts = factsLine(input);
   if (!input.hostFaceAssembled) {
-    return "下一步：宿主面未装配（本板进程未接宿主桥）⇒ 需先在 config.json 配 orgsDir，之后本页才会出现「触发一轮 / 确认」入口。";
+    return "下一步：宿主面未装配（本板进程未接宿主桥）⇒ 需先在 config.json 配 orgsDir，之后本页才会出现动作区入口。";
   }
   if (isTerminalFeatureState(input.state)) {
     return terminalFeatureNote(input.state);
   }
   if (input.awaitingAnswer) {
-    return "下一步：回答上方问题（页面下方「回答待澄清的问题」表单，同 contextId 续推）。";
+    return `下一步：等你回答上方问题（动作区下方的回答框，同 contextId 续推）。${facts}`;
   }
   switch (input.approval) {
-    case "未发起":
-      return "下一步：点「触发一轮」让 agent 开始需求访谈；产出改造文档后审批门会进入「待审批」。";
+    case "未发起": {
+      const pending = (input.registeredDocs?.length ?? 0) > 0 || (input.latestTurn !== null && input.latestTurn !== undefined);
+      if (pending) {
+        return `下一步：等你 —— agent 已把产出落到本页，看完在动作区补充框写明裁定 ⇒ 点「提交给 agent」。${facts}`;
+      }
+      return "下一步：等你 —— 本卡尚无产出 ⇒ 点「让 agent 继续」开始需求访谈（产出需求确认单后进入改造方案）。";
+    }
     case APPROVAL_PENDING:
-      return "下一步：核对改造文档后点「确认」（板只投指令给 agent，由 agent 核对后放行）。";
-    case "已通过":
-      return "下一步：审批门已通过，引擎按 DAG 接管执行；刷新本页看「进展三面」即可。";
+      return `下一步：等你 —— 改造文档已落文件 ⇒ 核对后点「确认改造文档 → 放行执行」（放不放行由 agent 核对后决定）。${facts}`;
+    case "已通过": {
+      if (isStalled(input)) {
+        return `下一步：agent 好像没接上？本页没有进行中的轮${sinceTurnLine(input)}⇒ 点动作区的「让 agent 继续」手动接一轮。${facts}`;
+      }
+      if (input.state === "reviewing") {
+        return `下一步：等你验收 —— 引擎已把全部节点跑完 ⇒ 在动作区写明验收结论点「反馈验收结论」（「通过」即收口）。${facts}`;
+      }
+      if (input.state === "testing") {
+        return `下一步：等 agent 回归 —— 回归段进行中 ⇒ 刷新本页看「进展三面」。${facts}`;
+      }
+      return `下一步：等 agent —— 审批门已通过，引擎按 DAG 自动接力 ⇒ 刷新本页看进展。${facts}`;
+    }
     default:
-      return `下一步：请核对该需求的审批门值（当前 = ${input.approval ?? "缺失"}）；尚无改造文档时先点「触发一轮」。`;
+      return `下一步：等你 —— 请核对该需求的审批门值（当前 = ${input.approval ?? "缺失"}）。${facts}`;
   }
 }
 
