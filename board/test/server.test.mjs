@@ -135,9 +135,9 @@ test("GET /requirements ⇒ 303 回首页（REQ-04 Q2 列表页退役；不触�
   });
 });
 
-test("GET /schedule 看板需求卡：渲染派生阶段徽标 + taskCount；桥一次调用（无 N+1）", async () => {
+test("GET /org/g/schedule 看板需求卡（B5a 重指空间排期页）：渲染派生阶段徽标 + taskCount；桥一次调用（无 N+1）", async () => {
   await withServer(async (base, calls) => {
-    const res = await get(base, "/schedule");
+    const res = await get(base, "/org/g/schedule");
     assert.equal(res.status, 200);
     assert.match(res.text, /需求甲/);
     assert.match(res.text, /改造中/);
@@ -146,11 +146,11 @@ test("GET /schedule 看板需求卡：渲染派生阶段徽标 + taskCount；桥
   });
 });
 
-test("过滤参数随列表页退役：`/schedule` 与 `/requirements` 均不消费 query（REQ-04 Q3）", async () => {
+test("过滤参数随列表页退役：`/org/g/schedule` 与 `/requirements` 均不消费 query（REQ-04 Q3 · B5a 看板宿主 = 空间页）", async () => {
   await withServer(async (base, calls) => {
-    const res = await get(base, "/schedule?state=completed");
+    const res = await get(base, "/org/g/schedule?state=completed");
     assert.equal(res.status, 200);
-    assert.match(res.text, /<title>排期看板 · board<\/title>/, "看板恒全量渲染，过滤参数无效果");
+    assert.match(res.text, /<title>空间 · g · 排期 · board<\/title>/, "看板恒全量渲染，过滤参数无效果");
     assert.doesNotMatch(res.text, /过滤后|filter-form/, "过滤表单已随列表页删除");
     const redirected = await fetch(`${base}/requirements?state=completed`, { redirect: "manual" });
     assert.equal(redirected.status, 303, "带 query 的旧深链同样 303 回首页");
@@ -200,13 +200,17 @@ test("/features/:id：trace 失败不静默（页面显示错误且详情仍渲�
   );
 });
 
-test("GET /tasks 无 project ⇒ 选单页；?project=p ⇒ 任务表", async () => {
+test("C1：GET /tasks 裸页（含 ?project= 空值）⇒ 303 回门户 + no-store、零触桥；?project=p ⇒ 深链存活 200 任务表", async () => {
   await withServer(async (base, calls) => {
-    const pick = await get(base, "/tasks");
-    assert.equal(pick.status, 200);
-    assert.match(pick.text, /<form method="get" action="\/tasks">/);
+    for (const path of ["/tasks", "/tasks?project="]) {
+      const pick = await fetch(`${base}${path}`, { redirect: "manual" });
+      assert.equal(pick.status, 303, `${path} ⇒ 303（裸页退役，判据 = pathname ∧ query，空 project = 无项目可列同档）`);
+      assert.equal(pick.headers.get("location"), "/", `${path} 303 目标 = 门户`);
+      assert.equal(pick.headers.get("cache-control"), "no-store", `${path} 重定向不缓存`);
+      await pick.body?.cancel();
+    }
     const list = await get(base, "/tasks?project=p");
-    assert.equal(list.status, 200);
+    assert.equal(list.status, 200, "深链 ?project=p 存活（views.ts org===null ∧ 带 project 分支不整删）");
     assert.match(list.text, /执行中（working）/);
     assert.ok(calls.some((c) => c.startsWith("getTasks:p")));
   });
@@ -305,7 +309,7 @@ test("BD10-⑤：默认组织未配置（defaultGroup = null，即 resolveDefaul
   const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client, now: () => NOW, defaultGroup: null });
   const base = `http://127.0.0.1:${handle.port}`;
   try {
-    for (const path of ["/", "/features/F1", "/tasks", "/tasks?project=p", "/projects", "/host"]) {
+    for (const path of ["/", "/features/F1", "/tasks?project=p", "/projects", "/host"]) {
       const res = await get(base, path);
       assert.equal(res.status, 200, `${path} 不得因默认组织缺失而失败（读面与写面配置无关）`);
     }

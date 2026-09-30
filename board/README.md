@@ -120,16 +120,16 @@ npm run restart        # stop + start
 
 ### 排期看板的版本维护（v0.9.4 · 版本台账 + 框头删除入口）
 
-**事实源已换**：版本状态不再读 `config.json` 的 `releasedVersions`（该键已退役，残留时一次性 warn 不双读），改读**板侧版本台账** `.data/versions.json`（`src/versions-ledger.ts`，三态闭集 `notstart` / `active` / `released`，热生效免重启）。写口 = **一条** `POST /versions`，靠表单 `action` 三支分流（`create` / `remove` / `setStatus`，`write-guard.parseVersionActionForm` 值域单点）。
+**事实源已换**：版本状态不再读 `config.json` 的 `releasedVersions`（该键已退役，残留时一次性 warn 不双读），改读**板侧版本台账** `.data/versions.json`（`src/versions-ledger.ts`，三态闭集 `notstart` / `active` / `released`，热生效免重启）。**唯一键 = `(组织, 版本)`**（v0.9.6 B1 起 schema 2）⇒ 不同组织可各有 `v0.9.5`。写口 = **一条** `POST /versions`，靠表单 `action` 三支分流（`create` / `remove` / `setStatus`，`write-guard.parseVersionActionForm` 值域单点）；组织空间页的表单提交到 `POST /org/<名>/versions`（`src/org-space.ts` 归一层剥前缀后命中**同一条**写口 ⇒ `WRITE_ROUTES` 十一条零扩，路由表零改）。
 
-**页头「＋ 新版本」**（增补七 a · 增补八 §9.3 弹窗化 · **增补十一 E1 §9.6 起为唯一入口**）：`/schedule` 页头（组织门户那处已撤除），服务端 `hidden`、由内联脚本显形后打开第三枚同款弹窗 `#new-version-dialog`（表单 `POST /versions(action=create)`）；无 JS ⇒ 按钮不显（不显死按钮），建版仍可由编排侧/台账路径完成。**看板尾「新版本」拖拽虚列（`data-newversion` 哨兵 + drop → `prompt()` 路径）已撤除** —— 拖拽只保留「拖到已有版本列 / 需求池列 = 改排期」一种语义。
+**页头「＋ 新版本」**（增补七 a · 增补八 §9.3 弹窗化 · 增补十一 E1 §9.6 起为唯一入口 · **v0.9.6 B4 起该入口归组织空间排期页 `/org/<名>/`**）：服务端 `hidden`、由内联脚本显形后打开同款弹窗 `#new-version-dialog`（表单 `action=/org/<名>/versions`，隐藏字段 `action=create`）；**表单零 org 字段** —— 归属只由服务端按**请求路径**注入（伪造 `org` / `group` 字段不改落点），成功 303 回**本空间排期页**。无 JS ⇒ 按钮不显（不显死按钮），建版仍可由编排侧/台账路径完成。全局 `/schedule` 页头那份按钮与弹窗骨架已撤（该页无组织上下文，挂在那里只会把新版本落进未归属空串桶；页壳留待 B5a 退役），`POST /versions` 直投仍可用（落未归属桶，删 / 设状态按「不限组织」取首个命中）。**看板尾「新版本」拖拽虚列（`data-newversion` 哨兵 + drop → `prompt()` 路径）已撤除** —— 拖拽只保留「拖到已有版本列 / 需求池列 = 改排期」一种语义。
 
-**删除入口 ×（框头右上角）**（增补七 b 曾引入列头操作行 · **增补十一 E2 §9.6 删除入口上框** · **增补十一 E3 §9.6 操作行整体撤除**，`views.renderVersionDelete`）：小表单**只接线、写口仍是同一条** `POST /versions`（隐藏字段 `action` / `version`），`data-ov="1"` ⇒ 被拒时抽 `.err-ov-card` 出浮层（无 JS 回落原生 PRG 整页回显）。可见性判据与服务端的闸**一一对应**（不出必 409 的死按钮）：
+**删除入口 ×（框头右上角）**（增补七 b 曾引入列头操作行 · **增补十一 E2 §9.6 删除入口上框** · **增补十一 E3 §9.6 操作行整体撤除**，`views.renderVersionDelete`）：小表单**只接线、写口仍是同一条**（隐藏字段 `action` / `version`；空间页 action 带 `/org/<名>/` 前缀，全局档仍 `/versions`），`data-ov="1"` ⇒ 被拒时抽 `.err-ov-card` 出浮层（无 JS 回落原生 PRG 整页回显）。可见性判据与服务端的闸**一一对应**（不出必 409 的死按钮）：
 
 | 入口 | 出现条件 | 闸（执法在服务端） |
 |---|---|---|
-| 框头 `×`（`h3` 内，`class="vdel"`） | 台账有该版 ∧ 非 `released` ∧ **名下没有任何已确认卡**（`stage ≠ 需求分析` 全假 = 「未开始」，与「首卡过确认门才转 active」同源） | 可删判据（E2 口径变更）= **名下无已确认卡**；删除时其下**想法卡自动回需求池**（逐张清空 `version`，不丢卡）；有已确认卡 ⇒ 409 `board_version_remove_confirmed_cards`；回池写失败 ⇒ 502 且不删条目（fail-closed） |
-| 版本状态（`released` / 重开 / `notstart`） | **前台零入口**（E3 撤「标记已发版」、增补十 §9.5 撤「重开」）⇒ 三列均不渲染 `setStatus` 表单，`released` 列仅 🔒 徽标 | 服务端 `POST /versions` 的 `setStatus` **保留为后台直投写口**（迁移矩阵五条边照旧执法，发版闸 = 名下**全部收尾** ∧ **有交付**：`total > 0 ∧ completed + cancelled === total ∧ completed > 0`；`failed` 不计入收尾 ⇒ 含 failed 拒，全 `cancelled`（无任何交付）亦拒）；真发版动作待「发版」按钮（另立需求 · 归 v0.9.5） |
+| 框头 `×`（`h3` 内，`class="vdel"`） | 台账有该 (组织, 版本) 条目 ∧ 非 `released` ∧ **本组织名下没有任何已确认卡**（`stage ≠ 需求分析` 全假 = 「未开始」，与「首卡过确认门才转 active」同源） | 可删判据（E2 口径变更）= **该组织该版本名下无已确认卡**（v0.9.6 B4 · 口径 30：数卡加 `ownerGroup` 过滤 ⇒ 他组织的同版号卡既不挡本组织删版，也不被本组织的 × 回池）；删除时其下**想法卡自动回需求池**（逐张清空 `version`，不丢卡）；有已确认卡 ⇒ 409 `board_version_remove_confirmed_cards`；回池写失败 ⇒ 502 且不删条目（fail-closed） |
+| 版本状态（`released` / 重开 / `notstart`） | **前台零入口**（E3 撤「标记已发版」、增补十 §9.5 撤「重开」）⇒ 三列均不渲染 `setStatus` 表单，`released` 列仅 🔒 徽标 | 服务端 `POST /versions` 的 `setStatus` **保留为后台直投写口**（迁移矩阵五条边照旧执法；**发版闸数卡集合按组织切片** = 「**该组织该版本**名下全部收尾」∧ **有交付**：`total > 0 ∧ completed + cancelled === total ∧ completed > 0`；`failed` 不计入收尾 ⇒ 含 failed 拒，全 `cancelled`（无任何交付）亦拒）；真发版动作待「发版」按钮（另立需求 · 归 v0.9.5） |
 | 台账无该版（历史脏列，只由卡片派生） | 无 × | — |
 
 × 的「二次确认」取**明确文案**档（`aria-label` + `title` 写闸 + 提交回显），未引入新内联脚本常量（闭集仍六元）；列头徽标与卡片数结构原样（× 绝对定位在 `h3` 右上角）。单测见 `test/version-column-ops.test.mjs`。

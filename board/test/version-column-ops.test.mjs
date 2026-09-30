@@ -11,7 +11,7 @@
  * - 入口可见性与迁移矩阵同源（`notstart → released` 矩阵禁止 ⇒ 该列不出「标记已发版」）；
  * - 台账无登记的列（历史脏列 = 只由卡片派生）⇒ 无操作（台账里无可删 / 可改状态的条目）；
  * - **内联脚本闭集六元不扩**（列头操作零 `<script>`；「二次确认」由明确文案承担）；
- * - 读面不突变：GET /schedule 渲染操作行不得改写台账文件。
+ * - 读面不突变：GET 排期页（B5a 后 = `/org/<名>/schedule`）渲染操作行不得改写台账文件。
  *
  * **REQ-2026-09-28-04 增补十（父改造文档 §9.5）改口本件**：已发版为终态 ⇒ `released` 列**不再渲染
  * 任何操作入口**（「重开」从前台退役，A2-③ / A2-⑥ / A2-⑧ 三处锚按新口径收口）；**服务端零改动**
@@ -38,6 +38,11 @@ import { createVersion, emptyVersionsLedger, serializeVersionsLedger, setVersion
 import { createBoardServer } from "../dist/server.js";
 
 const NOW = "2026-09-28T12:00:00.000Z";
+/**
+ * B5a 起全局 `/schedule` 退役 ⇒ 本文件 HTTP 面的看板宿主 = 该组织的空间排期页
+ * `/org/alpha/schedule`（台账 B1 起按 `(org, version)` 成域 ⇒ 条目须带本组织 org 才在该页成列）。
+ */
+const ORG = "alpha";
 
 function feature(featureId, version, overrides = {}) {
   return {
@@ -46,7 +51,7 @@ function feature(featureId, version, overrides = {}) {
     title: `需求 ${featureId}`,
     requirement: null,
     taskCount: 1,
-    ownerGroup: "alpha",
+    ownerGroup: ORG,
     stage: "改造方案",
     version,
     approval: "已通过",
@@ -57,11 +62,11 @@ function feature(featureId, version, overrides = {}) {
   };
 }
 
-/** entries: [[version, status], ...]（notstart 走 create，其余补 setStatus）。 */
+/** entries: [[version, status], ...]（notstart 走 create，其余补 setStatus）；条目挂 ORG 桶。 */
 function ledgerWith(entries) {
   let l = emptyVersionsLedger();
   for (const [v, status] of entries) {
-    l = createVersion(l, v, NOW).ledger;
+    l = createVersion(l, v, NOW, ORG).ledger;
     if (status !== "notstart") l = setVersionStatus(l, v, status, NOW).ledger;
   }
   return l;
@@ -315,12 +320,12 @@ test("E2-⑦b HTTP 接线：× 删「仅想法卡」的版本 ⇒ 200 + 卡自�
   );
 });
 
-test("A2-⑧ 读面不突变：GET /schedule 渲染删除入口零写台账", async () => {
+test("A2-⑧（B5a 改版）读面不突变：GET 空间排期页渲染删除入口零写台账", async () => {
   const ledger = ledgerWith([["v0.9.6", "active"], ["v0.9.7", "notstart"], ["v0.9.3", "released"]]);
   await withBoard(
     async (base, file) => {
       const before = readFileSync(file, "utf8");
-      const text = await (await fetch(`${base}/schedule`)).text();
+      const text = await (await fetch(`${base}/org/${ORG}/schedule`)).text();
       assert.doesNotMatch(text, /<button type="submit">标记已发版<\/button>/, "E3：active 列无「标记已发版」按钮");
       assert.doesNotMatch(text, /<button type="submit">删除版本<\/button>|class="inline vop"|<div class="vops">/, "E3：操作行整体不渲染（真页面无残留）");
       assert.match(text, /class="inline vdel"/, "真页面上未开始的 v0.9.7 列出 ×（非仅纯函数）");
@@ -369,7 +374,7 @@ test("D1-⑩ 服务端零改动：前台无重开入口，后台 setStatus 直�
   const ledger = ledgerWith([["v0.9.3", "released"]]);
   await withBoard(
     async (base, file) => {
-      const text = await (await fetch(`${base}/schedule`)).text();
+      const text = await (await fetch(`${base}/org/${ORG}/schedule`)).text();
       assert.doesNotMatch(text, /value="active"/, "前台页面上没有任何指向 status=active 的表单");
       assert.doesNotMatch(text, /name="action" value="setStatus"/, "E3：前台页面上没有任何 setStatus 表单");
       const res = await postVersions(base, { action: "setStatus", version: "v0.9.3", status: "active" });
@@ -385,7 +390,7 @@ test("E3-⑪ 前台撤「标记已发版」后，后台 setStatus 正向仍通�
   const ledger = ledgerWith([["v0.9.6", "active"]]);
   await withBoard(
     async (base, file) => {
-      const text = await (await fetch(`${base}/schedule`)).text();
+      const text = await (await fetch(`${base}/org/${ORG}/schedule`)).text();
       assert.doesNotMatch(text, /name="status" value="released"|标记已发版<\/button>/, "负向锚：前台无 status=released 表单");
       const res = await postVersions(base, { action: "setStatus", version: "v0.9.6", status: "released" });
       assert.equal(res.status, 303, "后台入口在位：active → released 直投放行（闸 = 名下全部收尾〔completed+cancelled〕∧ completed > 0，本例满足）");

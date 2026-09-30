@@ -2,10 +2,13 @@
  * v0.9.4 W6（REQ-2026-09-27-05 §2.6 · 入口交互单件）—— **增补十一 E1（§9.6）改版**：
  * 新增版本只保留一种方式 = 排期看板页头「＋ 新版本」按钮 + 弹窗；看板尾拖拽虚列已撤。
  *
- * ① 排期看板 `/schedule` headerActions「＋ 新版本」按钮（服务端 hidden，脚本显形）⇒
- *    **增补八 §9.3 起**点击打开同款弹窗 `#new-version-dialog`（表单 `POST /versions` `action=create`）→
- *    台账落 notstart 条目 ⇒ 看板出现空列（原 `prompt()` 输入已退役；锚见 `b8-new-version-dialog.test.mjs`）
- *    （**增补七 a §9.1-a**：入口原在组织门户 `/`，现迁入排期页 ⇒ 门户不再渲染该按钮）；
+ * ① 页头「＋ 新版本」按钮（服务端 hidden，脚本显形）⇒ 点击打开同款弹窗 `#new-version-dialog`
+ *    （表单 `action=create`）→ 台账落 notstart 条目 ⇒ 看板出现空列（原 `prompt()` 输入已退役；
+ *    锚见 `b8-new-version-dialog.test.mjs`）
+ *    （**增补七 a §9.1-a**：入口原在组织门户 `/`，迁入排期页 ⇒ 门户不再渲染该按钮；
+ *    **v0.9.6 B4**：入口再迁入**组织空间排期页** `/org/<名>/`，表单 action 带空间前缀
+ *    ⇒ 全局 `/schedule` 不再渲染该按钮与弹窗骨架 —— 路由 `POST /versions` 仍留作纯 HTTP 兜底，
+ *    页壳随 B5a 退役）；
  * ② **（E1 撤除）** 看板尾虚列壳（哨兵属性 `data-newversion`）与其 drop → `window.prompt()` 分支
  *    不再渲染 / 不再存在 ⇒ 本文件以**负向锚**钉「虚列与哨兵不再出现」。
  *
@@ -142,19 +145,26 @@ async function withServer(client, run) {
   }
 }
 
-test("W6-④（增补七 a）GET /schedule：页头带「＋ 新版本」按钮（服务端 hidden、紧随「＋ 新增需求」其后）；无外源脚本", async () => {
+test("W6-④（B4 改版）GET /org/alpha/：空间页头带「＋ 新版本」按钮（服务端 hidden、紧随「＋ 新增需求」其后）；脚本闭集不扩", async () => {
   await withServer(fakeClient([feature("F1", "v0.9.3")]), async (base) => {
-    const html = await (await fetch(`${base}/schedule`)).text();
+    const html = await (await fetch(`${base}/org/alpha/`)).text();
     assert.match(
       html,
       /<button type="button" id="new-version-open" class="header-actions" hidden>＋ 新版本<\/button>/,
-      "排期页页头「＋ 新版本」按钮（服务端 hidden）",
+      "空间排期页页头「＋ 新版本」按钮（服务端 hidden）",
     );
     assert.ok(
       html.indexOf('id="new-req-open"') < html.indexOf('id="new-version-open"'),
       "排在「＋ 新增需求」旁（其后）",
     );
     assert.ok(html.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), "新版本交互仍在弹窗常量内（第六枚内扩写）");
+    // 闭集不扩：入口迁空间页**不新增任何脚本枚**。B5a 起全局排期页退役 ⇒ 「与全局页同计数」的对照物失效，
+    // 等价式改钉**绝对枚数 5**（提交守卫 + err-ov 关闭 + 详情浮层 + 新增需求/版本弹窗 + 拖拽 = 看板注入面，
+    // 与 schedule-page N2-④ 同一口径；bare `<script>` 计数与是否 vendored mermaid 资产无关）。
+    assert.equal((html.match(/<script>/g) ?? []).length, 5, "空间排期页可执行内联脚本 = 五枚（未扩第七枚）");
+    for (const m of html.matchAll(/<script[^>]*src="([^"]*)"/g)) {
+      assert.match(m[1], /^\/static\//, "外源脚本面不变（仅既有同源 mermaid 资产，CSP 不动）");
+    }
   });
 });
 
@@ -169,16 +179,32 @@ test("W6-④b（增补七 a）GET /：门户页头**不再**渲染「＋ 新版�
   });
 });
 
-test("W6-⑤（E1 改版）GET /schedule：看板尾不再渲染虚列壳（哨兵撤）；按钮 + 弹窗仍在；不新增脚本枚数", async () => {
+test("W6-⑤（E1 改版 + B4 迁入口 · B5a 整页退役）`GET /schedule` ⇒ 303 空体（虚列壳 / 建版本入口 / 看板脚本随页一并消失）；看板尾列形态锚归空间排期页", async () => {
   await withServer(fakeClient([feature("F1", "v0.9.3"), feature("F2", null)]), async (base) => {
-    const html = await (await fetch(`${base}/schedule`)).text();
-    assert.doesNotMatch(html, /data-newversion/, "虚列壳哨兵不再渲染");
-    assert.doesNotMatch(html, /kcol newver/, "虚列壳 class 不再渲染");
-    assert.match(html, /<h3>需求池/, "需求池列仍是看板尾列");
-    // 唯一入口三件齐（按钮 + 弹窗骨架 + 拖拽常量仍在）
-    assert.match(html, /id="new-version-open"/, "页头「＋ 新版本」按钮 = 唯一创建入口，保留");
-    assert.match(html, /<dialog class="fd" id="new-version-dialog">/, "弹窗骨架保留");
-    assert.ok(html.includes(DRAG_SCHEDULE_SCRIPT), "拖拽脚本仍为单点常量注入（改排期用途不变）");
-    assert.ok(html.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), "弹窗脚本仍在（承载排期页新版本入口）");
+    const res = await fetch(`${base}/schedule`, { redirect: "manual" });
+    assert.equal(res.status, 303, "B5a：全局看板页退役");
+    const html = await res.text();
+    assert.doesNotMatch(html, /data-newversion|kcol newver|<h3>需求池/, "退役路径不渲染任何看板正文");
+    // B4：建版本入口归空间页 ⇒ 退役的全局页既无按钮也无骨架（写口路由仍在，留作纯 HTTP 兜底）
+    assert.doesNotMatch(html, /id="new-version-open"|id="new-version-dialog"/, "退役路径不出建版本按钮与骨架");
+    assert.doesNotMatch(html, /<script>/, "退役路径不注入看板脚本（闭集六元不因此扩）");
+    const board = await (await fetch(`${base}/org/alpha/schedule`)).text();
+    assert.match(board, /<h3>需求池/, "需求池列仍是看板尾列（宿主 = 空间排期页）");
+    assert.doesNotMatch(board, /data-newversion|kcol newver/, "虚列壳哨兵不随宿主迁移而复生");
+    assert.ok(board.includes(DRAG_SCHEDULE_SCRIPT), "拖拽脚本仍为单点常量注入（改排期用途不变）");
+    assert.ok(board.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), "弹窗脚本仍单点注入");
+  });
+});
+
+test("W6-⑤b（B4 · B5a 改版）GET /org/alpha/：唯一入口三件齐（按钮 + 骨架 + 前缀 action）；骨架内零组织字段", async () => {
+  await withServer(fakeClient([feature("F1", "v0.9.3")]), async (base) => {
+    const html = await (await fetch(`${base}/org/alpha/`)).text();
+    assert.match(html, /id="new-version-open"/, "空间页头「＋ 新版本」按钮 = 全站唯一创建入口");
+    assert.match(html, /<dialog class="fd" id="new-version-dialog">/, "弹窗骨架在空间页");
+    assert.match(html, /action="\/org\/alpha\/versions"/, "表单 action 带空间前缀（org 由路径决定）");
+    assert.doesNotMatch(html, /<input[^>]*name="org"/, "表单不带 org 字段（口径 4）");
+    // 脚本闭集不扩：同 W6-④ 的绝对枚数五枚锚（B5a 起全局页退役，无对照物）
+    assert.equal((html.match(/<script>/g) ?? []).length, 5, "空间页可执行内联脚本 = 五枚（未新增第七枚）");
+    assert.doesNotMatch(html, /<script type="text\/template"/, "不为入口迁移引入任何新的脚本载体");
   });
 });

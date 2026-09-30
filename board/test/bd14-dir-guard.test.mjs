@@ -267,6 +267,9 @@ test("BD14-①e（真进程钉子）orgsDir 指向不存在的目录 ⇒ 启动�
   const cfgPath = join(dir, "config.json");
   writeFileSync(cfgPath, JSON.stringify({ port, host: "127.0.0.1", orgsDir: bogus, group: "flow" }), "utf8");
   const child = spawn(process.execPath, [join(boardRoot, "dist", "index.js")], {
+    // cwd 必须离开真实板根：启动路径的台账 / 挂起台账落点按 `process.cwd()/.data` 解析，
+    // 用板根当 cwd ⇒ 本钉子会把**生产台账**按测试配置的 group 改写（v0.9.6 B1 migrateLedgerOrgs 暴露）。
+    cwd: dir,
     stdio: ["ignore", "pipe", "pipe"],
     env: { ...process.env, [CONFIG_PATH_ENV]: cfgPath },
   });

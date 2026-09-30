@@ -38,7 +38,13 @@ import type { EngineStateProbe, HostRelay } from "./host-relay.js";
 import { SuspendLedgerStore, defaultSuspendLedgerFile } from "./suspend-ledger.js";
 import { type Heartbeat, createHeartbeat } from "./heartbeat.js";
 import { OrgsLedgerStore, defaultOrgsLedgerFile, isOrgDisabled as ledgerIsOrgDisabled } from "./orgs-ledger.js";
-import { VersionsLedgerStore, defaultVersionsLedgerFile, migrateReleasedVersions, releasedVersionNames } from "./versions-ledger.js";
+import {
+  VersionsLedgerStore,
+  defaultVersionsLedgerFile,
+  migrateLedgerOrgs,
+  migrateReleasedVersions,
+  releasedVersionLabels,
+} from "./versions-ledger.js";
 import { readVersion } from "./version.js";
 import { patchStreamTimestamp } from "./log.js";
 import { createFatalRecorder, defaultFatalLogPath } from "./fatal-log.js";
@@ -206,6 +212,22 @@ async function main(): Promise<void> {
       `版本台账一次性迁移：config releasedVersions（${versionMigration.migrated.join(" · ")}）已灌入 ${versionsLedgerFile}（status=released）\n`,
     );
   }
+  // v0.9.6 B1（口径 32）：台账组织维度一次性迁移 —— 串接在 releasedVersions 灌入之后，
+  // 判据 = 条目缺 `org` 键 ⇒ stamp 为 config 的 group；未配 group ⇒ 一次性 warn + 留空串桶（**不 fail-fast**）。
+  // 无缺 org 条目 ⇒ 幂等空操作（不落盘，重启不重复 stamp）。
+  {
+    const before = versionsLedger.load();
+    const orgMigration = migrateLedgerOrgs(before.ledger, group, new Date().toISOString());
+    if (orgMigration.stamped.length > 0) {
+      versionsLedger.save(orgMigration.ledger);
+      process.stdout.write(
+        `版本台账一次性迁移：${orgMigration.stamped.length} 条缺组织维度的条目已 stamp 为默认组织（${orgMigration.stamped.join(" · ")}），落 ${versionsLedgerFile}\n`,
+      );
+    }
+    if (orgMigration.warning !== null) {
+      process.stderr.write(`警告：${orgMigration.warning}\n`);
+    }
+  }
   fatal.setPhase("宿主面装配");
   // v0.9.5 C3：只读引擎态探针 = 读面 BridgeClient 的一跳 getFeature（GET-only 硬约束不动）。
   // 与 HTTP 读面共用同一客户端实例（同一 baseUrl），不新增出网面。
@@ -264,7 +286,7 @@ async function main(): Promise<void> {
     );
   }
   fatal.setPhase("HTTP 监听");
-  // v0.9.5 C10：组织种子化 —— 建组织链落 `AGENTS.md`（模板渲染）+ `flow/spec` 两份规范快照，
+  // v0.9.5 C10：组织种子化 —— 建组织链落 `AGENTS.md`（模板渲染）+ `flow/spec` 三份规范快照，
   // 并在 createBoardServer 内 listen 前做幂等回填（只补缺不覆盖、逐组织 fail-open、跳过停用组织）。
   // `orgSeed` 省略 ⇒ 不种子化；生产入口（本文件）显式启用。
   process.stdout.write(
@@ -291,7 +313,8 @@ async function main(): Promise<void> {
   process.stdout.write(
     `生效值：port = ${cfg.port} · host = ${cfg.host} · 读面桥 = ${cfg.bridgeUrl} · MCP 基址 = ${cfg.mcpBaseUrl} · hostKind = ${cfg.hostKind} · machineDist = ${cfg.machineDist} · turnTimeoutMs = ${cfg.turnTimeoutMs ?? "未配置（下游缺省 10 min）"}\n`,
   );
-  const releasedNow = releasedVersionNames(versionsLedger.load().ledger);
+  // v0.9.6 B1（口径 32）：启动日志的已发版清单**带组织维度**（`(org, version)` 是唯一键，光版号会跨组织混淆）。
+  const releasedNow = releasedVersionLabels(versionsLedger.load().ledger);
   if (releasedNow.length > 0) {
     process.stdout.write(
       `已发版锁定：${releasedNow.join(" · ")}（版本台账 ${versionsLedgerFile} 的 released 条目）⇒ 提需求排入这些版本、以及排期写改入 / 改出（含清空）这些版本一律 409 board_version_released 拒绝（同锁版重提放行）；后台 POST /versions setStatus 直投标记 released / 重开为进行中实时生效（前台已撤该入口 · 增补十一 E3）\n`,

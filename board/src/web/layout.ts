@@ -10,7 +10,6 @@
  * 刷新 = 浏览器重载；**唯一例外** = 浮层动作区提交后的**有界进度轮询**（复用既有详情读面 +
  * 既有 {@link FEATURE_DETAIL_OVERLAY_SCRIPT} 的 `swapPage` 通路，零新端点、零新枚脚本，见该常量注记）。
  */
-import { readVersion } from "../version.js";
 
 /**
  * 与 orch 网页面同构的强 CSP。
@@ -70,23 +69,8 @@ export interface PageOrgNav {
   orgs: readonly string[];
 }
 
-/** NAV 全局路径 → 组织空间路径（`/org/<名>/…`，名段一律 `encodeURIComponent`）。 */
-const ORG_SPACE_VIEWS: Partial<Record<NavKey, string>> = {
-  schedule: "schedule",
-  tasks: "tasks",
-};
-
-/**
- * NAV 单条链接的落点（BD7 组织感知）：空间内且该页有空间对应面 ⇒ 落 `/org/<名>/<面>`；
- * 其余（projects / agents / orgs / host 无空间对应面，`home` 恒为全局门户，以及全局页面）
- * 保持全局路径。
- */
-export function navHrefFor(orgNav: PageOrgNav | undefined, key: NavKey, globalHref: string): string {
-  const org = orgNav?.org;
-  const view = org === undefined || org === null ? undefined : ORG_SPACE_VIEWS[key];
-  if (view === undefined || org === undefined || org === null) return globalHref;
-  return `/org/${encodeURIComponent(org)}/${view}`;
-}
+/** NAV 全局路径 → 组织空间路径的映射（`ORG_SPACE_VIEWS`）与 {@link navHrefFor} 已随 v0.9.6 B5a 退役：
+ * NAV 收三枚后全站同形，组织空间不再派生 NAV 落点（空间内导航 = `renderSpaceNav` 自己的链接行）。 */
 
 /**
  * **提交守卫**（收口轨 14 ①）：页面全部写表单共用的**一段内联脚本**。
@@ -767,32 +751,32 @@ export const DRAG_SCHEDULE_SCRIPT = `<script>
 })();
 </script>`;
 
-/** 导航单点（六条 = 全局路径单点事实源；组织空间下的落点经 {@link navHrefFor} 派生，不另立一份）。 */
+/** 导航单点（三条 = 全局路径单点事实源；v0.9.6 B5a 起全站同形，空间落点不再派生）。 */
 const NAV: ReadonlyArray<{ key: NavKey; href: string; text: string }> = [
-  // v0.9.4 §9-b（首页形态 B→A）：「首页」= 组织门户 `/`（不再是排期看板）；「排期」= `/schedule` 正本。
-  // v0.9.4 §9-c：「组织」/orgs 链接摘除 —— 页退役（GET /orgs ⇒ 303 /），管理职能迁空间内 `/org/<名>/manage`。
-  { key: "home", href: "/", text: "首页" },
-  { key: "schedule", href: "/schedule", text: "排期" },
-  { key: "tasks", href: "/tasks", text: "任务" },
-  { key: "projects", href: "/projects", text: "项目 / 机器" },
+  // v0.9.4 §9-b（首页形态 B→A）：「门户」= 组织门户 `/`（不再是排期看板）。
+  // v0.9.6 B5a（口径 37/38）闭集六 → 三枚：摘「排期」（`/schedule` 页退役）、「任务」（路由留、口径 33 深链可达）、
+  // 「宿主桥」（口径 38：`/host` 路由不退、NAV 摘条）；「项目 / 机器」→「项目」（全局 `/tasks*` 高亮并入本条）。
+  { key: "home", href: "/", text: "门户" },
+  { key: "projects", href: "/projects", text: "项目" },
   // v0.9.3 B-T3：Agent View（机器表 + 逐项目在飞任务 + 3300 收编的桥身份头）
   { key: "agents", href: "/agents", text: "Agent" },
-  { key: "host", href: "/host", text: "宿主桥" },
 ];
 
 /**
  * **顶栏组织切换器**（BD7 · §9-d 起清单口径与组织门户同源 = 台账未停用 ∪ 需求归属）：
  * 各组织 → `/org/<名>/` 的**服务端渲染链接**（跳转即全页刷新）⇒ **零新脚本**，
  * 不扩内联脚本闭集；清单为空 ⇒ 整块不渲染（无组织可切时不留空占位）。
+ * 导出 = B5b 起空间二级导航行也复用本函数（同一实现，不在空间侧复制 HTML）。
+ * `extraClass` = 挂位修饰类（空间正文的二级导航行传 `"right"` 靠右；顶栏调用不传 ⇒ 输出与移位前逐字节相同）。
  */
-function renderOrgSwitcher(orgNav: PageOrgNav): string {
+export function renderOrgSwitcher(orgNav: PageOrgNav, extraClass = ""): string {
   const items = orgNav.orgs
     .map(
       (o) =>
         `<a href="/org/${encodeURIComponent(o)}/"${o === orgNav.org ? ' class="on"' : ""}>${escapeHtml(o)}</a>`,
     )
     .join("");
-  return `<span class="org-switch"> <span class="muted">组织</span> ${items}</span>`;
+  return `<span class="org-switch${extraClass === "" ? "" : ` ${extraClass}`}"> <span class="muted">组织</span> ${items}</span>`;
 }
 
 export interface PageParams {
@@ -812,6 +796,12 @@ export interface PageParams {
    * 零新脚本，内联脚本闭集保持**六元**（N3-⑦/⑧ 纪律锚）。
    */
   orgNav?: PageOrgNav;
+  /**
+   * **组织切换器的挂位三态（v0.9.6 B5b）**：`top`（缺省，顶栏渲）/ `body`（正文的二级导航行已挂，顶栏不重复）/ `none`（整页不渲）。
+   * 判据 = 「本页是否渲 `renderSpaceNav`」，**不得**按「org 非空」隐藏 —— 空间内详情页 / 桥宕页 / 410 页的
+   * 唯一组织出路就在顶栏切换器上。
+   */
+  orgSwitcher?: "top" | "body" | "none";
 }
 
 export interface ErrorOverlayField {
@@ -871,11 +861,16 @@ ${fields}<button type="button" id="err-ov-close">知道了</button>
 }
 
 export function renderPage(params: PageParams): string {
-  const nav = NAV.map((n) => {
-    const href = navHrefFor(params.orgNav, n.key, n.href);
-    return `<a href="${href}"${n.key === params.active ? ' class="on"' : ""}>${escapeHtml(n.text)}</a>`;
-  }).join("");
-  const switcher = params.orgNav === undefined || params.orgNav.orgs.length === 0 ? "" : renderOrgSwitcher(params.orgNav);
+  const nav = NAV.map(
+    (n) => `<a href="${n.href}"${n.key === params.active ? ' class="on"' : ""}>${escapeHtml(n.text)}</a>`,
+  ).join("");
+  const switcher =
+    params.orgNav === undefined ||
+    params.orgNav.orgs.length === 0 ||
+    params.orgSwitcher === "body" ||
+    params.orgSwitcher === "none"
+      ? ""
+      : renderOrgSwitcher(params.orgNav);
   const notes =
     params.notes && params.notes.length > 0
       ? `<ul class="notes">${params.notes.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>`
@@ -900,6 +895,8 @@ export function renderPage(params: PageParams): string {
   .org-switch { margin-left: 8px; font-size: 12px; }
   .org-switch a { color: #567; text-decoration: none; padding: 1px 6px; border-radius: 4px; }
   .org-switch a.on { background: #5b86a8; color: #fff; }
+  /* v0.9.6 B5b（口径 20）：空间二级导航行的切换器靠行右（只此一处挂 right；顶栏不浮） */
+  .org-switch.right { float: right; }
   .hint { color: #777; margin: 6px 0; }
   .hint.err { color: #b42318; }
   .hint.warn { color: #b26a00; }
@@ -936,6 +933,12 @@ export function renderPage(params: PageParams): string {
   p.turn-trace { color: #667; }
   details.turn-summary { margin: 4px 0 0; }
   details.turn-summary > summary { cursor: pointer; color: #667; background: #8881; border: 1px solid #8884; border-radius: 6px; padding: 4px 8px; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+  /* v0.9.6 N4：轮回执卡（要点 / 待用户 / 下一步三行 + 产出指引）—— 零脚本，折叠沿用上面的 details 口径 */
+  div.receipt-card { border: 1px solid #8884; border-left: 3px solid #5678; border-radius: 6px; padding: 6px 10px; margin: 6px 0; background: #8881; }
+  div.receipt-card p.receipt-row { margin: 2px 0; color: #445; font-size: 13px; }
+  div.receipt-card p.receipt-row b { color: #567; }
+  div.receipt-card p.receipt-docs { margin: 6px 0 2px; font-size: 12px; }
+  div.receipt-card + details.turn-summary { margin-top: 6px; }
   code { background: #8881; padding: 0 3px; border-radius: 3px; }
   .md h1 { font-size: 17px; margin: 18px 0 6px; }
   .md h2 { font-size: 15px; }
@@ -962,6 +965,8 @@ export function renderPage(params: PageParams): string {
   .dg-legend { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; font-size: 12px; color: #667; }
   .dg-legend i { display: inline-block; width: 12px; height: 12px; border: 1px solid #8886; border-radius: 3px; }
   a.fl { color: inherit; }
+  /* v0.9.6 B5b（口径 22）：空间二级导航行的当前视图钩子（inline font-weight 保留，本行只管可点态颜色） */
+  a.fl.on { color: inherit; }
   .err-ov { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; background: #0006; padding: 16px; }
   .err-ov-card { max-width: 560px; width: 100%; background: Canvas; border: 1px solid #b4231888; border-radius: 8px; padding: 14px 18px 16px; box-shadow: 0 6px 24px #0004; }
   .err-ov-card h2 { font-size: 15px; margin: 0 0 8px; border: none; color: #b42318; padding: 0; }
@@ -1007,7 +1012,7 @@ export function renderPage(params: PageParams): string {
 <body>
 <header>
   <h1>${escapeHtml(params.title)}</h1>${params.headerActions ?? ""}
-  <nav>${nav}${switcher} <span class="muted mono">board v${escapeHtml(readVersion())} · 只读 + 提需求</span></header>
+  <nav>${nav}${switcher}</header>
 <main>
 ${params.bodyHtml}
 ${notes}

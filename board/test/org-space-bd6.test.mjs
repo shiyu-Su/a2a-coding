@@ -62,16 +62,24 @@ test("BD6-①（正例）：读面族路径剥离并归 view，首页对 `/org/<
     ["/org/flow-team/", "schedule"],
     ["/org/flow-team", "schedule"],
     ["/org/flow-team/schedule", "schedule"],
-    ["/org/flow-team/features", "features"],
     ["/org/flow-team/tasks", "tasks"],
-    // §9-c：`/orgs` 页退役 ⇒ 管理职能落空间内第四枚视图
+    // §9-c：`/orgs` 页退役 ⇒ 管理职能落空间内第三枚视图（B5b 起 `features` 整页退役，见下 BD6-①d）
     ["/org/flow-team/manage", "manage"],
   ]) {
     assert.deepEqual(resolveOrgSpaceRoute(p, u, "GET"), { kind: "view", org: "flow-team", view }, p);
   }
-  // 解析层的 remainder 口径
+  // 解析层的 remainder 口径（退役页的段仍照常解析 ⇒ 归类档才能发 303，不落 404）
   assert.deepEqual(parseOrgSpacePath("/org/flow-team/features"), { org: "flow-team", remainder: "/features" });
   assert.deepEqual(parseOrgSpacePath("/org/flow-team"), { org: "flow-team", remainder: "" });
+});
+
+test("BD6-①d（B5b · F2 退役形态）：/org/<名>/features ⇒ kind=retired（各方法同归类，303/405 由调用方分流）", () => {
+  const u = universe({ disk: ["flow-team"] });
+  for (const method of ["GET", "POST", "PUT"]) {
+    assert.deepEqual(resolveOrgSpaceRoute("/org/flow-team/features", u, method), { kind: "retired", org: "flow-team" }, method);
+  }
+  // 深链不随退役：/features/:id 仍透传全局详情（见 BD6-①c）
+  assert.equal(resolveOrgSpaceRoute("/org/flow-team/features/F1", u, "GET").kind, "feature_detail");
 });
 
 test("BD6-①b（非空间路径）：不以 /org/ 开头 ⇒ unknown（既有通路零改动）；/orge 不误命中", () => {
@@ -190,7 +198,7 @@ test("BD6-⑥（编码往返）：orgSpaceLink 拼出的每一枚读面链接都
   const names = ["flow-team", "组织甲", "a.b_c-1", "汉字", "FlowTeam2"];
   const u = universe({ disk: names });
   for (const org of names) {
-    for (const view of ["", "schedule", "features", "tasks"]) {
+    for (const view of ["", "schedule", "tasks", "manage"]) {
       const link = orgSpaceLink(org, view === "" ? "" : view);
       // 链接的段必须已百分号编码（无裸空格），且 HTTP request-target 解析回同一组织
       const seg = link.slice("/org/".length).split("/")[0];

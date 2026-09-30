@@ -2,10 +2,13 @@
  * REQ-v0.9.2-2026-09-26-02 增补 ④ · N3 回归补钉（纯测试锚，不动生产代码）——
  * REQ-v0.9.3-2026-09-26-04（排期页新增需求弹窗）同步：需求列表页退役，`GET /requirements` ⇒ 303 回首页。
  *
- * ① 路由面（N1）：`GET /schedule` = 排期看板结构 + 「排期」高亮 + 新增需求弹窗（页头按钮 + dialog 表单）；
- *    `GET /requirements` = 303 重定向（Q2，退役不 404、不触桥）；`GET /` = **组织门户**（§9-b 起首页形态
- *    B→A，不再与 `/schedule` 同构；§9.5 起门户注入**泛化后的弹窗脚本**承载建组织 dialog，但看板专属的
- *    浮层 / 拖拽 / mermaid 三枚不跟）；桥不可达 502 页面语义随迁（`/` 高亮「首页」、`/schedule` 高亮「排期」）。
+ * ① 路由面（N1）：**v0.9.6 B5a 起全局 `/schedule` 整页退役**（退役闭集四枚 = `/requirements` · `/orgs` ·
+ *    `/schedule` · `/tasks`〔C1 收编：GET 无/空 project ⇒ 303、非 GET ⇒ 405；`?project=X` 深链存活 200，
+ *    见 server.test C1 锚〕；GET ⇒ 303 回门户、非 GET ⇒ 405 列写面；见 N3-⑤b/⑤c）⇒ 排期看板唯一宿主 =
+ *    组织空间 `/org/<名>/schedule`（结构锚 + 空间导航当前项 + 新增需求弹窗，N3-①/②）；
+ *    `GET /` = **组织门户**（§9-b 起首页形态 B→A，不再与看板同构；§9.5 起门户注入**泛化后的弹窗脚本**
+ *    承载建组织 dialog，但看板专属的浮层 / 拖拽 / mermaid 三枚不跟）；桥不可达 502 页面语义随迁
+ *    （`/` 高亮「门户」；「排期」NAV 条已摘 ⇒ 空间排期页宕页改钉正文结构 + 三枚闭集，N3-⑤）。
  * ② 浮层三锚（N2）：排期页含 `<dialog` 骨架（详情浮层 + 新增需求弹窗）；开关脚本 = 单点内联字面量
  *    常量（`^<script>`、无 `src=`、不含用户数据）；卡片保留 `<a href="/features/:id">` 无 JS 回退。
  * ③ 纪律钉（本需求最重要的长效锚，BD14 mermaid 白名单先例模式复制）：
@@ -77,19 +80,26 @@ async function withServer(client, run) {
   }
 }
 
-/** 已发版锁夹具（v0.9.4 N3）：锁改读版本台账 ⇒ 预置临时台账文件喂入（`versionsLedgerFile`）。 */
-function releasedLedgerFixture(versions) {
+/**
+ * 已发版锁夹具（v0.9.4 N3）：锁改读版本台账 ⇒ 预置临时台账文件喂入（`versionsLedgerFile`）。
+ * v0.9.6 B1（扇出点）：条目唯一键 = `(org, version)`、schema 2 ⇒ 夹具**必须带 org**，
+ * 缺省 `"alpha"` 与本文件 `feature()` 的 ownerGroup 同值；跨组织场景按档传第二个参数。
+ * **v0.9.6 B3（口径 29）**：提需求写口的锁按 `(org, version)` 切 ⇒ 撞锁用例的条目 org 必须等于
+ * 该次提交解析出的归属档（`spaceOrg ?? form.group ?? defaultGroup`），如 N3-④ 的 `"g"`。
+ */
+function releasedLedgerFixture(versions, org = "alpha") {
   const dir = mkdtempSync(join(tmpdir(), "board-locked-"));
   const file = join(dir, "versions.json");
   const entries = versions.map((raw) => ({
+    org,
     version: String(raw).trim(),
     status: "released",
     createdAt: "2026-09-27T00:00:00.000Z",
     updatedAt: "2026-09-27T00:00:00.000Z",
     note: null,
   }));
-  writeFileSync(file, JSON.stringify({ version: 1, versions: entries }, null, 2) + "\n", "utf8");
-  return { file, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
+  writeFileSync(file, JSON.stringify({ version: 2, versions: entries }, null, 2) + "\n", "utf8");
+  return { file, dir, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 async function getHtml(base, path) {
@@ -98,20 +108,25 @@ async function getHtml(base, path) {
 }
 
 // ---------------------------------------------------------------------------
-// ① 路由面：GET /schedule = 排期看板（§9-b 起唯一宿主）
+// ① 路由面：排期看板（B5a 起唯一宿主 = 组织空间 `/org/<名>/schedule`）
 // ---------------------------------------------------------------------------
 
-test("N3-① GET /schedule = 排期看板结构 + 「排期」高亮（浮层 dialog 骨架与 `<a>` 无 JS 回退随看板在；REQ-04 起弹窗也在）", async () => {
+test("N3-①（B5a 重指空间排期页）GET /org/alpha/schedule = 排期看板结构 + 空间导航当前项（浮层 dialog 骨架与 `<a>` 无 JS 回退随看板在；REQ-04 起弹窗也在）", async () => {
   const client = fakeClient([
     feature("F1", "v0.9.2"),
     feature("F2", "v0.10.0"),
     feature("F3", null),
   ]);
   await withServer(client, async (base) => {
-    const res = await getHtml(base, "/schedule");
+    const res = await getHtml(base, "/org/alpha/schedule");
     assert.equal(res.status, 200);
-    assert.match(res.text, /<title>排期看板 · board<\/title>/, "看板标题 = 排期看板");
-    assert.match(res.text, /<a href="\/schedule" class="on">排期<\/a>/, "「排期」导航高亮");
+    assert.match(res.text, /<title>空间 · alpha · 排期 · board<\/title>/, "看板标题 = 空间排期页（B5a 起看板唯一宿主）");
+    assert.match(
+      res.text,
+      /<a class="fl on" href="\/org\/alpha\/schedule" style="font-weight:700">排期<\/a>/,
+      "「排期」= 空间导航行当前项（原全局 NAV 高亮锚随 B5a 摘条降级到此）",
+    );
+    assert.doesNotMatch(res.text, /<a href="\/schedule"/, "B5a：NAV 不再含「排期 /tasks /host」条（闭集三枚）");
     assert.doesNotMatch(res.text, /<a href="\/requirements"[^>]*>需求<\/a>/, "「需求」导航入口已删（REQ-04 Q2）");
     assert.ok(
       res.text.indexOf("<h3>v0.9.2") < res.text.indexOf("<h3>v0.10.0"),
@@ -123,7 +138,11 @@ test("N3-① GET /schedule = 排期看板结构 + 「排期」高亮（浮层 di
     assert.match(res.text, /<button type="button" id="new-req-open"[^>]*>＋ 新增需求<\/button>/, "页头「＋ 新增需求」按钮（REQ-04 Q1）");
     assert.match(res.text, /<dialog class="fd" id="new-req-dialog">/, "新增需求弹窗骨架在看板页");
     assert.match(res.text, /<h2>提需求<\/h2>/, "提需求表单进弹窗（自列表页迁入）");
-    assert.match(res.text, /<form method="post" action="\/requirements"/, "弹窗表单仍同源 POST /requirements");
+    assert.match(
+      res.text,
+      /<form method="post" action="\/org\/alpha\/requirements"/,
+      "弹窗表单 = 空间免选 action（BD8；写面仍解析到同一 POST /requirements）",
+    );
     assert.ok(
       res.text.includes(FEATURE_DETAIL_OVERLAY_SCRIPT),
       "浮层脚本随 schedule kind 页注入（看板页 · 增补轨锚）",
@@ -136,18 +155,18 @@ test("N3-① GET /schedule = 排期看板结构 + 「排期」高亮（浮层 di
   });
 });
 
-test("N3-②（§9-b 翻向 · §9.5 泛化）`/schedule` = 看板 · `/` = 组织门户：两页不再同构；看板专属脚本只在 `/schedule`", async () => {
+test("N3-②（§9-b 翻向 · §9.5 泛化 · B5a 重指空间排期页）`/org/alpha/schedule` = 看板 · `/` = 组织门户：两页不再同构；看板专属脚本只在排期页", async () => {
   const client = fakeClient([feature("F1", "v0.9.2"), feature("F3", null)]);
   await withServer(client, async (base) => {
     const root = await getHtml(base, "/");
-    const alias = await getHtml(base, "/schedule");
-    assert.equal(alias.status, 200, "深链 /schedule 不红");
+    const alias = await getHtml(base, "/org/alpha/schedule");
+    assert.equal(alias.status, 200, "空间排期深链不红（B5a 起看板唯一宿主）");
     assert.equal(root.status, 200, "首页不红（形态换义，不 303 不改地址）");
     assert.match(root.text, /<title>组织门户 · board<\/title>/, "`/` = 组织门户");
-    assert.match(alias.text, /<title>排期看板 · board<\/title>/, "`/schedule` = 排期看板");
+    assert.match(alias.text, /<title>空间 · alpha · 排期 · board<\/title>/, "`/org/<名>/schedule` = 排期看板");
     assert.notEqual(alias.text, root.text, "同构已翻向：门户不复用看板正文");
-    // 看板专属（浮层脚本 + 浮层骨架）只在 `/schedule`（门户不得白名单扩集）
-    for (const [label, html, want] of [["/", root.text, false], ["/schedule", alias.text, true]]) {
+    // 看板专属（浮层脚本 + 浮层骨架）只在排期页（门户不得白名单扩集）
+    for (const [label, html, want] of [["/", root.text, false], ["/org/alpha/schedule", alias.text, true]]) {
       assert.equal(html.includes(FEATURE_DETAIL_OVERLAY_SCRIPT), want, `${label} 浮层脚本${want ? "在" : "不在"}`);
       assert.equal(html.includes('<dialog class="fd" id="feat-dialog">'), want, `${label} 浮层 dialog 骨架${want ? "在" : "不在"}`);
       assert.equal(html.includes('<button type="button" id="new-req-open"'), want, `${label} 新增需求按钮${want ? "在" : "不在"}`);
@@ -157,7 +176,7 @@ test("N3-②（§9-b 翻向 · §9.5 泛化）`/schedule` = 看板 · `/` = 组�
     assert.ok(alias.text.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), "看板注入同一枚弹窗脚本（接 #new-req-dialog）");
     assert.match(root.text, /<dialog class="fd" id="new-org-dialog">/, "门户 = 建组织弹窗骨架");
     assert.match(alias.text, /<dialog class="fd" id="new-req-dialog">/, "看板 = 新增需求弹窗骨架");
-    assert.doesNotMatch(root.text, /id="new-req-dialog"/, "门户不渲染新增需求骨架（提需求在 /schedule）");
+    assert.doesNotMatch(root.text, /id="new-req-dialog"/, "门户不渲染新增需求骨架（提需求在空间排期页）");
     assert.doesNotMatch(alias.text, /id="new-org-dialog"/, "看板不渲染建组织骨架");
     assert.doesNotMatch(root.text, /<script[^>]*src=/, "门户无外源脚本（CSP 未动；闭集仍六元）");
   });
@@ -172,7 +191,7 @@ test("N3-③（REQ-04 Q2）GET /requirements ⇒ 303 回 /（不 404、不触桥
   await withServer(client, async (base) => {
     const res = await fetch(`${base}/requirements`, { redirect: "manual" });
     assert.equal(res.status, 303, "旧深链 303（板惯例，留反悔余地；R1 裁决替代 301）");
-    assert.equal(res.headers.get("location"), "/", "303 目标 = 首页（§9-b 起 = 组织门户；提需求弹窗在 /schedule）");
+    assert.equal(res.headers.get("location"), "/", "303 目标 = 首页（§9-b 起 = 组织门户；B5a 起提需求弹窗在空间排期页）");
     assert.equal(res.headers.get("cache-control"), "no-store");
     await res.body?.cancel();
     assert.deepEqual(client.calls, [], "重定向不触桥");
@@ -187,7 +206,7 @@ test("N3-③（REQ-04 Q2）GET /requirements ⇒ 303 回 /（不 404、不触桥
 test("N3-④（REQ-04 Q2）POST /requirements 保留断言：端点仍放开 · 已发版锁 409 原样执法（错误卡进响应页供弹窗叠加）", async () => {
   const client = fakeClient([]);
   const seen = [];
-  const seed = releasedLedgerFixture(["v0.9.0"]);
+  const seed = releasedLedgerFixture(["v0.9.0"], "g");
   const handle = await createBoardServer({
     host: "127.0.0.1",
     port: 0,
@@ -255,22 +274,56 @@ test("N3-④b（REQ-04 Q3）退役三函数零引用：src/** 不残留 parseFea
 // ① 路由面：桥不可达 502 语义随迁
 // ---------------------------------------------------------------------------
 
-test("N3-⑤ 桥不可达 502：`/` 高亮「首页」、`/schedule` 高亮「排期」（宕页高亮随发起页；「需求」导航已随 REQ-04 Q2 退役）", async () => {
+test("N3-⑤（B5a 改版）桥不可达 502：`/` 高亮「门户」、`/org/alpha/schedule` 502 且 NAV 闭集三枚（宕页高亮锚随「排期」摘条降级为正文结构锚；「需求」导航已随 REQ-04 Q2 退役）", async () => {
   await withServer(BROKEN_CLIENT, async (base) => {
-    for (const [path, nav, href] of [
-      ["/", "首页", "/"],
-      ["/schedule", "排期", "/schedule"],
-    ]) {
+    for (const path of ["/", "/org/alpha/schedule"]) {
       const res = await getHtml(base, path);
       assert.equal(res.status, 502, `${path} 桥不可达 = 502`);
       assert.match(res.text, /bridge_unreachable/, `${path} 错误码在页面`);
-      assert.match(
-        res.text,
-        new RegExp(`<a href="${href}" class="on">${nav}</a>`),
-        `${path} 宕页高亮留在「${nav}」`,
+      assert.match(res.text, /<h2>操作未成功（502）<\/h2>/, `${path} 错误页正文结构在（族名进浮层卡）`);
+      const navSegment = (/<nav>([\s\S]*?)(?=<span class="org-switch">|<\/header>)/.exec(res.text) ?? [, ""])[1];
+      assert.deepEqual(
+        [...navSegment.matchAll(/<a href="(\/[^"]*)"/g)].map((m) => m[1]),
+        ["/", "/projects", "/agents"],
+        `${path} 宕页 NAV 闭集 = 三枚（B5a 收口）`,
       );
       assert.doesNotMatch(res.text, /<a href="\/requirements"/, `${path} 宕页不再给「需求」导航留入口`);
     }
+    const home = await getHtml(base, "/");
+    assert.match(home.text, /<a href="\/" class="on">门户<\/a>/, "`/` 宕页高亮留在「门户」");
+  });
+});
+
+// ---------------------------------------------------------------------------
+// ①′ 退役闭集（表驱动，v0.9.6 B5a 收三枚 · C1 收第四枚 /tasks）：GET ⇒ 303 回门户 / 非 GET ⇒ 405 列写面
+// ---------------------------------------------------------------------------
+
+test("N3-⑤b（B5a 新增 · C1 收编 /tasks）退役页闭集 = {/requirements, /orgs, /schedule, /tasks}：GET ⇒ 303 `/` + no-store + 零触桥", async () => {
+  const client = fakeClient([feature("F1", "v0.9.2")]);
+  await withServer(client, async (base) => {
+    for (const path of ["/requirements", "/orgs", "/schedule", "/tasks"]) {
+      const res = await fetch(`${base}${path}`, { redirect: "manual" });
+      assert.equal(res.status, 303, `${path} GET ⇒ 303（板惯例，不 404）`);
+      assert.equal(res.headers.get("location"), "/", `${path} 303 目标 = 门户`);
+      assert.equal(res.headers.get("cache-control"), "no-store", `${path} 重定向不缓存`);
+      await res.body?.cancel();
+    }
+    assert.deepEqual(client.calls, [], "四路径重定向一律零触桥");
+  });
+});
+
+test("N3-⑤c（B5a 新增 · C1 收编 /tasks）退役页非 GET ⇒ 405 且文案含「本路径仅支持 GET」+ 写面清单（写分派前置于退役块 ⇒ 在途写路由不受影响）", async () => {
+  const client = fakeClient([feature("F1", "v0.9.2")]);
+  await withServer(client, async (base) => {
+    for (const path of ["/requirements", "/orgs", "/schedule", "/tasks"]) {
+      const res = await fetch(`${base}${path}`, { method: "DELETE" });
+      assert.equal(res.status, 405, `${path} DELETE ⇒ 405（退役路径不静默放行）`);
+      const text = await res.text();
+      assert.match(text, /method_not_allowed/, `${path} 错误码`);
+      assert.match(text, /本路径仅支持 GET（写面 = /, `${path} 405 文案列出写面清单`);
+      assert.match(text, new RegExp(`GET ${path} 已改 303 回`), `${path} 退役说明逐路径一条（表驱动文案）`);
+    }
+    assert.deepEqual(client.calls, [], "405 档同样零触桥");
   });
 });
 

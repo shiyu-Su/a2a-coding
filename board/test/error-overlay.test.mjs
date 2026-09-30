@@ -478,13 +478,15 @@ function faceReturning(outcome) {
   };
 }
 
-test("BD22-N2a：桥宕整页（GET /host，宿主面探活抛错）⇒ BD2 浮层（族名「桥不可达」+ mono bridge_unreachable），随发起页高亮", async () => {
+test("BD22-N2a：桥宕整页（GET /host，宿主面探活抛错）⇒ BD2 浮层（族名「桥不可达」+ mono bridge_unreachable），正文结构锚保留", async () => {
   await withServer(
     async (base) => {
       const res = await req(base, "/host");
       assert.equal(res.status, 502);
       assertOverlayPage(res, { status: 502, family: "桥不可达", code: "bridge_unreachable", errorSnippet: "宿主桥探活失败（假）" });
-      assert.match(res.text, /<a href="\/host" class="on">宿主桥<\/a>/, "导航高亮跟随发起页（不再是恒 features）");
+      // B5a 口径 38：NAV 摘「宿主桥」条 ⇒ 原「宕页高亮随发起页」锚降级为 `<h2>` 结构锚（:509 形制）
+      assert.ok(res.text.includes("<h2>桥不可达</h2>"), "族名以 <h2> 落在浮层卡（结构锚，替代已摘的导航高亮锚）");
+      assert.doesNotMatch(res.text, /<a href="\/host"/, "B5a：NAV 摘「宿主桥」条 ⇒ 宕页也不出该链接（可达面 = 正文深链，口径 33/38）");
     },
     {
       hostFace: {

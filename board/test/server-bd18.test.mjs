@@ -473,3 +473,44 @@ test("C6-页面（正锚）：latestTurnOf 有轮 ⇒ 详情页显示最近一�
     assert.equal(text.includes("<h2>最近一轮</h2>"), false, "默认 fakeFace latest=null ⇒ 留痕行缺席（缺席不是错误）");
   });
 });
+
+// ---------------------------------------------------------------------------
+// v0.9.6 N4 页级锚：台账 → 详情页装配层的 receipt 透传（漏一行 = 回执卡永不出现且无告警）
+// ---------------------------------------------------------------------------
+
+test("N4-页面（正锚）：latestTurnOf 带回执 ⇒ 详情页出现回执卡；无回执 ⇒ 保持现状折叠摘要", async () => {
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.match(text, /<div class="receipt-card">/, "装配层透传的 receipt 必须一路到页面");
+    assert.match(text, /<b>要点<\/b> · 改完两处渲染点<br>补了页级锚/);
+    assert.match(text, /<b>待用户<\/b> · ① 是否发版<br>② 文案是否要调/);
+    assert.match(text, /<b>下一步<\/b> · 等用户真机验收/);
+    assert.match(text, /📄 文档产出见『阶段产出』区，展开查看/);
+    assert.match(text, /<details class="fold turn-summary"><summary>完整摘要<\/summary><pre class="result">本轮结论：锚已合入<\/pre><\/details>/, "400 字摘要仍在（退入折叠）");
+  }, {
+    hostFace: fakeFace(null, null, {
+      turnId: "turn-0123456789abcdef",
+      state: "succeeded",
+      summary: "本轮结论：锚已合入",
+      finishedAt: "2026-09-30T08:30:00Z",
+      updatedAt: "2026-09-30T08:31:00Z",
+      error: null,
+      receipt: { head: ["改完两处渲染点", "补了页级锚"], todo: ["是否发版", "文案是否要调"], next: "等用户真机验收" },
+    }),
+  });
+
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.equal(text.includes('<div class="receipt-card">'), false, "无回执（历史轮 / agent 漏遵）⇒ 卡片不出现（整页含样式表，故锚到卡片标记本身）");
+    assert.match(text, /<details class="fold turn-summary"><summary>本轮结论：锚已合入<\/summary>/, "无回执 = C6 现状折叠");
+  }, {
+    hostFace: fakeFace(null, null, {
+      turnId: "turn-0123456789abcdef",
+      state: "succeeded",
+      summary: "本轮结论：锚已合入",
+      finishedAt: "2026-09-30T08:30:00Z",
+      updatedAt: "2026-09-30T08:31:00Z",
+      error: null,
+    }),
+  });
+});

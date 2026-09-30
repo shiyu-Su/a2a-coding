@@ -263,7 +263,7 @@ test("N3-①（§9-c 新锚）GET /org/<名>/manage: 成员区（声明态清单
     assert.match(res.text, /<form method="post" action="\/orgs" class="inline" data-submit="已提交，停用中…" data-ov="1" data-ov-redirect="\/">/);
     assert.match(res.text, /<input type="hidden" name="org" value="alpha">/);
     // 空间导航含 manage 入口且高亮
-    assert.match(res.text, /<a class="fl" href="\/org\/alpha\/manage" style="font-weight:700">管理<\/a>/);
+    assert.match(res.text, /<a class="fl on" href="\/org\/alpha\/manage" style="font-weight:700">管理<\/a>/);
     assert.doesNotMatch(res.text, /<script src>/, "纯 SSR：不扩内联脚本闭集（N3-⑦/⑧ 纪律）");
   }, { fetcher: async () => ({ ok: true, projects: [] }) });
 });
@@ -353,21 +353,21 @@ test("N6-⑪ 方法门与写面纪律: /orgs 退役后 GET ⇒ 303、POST 写径
 // 导航闭集更新（v0.9.2 M4 增排期看板 = 六项；REQ-2026-09-26-04 Q2 需求页退役 = 五项；
 // REQ-2026-09-26-02 B-T3 增 Agent View = 六项；同版增补 ③ Timeline 退役 = 六项维持；
 // REQ-2026-09-27-06 §9-b 首页形态 B→A 增「首页」= 七项；
-// REQ-2026-09-27-06 §9-c 组织管理页退役 ⇒ 摘「组织」= 六项）
+// REQ-2026-09-27-06 §9-c 组织管理页退役 ⇒ 摘「组织」= 六项；
+// REQ-2026-09-28-07 v0.9.6 B5a ⇒ 摘「排期 / 任务 / 宿主桥」+ 文案改字面（口径 37/38）= 三枚）
 // ---------------------------------------------------------------------------
 
-test("N6-⑫（§9-c 翻向）导航闭集: 六项（首页/排期/任务/项目·机器/Agent/宿主桥），href 与顺序钉死；/orgs 链接已摘", () => {
-  const html = renderPage({ title: "t", active: "schedule", bodyHtml: "<p>b</p>" });
+test("N6-⑫（B5a 收三枚）导航闭集: 三项（门户/项目/Agent），href、文案与顺序钉死；/schedule、/tasks、/host 链接已摘", () => {
+  const html = renderPage({ title: "t", active: "projects", bodyHtml: "<p>b</p>" });
   const anchors = [...html.matchAll(/<a href="(\/[^"]*)"[^>]*>([^<]+)<\/a>/g)].map((m) => `${m[1]}|${m[2]}`);
   assert.deepEqual(anchors, [
-    "/|首页",
-    "/schedule|排期",
-    "/tasks|任务",
-    "/projects|项目 / 机器",
+    "/|门户",
+    "/projects|项目",
     "/agents|Agent",
-    "/host|宿主桥",
   ]);
-  assert.doesNotMatch(html, /href="\/orgs"/, "NAV 不得再含 /orgs（页退役 ⇒ 303，链接不留守）");
+  assert.doesNotMatch(html, /href="\/orgs"/, "§9-c：NAV 不得含 /orgs（页退役 ⇒ 303，链接不留守）");
+  assert.doesNotMatch(html, /href="\/schedule"/, "B5a：NAV 不得含 /schedule（全局排期页退役 ⇒ 303 回门户）");
+  assert.doesNotMatch(html, /href="\/tasks"|href="\/host"/, "B5a 口径 33/38：路由不退但 NAV 摘条（可达面 = 正文深链）");
 });
 
 // ---------------------------------------------------------------------------

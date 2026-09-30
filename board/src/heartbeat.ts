@@ -36,6 +36,7 @@
  * 未知 id（404）按「读不到 ⇒ 不就绪」保守处理，**不假唤醒**（真兜底交给 ⑤）。
  */
 import { isTerminalFeatureState } from "./derive.js";
+import { RECEIPT_CONTRACT } from "./receipt.js";
 import type { SuspendedEntry } from "./suspend-ledger.js";
 
 // ---------------------------------------------------------------------------
@@ -250,7 +251,8 @@ export interface WakePromptInput {
 
 /**
  * 唤醒轮提示词（纯函数）。**不出现任何编排桥工具全名**（§3.6：各家后端工具名不同）；
- * 把命中条件作为**结构化事实快照**给 agent（板不解析 agent 文本，只给事实）。
+ * 把命中条件作为**结构化事实快照**给 agent（板不解析 agent 文本，唯一例外 = 收口回执块
+ * （`src/receipt.ts` `parseReceiptBlock`）：获准解析、且必须容错——不匹配即退回现状摘要，不劣于无解析）。
  */
 export function buildWakePrompt(input: WakePromptInput): string {
   const lead =
@@ -272,6 +274,9 @@ export function buildWakePrompt(input: WakePromptInput): string {
     "2. 需要人决策就用 A2A 的 input-required 结束本轮，不要空转；",
     "3. 本轮若再次下发子任务，先调板侧挂起口登记 pending 清单再退出（见本组织 workspace 的 AGENTS.md）；",
     "4. 状态机推进（审批 / 推进 / 取消）只能经编排桥的能力做，板不代劳。",
+    // v0.9.6 N6：唤醒轮同样是一轮收尾 ⇒ 引用同一契约常量。
+    "",
+    RECEIPT_CONTRACT,
   ];
   return lines.join("\n");
 }

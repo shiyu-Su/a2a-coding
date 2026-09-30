@@ -33,6 +33,7 @@ const TEMPLATE = [
 
 const SPEC_MAIN = "# 需求流程\n\n> **规范版本戳**：v9.9.9（2099-01-01）\n\n正文 A\n";
 const SPEC_MAP = "# 引擎映射\n\n> **规范版本戳**：v9.9.9（2099-01-01）\n\n正文 B\n";
+const SPEC_TPL = "# 文档模板\n\n> **规范版本戳**：v9.9.9（2099-01-01）\n\n模板正文（含使用期占位 {topic}，逐字节透传）\n";
 
 function fixture() {
   const root = mkdtempSync(join(tmpdir(), "board-t11-"));
@@ -43,6 +44,7 @@ function fixture() {
   mkdirSync(join(repoRoot, "flow", "spec"), { recursive: true });
   writeFileSync(join(repoRoot, "flow", "spec", "需求流程.md"), SPEC_MAIN, "utf8");
   writeFileSync(join(repoRoot, "flow", "spec", "引擎映射.md"), SPEC_MAP, "utf8");
+  writeFileSync(join(repoRoot, "flow", "spec", "文档模板.md"), SPEC_TPL, "utf8");
   const orgsDir = join(root, "orgs");
   mkdirSync(orgsDir, { recursive: true });
   return { root, templateRoot, repoRoot, orgsDir };
@@ -147,13 +149,16 @@ test("T11-③ 纯函数：回填清单 = 盘∪台账（剔停用 / 去重 / 排
 // ② 单组织种子化（建组织链落盘口径）
 // ---------------------------------------------------------------------------
 
-test("T11-④ 建组织链：AGENTS.md + flow/spec 两份快照落盘（fixture 模板注入）", () => {
+test("T11-④ 建组织链：AGENTS.md + flow/spec 三份快照落盘（fixture 模板注入）", () => {
   const f = fixture();
   const orgDir = join(f.orgsDir, "新组");
   const r = seedOrgWorkspace(orgDir, "新组", opts(f));
-  assert.deepEqual([...r.created].sort(), ["AGENTS.md", "flow/spec/引擎映射.md", "flow/spec/需求流程.md"].sort());
+  assert.deepEqual(
+    [...r.created].sort(),
+    ["AGENTS.md", "flow/spec/文档模板.md", "flow/spec/引擎映射.md", "flow/spec/需求流程.md"].sort(),
+  );
   assert.deepEqual(r.warnings, []);
-  assert.deepEqual(summarizeSeedResults([r]), { created: 3, skipped: 0 });
+  assert.deepEqual(summarizeSeedResults([r]), { created: 4, skipped: 0 });
 
   const agents = readFileSync(join(orgDir, AGENTS_TARGET_FILE), "utf8");
   assert.match(agents, /# 新组 工作区/);
@@ -166,6 +171,10 @@ test("T11-④ 建组织链：AGENTS.md + flow/spec 两份快照落盘（fixture 
   assert.match(firstLine(snap), /board 版本 v9\.9\.9/);
   assert.match(firstLine(snap), /源文件规范版本戳 v9\.9\.9（2099-01-01）/);
   assert.ok(snap.includes("正文 A"), "源正文逐字保留");
+
+  const tplSnap = readFileSync(join(orgDir, "flow", "spec", "文档模板.md"), "utf8");
+  assert.match(firstLine(tplSnap), /来源 flow\/spec\/文档模板\.md/);
+  assert.ok(tplSnap.includes("{topic}"), "模板内的使用期占位符逐字节透传（快照不经模板渲染）");
 });
 
 test("T11-⑤ 幂等只补缺：已有文件一律不覆盖（组织自改保留），缺失补齐；再跑无新建", () => {
@@ -178,7 +187,7 @@ test("T11-⑤ 幂等只补缺：已有文件一律不覆盖（组织自改保留
   const r = seedOrgWorkspace(orgDir, "存改组", opts(f));
   assert.equal(readFileSync(join(orgDir, "AGENTS.md"), "utf8"), "组织自改版");
   assert.equal(readFileSync(join(orgDir, "flow", "spec", "需求流程.md"), "utf8"), "组织自改规范");
-  assert.deepEqual(r.created, ["flow/spec/引擎映射.md"]);
+  assert.deepEqual([...r.created].sort(), ["flow/spec/引擎映射.md", "flow/spec/文档模板.md"]);
   assert.deepEqual([...r.skipped].sort(), ["AGENTS.md", "flow/spec/需求流程.md"].sort());
 
   const again = seedOrgWorkspace(orgDir, "存改组", opts(f));
@@ -202,7 +211,7 @@ test("T11-⑦ fail-open：flow/spec 缺失 ⇒ 告警、AGENTS.md 照落盘（{F
   const orgDir = join(f.orgsDir, "无规范组");
   const r = seedOrgWorkspace(orgDir, "无规范组", opts(f));
   assert.equal(existsSync(join(orgDir, "AGENTS.md")), true);
-  assert.equal(r.warnings.filter((w) => w.code === "board_org_seed_spec_missing").length, 2);
+  assert.equal(r.warnings.filter((w) => w.code === "board_org_seed_spec_missing").length, 3);
   assert.match(readFileSync(join(orgDir, "AGENTS.md"), "utf8"), /未获取：flow\/spec 不可读/);
 });
 
@@ -211,7 +220,7 @@ test("T11-⑧ fail-open：目标不可写（组织目录位被文件占用）⇒
   writeFileSync(join(f.orgsDir, "占位文件"), "x", "utf8");
   const r = seedOrgWorkspace(join(f.orgsDir, "占位文件"), "占位文件", opts(f));
   assert.deepEqual(r.created, []);
-  assert.equal(r.warnings.length, 3, "三份落盘各自失败各自告警");
+  assert.equal(r.warnings.length, 4, "四份落盘各自失败各自告警");
   assert.ok(r.warnings.every((w) => w.code === "board_org_seed_write_failed"));
 });
 
@@ -265,6 +274,7 @@ test("T11-⑩ HTTP：POST /orgs 建组织 ⇒ AGENTS.md + flow 快照当场出�
       assert.deepEqual(await res.json(), { ok: true, org: "接口组", ledgerFile: env.ledgerFile });
       assert.ok(existsSync(join(f.orgsDir, "接口组", "AGENTS.md")));
       assert.ok(existsSync(join(f.orgsDir, "接口组", "flow", "spec", "需求流程.md")));
+      assert.ok(existsSync(join(f.orgsDir, "接口组", "flow", "spec", "文档模板.md")), "三份规范快照含文档模板");
     },
     { orgSeed: { templateRoot: f.templateRoot, repoRoot: f.repoRoot, boardVersion: "9.9.9", hostKind: "opencode" } },
   );
@@ -278,6 +288,7 @@ test("T11-⑪ HTTP：启动回填 —— listen 前为存量组织补 AGENTS.md�
     async () => {
       assert.ok(existsSync(join(f.orgsDir, "存量组", "AGENTS.md")), "listen 前已回填");
       assert.ok(existsSync(join(f.orgsDir, "存量组", "flow", "spec", "引擎映射.md")));
+      assert.ok(existsSync(join(f.orgsDir, "存量组", "flow", "spec", "文档模板.md")), "回填同样补文档模板快照");
     },
     { orgSeed: { templateRoot: f.templateRoot, repoRoot: f.repoRoot, boardVersion: "9.9.9", hostKind: "opencode" } },
   );

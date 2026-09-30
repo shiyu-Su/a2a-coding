@@ -55,7 +55,7 @@ function feature(id, version, overrides = {}) {
 
 function tmpEnv() {
   const dir = mkdtempSync(join(tmpdir(), "board-versions-http-"));
-  return { dir, versionsFile: join(dir, "data", "versions.json") };
+  return { dir, orgsRoot: join(dir, "orgs"), versionsFile: join(dir, "data", "versions.json") };
 }
 
 function seedLedger(file, entries) {
@@ -71,8 +71,19 @@ function rec(version, status) {
   return { version, status, createdAt: "2026-09-27T00:00:00.000Z", updatedAt: "2026-09-27T00:00:00.000Z", note: null };
 }
 
-async function withVersionServer(run, { envOptions = {}, serverOverrides = {} } = {}) {
+/** 空间档条目（B4）：唯一键 = `(org, version)` ⇒ 种子须带组织；`rec()` 的无 org 条目落未归属空串桶。 */
+function recOrg(org, version, status) {
+  return { ...rec(version, status), org };
+}
+
+async function withVersionServer(
+  run,
+  { envOptions = {}, serverOverrides = {}, orgs = [], preSeed = null } = {},
+) {
   const env = tmpEnv();
+  mkdirSync(env.orgsRoot, { recursive: true });
+  for (const org of orgs) mkdirSync(join(env.orgsRoot, org), { recursive: true });
+  if (preSeed !== null) preSeed(env.versionsFile);
   const { client, calls } = fakeClient(envOptions);
   const handle = await createBoardServer({
     host: "127.0.0.1",
@@ -80,6 +91,7 @@ async function withVersionServer(run, { envOptions = {}, serverOverrides = {} } 
     client,
     now: () => NOW,
     versionsLedgerFile: env.versionsFile,
+    docs: { repoRoot: env.dir, orgsDir: env.orgsRoot },
     ...serverOverrides,
   });
   try {
@@ -91,6 +103,16 @@ async function withVersionServer(run, { envOptions = {}, serverOverrides = {} } 
 
 function postVersions(base, fields, headers = WRITE_HEADERS) {
   return fetch(`${base}/versions`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded", ...headers },
+    body: new URLSearchParams(fields).toString(),
+  });
+}
+
+/** 空间档写口（B4）：`/org/<编码组织名>/versions` —— 归一层剥前缀后命中同一条全局写路径。 */
+function postVersionsAt(base, path, fields, headers = WRITE_HEADERS) {
+  return fetch(`${base}${path}`, {
     method: "POST",
     redirect: "manual",
     headers: { "content-type": "application/x-www-form-urlencoded", ...headers },
@@ -343,4 +365,217 @@ test("N1-⑪ setStatus：不存在 ⇒ 404；status 缺失/非闭集 ⇒ 400；�
     assert.equal(json.changed, true);
     assert.equal(readLedger(env.versionsFile)[0].status, "active");
   });
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.6 B4 · 空间档（`POST /org/<名>/versions`）：org 只从路径取，写面 / 数卡闸 / 303 三处切片
+// （口径 4 / 5 / 30；台账唯一键 = `(org, version)` ⇒ 同版号跨组织各自成立）
+// ---------------------------------------------------------------------------
+
+const ORG_A = "组织甲";
+const ORG_B = "组织乙";
+const SEG_A = encodeURIComponent(ORG_A);
+const SEG_B = encodeURIComponent(ORG_B);
+const V1 = "v1.0.0";
+
+test("B4-① 空间档 create：条目落 (org, version)；同版号他组织可各建；同组织重复 ⇒ 409 且文案点名组织", async () => {
+  await withVersionServer(
+    async (base, env) => {
+      const a = await postVersionsAt(base, `/org/${SEG_A}/versions`, { action: "create", version: V1 });
+      assert.equal(a.status, 201);
+      assert.deepEqual(await a.json(), { ok: true, version: V1, status: "notstart", ledgerFile: env.versionsFile });
+
+      const b = await postVersionsAt(base, `/org/${SEG_B}/versions`, { action: "create", version: V1 });
+      assert.equal(b.status, 201, "同版号在另一组织可各自登记（唯一键含 org）");
+
+      assert.deepEqual(
+        readLedger(env.versionsFile).map((v) => [v.org, v.version, v.status]),
+        [[ORG_A, V1, "notstart"], [ORG_B, V1, "notstart"]],
+        "两条独立条目，组织维不丢",
+      );
+
+      const dup = await postVersionsAt(base, `/org/${SEG_A}/versions`, { action: "create", version: V1 });
+      assert.equal(dup.status, 409);
+      const json = await dup.json();
+      assert.equal(json.code, "board_version_exists");
+      assert.match(json.error, new RegExp(`已在组织 ${ORG_A} 的台账中`), "409 文案点名本组织（闸 = 同组织同版号）");
+      assert.equal(readLedger(env.versionsFile).length, 2, "被拒即零写");
+    },
+    { orgs: [ORG_A, ORG_B] },
+  );
+});
+
+test("B4-①b 空间档 create：表单伪造 org / group 字段不改落点（org 只由服务端路径注入，口径 4）", async () => {
+  await withVersionServer(
+    async (base, env) => {
+      const res = await postVersionsAt(base, `/org/${SEG_A}/versions`, {
+        action: "create",
+        version: V1,
+        org: ORG_B,
+        group: ORG_B,
+      });
+      assert.equal(res.status, 201);
+      assert.deepEqual(
+        readLedger(env.versionsFile).map((v) => [v.org, v.version]),
+        [[ORG_A, V1]],
+        "落点 = 路径组织，客户端提交的组织字段被忽略",
+      );
+    },
+    { orgs: [ORG_A, ORG_B] },
+  );
+});
+
+test("B4-② 空间档 create 表单档：303 回**本空间**排期页（口径 5，不再甩回全局 /schedule）", async () => {
+  await withVersionServer(
+    async (base, env) => {
+      const form = await postVersionsAt(base, `/org/${SEG_A}/versions`, { action: "create", version: V1 }, { origin: base });
+      assert.equal(form.status, 303);
+      assert.equal(form.headers.get("location"), `/org/${SEG_A}/schedule`);
+      assert.equal(readLedger(env.versionsFile)[0].org, ORG_A, "303 档同样落本组织条目");
+    },
+    { orgs: [ORG_A] },
+  );
+});
+
+test("B4-③ 空间档 remove：只摘本组织条目（他组织同版号条目不动）", async () => {
+  await withVersionServer(
+    async (base, env) => {
+      seedLedger(env.versionsFile, [recOrg(ORG_A, V1, "notstart"), recOrg(ORG_B, V1, "notstart")]);
+      const res = await postVersionsAt(base, `/org/${SEG_A}/versions`, { action: "remove", version: V1 });
+      assert.equal(res.status, 200);
+      assert.equal((await res.json()).removed, true);
+      assert.deepEqual(
+        readLedger(env.versionsFile).map((v) => [v.org, v.version]),
+        [[ORG_B, V1]],
+        "只删 (组织甲, v1.0.0)，(组织乙, v1.0.0) 照旧在册",
+      );
+    },
+    { orgs: [ORG_A, ORG_B], envOptions: { features: [] } },
+  );
+});
+
+test("B4-④ 空间档 remove 的「名下已确认卡」闸按组织数卡（口径 30：他组织的同版号卡不挡本组织删版）", async () => {
+  const { fn, seen } = fakeSchedule();
+  await withVersionServer(
+    async (base, env) => {
+      seedLedger(env.versionsFile, [recOrg(ORG_A, V1, "notstart"), recOrg(ORG_B, V1, "notstart")]);
+      const out = await postVersionsAt(base, `/org/${SEG_A}/versions`, { action: "remove", version: V1 });
+      assert.equal(out.status, 200, "本组织名下只有想法卡 ⇒ 可删（他组织的已确认卡不计入本闸）");
+      assert.deepEqual((await out.json()).backToPool, ["FA"], "仅本组织的想法卡回池");
+      assert.deepEqual(
+        seen.map((s) => [s.input.featureId, s.input.version, s.options.group]),
+        [["FA", "", ORG_A]],
+      );
+
+      const blocked = await postVersionsAt(base, `/org/${SEG_B}/versions`, { action: "remove", version: V1 });
+      assert.equal(blocked.status, 409);
+      const json = await blocked.json();
+      assert.equal(json.code, "board_version_remove_confirmed_cards");
+      assert.match(json.error, /该版本下还有已确认需求（1 条）/, "本组织那张已确认卡 ⇒ 1 条（他组织想法卡不计数）");
+
+      assert.deepEqual(
+        readLedger(env.versionsFile).map((v) => v.org),
+        [ORG_B],
+      );
+    },
+    {
+      orgs: [ORG_A, ORG_B],
+      envOptions: {
+        features: [
+          feature("FA", V1, { ownerGroup: ORG_A }),
+          feature("FB", V1, { ownerGroup: ORG_B, stage: "改造方案", approval: "已通过" }),
+        ],
+      },
+      serverOverrides: { scheduleFeatureImpl: fn },
+    },
+  );
+});
+
+test("B4-⑤ 空间档 setStatus 的发版闸按组织数卡（判据 = 该组织该版本名下全收口，口径 30）", async () => {
+  await withVersionServer(
+    async (base, env) => {
+      seedLedger(env.versionsFile, [recOrg(ORG_A, V1, "active"), recOrg(ORG_B, V1, "active")]);
+      const ok = await postVersionsAt(base, `/org/${SEG_A}/versions`, { action: "setStatus", version: V1, status: "released" });
+      assert.equal(ok.status, 200, "组织甲名下唯一卡已 completed ⇒ 该组织该版本可标记已发版");
+      assert.equal((await ok.json()).status, "released");
+
+      const denied = await postVersionsAt(base, `/org/${SEG_B}/versions`, { action: "setStatus", version: V1, status: "released" });
+      assert.equal(denied.status, 409);
+      const json = await denied.json();
+      assert.equal(json.code, "board_version_transition_release_incomplete");
+      assert.match(json.error, /total 1/, "组织乙切片只数自己的 1 张卡（甲的完成不点亮乙的闸）");
+
+      assert.deepEqual(
+        readLedger(env.versionsFile).map((v) => [v.org, v.status]),
+        [[ORG_A, "released"], [ORG_B, "active"]],
+        "setStatus 精确命中 (org, version)，他组织同版号条目不动",
+      );
+    },
+    {
+      orgs: [ORG_A, ORG_B],
+      envOptions: {
+        features: [
+          feature("FA", V1, { ownerGroup: ORG_A, state: "completed", stage: "改造方案", approval: "已通过" }),
+          feature("FB", V1, { ownerGroup: ORG_B, state: "executing", stage: "改造方案", approval: "已通过" }),
+        ],
+      },
+    },
+  );
+});
+
+test("B4-⑥ 空间档 remove / setStatus：仅他组织有同版号条目 ⇒ 404（不跨组织命中）", async () => {
+  await withVersionServer(
+    async (base, env) => {
+      seedLedger(env.versionsFile, [recOrg(ORG_A, V1, "notstart")]);
+      const rm = await postVersionsAt(base, `/org/${SEG_B}/versions`, { action: "remove", version: V1 });
+      assert.equal(rm.status, 404);
+      assert.equal((await rm.json()).code, "board_version_not_found");
+
+      const st = await postVersionsAt(base, `/org/${SEG_B}/versions`, { action: "setStatus", version: V1, status: "active" });
+      assert.equal(st.status, 404);
+      assert.equal((await st.json()).code, "board_version_not_found");
+
+      assert.deepEqual(readLedger(env.versionsFile).map((v) => v.org), [ORG_A], "台账不动");
+    },
+    { orgs: [ORG_A, ORG_B] },
+  );
+});
+
+test("B4-⑦ 空间排期页的删除 × 表单同样带空间前缀（缺前缀会让删除落回「不限组织」而误删他组织条目）", async () => {
+  await withVersionServer(
+    async (base) => {
+      const html = await (await fetch(`${base}/org/${SEG_A}/schedule`)).text();
+      assert.match(
+        html,
+        new RegExp(`<form method="post" action="/org/${SEG_A}/versions" class="inline vdel"`),
+        "× 提交到本空间路径（归一层剥前缀命中同一条全局写口）",
+      );
+      assert.doesNotMatch(html, /<form method="post" action="\/versions" class="inline vdel"/, "空间页不渲染全局 action");
+    },
+    {
+      orgs: [ORG_A],
+      envOptions: { features: [feature("FA", V1, { ownerGroup: ORG_A })] },
+      preSeed: (file) => seedLedger(file, [recOrg(ORG_A, V1, "notstart")]),
+    },
+  );
+});
+
+test("B4-⑧ 全局档不变形（路由留到 B5a 退役）：create 落未归属空串桶 ∧ 删 / 设状态按「不限组织」取首个命中 ∧ 303 回 /schedule", async () => {
+  await withVersionServer(
+    async (base, env) => {
+      const created = await postVersions(base, { action: "create", version: V1 }, { origin: base });
+      assert.equal(created.status, 303);
+      assert.equal(created.headers.get("location"), "/schedule");
+      assert.deepEqual(
+        readLedger(env.versionsFile).map((v) => [v.org, v.version]),
+        [["", V1]],
+        "全局直投 = 未归属空串桶（与 migrateLedgerOrgs 的缺桶同构），不猜组织",
+      );
+
+      const removed = await postVersions(base, { action: "remove", version: V1 });
+      assert.equal(removed.status, 200, "全局档 remove 不限组织 ⇒ 命中空串桶条目");
+      assert.deepEqual(readLedger(env.versionsFile), []);
+    },
+    { orgs: [ORG_A], envOptions: { features: [] } },
+  );
 });

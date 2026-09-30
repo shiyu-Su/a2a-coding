@@ -23,6 +23,12 @@ import {
 import { createBoardServer } from "../dist/server.js";
 
 const NOW = "2026-09-27T12:00:00.000Z";
+/**
+ * B5a 起全局 `/schedule` 退役 ⇒ N2-⑤ HTTP 面的看板宿主 = 空间排期页 `/org/alpha/schedule`；
+ * 台账 B1 起按 `(org, version)` 成域 ⇒ 条目须带本组织 org 才能在该页成列（纯函数面 org 传
+ * `undefined` = 不限组织，故本文件 ①–④ 单元锚不受影响）。
+ */
+const ORG = "alpha";
 
 function feature(featureId, version, overrides = {}) {
   return {
@@ -31,7 +37,7 @@ function feature(featureId, version, overrides = {}) {
     title: `需求 ${featureId}`,
     requirement: null,
     taskCount: 1,
-    ownerGroup: "alpha",
+    ownerGroup: ORG,
     stage: "改造方案",
     version,
     approval: "已通过",
@@ -46,7 +52,7 @@ function feature(featureId, version, overrides = {}) {
 function ledgerWith(entries) {
   let l = emptyVersionsLedger();
   for (const [v, status] of entries) {
-    l = createVersion(l, v, NOW).ledger;
+    l = createVersion(l, v, NOW, ORG).ledger;
     if (status !== "notstart") l = setVersionStatus(l, v, status, NOW).ledger;
   }
   return l;
@@ -123,7 +129,7 @@ test("N2-④ 交集列：徽标以台账状态为准（卡在场但台账 notsta
 // N2-⑤ HTTP 接线 + 读面零写
 // ---------------------------------------------------------------------------
 
-test("N2-⑤ HTTP：/schedule 台账独有列现形 + 三态徽标；GET 不改写台账文件（读面零写）", async () => {
+test("N2-⑤（B5a 改版）HTTP：空间排期页台账独有列现形 + 三态徽标；GET 不改写台账文件（读面零写）", async () => {
   const dir = mkdtempSync(join(tmpdir(), "board-n2-"));
   try {
     const ledgerFile = join(dir, ".data", "versions.json");
@@ -147,7 +153,7 @@ test("N2-⑤ HTTP：/schedule 台账独有列现形 + 三态徽标；GET 不改�
     };
     const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client, versionsLedgerFile: ledgerFile });
     try {
-      const text = await (await fetch(`http://127.0.0.1:${handle.port}/schedule`)).text();
+      const text = await (await fetch(`http://127.0.0.1:${handle.port}/org/${ORG}/schedule`)).text();
       assert.match(
         text,
         /<h3>v0\.9\.5 <span class="kbadge vbadge notstart"[^>]*>未开始<\/span>/,
@@ -158,7 +164,7 @@ test("N2-⑤ HTTP：/schedule 台账独有列现形 + 三态徽标；GET 不改�
     } finally {
       await handle.close();
     }
-    assert.equal(readFileSync(ledgerFile, "utf8"), before, "GET /schedule 不得改写台账（并集/徽标为纯读）");
+    assert.equal(readFileSync(ledgerFile, "utf8"), before, "GET 排期页不得改写台账（并集/徽标为纯读）");
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

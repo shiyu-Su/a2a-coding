@@ -454,3 +454,10 @@ test("T7-⑫ C9：模板含挂起口纪律段（地址/schema/先调口再退出
   assert.match(tpl, /触发来源分野/, "分野段");
   assert.match(tpl, /watch-task\.mjs/, "客户端触发用 watch 脚本自等");
 });
+
+test("T7-⑬ B1（v0.9.6 模板接入）：模板 §3 指针指向 `flow/spec/文档模板.md` 且不再指向 planlog 台账", async () => {
+  const { readFileSync: read } = await import("node:fs");
+  const tpl = read(join(process.cwd(), "templates", "org", "AGENTS.template.md"), "utf8");
+  assert.match(tpl, /Step 0、Step 1 产出物先读 `flow\/spec\/文档模板\.md` 对应节、按模板骨架成文/, "指针措辞（先读对应节、按骨架成文）");
+  assert.equal(tpl.includes("`planlog.md` 的「当前步骤」已更新"), false, "推进条件② 已改述为「需求池标记以引擎为准」");
+});

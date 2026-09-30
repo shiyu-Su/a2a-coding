@@ -20,8 +20,15 @@
  */
 import { mkdirSync, readFileSync, renameSync, writeFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
+import type { Receipt } from "./receipt.js";
 
-/** 台账 schema 版本。 */
+/**
+ * 台账 schema 版本。
+ *
+ * **receipt 字段不 bump 本版本**（已裁定）：该常量当前无任何读者（grep 无版本分支），
+ * bump 只是净增耦合。`receipt` 的向后兼容靠 {@link parseTurnRecord} 的**显式解析分支**
+ * —— 旧记录缺该字段 ⇒ 解析为 `null`，不写 `if (version < 2)` 之类的版本分支。
+ */
 export const TURN_LEDGER_VERSION = 1;
 
 /** 缺省落点：`<board>/.data/host-turns.json`（与进程台账分文件，互不覆盖）。 */
@@ -85,6 +92,12 @@ export interface TurnRecord {
   error: { code: string; message: string } | null;
   /** 桥重拉后同 `contextId` 续 ⇒ 会话可能已回退为新建（§2.2-7「须让用户看见」）。 */
   bridgeNote: string | null;
+  /**
+   * 本轮尾部【回执】块的结构化结果（契约与类型见 `receipt.ts`）——
+   * 嵌套对象（**不用 head/todo/next 三平行字段**，R1 裁定）。
+   * 旧记录无此字段、或回执结构损坏 ⇒ `null`（界面按「无回执」渲染）。
+   */
+  receipt?: Receipt | null;
   queuedAt: string;
   startedAt: string | null;
   finishedAt: string | null;
@@ -139,6 +152,32 @@ function parseError(v: unknown): { code: string; message: string } | null {
   return { code, message };
 }
 
+/** 字符串数组的容错解析（非数组 / 含非字符串 ⇒ null，**不臆造**）。 */
+function stringArray(v: unknown): string[] | null {
+  if (!Array.isArray(v)) return null;
+  const out: string[] = [];
+  for (const item of v) {
+    if (typeof item !== "string") return null;
+    out.push(item);
+  }
+  return out;
+}
+
+/**
+ * 回执字段的容错解析（receipt.ts 的 Receipt 落账形态）。
+ * 缺字段 / 显式 null ⇒ null（**旧记录兼容**）；三键不全或类型不符 ⇒ null（结构损坏）。
+ * 注意：本函数**只决定 receipt 的值**，不因回执坏掉而丢弃整条轮记录。
+ */
+function parseReceiptField(v: unknown): Receipt {
+  if (typeof v !== "object" || v === null || Array.isArray(v)) return null;
+  const r = v as Record<string, unknown>;
+  const head = stringArray(r.head);
+  const todo = stringArray(r.todo);
+  if (head === null || todo === null) return null;
+  if (typeof r.next !== "string") return null;
+  return { head, todo, next: r.next };
+}
+
 /** 需求会话记录的容错解析（缺字段 ⇒ null，**不臆造**）。 */
 export function parseSessionRecord(input: unknown): RequirementSessionRecord | null {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
@@ -157,7 +196,13 @@ export function parseSessionRecord(input: unknown): RequirementSessionRecord | n
   };
 }
 
-/** 轮记录的容错解析（未知轮态 ⇒ null，防坏数据把界面带偏）。 */
+/**
+ * 轮记录的容错解析（未知轮态 ⇒ null，防坏数据把界面带偏）。
+ *
+ * ⚠ **本函数逐字段显式重构对象**：RMW 回路（recordTurn → mutate → load → parse）会把
+ * 未在此列出的字段**静默丢弃且无任何告警**。新增 TurnRecord 字段时**必须同步加解析分支**
+ * （`receipt` 即此口径；兼容旧记录靠显式解析，不 bump `TURN_LEDGER_VERSION`、不写版本分支）。
+ */
 export function parseTurnRecord(input: unknown): TurnRecord | null {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
   const r = input as Record<string, unknown>;
@@ -179,6 +224,7 @@ export function parseTurnRecord(input: unknown): TurnRecord | null {
     question: strOrNull(r.question),
     error: parseError(r.error),
     bridgeNote: strOrNull(r.bridgeNote),
+    receipt: parseReceiptField(r.receipt),
     queuedAt: str(r.queuedAt) ?? "",
     startedAt: strOrNull(r.startedAt),
     finishedAt: strOrNull(r.finishedAt),

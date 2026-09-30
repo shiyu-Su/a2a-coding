@@ -22,8 +22,9 @@ import { parseWriteRoute, validateOrgName } from "./write-guard.js";
 /** 组织空间 URL 前缀（含尾斜杠；`/org` 不带斜杠 ≠ 空间路径）。 */
 export const ORG_SPACE_PREFIX = "/org/";
 
-/** D 档读面路由族（改造文档 §2.5 三枚 + §9-c 管理页一枚）；`/org/<名>/features/:id` 属深链透传，不在此族内。 */
-export type OrgSpaceView = "schedule" | "features" | "tasks" | "manage";
+/** D 档读面路由族（改造文档 §2.5 三枚 + §9-c 管理页一枚）；`/org/<名>/features/:id` 属深链透传，不在此族内。
+ * **v0.9.6 B5b（口径 14）**：`features`（组织空间需求清单读面）整页退役 ⇒ 值域收窄为三枚。 */
+export type OrgSpaceView = "schedule" | "tasks" | "manage";
 
 /** 归一失败档（HTTP 状态与结构化码由调用方按此分流）。 */
 export type OrgSpaceFailure = "invalid_name" | "not_found" | "gone";
@@ -46,6 +47,8 @@ export type OrgSpaceRoute =
   | { kind: "view"; org: string; view: OrgSpaceView }
   | { kind: "feature_detail"; org: string; featureId: string }
   | { kind: "write"; org: string; remainder: string }
+  /** `/org/<名>/features`（退役清单读面）：GET ⇒ 303 同空间排期页，非 GET ⇒ 与读面族同款 405。 */
+  | { kind: "retired"; org: string }
   | { kind: "other"; org: string };
 
 /** 四源存在性 universe 装配（停用名并入盘/需求源时由 ledger 档兜住，停用档先判）。 */
@@ -94,12 +97,15 @@ type RemainderClass =
   | { view: OrgSpaceView }
   | { featureId: string }
   | { write: string }
+  | { retired: true }
   | { other: true };
 
 /** 剩余路径 → 读面族 / 深链 / 写归一（纯映射；`/features/:id` 全局唯一，不强制 303）。 */
 function classifyRemainder(remainder: string, method: string | undefined): RemainderClass {
   if (remainder === "" || remainder === "/" || remainder === "/schedule") return { view: "schedule" };
-  if (remainder === "/features") return { view: "features" };
+  // v0.9.6 B5b（口径 15）：组织空间需求清单读面整页退役 ⇒ 独立「退役形态」档（**不得删净落 404**：
+  // GET 由调用方发 303 到同空间排期页，非 GET 走读面族同款 405，保持方法门与 BD6-④d 口径一致）
+  if (remainder === "/features") return { retired: true };
   if (remainder === "/tasks") return { view: "tasks" };
   // §9-c：/orgs 管理页退役 ⇒ 成员管理与停用操作落空间内 manage 页（写 action 仍走全局端点）
   if (remainder === "/manage") return { view: "manage" };
@@ -144,6 +150,7 @@ export function resolveOrgSpaceRoute(pathname: string, universe: OrgSpaceUnivers
   if ("view" in classified) return { kind: "view", org, view: classified.view };
   if ("featureId" in classified) return { kind: "feature_detail", org, featureId: classified.featureId };
   if ("write" in classified) return { kind: "write", org, remainder: classified.write };
+  if ("retired" in classified) return { kind: "retired", org };
   return { kind: "other", org };
 }
 

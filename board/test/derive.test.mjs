@@ -302,6 +302,30 @@ test("C1-derive 下一步：产出 > 3 份只列前三 + 计数；摘要超上�
   assert.match(many, new RegExp(`长{${String(LATEST_TURN_SUMMARY_MAX)}}…`), "摘要按上限截断，不整段刷页");
 });
 
+test("N5-derive 回执卡在场 ⇒ 撤「最近一轮 <state>：<摘要>」后缀，改指回执卡", () => {
+  const turn = { state: "succeeded", summary: "本轮结论：门禁全绿", at: "2026-09-29T10:00:00Z" };
+  const withReceipt = deriveNextStepHint({ ...NS, latestTurn: turn, receiptPresent: true });
+  assert.doesNotMatch(withReceipt, /最近一轮/, "回执卡在场 ⇒ 不再重复状态+摘要");
+  assert.doesNotMatch(withReceipt, /本轮结论：门禁全绿/, "摘要不进引导行（全文在回执卡）");
+  assert.match(withReceipt, /本轮回执见下方回执卡/);
+});
+
+test("N5-derive 回执卡在场 ∧ 未发起有轮 ⇒ 整句改写为「指向待用户行 + 动作区裁定」（非旧句）", () => {
+  const turn = { state: "succeeded", summary: "已落确认单", at: "2026-09-29T10:00:00Z" };
+  const hint = deriveNextStepHint({ ...NS, latestTurn: turn, receiptPresent: true });
+  assert.match(hint, /回执卡「待用户」.*动作区补充框.*点「提交给 agent」/);
+  assert.doesNotMatch(hint, /agent 已把产出落到本页/, "旧句改写（与回执卡「待用户」行不重复）");
+});
+
+test("N5-derive（负向）receiptPresent 缺省/false ⇒ 旧行为逐字节不变（后缀 + 未发起旧句照旧）", () => {
+  const turn = { state: "succeeded", summary: "本轮结论：门禁全绿", at: "2026-09-29T10:00:00Z" };
+  const omitted = deriveNextStepHint({ ...NS, latestTurn: turn });
+  const explicitFalse = deriveNextStepHint({ ...NS, latestTurn: turn, receiptPresent: false });
+  assert.equal(omitted, explicitFalse, "缺省 == 显式 false（未接线调用方不回归）");
+  assert.match(omitted, /最近一轮 succeeded：本轮结论：门禁全绿/, "旧后缀保持");
+  assert.match(omitted, /agent 已把产出落到本页/, "未发起旧句保持");
+});
+
 test("C1-derive 卡滞档：executing ∧ 无在飞轮 ∧ 最近一轮超阈值 ⇒ 建议手动「让 agent 继续」（含距今）", () => {
   const at = "2026-09-29T10:00:00Z";
   const then = Date.parse(at);

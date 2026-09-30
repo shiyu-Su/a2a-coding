@@ -843,6 +843,68 @@ test("轨16 findAwaitingTurn（真机复现画像 850b3aa9）：轮史被裁剩�
 });
 
 // ---------------------------------------------------------------------------
+// 收口接线（v0.9.6 REQ-2026-09-30-02 · §2-2）：回执块解析落 pollUntilTerminal 终态分支
+// ---------------------------------------------------------------------------
+
+const RECEIPT_TAIL = [
+  "【回执】",
+  "要点:",
+  "- 读了改造文档",
+  "- 改了 host-turn.ts",
+  "待用户: ① 是否重启板 ② 要不要补测试",
+  "下一步: 等 N4 渲染",
+].join("\n");
+
+test("回执收口：succeeded 轮从 artifact 全文解析入账（TurnResult 透传 · 400 字摘要口径零改）", async () => {
+  const h = harness({ scripts: [{ pollStates: ["completed"], text: `本轮把确认单落了文件。\n\n${RECEIPT_TAIL}` }] });
+  const r = await settled(h.manager.submitTurn({ org: "flow", requirementId: "REQ-A", text: "A" }));
+  assert.deepEqual(r.receipt, {
+    head: ["读了改造文档", "改了 host-turn.ts"],
+    todo: ["是否重启板", "要不要补测试"],
+    next: "等 N4 渲染",
+  });
+  const rec = findTurn(h.ledger.load().ledger, r.turnId);
+  assert.deepEqual(rec.receipt, r.receipt, "台账与结果同源");
+  assert.equal(
+    rec.summary,
+    "本轮把确认单落了文件。 【回执】 要点: - 读了改造文档 - 改了 host-turn.ts 待用户: ① 是否重启板 ② 要不要补测试 下一步: 等 N4 渲染",
+    "摘要仍走 summarizeTurnText 前段取法（未超 400 ⇒ 折叠全文），不受回执解析影响、也不剥回执块",
+  );
+});
+
+test("回执收口：待澄清轮从 question 原文解析（artifact 全文仅解析即弃的已裁口径不扩到 question 面）", async () => {
+  const h = harness({ scripts: [{ pollStates: ["input-required"], question: `要不要按 v0.9.6 发布？\n\n${RECEIPT_TAIL.slice(RECEIPT_TAIL.indexOf("【回执】"))}` }] });
+  const r = await settled(h.manager.submitTurn({ org: "flow", requirementId: "REQ-A", text: "A" }));
+  assert.equal(r.state, "awaiting_answer");
+  assert.equal(r.question.startsWith("要不要按 v0.9.6 发布？"), true, "交人面的问题原文不被改写");
+  assert.deepEqual(r.receipt?.head, ["读了改造文档", "改了 host-turn.ts"]);
+});
+
+test("回执收口：无回执块 / cancel / timeout 出口 ⇒ receipt=null 落账（旧记录兼容）", async () => {
+  const h = harness({
+    scripts: [
+      { pollStates: ["completed"], text: "普通结果，无回执块" },
+      { pollStates: ["working"] },
+      { pollStates: ["working"] },
+    ],
+    turnTimeoutMs: 50,
+    pollIntervalMs: 10,
+  });
+  const plain = await settled(h.manager.submitTurn({ org: "flow", requirementId: "REQ-A", text: "A" }));
+  assert.equal(plain.receipt, null);
+  assert.equal(findTurn(h.ledger.load().ledger, plain.turnId).receipt, null);
+  const never = h.manager.submitTurn({ org: "flow", requirementId: "REQ-B", text: "永不结束的轮" });
+  assert.equal(await waitUntil(() => h.count("tasks/get") >= 1), true);
+  await h.manager.cancelTurn(never.turnId);
+  const c = await never.done;
+  assert.equal(c.state, "canceled");
+  assert.equal(c.receipt, null);
+  const t = await settled(h.manager.submitTurn({ org: "flow", requirementId: "REQ-C", text: "超时轮" }));
+  assert.equal(t.state, "timeout");
+  assert.equal(t.receipt, null);
+});
+
+// ---------------------------------------------------------------------------
 // 硬约束面（源码扫描：不写引擎状态机 · 不走 Launcher · 不自行管进程）
 // ---------------------------------------------------------------------------
 

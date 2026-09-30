@@ -12,6 +12,7 @@ import {
   isTerminalTurnState,
   openSession,
   parseTurnLedger,
+  parseTurnRecord,
   serializeTurnLedger,
   trimTurns,
   upsertTurn,
@@ -86,6 +87,7 @@ function turn(turnId, state, queuedAt = "2026-09-24T00:00:00.000Z") {
     question: null,
     error: null,
     bridgeNote: null,
+    receipt: null,
     queuedAt,
     startedAt: null,
     finishedAt: null,
@@ -152,6 +154,40 @@ test("序列化往返：文件形态读回与内存一致", () => {
   const back = parseTurnLedger(JSON.parse(serializeTurnLedger(ledger)));
   assert.deepEqual(back.turns, ledger.turns);
   assert.deepEqual(back.requirements, ledger.requirements);
+});
+
+// ---------------------------------------------------------------------------
+// receipt 字段（v0.9.6 · REQ-2026-09-30-02 · N2）
+// ---------------------------------------------------------------------------
+
+test("receipt：带回执的轮记录序列化往返保真（RMW 回路不静默丢字段）", () => {
+  const receipt = { head: ["改了台账解析", "补了三条锚"], todo: ["① 是否发版"], next: "等用户验收" };
+  const rec = { ...turn("T1", "succeeded"), receipt };
+  const back = parseTurnLedger(JSON.parse(serializeTurnLedger(upsertTurn(emptyTurnLedger(), rec))));
+  assert.equal(back.turns.length, 1);
+  assert.deepEqual(back.turns[0].receipt, receipt);
+  // 真正的风险面 = 存盘的 read-modify-write 回路（漏解析 ⇒ 静默丢弃、无告警）
+  const dir = mkdtempSync(join(tmpdir(), "board-turn-receipt-"));
+  const store = new HostTurnLedgerStore(join(dir, "host-turns.json"));
+  store.recordTurn(rec);
+  assert.deepEqual(new HostTurnLedgerStore(store.file).load().ledger.turns[0].receipt, receipt);
+});
+
+test("receipt：旧记录（文件里根本没有该键）解析为 null，记录本身不丢", () => {
+  const legacy = { ...turn("T1", "succeeded") };
+  delete legacy.receipt;
+  const rec = parseTurnRecord(legacy);
+  assert.ok(rec);
+  assert.equal(rec.receipt, null);
+});
+
+test("receipt：结构损坏（缺键 / 类型不符）解析为 null，不臆造也不丢整条记录", () => {
+  const missingKey = parseTurnRecord({ ...turn("T1", "succeeded"), receipt: { head: ["a"], next: "b" } });
+  assert.ok(missingKey);
+  assert.equal(missingKey.receipt, null);
+  const wrongType = parseTurnRecord({ ...turn("T2", "succeeded"), receipt: { head: "a", todo: [], next: "b" } });
+  assert.ok(wrongType);
+  assert.equal(wrongType.receipt, null);
 });
 
 // ---------------------------------------------------------------------------

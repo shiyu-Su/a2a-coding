@@ -4,7 +4,7 @@
  *
  * 事实源：改造文档 §2.2-6（进程拓扑）· §3.4 R4（并发口径改判）· §3.7（M2b 实测）
  *
- * ## 三条硬口径
+ * ## 四条硬口径
  * 1. **单飞闸挂在「桥」这一层，不是「每需求一个」**（§3.4 R4）：桥内**零并发闸**，
  *    「一个后端进程同时吃两条 `session/prompt`」**从未验证**，且同 `contextId` 并发会互相覆盖
  *    捕获窗并丢文本 ⇒ **同一组织一时刻只允许 1 个在飞 prompt**；第二个需求要发轮 ⇒ **板侧排队**
@@ -15,6 +15,10 @@
  * 3. **`input-required` 不是失败**：桥**保留了** outcome 约定注入 ⇒ `input-required` 正是板要的
  *    「待澄清」信号（与引擎 `needs_input` 对上）⇒ 落 `awaiting_answer`（**非终态、不占闸位**），
  *    可续发同 `contextId` 的一轮。
+ * 4. **回执块 = 唯一获准的 agent 文本解析面**（v0.9.6 REQ-2026-09-30-02）：收口点只对尾部
+ *    【回执】块做结构化解析（`receipt.ts` 的 {@link parseReceiptBlock} 契约）；摘要等其余文本
+ *    **一律不解析**。解析**必须容错**：不匹配 ⇒ 返回 null ⇒ 退回现状 400 字摘要，任何情况不劣于
+ *    无解析（同口径亦登记于 `host-relay.ts`/`heartbeat.ts` 的提示词注释）。
  *
  * ## 本节点的边界
  * - **不做进程管理**：起 / 停 / 探活 / 空闲回收复用 BD4a 的出口，经 {@link BridgeGateway} 接线
@@ -51,6 +55,7 @@ import {
   type HostBridgeConfig,
   type HostBridgeManager,
 } from "./host-bridge.js";
+import { parseReceiptBlock, type Receipt } from "./receipt.js";
 
 // ---------------------------------------------------------------------------
 // 口径常量
@@ -453,6 +458,8 @@ export interface TurnResult {
   text: string | null;
   summary: string | null;
   question: string | null;
+  /** 尾部【回执】块的结构化结果（无回执 / 解析未命中 ⇒ null；与台账 `TurnRecord.receipt` 同源）。 */
+  receipt: Receipt | null;
   error: { code: string; message: string } | null;
   /** 桥重拉提示（§2.2-7）；无 ⇒ null。 */
   bridgeNote: string | null;
@@ -763,7 +770,7 @@ export class HostTurnManager {
       const waiting = channel.queue.indexOf(job);
       if (waiting >= 0) channel.queue.splice(waiting, 1);
       if (job.state === "queued") {
-        this.finish(job, { kind: "canceled", text: null, question: null, error: null });
+        this.finish(job, { kind: "canceled", text: null, question: null, receipt: null, error: null });
         return { ok: true, turnId, state: "canceled", error: null, display: "已取消（未开跑，已从队列移除）" };
       }
     }
@@ -783,6 +790,7 @@ export class HostTurnManager {
       kind: "canceled",
       text: null,
       question: null,
+      receipt: null,
       error: rpcError === null ? null : { code: rpcError.code, message: `已停本地轮，但桥侧回执异常：${rpcError.message}` },
     });
     // `finish` 幂等：若在途 `tasks/get` 已先行收口 ⇒ 这里不改写，返回**真实既有态**
@@ -1042,6 +1050,7 @@ export class HostTurnManager {
           kind: "failed",
           text: null,
           question: null,
+          receipt: null,
           error: { code: "bridge_unavailable", message: `${HOST_BRIDGE_DOWN_MESSAGE}：${ensured.error ?? "端口未知"}` },
         });
         return;
@@ -1060,12 +1069,12 @@ export class HostTurnManager {
       this.writeTurn(job);
       await this.pollUntilTerminal(job, rpc);
     } catch (err) {
-      this.finish(job, { kind: "failed", text: null, question: null, error: errorOf(err, "turn_failed") });
+      this.finish(job, { kind: "failed", text: null, question: null, receipt: null, error: errorOf(err, "turn_failed") });
     } finally {
       // BD4a 的在飞计数与 beginRound 严格配对：发轮抛错也必须落计数，否则该桥永不回收
       if (roundBegan) this.gateway.endRound(job.org);
       // 收口兜底：任何出口都不允许「没收口就交闸」（否则 done 永不解决、闸位泄漏）
-      this.finish(job, { kind: "failed", text: null, question: null, error: { code: "turn_unsettled", message: "本轮未收口（内部兜底）" } });
+      this.finish(job, { kind: "failed", text: null, question: null, receipt: null, error: { code: "turn_unsettled", message: "本轮未收口（内部兜底）" } });
       const channel = this.channel(job.org);
       if (channel.running === job) channel.running = null;
       this.pump(job.org);
@@ -1091,7 +1100,7 @@ export class HostTurnManager {
     const deadline = this.now() + job.timeoutMs;
     for (;;) {
       if (job.cancelRequested) {
-        this.finish(job, { kind: "canceled", text: null, question: null, error: null });
+        this.finish(job, { kind: "canceled", text: null, question: null, receipt: null, error: null });
         return;
       }
       let task: NormalizedTask;
@@ -1101,7 +1110,7 @@ export class HostTurnManager {
         const error = errorOf(err, "poll_failed");
         if (error.code === "task_not_found") {
           // 桥侧不再认识这条任务（如桥重启）⇒ 判失败，**不谎报成功**
-          this.finish(job, { kind: "failed", text: null, question: null, error });
+          this.finish(job, { kind: "failed", text: null, question: null, receipt: null, error });
           return;
         }
         if (this.now() >= deadline) {
@@ -1109,6 +1118,7 @@ export class HostTurnManager {
             kind: "failed",
             text: null,
             question: null,
+            receipt: null,
             state: "timeout",
             error: { code: "turn_timeout", message: `等待终态超过 ${String(job.timeoutMs)}ms（有界上限），末次读取仍失败：${error.message}` },
           });
@@ -1118,10 +1128,14 @@ export class HostTurnManager {
         continue;
       }
       if (task.terminal) {
+        // 回执解析（§2-2 已裁方案 a）：succeeded/failed 拿 artifact 原文、待澄清轮拿 question 原文；
+        // 其余出口（cancel/timeout/抛错）无原文 ⇒ 不解析。artifact 全文仅解析即弃（不落 summary）。
+        const receiptSource = task.kind === "awaiting_answer" ? task.question : task.text;
         this.finish(job, {
           kind: task.kind,
           text: task.kind === "awaiting_answer" ? task.question : task.text,
           question: task.question,
+          receipt: receiptSource === null ? null : parseReceiptBlock(receiptSource),
           error:
             task.kind === "failed"
               ? { code: "bridge_task_failed", message: task.reason ?? task.text ?? "桥侧任务失败" }
@@ -1136,6 +1150,7 @@ export class HostTurnManager {
           state: "timeout",
           text: null,
           question: null,
+          receipt: null,
           error: { code: "turn_timeout", message: `等待终态超过 ${String(job.timeoutMs)}ms（有界上限），已尽力取消` },
         });
         return;
@@ -1167,6 +1182,8 @@ export class HostTurnManager {
       state?: TurnState;
       text: string | null;
       question: string | null;
+      /** 尾部【回执】块解析结果（仅终态收口点持有原文并解析；其余出口恒 null）。 */
+      receipt: Receipt | null;
       error: { code: string; message: string } | null;
     },
   ): void {
@@ -1182,6 +1199,7 @@ export class HostTurnManager {
       state,
       summary,
       question: state === "awaiting_answer" ? (outcome.question ?? summary) : outcome.question,
+      receipt: outcome.receipt ?? null,
       error: outcome.error,
       bridgeNote: job.bridgeNote,
       startedAt: job.startedAt === null ? null : toIso(job.startedAt),
@@ -1227,6 +1245,7 @@ export class HostTurnManager {
       text: job.record.summary,
       summary: job.record.summary,
       question: job.record.question,
+      receipt: job.record.receipt ?? null,
       error: job.record.error,
       bridgeNote: job.bridgeNote,
       display: turnDisplay(job),

@@ -455,6 +455,11 @@ export interface NextStepInput {
   busyTurn?: BusyTurnView | null;
   /** v0.9.5 C1：当前时刻（毫秒）；缺省 ⇒ 卡滞档不可判（不猜） */
   nowMs?: number;
+  /**
+   * v0.9.6 N5：详情页「最近一轮」下方的结构化回执卡是否在场（最新轮带 `receipt` ⇒ true）。
+   * 缺省 false ⇒ 未接线的调用方保持旧行为（引导行照旧显示「最近一轮 <state>：<摘要>」）。
+   */
+  receiptPresent?: boolean;
 }
 
 /** 卡滞判据（纯函数）：executing ∧ 无在飞 / 排队轮 ∧ 最近一轮距今 > {@link TURN_STALL_AFTER_MS}。 */
@@ -496,11 +501,16 @@ function factsLine(input: NextStepInput): string {
   if (c !== undefined && c.total > 0) parts.push(`任务 ${String(c.completed)}/${String(c.total)} 完成 · 失败 ${String(c.failed)}`);
   const turn = input.latestTurn;
   if (turn !== null && turn !== undefined) {
-    const summary =
-      turn.summary !== null && turn.summary !== ""
-        ? `：${turn.summary.length > LATEST_TURN_SUMMARY_MAX ? `${turn.summary.slice(0, LATEST_TURN_SUMMARY_MAX)}…` : turn.summary}`
-        : "";
-    parts.push(`最近一轮 ${turn.state}${summary}`);
+    if (input.receiptPresent === true) {
+      // 回执卡（要点 / 待用户 / 下一步）已在「最近一轮」下方渲染 ⇒ 引导行不重复状态+摘要，改指回执卡。
+      parts.push("本轮回执见下方回执卡");
+    } else {
+      const summary =
+        turn.summary !== null && turn.summary !== ""
+          ? `：${turn.summary.length > LATEST_TURN_SUMMARY_MAX ? `${turn.summary.slice(0, LATEST_TURN_SUMMARY_MAX)}…` : turn.summary}`
+          : "";
+      parts.push(`最近一轮 ${turn.state}${summary}`);
+    }
   }
   return parts.length === 0 ? "" : `（${parts.join(" · ")}` + "）";
 }
@@ -529,6 +539,9 @@ export function deriveNextStepHint(input: NextStepInput): string {
     case "未发起": {
       const pending = (input.registeredDocs?.length ?? 0) > 0 || (input.latestTurn !== null && input.latestTurn !== undefined);
       if (pending) {
+        if (input.receiptPresent === true) {
+          return `下一步：等你 —— 回执卡「待用户」列出了待你拍板的事项 ⇒ 在动作区补充框逐条写明裁定后点「提交给 agent」。${facts}`;
+        }
         return `下一步：等你 —— agent 已把产出落到本页，看完在动作区补充框写明裁定 ⇒ 点「提交给 agent」。${facts}`;
       }
       return "下一步：等你 —— 本卡尚无产出 ⇒ 点「让 agent 继续」开始需求访谈（产出需求确认单后进入改造方案）。";

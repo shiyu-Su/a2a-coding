@@ -16,10 +16,11 @@
  * - 未列出的边（如 `released → notstart`）一律 `forbidden`（fail-closed，不猜）。
  *
  * **自动转换唯一一处** = {@link applyAutoVersionTransitions}（渲染前惰性比对
- * 「台账 `notstart` 条目 × 名下存在 `stage ≠ 需求分析` 的卡」），**三条护栏**：
+ * 「台账 `notstart` 条目 × 名下存在 `stage ≠ 需求分析` 的卡」，**逐组织判定** —— 候选键 =
+ * `(org, version)`，REQ-2026-09-28-07 口径 31），**三条护栏**：
  * ① 幂等（命中一跳后 `status = active`，下次比对不再命中）；② 写失败不阻断渲染
  * （`failed` 回报，调用方 warn 留痕；失败条目从回落台账剔除 ⇒ 徽标回落派生态）；
- * ③ 进程内节流（同条目 ≥ {@link AUTO_THROTTLE_MS} 至多尝试一次）。自动写留
+ * ③ 进程内节流（同 `(org, version)` 条目 ≥ {@link AUTO_THROTTLE_MS} 至多尝试一次）。自动写留
  * {@link AUTO_NOTE} 与手动区分。**不做 `active → notstart` 自动回落**（stage/approval 单向无回边）。
  */
 import { normalizeVersion } from "./version-order.js";
@@ -43,11 +44,21 @@ export function isConfirmedCard(stage: string | null | undefined): boolean {
   return (stage ?? "") !== IDEA_CARD_STAGE;
 }
 
-/** 自动转换判据 / 手动闸所需的**最小卡片事实**（`FeatureListItem` 的结构相容子集）。 */
+/**
+ * 自动转换判据 / 手动闸所需的**最小卡片事实**（`FeatureListItem` 的结构相容子集）。
+ * `ownerGroup` = 卡片归属组织，自动转换候选键之一（口径 31）；缺列 / 空白 ⇒ 未归属桶（见 `cardOrg`）。
+ */
 export interface VersionCardFact {
   version: string | null | undefined;
   stage: string | null | undefined;
   state?: string | null | undefined;
+  ownerGroup?: string | null | undefined;
+}
+
+/** 自动转换的**落点键** = 台账条目 `(org, version)`（口径 31；`org` 空串 = 未归属桶）。 */
+export interface AutoTransitionTarget {
+  org: string;
+  version: string;
 }
 
 // ---------------------------------------------------------------------------
@@ -128,43 +139,68 @@ export function decideVersionTransition(
 // ---------------------------------------------------------------------------
 
 /**
- * 自动转 `active` 的候选（纯函数）：台账中 `status = notstart` **且**名下存在已确认卡
- * （`stage ≠ 需求分析`）的条目版本号；顺序 = 台账登记序。排卡本身**不触发**（想法卡可停在
- * notstart 版本），仅「首卡过确认门」触发。空版本串 / 无卡 ⇒ 不入候选。
+ * 复合键分隔符 = NUL（U+0000）。组织名与版本串都是自由文本，
+ * 用 `-` / `.` 等常规字符拼接会撞键（`('a', 'b-c')` 与 `('a-b', 'c')` 同串）。
+ */
+const KEY_SEP = String.fromCharCode(0);
+
+/** `(org, version)` 复合串：节流表键与「写失败回落」集合共用同一把键。 */
+export function versionKey(org: string, version: string): string {
+  return org + KEY_SEP + version;
+}
+
+/** 卡片归属组织键：trim；老桥缺列 / 空白 ⇒ 空串（= 台账的未归属桶，口径 32）。 */
+function cardOrg(raw: string | null | undefined): string {
+  return (raw ?? "").trim();
+}
+
+/**
+ * 自动转 `active` 的候选（纯函数）：台账中 `status = notstart` **且**「该组织的该版本」名下
+ * 存在已确认卡（`stage ≠ 需求分析`）的条目，**逐组织判定** ⇒ 候选键 = `(org, version)`
+ * （口径 31；不同组织各有 `v0.9.5` 互不点亮）。顺序 = 台账登记序。排卡本身**不触发**
+ * （想法卡可停在 notstart 版本），仅「首卡过确认门」触发。空版本串 / 无卡 ⇒ 不入候选。
  */
 export function deriveAutoActiveVersions(
   ledger: VersionsLedger,
   cards: readonly VersionCardFact[],
-): string[] {
-  const confirmedVersions = new Set<string>();
+): AutoTransitionTarget[] {
+  const confirmedKeys = new Set<string>();
   for (const c of cards) {
     const v = normalizeVersion(c.version);
-    if (v !== "" && isConfirmedCard(c.stage)) confirmedVersions.add(v);
+    if (v !== "" && isConfirmedCard(c.stage)) confirmedKeys.add(versionKey(cardOrg(c.ownerGroup), v));
   }
   return ledger.versions
-    .filter((r) => r.status === "notstart" && confirmedVersions.has(normalizeVersion(r.version)))
-    .map((r) => r.version);
+    .filter(
+      (r) =>
+        r.status === "notstart" &&
+        confirmedKeys.has(versionKey(cardOrg(r.org), normalizeVersion(r.version))),
+    )
+    .map((r) => ({ org: r.org, version: r.version }));
 }
 
 /** 自动转换所需的**最小存储面**（`VersionsLedgerStore` 的结构相容子集；单测可注入假 store）。 */
 export interface AutoTransitionStore {
-  /** 把条目置 `active` 并落盘；**写失败必须抛出**（由本函数兜、不阻断调用方渲染）。 */
+  /**
+   * 把「该组织的该版本」条目置 `active` 并落盘（org 精确匹配 `(org, version)`，口径 31）；
+   * **写失败必须抛出**（由本函数兜、不阻断调用方渲染）。
+   */
   setStatus(
     version: string,
     status: VersionLedgerStatus,
     now: string,
-    note?: string | null,
+    note: string,
+    org: string,
   ): { ledger: VersionsLedger };
 }
 
 export interface AutoTransitionInput {
   /** 当前台账（调用方已 load）。 */
   ledger: VersionsLedger;
-  /** 需求卡事实（全局列表；判据只看 version / stage）。 */
+  /** 需求卡事实（**全局列表**；落点判定按 `(ownerGroup, version)` 分组织，口径 31）。 */
   cards: readonly VersionCardFact[];
   /** 存储写入面（抛错 ⇒ 计入 `failed`，不向上传播）。 */
   store: AutoTransitionStore;
-  /** 进程内节流表（版本 → 上次尝试时刻 ms）；**跨请求复用**，由调用方持有。 */
+  /** 进程内节流表（`versionKey(org, version)` → 上次尝试时刻 ms）；**跨请求复用**，由调用方持有。 */
   throttle: Map<string, number>;
   /** 当前时刻 ms。 */
   nowMs: number;
@@ -173,45 +209,54 @@ export interface AutoTransitionInput {
 export interface AutoTransitionOutcome {
   /** **回落渲染用**台账：已含成功转换；写失败条目被剔除 ⇒ 列头徽标回落派生态。 */
   ledger: VersionsLedger;
-  /** 本次成功转换的版本（`note = AUTO_NOTE`）。 */
-  written: string[];
-  /** 命中节流跳过的版本。 */
-  throttled: string[];
-  /** 尝试写入但失败的版本（调用方 warn 留痕）。 */
-  failed: string[];
+  /** 本次成功转换的条目（`note = AUTO_NOTE`）。 */
+  written: AutoTransitionTarget[];
+  /** 命中节流跳过的条目。 */
+  throttled: AutoTransitionTarget[];
+  /** 尝试写入但失败的条目（调用方 warn 留痕）。 */
+  failed: AutoTransitionTarget[];
 }
 
 /**
- * 应用自动转换（`notstart → active`）：逐候选 **先判节流**（同条目 ≥ {@link AUTO_THROTTLE_MS}
- * 至多尝试一次，失败也记录时刻避免渲染风暴），再尝试写；失败计入 `failed`、**不抛出**。
- * 返回的 `ledger` 为回落渲染台账（护栏②：失败条目剔除 ⇒ 不误导为「未开始」）。
+ * 应用自动转换（`notstart → active`）：逐候选 **先判节流**（同 `(org, version)` 条目 ≥
+ * {@link AUTO_THROTTLE_MS} 至多尝试一次，失败也记录时刻避免渲染风暴），再尝试写；
+ * 失败计入 `failed`、**不抛出**。
+ * 返回的 `ledger` 为回落渲染台账（护栏②：失败条目按 `(org, version)` 剔除 ⇒ 不误导为「未开始」，
+ * 也不误剔他组织的同版号条目）。
  */
 export function applyAutoVersionTransitions(input: AutoTransitionInput): AutoTransitionOutcome {
   const { ledger, cards, store, throttle, nowMs } = input;
   const qualifying = deriveAutoActiveVersions(ledger, cards);
-  const written: string[] = [];
-  const throttled: string[] = [];
-  const failed: string[] = [];
+  const written: AutoTransitionTarget[] = [];
+  const throttled: AutoTransitionTarget[] = [];
+  const failed: AutoTransitionTarget[] = [];
   let effective = ledger;
-  for (const version of qualifying) {
-    const last = throttle.get(version);
+  for (const target of qualifying) {
+    const key = versionKey(target.org, target.version);
+    const last = throttle.get(key);
     if (last !== undefined && nowMs - last < AUTO_THROTTLE_MS) {
-      throttled.push(version);
+      throttled.push(target);
       continue;
     }
-    throttle.set(version, nowMs);
+    throttle.set(key, nowMs);
     try {
-      effective = store.setStatus(version, "active", new Date(nowMs).toISOString(), AUTO_NOTE).ledger;
-      written.push(version);
+      effective = store.setStatus(
+        target.version,
+        "active",
+        new Date(nowMs).toISOString(),
+        AUTO_NOTE,
+        target.org,
+      ).ledger;
+      written.push(target);
     } catch {
-      failed.push(version);
+      failed.push(target);
     }
   }
   if (failed.length > 0) {
-    const failedSet = new Set(failed);
+    const failedSet = new Set(failed.map((t) => versionKey(t.org, t.version)));
     effective = {
       version: effective.version,
-      versions: effective.versions.filter((r) => !failedSet.has(r.version)),
+      versions: effective.versions.filter((r) => !failedSet.has(versionKey(r.org, r.version))),
     };
   }
   return { ledger: effective, written, throttled, failed };

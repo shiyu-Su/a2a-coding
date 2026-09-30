@@ -49,6 +49,7 @@
  */
 import type { SubmittedTurn, SubmitTurnInput, TurnResult } from "./host-turn.js";
 import { isTerminalFeatureState, type ChainStopSource } from "./derive.js";
+import { RECEIPT_CONTRACT } from "./receipt.js";
 
 // ---------------------------------------------------------------------------
 // 口径常量
@@ -200,7 +201,8 @@ export interface RelayPromptInput {
 
 /**
  * 自动接力轮的提示词（纯函数）。**不出现任何 MCP 工具全名**（§3.6：各家后端工具名不同）；
- * 把板侧重取到的**引擎态快照作为结构化事实**给 agent（板不解析 agent 文本，只给事实）。
+ * 把板侧重取到的**引擎态快照作为结构化事实**给 agent（板不解析 agent 文本，唯一例外 = 收口回执块
+ * （`src/receipt.ts` `parseReceiptBlock`）：获准解析、且必须容错——不匹配即退回现状摘要，不劣于无解析）。
  */
 export function buildRelayPrompt(input: RelayPromptInput): string {
   const engine = input.engine;
@@ -215,6 +217,9 @@ export function buildRelayPrompt(input: RelayPromptInput): string {
     "1. 先用编排桥的只读能力核对本需求的引擎态与子任务进展，不要凭猜测动手；",
     "2. 子任务仍需等待 ⇒ 按规程收口（需要人决策就用 A2A 的 input-required 结束本轮），不要空转；",
     "3. 状态机推进（审批 / 推进 / 取消）只能经编排桥的能力做，板不代劳。",
+    // v0.9.6 N6：接力轮同样是一轮收尾 ⇒ 引用同一契约常量。
+    "",
+    RECEIPT_CONTRACT,
   ].join("\n");
 }
 

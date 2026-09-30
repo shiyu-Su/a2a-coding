@@ -20,6 +20,8 @@ import { createBoardServer } from "../dist/server.js";
 
 const NOW = "2026-09-28T12:00:00.000Z";
 const IDEA = "需求分析";
+/** B5a 后 HTTP 面唯一看板宿主 = 该组织的空间排期页（与 feature() 缺省 ownerGroup 同源）。 */
+const ORG = "alpha";
 
 function feature(featureId, version, overrides = {}) {
   return {
@@ -28,7 +30,7 @@ function feature(featureId, version, overrides = {}) {
     title: `需求 ${featureId}`,
     requirement: null,
     taskCount: 1,
-    ownerGroup: "alpha",
+    ownerGroup: ORG,
     stage: IDEA,
     version,
     approval: "未发起",
@@ -136,10 +138,11 @@ test("C1-⑤ v0.9.4 现况：卡均 stage=改造方案 ⇒ 进行中；台账态
 // ⑥ HTTP 面 + 不受影响面（需求池列 / 新版本虚列）
 // ---------------------------------------------------------------------------
 
-test("C1-⑥ HTTP /schedule：想法卡列未开始、已确认列进行中；需求池列与虚列不受影响", async () => {
+test("C1-⑥（B5a 改版：全局 /schedule 退役 ⇒ 宿主 = 空间排期页）HTTP：想法卡列未开始、已确认列进行中；需求池列与虚列不受影响", async () => {
   const dir = mkdtempSync(join(tmpdir(), "board-c1-"));
   const ledgerFile = join(dir, "versions.json");
-  writeFileSync(ledgerFile, serializeVersionsLedger(createVersion(emptyVersionsLedger(), "v0.9.9", NOW).ledger), "utf8");
+  // B1 起台账按 (org, version) 键 ⇒ 空间页只切本组织桶，台账条目须带 org 才在 alpha 列现形
+  writeFileSync(ledgerFile, serializeVersionsLedger(createVersion(emptyVersionsLedger(), "v0.9.9", NOW, ORG).ledger), "utf8");
   const cards = [
     feature("F1", "v0.9.5"),
     feature("F2", "v0.9.4", { stage: "改造方案", approval: "已通过", state: "executing" }),
@@ -153,7 +156,7 @@ test("C1-⑥ HTTP /schedule：想法卡列未开始、已确认列进行中；�
   };
   const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client, versionsLedgerFile: ledgerFile });
   try {
-    const text = await (await fetch(`http://127.0.0.1:${handle.port}/schedule`)).text();
+    const text = await (await fetch(`http://127.0.0.1:${handle.port}/org/${ORG}/schedule`)).text();
     assert.match(text, /<h3>v0\.9\.5 <span class="kbadge vbadge notstart"[^>]*>未开始<\/span>/);
     assert.match(text, /<h3>v0\.9\.4 <span class="kbadge vbadge wip"[^>]*>进行中<\/span>/);
     assert.match(headOf(text, "v0.9.9"), /<span class="kbadge vbadge notstart"[^>]*>未开始<\/span>/, "台账 notstart 空列照旧");

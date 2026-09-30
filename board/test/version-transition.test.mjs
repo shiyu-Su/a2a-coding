@@ -7,8 +7,9 @@
  *   **完成集合 = completed + cancelled**（cancelled 轨已终止、无遗留待办 ⇒ 计入），`failed` 不计入
  *   ⇒ 含 failed 反例必须拒；**全 cancelled（无任何交付）同样必须拒**）·
  *   `released → active`（重开）· `notstart → released`（状态机拒）；
- * - 自动转换唯一一处 = 渲染前惰性比对「台账 notstart 条目 × 名下存在 stage ≠ 需求分析 的卡」，
- *   三护栏：幂等 / 写失败不阻断渲染（回落派生态） / 进程内节流（≥30s）；
+ * - 自动转换唯一一处 = 渲染前惰性比对「台账 notstart 条目 × 该组织该版本名下存在 stage ≠ 需求分析 的卡」
+ *   （v0.9.6 B2 · 口径 31：候选键 = `(org, version)`，他组织的卡不点亮本组织条目），
+ *   三护栏：幂等 / 写失败不阻断渲染（回落派生态） / 进程内节流（≥30s，按条目计量）；
  * - 自动写留 `note='auto:first-card-confirmed'`。
  */
 import { test } from "node:test";
@@ -126,7 +127,7 @@ test("W3-⑥ released → active 重开放行；notstart → released 与 releas
 // 自动转换引擎（注入假 store）：判据 + 三护栏
 // ---------------------------------------------------------------------------
 
-/** 假存储：可注入 `fail`（抛错）以验证护栏②；记录全部写入尝试。 */
+/** 假存储：可注入 `fail`（全抛）/ `failOrg`（该组织的写抛错）以验证护栏②；记录全部写入尝试。 */
 function fakeStore(ledger, opts = {}) {
   let current = ledger;
   const writes = [];
@@ -135,39 +136,46 @@ function fakeStore(ledger, opts = {}) {
     get ledger() {
       return current;
     },
-    setStatus(version, status, now, note) {
-      writes.push({ version, status, now, note });
-      if (opts.fail) throw new Error("disk boom（用例注入）");
-      current = setVersionStatus(current, version, status, now, note).ledger;
+    setStatus(version, status, now, note, org) {
+      writes.push({ version, status, now, note, org });
+      if (opts.fail || (opts.failOrg !== undefined && org === opts.failOrg)) throw new Error("disk boom（用例注入）");
+      current = setVersionStatus(current, version, status, now, note, org).ledger;
       return { ledger: current };
     },
   };
 }
 
-function twoVersionLedger() {
-  let l = createVersion(emptyVersionsLedger(), "v0.9.4", NOW).ledger;
-  return createVersion(l, "v0.9.5", NOW).ledger;
+function twoVersionLedger(org = "alpha") {
+  let l = createVersion(emptyVersionsLedger(), "v0.9.4", NOW, org).ledger;
+  return createVersion(l, "v0.9.5", NOW, org).ledger;
 }
 
-test("W3-⑦ 自动转换判据：仅「notstart ∧ 名下已确认卡」命中；想法卡不触发；幂等（护栏①：一跳后不再写）", () => {
+/** 两条同版号、分属两组织的 notstart 台账（口径 31 的隔离面）。 */
+function sameVersionTwoOrgs() {
+  let l = createVersion(emptyVersionsLedger(), "v0.9.4", NOW, "alpha").ledger;
+  return createVersion(l, "v0.9.4", NOW, "beta").ledger;
+}
+
+test("W3-⑦ 自动转换判据：仅「notstart ∧ 该组织该版本名下已确认卡」命中；想法卡不触发；幂等（护栏①：一跳后不再写）", () => {
   const ledger = twoVersionLedger();
   const cards = [
-    { version: "v0.9.4", stage: "改造方案" }, // 已确认
-    { version: "v0.9.5", stage: IDEA_CARD_STAGE }, // 想法卡 ⇒ 不触发
+    { ownerGroup: "alpha", version: "v0.9.4", stage: "改造方案" }, // 已确认
+    { ownerGroup: "alpha", version: "v0.9.5", stage: IDEA_CARD_STAGE }, // 想法卡 ⇒ 不触发
   ];
-  assert.deepEqual(deriveAutoActiveVersions(ledger, cards), ["v0.9.4"], "仅已确认卡命中；想法卡不触发");
+  assert.deepEqual(deriveAutoActiveVersions(ledger, cards), [{ org: "alpha", version: "v0.9.4" }], "仅已确认卡命中；想法卡不触发");
 
   const store = fakeStore(ledger);
   const throttle = new Map();
   const first = applyAutoVersionTransitions({ ledger, cards, store, throttle, nowMs: NOW_MS });
-  assert.deepEqual(first.written, ["v0.9.4"]);
+  assert.deepEqual(first.written, [{ org: "alpha", version: "v0.9.4" }]);
   assert.deepEqual(first.failed, []);
   assert.deepEqual(first.throttled, []);
   assert.equal(store.writes.length, 1);
   assert.equal(store.writes[0].note, AUTO_NOTE, "自动写留 note");
-  assert.equal(findVersionRecord(first.ledger, "v0.9.4").status, "active");
-  assert.equal(findVersionRecord(first.ledger, "v0.9.4").note, AUTO_NOTE);
-  assert.equal(findVersionRecord(first.ledger, "v0.9.5").status, "notstart", "想法卡版本停在 notstart");
+  assert.equal(store.writes[0].org, "alpha", "写入按 (org, version) 精确落点");
+  assert.equal(findVersionRecord(first.ledger, "v0.9.4", "alpha").status, "active");
+  assert.equal(findVersionRecord(first.ledger, "v0.9.4", "alpha").note, AUTO_NOTE);
+  assert.equal(findVersionRecord(first.ledger, "v0.9.5", "alpha").status, "notstart", "想法卡版本停在 notstart");
 
   // 护栏① 幂等：以回落台账再跑一次 ⇒ 已 active，候选为空 ⇒ 零写。
   const second = applyAutoVersionTransitions({
@@ -181,18 +189,48 @@ test("W3-⑦ 自动转换判据：仅「notstart ∧ 名下已确认卡」命中
   assert.equal(store.writes.length, 1, "命中一跳不再写");
 });
 
-test("W3-⑧ 护栏③ 进程内节流：同条目 ≥30s 至多尝试一次", () => {
-  const ledger = createVersion(emptyVersionsLedger(), "v0.9.4", NOW).ledger;
-  const cards = [{ version: "v0.9.4", stage: "改造方案" }];
+test("W3-⑦b 自动转换逐 org（口径 31）：候选键 = (org, version) ⇒ 他组织的已确认卡不点亮本组织同版号，节流亦按条目计量", () => {
+  const ledger = sameVersionTwoOrgs();
+  const cards = [{ ownerGroup: "alpha", version: "v0.9.4", stage: "改造方案" }];
+  assert.deepEqual(deriveAutoActiveVersions(ledger, cards), [{ org: "alpha", version: "v0.9.4" }], "beta 的同版号条目不入候选");
+
+  const store = fakeStore(ledger);
+  const throttle = new Map();
+  const out = applyAutoVersionTransitions({ ledger, cards, store, throttle, nowMs: NOW_MS });
+  assert.deepEqual(out.written, [{ org: "alpha", version: "v0.9.4" }]);
+  assert.equal(findVersionRecord(out.ledger, "v0.9.4", "alpha").status, "active");
+  assert.equal(findVersionRecord(out.ledger, "v0.9.4", "beta").status, "notstart", "他组织的同版号条目不受影响");
+
+  // 节流按 (org, version) 计量：beta 同版号不被 alpha 刚才那次尝试挡住（同刻即可写）
+  const out2 = applyAutoVersionTransitions({
+    ledger: out.ledger,
+    cards: [{ ownerGroup: "beta", version: "v0.9.4", stage: "改造方案" }],
+    store,
+    throttle,
+    nowMs: NOW_MS,
+  });
+  assert.deepEqual(out2.throttled, [], "节流键是复合串，不是光版本串");
+  assert.deepEqual(out2.written, [{ org: "beta", version: "v0.9.4" }]);
+
+  // 未归属桶（口径 32 的迁移层遗留）：无归属的卡只点亮 org = "" 的同版号条目，不认领带组织的条目
+  const three = createVersion(sameVersionTwoOrgs(), "v0.9.4", NOW, "").ledger;
+  const orphanCards = [{ ownerGroup: null, version: "v0.9.4", stage: "改造方案" }];
+  assert.deepEqual(deriveAutoActiveVersions(three, orphanCards), [{ org: "", version: "v0.9.4" }], "org 精确匹配，空串桶不是通配档");
+});
+
+test("W3-⑧ 护栏③ 进程内节流：同 (org, version) 条目 ≥30s 至多尝试一次", () => {
+  const ledger = createVersion(emptyVersionsLedger(), "v0.9.4", NOW, "alpha").ledger;
+  const cards = [{ ownerGroup: "alpha", version: "v0.9.4", stage: "改造方案" }];
   const store = fakeStore(ledger, { fail: true }); // 写失败 ⇒ 条目仍 notstart ⇒ 下次仍命中候选
   const throttle = new Map();
+  const hit = [{ org: "alpha", version: "v0.9.4" }];
 
   const a = applyAutoVersionTransitions({ ledger, cards, store, throttle, nowMs: NOW_MS });
-  assert.deepEqual(a.failed, ["v0.9.4"]);
+  assert.deepEqual(a.failed, hit);
   assert.equal(store.writes.length, 1);
 
   const b = applyAutoVersionTransitions({ ledger, cards, store, throttle, nowMs: NOW_MS + 10_000 });
-  assert.deepEqual(b.throttled, ["v0.9.4"]);
+  assert.deepEqual(b.throttled, hit);
   assert.equal(store.writes.length, 1, "30s 内不再尝试");
 
   const c = applyAutoVersionTransitions({
@@ -202,19 +240,23 @@ test("W3-⑧ 护栏③ 进程内节流：同条目 ≥30s 至多尝试一次", (
     throttle,
     nowMs: NOW_MS + AUTO_THROTTLE_MS,
   });
-  assert.deepEqual(c.failed, ["v0.9.4"]);
+  assert.deepEqual(c.failed, hit);
   assert.equal(store.writes.length, 2, "越过窗口后再尝试");
 });
 
-test("W3-⑨ 护栏② 写失败不阻断：failed 回报 + 回落台账剔除失败条目（不误导为「未开始」）、入参无副作用", () => {
-  const ledger = createVersion(emptyVersionsLedger(), "v0.9.4", NOW).ledger;
-  const cards = [{ version: "v0.9.4", stage: "改造方案" }];
-  const store = fakeStore(ledger, { fail: true });
+test("W3-⑨ 护栏② 写失败不阻断：failed 回报 + 回落台账按 (org, version) 剔除失败条目（不误导为「未开始」、不误剔他组织同版号）、入参无副作用", () => {
+  const ledger = sameVersionTwoOrgs();
+  const cards = [
+    { ownerGroup: "alpha", version: "v0.9.4", stage: "改造方案" },
+    { ownerGroup: "beta", version: "v0.9.4", stage: "改造方案" },
+  ];
+  const store = fakeStore(ledger, { failOrg: "alpha" }); // 只有 alpha 那次写失败
   const out = applyAutoVersionTransitions({ ledger, cards, store, throttle: new Map(), nowMs: NOW_MS });
-  assert.deepEqual(out.failed, ["v0.9.4"]);
-  assert.deepEqual(out.written, []);
-  assert.equal(findVersionRecord(out.ledger, "v0.9.4"), null, "失败条目剔除 ⇒ 徽标回落派生态");
-  assert.equal(findVersionRecord(ledger, "v0.9.4").status, "notstart", "入参台账不得被改动");
+  assert.deepEqual(out.failed, [{ org: "alpha", version: "v0.9.4" }]);
+  assert.deepEqual(out.written, [{ org: "beta", version: "v0.9.4" }]);
+  assert.equal(findVersionRecord(out.ledger, "v0.9.4", "alpha"), null, "失败条目剔除 ⇒ 徽标回落派生态");
+  assert.equal(findVersionRecord(out.ledger, "v0.9.4", "beta").status, "active", "不误剔他组织的同版号条目");
+  assert.equal(findVersionRecord(ledger, "v0.9.4", "alpha").status, "notstart", "入参台账不得被改动");
 });
 
 // ---------------------------------------------------------------------------
@@ -249,8 +291,9 @@ function seedLedger(file, entries) {
   writeFileSync(file, JSON.stringify({ version: 1, versions: entries }, null, 2) + "\n", "utf8");
 }
 
-function rec(version, status) {
-  return { version, status, createdAt: NOW, updatedAt: NOW, note: null };
+/** 台账条目夹具：`org` 缺省 = `feature()` 夹具的归属组织（口径 31 后自动转换按 (org, version) 命中）。 */
+function rec(version, status, org = "alpha") {
+  return { org, version, status, createdAt: NOW, updatedAt: NOW, note: null };
 }
 
 function readLedger(file) {
@@ -432,10 +475,10 @@ test("W3-⑬ HTTP released → active 重开放行（200）", async () => {
   );
 });
 
-test("W3-⑭ HTTP GET /schedule 自动转换：notstart + 已确认卡 ⇒ 落盘 active + note；再 GET 幂等不再写", async () => {
+test("W3-⑭（B5a 改版：全局 /schedule 退役 ⇒ 看板宿主 = 空间排期页）HTTP GET /org/alpha/schedule 自动转换：notstart + 已确认卡 ⇒ 落盘 active + note；再 GET 幂等不再写", async () => {
   await withServer(
     async (base, env) => {
-      const res = await fetch(`${base}/schedule`);
+      const res = await fetch(`${base}/org/alpha/schedule`);
       assert.equal(res.status, 200);
       const html = await res.text();
       const first = readLedger(env.versionsFile)[0];
@@ -444,7 +487,7 @@ test("W3-⑭ HTTP GET /schedule 自动转换：notstart + 已确认卡 ⇒ 落�
       assert.match(html, /<h3>v0\.9\.4 <span class="kbadge vbadge wip"[^>]*>进行中<\/span>/, "徽标 = 台账 active");
 
       const snapshot = readFileSync(env.versionsFile, "utf8");
-      await (await fetch(`${base}/schedule`)).text();
+      await (await fetch(`${base}/org/alpha/schedule`)).text();
       assert.equal(readFileSync(env.versionsFile, "utf8"), snapshot, "幂等：已 active ⇒ 不再写");
     },
     { seed: [rec("v0.9.4", "notstart")], features: [feature("F1", "v0.9.4")] },
@@ -452,7 +495,7 @@ test("W3-⑭ HTTP GET /schedule 自动转换：notstart + 已确认卡 ⇒ 落�
   // 想法卡不触发：GET 后仍 notstart
   await withServer(
     async (base, env) => {
-      await (await fetch(`${base}/schedule`)).text();
+      await (await fetch(`${base}/org/alpha/schedule`)).text();
       assert.equal(readLedger(env.versionsFile)[0].status, "notstart", "仅想法卡 ⇒ 不触发自动转换");
     },
     { seed: [rec("v0.9.4", "notstart")], features: [feature("F1", "v0.9.4", { stage: IDEA_CARD_STAGE })] },

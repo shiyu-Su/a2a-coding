@@ -226,6 +226,9 @@ test("⑦b（真进程钉子）argv 传配置内容一律不生效：--port / --
     process.execPath,
     [join(boardRoot, "dist", "index.js"), "--port=12345", "--group=argv组", "--orgs-dir=Z:/argv", String(port + 1)],
     {
+      // cwd 必须离开真实板根：启动路径的台账 / 挂起台账落点按 `process.cwd()/.data` 解析，
+      // 用板根当 cwd ⇒ 本钉子会改写**生产台账**（v0.9.6 B1 migrateLedgerOrgs 暴露）。
+      cwd: dir,
       stdio: ["ignore", "pipe", "pipe"],
       env: { ...process.env, [CONFIG_PATH_ENV]: path, BOARD_PORT: String(port + 2) },
     },

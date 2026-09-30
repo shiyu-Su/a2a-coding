@@ -11,13 +11,9 @@
  *   无 JS 回退 = 正文 `#new-org-inline` 内联表单）；旧首页（排期看板）深链者落本页为可接受代价，不做 303；
  * - `GET /requirements`    —— **303 重定向回 `/`**（REQ-2026-09-26-04 Q2：需求列表页退役，旧地址深链兼容；
  *   与下 `POST /requirements` **同路径双义已终结** —— GET 恒重定向、不触桥，POST 仍建需求）；
- * - `GET /schedule`        —— **全局排期看板**（v0.9.2 M4/M5，只读；§9-b 起为唯一宿主，不再是 `/` 的别名）：
- *   数据 = 列表 `getFeatures()` 复用，
- *   板内存按 `version` 归组（M1 `version-order.ts` 数值序，非 `x.y.z` 字典序垫底）；列头 = 版本号 +
- *   卡片数；卡片 = title + 状态徽标 + stage/approval + taskCount（按状态分列不做）；
- *   **未排期卡**（单一判据 `trim() === ""`）不占版本列，集中本页末列「需求池」（卡上需求原文截断 120 字）；
- *   页头「＋ 新增需求」按钮 + `<dialog id="new-req-dialog">` 提需求弹窗（REQ-2026-09-26-04 Q1）；
- *   本页注入四枚白名单脚本（详情浮层 / 新增需求弹窗 / 排期拖拽 / vendored mermaid）；零写、零新桥接口；
+ * - `GET /schedule`        —— **303 重定向回门户**（v0.9.6 B5a：全局排期看板整页退役，旧地址深链兼容；
+ *   非 GET ⇒ 405）。看板正文单点 {@link renderScheduleBoard} 保留，唯一调用方 = 组织空间排期页
+ *   `/org/<名>/schedule`（列并集 / 需求池末列 / 四枚白名单脚本 / 页头「＋ 新增需求」「＋ 新版本」都在那一页）；
  * - `GET /features/:id`    —— 需求详情 + 任务 + trace 三面 + 「触发一轮」+「阶段产出」（BD11；
  *   REQ-v0.9.2 按需求归约：该区由本需求 `decisions` 登记驱动，与旧「产出登记」合并为单区，版本目录清单作废）；
  * - `GET /features/:id/docs?file=<name>[&src=A|B][&mode=render|raw]` —— **单文档内容**（BD11 读文档面）：
@@ -30,7 +26,12 @@
  * - `GET /static/<名>`      —— **vendored 静态资产**（BD14，mermaid.min.js）：文件名 = 白名单闭集
  *   （`docs-render.VENDORED_ASSETS`），白名单外 / 缺文件 ⇒ 404，不做目录遍历；同源脚本加载经
  *   CSP `script-src 'self'` 放行（板 CSP 首次放宽，理由见 layout.ts 注释）；
- * - `GET /tasks[?project=]`—— 任务视图（桥 `/api/tasks`，project 必填；缺省为选单页）；
+ * - `GET /tasks`           —— **已退役（v0.9.6 C1 · B5c：全局任务裸页下架）⇒ 303 回门户**；
+ *   **深链存活例外**：`GET /tasks?project=X`（X 非空）⇒ 200 任务表（退役判据 = pathname ∧ query，
+ *   `views.ts` 的 `org===null ∧ 带 project` 渲染分支保留）；非 GET ⇒ 405（同退役先例）；
+ *   空间任务页 `/org/<名>/tasks`（含其选单档）不受影响；
+ *   **C3 补（v0.9.6）**：深链任务表页头加「所属组织：X」标注（声明面 `GET /api/groups` 命中；
+ *   未命中 ⇒「无归属组织」；声明面不可判定 ⇒ 不渲该行；不臆造默认组）；
  * - `GET /projects`        —— 项目 / 机器视图（桥 `/api/projects`）；
  * - `GET /orgs`            —— **已退役（v0.9.4 §9-c · REQ-2026-09-27-06 N3）⇒ 303 回门户 `/`**：
  *   原 REQ-v0.9.2 N6 只读「组织视角」页 + v0.9.4 A5/BD2 管理页整体下架 —— 看 = 门户 `/` 与空间三页
@@ -125,6 +126,7 @@ import {
   type BridgeClient,
   type BridgeClientOptions,
   type FeatureListItem,
+  type ProjectsView,
 } from "./bridge-client.js";
 import { dispositionHttpStatus, terminalTurnRejection, diagnoseOrgsDir, ORGS_DIR_NOT_CONFIGURED, ORG_DISABLED, type BoardHostFace, type TriggerTurnOutcome } from "./host-face.js";
 import {
@@ -179,6 +181,7 @@ import {
   releaseOrgGroup,
   describeMemberWriteFailure,
   describeMemberGroupConflict,
+  ownerOrgOfProject,
   DUPLICATE_MEMBER_CODE,
   memberActionToOp,
   removesLastGroupMember,
@@ -192,7 +195,7 @@ import {
   type GroupMemberWriteOptions,
 } from "./group-admin.js";
 import { OrgsLedgerStore, defaultOrgsLedgerFile, enabledOrgNames, ledgerOrgNames, disabledOrgNames, isOrgDisabled } from "./orgs-ledger.js";
-import { VersionsLedgerStore, defaultVersionsLedgerFile, findVersionRecord, ledgerVersionNames, releasedVersionNames, type VersionsLedger } from "./versions-ledger.js";
+import { VersionsLedgerStore, defaultVersionsLedgerFile, findVersionRecord, ledgerVersionNames, releasedVersionNames, type VersionOrgFilter, type VersionsLedger } from "./versions-ledger.js";
 import { SuspendLedgerStore, defaultSuspendLedgerFile, type SuspendedEntry } from "./suspend-ledger.js";
 import {
   applyAutoVersionTransitions,
@@ -253,6 +256,7 @@ import {
   BOARD_CSP,
   BOARD_REFERRER_POLICY,
   escapeHtml,
+  renderOrgSwitcher,
   renderPage,
   FEATURE_DETAIL_OVERLAY_SCRIPT,
   NEW_REQUIREMENT_DIALOG_SCRIPT,
@@ -280,7 +284,6 @@ import {
   renderNewRequirementDialog,
   renderNewVersionDialog,
   renderOrgPortal,
-  renderOrgSpaceFeaturesList,
   renderNextStepGuide,
   renderOrgSpaceManagePage,
   renderProjects,
@@ -560,8 +563,9 @@ interface Ctx extends PageCtx {
    */
   orgSeed: ResolvedOrgSeedOptions | null;
   /**
-   * v0.9.4 W3：自动转换（`notstart → active`）的**进程内节流表**（版本 → 上次尝试时刻 ms）——
-   * 跨请求复用；板进程内单实例（护栏③）。
+   * v0.9.4 W3：自动转换（`notstart → active`）的**进程内节流表**——
+   * 键 = `versionKey(org, version)` 复合串（v0.9.6 B2 · 口径 31：同一版本在不同组织各自计量），
+   * 值 = 上次尝试时刻 ms；跨请求复用，板进程内单实例（护栏③）。
    */
   versionAutoThrottle: Map<string, number>;
 }
@@ -579,6 +583,8 @@ interface Page {
   extraScripts?: string;
   /** BD7：组织上下文（NAV 组织感知 + 顶栏切换器）；`undefined` ⇒ 按全局页面渲染。 */
   orgNav?: PageOrgNav;
+  /** B5b：组织切换器挂位三态（缺省 `top`）；判据 = 本页是否渲 `renderSpaceNav`，不按「org 非空」推。 */
+  orgSwitcher?: "top" | "body" | "none";
 }
 
 function sendPage(res: ServerResponse, page: Page): void {
@@ -593,6 +599,7 @@ function sendPage(res: ServerResponse, page: Page): void {
       headerActions: page.headerActions,
       errorOverlay: page.errorOverlay,
       orgNav: page.orgNav,
+      orgSwitcher: page.orgSwitcher,
     }),
   );
 }
@@ -709,10 +716,12 @@ function orgsStatusOf(host: BoardHostFace | null): OrgsDirStatus {
  */
 /**
  * 渲染前**惰性自动转换**（W3 · 改造文档 §2.3）：唯一一处 `notstart → active` 触发点。
- * 比对「台账 notstart 条目 × 名下存在已确认卡（stage ≠ 需求分析）」；三护栏由
- * {@link applyAutoVersionTransitions} 承担（幂等 / 写失败不阻断渲染 / 进程内节流），
- * 此处仅做 warn 留痕（写失败 ⇒ 该条目回落派生态、渲染照常）。候选以**全局**需求列表判定
- * （版本是板级数据，不随组织空间过滤）。
+ * 比对「台账 notstart 条目 × 该条目所属组织的该版本名下存在已确认卡（stage ≠ 需求分析）」；
+ * 三护栏由 {@link applyAutoVersionTransitions} 承担（幂等 / 写失败不阻断渲染 / 进程内节流），
+ * 此处仅做 warn 留痕（写失败 ⇒ 该条目回落派生态、渲染照常）。
+ * **候选逐组织判定**（v0.9.6 B2 · 口径 31）：`cards` 喂**全局**列表（自动转换要看得到每张卡的
+ * 归属），落点按 `(ownerGroup, version)` 判定 —— 台账已按 `(org, version)` 成域，他组织的
+ * 已确认卡不点亮本组织的同版号条目。
  */
 function syncAutoVersionTransitions(ctx: Ctx, features: readonly FeatureListItem[]): VersionsLedger {
   const { ledger } = ctx.versionsLedger.load();
@@ -723,39 +732,51 @@ function syncAutoVersionTransitions(ctx: Ctx, features: readonly FeatureListItem
     throttle: ctx.versionAutoThrottle,
     nowMs: ctx.now(),
   });
-  for (const version of outcome.failed) {
+  for (const t of outcome.failed) {
     process.stderr.write(
-      `警告：版本 ${version} 首卡过确认门自动转 active 写失败（不阻断渲染，回落派生态）\n`,
+      `警告：版本 ${t.version}（${t.org === "" ? "未归属组织" : t.org}）首卡过确认门自动转 active 写失败（不阻断渲染，回落派生态）\n`,
     );
   }
   return outcome.ledger;
 }
 
 /**
- * 排期看板正文单点（全局页 ∩ D 档组织空间页共用）：数据源由调用方给定
- * （全局 = `getFeatures()` 原样；空间 = 先过 {@link featuresOfOrg} 按 ownerGroup 过滤）。
+ * 排期看板正文单点（v0.9.6 B5a 起唯一调用方 = D 档组织空间排期页；全局 `/schedule` 页已退役）：
+ * 数据源由调用方给定（空间 = 先过 {@link featuresOfOrg} 按 ownerGroup 过滤）。
  * 弹窗表单的组织上下文（BD8）：`spaceOrg` 非空 ⇒ 免选形态（只读展示 + hidden 值必发 + action 带前缀）。
  * `ledger` = 调用方已过 {@link syncAutoVersionTransitions} 的回落渲染台账（版本列 = 台账 ∪ 卡派生并集）。
  * **增补八 §9.3**：全局页（`spaceOrg` 为 null）另挂「＋ 新版本」弹窗骨架（入口按钮只在全局页头）。
+ * **版本切片读面（v0.9.6 B3 · 口径 3 / 29）**：台账唯一键 = `(org, version)` ⇒ 本页的三张读面
+ * （已发版锁名单 / 版本列并集 / 列头徽标与删除 ×）全部按 `spaceOrg` 切片 —— 空间页他组织的同版号
+ * **既不出空列、也不加锁**（验收④「两组织同版号互不可见互不锁」）；`spaceOrg` 为 null 时传
+ * `undefined` = **不限组织**（跨组织并集档自 B5a 全局页退役起不再有页级调用方，仅留作口径完整）。
+ * 切片只在这一处发生，
+ * `isVersionLocked` / `deriveVersionStatus` / 台账纯函数签名一律不动（口径 3）。
+ * **建版本入口归空间页（v0.9.6 B4 · 口径 4 / 9）**：「＋ 新版本」弹窗骨架的渲染门由「只全局页」
+ * **反转**为「只空间页」—— 台账按 `(org, version)` 成域后，全局页**没有组织上下文**（建版本表单零
+ * org 字段、org 只从路径取，见 {@link handleWriteVersions}），挂在那儿只会把新版本写进**未归属空串桶**
+ * ⇒ 门户与各空间页都读不到 = 静默黑洞。故入口随本节点整体迁进空间排期页（全局页头按钮同批撤除；
+ * `POST /versions` 全局路由与写闸**零改动**留作纯 HTTP 兜底口，口径同 §9.2「UI 撤、写口留」）。
  */
 function renderScheduleBoard(
   ctx: Ctx,
   features: readonly FeatureListItem[],
   ledger: VersionsLedger,
-  spaceOrg: string | null = null,
+  spaceOrg: string | null,
 ): string {
-  const lockedVersions = releasedVersionNames(ledger);
+  const org = spaceOrg === null ? undefined : spaceOrg.trim();
+  const lockedVersions = releasedVersionNames(ledger, org);
   return (
-    renderSchedule(groupFeaturesByVersion(features, ledgerVersionNames(ledger)), selectRequirementPool(features), lockedVersions, ledger) +
+    renderSchedule(groupFeaturesByVersion(features, ledgerVersionNames(ledger, org)), selectRequirementPool(features), lockedVersions, ledger, org) +
     // 提需求弹窗骨架（表单原样复用；orgsDir 三档提示与锁版警示随表单呈现）
     renderNewRequirementDialog(ctx.write.defaultGroup, orgsStatusOf(ctx.host), lockedVersions, spaceOrg) +
-    (spaceOrg === null ? renderNewVersionDialog() : "")
+    (spaceOrg !== null ? renderNewVersionDialog(spaceOrg) : "")
   );
 }
 
 /**
- * 排期看板页脚本单点（全局页与空间页同通路 ⇒ 浮层 / 拖拽两枚常量各保持唯一注入点，N3-⑧ 纪律锚）。
- * REQ-v0.9.2 增补 ④：详情浮层脚本随本页（= schedule kind，`/schedule` 与空间排期页同一通路）注入，
+ * 排期看板页脚本单点（v0.9.6 B5a 起唯一宿主 = D 档组织空间排期页 ⇒ 浮层 / 拖拽两枚常量各保持唯一注入点，N3-⑧ 纪律锚）。
+ * REQ-v0.9.2 增补 ④：详情浮层脚本随本页（= schedule kind）注入，
  * 单点常量；其它 kind 无 dialog 骨架，脚本自身空转 ⇒ 不注入。卡片 <a> 回退不依赖它。
  * REQ-2026-09-26-04 Q1：新增需求弹窗脚本同页、同 extraScripts 通路注入（两枚各管各的 dialog）。
  * v0.9.3 B-T5：排期拖拽脚本同页、同通路（第三枚，常量分立不可共置；无 #schedule-board 的页面自然空转）。
@@ -776,33 +797,6 @@ function schedulePageScripts(ctx: Ctx): string {
 }
 
 /**
- * 排期看板页（v0.9.2 M4 + M5 需求池；REQ-2026-09-26-04 Q1 起另承载「＋ 新增需求」弹窗）：
- * 数据 = `getFeatures()` 复用（零新桥接口），板内存按 version 归组；
- * 未排期卡不占版本列，集中末列「需求池」（判据单一 = `trim() === ""`）。
- * 弹窗 = 页头按钮 + dialog 骨架（表单复用 `renderRequirementForm`）+ 白名单内联脚本；
- * GET /requirements 列表页已退役（Q2：303 回本页）。正文与脚本走 {@link renderScheduleBoard}/{@link schedulePageScripts} 单点。
- * **增补七 a（§9.1-a）**：「＋ 新版本」按钮自组织门户迁入本页页头（门户那处撤除 ⇒ 全站唯一入口在排期页）。
- */
-async function pageSchedule(ctx: Ctx): Promise<Page> {
-  const view = await ctx.client.getFeatures();
-  const ledger = syncAutoVersionTransitions(ctx, view.features);
-  return {
-    title: "排期看板",
-    active: "schedule",
-    // §9-b：切换器口径含需求归属源 —— 本页已持有列表，喂给同一个纯函数（零新增触桥）
-    orgNav: orgNavOf(ctx, undefined, featureOrgGroups(view.features)),
-    headerActions:
-      '<button type="button" id="new-req-open" class="header-actions">＋ 新增需求</button>' +
-      // 增补七 a：门户「＋ 新版本」入口迁入本页（全站只留排期页一处）。服务端 hidden ⇒ 无 JS 不显
-      // 死按钮；增补八 §9.3 起显形与点击经 wireNewVersion 委托 wire()（点按钮 showModal 打开
-      // #new-version-dialog，与「＋ 新增需求」同款弹窗；闭集六元不扩）。
-      '<button type="button" id="new-version-open" class="header-actions" hidden>＋ 新版本</button>',
-    bodyHtml: renderScheduleBoard(ctx, view.features, ledger),
-    extraScripts: schedulePageScripts(ctx),
-  };
-}
-
-/**
  * `GET /` 组织门户页（v0.9.4 §9-b · 首页形态 B→A；§9.5 增补六：建组织改「＋ 建组织」按钮 + 弹窗）：
  * 卡清单 = 顶栏切换器同一纯函数 {@link portalOrgNames} 的口径（台账未停用 ∪ 需求归属），
  * 计数摘要 = `getFeatures()` 既有数据派生（**零新桥接口、零新触桥面**）；卡头链进
@@ -813,6 +807,8 @@ async function pageSchedule(ctx: Ctx): Promise<Page> {
  * **v0.9.4 W6（§2.6）→ 增补七 a（§9.1-a）**：「＋ 新版本」按钮曾挂在本页页头，现**迁往排期看板**
  * （`/schedule` 页头，全站唯一入口）—— 本页不再渲染该按钮（弹窗脚本内的 `wireNewVersion` 因无此 id 空转）。
  * **不注入**排期看板的浮层 / 拖拽 / mermaid 三枚脚本（它们随 `/schedule` 走）。
+ * **B6**：顶栏组织切换器摘除（`orgSwitcher = "none"`，正文不另挂）；卡增「已发版 / 进行中」版本摘要行
+ * （台账只读喂入，纯读面不做自动点亮，派生档带 `*`）。
  * 内联脚本闭集保持**六元**（N3-⑦/⑧ 纪律锚；门户新增的这点脚本是既有第六枚内的泛化，非新枚）。
  */
 async function pageOrgPortal(ctx: Ctx): Promise<Page> {
@@ -822,8 +818,15 @@ async function pageOrgPortal(ctx: Ctx): Promise<Page> {
     title: "组织门户",
     active: "home",
     orgNav,
+    // B6：门户摘顶栏切换器（动线 = 点卡进空间，空间页自带行右切换器；顶栏那份是重复入口）。
+    // orgNav 装配照旧保留 —— 门户卡数据源就是 orgNav.orgs。
+    orgSwitcher: "none",
     headerActions: '<button type="button" id="new-org-open" class="header-actions" hidden>＋ 建组织</button>',
-    bodyHtml: renderOrgPortal(buildOrgPortalCards(orgNav.orgs, view.features), orgsStatusOf(ctx.host)),
+    // B6：版本台账只读喂入（门户纯读面，**不跑** syncAutoVersionTransitions —— 显示派生不执法、零写）。
+    bodyHtml: renderOrgPortal(
+      buildOrgPortalCards(orgNav.orgs, view.features, ctx.versionsLedger.load().ledger),
+      orgsStatusOf(ctx.host),
+    ),
     extraScripts: NEW_REQUIREMENT_DIALOG_SCRIPT,
   };
 }
@@ -845,6 +848,8 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
   const awaiting = ctx.host === null || terminal ? null : ctx.host.awaitingTurnOf(f.featureId);
   const busy = ctx.host === null ? null : ctx.host.busyTurnOf(f.featureId);
   // C6：最近一轮留痕（宿主面未装配 ⇒ 缺席不渲染、不带崩；`at` = 该轮最近一次时刻）。
+  // v0.9.6 N4：`receipt` 必须在此**显式透传** —— 本处是逐字段重构（与台账 parseTurnRecord 同构的
+  // 静默丢失点）：漏一行 ⇒ 详情页回执卡永不出现且无任何告警。
   const latest = ctx.host === null ? null : ctx.host.latestTurnOf(f.featureId);
   const latestTurn =
     latest === null
@@ -855,6 +860,7 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
           summary: latest.summary,
           at: latest.finishedAt ?? latest.updatedAt,
           errorCode: latest.error?.code ?? null,
+          receipt: latest.receipt ?? null,
         };
   // REQ-v0.9.2 N7：轮次进度行 —— 排队位次取该桥队列可见面（在飞不查、查不到 ⇒ 不显示位次，
   // 队列面异常也不该把详情页带崩 ⇒ 兜成 null）。
@@ -871,6 +877,8 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
     turnBusy: busy !== null,
     busyTurn: busy,
     nowMs: ctx.now(),
+    // v0.9.6 N5：回执卡在场判据 = 最新轮带结构化 receipt（与 views 渲染回执卡同一条件）。
+    receiptPresent: latest !== null && (latest.receipt ?? null) !== null,
   };
   const turnProgress = renderTurnProgress(deriveTurnProgress(busy, queuePosition));
   // v0.9.5 增补二 · D2：链状态行（监视中 / 链已停 + 来源）。读面**只取快照、不写状态**；
@@ -884,6 +892,9 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
     graph.needsMermaid && vendoredAssetExists(ctx.docs.staticRoot, MERMAID_ASSET.file)
       ? mermaidAssetScriptTag() + mermaidRenderScript()
       : "";
+  // 版本切片读面（v0.9.6 B3）：详情页的排期锁 = **该卡归属组织**的 released 切片
+  // （归属缺失 ⇒ 空串桶 `""`，与 `migrateLedgerOrgs` 的未归属桶同构）—— 他组织的同版号不锁本卡。
+  const lockedVersions = releasedVersionNames(ctx.versionsLedger.load().ledger, (f.ownerGroup ?? "").trim());
   return {
     title: `需求 ${featureId.slice(0, 8)}`,
     active: "features",
@@ -893,7 +904,7 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
       traceError,
       ctx.now(),
       true,
-      releasedVersionNames(ctx.versionsLedger.load().ledger),
+      lockedVersions,
       {
         nextStepHtml: renderNextStepGuide(nextStepInput),
         actionAreaHtml: renderActionArea(f.featureId, nextStepInput),
@@ -1046,13 +1057,63 @@ async function pageHost(ctx: Ctx, notice: string | null): Promise<Page> {
   };
 }
 
+/**
+ * 本组织**声明面**成员 projectId 集（v0.9.6 C2 · §4 口径 6）：数据源 = 3300 `GET /api/groups`
+ * （{@link Ctx.orgGroups}，组结构声明面），**不用**逐组 `a2a_projects` 运行态（桥抖动 ⇒ 清单抖动）。
+ * 返回值三态：
+ * - `Set<string>`（可判定）= 该组声明成员的 projectId 集；组未声明（盘/台账可先于 orch 组存在）⇒ **空集 = 真空**（本组织无项目，非缺位）；
+ * - `null`（不可判定）= 查询器未装配（`orgGroups === null`）或声明面读失败（`ok=false` / 抛异常）⇒
+ *   调用方**不得**据此外泄他组项目，也不得谎报「本组织无项目」。
+ */
+async function orgDeclaredProjectIds(ctx: Ctx, org: string): Promise<Set<string> | null> {
+  if (ctx.orgGroups === null) return null;
+  const outcome: OrgGroupsOutcome = await ctx.orgGroups().catch(
+    (err: unknown): OrgGroupsOutcome => ({
+      ok: false,
+      code: "groups_query_failed",
+      error: err instanceof Error ? err.message : String(err),
+    }),
+  );
+  if (!outcome.ok) return null;
+  const row = outcome.groups.find((g) => g.name === org);
+  if (row === undefined) return new Set<string>();
+  return new Set(row.members.map((m) => m.projectId));
+}
+
+/** 交集过滤：保留 `projects` 快照中 projectId ∈ `ids` 的机器项（`renderTasksPick` 只读 `machines[].projects`）。 */
+function filterProjectsToIds(projects: ProjectsView, ids: ReadonlySet<string>): ProjectsView {
+  return {
+    ...projects,
+    machines: projects.machines.map((m) => ({ ...m, projects: m.projects.filter((p) => ids.has(p.projectId)) })),
+  };
+}
+
+/**
+ * 深链任务页头「所属组织」标注（v0.9.6 C3 · §4 口径 34）：projectId → 声明面命中组名。
+ * 三态：命中 ⇒ 组名；未命中 ⇒「无归属组织」；查询器未装配 / 声明面读失败 ⇒ `null`（不可判定，
+ * 页头不渲该行）。**不臆造默认组**（`ctx.write.defaultGroup` 不参与本判定）。
+ */
+async function deepLinkHomeOrg(ctx: Ctx, projectId: string): Promise<string | null> {
+  if (ctx.orgGroups === null) return null;
+  const outcome: OrgGroupsOutcome = await ctx.orgGroups().catch(
+    (err: unknown): OrgGroupsOutcome => ({
+      ok: false,
+      code: "groups_query_failed",
+      error: err instanceof Error ? err.message : String(err),
+    }),
+  );
+  if (!outcome.ok) return null;
+  // machineId 传空串 ⇒ pair 档必不命中，落 projectId 档（真实 machineId 恒非空，O1 写口要求成对）
+  return ownerOrgOfProject(outcome.groups, { machineId: "", projectId }) ?? "无归属组织";
+}
+
 async function pageTasks(
-  ctx: PageCtx,
+  ctx: Ctx,
   url: URL,
   res: ServerResponse,
   accept: string | undefined,
   org: string | null = null,
-  orgNav?: PageOrgNav,
+  orgNav: PageOrgNav,
 ): Promise<void> {
   const project = url.searchParams.get("project");
   if (project === null || project.length === 0) {
@@ -1063,11 +1124,32 @@ async function pageTasks(
     } catch (err) {
       projectsError = errText(err);
     }
+    // v0.9.6 C2（§4 · 口径 6）：空间任务页项目清单 = **交集式真过滤**
+    // = getProjects() 快照的 projectId ∩ 本组织声明面（3300 `GET /api/groups`）该组 `members[].projectId`。
+    // 数据源用**声明面**（orgGroups），**不用**逐组 `a2a_projects` 运行态（桥抖动 ⇒ 清单抖动）；
+    // 组织存在性 / 停用校验已由 `resolveOrgSpaceRoute` 承担，此处不新增触桥。全局档（org===null）不滤。
+    let membershipError: string | null = null;
+    if (org !== null && projects !== null) {
+      const ids = await orgDeclaredProjectIds(ctx, org);
+      if (ids === null) {
+        // 声明面不可判定（查询器未装配 / 3300 读失败）⇒ 不猜、不外泄他组：清空清单 + 如实标注
+        membershipError = "本组织项目集合暂不可判定（声明面 GET /api/groups 读取失败）⇒ 不呈现项目清单（仍可手工输入项目名查询）";
+        projects = { ...projects, machines: [], runners: [] };
+      } else {
+        projects = filterProjectsToIds(projects, ids);
+      }
+    }
     sendPage(res, {
       title: org === null ? "任务视图" : `空间 · ${org} · 任务`,
-      active: "tasks",
+      // v0.9.6 B5a（口径 37/38）：全局 /tasks* 的 NAV 高亮归「项目」（NAV 摘「任务」条后不空置）；
+      // 空间任务页不套用（空间侧导航归 B5b 处置）。
+      active: org === null ? "projects" : "tasks",
       orgNav,
-      bodyHtml: renderTasksPick(projects, projectsError, org),
+      // B5b ④：空间档补二级导航行（全局档不渲）
+      orgSwitcher: org === null ? undefined : "body",
+      bodyHtml:
+        (org === null ? "" : renderSpaceNav(org, "tasks", orgNav)) +
+        renderTasksPick(projects, projectsError, org, membershipError),
     });
     return;
   }
@@ -1096,11 +1178,14 @@ async function pageTasks(
   }
   const filter = { ...(state === "" ? {} : { state }), ...(limit === undefined ? {} : { limit }) };
   const view = await ctx.client.getTasks(project, filter);
+  // v0.9.6 C3：全局深链页头加「所属组织」标注（空间档 org 非 null ⇒ 不重复查、不渲该行）
+  const homeOrg = org === null ? await deepLinkHomeOrg(ctx, project) : null;
   sendPage(res, {
     title: `任务 · ${project}`,
-    active: "tasks",
+    // v0.9.6 B5a：全局 `?project=` 详情页同款归「项目」高亮（口径 37/38）；空间档不套用
+    active: org === null ? "projects" : "tasks",
     orgNav: org !== null ? { org, orgs: orgNav?.orgs ?? [] } : orgNav,
-    bodyHtml: renderTasks(view, filter, org),
+    bodyHtml: renderTasks(view, filter, org, homeOrg),
   });
 }
 
@@ -1286,12 +1371,13 @@ const HOST_FACE_DISABLED_DISPLAY =
 type PageRoute = { kind: "feature" | "feature-docs"; id: string } | { kind: Exclude<NavKey, "features"> } | null;
 
 function matchPage(pathname: string): PageRoute {
-  // v0.9.4 §9-b（首页形态 B→A）：`/` = 组织门户；`/schedule` = 全局排期看板正本
-  //（REQ-v0.9.2 N1 的「`/` ∪ `/schedule` 同 kind」别名关系就此拆返，两页各处其份）。
+  // v0.9.4 §9-b（首页形态 B→A）：`/` = 组织门户（REQ-v0.9.2 N1 的「`/` ∪ `/schedule` 同 kind」别名关系就此拆返）。
   if (pathname === "/") return { kind: "home" };
-  if (pathname === "/schedule") return { kind: "schedule" };
+  // v0.9.6 B5a：`/schedule` 全局排期看板退役 ⇒ 不再注册读面路由（GET 303 回门户在 handle 先行处理；
+  // 排期面唯一承载位 = 组织空间 `/org/<名>/schedule`，建版本入口自 B4 起亦只在那一页）。
   // REQ-2026-09-26-04 Q2：`/requirements` 列表页退役 ⇒ 不再注册读面路由（GET 重定向在 handle 先行处理）。
-  if (pathname === "/tasks") return { kind: "tasks" };
+  // v0.9.6 C1：全局 `/tasks` 裸页退役 ⇒ 不再注册读面路由（GET 无/空 project ⇒ 303 回门户、非 GET ⇒ 405，
+  // 均在 handle 退役块先行处理；`?project=X` 深链例外存活 ⇒ 走 handle 的 C1 显式分派，不在此注册）。
   if (pathname === "/projects") return { kind: "projects" };
   // REQ-2026-09-27-06 §9-c：`/orgs` 组织管理页同款退役 ⇒ 不再注册读面路由
   //（GET 303 回门户在 handle 先行处理；POST /orgs 写口照旧 = parseWriteRoute 白名单）。
@@ -1313,6 +1399,25 @@ function matchPage(pathname: string): PageRoute {
   }
   return null;
 }
+
+/**
+ * **已退役页面闭集（v0.9.6 B5a 起表驱动）**：路径 → 405 文案里的「退役说明」。
+ * 命中即先于路由匹配处理：GET ⇒ 303 回门户（重定向不触桥；板惯例用 303，R1 裁决替代 301 留反悔余地）；
+ * 非 GET ⇒ 405（写面白名单在更前面已分流，落到此处的非 GET 一律不放开 ⇒ `PUT /orgs` 的
+ * 「405 文案列全写面」锚由此保留）。
+ * - `GET /requirements` —— REQ-2026-09-26-04 Q2 需求列表页退役 ⇒ 回首页（§9-b 起 = 组织门户）；
+ * - `GET /orgs`         —— REQ-2026-09-27-06 §9-c 组织管理页退役 ⇒ 回门户（管理职能迁 `/org/<名>/manage`）；
+ * - `GET /schedule`     —— v0.9.6 B5a 全局排期看板退役 ⇒ 回门户（排期面唯一承载位 = 组织空间 `/org/<名>/schedule`）；
+ * - `GET /tasks`        —— v0.9.6 C1 全局任务裸页退役 ⇒ 回门户（任务深链 `?project=X` 存活，见下表注）。
+ */
+const RETIRED_PAGES: ReadonlyMap<string, string> = new Map([
+  ["/requirements", "GET /requirements 已改 303 回首页"],
+  ["/orgs", "GET /orgs 已改 303 回门户（管理职能迁 /org/<名>/manage）"],
+  ["/schedule", "GET /schedule 已改 303 回门户（排期面迁 /org/<名>/schedule）"],
+  // C1 深链存活例外：`/tasks` 的退役判据 = pathname ∧ query —— GET 且 `project` 非空 ⇒ 不进本表判定
+  // （任务表读面保留，判据执法点在 handle 退役块；非 GET 不带例外 —— 同退役先例 405）。
+  ["/tasks", "GET /tasks 已改 303 回门户（任务深链 /tasks?project=X 保留）"],
+]);
 
 async function handle(
   req: IncomingMessage,
@@ -1393,8 +1498,12 @@ async function handle(
       }
       spaceOrg = spaceRoute.org;
       url = new URL(spaceRoute.remainder, "http://board.invalid");
-    } else if (spaceRoute.kind === "view" || spaceRoute.kind === "feature_detail") {
-      // 空间已知读面族 = GET-only（与全局方法门同口径：已知页面非 GET ⇒ 405）
+    } else if (
+      spaceRoute.kind === "view" ||
+      spaceRoute.kind === "feature_detail" ||
+      spaceRoute.kind === "retired"
+    ) {
+      // 空间已知读面族（含 F2 退役形态）= GET-only（与全局方法门同口径：已知页面非 GET ⇒ 405）
       if (req.method !== "GET") {
         respondError(
           res,
@@ -1409,6 +1518,12 @@ async function handle(
         );
         return;
       }
+      // F2（B5b · 口径 15）：`/org/<名>/features` 整页退役 ⇒ 303 落**同空间排期页**（非门户），不留 404 死面
+      if (spaceRoute.kind === "retired") {
+        res.writeHead(303, { location: orgSpaceLink(spaceRoute.org, "schedule"), "cache-control": "no-store" });
+        res.end();
+        return;
+      }
       if (spaceRoute.kind === "feature_detail") {
         try {
           sendPage(res, { ...(await pageFeatureDetail(ctx, spaceRoute.featureId)), orgNav: spaceNav });
@@ -1420,8 +1535,6 @@ async function handle(
       try {
         if (spaceRoute.view === "schedule") {
           sendPage(res, await pageOrgSpaceSchedule(ctx, spaceRoute.org, resolved.features, spaceNav));
-        } else if (spaceRoute.view === "features") {
-          sendPage(res, await pageOrgSpaceFeatures(ctx, spaceRoute.org, resolved.features, spaceNav));
         } else if (spaceRoute.view === "manage") {
           sendPage(res, await pageOrgSpaceManage(ctx, spaceRoute.org, resolved.features, spaceNav));
         } else {
@@ -1458,7 +1571,7 @@ async function handle(
     } else if (writeRoute.kind === "org_members") {
       await handleWriteOrgMembers(req, res, ctx, writeRoute.org);
     } else if (writeRoute.kind === "versions") {
-      await handleWriteVersions(req, res, ctx);
+      await handleWriteVersions(req, res, ctx, spaceOrg);
     } else {
       await handleWriteHostStop(req, res, ctx, writeRoute.org);
     }
@@ -1497,17 +1610,16 @@ async function handle(
     return;
   }
   /**
-   * **已退役页面的 303 档**（先于路由匹配处理：这些路径不再是读面路由；重定向不触桥。板惯例用 303，
-   * R1 裁决：替代 301，留反悔余地）：
-   * - `GET /requirements` —— REQ-2026-09-26-04 Q2 需求列表页退役 ⇒ 回首页（§9-b 起 = 组织门户；提需求弹窗在 /schedule）；
-   * - `GET /orgs`         —— REQ-2026-09-27-06 §9-c 组织管理页退役 ⇒ 回门户（管理职能迁 `/org/<名>/manage`）。
-   * 非 GET 同径 ⇒ 405（`PUT /orgs` 的「405 文案列全写面」锚由此保留；`POST /orgs` 在更前面的写面白名单已分流）。
+   * 已退役页面的 303 / 405 档（闭集与文案见 {@link RETIRED_PAGES}；重定向不触桥）。
+   * C1 唯一的路径级例外：`/tasks?project=X`（X 非空）⇒ 深链存活 200（退役判据 = pathname ∧ query；
+   * 例外仅认 GET —— 非 GET 一律走退役 405 档，带 project 也不放开。其余退役路径不受此支影响。
+   * `project` 空值 = 无项目可列 ⇒ 与裸页同档退役）。
    */
-  if (url.pathname === "/requirements" || url.pathname === "/orgs") {
-    const retired =
-      url.pathname === "/orgs"
-        ? "GET /orgs 已改 303 回门户（管理职能迁 /org/<名>/manage）"
-        : "GET /requirements 已改 303 回首页";
+  const retired = RETIRED_PAGES.get(url.pathname);
+  if (
+    retired !== undefined &&
+    !(url.pathname === "/tasks" && req.method === "GET" && (url.searchParams.get("project") ?? "") !== "")
+  ) {
     if (req.method === "GET") {
       res.writeHead(303, { location: "/", "cache-control": "no-store" });
       res.end();
@@ -1520,6 +1632,22 @@ async function handle(
       "method_not_allowed",
       `${retired}；本路径仅支持 GET（写面 = ${WRITE_ROUTES.join(" · ")}，表单 action 用全局路径；收到 ${req.method ?? "?"} ${url.pathname}）`,
     );
+    return;
+  }
+  // BD7：全局页面的组织上下文（org = null ⇒ NAV 落全局路径；切换器清单台账 ∪ 默认，不触桥）
+  const globalNav = orgNavOf(ctx);
+  /**
+   * C1 深链存活通路（退役例外的正半支）：`GET /tasks?project=X`（X 非空）⇒ 任务表 200。
+   * 不复经 matchPage 路由（`/tasks` 已摘 ⇒ route=null）—— 判据落在 pathname ∧ query 的**显式分派**。
+   * 非 GET 到不了此处（上方退役块已按退役先例收 405）；pageTasks 的 `org===null ∧ 带 project`
+   * 渲染分支（views.ts renderTasks）照常复用，不整删。
+   */
+  if (url.pathname === "/tasks" && (url.searchParams.get("project") ?? "") !== "") {
+    try {
+      await pageTasks(ctx, url, res, req.headers.accept, null, globalNav);
+    } catch (err) {
+      sendPage(res, bridgeDownPage(`目标 = ${url.pathname}`, err, "projects", globalNav));
+    }
     return;
   }
   if (route === null) {
@@ -1536,25 +1664,20 @@ async function handle(
     );
     return;
   }
-  // BD7：全局页面的组织上下文（org = null ⇒ NAV 落全局路径；切换器清单台账 ∪ 默认，不触桥）
-  const globalNav = orgNavOf(ctx);
   try {
     if (route.kind === "feature") {
       sendPage(res, { ...(await pageFeatureDetail(ctx, route.id)), orgNav: globalNav });
     } else if (route.kind === "feature-docs") {
       await handleFeatureDoc(ctx, res, req, route.id, url.searchParams);
-    } else if (route.kind === "tasks") {
-      await pageTasks(ctx, url, res, req.headers.accept, null, globalNav);
     } else if (route.kind === "host") {
       sendPage(res, { ...(await pageHost(ctx, null)), orgNav: globalNav });
     } else if (route.kind === "home") {
       sendPage(res, await pageOrgPortal(ctx));
-    } else if (route.kind === "schedule") {
-      sendPage(res, await pageSchedule(ctx));
     } else if (route.kind === "agents") {
-      sendPage(res, { ...(await pageAgents(ctx)), orgNav: globalNav });
+      // 口径 42：全局页摘顶栏组织切换器（组织动线 = 门户/空间页；本页不承载）
+      sendPage(res, { ...(await pageAgents(ctx)), orgNav: globalNav, orgSwitcher: "none" });
     } else {
-      sendPage(res, { ...(await pageProjects(ctx)), orgNav: globalNav });
+      sendPage(res, { ...(await pageProjects(ctx)), orgNav: globalNav, orgSwitcher: "none" });
     }
   } catch (err) {
     sendPage(res, bridgeDownPage(`目标 = ${url.pathname}`, err, pageActiveOf(route), globalNav));
@@ -1620,7 +1743,7 @@ function respondSpaceFailure(res: ServerResponse, accept: string | undefined, ro
       accept,
       410,
       ORG_SPACE_GONE_CODE,
-      `组织 ${route.orgRaw} 已在板台账停用 ⇒ 组织空间不再开放（名下需求照常可见，管理页含空间与成员均 410；恢复 = 同名重建，零迁移）`,
+      `组织 ${route.orgRaw} 已在板台账停用 ⇒ 组织空间不再开放（在途部分在排期看板照常可见，未排期∧终态者经引擎查阅（组织空间需求清单读面已退役），管理页含空间与成员均 410；恢复 = 同名重建，零迁移）`,
       undefined,
       undefined,
       SPACE_ACTIVE,
@@ -1668,41 +1791,45 @@ function featureOrgGroups(features: readonly FeatureListItem[]): string[] {
   return [...new Set(features.map((f) => (f.ownerGroup ?? "").trim()).filter((n) => n !== ""))];
 }
 
-/** 空间顶部的组织内导航行（四链接 = 空间内视图快切；§9-c 起含「管理」；全局 NAV 的组织感知与顶栏切换器同见 {@link orgNavOf}）。 */
-function renderSpaceNav(org: string, view: OrgSpaceView): string {
+/**
+ * 空间二级导航行（v0.9.6 B5b · 口径 14 / 19–23）：三枚 tab「排期 · 任务 · 管理」+ 行右组织切换器
+ * （切换器 = {@link renderOrgSwitcher} 单点复用、传整个 `spaceNav`，不在空间侧复制 HTML）。
+ * 「需求」枚随 `/org/<名>/features` 整页退役；末段「← 回全局」撤（回全局动线由顶栏 NAV「门户」承担）。
+ * 当前视图在 inline `font-weight:700` 之外另挂 `class="fl on"` —— 空间页位置的唯一断言钩子。
+ */
+function renderSpaceNav(org: string, view: OrgSpaceView, spaceNav: PageOrgNav): string {
   const link = (v: OrgSpaceView, text: string): string =>
-    `<a class="fl" href="${escapeHtml(orgSpaceLink(org, v))}"${v === view ? ' style="font-weight:700"' : ""}>${text}</a>`;
-  return `<p class="hint">组织空间 <b>${escapeHtml(org)}</b>：${link("schedule", "排期")} · ${link("features", "需求")} · ${link("tasks", "任务")} · ${link("manage", "管理")} · <a class="fl" href="/schedule">← 回全局</a></p>`;
+    `<a class="fl${v === view ? " on" : ""}" href="${escapeHtml(orgSpaceLink(org, v))}"${v === view ? ' style="font-weight:700"' : ""}>${text}</a>`;
+  return `<p class="hint">组织空间 <b>${escapeHtml(org)}</b>：${link("schedule", "排期")} · ${link("tasks", "任务")} · ${link("manage", "管理")}${renderOrgSwitcher(spaceNav, "right")}</p>`;
 }
 
 /**
  * `GET /org/<名>/`（D 档空间首页 = 排期看板，按 ownerGroup 过滤）：
- * 页函数复用全局 `pageSchedule` 的渲染链，数据先过 {@link featuresOfOrg} 过滤。
+ * 正文走 {@link renderScheduleBoard}/{@link schedulePageScripts} 单点（B5a 起本页是该单点**唯一**调用方），
+ * 数据先过 {@link featuresOfOrg} 过滤。
  * 提需求弹窗 = BD8 免选形态（组织只读展示 + hidden 值必发，action 带空间前缀）；
  * 组织归属 mismatch 执法见 `handleWriteRequirement`。
+ * **建版本入口归本页（v0.9.6 B4 · 口径 4 / 24）**：页头「＋ 新版本」按钮 + {@link renderNewVersionDialog}
+ * 骨架同批在位（骨架由 {@link renderScheduleBoard} 在 `spaceOrg !== null` 档渲染）——台账按
+ * `(org, version)` 成域后，本页是**全站唯一**的登记新版本入口（全局 `/schedule` 那份已随 B5a 整页退役）。
  */
-async function pageOrgSpaceSchedule(ctx: Ctx, org: string, all: readonly FeatureListItem[], orgNav?: PageOrgNav): Promise<Page> {
+async function pageOrgSpaceSchedule(ctx: Ctx, org: string, all: readonly FeatureListItem[], orgNav: PageOrgNav): Promise<Page> {
   const features = featuresOfOrg(all, org);
-  // 自动转换以**全局**列表判定（版本板级、不随空间过滤）；渲染用本空间过滤集。
+  // 自动转换喂**全局**列表（要看得到每张卡的归属，落点按 (org, version) 判定，口径 31）；渲染用本空间过滤集。
   const ledger = syncAutoVersionTransitions(ctx, all);
   return {
     title: `空间 · ${org} · 排期`,
     active: "schedule",
     orgNav,
-    headerActions: '<button type="button" id="new-req-open" class="header-actions">＋ 新增需求</button>',
-    bodyHtml: renderSpaceNav(org, "schedule") + renderScheduleBoard(ctx, features, ledger, org),
+    // B5b：切换器随正文的二级导航行挂出 ⇒ 顶栏不重复渲染
+    orgSwitcher: "body",
+    // 「＋ 新版本」与「＋ 新增需求」同规格：服务端 `hidden` ⇒ 无 JS 不显死按钮，显形与点击经 wireNewVersion 委托 wire()
+    headerActions:
+      '<button type="button" id="new-req-open" class="header-actions">＋ 新增需求</button>' +
+      '<button type="button" id="new-version-open" class="header-actions" hidden>＋ 新版本</button>',
+    // B5b ⑤：看板页头 `<h2>` 由本页给出（`renderSchedule` 不再自带）
+    bodyHtml: `${renderSpaceNav(org, "schedule", orgNav)}<h2>排期看板</h2>${renderScheduleBoard(ctx, features, ledger, org)}`,
     extraScripts: schedulePageScripts(ctx),
-  };
-}
-
-/** `GET /org/<名>/features`（需求列表 · ownerGroup 过滤；点行 = 全局深链 `/features/:id`）。 */
-async function pageOrgSpaceFeatures(ctx: Ctx, org: string, all: readonly FeatureListItem[], orgNav?: PageOrgNav): Promise<Page> {
-  const features = featuresOfOrg(all, org);
-  return {
-    title: `空间 · ${org} · 需求`,
-    active: "schedule",
-    orgNav,
-    bodyHtml: renderSpaceNav(org, "features") + renderOrgSpaceFeaturesList(org, features),
   };
 }
 
@@ -1719,7 +1846,7 @@ const SPACE_ACTIVE: NavKey = "schedule";
  * - 需求简表 = 归一层已持有的该组需求投影（`resolved.features`，**零新增触桥面**）。
  * 停用组织进本路由已由归一层挡下（410 `board_org_space_gone`，同空间口径）。
  */
-async function pageOrgSpaceManage(ctx: Ctx, org: string, all: readonly FeatureListItem[], orgNav?: PageOrgNav): Promise<Page> {
+async function pageOrgSpaceManage(ctx: Ctx, org: string, all: readonly FeatureListItem[], orgNav: PageOrgNav): Promise<Page> {
   const groupsOutcome =
     ctx.orgGroups === null
       ? Promise.resolve<OrgGroupsOutcome | null>(null)
@@ -1741,8 +1868,9 @@ async function pageOrgSpaceManage(ctx: Ctx, org: string, all: readonly FeatureLi
     title: `空间 · ${org} · 管理`,
     active: SPACE_ACTIVE,
     orgNav,
+    orgSwitcher: "body",
     bodyHtml:
-      renderSpaceNav(org, "manage") +
+      renderSpaceNav(org, "manage", orgNav) +
       renderOrgSpaceManagePage({
         org,
         features: featuresOfOrg(all, org),
@@ -1844,7 +1972,7 @@ async function handleWriteRequirement(
         headers.accept,
         409,
         ORG_MISMATCH,
-        `表单组织（${form.group}）与组织空间路径（${spaceOrg}）不一致 ⇒ 以路径为准拒写（跨组织提需求请回 <code>/schedule</code> 全局提需求或改走对应组织空间）。`,
+        `表单组织（${form.group}）与组织空间路径（${spaceOrg}）不一致 ⇒ 以路径为准拒写（跨组织提需求请改走对应组织空间的排期页）。`,
         undefined,
         requirementBackfillFields(body, spaceOrg),
         "schedule",
@@ -1855,7 +1983,11 @@ async function handleWriteRequirement(
   }
   // ③ 已发版锁（REQ-v0.9.2 增补 ⑤ N2 / v0.9.4 N3 锁读台账）：目标版本 ∈ 版本台账 released ⇒ 409 零出网。
   //    锁判据唯一走 `isVersionLocked`（trim 后精确串匹配，禁前缀）；空 version = 未排期 ⇒ 恒不锁、放行。
-  if (isVersionLocked(form.version, releasedVersionNames(ctx.versionsLedger.load().ledger))) {
+  //    **锁的 org 维**（v0.9.6 B3 · 口径 29）= 三段回退 `spaceOrg ?? form.group ?? ctx.write.defaultGroup`
+  //    （`form.group` 已由 `parseRequirementForm` 做过「表单 > 板级默认」回落 ⇒ 与下方 ③b
+  //    `isOrgDisabled` 的归属解析同源，不新立一套）；台账唯一键 `(org, version)` ⇒ 他组织同版号不锁本条。
+  const lockOrg = (spaceOrg ?? form.group ?? ctx.write.defaultGroup ?? "").trim();
+  if (isVersionLocked(form.version, releasedVersionNames(ctx.versionsLedger.load().ledger, lockOrg))) {
     respondError(
       res,
       headers.accept,
@@ -2128,7 +2260,7 @@ async function handleWriteOrg(req: IncomingMessage, res: ServerResponse, ctx: Ct
     );
     return;
   }
-  // ⑥′ 组织种子化（v0.9.5 C10）：`AGENTS.md`（模板渲染）+ `flow/spec` 两份规范快照落组织目录。
+  // ⑥′ 组织种子化（v0.9.5 C10）：`AGENTS.md`（模板渲染）+ `flow/spec` 三份规范快照落组织目录。
   //     **fail-open**：任一步失败只记结构化告警，**不回滚组织创建、不改回显**（缺失由启动幂等回填自愈）；
   //     `seedOrgWorkspace` 自身零抛。无独立写路由 —— 本步不是 HTTP 端点，白名单保持 11 条不动。
   if (ctx.orgSeed !== null) {
@@ -2253,19 +2385,33 @@ function versionBackfillFields(body: string): ErrorOverlayField[] {
 /**
  * 版本台账写（v0.9.4 N1 · REQ-2026-09-27-05）。一条 `POST /versions` 靠表单 `action` 分三支：
  * - **create**：`version` 非空 ∧ `x.y.z`（复用 `parseVersion`，零新增 regex）⇒ 台账落
- *   `status = notstart`（三态初态；`notstart → active` 由 W3 渲染前惰性自动转换）；同名 ⇒ 409。
+ *   `status = notstart`（三态初态；`notstart → active` 由 W3 渲染前惰性自动转换）；**同组织同版号** ⇒ 409。
  * - **remove**：闸 = 台账存在 ∧ `status ∈ {notstart, active}` ∧ **名下无已确认卡**
  *   （增补十一 E2 口径变更：原「名下无卡（含想法卡）」作废）；`released` 不可删（409）；
  *   名下有已确认卡 ⇒ 409 `board_version_remove_confirmed_cards`；桥读不动 ⇒ 502 fail-closed（不删）。
  *   删除时名下**想法卡自动回需求池**（逐张清空 `version`）；任一张回池失败 ⇒ 502 且不删台账条目。
  * - **setStatus**：台账存在 ⇒ **迁移矩阵五条边执法**（W3 · `version-transition.ts`；需事实的两条边
- *   读桥、不可达 ⇒ 502 fail-closed）；非法迁移 ⇒ 409；条目不存在 ⇒ 404。
+ *     读桥、不可达 ⇒ 502 fail-closed）；非法迁移 ⇒ 409；条目不存在 ⇒ 404。
  *
  * CSRF / body 上限 / 回填 / 错误浮层与其余写口**同规格**；**不写状态机、不动任何配置**。
- * 回显：JSON ⇒ 结构化载荷（create 201 / remove 200 / setStatus 200）；表单档 ⇒ **303 回 `/schedule`**
+ * 回显：JSON ⇒ 结构化载荷（create 201 / remove 200 / setStatus 200）；表单档 ⇒ **303 回排期看板**
  * （PRG，版本列就在该页；刷新不重复写）。
+ *
+ * **组织作用域（v0.9.6 B4 · 口径 4 / 5 / 30）**：台账唯一键 = `(org, version)` ⇒ 本 handler 的 org
+ * **只从服务端路径上下文取**（`spaceOrg` = 归一层剥 `/org/<名>` 前缀后的路径组织；建版本表单**不带
+ * org 字段**，客户端不提交、也不可提交）。
+ * - `spaceOrg` 非空 ⇒ 建 / 删 / 设状态三处均按 `(spaceOrg, version)` 精确落条目，两处数卡闸
+ *   （删除的「名下无已确认卡」、发版的「名下全收口」）**只数该组织名下的卡**，303 回**本空间排期页**；
+ * - `spaceOrg` 为 null（全局 `POST /versions` 直投 —— 全局页头入口已随本节点撤除，路由留到
+ *   B5a 退役）⇒ create 落**未归属空串桶**、删 / 设状态按「不限组织」取首个命中、303 回 `/schedule`，
+ *   即 B4 之前的既有形态（切片只在空间档生效，全局档不做第二套猜测）。
  */
-async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ctx: Ctx): Promise<void> {
+async function handleWriteVersions(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: Ctx,
+  spaceOrg: string | null = null,
+): Promise<void> {
   const headers = lowerHeaders(req);
   // ① CSRF 守卫先于一切（与其余八条写径同规格：未认证请求不消耗 body 读取）
   const auth = checkWriteAuth({ method: req.method, headers, proto: "http" });
@@ -2288,6 +2434,27 @@ async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ct
     return;
   }
   const nowIso = (): string => new Date(ctx.now()).toISOString();
+  /**
+   * 本请求的组织档（口径 4 / 30：org **只**由服务端路径上下文决定，表单零 org 字段）。
+   * - `writeOrg` = create 的落点桶（全局直投 ⇒ 空串 = 未归属桶，与 `migrateLedgerOrgs` 的缺桶同构）；
+   * - `orgFilter` = 取条目与两处数卡闸的切片档（全局档 `undefined` = 不限组织 = B4 之前的既有形态）；
+   * - `backTo` = 三支共用的 303 落点（空间档回**本空间排期页**，全局档仍 `/schedule`，口径 5）。
+   */
+  const writeOrg = spaceOrg === null ? "" : spaceOrg.trim();
+  const orgFilter: VersionOrgFilter = spaceOrg === null ? undefined : spaceOrg.trim();
+  const backTo = spaceOrg === null ? "/schedule" : orgSpaceLink(spaceOrg, "schedule");
+  const orgLabel = writeOrg === "" ? "未归属组织" : writeOrg;
+  /**
+   * 名下卡集合 = 两处数卡闸（删除的「名下无已确认卡」/ 发版的「名下全收口」）唯一数据源。
+   * **空间档再加一层 `ownerGroup` 过滤**：他组织的同版号卡既不挡本组织删版，也不计入本组织的收口判据
+   * （口径 30「该组织的该版本名下全收口」）；`orgFilter` 为 `undefined` ⇒ 不过滤（全局并集形态）。
+   */
+  const cardsUnderKey = (all: readonly FeatureListItem[]): readonly FeatureListItem[] =>
+    all.filter(
+      (f) =>
+        normalizeVersion(f.version) === form.version &&
+        (orgFilter === undefined || (f.ownerGroup ?? "").trim() === orgFilter),
+    );
 
   if (form.action === VERSION_ACTION_CREATE) {
     // semver 收口（§2.5 方向）：复用 parseVersion，非 x.y.z ⇒ 拒新写（读面存量脏值保留）。
@@ -2303,14 +2470,15 @@ async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ct
       );
       return;
     }
-    const created = ctx.versionsLedger.create(form.version, nowIso());
+    const created = ctx.versionsLedger.create(form.version, nowIso(), writeOrg);
     if (!created.added) {
       respondError(
         res,
         headers.accept,
         409,
         VERSION_EXISTS_CODE,
-        `版本 ${form.version} 已在台账中 ⇒ 不重复创建`,
+        `版本 ${form.version} 已在组织 ${orgLabel} 的台账中 ⇒ 不重复创建` +
+          `（唯一键 = (组织, 版本)，本闸只挡**同组织同版号**；他组织各有其版本序列，互不冲突）。`,
         undefined,
         versionBackfillFields(body),
       );
@@ -2325,13 +2493,13 @@ async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ct
       });
       return;
     }
-    res.writeHead(303, { location: "/schedule", "cache-control": "no-store" });
+    res.writeHead(303, { location: backTo, "cache-control": "no-store" });
     res.end();
     return;
   }
 
   if (form.action === VERSION_ACTION_REMOVE) {
-    const rec = findVersionRecord(ctx.versionsLedger.load().ledger, form.version);
+    const rec = findVersionRecord(ctx.versionsLedger.load().ledger, form.version, orgFilter);
     if (rec === null) {
       respondError(res, headers.accept, 404, VERSION_NOT_FOUND_CODE, `版本 ${form.version} 不在台账中 ⇒ 无可删`, undefined, versionBackfillFields(body));
       return;
@@ -2355,7 +2523,7 @@ async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ct
     let mine: readonly FeatureListItem[];
     try {
       const view = await ctx.client.getFeatures();
-      mine = view.features.filter((f) => normalizeVersion(f.version) === form.version);
+      mine = cardsUnderKey(view.features);
     } catch (err) {
       respondError(
         res,
@@ -2417,7 +2585,7 @@ async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ct
       );
       return;
     }
-    const removed = ctx.versionsLedger.remove(form.version);
+    const removed = ctx.versionsLedger.remove(form.version, orgFilter);
     if ((headers.accept ?? "").includes("application/json")) {
       respondJson(res, 200, {
         ok: true,
@@ -2428,7 +2596,7 @@ async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ct
       });
       return;
     }
-    res.writeHead(303, { location: "/schedule", "cache-control": "no-store" });
+    res.writeHead(303, { location: backTo, "cache-control": "no-store" });
     res.end();
     return;
   }
@@ -2440,7 +2608,7 @@ async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ct
       respondError(res, headers.accept, 400, VERSION_FORM_INVALID_CODE, "目标状态缺失（setStatus 必带 status）", undefined, versionBackfillFields(body));
       return;
     }
-    const rec = findVersionRecord(ctx.versionsLedger.load().ledger, form.version);
+    const rec = findVersionRecord(ctx.versionsLedger.load().ledger, form.version, orgFilter);
     if (rec === null) {
       respondError(res, headers.accept, 404, VERSION_NOT_FOUND_CODE, `版本 ${form.version} 不在台账中 ⇒ 无法设状态`, undefined, versionBackfillFields(body));
       return;
@@ -2456,7 +2624,7 @@ async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ct
         let mine: readonly FeatureListItem[];
         try {
           const view = await ctx.client.getFeatures();
-          mine = view.features.filter((f) => normalizeVersion(f.version) === form.version);
+          mine = cardsUnderKey(view.features);
         } catch (err) {
           respondError(
             res,
@@ -2489,7 +2657,7 @@ async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ct
         return;
       }
     }
-    const set = ctx.versionsLedger.setStatus(form.version, target, nowIso());
+    const set = ctx.versionsLedger.setStatus(form.version, target, nowIso(), undefined, orgFilter);
     if (!set.found) {
       respondError(res, headers.accept, 404, VERSION_NOT_FOUND_CODE, `版本 ${form.version} 不在台账中 ⇒ 无法设状态`, undefined, versionBackfillFields(body));
       return;
@@ -2504,7 +2672,7 @@ async function handleWriteVersions(req: IncomingMessage, res: ServerResponse, ct
       });
       return;
     }
-    res.writeHead(303, { location: "/schedule", "cache-control": "no-store" });
+    res.writeHead(303, { location: backTo, "cache-control": "no-store" });
     res.end();
     return;
   }
@@ -2728,10 +2896,13 @@ async function handleWriteOrgMembers(
     const view = await ctx.client.getFeatures();
     page = await pageOrgSpaceManage(ctx, org.name, view.features, orgNavOf(ctx, org.name, featureOrgGroups(view.features)));
   } catch (err) {
+    const nav = orgNavOf(ctx, org.name);
     page = {
       title: `空间 · ${org.name} · 管理`,
       active: SPACE_ACTIVE,
-      bodyHtml: `${renderSpaceNav(org.name, "manage")}<p class="hint warn">管理页刷新失败（${escapeHtml(errText(err))}）：上方成员写的结果仍然有效，恢复后重开本页即可。</p>`,
+      orgNav: nav,
+      orgSwitcher: "body",
+      bodyHtml: `${renderSpaceNav(org.name, "manage", nav)}<p class="hint warn">管理页刷新失败（${escapeHtml(errText(err))}）：上方成员写的结果仍然有效，恢复后重开本页即可。</p>`,
     };
   }
   sendPage(res, { ...page, bodyHtml: card + page.bodyHtml });

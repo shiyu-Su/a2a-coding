@@ -3,13 +3,13 @@
  *
  * 存在理由：N1 已删除那 5 张探针卡 ⇒ 活数据里不再有「未排期 ∧ 终态」样本，
  * 板页真机机判只能证明「池列计数与可见卡符合预期」，**过滤行为本身**与
- * **组织空间列表仍渲染该类卡（第 6 项负向断言）**必须由夹具承载（改造文档 §4.2）。
+ * **该类卡的读面口径（第 6 项负向断言，B5b 起 = 页退役 + 引擎查阅）**必须由夹具承载（改造文档 §4.2）。
  *
  * 两面判据：
- * ① `GET /schedule` 需求池列 = 未排期 ∧ **非**终态（三终态不进池，池头计数同步）；
+ * ① `GET /org/<名>/schedule`（B5a 起看板唯一宿主）需求池列 = 未排期 ∧ **非**终态（三终态不进池，池头计数同步）；
  * ② 已排期终态卡仍在其版本列显示（过滤只作用于池列）；
- * ③ `GET /org/<名>/features`（`renderOrgSpaceFeaturesList`，不经 `selectRequirementPool`）
- *    仍渲染「未排期 ∧ 终态」卡 —— 该类卡的历史读面不因此次过滤而失联。
+ * ③（B5b 改版）`/org/<名>/features` 整页退役 ⇒ 303 落同空间排期页；「未排期 ∧ 终态」卡
+ *    不再有板面清单读面，看板 hint 明示历史读面经引擎 `a2a_feature_status` / `a2a_feature_trace` 查阅。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -91,7 +91,7 @@ async function withFixtureServer(run) {
   }
 }
 
-/** 摘出 `/schedule` 池列正文（`data-version=""` 那一列）。 */
+/** 摘出空间排期页（`/org/<名>/schedule`）池列正文（`data-version=""` 那一列）。 */
 function poolColumnOf(html) {
   const kanban = html.slice(html.indexOf('id="schedule-board"'));
   const hit = kanban.match(/<div class="kcol" data-version="">([\s\S]*?)(?=<div class="kcol" data-version=|<dialog)/);
@@ -101,7 +101,7 @@ function poolColumnOf(html) {
 
 test("REQ04-① 池列：三终态未排期卡不进池；非终态照入且池头计数 = 可见卡数", async () => {
   await withFixtureServer(async (base) => {
-    const html = await (await fetch(`${base}/schedule`)).text();
+    const html = await (await fetch(`${base}/org/${encodeURIComponent(ORG)}/schedule`)).text();
     const pool = poolColumnOf(html);
     assert.match(pool, /href="\/features\/P-OPEN"/, "未排期非终态卡照入池");
     for (const gone of ["P-CANCELLED", "P-COMPLETED", "P-FAILED"]) {
@@ -114,7 +114,7 @@ test("REQ04-① 池列：三终态未排期卡不进池；非终态照入且池�
 
 test("REQ04-② 版本列：已排期终态卡照旧显示（过滤只作用于池列）", async () => {
   await withFixtureServer(async (base) => {
-    const html = await (await fetch(`${base}/schedule`)).text();
+    const html = await (await fetch(`${base}/org/${encodeURIComponent(ORG)}/schedule`)).text();
     const versionCols = html.slice(html.indexOf('id="schedule-board"')).split('<div class="kcol" data-version="">')[0];
     assert.match(versionCols, /href="\/features\/V-CANCELLED"/, "已排期 cancelled 卡仍在其版本列");
     assert.match(versionCols, /href="\/features\/V-OPEN"/, "同列非终态卡不受影响");
@@ -122,21 +122,20 @@ test("REQ04-② 版本列：已排期终态卡照旧显示（过滤只作用于�
   });
 });
 
-test("REQ04-③ 负向断言（第 6 项）：/org/<名>/features 仍渲染「未排期 ∧ 终态」卡（历史读面不失联）", async () => {
+test("REQ04-③（B5b 改版）：/org/<名>/features 整页退役 ⇒ 303 落同空间排期看板；该类卡的历史读面口径 = 引擎", async () => {
   await withFixtureServer(async (base) => {
-    const res = await fetch(`${base}/org/${encodeURIComponent(ORG)}/features`);
-    assert.equal(res.status, 200);
-    const html = await res.text();
-    for (const kept of ["P-CANCELLED", "P-COMPLETED", "P-FAILED"]) {
-      assert.match(html, new RegExp(`href="/features/${kept}"`), `${kept} = 未排期 ∧ 终态 ⇒ 空间列表须仍渲染`);
+    const raw = await fetch(`${base}/org/${encodeURIComponent(ORG)}/features`, { redirect: "manual" });
+    assert.equal(raw.status, 303, "退役清单读面 ⇒ 303（不留 404 死面）");
+    assert.equal(raw.headers.get("location"), `/org/${encodeURIComponent(ORG)}/schedule`, "落点 = 同空间排期页");
+    assert.equal(raw.headers.get("cache-control"), "no-store", "重定向不缓存（口径同全局退役页闭集）");
+    await raw.body?.cancel();
+    const html = await (await fetch(`${base}/org/${encodeURIComponent(ORG)}/schedule`)).text();
+    assert.match(html, /板面无清单读面/, "看板 hint 明示「未排期 ∧ 终态」卡无板面清单读面");
+    assert.match(html, /需求清单读面已随/, "随 v0.9.6 组织作用域收敛退役（不再指向已删页）");
+    assert.match(html, /a2a_feature_status/, "历史读面 = 经引擎查阅（不得默认算完成）");
+    const pool = poolColumnOf(html);
+    for (const gone of ["P-CANCELLED", "P-COMPLETED", "P-FAILED"]) {
+      assert.ok(!pool.includes(`/features/${gone}`), `${gone} 仍不进池（页退役不改变池过滤口径）`);
     }
-    assert.match(html, /href="\/features\/P-OPEN"/, "未排期非终态卡同样在空间列表");
-    assert.equal(
-      ["P-CANCELLED", "P-COMPLETED", "P-FAILED", "P-OPEN", "V-CANCELLED", "V-OPEN"].filter((id) =>
-        html.includes(`/features/${id}`),
-      ).length,
-      6,
-      "空间列表 = 本组全量（六张全在，终态不过滤）",
-    );
   });
 });

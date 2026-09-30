@@ -58,6 +58,7 @@ import {
 } from "./host-relay.js";
 import type { ChainStateSnapshot } from "./derive.js";
 import { type TurnRecord, type TurnState } from "./host-turn-ledger.js";
+import { RECEIPT_CONTRACT, type Receipt } from "./receipt.js";
 
 // ---------------------------------------------------------------------------
 // 错误码（HTTP 层据此分流；**不得静默**）
@@ -231,6 +232,8 @@ export function buildTurnPrompt(input: {
       "⇒ 请把上述补充纳入本轮判断与产出。",
     );
   }
+  // v0.9.6 N6：轮回执契约常量（单点定义于 receipt.ts）——本轮收尾时按此格式输出回执块。
+  lines.push("", RECEIPT_CONTRACT);
   return lines.join("\n");
 }
 
@@ -252,6 +255,9 @@ export function buildConfirmPrompt(input: { featureId: string; org: string; vers
     "1. 先只读核对：改造文档是否已落文件、边界确认是否已完成、审批门是否处于「待审批」；",
     "2. 核对通过 ⇒ 经编排桥的审批能力（approve 语义）放行这条需求，再按流程继续推进当前该做的一步；",
     "3. 条件不满足 ⇒ **不要放行**，用本轮结论如实说明缺什么（需要人补齐就用 A2A 的 input-required 收口），不得为迎合按钮硬推。",
+    // v0.9.6 N6：确认档同样是一轮收尾 ⇒ 引用同一契约常量。
+    "",
+    RECEIPT_CONTRACT,
   ].join("\n");
 }
 
@@ -368,6 +374,12 @@ export interface TriggerTurnOutcome {
   display: string;
   summary: string | null;
   question: string | null;
+  /**
+   * 本轮尾部【回执】块的结构化结果（v0.9.6 N4 · 契约见 `receipt.ts`）。
+   * 只有**真正跑到终态**的那条收口（`settleSubmitted` 取 `TurnResult.receipt`）带真值；
+   * 未起轮的拒单（配置错 / 终态 / 排队…）一律 `null` ⇒ 结果页走现状渲染。
+   */
+  receipt: Receipt | null;
   error: { code: string; message: string } | null;
   /** 桥的 pid / port / kind（触发时如实回显，便于真机取证）。 */
   bridge: { pid: number | null; port: number | null; kind: string } | null;
@@ -398,6 +410,7 @@ export function terminalTurnRejection(featureId: string, engineState: string): T
     display: `本需求已终态（${engineState}）：本轮未提交`,
     summary: null,
     question: null,
+    receipt: null,
     error: {
       code: FEATURE_TERMINAL,
       message: `该需求已进入引擎终态（${engineState}）⇒ 触发 / 确认 / 回答不再受理，板不为已结束的需求白烧一轮`,
@@ -945,6 +958,7 @@ export class BoardHostFace {
       display: "",
       summary: null,
       question: null,
+      receipt: null,
       error: null,
       bridge: null,
     };
@@ -1042,6 +1056,7 @@ export class BoardHostFace {
       display: result.display,
       summary: result.summary,
       question: result.question,
+      receipt: result.receipt,
       error: result.error,
       bridge,
     };

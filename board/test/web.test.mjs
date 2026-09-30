@@ -1,7 +1,7 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { renderPage, escapeHtml, BOARD_CSP, BOARD_REFERRER_POLICY, SUBMIT_GUARD_SCRIPT, FEATURE_DETAIL_OVERLAY_SCRIPT, NEW_REQUIREMENT_DIALOG_SCRIPT } from "../dist/web/layout.js";
+import { renderPage, renderOrgSwitcher, escapeHtml, BOARD_CSP, BOARD_REFERRER_POLICY, SUBMIT_GUARD_SCRIPT, FEATURE_DETAIL_OVERLAY_SCRIPT, NEW_REQUIREMENT_DIALOG_SCRIPT } from "../dist/web/layout.js";
 import {
   renderFeatureDetail,
   renderTasksPick,
@@ -49,34 +49,61 @@ test("escapeHtml: 五字符全转义；null/undefined 为空串", () => {
 test("renderPage: 标题转义 + 导航高亮 + 口径脚注逐条渲染", () => {
   const html = renderPage({
     title: `页 <x>`,
-    active: "schedule",
+    active: "projects",
     bodyHtml: "<p>正文</p>",
     notes: ["注 A", "注 <B>"],
   });
   assert.match(html, /<title>页 &lt;x&gt; · board<\/title>/);
-  assert.match(html, /<a href="\/schedule" class="on">排期<\/a>/);
+  assert.match(html, /<a href="\/projects" class="on">项目<\/a>/);
   assert.match(html, /<li>注 A<\/li>/);
   assert.match(html, /<li>注 &lt;B&gt;<\/li>/);
 });
 
-test("REQ-04 Q2：导航「需求」项退役 ⇒ 页面不含 /requirements 链接（v0.9.3 B-T3 增 Agent；§9-b 增首页；§9-c 摘 /orgs = 闭集六项）", () => {
-  const html = renderPage({ title: "t", active: "schedule", bodyHtml: "<p>b</p>" });
+test("REQ-04 Q2：导航「需求」项退役 ⇒ 页面不含 /requirements 链接（v0.9.6 B5a 闭集六 → 三枚：摘排期/任务/宿主桥）", () => {
+  const html = renderPage({ title: "t", active: "projects", bodyHtml: "<p>b</p>" });
   assert.doesNotMatch(html, /href="\/requirements"/);
   assert.doesNotMatch(html, /\/timeline|Timeline/, "Timeline 导航已退役（增补 ③）");
   assert.doesNotMatch(html, /href="\/orgs"/, "§9-c：组织管理页退役 ⇒ NAV「组织」项摘除（管理职能迁空间内 /org/<名>/manage）");
+  assert.doesNotMatch(html, /href="\/schedule"/, "B5a：全局排期页退役 ⇒ NAV「排期」项摘除（排期面唯一承载位 = /org/<名>/schedule）");
+  assert.doesNotMatch(html, /href="\/tasks"/, "B5a 口径 33：「任务」摘条（路由不退 ⇒ 深链可达，不留 NAV 入口）");
+  assert.doesNotMatch(html, /href="\/host"/, "B5a 口径 38：「宿主桥」摘条（路由不退 ⇒ 正文链接可达，不留 NAV 入口）");
   for (const [href, text] of [
-    ["/", "首页"],
-    ["/schedule", "排期"],
-    ["/tasks", "任务"],
-    ["/projects", "项目 / 机器"],
+    ["/", "门户"],
+    ["/projects", "项目"],
     ["/agents", "Agent"],
-    ["/host", "宿主桥"],
   ]) {
     assert.ok(html.includes(`<a href="${href}"`), `导航含 ${href}`);
     assert.ok(html.includes(`>${text}</a>`), `导航含 ${text}`);
   }
   // 正文为纯 <p> ⇒ 全页锚点 = 导航闭集，多一枚即「需求」退役不彻底
-  assert.equal((html.match(/<a href=/g) ?? []).length, 6, "导航闭集 = 6 项（需求页退役 + Timeline 退役 + v0.9.3 Agent + §9-b 首页门户 + §9-c 摘组织）");
+  assert.equal((html.match(/<a href=/g) ?? []).length, 3, "导航闭集 = 3 项（B5a 收三枚：门户 / 项目 / Agent）");
+});
+
+// --- v0.9.6 B5b：组织切换器挂位三态（口径 19 / 20）--------------------------
+
+const ORG_NAV_2 = { org: "组织甲", orgs: ["组织甲", "组织乙"] };
+
+test("B5b-① 切换器三态：缺省 top 顶栏渲 / body 顶栏不渲（正文自挂）/ none 整页不渲 —— 判据是字段，**不是**「org 非空」", () => {
+  const top = renderPage({ title: "t", active: "home", bodyHtml: "<p>b</p>", orgNav: ORG_NAV_2 });
+  const body = renderPage({ title: "t", active: "home", bodyHtml: "<p>b</p>", orgNav: ORG_NAV_2, orgSwitcher: "body" });
+  const none = renderPage({ title: "t", active: "home", bodyHtml: "<p>b</p>", orgNav: ORG_NAV_2, orgSwitcher: "none" });
+  assert.match(top, /<header>[\s\S]*?class="org-switch"/, "top（缺省）：顶栏渲");
+  assert.doesNotMatch(body.slice(0, body.indexOf("<main>")), /class="org-switch/, "body：顶栏不渲");
+  assert.doesNotMatch(none, /class="org-switch/, "none：整页不渲");
+  // 反向钉「不得按 org 非空隐藏」：org 非空 + 缺省档 ⇒ 仍须顶栏渲（空间错误页族的唯一组织出路）
+  assert.notEqual(ORG_NAV_2.org, null, "本钉的前提 = org 非空");
+  assert.equal(body.slice(body.indexOf("<main>")), none.slice(none.indexOf("<main>")), "body 与 none 的正文一致（区别只在顶栏）");
+});
+
+test("B5b-② 切换器单点复用 + 行右修饰类：extraClass 只改 class 一枚，顶栏档输出逐字节不变（CSS 另挂 .org-switch.right）", () => {
+  assert.equal(
+    renderOrgSwitcher(ORG_NAV_2),
+    '<span class="org-switch"> <span class="muted">组织</span> <a href="/org/%E7%BB%84%E7%BB%87%E7%94%B2/" class="on">组织甲</a><a href="/org/%E7%BB%84%E7%BB%87%E4%B9%99/">组织乙</a></span>',
+    "缺省档 = 移位前逐字节（顶栏不收影响）",
+  );
+  assert.match(renderOrgSwitcher(ORG_NAV_2, "right"), /^<span class="org-switch right">/, "行右档只加修饰类");
+  const css = renderPage({ title: "t", active: "home", bodyHtml: "" });
+  assert.match(css, /\.org-switch\.right \{ float: right; \}/, "行右靠 CSS 一枚，不复用 .header-actions");
 });
 
 test("BOARD_CSP: 无外部资源（default-src none + 仅内联 style + 同源表单）", () => {
@@ -684,6 +711,65 @@ test("C6 renderTurnTrace 轮留痕：state/轮 id/时间一行 + 摘要折叠展
   assert.equal(noTime.includes("turn-summary"), false, "无摘要 ⇒ 不套空折叠层");
 });
 
+// --- v0.9.6 N4（REQ-2026-09-30-02）：详情页「最近一轮」回执卡（两处渲染点之一，另一处见结果页锚） ----
+
+const RECEIPT = { head: ["改了 views 与 server 装配", "补了四条锚"], todo: ["是否发版", "回执卡文案是否要调"], next: "等用户真机验收" };
+
+test("N4 renderTurnTrace：有 receipt ⇒ 渲结构化回执卡（三行 + 待用户逐条 ①② + 展开指引 + 完整摘要折叠）", () => {
+  const html = renderTurnTrace({
+    turnId: "turn-0123456789abcdef",
+    state: "succeeded",
+    summary: "本轮结论：门禁全绿",
+    at: "2026-09-30T08:00:00Z",
+    errorCode: null,
+    receipt: RECEIPT,
+  });
+  assert.match(html, /<div class="receipt-card">/, "回执卡容器");
+  assert.match(html, /<p class="hint receipt-row"><b>要点<\/b> · 改了 views 与 server 装配<br>补了四条锚<\/p>/, "要点逐行");
+  assert.match(html, /<b>待用户<\/b> · ① 是否发版<br>② 回执卡文案是否要调<\/p>/, "待用户逐条带圈号");
+  assert.match(html, /<b>下一步<\/b> · 等用户真机验收<\/p>/, "下一步一句话");
+  assert.match(html, /📄 文档产出见『阶段产出』区，展开查看/, "产出指引 = 静态行，且措辞含「展开」（该区默认收起）");
+  assert.match(
+    html,
+    /<details class="fold turn-summary"><summary>完整摘要<\/summary><pre class="result">本轮结论：门禁全绿<\/pre><\/details>/,
+    "摘要退入「完整摘要」折叠，内容仍是现状那枚 pre",
+  );
+  assert.equal(html.includes("<script"), false, "回执卡零脚本（折叠只用原生 details · N3 内联脚本闭集不扩）");
+});
+
+test("N4 renderTurnTrace：待用户「无」/ 要点缺 ⇒ 三行照常在场（不空渲、不臆造）", () => {
+  const html = renderTurnTrace({
+    turnId: "t4",
+    state: "succeeded",
+    summary: null,
+    at: null,
+    errorCode: null,
+    receipt: { head: [], todo: [], next: "" },
+  });
+  assert.match(html, /<b>要点<\/b> · —<\/p>/);
+  assert.match(html, /<b>待用户<\/b> · 无<\/p>/, "空清单 = 「无」（与 receipt.ts 契约同口径）");
+  assert.match(html, /<b>下一步<\/b> · —<\/p>/);
+  assert.equal(html.includes("turn-summary"), false, "无摘要 ⇒ 不套空折叠层");
+});
+
+test("N4 renderTurnTrace：无 receipt（null / 键缺席 / agent 漏遵）⇒ 渲染与现状逐字节一致", () => {
+  const base = {
+    turnId: "t5",
+    state: "failed",
+    summary: "故".repeat(200),
+    at: "2026-09-30T09:00:00Z",
+    errorCode: "turn_upstream_unreachable",
+  };
+  const legacy = renderTurnTrace({ ...base });
+  assert.equal(renderTurnTrace({ ...base, receipt: null }), legacy, "receipt = null ⇒ 与历史轮同一渲染");
+  assert.equal(
+    legacy,
+    `<h2>最近一轮</h2>\n<p class="hint turn-trace"><b>失败（failed）</b> · <span class="mono">t5</span> · 2026-09-30T09:00:00Z · <span class="mono">turn_upstream_unreachable</span></p>\n<details class="fold turn-summary"><summary>故${"故".repeat(119)}…</summary><pre class="result">${"故".repeat(200)}</pre></details>`,
+    "无回执 = C6 现状逐字节（容错退回，不劣于今天）",
+  );
+  assert.equal(legacy.includes("receipt-card"), false, "现状渲染不得带出回执卡痕迹");
+});
+
 // --- B-T4（3300 收编补差）：详情页任务行「三时刻 + 排队/执行时长」 --------------------------
 
 const timingsTask = {
@@ -963,6 +1049,42 @@ test("C5 renderTurnOutcome：display 缺省时标题落「本轮结果：<结局
   const withDisplay = renderTurnOutcome(outcome({ display: "需要你回答", disposition: "awaiting_answer" }));
   assert.match(withDisplay, /<h2>需要你回答<\/h2>/, "display 有值 ⇒ 如实显示，不被兜底覆盖");
   assert.doesNotMatch(withDisplay, /触发一轮/);
+});
+
+test("N4 renderTurnOutcome：结果页带回执 ⇒ 渲「本轮回执」卡（摘要退入完整摘要）；无回执 ⇒ 现状平铺", () => {
+  const outcome = (over = {}) => ({
+    ok: true,
+    org: "flow-team",
+    featureId: "F1",
+    disposition: "completed",
+    queued: false,
+    turnId: "turn-1",
+    contextId: "ctx-1",
+    round: 2,
+    state: "completed",
+    display: "",
+    summary: "产出摘要",
+    question: null,
+    receipt: null,
+    error: null,
+    bridge: { pid: 4242, port: 8790, kind: "claude" },
+    ...over,
+  });
+
+  const plain = renderTurnOutcome(outcome());
+  assert.match(plain, /<h2>本轮产出（摘要）<\/h2><pre class="result">产出摘要<\/pre>/, "无回执 ⇒ 摘要平铺 = 现状");
+  assert.equal(plain.includes("receipt-card"), false, "拒单/无回执档不得带出回执卡痕迹");
+
+  const keyed = renderTurnOutcome(outcome({ receipt: RECEIPT }));
+  assert.match(keyed, /<h2>本轮回执<\/h2>/, "有回执 ⇒ 标题换「本轮回执」");
+  assert.match(keyed, /<div class="receipt-card">[\s\S]*<b>要点<\/b> · 改了 views 与 server 装配[\s\S]*<b>下一步<\/b> · 等用户真机验收[\s\S]*<\/div>/);
+  assert.match(keyed, /📄 文档产出见『阶段产出』区，展开查看/);
+  assert.match(keyed, /<details class="fold turn-summary"><summary>完整摘要<\/summary><pre class="result">产出摘要<\/pre><\/details>/, "摘要不丢：折叠层内仍是现状 pre");
+  assert.equal(keyed.includes("<script"), false, "结果页同样零脚本");
+
+  const noKey = { ...outcome() };
+  delete noKey.receipt;
+  assert.equal(renderTurnOutcome(noKey), plain, "receipt 键缺席（老调用方）⇒ 与现状逐字节一致");
 });
 
 // ---------------------------------------------------------------------------

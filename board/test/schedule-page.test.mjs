@@ -1,8 +1,9 @@
 /**
- * REQ-v0.9.2-2026-09-25-02 · M4 排期看板页 `/schedule`（只读）+ M5 需求池 ——
+ * REQ-v0.9.2-2026-09-25-02 · M4 排期看板（只读）+ M5 需求池 ——
  * 分组纯函数（version-order 数值序 + 未排期滤除）/ 卡片渲染（状态徽标 · 无按状态分列）/
  * 需求池（判据 = 未排期 ∧ 非终态（三终态不进池）、池序 createdAt 降序 null 落底 featureId 兜底、卡上需求原文截断转义）/
- * HTTP 面（GET 200 + 导航高亮 / 方法门 405 / 桥不可达 502）/ 导航闭集六项。
+ * HTTP 面（**v0.9.6 B5a**：全局 `/schedule` 退役 ⇒ GET 303 回门户、非 GET 405；看板宿主 = 空间排期页
+ * `/org/alpha/schedule` 200 + 空间导航当前项 / 桥不可达 502）/ 导航闭集三枚（见 `orgs-page` N6-⑫）。
  * REQ-v0.9.2-2026-09-26-02 增补 ④ —— 详情浮层：dialog 骨架 + 内联脚本常量规格 + `<a>` 回退。
  * REQ-2026-09-26-02 T5 —— 拖拽排期视图闸：可拖属性仅「想法挪版」态出、锁态置灰 + 紧凑标记（增补 ①
  * 降噪：长说明只在 409 错误卡）、
@@ -622,7 +623,7 @@ async function withScheduleServer(client, run) {
   }
 }
 
-test("M4-⑥ GET /schedule: 200 + 导航「排期」高亮 + 版本列有序；未排期卡在需求池列、不占版本列", async () => {
+test("M4-⑥（B5a 重指空间排期页）GET /org/alpha/schedule: 200 + 空间导航「排期」为当前项 + 版本列有序；未排期卡在需求池列、不占版本列", async () => {
   const client = fakeClient([
     feature("F1", "v0.10.0"),
     feature("F2", "v0.9.2"),
@@ -630,10 +631,11 @@ test("M4-⑥ GET /schedule: 200 + 导航「排期」高亮 + 版本列有序；�
     feature("F4", "  "),
   ]);
   await withScheduleServer(client, async (base) => {
-    const res = await fetch(`${base}/schedule`);
+    const res = await fetch(`${base}/org/alpha/schedule`);
     const text = await res.text();
     assert.equal(res.status, 200);
-    assert.match(text, /<a href="\/schedule" class="on">排期<\/a>/);
+    assert.match(text, /<a class="fl on" href="\/org\/alpha\/schedule" style="font-weight:700">排期<\/a>/, "空间导航当前项 = 排期（B5a 起 NAV 无排期条 ⇒ 锚落空间导航行）");
+    assert.doesNotMatch(text, /<a href="\/schedule"/, "NAV 不含 /schedule（B5a 摘条）");
     assert.match(text, /<h3>v0\.9\.2/, "v0.9.2 列在左");
     assert.match(text, /<h3>v0\.10\.0/, "v0.10.0 列在右（数值序）");
     assert.ok(
@@ -658,9 +660,9 @@ test("M4-⑥ GET /schedule: 200 + 导航「排期」高亮 + 版本列有序；�
   });
 });
 
-test("N2-④ 注入面：`/schedule` = 看板四枚脚本；门户 `/` 只多一枚泛化弹窗脚本（§9.5）；其余页零页面脚本", async () => {
+test("N2-④ 注入面：`/org/<名>/schedule` = 看板四枚脚本（B5a 起唯一宿主）；门户 `/` 只多一枚泛化弹窗脚本（§9.5）；其余页零页面脚本", async () => {
   await withScheduleServer(fakeClient([feature("F1", "v0.9.2"), feature("F3", null)]), async (base) => {
-    for (const path of ["/schedule"]) {
+    for (const path of ["/org/alpha/schedule"]) {
       const text = await (await fetch(`${base}${path}`)).text();
       assert.ok(text.includes(FEATURE_DETAIL_OVERLAY_SCRIPT), `${path} 含浮层脚本`);
       assert.match(text, /<dialog class="fd" id="feat-dialog">/, `${path} 含 dialog 骨架`);
@@ -668,7 +670,7 @@ test("N2-④ 注入面：`/schedule` = 看板四枚脚本；门户 `/` 只多一
       assert.match(text, /<dialog class="fd" id="new-req-dialog">/, `${path} 含新增需求 dialog 骨架`);
       assert.match(text, /<button type="button" id="new-req-open"/, `${path} 页头有「＋ 新增需求」按钮`);
     }
-    for (const path of ["/tasks", "/projects", "/host"]) {
+    for (const path of ["/tasks?project=p", "/projects", "/host"]) {
       const text = await (await fetch(`${base}${path}`)).text();
       assert.ok(!text.includes(FEATURE_DETAIL_OVERLAY_SCRIPT), `${path} 不注入浮层脚本`);
       assert.ok(!text.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), `${path} 不注入弹窗脚本`);
@@ -690,14 +692,15 @@ test("N2-④ 注入面：`/schedule` = 看板四枚脚本；门户 `/` 只多一
 
 test("增补② 注入面：排期页同挂 vendored mermaid + 渲染脚本（浮层换入的依赖图补渲）；非看板页不挂", async () => {
   await withScheduleServer(fakeClient([feature("F1", "v0.9.2")]), async (base) => {
-    const text = await (await fetch(`${base}/schedule`)).text();
+    const text = await (await fetch(`${base}/org/alpha/schedule`)).text();
     assert.match(text, /<script src="\/static\/mermaid\.min\.js" defer><\/script>/, "库先（defer 于解析末段执行）");
     assert.match(text, /window\.a2aRenderMermaid = renderBlocks/, "渲染脚本（含补渲钩子）随后");
     assert.ok(
       text.indexOf('/static/mermaid.min.js') < text.indexOf("window.a2aRenderMermaid = renderBlocks"),
       "注入顺序 = 先库后渲染脚本（浮层脚本只**引用**钩子名，不含赋值，故以赋值为序标）",
     );
-    const other = await (await fetch(`${base}/tasks`)).text();
+    // C1：全局 /tasks 裸页退役 ⇒ 对照样本换深链存活档 `?project=x`（本夹具无 getTasks ⇒ 落桥宕档，同样零脚本）
+    const other = await (await fetch(`${base}/tasks?project=x`)).text();
     assert.ok(!other.includes("a2aRenderMermaid"), "非浮层承载页不挂 mermaid 脚本");
   });
 });
@@ -733,7 +736,7 @@ test("增补① 锁定说明归属：409 服务端文案完整保留（卡面降
   const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client, versionsLedgerFile: lockFreeFile });
   try {
     const base = `http://127.0.0.1:${handle.port}`;
-    const cardText = await (await fetch(`${base}/schedule`)).text();
+    const cardText = await (await fetch(`${base}/org/alpha/schedule`)).text();
     assert.ok(!/本板不提供解除入口|需求确认单经用户确认后/.test(cardText), "长文案不在排期页卡面");
     const res = await fetch(`${base}/features/LOCKED/schedule`, {
       method: "POST",
@@ -752,14 +755,14 @@ test("增补① 锁定说明归属：409 服务端文案完整保留（卡面降
   }
 });
 
-test("N4-④ HTTP 面：版本台账 released 条目在 /schedule 列头显示「已发版」；未登记版标「进行中」（v0.9.4 N3 锁读台账，config releasedVersions 退役）", async () => {
+test("N4-④（B5a 重指空间排期页）HTTP 面：版本台账 released 条目在 /org/alpha/schedule 列头显示「已发版」；未登记版标「进行中」（v0.9.4 N3 锁读台账，config releasedVersions 退役）", async () => {
   const client = fakeClient([feature("F1", "v0.9.1"), feature("F2", "v0.9.2")]);
   const dir = mkdtempSync(join(tmpdir(), "board-locked-"));
   const ledgerFile = join(dir, "versions.json");
   writeFileSync(
     ledgerFile,
     JSON.stringify(
-      { version: 1, versions: [{ version: "v0.9.1", status: "released", createdAt: "c", updatedAt: "u", note: null }] },
+      { version: 2, versions: [{ org: "alpha", version: "v0.9.1", status: "released", createdAt: "c", updatedAt: "u", note: null }] },
       null,
       2,
     ) + "\n",
@@ -767,7 +770,7 @@ test("N4-④ HTTP 面：版本台账 released 条目在 /schedule 列头显示�
   );
   const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client, versionsLedgerFile: ledgerFile });
   try {
-    const text = await (await fetch(`http://127.0.0.1:${handle.port}/schedule`)).text();
+    const text = await (await fetch(`http://127.0.0.1:${handle.port}/org/alpha/schedule`)).text();
     assert.match(text, /<h3>v0\.9\.1 <span class="kbadge vbadge locked"[^>]*>🔒 已发版<\/span>/);
     assert.match(text, /<h3>v0\.9\.2 <span class="kbadge vbadge wip"[^>]*>进行中<\/span>/, "未登记版列头 = 进行中徽标");
   } finally {
@@ -776,11 +779,20 @@ test("N4-④ HTTP 面：版本台账 released 条目在 /schedule 列头显示�
   }
 });
 
-test("M4-⑦ 方法门与错误面: POST /schedule ⇒ 405；桥不可达 ⇒ 502 且高亮留在排期页", async () => {
+test("M4-⑦（B5a 改版）方法门与错误面: GET /schedule ⇒ 303 回门户（不触桥）、POST /schedule ⇒ 405 带退役文案；空间排期页桥不可达 ⇒ 502 且正文结构在", async () => {
   await withScheduleServer(fakeClient([feature("F1", "v0.9.2")]), async (base) => {
+    // 新锚 ①：退役路径 GET ⇒ 303（不 404、不触桥）
+    const get = await fetch(`${base}/schedule`, { redirect: "manual" });
+    assert.equal(get.status, 303, "B5a：/schedule 整页退役 ⇒ 303（板惯例，留反悔余地）");
+    assert.equal(get.headers.get("location"), "/", "303 目标 = 门户");
+    assert.equal(get.headers.get("cache-control"), "no-store");
+    await get.body?.cancel();
+    // 新锚 ②：退役路径非 GET ⇒ 405（文案列全写面，同 /requirements、/orgs 形制）
     const post = await fetch(`${base}/schedule`, { method: "POST" });
     assert.equal(post.status, 405);
-    assert.match(await post.text(), /仅支持 GET/);
+    const postText = await post.text();
+    assert.match(postText, /GET \/schedule 已改 303 回门户（排期面迁 \/org\/&lt;名&gt;\/schedule）/, "405 文案 = 退役说明（表驱动逐路径一条）");
+    assert.match(postText, /仅支持 GET（写面 = /, "405 文案列全写面（表驱动后与旧两条同形制）");
   });
   const broken = {
     baseUrl: "http://fake",
@@ -789,10 +801,12 @@ test("M4-⑦ 方法门与错误面: POST /schedule ⇒ 405；桥不可达 ⇒ 50
     },
   };
   await withScheduleServer(broken, async (base) => {
-    const res = await fetch(`${base}/schedule`);
+    const res = await fetch(`${base}/org/alpha/schedule`);
     const text = await res.text();
     assert.equal(res.status, 502);
     assert.match(text, /bridge_unreachable/);
-    assert.match(text, /<a href="\/schedule" class="on">排期<\/a>/, "宕页高亮随发起页，不跳回需求");
+    // B5a：NAV 摘「排期」条 ⇒ 原「宕页高亮随发起页」锚降级为正文结构锚（桥宕页仍是板页外壳）
+    assert.match(text, /<nav>/, "宕页仍出板壳（导航结构在，不跳回需求）");
+    assert.doesNotMatch(text, /<a href="\/schedule"/, "宕页不再给「排期」留 NAV 入口（退役闭集钉）");
   });
 });

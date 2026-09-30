@@ -14,11 +14,13 @@ import {
   serializeVersionsLedger,
   findVersionRecord,
   releasedVersionNames,
+  releasedVersionLabels,
   isVersionReleased,
   createVersion,
   removeVersion,
   setVersionStatus,
   migrateReleasedVersions,
+  migrateLedgerOrgs,
   VersionsLedgerStore,
 } from "../dist/versions-ledger.js";
 
@@ -45,6 +47,7 @@ test("N1-parse 容错：坏形状 ⇒ 空台账；version 缺失/空白 ⇒ 丢�
   assert.equal(parseVersionRecord({ version: "   " }), null);
   assert.equal(parseVersionRecord("x"), null);
   assert.deepEqual(parseVersionRecord({ version: " v0.9.4 ", status: "活跃" }), {
+    org: "",
     version: "v0.9.4",
     status: "notstart",
     createdAt: "",
@@ -77,7 +80,7 @@ test("N1-createVersion 纯函数：新条 status=notstart；同名幂等 added=f
   const first = createVersion(base, "v0.9.4", NOW);
   assert.equal(first.added, true);
   assert.deepEqual(first.ledger.versions, [
-    { version: "v0.9.4", status: "notstart", createdAt: NOW, updatedAt: NOW, note: null },
+    { org: "", version: "v0.9.4", status: "notstart", createdAt: NOW, updatedAt: NOW, note: null },
   ]);
   assert.deepEqual(base.versions, [], "纯函数：不得改动入参台账");
   const again = createVersion(first.ledger, "v0.9.4", "2026-01-01T00:00:00.000Z");
@@ -96,6 +99,7 @@ test("N1-setVersionStatus 纯函数：不存在 ⇒ found=false；同值 ⇒ cha
   const up = setVersionStatus(l, "v0.9.4", "active", "2026-10-01T00:00:00.000Z", "manual:probe");
   assert.equal(up.changed, true);
   assert.deepEqual(findVersionRecord(up.ledger, "v0.9.4"), {
+    org: "",
     version: "v0.9.4",
     status: "active",
     createdAt: NOW,
@@ -225,4 +229,122 @@ test("N1-残留键 warn / 不双读：台账已存在 ⇒ 忽略 config 键（re
   assert.match(out.warning, /残留键/, "一次性 warn 文案");
   assert.equal(readFileSync(file, "utf8"), before, "残留键不得改动台账文件");
   assert.deepEqual(findVersionRecord(store.load().ledger, "v0.9.0"), null, "残留键值不进台账");
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.6 B1（REQ-2026-09-28-07 口径 1/2/32）：台账组织维度 + migrateLedgerOrgs
+// ---------------------------------------------------------------------------
+
+test("B1-① 跨组织同名不互覆盖（解析层）：去重键 = (org, version)；同键仍后读到覆盖前者", () => {
+  const l = parseVersionsLedger({
+    version: VERSIONS_LEDGER_VERSION,
+    versions: [
+      { org: "alpha", version: "v0.9.5", status: "released", createdAt: NOW, updatedAt: NOW },
+      { org: "beta", version: "v0.9.5", status: "notstart", createdAt: NOW, updatedAt: NOW },
+      { org: "alpha", version: "v0.9.5", status: "active", createdAt: NOW, updatedAt: NOW },
+    ],
+  });
+  assert.equal(l.versions.length, 2, "两个组织的同版号 = 两条独立条目（beta 不得被 alpha 覆盖掉）");
+  assert.equal(findVersionRecord(l, "v0.9.5", "alpha").status, "active", "同 (org, version) ⇒ 后读到覆盖前者");
+  assert.equal(findVersionRecord(l, "v0.9.5", "beta").status, "notstart", "另一组织的同名条目不受影响");
+  assert.deepEqual(releasedVersionNames(l, "alpha"), [], "切片读面：alpha 名下无 released");
+  assert.deepEqual(releasedVersionNames(l, "beta"), [], "beta 名下是 notstart，不是 released");
+  assert.deepEqual(
+    releasedVersionNames(parseVersionsLedger({ version: 2, versions: [{ org: "alpha", version: "v0.9.5", status: "released" }] })),
+    ["v0.9.5"],
+    "已发版集合按组织可查",
+  );
+});
+
+test("B1-② 跨组织同名不互覆盖（写面纯函数）：建/设状态/删按 (org, version)，org 省略 = 不限组织", () => {
+  let l = createVersion(emptyVersionsLedger(), "v1.0.0", NOW, "alpha").ledger;
+  assert.equal(createVersion(l, "v1.0.0", NOW, "alpha").added, false, "同组织同版号 ⇒ 幂等 added=false");
+  const cross = createVersion(l, "v1.0.0", NOW, "beta");
+  assert.equal(cross.added, true, "不同组织的同版号是**新条目**，不是撞名");
+  assert.equal(cross.ledger.versions.length, 2);
+  const marked = setVersionStatus(cross.ledger, "v1.0.0", "released", "2026-10-01T00:00:00.000Z", "manual:alpha", "alpha");
+  assert.equal(marked.changed, true);
+  assert.equal(isVersionReleased(marked.ledger, "v1.0.0", "alpha"), true, "alpha 名下已发版");
+  assert.equal(isVersionReleased(marked.ledger, "v1.0.0", "beta"), false, "**beta 不得被同版号的 alpha 锁住**");
+  assert.deepEqual(
+    marked.ledger.versions.filter((v) => v.org === "beta").map((v) => v.updatedAt),
+    [NOW],
+    "另一组织的 updatedAt 不被带动",
+  );
+  assert.deepEqual(releasedVersionLabels(marked.ledger), ["v1.0.0（alpha）"], "启动日志读面带组织维度（空串桶显式标未归属）");
+  const rm = removeVersion(marked.ledger, "v1.0.0", "alpha");
+  assert.equal(rm.removed, true);
+  assert.deepEqual(rm.ledger.versions.map((v) => v.org), ["beta"], "删条目只删该组织那一行");
+  assert.equal(removeVersion(rm.ledger, "v1.0.0", "alpha").removed, false, "已删的组织再删 ⇒ removed=false");
+});
+
+test("B1-②b org 不落白名单 = 读一次静默丢 org（最危险一类）：解析 + 序列化 round-trip 必须保 org", () => {
+  const l = parseVersionsLedger({
+    version: VERSIONS_LEDGER_VERSION,
+    versions: [{ org: " alpha ", version: "v0.9.6", status: "active", createdAt: NOW, updatedAt: NOW, note: "k" }],
+  });
+  assert.equal(l.versions[0].org, "alpha", "org 键须被解析（trim）");
+  const text = serializeVersionsLedger(l);
+  assert.equal(JSON.parse(text).versions[0].org, "alpha", "序列化不得丢 org 键");
+  assert.deepEqual(parseVersionsLedger(JSON.parse(text)), l, "round-trip 后 org 仍在");
+});
+
+test("B1-③ schema 1 → 2：常量 bump；读到 v1 台账（条目缺 org）⇒ 落盘即写 2", () => {
+  assert.equal(VERSIONS_LEDGER_VERSION, 2, "台账 schema 常量 = 2（v0.9.6 B1 记录扩 org）");
+  const { dir, file } = tmpLedger();
+  mkdirSync(join(dir, ".data"));
+  writeFileSync(file, JSON.stringify({ version: 1, versions: [{ version: "v0.9.0", status: "released", createdAt: NOW, updatedAt: NOW }] }, null, 2) + "\n", "utf8");
+  const store = new VersionsLedgerStore(file);
+  const { ledger } = store.load();
+  assert.equal(ledger.version, 1, "读侧如实保留文件里的 schema 值");
+  assert.equal(ledger.versions[0].org, "", "缺 org 键 ⇒ 解析落空串（迁移判据）");
+  const out = migrateLedgerOrgs(ledger, "a2a-coding", NOW);
+  store.save(out.ledger);
+  const onDisk = JSON.parse(readFileSync(file, "utf8"));
+  assert.equal(onDisk.version, 2, "落盘恒写当前 schema（1 → 2 随迁移完成）");
+  assert.equal(onDisk.versions[0].org, "a2a-coding", "迁移后条目带 org");
+});
+
+test("B1-④ migrateLedgerOrgs：缺 org 的 8 条全部 stamp 为 defaultGroup；重跑幂等不重复 stamp", () => {
+  const legacy = parseVersionsLedger({
+    version: 1,
+    versions: [
+      ...["v0.9.0", "v0.9.1", "v0.9.2", "v0.9.3", "v0.9.4", "v0.9.5"].map((version) => ({
+        version,
+        status: "released",
+        createdAt: "2026-09-27T17:05:15.815Z",
+        updatedAt: "2026-09-27T17:05:15.815Z",
+        note: "migrated:config-releasedVersions",
+      })),
+      { version: "v0.9.6", status: "active", createdAt: NOW, updatedAt: NOW, note: "auto:first-card-confirmed" },
+      { version: "v0.9.7", status: "notstart", createdAt: NOW, updatedAt: NOW, note: null },
+    ],
+  });
+  const once = migrateLedgerOrgs(legacy, "a2a-coding", "2026-09-29T00:00:00.000Z");
+  assert.deepEqual(once.stamped, ["v0.9.0", "v0.9.1", "v0.9.2", "v0.9.3", "v0.9.4", "v0.9.5", "v0.9.6", "v0.9.7"], "8 条全 stamp");
+  assert.deepEqual(once.bucketed, [], "已配默认组织 ⇒ 不落空串桶");
+  assert.equal(once.warning, null);
+  assert.deepEqual(once.ledger.versions.map((v) => v.org), Array(8).fill("a2a-coding"), "全部条目归位 a2a-coding");
+  assert.equal(once.ledger.versions[0].createdAt, "2026-09-27T17:05:15.815Z", "stamp 只补 org，不动 createdAt");
+  assert.equal(once.ledger.versions[0].note, "migrated:config-releasedVersions", "既有 note 留痕不得被迁移覆盖");
+  assert.equal(once.ledger.version, 2, "迁移后台账升为 schema 2");
+  const twice = migrateLedgerOrgs(once.ledger, "a2a-coding", "2026-09-30T00:00:00.000Z");
+  assert.deepEqual(twice.stamped, [], "重启幂等：已带 org ⇒ 不再 stamp");
+  assert.deepEqual(twice.bucketed, []);
+  assert.equal(twice.warning, null);
+  assert.equal(twice.ledger, once.ledger, "无条目待迁移 ⇒ 台账**原样返回**（调用方据此不落盘）");
+});
+
+test("B1-⑤ migrateLedgerOrgs（defaultGroup 未配档）：一次性 warn + 留空串桶，不 fail-fast、不落盘", () => {
+  const legacy = parseVersionsLedger({ version: 1, versions: [{ version: "v0.9.0", status: "released", createdAt: NOW, updatedAt: NOW }] });
+  for (const missing of [null, "", "   "]) {
+    const out = migrateLedgerOrgs(legacy, missing, NOW);
+    assert.deepEqual(out.stamped, [], JSON.stringify(missing) + " ⇒ 不 stamp");
+    assert.deepEqual(out.bucketed, ["v0.9.0"], "缺 org 条目登记为空串桶版号（供 warn 文案与排查）");
+    assert.match(out.warning, /未配默认组织/, "一次性 warn 文案");
+    assert.equal(out.ledger, legacy, "未配档 ⇒ 台账原样返回（调用方不得写文件）");
+    assert.equal(out.ledger.versions[0].org, "", "留在空串桶（门户不暴露该桶，由调用方过滤）");
+  }
+  const labels = releasedVersionLabels(legacy);
+  assert.deepEqual(labels, ["v0.9.0（未归属组织）"], "空串桶在启动日志显式标出，不静默当光版号");
 });

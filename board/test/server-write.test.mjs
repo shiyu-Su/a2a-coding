@@ -58,25 +58,32 @@ function fakeClient() {
  * 已发版锁夹具（v0.9.4 N3）：`releasedVersions` 已退役出服务端配置（运行时锁改读版本台账）
  * ⇒ 测试把「这些版本已发版」预置为临时台账文件喂入（`versionsLedgerFile`）。
  * **恒注入**（未声明锁版时喂空台账）：否则缺省会读开发机真实 `.data/versions.json`，锁随本机状态漂移。
+ * **v0.9.6 B3**：条目唯一键 = `(org, version)` ⇒ 夹具带 `org` 档（缺省空串 = 未归属桶，
+ * 不锁任何具名组织的写口）；要撞锁的用例按提需求实际归属档传 `releasedOrg`。
+ * 单项也可写成 `{ org, version }`（同一本台账里跨组织布条目，见 N2-⑧）。
  */
-function releasedLedgerFixture(versions = []) {
+function releasedLedgerFixture(versions = [], org = "") {
   const dir = mkdtempSync(join(tmpdir(), "board-locked-"));
   const file = join(dir, "versions.json");
-  const entries = versions.map((raw) => ({
-    version: String(raw).trim(),
-    status: "released",
-    createdAt: "2026-09-24T00:00:00.000Z",
-    updatedAt: "2026-09-24T00:00:00.000Z",
-    note: null,
-  }));
-  writeFileSync(file, JSON.stringify({ version: 1, versions: entries }, null, 2) + "\n", "utf8");
+  const entries = versions.map((raw) => {
+    const pair = typeof raw === "object" && raw !== null ? raw : { org, version: String(raw) };
+    return {
+      org: pair.org ?? "",
+      version: String(pair.version).trim(),
+      status: "released",
+      createdAt: "2026-09-24T00:00:00.000Z",
+      updatedAt: "2026-09-24T00:00:00.000Z",
+      note: null,
+    };
+  });
+  writeFileSync(file, JSON.stringify({ version: 2, versions: entries }, null, 2) + "\n", "utf8");
   return { file, cleanup: () => rmSync(dir, { recursive: true, force: true }) };
 }
 
 async function withServer(run, serverOptions = {}) {
   const { client, calls } = fakeClient();
-  const { releasedVersions, ...rest } = serverOptions;
-  const seed = releasedLedgerFixture(releasedVersions ?? []);
+  const { releasedVersions, releasedOrg, ...rest } = serverOptions;
+  const seed = releasedLedgerFixture(releasedVersions ?? [], releasedOrg ?? "");
   const handle = await createBoardServer({
     host: "127.0.0.1",
     port: 0,
@@ -482,18 +489,19 @@ test("BD11-⑥（负向锚）：板不写状态机迁移 —— approve/cancel �
   );
 });
 
-test("BD7-⑦（BD11 反转）：提需求表单**含**组织名字段（REQ-04 Q2 起在看板页弹窗内；§9-b 起看板宿主 = /schedule）；只读渲染与 CSP 均未变", async () => {
-  // 未配默认组织 ⇒ 组织名带 required（前端便利；硬校验仍在服务端）
+test("BD7-⑦（BD11 反转 · B5a 重指空间排期页）：提需求表单在看板上的**空间免选**档（全局档表单已无 HTTP 宿主，字段形状钉在 web.test BD8/BD11）；只读渲染与 CSP 均未变", async () => {
+  // B5a 起看板唯一宿主 = `/org/<名>/schedule` ⇒ 页面上那枚表单恒为 BD8 免选形态（组织由路径决定）
   await withServer(async (base, calls) => {
-    const res = await req(base, "/schedule");
+    const res = await req(base, "/org/g/schedule");
     assert.equal(res.status, 200);
-    assert.match(res.text, /<form method="post" action="\/requirements"/);
+    assert.match(res.text, /<form method="post" action="\/org\/g\/requirements"/, "action 带空间前缀（写面仍归一到 POST /requirements）");
     assert.match(res.text, /name="title"/);
     assert.match(res.text, /name="version"/);
     assert.match(res.text, /name="requirement"/);
-    assert.match(res.text, /name="group"[^>]*required/, "未配默认组织 ⇒ 表单组织名为必填");
-    assert.match(res.text, /首次填写即创建该组织/, "表单须说明「首次使用该组织名 = 创建该组织」");
-    // N3：本文件默认未装配宿主面 ⇒ 首页表单旁如实标 orgsDir 未装配
+    assert.match(res.text, /<input type="hidden" name="group" value="g">/, "组织名不进可编辑字段：hidden 值必发");
+    assert.doesNotMatch(res.text, /<input name="group"/, "空间页不出可编辑组织输入（必填/留空两档归单元面）");
+    assert.match(res.text, /board_org_mismatch/, "mismatch 执法提示在表单内");
+    // N3：本文件默认未装配宿主面 ⇒ 提需求表单旁如实标 orgsDir 未装配
     assert.match(res.text, /组织目录根（orgsDir）未装配/);
     // 收口轨 14：页面引入**同源内联脚本**（提交守卫等，无外源 src=）；
     // 增补② 起排期页另挂**同源 vendored** 资产（/static/mermaid.min.js，浮层换入依赖图补渲）⇒
@@ -504,7 +512,7 @@ test("BD7-⑦（BD11 反转）：提需求表单**含**组织名字段（REQ-04 
     }
     assert.doesNotMatch(res.text, /<script[^>]*src="(https?:|\/\/)/, "不得引入外源脚本");
     assert.match(res.text, /data-submit=/, "写表单须带提交守卫的就地反馈文案");
-    // 既有只读渲染照旧（REQ-04 Q2：列表页退役后由排期看板承载同一份 features 读面）
+    // 既有只读渲染照旧（REQ-04 Q2：列表页退役后由排期看板承载同一份 features 读面；B5a 宿主 = 空间页）
     assert.match(res.text, /需求甲/);
     assert.match(res.text, /任务数：4/);
     assert.deepEqual(calls, ["getFeatures"]);
@@ -525,12 +533,11 @@ test("BD7-⑦（BD11 反转）：提需求表单**含**组织名字段（REQ-04 
     const connectDir = /(^|;)\s*connect-src([^;]*)/.exec(csp)?.[2]?.trim() ?? "";
     assert.deepEqual(connectDir.split(/\s+/), ["'self'"], "connect-src 只放开同源一档");
   });
-  // 配了默认组织 ⇒ 组织名可不填，且把默认值如实显示在字段旁（不伪装成必填）
+  // 配了默认组织：空间页仍恒免选（板级默认提示属全局档，B5a 后无 HTTP 宿主 ⇒ 负向钉）
   await withServer(async (base) => {
-    const res = await req(base, "/schedule");
-    assert.match(res.text, /name="group"/);
-    assert.doesNotMatch(res.text, /name="group"[^>]*required/, "有默认组织 ⇒ 该字段允许留空");
-    assert.match(res.text, /留空 = 用板级默认 board-default-org/);
+    const res = await req(base, "/org/g/schedule");
+    assert.match(res.text, /<input type="hidden" name="group" value="g">/, "空间档不受 defaultGroup 影响");
+    assert.doesNotMatch(res.text, /留空 = 用板级默认/, "板级默认提示只在单元面钉（web.test BD11）：HTTP 面无全局档宿主");
   }, { defaultGroup: "board-default-org" });
 });
 
@@ -620,7 +627,7 @@ test("N2-①（负向 · API 档）：锁版排入 ⇒ 409 board_version_release
       assert.match(json.error, /已发版版本不可排入新需求/);
       assert.equal(seen.length, 0, "锁校验必须先于写封装（零出网）");
     },
-    { defaultGroup: null, createRequirementImpl: fn, releasedVersions: ["v0.9.1"] },
+    { defaultGroup: null, createRequirementImpl: fn, releasedVersions: ["v0.9.1"], releasedOrg: "g" },
   );
 });
 
@@ -645,7 +652,7 @@ test("N2-②（负向 · 表单档）：锁版排入 ⇒ 409 错误浮层（族�
       assert.match(res.text, field("需求描述", "文案回填"));
       assert.equal(seen.length, 0);
     },
-    { defaultGroup: null, createRequirementImpl: fn, releasedVersions: ["v0.9.1"] },
+    { defaultGroup: null, createRequirementImpl: fn, releasedVersions: ["v0.9.1"], releasedOrg: "flow" },
   );
 });
 
@@ -662,7 +669,7 @@ test("N2-③（正向）：未锁版本照常放行（201）；锁表存在不�
       assert.equal(seen.length, 1);
       assert.equal(seen[0].input.version, "v0.9.2");
     },
-    { defaultGroup: "g", createRequirementImpl: fn, releasedVersions: ["v0.9.0", "v0.9.1"] },
+    { defaultGroup: "g", createRequirementImpl: fn, releasedVersions: ["v0.9.0", "v0.9.1"], releasedOrg: "g" },
   );
 });
 
@@ -676,7 +683,7 @@ test("N2-④（正向 · 不扩拦）：空 version（键缺失 / 纯空白）�
       assert.equal(blank.status, 201, "纯空白 version trim 后 = 空串 ⇒ 恒不锁");
       assert.equal(seen.length, 2);
     },
-    { defaultGroup: "g", createRequirementImpl: fn, releasedVersions: ["v0.9.1"] },
+    { defaultGroup: "g", createRequirementImpl: fn, releasedVersions: ["v0.9.1"], releasedOrg: "g" },
   );
 });
 
@@ -704,7 +711,7 @@ test("N2-⑤（锁判据边界）：前后空白仍锁（trim 全等）；近似
       assert.equal(partial.status, 201, "禁子串匹配：锁表元素与提交值都必须全等");
       assert.equal(seen.length, 2);
     },
-    { defaultGroup: "g", createRequirementImpl: fn, releasedVersions: [" v0.9.1 ", "v0.9.0"] },
+    { defaultGroup: "g", createRequirementImpl: fn, releasedVersions: [" v0.9.1 ", "v0.9.0"], releasedOrg: "g" },
   );
 });
 
@@ -723,7 +730,64 @@ test("N2-⑥（校验顺序锚）：锁校验排在 CSRF / 入参校验之后 �
       assert.equal(JSON.parse(noTitle.text).code, "requirement_form_invalid");
       assert.equal(seen.length, 0);
     },
-    { defaultGroup: "g", createRequirementImpl: fn, releasedVersions: ["v0.9.1"] },
+    { defaultGroup: "g", createRequirementImpl: fn, releasedVersions: ["v0.9.1"], releasedOrg: "g" },
+  );
+});
+
+/**
+ * **REQ-2026-09-28-07 · v0.9.6 B3（版本切片读面 · 口径 29）**：提需求写口的锁按组织切 ——
+ * 台账唯一键 `(org, version)` ⇒ 锁的 org 维 = 三段回退 `spaceOrg ?? form.group ?? ctx.write.defaultGroup`
+ * （全局档 = 表单组织，未填才落板级默认）。验收④「两组织同版号互不可见互不锁」的写口那一半。
+ */
+test("N2-⑦（v0.9.6 B3 · 组织切片）：同版号只锁该组织 —— alpha released ⇒ alpha 撞 409、beta 照常 201", async () => {
+  const { fn, seen } = fakeCreate();
+  await withServer(
+    async (base) => {
+      const hit = await post(
+        base,
+        { group: "alpha", title: "撞本组织锁", version: "v0.9.1" },
+        { ...WRITE_HEADERS, accept: "application/json" },
+      );
+      assert.equal(hit.status, 409, "同组织同版号 ⇒ 锁照常执法");
+      assert.equal(JSON.parse(hit.text).code, "board_version_released");
+      const other = await post(
+        base,
+        { group: "beta", title: "他组织同版号", version: "v0.9.1" },
+        { ...WRITE_HEADERS, accept: "application/json" },
+      );
+      assert.equal(other.status, 201, "他组织的 released 不锁本组织（切片读面）");
+      assert.equal(seen.length, 1, "仅放行的一条触达写封装");
+      assert.equal(seen[0].options.group, "beta");
+    },
+    { defaultGroup: "alpha", createRequirementImpl: fn, releasedVersions: ["v0.9.1"], releasedOrg: "alpha" },
+  );
+});
+
+test("N2-⑧（v0.9.6 B3 · 三段回退档）：表单未填组织 ⇒ 锁随板级默认档走（回落档不是免锁档）", async () => {
+  const { fn, seen } = fakeCreate();
+  await withServer(
+    async (base) => {
+      const miss = await post(
+        base,
+        { title: "回落默认组织", version: "v0.9.1" },
+        { ...WRITE_HEADERS, accept: "application/json" },
+      );
+      assert.equal(miss.status, 201, "released 条目挂在 he-org 名下 ⇒ 不锁板级默认组织的同版号");
+      const hit = await post(
+        base,
+        { title: "撞默认组织自己的锁", version: "v0.9.0" },
+        { ...WRITE_HEADERS, accept: "application/json" },
+      );
+      assert.equal(hit.status, 409, "板级默认组织自己名下 released ⇒ 仍 409（回落档照常执法）");
+      assert.equal(JSON.parse(hit.text).code, "board_version_released");
+      assert.equal(seen.length, 1, "只有放行的一条触达写封装");
+      assert.equal(seen[0].input.version, "v0.9.1");
+    },
+    {
+      defaultGroup: "g",
+      createRequirementImpl: fn,
+      releasedVersions: [{ org: "he-org", version: "v0.9.1" }, { org: "g", version: "v0.9.0" }],
+    },
   );
 });
 

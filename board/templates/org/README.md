@@ -2,7 +2,7 @@
 
 > **归属**：改造文档 `doc/v0.9.0/Web看板与确认入口-改造文档.md` §2.2-8（组织目录内容）与 §2.2-14（组织版 `AGENTS.md` 模板归**板侧资产**）。
 > **本目录只放模板，不铺设任何真实组织目录。** 组织目录 = 宿主 agent 的 workspace（**不含代码仓**），将来由**板上建组织（V2）渲染复制**，V1 阶段由人按 `SETUP.md` 手工铺。
-> **接入状态（v0.9.5 C10 起）**：板侧 `src/org-seed.ts` **已代码接入** —— 建组织链（`POST /orgs`）与本板启动回填读取本目录的 `AGENTS.template.md`，渲染后落 `<组织目录>/AGENTS.md`（占位符替换见该模块；只补缺不覆盖、fail-open）。其余模板（`CLAUDE` / `planlog` / `CHANGELOG`）仍走 V1 人工铺设（`SETUP.md`）。
+> **接入状态（v0.9.5 C10 起）**：板侧 `src/org-seed.ts` **已代码接入** —— 建组织链（`POST /orgs`）与本板启动回填读取本目录的 `AGENTS.template.md`，渲染后落 `<组织目录>/AGENTS.md`（占位符替换见该模块；只补缺不覆盖、fail-open），并把 `flow/spec/` 的**三份规范**（`需求流程.md` / `引擎映射.md` / `文档模板.md`，最后一份随 v0.9.6 模板接入入列）快照落 `<组织目录>/flow/spec/`。其余模板（`CLAUDE` / `planlog` / `CHANGELOG`）仍走 V1 人工铺设（`SETUP.md`）。
 
 ## 1. 本目录的文件
 
@@ -24,7 +24,7 @@
 | 3 | `CLAUDE.md`（由 `CLAUDE.template.md` 生成、写明「以 AGENTS.md 为准」） | 本目录 `CLAUDE.template.md` | 同上 | ✅ |
 | 4 | `planlog.md` | 本目录 `planlog.template.md` | 同上 | ✅ |
 | 5 | `CHANGELOG.md` | 本目录 `CHANGELOG.template.md` | 同上 | ✅ |
-| 6 | `doc/` | 空目录 | `mkdir doc`；内容由 Step 0/1 落文件（`doc/{版本}/{topic}-*.md`） | — 无需模板（模板本体在 `flow/spec/文档模板.md`） |
+| 6 | `doc/` | 空目录 | `mkdir doc`；内容由 Step 0/1 落文件（`doc/{版本}/{topic}-*.md`） | — `doc/` 自身不存模板，但**组织内有模板副本**：`flow/spec/文档模板.md`（V2 由板随三份规范种子化落入，V1 由第 3 步按清单拷入） |
 | 7 | `scripts/watch-feature.mjs` + `scripts/watch-task.mjs` | a2a-coding **仓根 `scripts/`**（规范等待纪律的直接引用对象） | 复制这两个文件；**缺省打 3300 ⇒ 3300 须保持可用** | ⚠ 脚本本体**不在**本目录另存一份（避免第二份真相），来源见 §5 疑点 1 |
 | 8 | `.git`（`init` + 首提交 = **一组织一仓**、版本自治） | `git init` | `SETUP.md` 第 8 步 | — |
 | 9 | `.a2a/`（**不预置**、运行时自动落、须可写、建议 gitignore） | 编排桥运行时 | 不创建，只保证目录**可写** | — |
@@ -65,7 +65,7 @@
 | # | 疑点 | 本模板的处置 |
 |---|---|---|
 | 1 | **`scripts/watch-*.mjs` 的「从哪来」§2.2-8 未定**：事实源在 a2a-coding 仓根 `scripts/`，但组织目录可能在**另一台机**（板 spawn 宿主的 workspace），届时无仓可拷 | 不在模板目录另存脚本副本（避免第二份真相）；`SETUP.md` 第 6 步以「本仓 `scripts/` 为来源」写清命令，并把跨机分发登记为 **V2 待裁**（板内嵌资源 or 由板写出） |
-| 2 | `doc/_templates/` **不在 §2.2-8 清单**，但本仓 `doc/_templates/需求确认单.md` 实为 `flow/spec/文档模板.md` §1 的**逐字复制**（`flow/` 自己也这么建议） | 遵清单**不生成** `doc/_templates/`；组织宿主直接用 `flow/spec/文档模板.md`。若希望就近有模板 ⇒ 需先给 §2.2-8 **+1 条**（属方案变更，不自行加） |
+| 2 | `doc/_templates/` **不在 §2.2-8 清单**，但本仓 `doc/_templates/需求确认单.md` 实为 `flow/spec/文档模板.md` §1 的**逐字复制**（`flow/` 自己也这么建议） | **closed（v0.9.6 REQ-2026-09-30-01 裁定）**：权威源收敛到 `flow/spec/文档模板.md`（实战丰富版内容已并入、四方规范版本戳同步 v0.9.6），板种子化清单已把该文件落入组织工作区 ⇒ 「就近有模板」由清单条目 1 承载，**无需给 §2.2-8 +1 条**；本仓 `doc/_templates/` 两份由宿主退役 |
 | 3 | `.gitignore` 也不在 §2.2-8 清单，但条目 9 要求「`.a2a/` 建议 gitignore」⇒ 无落点 | 不提供 `.gitignore` 模板文件（免得「多」出一项），改为 `SETUP.md` 第 8 步内联给出内容 |
 | 4 | 组织目录**没有自述 README**（清单里没有 ⇒ 按「别漏别多」未加） | 未加。影响：新宿主进目录只看到 `AGENTS.md`/`CLAUDE.md` —— 二者已足以自述，可接受 |
 | 5 | **失败处置细则不在 `flow/`**：`failureKind` 六类 / 续跑余量 / 超时总框的事实源是本仓 `CLAUDE.md` 与 `PROTOCOL.md`，而 §2.2-8 明确不放本仓文档 | `AGENTS.template.md` §3.1 末显式声明「本工作区不带、也不自行发明该口径」，只保留 `引擎映射.md` §4 / §6 的粗口径（不猜重试策略）。若组织宿主需要该细则 ⇒ 需由底座随包分发一份，登记待裁 |

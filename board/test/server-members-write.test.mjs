@@ -375,7 +375,7 @@ test("BD4-⑩（正向 · 表单档）：200 整页含成功卡（备份路径 +
     assert.match(text, /重启该机 Launcher/);
     assert.match(text, /win-a/);
     // §9-c：成员写的成功回执宿主页 = 该组织空间的管理页（`/orgs` 页退役 ⇒ 落点随宿主迁）
-    assert.match(text, /<a class="fl" href="\/org\/flow-team\/manage" style="font-weight:700">管理<\/a>/, "回执整页带空间管理页导航（当前视图 = 管理）");
+    assert.match(text, /<a class="fl on" href="\/org\/flow-team\/manage" style="font-weight:700">管理<\/a>/, "回执整页带空间管理页导航（当前视图 = 管理）");
     assert.equal(existsSync(join(dir, "data", "orgs.json")), false, "成员写落点在 orch，不动板台账");
   });
 });

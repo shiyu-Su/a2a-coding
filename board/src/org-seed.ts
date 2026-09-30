@@ -5,7 +5,7 @@
  *
  * 1. **模板接线**：`board/templates/org/AGENTS.template.md` 渲染后落 `<orgDir>/AGENTS.md`
  *    （占位符替换见 {@link renderAgentsTemplate} —— 只替换 T11 **权威已知**的键）。
- * 2. **flow/spec 快照**：运行时读 `<repoRoot>/flow/spec/` 的两份规范（{@link DEFAULT_SPEC_SNAPSHOTS}），
+ * 2. **flow/spec 快照**：运行时读 `<repoRoot>/flow/spec/` 的三份规范（{@link DEFAULT_SPEC_SNAPSHOTS}），
  *    落 `<orgDir>/flow/spec/<名>`，文件头加**版本戳双记**注释（来源路径 + board 版本 + 源文件自身规范版本戳）。
  *    路径经 `docs-read.ts#defaultRepoRoot()` 单点推导，**禁硬编码**。
  * 3. **启动幂等回填**：枚举 `listOrgDirs(orgsDir) ∪ 组织台账`，只补缺失、不覆盖已有
@@ -37,11 +37,11 @@ export const AGENTS_TEMPLATE_FILE = "AGENTS.template.md";
 export const AGENTS_TARGET_FILE = "AGENTS.md";
 
 /**
- * flow/spec 快照的**缺省清单**（两份规范，C10 定稿口径）：
- * 需求流程内核 + 引擎映射。`templates/org/README.md` §2 的 flow/ 十文件清单是 V1 人工铺设口径，
+ * flow/spec 快照的**缺省清单**（三份规范，C10 定稿 + v0.9.6 模板接入）：
+ * 需求流程内核 + 引擎映射 + 文档模板。`templates/org/README.md` §2 的 flow/ 十文件清单是 V1 人工铺设口径，
  * 不属本节点范围。
  */
-export const DEFAULT_SPEC_SNAPSHOTS: readonly string[] = ["需求流程.md", "引擎映射.md"];
+export const DEFAULT_SPEC_SNAPSHOTS: readonly string[] = ["需求流程.md", "引擎映射.md", "文档模板.md"];
 
 /** 缺省宿主 kind（渲染 `{HOST_KIND}`；与 `config.ts` 的缺省一致）。 */
 export const DEFAULT_SEED_HOST_KIND = "claude";
@@ -144,7 +144,7 @@ export function renderAgentsTemplate(
 
 /**
  * 从规范正文提取「规范版本戳」（**纯函数**）：认 `**规范版本戳**：<token>` 首个命中
- * （`需求流程.md` / `引擎映射.md` 顶部均为此形）。取不到 ⇒ `null`（不臆造）。
+ * （`需求流程.md` / `引擎映射.md` / `文档模板.md` 顶部均为此形）。取不到 ⇒ `null`（不臆造）。
  */
 export function extractSpecStamp(content: string): string | null {
   const m = content.match(/\*\*规范版本戳\*\*[：:]\s*([^\n\r]+)/);
@@ -213,7 +213,7 @@ interface SeedFile {
 
 /**
  * 单组织种子化（**不抛错** —— 一切失败收口为结构化告警）：
- * ① 读模板（缺 ⇒ 告警，跳过 AGENTS.md）；② 读 flow/spec 两份（逐份缺 ⇒ 告警，跳过该份；
+ * ① 读模板（缺 ⇒ 告警，跳过 AGENTS.md）；② 读 flow/spec 三份（逐份缺 ⇒ 告警，跳过该份；
  * 全缺 ⇒ `{FLOW_SPEC_STAMP}` 落回退串，AGENTS.md 照落）；③ 只补缺、原子写、逐文件 fail-open。
  */
 export function seedOrgWorkspace(
