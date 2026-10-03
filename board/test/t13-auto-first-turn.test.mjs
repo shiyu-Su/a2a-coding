@@ -486,7 +486,9 @@ test("T13-⑨ 建卡失败（400 无 title / 502 写封装失败）⇒ 宿主面
   );
 });
 
-test("T13-⑩ 人工入口未动：动作区仍渲染「触发一轮」表单（补充口 + 留空 = 只说继续）", () => {
+test("T13-⑩ 人工入口未动：动作区仍渲染「触发一轮」表单（补充口 + 留空 = 只说继续）· 非监视态", () => {
+  // 入参未带 chainMonitoring（缺省 undefined = 未接线/非监视态）⇒ -04 监视中短路不触发；
+  // 本锚的语义边界 = **非监视态下**建卡自动首轮接入未吃掉人工入口（-04 §3⑥ 限域）。
   const html = renderActionArea("F1", {
     hostFaceAssembled: true,
     awaitingAnswer: false,
@@ -496,4 +498,19 @@ test("T13-⑩ 人工入口未动：动作区仍渲染「触发一轮」表单（
   assert.match(html, /action="\/features\/F1\/turn"/, "人工触发口仍在原路由");
   assert.match(html, /<textarea name="supplement"/, "补充字段仍由人工表单携带");
   assert.match(html, /留空 = 只说「继续」/);
+});
+
+test("T13-⑩b 监视态（-04 §3⑥ 新例）：chainMonitoring=true ⇒ 人工入口整块离场（无人工触发 / 无补充框）", () => {
+  // 与 ⑩ 同入参、只多一个 chainMonitoring=true：短路语义交给 derive 的监视中分支（-04 T1 已落）；
+  // 本例把「监视中 ⇒ 人工入口缺席」这条页级判据钉在 t13 面，防有人日后把建卡自动首轮的锚扩到监视态。
+  const html = renderActionArea("F1", {
+    hostFaceAssembled: true,
+    awaitingAnswer: false,
+    approval: "未发起",
+    state: "waiting_approval",
+    chainMonitoring: true,
+  });
+  assert.equal(html, "", "监视中 ⇒ renderActionArea 空串（人工触发 + 补充框整块离场）");
+  assert.equal(html.includes('action="/features/F1/turn"'), false, "无「触发一轮」路由");
+  assert.equal(html.includes("name=\"supplement\""), false, "无补充字段");
 });

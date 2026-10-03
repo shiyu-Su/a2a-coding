@@ -181,11 +181,18 @@ export interface ActionAffordance {
 /**
  * 动作区唯一档位判据（纯函数，与 {@link deriveNextStepHint} 共用同一入参 = 同一事实源）。
  *
- * 判序：终态 / 宿主面未装配 ⇒ `null`（**不渲染动作区**，见文件头 C5 口径）> 轮占用（disabled）
+ * 判序：终态 / 宿主面未装配 ⇒ `null`（**不渲染动作区**，见文件头 C5 口径）> **awaiting 短路**
+ * （REQ-2026-09-30-03：有待澄清轮 ⇒ `null`，输入面互斥 = 澄清框在场时动作区整体不渲染，
+ * **无条件优先**，含 `approval = 待审批` 组合 —— 该态确认动作由澄清框承载）> **监视中短路**
+ * （REQ-2026-09-30-04：链监视中 ⇒ `null`，球在引擎不在用户 —— 动作区与补充框整块不出 DOM；
+ * **无条件优先于 approval 三态**，`监视中 ∧ approval = 待审批` 确认按钮一并退场、不开例外，
+ * 插话逃生门 = 链状态行停链按钮）> 轮占用（disabled）
  * > `approval = 待审批`（确认档，唯一出现「确认」按钮的地方）> 验收段 > 待裁待答 > 闲置。
  */
 export function deriveActionAffordance(input: NextStepInput): ActionAffordance | null {
   if (!input.hostFaceAssembled || isTerminalFeatureState(input.state)) return null;
+  if (input.awaitingAnswer === true) return null;
+  if (input.chainMonitoring === true) return null;
   const base = actionTierBase(input);
   const busy = input.turnBusy === true;
   if (!busy) return base;
@@ -225,7 +232,7 @@ function actionTierBase(input: NextStepInput): ActionAffordance {
   };
 }
 
-/** 「有待裁待答」的显示层判据：待澄清轮 / 已登记产出 / 已有轮次留痕（板不解析待裁项结构，见改造文档 §6）。 */
+/** 「有待裁待答」的显示层判据：待澄清轮 / 已登记产出 / 已有轮次留痕（板不解析待裁项结构，见改造文档 §6）。awaiting 已在动作区入口短路（互斥渲染），此处保留仅作语义完整。 */
 function hasPendingUserInput(input: NextStepInput): boolean {
   return (
     input.awaitingAnswer === true ||
@@ -251,6 +258,41 @@ const APPROVAL_NOT_INITIATED = "未发起";
  */
 export function deriveScheduleGateOpen(stage: string | null, approval: string | null): boolean {
   return stage === STAGE_REQUIREMENT_ANALYSIS && approval === APPROVAL_NOT_INITIATED;
+}
+
+// ---------------------------------------------------------------------------
+// 增补五 件B（REQ-2026-10-02-05）：状态 → 色档（排期卡左缘色条的单一规则源）
+// ---------------------------------------------------------------------------
+
+/**
+ * 色档闭集（六档）。视图只认档位，不认状态名 —— 新增引擎态时改本映射一处，
+ * 不在模板里散写条件。**`locked` = 显式锁定语义预留档**；
+ * 「已发版」（`completed` ∧ `stage=发版`）的派生显示仍归 `ok`。
+ */
+export type CardColorTier = "brand" | "warn" | "ok" | "danger" | "locked" | "neutral";
+
+/**
+ * 引擎态 → 色档（纯函数，与 {@link deriveDisplayStage} / {@link deriveScheduleGateOpen}
+ * 同一规则源侧）：在途主链四态（`executing`/`integrating`/`testing`/`reviewing`）→ `brand`；
+ * 待确认 `waiting_approval` → `warn`；`completed` → `ok`；`failed` → `danger`；
+ * `needs_input` / `cancelled` / `null` / 未知值 → `neutral`（不猜、不吞，回落中性档）。
+ */
+export function deriveCardColorTier(state: string | null): CardColorTier {
+  switch (state) {
+    case "executing":
+    case "integrating":
+    case "testing":
+    case "reviewing":
+      return "brand";
+    case "waiting_approval":
+      return "warn";
+    case "completed":
+      return "ok";
+    case "failed":
+      return "danger";
+    default:
+      return "neutral";
+  }
 }
 
 // ---------------------------------------------------------------------------
@@ -460,6 +502,18 @@ export interface NextStepInput {
    * 缺省 false ⇒ 未接线的调用方保持旧行为（引导行照旧显示「最近一轮 <state>：<摘要>」）。
    */
   receiptPresent?: boolean;
+  /**
+   * REQ-2026-09-30-04：链是否处于「监视中」（接力/心跳自动续推等子任务回传）。
+   * 取值 = `deriveChainStateLine(snap)?.state === "monitoring"` 单点派生（复用闭集校验，
+   * 不在原始快照上另开第二条链态判据）；**fail-open**：`null` / 字段缺席 ⇒ false ⇒ 不隐藏动作区，
+   * 未接线的调用方保持旧行为。
+   */
+  chainMonitoring?: boolean;
+  /**
+   * REQ-2026-09-30-04：监视档显示用的等待回传子任务条数（取值 = `deriveChainStateLine(snap)?.pendingCount`，
+   * 同一次派生的附带字段，不二次触桥）。`null` / 缺席 ⇒ 文案退为「等子任务回传」（不臆造个数）。
+   */
+  chainPendingCount?: number | null;
 }
 
 /** 卡滞判据（纯函数）：executing ∧ 无在飞 / 排队轮 ∧ 最近一轮距今 > {@link TURN_STALL_AFTER_MS}。 */
@@ -518,11 +572,20 @@ function factsLine(input: NextStepInput): string {
 /**
  * 详情页「下一步」一行提示（纯函数；v0.9.5 C1 升级为「本卡状态 + 该做的一件事」）。
  *
- * **判序纪律保留**：宿主面未装配 > **终态** > 待澄清回答 > approval 三态；**卡滞档最低**
- * （只在 executing 段内生效，覆盖「已通过 · 等引擎」文案）。每档一句「卡在哪 + 等谁 + 做什么」，
- * 文案只指向**页面上真实存在的入口**（动作区按钮 / 回答框 / config.json）。
+ * **判序纪律保留**：宿主面未装配 > **终态** > 待澄清回答 > needs_input 前置档 > **监视中** > approval 三态；
+ * **卡滞档最低**（只在 executing 段内且 `approval = 已通过` 分支里生效）。每档一句「卡在哪 + 等谁 + 做什么」，
+ * 文案只指向**页面上真实存在的入口**（动作区按钮 / 澄清框 / 链状态行停链按钮 / config.json）。
  *
  * **v0.9.5 C5 口径**：UI 不再出现「触发一轮」字样（它是底层机制），故本行不得使用该词。
+ *
+ * **REQ-2026-09-30-03 互斥口径**：有待澄清轮时动作区不渲染（见 {@link deriveActionAffordance} 的
+ * awaiting 短路），故 awaiting 档只指路**澄清框**、不提「动作区下方的回答框」；needs_input 无 awaiting
+ * 轮时页面无澄清框，文案不得指向不在场入口。
+ *
+ * **REQ-2026-09-30-04 监视口径**：链监视中时动作区不渲染（{@link deriveActionAffordance} 的监视中短路），
+ * 故监视档只指路**链状态行停链按钮**；文案只描述快照事实（等 N 个子任务），**不预测唤醒时机**
+ * （不留第二套「等不等唤醒」口径）。**卡滞档在监视中不可达**是判序的自然结果 ——
+ * `isStalled` 只活在 `approval = 已通过` 分支内，监视档排在 approval 三态之前即被遮蔽，不另设执法点。
  */
 export function deriveNextStepHint(input: NextStepInput): string {
   const facts = factsLine(input);
@@ -533,16 +596,29 @@ export function deriveNextStepHint(input: NextStepInput): string {
     return terminalFeatureNote(input.state);
   }
   if (input.awaitingAnswer) {
-    return `下一步：等你回答上方问题（动作区下方的回答框，同 contextId 续推）。${facts}`;
+    return `下一步：等你回答上方问题（页面下方的澄清框，同 contextId 续推；也可直接给新指示）。${facts}`;
+  }
+  if (input.state === "needs_input") {
+    // 相悖 B 子情形：引擎已挂起（needs_input）但板侧无 awaiting 轮 ⇒ 页面上没有澄清框，
+    // 文案不得指向不在场入口（改造文档 §2.3）。
+    return `下一步：agent 已挂起（needs_input）· 本页暂无待澄清问题 ⇒ 等 agent 接上，或在动作区补充框写明指示手动接一轮。${facts}`;
+  }
+  if (input.chainMonitoring === true) {
+    // 监视档只陈述快照事实（等子任务回传），不预测唤醒时机（-04 §2.6）；指路唯一在场的插话入口 = 链状态行停链按钮。
+    const waiting =
+      input.chainPendingCount !== null && input.chainPendingCount !== undefined
+        ? `等 ${String(input.chainPendingCount)} 个子任务回传`
+        : "等子任务回传";
+    return `下一步：链监视中（${waiting}）· 球在引擎不在你手里 ⇒ 动作区与提交口暂时退场；要插话请点本页链状态行的「停链」按钮（停链后动作区回来）。${facts}`;
   }
   switch (input.approval) {
     case "未发起": {
       const pending = (input.registeredDocs?.length ?? 0) > 0 || (input.latestTurn !== null && input.latestTurn !== undefined);
       if (pending) {
         if (input.receiptPresent === true) {
-          return `下一步：等你 —— 回执卡「待用户」列出了待你拍板的事项 ⇒ 在动作区补充框逐条写明裁定后点「提交给 agent」。${facts}`;
+          return `下一步：等你 —— 回执卡「待用户」列出了待你拍板的事项 ⇒ 若链在监视中先点链状态行「停链」，再在回来的动作区补充框逐条写明裁定，点「提交给 agent」。${facts}`;
         }
-        return `下一步：等你 —— agent 已把产出落到本页，看完在动作区补充框写明裁定 ⇒ 点「提交给 agent」。${facts}`;
+        return `下一步：等你 —— agent 已把产出落到本页 ⇒ 若链在监视中先点链状态行「停链」，看完后在回来的动作区补充框写明裁定，点「提交给 agent」。${facts}`;
       }
       return "下一步：等你 —— 本卡尚无产出 ⇒ 点「让 agent 继续」开始需求访谈（产出需求确认单后进入改造方案）。";
     }
@@ -550,10 +626,11 @@ export function deriveNextStepHint(input: NextStepInput): string {
       return `下一步：等你 —— 改造文档已落文件 ⇒ 核对后点「确认改造文档 → 放行执行」（放不放行由 agent 核对后决定）。${facts}`;
     case "已通过": {
       if (isStalled(input)) {
-        return `下一步：agent 好像没接上？本页没有进行中的轮${sinceTurnLine(input)}⇒ 点动作区的「让 agent 继续」手动接一轮。${facts}`;
+        // 卡滞档只在 approval=已通过 分支内评估；链监视中时监视档排在 approval 三态之前 ⇒ 本档不可达（判序自然结果，不另设执法点）。
+        return `下一步：agent 好像没接上？本页没有进行中的轮${sinceTurnLine(input)}⇒ 若链在监视中先点链状态行「停链」，动作区回来后手动接一轮。${facts}`;
       }
       if (input.state === "reviewing") {
-        return `下一步：等你验收 —— 引擎已把全部节点跑完 ⇒ 在动作区写明验收结论点「反馈验收结论」（「通过」即收口）。${facts}`;
+        return `下一步：等你验收 —— 引擎已把全部节点跑完 ⇒ 若链在监视中先点链状态行「停链」，动作区回来后写明验收结论点「反馈验收结论」（「通过」即收口）。${facts}`;
       }
       if (input.state === "testing") {
         return `下一步：等 agent 回归 —— 回归段进行中 ⇒ 刷新本页看「进展三面」。${facts}`;

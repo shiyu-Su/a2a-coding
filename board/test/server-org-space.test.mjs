@@ -161,7 +161,7 @@ test("BD6-①（空间首页）：/org/组织甲/ = 排期看板只含本组卡�
     const res = await fetch(`${base}/org/${encodeURIComponent("组织甲")}/`);
     assert.equal(res.status, 200);
     const html = await res.text();
-    assert.match(html, /组织空间 <b>组织甲<\/b>/, "空间导航行");
+    assert.match(html, /项目组空间 <b>组织甲<\/b>/, "空间导航行（件1 文案改名「组织」→「项目组」，URL /org/<名> 不动）");
     assert.match(html, /甲一/, "本组已排期卡");
     assert.match(html, /甲二/, "本组需求池卡");
     assert.doesNotMatch(html, /乙一/, "他组需求不得进空间");
@@ -180,7 +180,7 @@ test("BD6-①b（F2 退役 · B5b）：GET /org/组织甲/features ⇒ 303 落**
     const followed = await fetch(`${base}/org/${org}/features`);
     assert.equal(followed.status, 200);
     const html = await followed.text();
-    assert.match(html, /组织空间 <b>组织甲<\/b>/, "跟随重定向 = 空间排期页导航行");
+    assert.match(html, /项目组空间 <b>组织甲<\/b>/, "跟随重定向 = 空间排期页导航行");
     assert.match(html, /甲一/, "本组卡在排期看板照常可见");
     assert.doesNotMatch(html, /需求 · 组织空间/, "旧需求清单页整枚退役（标题不再出任何面）");
     const post = await fetch(`${base}/org/${org}/features`, { method: "POST", body: "" });

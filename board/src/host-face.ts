@@ -697,12 +697,25 @@ export class BoardHostFace {
         display: "停链失败：自动接力未装配",
       };
     }
-    // 先置标志再取消：取消触发的收口回调据此短路（判定序①），不会自激。
-    // 来源 = `user`（用户在停链口主动停）⇒ 人工动作（补充 / 回答）不解冻，见增补二 D2。
-    this.relay.requestStop(id, "route", "user");
+    // 停链原因 = 「谁停的 + 停时那一轮的事实」（REQ-2026-09-30-04 §2.5 人话化）：三档与下面的
+    // `display` 同信息量（取消了第 N 轮 + turnId / 有轮但取消能力不可用 / 无在飞轮）。停链成功档
+    // 现在 303 回详情页，这一串即链状态行显示的「原因」——原独立结果页承载的信息迁到这里。
+    // **纯显示文案**：读占用轮只读，可前移到置标志之前；置标志仍**先于** `cancelTurn`（判定序①
+    // 据此短路，不自激）；来源 = `user` ⇒ 人工动作（补充 / 回答）不解冻，见增补二 D2。
     const busy = this.deps.turns.busyTurnOf(id);
     const busyTurnId = busy === null ? null : busy.turnId;
     const busyRound = busy === null ? null : busy.round;
+    const stopTarget =
+      busyTurnId === null || busyRound === null
+        ? ""
+        : `第 ${String(busyRound)} 轮（${busyTurnId}）`;
+    const stopReason =
+      stopTarget === ""
+        ? "用户经链状态行「停链」· 该需求无在飞 / 排队轮"
+        : this.deps.turns.cancelTurn === undefined
+          ? `用户经链状态行「停链」· 有${stopTarget}但取消能力不可用 ⇒ 仅置停链标志`
+          : `用户经链状态行「停链」· 同时取消${stopTarget}`;
+    this.relay.requestStop(id, stopReason, "user");
     let cancelledTurnId: string | null = null;
     let cancelDisplay: string | null = null;
     if (busy !== null && this.deps.turns.cancelTurn !== undefined) {

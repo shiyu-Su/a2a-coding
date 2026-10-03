@@ -1,13 +1,14 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
 
-import { renderPage, renderOrgSwitcher, escapeHtml, BOARD_CSP, BOARD_REFERRER_POLICY, SUBMIT_GUARD_SCRIPT, FEATURE_DETAIL_OVERLAY_SCRIPT, NEW_REQUIREMENT_DIALOG_SCRIPT } from "../dist/web/layout.js";
+import { renderPage, escapeHtml, BOARD_CSP, BOARD_REFERRER_POLICY, SUBMIT_GUARD_SCRIPT, FEATURE_DETAIL_OVERLAY_SCRIPT, NEW_REQUIREMENT_DIALOG_SCRIPT } from "../dist/web/layout.js";
 import {
   renderFeatureDetail,
   renderTasksPick,
   renderTasks,
   renderProjects,
   renderHostPage,
+  renderChainStateLine,
   renderRequirementForm,
   renderScheduleForm,
   renderVersionSwitchWarningLine,
@@ -46,70 +47,121 @@ test("escapeHtml: 五字符全转义；null/undefined 为空串", () => {
   assert.equal(escapeHtml(undefined), "");
 });
 
-test("renderPage: 标题转义 + 导航高亮 + 口径脚注逐条渲染", () => {
+test("renderPage: 标题转义 + 侧栏一级菜单高亮 + 口径脚注逐条渲染", () => {
   const html = renderPage({
     title: `页 <x>`,
-    active: "projects",
+    active: "home",
     bodyHtml: "<p>正文</p>",
     notes: ["注 A", "注 <B>"],
   });
   assert.match(html, /<title>页 &lt;x&gt; · board<\/title>/);
-  assert.match(html, /<a href="\/projects" class="on">项目<\/a>/);
+  assert.match(html, /<a href="\/" class="on">项目组门户<\/a>/);
   assert.match(html, /<li>注 A<\/li>/);
   assert.match(html, /<li>注 &lt;B&gt;<\/li>/);
 });
 
-test("REQ-04 Q2：导航「需求」项退役 ⇒ 页面不含 /requirements 链接（v0.9.6 B5a 闭集六 → 三枚：摘排期/任务/宿主桥）", () => {
-  const html = renderPage({ title: "t", active: "projects", bodyHtml: "<p>b</p>" });
+test("REQ-04 Q2 + 件1：导航闭集收一枚「项目组门户」⇒ /projects 与 /agents 撤出导航（页面保留、深链可达）", () => {
+  const html = renderPage({ title: "t", active: "home", bodyHtml: "<p>b</p>" });
   assert.doesNotMatch(html, /href="\/requirements"/);
   assert.doesNotMatch(html, /\/timeline|Timeline/, "Timeline 导航已退役（增补 ③）");
   assert.doesNotMatch(html, /href="\/orgs"/, "§9-c：组织管理页退役 ⇒ NAV「组织」项摘除（管理职能迁空间内 /org/<名>/manage）");
   assert.doesNotMatch(html, /href="\/schedule"/, "B5a：全局排期页退役 ⇒ NAV「排期」项摘除（排期面唯一承载位 = /org/<名>/schedule）");
   assert.doesNotMatch(html, /href="\/tasks"/, "B5a 口径 33：「任务」摘条（路由不退 ⇒ 深链可达，不留 NAV 入口）");
   assert.doesNotMatch(html, /href="\/host"/, "B5a 口径 38：「宿主桥」摘条（路由不退 ⇒ 正文链接可达，不留 NAV 入口）");
-  for (const [href, text] of [
-    ["/", "门户"],
-    ["/projects", "项目"],
-    ["/agents", "Agent"],
-  ]) {
-    assert.ok(html.includes(`<a href="${href}"`), `导航含 ${href}`);
-    assert.ok(html.includes(`>${text}</a>`), `导航含 ${text}`);
-  }
-  // 正文为纯 <p> ⇒ 全页锚点 = 导航闭集，多一枚即「需求」退役不彻底
-  assert.equal((html.match(/<a href=/g) ?? []).length, 3, "导航闭集 = 3 项（B5a 收三枚：门户 / 项目 / Agent）");
+  // 件1 撤出的两条与 B5a 同处置：路由与页函数不随撤 ⇒ 导航不得留入口（可达面 = 深链 / 正文链接）
+  assert.doesNotMatch(html, /href="\/projects"/, "件1：「机器与项目」撤出导航");
+  assert.doesNotMatch(html, /href="\/agents"/, "件1：「运行监控」撤出导航");
+  // 正文为纯 <p> ⇒ 全页锚点 = 导航闭集，多一枚即退役不彻底
+  assert.equal((html.match(/<a href=/g) ?? []).length, 1, "导航闭集 = 1 项（件1 侧栏一级菜单仅「项目组门户」）");
+  assert.match(html, />项目组门户<\/a>/, "一级菜单文案 = 项目组门户（显示文案改名：组织 → 项目组）");
 });
 
-// --- v0.9.6 B5b：组织切换器挂位三态（口径 19 / 20）--------------------------
+// --- REQ-2026-09-30-04 件1：全站外壳（固定侧栏 + 主区标题栏）----------------
+// 原「顶栏组织切换器挂位三态」（B5b-①/②）随形态变更整批重指：组织切换 = 侧栏二级菜单，
+// 顶栏文字组形态（`.org-switch` / `extraClass="right"` / `orgSwitcher` 三态）已删除。
 
 const ORG_NAV_2 = { org: "组织甲", orgs: ["组织甲", "组织乙"] };
 
-test("B5b-① 切换器三态：缺省 top 顶栏渲 / body 顶栏不渲（正文自挂）/ none 整页不渲 —— 判据是字段，**不是**「org 非空」", () => {
-  const top = renderPage({ title: "t", active: "home", bodyHtml: "<p>b</p>", orgNav: ORG_NAV_2 });
-  const body = renderPage({ title: "t", active: "home", bodyHtml: "<p>b</p>", orgNav: ORG_NAV_2, orgSwitcher: "body" });
-  const none = renderPage({ title: "t", active: "home", bodyHtml: "<p>b</p>", orgNav: ORG_NAV_2, orgSwitcher: "none" });
-  assert.match(top, /<header>[\s\S]*?class="org-switch"/, "top（缺省）：顶栏渲");
-  assert.doesNotMatch(body.slice(0, body.indexOf("<main>")), /class="org-switch/, "body：顶栏不渲");
-  assert.doesNotMatch(none, /class="org-switch/, "none：整页不渲");
-  // 反向钉「不得按 org 非空隐藏」：org 非空 + 缺省档 ⇒ 仍须顶栏渲（空间错误页族的唯一组织出路）
-  assert.notEqual(ORG_NAV_2.org, null, "本钉的前提 = org 非空");
-  assert.equal(body.slice(body.indexOf("<main>")), none.slice(none.indexOf("<main>")), "body 与 none 的正文一致（区别只在顶栏）");
+/** 侧栏段 = `<aside class="sidebar">` 到其 `</aside>`（一级菜单 + 二级项目组菜单都在段内）。 */
+const sideOf = (html) => {
+  const m = /<aside class="sidebar">([\s\S]*?)<\/aside>/.exec(html);
+  assert.ok(m !== null, "页面必须含侧栏段");
+  return m[1];
+};
+
+test("件1-① 侧栏二级菜单 = 各项目组（服务端渲染链接 · 当前空间标 on · 空清单不渲整块）＋ 顶栏切换器形态整块撤除", () => {
+  const html = renderPage({ title: "t", active: "home", bodyHtml: "<p>b</p>", orgNav: ORG_NAV_2 });
+  const side = sideOf(html);
+  assert.match(side, /<p class="side-orgs-label">项目组<\/p>/, "二级菜单标题 = 项目组（原「组织」显示文案改名）");
+  assert.match(
+    side,
+    /<a href="\/org\/%E7%BB%84%E7%BB%87%E7%94%B2\/" class="on">组织甲<\/a>/,
+    "当前空间项标 on（原切换器链接形状逐字节保留 = href 编码 + class=on）",
+  );
+  assert.match(side, /<a href="\/org\/%E7%BB%84%E7%BB%87%E4%B9%99\/">组织乙<\/a>/, "非当前项不标 on");
+  // 二级菜单在一级菜单之后（缩进列表的层级 = 段序）
+  assert.ok(
+    side.indexOf("<nav>") < side.indexOf('<div class="side-orgs">'),
+    "一级菜单（nav）先于二级菜单（side-orgs）",
+  );
+  // 形态变更、功能语义不变：仍是服务端渲染链接、整页跳转、零新脚本
+  assert.doesNotMatch(side, /<script|onclick=|details/, "侧栏导航零脚本（点击 = 原生整页跳转）");
+  assert.doesNotMatch(html, /org-switch/, "原顶栏 / 正文行右的 `.org-switch` 形态整块撤除（不留双入口）");
+  assert.doesNotMatch(html, /<details/, "原切换器 <details> 面板形态不留残余");
+  for (const orgNav of [undefined, { org: null, orgs: [] }, { org: "组织甲", orgs: [] }]) {
+    assert.doesNotMatch(
+      renderPage({ title: "t", active: "home", bodyHtml: "<p>b</p>", ...(orgNav === undefined ? {} : { orgNav }) }),
+      /class="side-orgs"/,
+      `清单为空 / 无组织上下文 ⇒ 整块不渲（不留空占位；orgNav=${JSON.stringify(orgNav)}）`,
+    );
+  }
 });
 
-test("B5b-② 切换器单点复用 + 行右修饰类：extraClass 只改 class 一枚，顶栏档输出逐字节不变（CSS 另挂 .org-switch.right）", () => {
-  assert.equal(
-    renderOrgSwitcher(ORG_NAV_2),
-    '<span class="org-switch"> <span class="muted">组织</span> <a href="/org/%E7%BB%84%E7%BB%87%E7%94%B2/" class="on">组织甲</a><a href="/org/%E7%BB%84%E7%BB%87%E4%B9%99/">组织乙</a></span>',
-    "缺省档 = 移位前逐字节（顶栏不收影响）",
-  );
-  assert.match(renderOrgSwitcher(ORG_NAV_2, "right"), /^<span class="org-switch right">/, "行右档只加修饰类");
-  const css = renderPage({ title: "t", active: "home", bodyHtml: "" });
-  assert.match(css, /\.org-switch\.right \{ float: right; \}/, "行右靠 CSS 一枚，不复用 .header-actions");
+test("件1-② 外壳骨架 = grid〔216px 固定侧栏 | 主区〕· 品牌区仅 board · 页头动作钮归位标题右侧 · 主区随视口铺满", () => {
+  const withBtn = renderPage({
+    title: "排期看板",
+    active: "schedule",
+    bodyHtml: "<p>b</p>",
+    headerActions: '<button type="button" id="new-req-open" class="header-actions">＋ 新增需求</button>',
+  });
+  const css = pageCss(withBtn);
+  assert.match(css, /body \{[^}]*display: grid;[^}]*grid-template-columns: 216px minmax\(0, 1fr\)/, "外壳 = 216px 侧栏 + 主区两列 grid");
+  assert.match(css, /\.sidebar \{[^}]*position: sticky/, "侧栏固定（滚动不离场）");
+  assert.doesNotMatch(css, /main \{[^}]*max-width/, "主区去封宽 = main 不再限宽（随视口铺满）");
+  assert.doesNotMatch(css, /max-width: 1180px/, "全站不留封宽常量");
+  assert.match(css, /\.page-head \{[^}]*display: flex[^}]*justify-content: space-between/, "页标题栏 = flex（页面名左 · 操作钮右）");
+  assert.doesNotMatch(css, /\.header-actions \{ float: right/, "原页头按钮 float 归位随顶栏形态退役");
+  assert.match(withBtn, /<div class="brand">board<\/div>/, "品牌区 = 仅 board 二字");
+  assert.doesNotMatch(sideOf(withBtn), /v\d+\.\d+\.\d+/, "侧栏不挂版本徽标（版本口径仍以 /health 为准，只是不在板面显示）");
+  const plain = renderPage({ title: "t", active: "schedule", bodyHtml: "<p>b</p>" });
+  assert.doesNotMatch(plain, /new-req-open/, "其它页无该按钮（不注入按钮位）");
 });
 
 test("BOARD_CSP: 无外部资源（default-src none + 仅内联 style + 同源表单）", () => {
   assert.match(BOARD_CSP, /default-src 'none'/);
   assert.match(BOARD_CSP, /style-src 'unsafe-inline'/);
   assert.ok(!BOARD_CSP.includes("http://") && !BOARD_CSP.includes("https://"));
+});
+
+// --- REQ-2026-09-30-04 节点①：`--b-` token 层的防回改锚（浅色单档纪律）-------
+
+/**
+ * 全页 CSS 文本 = 所有 `<style>` 块拼接。负向锚**只作用于此作用域**，不查整页文本
+ * （正文里可能出现用户数据 / 口径脚注含「dark」一类字样，整页查会误伤）。
+ */
+function pageCss(html) {
+  return [...html.matchAll(/<style>([\s\S]*?)<\/style>/g)].map((m) => m[1]).join("\n");
+}
+
+test("REQ-04 节点①（正向锚）token 层 color-scheme = light 单档", () => {
+  const css = pageCss(renderPage({ title: "t", active: "home", bodyHtml: "<p>b</p>" }));
+  assert.match(css, /color-scheme:\s*light\s*(?:;|\})/);
+});
+
+test("REQ-04 节点①（负向锚）CSS 内零深色口径 —— 无 `light dark`、无 prefers-color-scheme", () => {
+  const css = pageCss(renderPage({ title: "t", active: "home", bodyHtml: "<p>b</p>" }));
+  assert.doesNotMatch(css, /light\s+dark/, "color-scheme 不得回到两档");
+  assert.doesNotMatch(css, /prefers-color-scheme/, "本轮不留深色档入口");
 });
 
 // --- BD17：Referrer-Policy 不得掐掉写面表单档的同源 Referer 兜底 -----------
@@ -294,6 +346,60 @@ test("轨17-页面（正向锚）非终态 / null / 未知态 ⇒ 动作区回�
 });
 
 // ---------------------------------------------------------------------------
+// REQ-2026-09-30-03：输入面互斥（动作区 ↔ 澄清框恒为一个）纯函数层
+// ---------------------------------------------------------------------------
+
+test("REQ-03-纯函数（输入面互斥 · 恒一有一空）：awaiting ⇒ renderActionArea 空串；无 awaiting ⇒ 澄清框不渲染", () => {
+  // 与 server.ts 组装同构：actionArea = renderActionArea(input)；answerForm = awaiting ? renderAnswerForm() : ""
+  const faces = (awaiting) => {
+    const actionArea = renderActionArea("F1", actionInput({ awaitingAnswer: awaiting, approval: "待审批", state: "executing" }));
+    const answerForm = awaiting ? renderAnswerForm("F1", "改造文档以哪个版本落？") : "";
+    return [actionArea.includes("<h2>动作</h2>"), answerForm !== ""];
+  };
+  const [actionA, answerA] = faces(true);
+  assert.equal(actionA, false, "awaiting ⇒ 动作区空串（derive awaiting 短路）");
+  assert.equal(answerA, true, "awaiting ⇒ 澄清框在场");
+  assert.notEqual(actionA, answerA, "awaiting 态两输入面恰一为真");
+  const [actionB, answerB] = faces(false);
+  assert.equal(actionB, true, "无 awaiting ⇒ 动作区在场");
+  assert.equal(answerB, false, "无 awaiting ⇒ 澄清框不出 DOM");
+  assert.notEqual(actionB, answerB, "非 awaiting 态两输入面恰一为真");
+});
+
+test("REQ-03-纯函数（防回归）：renderAnswerForm 引导文案含「在这里回答」+「直接给新指示」+ 保留同 contextId 口径", () => {
+  const html = renderAnswerForm("F1", "改造文档以哪个版本落？");
+  assert.match(html, /在这里回答/, "澄清框引导补「在这里回答」");
+  assert.match(html, /或直接给新指示/, "补「或直接给新指示（改方向、取消等均可）」");
+  assert.match(html, /改方向、取消等均可/, "新指示举例在位");
+  assert.match(html, /续接同一 contextId/, "澄清续推同 contextId 口径不丢");
+});
+
+// ---------------------------------------------------------------------------
+// REQ-2026-09-30-04：监视中短路（纯函数层 · 页级 workspace 锚不侵入 -03 互斥块）
+// ---------------------------------------------------------------------------
+
+test("REQ-04-纯函数（监视态输入面收敛）：chainMonitoring=true ⇒ 动作区空串（补充框随块离场）· awaiting=false ⇒ 澄清框也空 ⇒ 唯一在场入口 = 链状态行停链表单", () => {
+  // 与 server.ts 组装同构（-04 §2.1）：三块各自独立派生；监视中 ⇒ 动作区整块无 DOM，
+  // 页面上「能提交的」只剩链状态行的停链表单（renderChainStateLine 在 T2 已锚，这里只钉组合语义）。
+  const view = { state: "monitoring", pendingCount: 2, reason: null, source: null };
+  const actionArea = renderActionArea("F1", actionInput({ chainMonitoring: true, approval: "待审批", state: "executing" }));
+  const answerForm = "";
+  const chainLine = renderChainStateLine(view, "F1");
+  assert.equal(actionArea.includes("<h2>动作</h2>"), false, "监视中 ⇒ 动作区空串");
+  assert.equal(actionArea.includes('name="supplement"'), false, "补充框随动作区整块离场");
+  assert.equal(answerForm, "", "无 awaiting ⇒ 澄清框本就不渲染（-03 锚不受本卡影响）");
+  assert.match(chainLine, /<b>监视中<\/b>/, "链状态行在场");
+  assert.match(chainLine, /action="\/features\/F1\/stop-chain"/, "停链表单 = 唯一在场写入口");
+  // fail-open：显式 false ⇒ 三块回到 -03 前语义（动作区照旧在场）
+  const notMon = renderActionArea("F1", actionInput({ chainMonitoring: false, approval: "待审批", state: "executing" }));
+  assert.match(notMon, /<h2>动作<\/h2>/, "chainMonitoring=false ⇒ 动作区照旧在场");
+  assert.equal(renderChainStateLine(view).includes("stop-chain"), false, "不传 featureId ⇒ 无表单（既有调用点零改动）");
+  // -03 锚不翻（web.test 互斥断言）：awaiting 短路与监视短路并列在场时，动作区仍缺席、澄清框仍在
+  const awaitingAction = renderActionArea("F1", actionInput({ awaitingAnswer: true, chainMonitoring: true, approval: "待审批", state: "executing" }));
+  assert.equal(awaitingAction, "", "监视 ∧ awaiting 双短路 ⇒ 动作区恒空（-03 优先序不翻）");
+});
+
+// ---------------------------------------------------------------------------
 // REQ-v0.9.2 N7：详情页轮次进度行（303 回详情页后的可见落点）
 // ---------------------------------------------------------------------------
 
@@ -464,7 +570,8 @@ test("REQ-04 renderPage：headerActions 随标题渲染（页头「＋ 新增需
     bodyHtml: "<p>b</p>",
     headerActions: '<button type="button" id="new-req-open" class="header-actions">＋ 新增需求</button>',
   });
-  assert.match(withBtn, /<h1>排期看板<\/h1><button type="button" id="new-req-open"/, "按钮紧随标题在页头");
+  // 件1：按钮位由「紧随 h1 的裸元素」改为标题右侧的 .page-actions 容器（归位语义不变）
+  assert.match(withBtn, /<h1>排期看板<\/h1><div class="page-actions"><button type="button" id="new-req-open"/, "按钮紧随标题在页头");
   const plain = renderPage({ title: "t", active: "schedule", bodyHtml: "<p>b</p>" });
   assert.doesNotMatch(plain, /new-req-open/, "其它页无该按钮（不注入按钮位）");
 });
@@ -606,7 +713,7 @@ test("C4 renderFeatureDetail: 需求原文常驻层 —— 短文本直显 / 超
 
 // --- v0.9.5 T2 正锚：C1 第一屏拼接序 / C2 空区块短路 / C6 轮留痕 ---------------------------
 
-test("C1 renderFeatureDetail 第一屏：字段表 → 引导行 → 需求原文（拼接序即「第一屏可见」的结构锚）", () => {
+test("C1 renderFeatureDetail 第一屏（件2 两栏改版）：标题 → 阶段步条 → 引导卡 → 折叠层（需求原文默认收起）→ 侧栏", () => {
   const html = renderFeatureDetail(
     { ...detailFixture, feature: { ...detailFixture.feature, requirement: "要一个只读的排期导出" } },
     traceFixture,
@@ -618,16 +725,87 @@ test("C1 renderFeatureDetail 第一屏：字段表 → 引导行 → 需求原�
   );
   const marks = [
     html.indexOf("<h2>甲"),
+    html.indexOf('<div class="b-steps">'),
     html.indexOf('<p class="hint nextstep">'),
-    html.indexOf("<h2>需求原文</h2>"),
     html.indexOf('<details class="fold"'),
+    html.indexOf("<h2>需求原文</h2>"),
+    html.indexOf('<div class="feat-side">'),
   ];
-  assert.equal(marks.every((i) => i >= 0), true, "四层都在场");
+  assert.equal(marks.every((i) => i >= 0), true, "六处结构锚都在场");
   assert.deepEqual(
     [...marks].sort((a, b) => a - b),
     marks,
-    "拼接序 = 字段表 → 引导行 → 需求原文 → 折叠层（引导行不上第一屏即回归）",
+    "拼接序 = 标题 → 阶段步条 → 引导卡 → 折叠层（需求原文在其内）→ 侧栏（元数据卡在折叠之后）",
   );
+  assert.match(html, /<div class="feat-cols">\n<div class="feat-main">/, "两栏容器 = 主栏在前、侧栏在后");
+});
+
+// --- 件2 正锚：阶段步条 / 侧栏四卡（REQ-2026-09-30-04） --------------------------------------
+
+test("件2 阶段步条：五段齐备 · 完成段打勾 · 当前段实底 · 派生/登记标注不丢 · 阶段双行退场", () => {
+  const html = renderFeatureDetail(detailFixture, null, null, NOW); // executing + stage=改造方案 ⇒ 改造中（派生）挂第 3 段
+  assert.match(html, /<span class="b-step done"><i class="b-step-dot">✓<\/i><b class="b-step-name">需求分析<\/b><\/span>/);
+  assert.match(html, /<span class="b-step done"><i class="b-step-dot">✓<\/i><b class="b-step-name">改造方案<\/b><\/span>/);
+  assert.match(html, /<span class="b-step cur"><i class="b-step-dot"><\/i><b class="b-step-name">改造<\/b><\/span>/);
+  assert.match(html, /<span class="b-step"><i class="b-step-dot"><\/i><b class="b-step-name">发版<\/b><\/span>/, "未到达段 = 无态（不高亮、不打勾）");
+  assert.match(html, /当前 = <b>改造中<\/b> <span class="muted">（派生）<\/span>/, "显示阶段 + 派生标注随步条走（原代表述不丢）");
+  assert.equal(html.includes("阶段（显示）") || html.includes("阶段（登记）"), false, "元数据表的阶段双行已由步条替代");
+});
+
+test("件2 阶段步条三档边界：已发版 = 五段全勾 · 验收中挂「回归」段带补注 · 归档不上不猜", () => {
+  const released = renderFeatureDetail(
+    { ...detailFixture, feature: { ...detailFixture.feature, state: "completed", stage: "发版" } },
+    null,
+    null,
+    NOW,
+  );
+  assert.equal(released.includes("b-step cur"), false, "已发版 ⇒ 无当前段（全段完成）");
+  assert.equal((released.match(/b-step done/g) ?? []).length, 5, "五段全打勾");
+  assert.match(released, /当前 = <b>已发版<\/b>/);
+
+  const reviewing = renderFeatureDetail(
+    { ...detailFixture, feature: { ...detailFixture.feature, state: "reviewing" } },
+    null,
+    null,
+    NOW,
+  );
+  assert.match(reviewing, /<b class="b-step-name">回归 · 验收中<\/b>/, "验收挂回归段，段名补注如实");
+
+  const unknown = renderFeatureDetail(
+    { ...detailFixture, feature: { ...detailFixture.feature, state: "failed", stage: null } },
+    null,
+    null,
+    NOW,
+  );
+  assert.equal(unknown.includes("b-step done") || unknown.includes("b-step cur"), false, "归档不上 ⇒ 一段不高亮");
+  assert.match(unknown, /当前阶段 = <b>未知（登记缺失）<\/b> <span class="muted">（登记 · 未归档到步条，如实显示）<\/span>/);
+});
+
+test("件2 侧栏四卡序：元数据卡（compact 两列）→ 阶段产出卡 → 依赖图卡 → 排期卡；依赖图已移出执行明细折叠", () => {
+  const html = renderFeatureDetail(detailFixture, null, null, NOW, true, [], {
+    graphHtml: "<h2>依赖图（1 节点 · 0 边）</h2><p class=\"hint dg-legend-row\">图例</p>",
+  });
+  const marks = [
+    html.indexOf('<div class="feat-side">'),
+    html.indexOf("<dt>引擎态</dt>"),
+    html.indexOf("<h2>阶段产出</h2>"),
+    html.indexOf("<h2>依赖图"),
+    html.indexOf("<h2>排期</h2>"),
+  ];
+  assert.equal(marks.every((i) => i >= 0), true, "五处侧栏锚都在场");
+  assert.deepEqual([...marks].sort((a, b) => a - b), marks, "侧栏卡序 = 元数据 → 阶段产出 → 依赖图 → 排期");
+  assert.match(html, /<div class="b-meta-row"><dt>审批门（approval）<\/dt><dd>已通过<\/dd><\/div>/, "元数据 = 名 / 值两列（dl），不再是 4×2 大表");
+  assert.equal(html.includes("<table><tbody>\n<tr><th>引擎态</th>"), false, "原 4×2 大表整块退场");
+  assert.ok(html.indexOf("<h2>依赖图") > html.indexOf("执行明细"), "依赖图不再嵌在执行明细折叠内（移出为独立卡）");
+});
+
+test("件2 空块短路照旧：无任务 / trace 空 / 无图 / 无表单 ⇒ 侧栏只剩元数据卡，主栏不空转", () => {
+  const html = renderFeatureDetail({ ...detailFixture, tasks: [] }, { ...traceFixture, nodes: [] }, null, NOW);
+  assert.equal(html.includes("feat-graph"), false, "无任务 ⇒ 依赖图卡不渲");
+  assert.equal(html.includes("feat-action"), false, "未接线动作区（extras 缺省）⇒ 动作区卡不渲");
+  assert.equal(html.includes("feat-turn"), false, "无最近一轮 ⇒ 轮次卡不渲");
+  assert.equal(html.includes("执行明细"), false, "任务 0 ∧ trace 空 ⇒ 执行明细区整体消失（C2 同锚）");
+  assert.match(html, /<div class="b-card feat-card feat-meta">[\s\S]*<h2>需求信息<\/h2>/, "侧栏元数据卡恒在场");
 });
 
 test("C2 renderFeatureDetail 空区块短路：任务 0 ⇒ 任务表不出；trace 空节点 ⇒ 三面表不出；trace 读失败 ⇒ 不短路", () => {
@@ -833,7 +1011,7 @@ test("VIEW_NOTES: 每页统一挂 B13 三条 + 并行度文案", () => {
 // 任务 / 项目视图
 // ---------------------------------------------------------------------------
 
-test("renderTasksPick: project 必填说明 + GET 表单 + 快照项目链接", () => {
+test("renderTasksPick: GET 表单 + 快照项目链接", () => {
   const projects = {
     source: "s",
     note: "快照语义",
@@ -851,13 +1029,12 @@ test("renderTasksPick: project 必填说明 + GET 表单 + 快照项目链接", 
     runners: [],
   };
   const html = renderTasksPick(projects, null);
-  assert.match(html, /<code>project<\/code> 为必填/);
   assert.match(html, /<form method="get" action="\/tasks">/);
   assert.match(html, /href="\/tasks\?project=alpha"/);
   assert.match(html, /href="\/tasks\?project=zeta"/);
 });
 
-test("renderTasks: 行渲染 + 不可达提示 + inFlightCount 口径标注", () => {
+test("renderTasks: 行渲染 + 不可达提示", () => {
   const view = {
     projectId: "p",
     reachable: false,
@@ -870,7 +1047,6 @@ test("renderTasks: 行渲染 + 不可达提示 + inFlightCount 口径标注", ()
   assert.match(html, /执行中（working）/);
   assert.match(html, /stale/);
   assert.match(html, /当前不可达/);
-  assert.match(html, /inFlightCount[^<]*≠ 实际在跑数|≠ 实际在跑数/);
 });
 
 test("renderProjects: 机器不可达行 + runner 在线态 + 快照注", () => {

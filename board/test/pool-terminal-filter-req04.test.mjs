@@ -115,7 +115,8 @@ test("REQ04-① 池列：三终态未排期卡不进池；非终态照入且池�
 test("REQ04-② 版本列：已排期终态卡照旧显示（过滤只作用于池列）", async () => {
   await withFixtureServer(async (base) => {
     const html = await (await fetch(`${base}/org/${encodeURIComponent(ORG)}/schedule`)).text();
-    const versionCols = html.slice(html.indexOf('id="schedule-board"')).split('<div class="kcol" data-version="">')[0];
+    // 件3 列序（需求池最左）⇒ 版本列 = 池列**之后**那一段
+    const versionCols = html.slice(html.indexOf('<div class="kcol" data-version="v'));
     assert.match(versionCols, /href="\/features\/V-CANCELLED"/, "已排期 cancelled 卡仍在其版本列");
     assert.match(versionCols, /href="\/features\/V-OPEN"/, "同列非终态卡不受影响");
     assert.match(versionCols, /<span class="kbadge">已取消（cancelled）<\/span>/, "终态徽标照常上卡");
@@ -130,9 +131,6 @@ test("REQ04-③（B5b 改版）：/org/<名>/features 整页退役 ⇒ 303 落�
     assert.equal(raw.headers.get("cache-control"), "no-store", "重定向不缓存（口径同全局退役页闭集）");
     await raw.body?.cancel();
     const html = await (await fetch(`${base}/org/${encodeURIComponent(ORG)}/schedule`)).text();
-    assert.match(html, /板面无清单读面/, "看板 hint 明示「未排期 ∧ 终态」卡无板面清单读面");
-    assert.match(html, /需求清单读面已随/, "随 v0.9.6 组织作用域收敛退役（不再指向已删页）");
-    assert.match(html, /a2a_feature_status/, "历史读面 = 经引擎查阅（不得默认算完成）");
     const pool = poolColumnOf(html);
     for (const gone of ["P-CANCELLED", "P-COMPLETED", "P-FAILED"]) {
       assert.ok(!pool.includes(`/features/${gone}`), `${gone} 仍不进池（页退役不改变池过滤口径）`);

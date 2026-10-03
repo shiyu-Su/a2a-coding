@@ -264,6 +264,9 @@ test("N3-①（§9-c 新锚）GET /org/<名>/manage: 成员区（声明态清单
     assert.match(res.text, /<input type="hidden" name="org" value="alpha">/);
     // 空间导航含 manage 入口且高亮
     assert.match(res.text, /<a class="fl on" href="\/org\/alpha\/manage" style="font-weight:700">管理<\/a>/);
+    // 增补四（REQ-2026-10-02-04）：管理页不收全站口径说明、无口径折叠块
+    assert.doesNotMatch(res.text, /<details class="calib"/, "增补四：管理页口径折叠块已删");
+    assert.doesNotMatch(res.text, /<ul class="notes"/, "增补四：管理页不收全站口径说明");
     assert.doesNotMatch(res.text, /<script src>/, "纯 SSR：不扩内联脚本闭集（N3-⑦/⑧ 纪律）");
   }, { fetcher: async () => ({ ok: true, projects: [] }) });
 });
@@ -357,16 +360,11 @@ test("N6-⑪ 方法门与写面纪律: /orgs 退役后 GET ⇒ 303、POST 写径
 // REQ-2026-09-28-07 v0.9.6 B5a ⇒ 摘「排期 / 任务 / 宿主桥」+ 文案改字面（口径 37/38）= 三枚）
 // ---------------------------------------------------------------------------
 
-test("N6-⑫（B5a 收三枚）导航闭集: 三项（门户/项目/Agent），href、文案与顺序钉死；/schedule、/tasks、/host 链接已摘", () => {
+test("N6-⑫（B5a 收三枚 · 件1 收一枚）导航闭集: 仅「项目组门户」一项，href、文案与顺序钉死；/projects、/agents 同撤，/schedule、/tasks、/host 链接已摘", () => {
   const html = renderPage({ title: "t", active: "projects", bodyHtml: "<p>b</p>" });
   const anchors = [...html.matchAll(/<a href="(\/[^"]*)"[^>]*>([^<]+)<\/a>/g)].map((m) => `${m[1]}|${m[2]}`);
-  assert.deepEqual(anchors, [
-    "/|门户",
-    "/projects|项目",
-    "/agents|Agent",
-  ]);
-  assert.doesNotMatch(html, /href="\/orgs"/, "§9-c：NAV 不得含 /orgs（页退役 ⇒ 303，链接不留守）");
-  assert.doesNotMatch(html, /href="\/schedule"/, "B5a：NAV 不得含 /schedule（全局排期页退役 ⇒ 303 回门户）");
+  assert.deepEqual(anchors, ["/|项目组门户"]);
+  assert.doesNotMatch(html, /href="\/(orgs|schedule|projects|agents)"/, "§9-c / B5a / 件1：/orgs 与 /schedule 退役、/projects 与 /agents 撤出导航（路由不退 ⇒ 深链照旧可达）");
   assert.doesNotMatch(html, /href="\/tasks"|href="\/host"/, "B5a 口径 33/38：路由不退但 NAV 摘条（可达面 = 正文深链）");
 });
 
@@ -381,7 +379,7 @@ test("BD2-①（§9-b 翻向 · §9-c 再翻）建组织表单渲染锚在门户
     const home = await get(base, "/");
     assert.equal(home.status, 200);
     assert.match(home.text, /<form method="post" action="\/orgs"[^>]*data-submit="已提交，建组织中…" data-ov="1">/, "同源 SSR 表单（增补二 §9.1-②：data-ov 浮层报错，无新脚本常量）");
-    assert.match(home.text, /<label>组织名 \*<input name="org" required/, "字段名 = write-guard.ORG_FORM_FIELD = org");
+    assert.match(home.text, /<label>项目组名 \*<input name="org" required/, "字段名 = write-guard.ORG_FORM_FIELD = org（标签文案 v0.9.7 增补改「项目组名」，字段名不变）");
     assert.match(home.text, /中文 \/ 字母（Latin）\/ 数字/, "闭集 hint 上板");
     assert.match(home.text, /不触桥、不写状态机、不写 machine 配置/, "写面口径上板");
     assert.doesNotMatch(home.text, /<script src>/, "无外源脚本（§9.5 复用的仍是既有六元常量，未引入新枚）");

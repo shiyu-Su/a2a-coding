@@ -2,6 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 import {
+  deriveCardColorTier,
   deriveDisplayStage,
   deriveActionAffordance,
   deriveTurnBusyAffordance,
@@ -60,6 +61,28 @@ test("deriveDisplayStage: 登记缺失（null）⇒ 未知（登记缺失），�
   const r = deriveDisplayStage("waiting_approval", null);
   assert.equal(r.label, UNKNOWN_STAGE_LABEL);
   assert.equal(r.basis, "registered");
+});
+
+// ---------------------------------------------------------------------------
+// 增补五 件B（REQ-2026-10-02-05）：状态 → 色档（9 态归 6 档，闭集不扩）
+// ---------------------------------------------------------------------------
+
+test("deriveCardColorTier: 在途主链四态归 brand", () => {
+  for (const s of ["executing", "integrating", "testing", "reviewing"]) {
+    assert.equal(deriveCardColorTier(s), "brand", `${s} ⇒ brand`);
+  }
+});
+
+test("deriveCardColorTier: waiting_approval ⇒ warn · completed ⇒ ok · failed ⇒ danger", () => {
+  assert.equal(deriveCardColorTier("waiting_approval"), "warn");
+  assert.equal(deriveCardColorTier("completed"), "ok");
+  assert.equal(deriveCardColorTier("failed"), "danger");
+});
+
+test("deriveCardColorTier: needs_input / cancelled / null / 未知值 ⇒ neutral（不猜、回落中性档）", () => {
+  for (const s of ["needs_input", "cancelled", "blocked", null, "some-future-state"]) {
+    assert.equal(deriveCardColorTier(s), "neutral", `${s} ⇒ neutral`);
+  }
 });
 
 // ---------------------------------------------------------------------------
@@ -197,10 +220,104 @@ test("C5-derive 闲置档：预审卡无任何产出 ⇒「让 agent 继续」�
   assert.equal(a.enabled, true);
 });
 
-test("C5-derive 提交档：有待裁待答（awaiting / 已登记产出 / 已有轮次）⇒「提交给 agent」", () => {
-  assert.equal(deriveActionAffordance({ ...ACT, awaitingAnswer: true }).label, "提交给 agent");
+test("C5-derive 提交档：有待裁待答（已登记产出 / 已有轮次）⇒「提交给 agent」", () => {
   assert.equal(deriveActionAffordance({ ...ACT, registeredDocs: ["甲-需求确认单.md"] }).label, "提交给 agent");
   assert.equal(deriveActionAffordance({ ...ACT, latestTurn: { state: "succeeded", summary: "已落文档", at: "x" } }).label, "提交给 agent");
+});
+
+// REQ-2026-09-30-03 互斥渲染：awaiting 短路（无条件优先，含待审批组合）
+test("互斥-derive awaiting 短路：有待澄清轮 ⇒ 动作区 null（含 approval=待审批 组合，确认由澄清框承载）", () => {
+  assert.equal(deriveActionAffordance({ ...ACT, awaitingAnswer: true }), null);
+  assert.equal(deriveActionAffordance({ ...ACT, awaitingAnswer: true, approval: "待审批" }), null, "待审批不开例外");
+  assert.equal(deriveActionAffordance({ ...ACT, awaitingAnswer: true, approval: "已通过", state: "executing" }), null);
+  assert.equal(deriveActionAffordance({ ...ACT, awaitingAnswer: true, turnBusy: true, busyTurn: { turnId: "t", round: 1, state: "running" } }), null, "短路优先于轮占用档");
+});
+
+test("互斥-derive（负向）awaiting=false ⇒ 档位派生与短路前一致（确认档/提交档/验收档照常）", () => {
+  assert.equal(deriveActionAffordance({ ...ACT, awaitingAnswer: false, approval: "待审批" }).kind, "confirm");
+  assert.equal(deriveActionAffordance({ ...ACT, awaitingAnswer: false, registeredDocs: ["甲-需求确认单.md"] }).label, "提交给 agent");
+  assert.equal(deriveActionAffordance({ ...ACT, awaitingAnswer: false, approval: "已通过", state: "reviewing" }).label, "反馈验收结论");
+});
+
+// REQ-2026-09-30-04 §2.1/§2.6：监视中短路（单点判据 + fail-open）与引导行监视档
+test("监视-derive 短路：chainMonitoring=true ⇒ 动作区 null（含待审批组合，确认按钮一并退场不开例外）", () => {
+  assert.equal(deriveActionAffordance({ ...ACT, chainMonitoring: true }), null);
+  assert.equal(deriveActionAffordance({ ...ACT, chainMonitoring: true, approval: "待审批" }), null, "待审批不开例外");
+  assert.equal(deriveActionAffordance({ ...ACT, chainMonitoring: true, approval: "已通过", state: "executing" }), null);
+  assert.equal(deriveActionAffordance({ ...ACT, chainMonitoring: true, approval: "已通过", state: "reviewing" }), null);
+  assert.equal(deriveActionAffordance({ ...ACT, chainMonitoring: true, turnBusy: true, busyTurn: { turnId: "t", round: 1, state: "running" } }), null, "短路优先于轮占用档");
+});
+
+test("监视-derive 优先序对照：awaiting 短路在前（-03 锚不翻），监视短路紧随其后", () => {
+  // 监视中 ∧ awaiting ⇒ 两者都短路（行为与 -03 一致：出澄清框、动作区缺席）
+  assert.equal(deriveActionAffordance({ ...ACT, awaitingAnswer: true, chainMonitoring: true }), null);
+  assert.equal(deriveActionAffordance({ ...ACT, awaitingAnswer: true, chainMonitoring: true, approval: "待审批" }), null);
+  // 引导行判序 awaiting > 监视中：监视中仍出「回答上方问题」（球在用户 = 澄清框在场）
+  const both = deriveNextStepHint({ ...NS, awaitingAnswer: true, chainMonitoring: true, approval: "待审批" });
+  assert.match(both, /回答上方问题/);
+  assert.doesNotMatch(both, /链监视中/, "awaiting 档排前，不出监视档文案");
+});
+
+test("监视-derive fail-open：字段缺席 / 显式 false ⇒ 档位与引导行照旧（未接线调用方不回归）", () => {
+  const turn = { state: "succeeded", summary: "本轮结论：门禁全绿", at: "2026-09-29T10:00:00Z" };
+  assert.equal(deriveActionAffordance({ ...ACT, approval: "待审批" }).kind, "confirm", "缺席 ⇒ 确认档照常");
+  assert.equal(deriveActionAffordance({ ...ACT, chainMonitoring: false, approval: "待审批" }).kind, "confirm");
+  const omitted = deriveNextStepHint({ ...NS, latestTurn: turn });
+  assert.equal(omitted, deriveNextStepHint({ ...NS, latestTurn: turn, chainMonitoring: false }), "缺省 == 显式 false");
+  assert.doesNotMatch(omitted, /链监视中（|动作区与提交口暂时退场/, "缺席不出监视档整句（chainLine=null ⇒ state=false 不隐藏；条件句「若链在监视中…」除外）");
+});
+
+test("监视-derive 引导行监视档：如实描述快照事实（等 N 个子任务）+ 提交口退场 + 指路停链，不预测唤醒时机", () => {
+  for (const approval of ["未发起", "待审批", "已通过"]) {
+    const hint = deriveNextStepHint({ ...NS, chainMonitoring: true, chainPendingCount: 3, approval, state: "executing" });
+    assert.match(hint, /链监视中（等 3 个子任务回传）/);
+    assert.match(hint, /动作区与提交口暂时退场/, "含审批门退场交代（待审批组合一并说明）");
+    assert.match(hint, /要插话请点本页链状态行的「停链」按钮/);
+    assert.doesNotMatch(hint, /自动接力|等引擎|刷新本页看进展/, "不预测唤醒时机（不留第二套「等不等唤醒」口径）");
+  }
+  const noCount = deriveNextStepHint({ ...NS, chainMonitoring: true, approval: "已通过", state: "executing" });
+  assert.match(noCount, /等子任务回传/, "pendingCount 缺席 ⇒ 退化为不带个数（不臆造）");
+  assert.doesNotMatch(noCount, /等 \d+ 个/);
+});
+
+test("监视-derive 卡滞档在监视中不可达（判序自然结果：isStalled 只活在已通过分支，监视档排前）", () => {
+  const at = "2026-09-29T10:00:00Z";
+  const then = Date.parse(at);
+  const base = {
+    ...NS,
+    approval: "已通过",
+    state: "executing",
+    latestTurn: { state: "succeeded", summary: "已派下一节点", at },
+    turnBusy: false,
+    nowMs: then + TURN_STALL_AFTER_MS + 60_000,
+  };
+  assert.match(deriveNextStepHint(base), /好像没接上/, "非监视：卡滞照常");
+  assert.doesNotMatch(deriveNextStepHint({ ...base, chainMonitoring: true }), /好像没接上/, "监视中：卡滞文案整体退场");
+  assert.match(deriveNextStepHint({ ...base, chainMonitoring: true }), /链监视中/);
+});
+
+test("监视-derive 死指路 4 处改写：非监视态不再直导「点动作区…」，一律交代「先停链、动作区回来」", () => {
+  const turn = { state: "succeeded", summary: "s", at: "2026-09-29T10:00:00Z" };
+  const cases = [
+    { ...NS, receiptPresent: true, latestTurn: turn }, // 原 :555（未发起 × 回执卡）
+    { ...NS, registeredDocs: ["甲-需求确认单.md"] }, // 原 :557（未发起 × 产出）
+    { ...NS, approval: "已通过", state: "reviewing" }, // 原 :568（reviewing 验收引导）
+    { ...NS, approval: "已通过", state: "executing", latestTurn: turn, turnBusy: false, nowMs: Date.parse(turn.at) + TURN_STALL_AFTER_MS + 60_000 }, // 原 :565（卡滞）
+  ];
+  for (const input of cases) {
+    const hint = deriveNextStepHint(input);
+    assert.doesNotMatch(hint, /在动作区补充框|在动作区写明|点动作区的/, `死指路残留：${hint}`);
+    assert.match(hint, /停链/);
+  }
+  // 负锚：无产出的「让 agent 继续」引导（:559，非改写点）与 approval=待审批 确认引导（:562，按钮本就随动作区渲染）不要求停链字样
+  assert.match(deriveNextStepHint({ ...NS }), /点「让 agent 继续」/);
+  assert.doesNotMatch(deriveNextStepHint({ ...NS }), /停链/);
+  assert.match(deriveNextStepHint({ ...NS, approval: "待审批" }), /核对后点「确认改造文档 → 放行执行」/);
+});
+
+test("监视-derive 负锚：needs_input 档（原 :548）原文保留，其指路对象在该档真实在场", () => {
+  const hint = deriveNextStepHint({ ...NS, state: "needs_input", awaitingAnswer: false, approval: "已通过", chainMonitoring: true });
+  assert.match(hint, /agent 已挂起（needs_input）· 本页暂无待澄清问题 ⇒ 等 agent 接上，或在动作区补充框写明指示手动接一轮。/, "needs_input 档排在监视档之前，不受本卡影响");
 });
 
 test("C5-derive 验收档：reviewing / testing ⇒「反馈验收结论」；executing 的兜底档低调（quiet）", () => {
@@ -310,10 +427,10 @@ test("N5-derive 回执卡在场 ⇒ 撤「最近一轮 <state>：<摘要>」后�
   assert.match(withReceipt, /本轮回执见下方回执卡/);
 });
 
-test("N5-derive 回执卡在场 ∧ 未发起有轮 ⇒ 整句改写为「指向待用户行 + 动作区裁定」（非旧句）", () => {
+test("N5-derive 回执卡在场 ∧ 未发起有轮 ⇒ 整句改写为「指向待用户行 + 停链后动作区裁定」（非旧句）", () => {
   const turn = { state: "succeeded", summary: "已落确认单", at: "2026-09-29T10:00:00Z" };
   const hint = deriveNextStepHint({ ...NS, latestTurn: turn, receiptPresent: true });
-  assert.match(hint, /回执卡「待用户」.*动作区补充框.*点「提交给 agent」/);
+  assert.match(hint, /回执卡「待用户」.*停链.*补充框.*「提交给 agent」/);
   assert.doesNotMatch(hint, /agent 已把产出落到本页/, "旧句改写（与回执卡「待用户」行不重复）");
 });
 
@@ -340,7 +457,7 @@ test("C1-derive 卡滞档：executing ∧ 无在飞轮 ∧ 最近一轮超阈值
   assert.match(hint, /agent 好像没接上/);
   assert.match(hint, /没有进行中的轮/);
   assert.match(hint, /距今 11min/, "「距今」= nowMs - at 单时钟差值（derive 内不读时钟）");
-  assert.match(hint, /点动作区的「让 agent 继续」/);
+  assert.match(hint, /停链.*动作区回来后手动接一轮/, "-04 死指路改写：不再直导「点动作区的…」（监视中该入口不在场）");
 });
 
 test("C1-derive 卡滞档（负向四闸）：阈值内 / 有在飞轮 / 无轮次 / 未给 nowMs ⇒ 一律不切卡滞档", () => {
@@ -393,6 +510,22 @@ test("轨16-derive 下一步：非终态（executing / needs_input）的 awaitin
   for (const state of ["executing", "needs_input"]) {
     assert.match(deriveNextStepHint({ ...NS, state, awaitingAnswer: true }), /回答上方问题/);
   }
+});
+
+// REQ-2026-09-30-03 §2.3：needs_input 独立文案档（awaiting 在场 / 不在场两子情形）
+test("互斥-derive 下一步 needs_input A（awaiting 在场）⇒ 澄清框引导，不说「等 agent 自动接力」", () => {
+  const hint = deriveNextStepHint({ ...NS, state: "needs_input", awaitingAnswer: true, approval: "已通过" });
+  assert.match(hint, /回答上方问题/);
+  assert.match(hint, /澄清框/, "指路澄清框（互斥后动作区不在场）");
+  assert.doesNotMatch(hint, /自动接力|动作区/, "不指向不在场入口、不承诺自动接力");
+});
+
+test("互斥-derive 下一步 needs_input B（相悖 B：无 awaiting 轮）⇒ 诚实措辞，不指向不在场澄清框", () => {
+  const hint = deriveNextStepHint({ ...NS, state: "needs_input", awaitingAnswer: false, approval: "已通过" });
+  assert.match(hint, /agent 已挂起/);
+  assert.match(hint, /等 agent 接上.*动作区/, "给「等接上 / 动作区手动接一轮」出口");
+  assert.doesNotMatch(hint, /回答上方问题|澄清框/, "B 子情形页面无澄清框，不得指路");
+  assert.doesNotMatch(hint, /自动接力/, "needs_input 档先于 approval switch，纠正旧兜底失真");
 });
 
 test("轨16-derive isTerminalFeatureState：三值闭集；null / 未知态 ⇒ 非终态（不吞不猜）", () => {

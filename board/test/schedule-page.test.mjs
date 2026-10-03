@@ -94,7 +94,7 @@ test("M4-③ groupFeaturesByVersion: 列内保持入参顺序（不做列内二�
 // 渲染纯函数
 // ---------------------------------------------------------------------------
 
-test("M4-④ renderSchedule: 列头 = 版本号 + 卡片数；卡 = title + 状态徽标 + stage/approval + taskCount", () => {
+test("M4-④ renderSchedule: 列头 = 版本号 + 卡片数；卡固定四行（增补五 件A）= 名称 / id 行 / 状态徽标 / 一行元信息（阶段 + 任务数）", () => {
   const cols = groupFeaturesByVersion([
     feature("F1", "v0.9.2"),
     feature("F2", "v0.9.2", { state: "waiting_approval", approval: "待审批", taskCount: null }),
@@ -103,9 +103,11 @@ test("M4-④ renderSchedule: 列头 = 版本号 + 卡片数；卡 = title + 状�
   assert.match(html, /<h3>v0\.9\.2 <span class="kbadge vbadge wip"[^>]*>进行中<\/span> <span class="muted">\(2\)<\/span><\/h3>/, "列头 = 版本号 + 状态徽标（增补 ② 后恒有）+ 卡片数");
   assert.match(html, /href="\/features\/F1"/, "卡标题链详情页");
   assert.match(html, /<span class="kbadge">执行中（executing）<\/span>/, "状态作徽标");
-  assert.match(html, /待审批（waiting_approval）/, "第二卡徽标 = 待审批");
-  assert.match(html, /阶段：改造方案（登记）/, "stage 展示沿用 derive 口径");
-  assert.match(html, /审批门：已通过 · 任务数：1<\/p>/, "approval + taskCount 上卡");
+  assert.match(html, /待审批（waiting_approval）/, "第二卡徽标 = 待审批（审批门摘出元信息行后仍由状态徽标承载）");
+  assert.match(html, /阶段：改造中 · 任务数：1<\/p>/, "元信息行 = 阶段 + 任务数（件3 一行 11px；派生档不带后缀）");
+  assert.match(html, /阶段：改造方案 · 任务数：—<\/p>/, "第二卡：登记档 + taskCount null 如实「—」");
+  assert.doesNotMatch(html, /审批门：/, "审批门不再上卡面（其值 = 状态徽标，登记字段原样在详情页）");
+  assert.doesNotMatch(html, /（登记）|（派生）/, "阶段档的「派生 / 登记」后缀摘出卡面");
   assert.match(html, /任务数：—<\/p>/, "taskCount null 如实「—」");
   assert.doesNotMatch(html, /class="kcol"[^>]*><h3>[^<]*待审批/, "按状态分列不做：列头只有版本号");
 });
@@ -158,7 +160,7 @@ test("M5-② renderSchedule 池卡: 需求原文截断 120 字 + 转义 + 链详
   assert.doesNotMatch(f3seg, /需求：/, "空串 requirement 不出行");
   const f4seg = html.slice(html.indexOf('href="/features/F4"'));
   assert.doesNotMatch(f4seg, /需求：/, "null requirement 不出行");
-  const versionCol = html.slice(0, html.indexOf("<h3>需求池"));
+  const versionCol = html.slice(html.indexOf('<div class="kcol" data-version="v'));
   assert.doesNotMatch(versionCol, /需求：/, "版本列卡不出需求原文行（池卡专属）");
 });
 
@@ -190,7 +192,7 @@ test("M5-④ selectRequirementPool: 三终态（completed/failed/cancelled）不
   );
 });
 
-test("M5-⑤ 终态过滤只管池列：已排终态卡仍占版本列（不改 groupFeaturesByVersion）；页头 hint 含「终态卡不进需求池」", () => {
+test("M5-⑤ 终态过滤只管池列：已排终态卡仍占版本列（不改 groupFeaturesByVersion）", () => {
   const features = [
     feature("F-done", "v0.9.4", { state: "completed" }),
     feature("F-cancel", "v0.9.4", { state: "cancelled" }),
@@ -202,27 +204,33 @@ test("M5-⑤ 终态过滤只管池列：已排终态卡仍占版本列（不改 
   );
   assert.match(html, /\/features\/F-done/, "版本列仍显示 completed 卡");
   assert.match(html, /\/features\/F-cancel/, "版本列仍显示 cancelled 卡");
-  assert.match(html, /<b>终态卡不进需求池<\/b>/, "页头 hint 已改述过滤口径");
 });
 
 // ---------------------------------------------------------------------------
-// v0.9.3 B1 增补徽标（排期卡 / 池卡 · fixture 自构造，不依赖真桥 O1）
+// v0.9.3 B1 增补标注（排期卡 / 池卡 · fixture 自构造，不依赖真桥 O1）
+// 增补五 件A（REQ-2026-10-02-05）：标注形态由「.khd 首因子 .kbadge 徽标」并入卡内第 2 行 id 行
 // ---------------------------------------------------------------------------
-test("B1-① renderSchedule 卡: parentFeatureId 非空 ⇒「增补 · 父需求」徽标 + 单跳深链", () => {
+test("B1-① renderSchedule 卡: parentFeatureId 非空 ⇒ 关联需求 id 并入第 2 行（不再单独置顶徽标）+ 单跳深链", () => {
   const html = renderSchedule(
     groupFeaturesByVersion([feature("A1", "v0.9.3", { parentFeatureId: "P1" })]),
     selectRequirementPool([feature("A2", null, { parentFeatureId: "P2" })]),
   );
-  assert.match(html, /<span class="kbadge">增补 · 父需求 <a class="fl" href="\/features\/P1">P1<\/a><\/span>/);
-  assert.match(html, /增补 · 父需求 <a class="fl" href="\/features\/P2">P2<\/a>/, "池卡同款徽标");
+  assert.match(
+    html,
+    /<span class="mono muted" title="P1"><a class="fl" href="\/features\/P1">P1<\/a><\/span>/,
+    "版本列卡：关联需求 id = mono muted 短标 + 深链",
+  );
+  assert.match(html, /title="P2"><a class="fl" href="\/features\/P2">P2<\/a><\/span>/, "池卡同款关联需求 id");
+  assert.doesNotMatch(html, /<span class="kbadge">增补 · 父需求/, "「增补 · 父需求」徽标形态退役（排期卡不再单独置顶）");
 });
 
-test("B1-② renderSchedule 卡: 无 parentFeatureId（缺省 null）⇒ 不徽标（老桥口径）", () => {
+test("B1-② renderSchedule 卡: 无 parentFeatureId（缺省 null）⇒ 不出关联需求 id（老桥口径）", () => {
   const html = renderSchedule(groupFeaturesByVersion([feature("A1", "v0.9.3")]), []);
   assert.doesNotMatch(html, /增补 · 父需求/);
+  assert.match(html, /<p class="kmeta"><span class="mono muted" title="A1">A1<\/span><\/p>/, "id 行只有本卡短 id");
 });
 
-test("B1-③ 增补徽标只取一层不递归：父链 href 只做编码拼接 + 文本转义", () => {
+test("B1-③ 关联需求 id 只取一层不递归：父链 href 只做编码拼接 + 文本转义", () => {
   const html = renderSchedule(
     groupFeaturesByVersion([feature("A1", "v0.9.3", { parentFeatureId: `P/x"><script>` })]),
     [],
@@ -232,7 +240,107 @@ test("B1-③ 增补徽标只取一层不递归：父链 href 只做编码拼接 
     /href="\/features\/P%2Fx%22%3E%3Cscript%3E"/,
     "href 经 encodeURIComponent，不注入原串",
   );
-  assert.doesNotMatch(html, /<script>/, "徽标文本不得逃逸成脚本");
+  assert.doesNotMatch(html, /<script>/, "关联需求 id 文本不得逃逸成脚本");
+});
+
+// ---------------------------------------------------------------------------
+// 增补五 件A（REQ-2026-10-02-05）：排期卡固定四行序（SSR 显示层）
+// ---------------------------------------------------------------------------
+
+test("增补五A-① 卡内行序 = 名称 → id 行 → 状态徽标 → 阶段+任务数（徽标搬出 .khd）", () => {
+  const html = renderSchedule(groupFeaturesByVersion([feature("F1", "v0.9.7")]), []);
+  const card = cardOf(html, "F1");
+  const rows = [
+    `<div class="khd"><a class="fl" href="/features/F1">需求 F1</a></div>`,
+    `<p class="kmeta"><span class="mono muted" title="F1">F1</span></p>`,
+    // 闸锁卡：紧凑锁定标记与状态徽标同处徽标行（两者字面未改）
+    `<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">执行中（executing）</span></p>`,
+    `<p class="kmeta">阶段：改造中 · 任务数：1</p>`,
+  ];
+  const at = rows.map((r) => card.indexOf(r));
+  assert.ok(at.every((i) => i >= 0), `四行齐备：${JSON.stringify(at)}`);
+  assert.deepEqual([...at].sort((a, b) => a - b), at, "行序固定（名称 → id → 徽标 → 元信息）");
+  assert.doesNotMatch(card.slice(0, at[1]), /<span class="kbadge">/, "状态徽标不再与标题同层");
+});
+
+test("增补五A-② 样式面：徽标行新选择器在场 · .khd 首因子规则随徽标搬离而退役", () => {
+  const page = renderPage({ title: "t", active: "features", bodyHtml: renderSchedule([], []) });
+  assert.match(page, /\.kcard > \.kbadge-line {[^}]*justify-content: flex-end/);
+  assert.doesNotMatch(page, /\.kcard > \.khd > \.kbadge:first-child/, "失效规则已删");
+  assert.match(page, /\.kcard > \.khd > a {[^}]*-webkit-line-clamp: 2/, "名称 ≤2 行截断保留");
+});
+
+// ---------------------------------------------------------------------------
+// 增补五 件B（REQ-2026-10-02-05）：排期卡按状态着色（9 态 → 6 档，左缘色条）
+// ---------------------------------------------------------------------------
+
+/** 取某张卡的卡根 class 属性值（cardOf 以 `<div class="kcard` 切段 ⇒ 段首到首个 `"` 即类名余部）。 */
+function cardClasses(html, featureId) {
+  const seg = cardOf(html, featureId);
+  const m = /^([^"]*)"/.exec(seg);
+  assert.ok(m, `${featureId} 卡根 class 属性未闭合`);
+  return `kcard${m[1]}`;
+}
+
+test("增补五B-① 卡根档类 = 状态族（6 档闭集）· 行为判据字面未动", () => {
+  const cases = [
+    ["executing", "kst-brand"],
+    ["integrating", "kst-brand"],
+    ["testing", "kst-brand"],
+    ["reviewing", "kst-brand"],
+    ["waiting_approval", "kst-warn"],
+    ["completed", "kst-ok"],
+    ["failed", "kst-danger"],
+    ["needs_input", "kst-neutral"],
+    ["cancelled", "kst-neutral"],
+    [null, "kst-neutral"],
+    ["some-future-state", "kst-neutral"],
+  ];
+  for (const [state, tier] of cases) {
+    const id = state ?? "NULL";
+    // 闸锁形态（stage/approval 非「想法挪版」）⇒ 档类在 draglocked 之后，两态均出档
+    const locked = cardClasses(renderSchedule(groupFeaturesByVersion([feature(id, "v0.9.7", { state })]), []), id);
+    assert.equal(locked, `kcard draglocked ${tier}`);
+    const openHtml = renderSchedule(
+      groupFeaturesByVersion([feature(id, "v0.9.7", { state, stage: "需求分析", approval: "未发起" })]),
+      [],
+    );
+    assert.equal(cardClasses(openHtml, id), `kcard ${tier}`, `放行卡 ${state} ⇒ ${tier}`);
+    // 行为判据不回归：档类只是追加，draggable / data-feature / data-version 原样紧跟卡根 class 属性
+    assert.match(
+      cardOf(openHtml, id),
+      new RegExp(`^ kst-[a-z]+" draggable="true" data-feature="${id}" data-version="v0\\.9\\.7"`),
+      `放行卡 ${state} 的拖拽属性未因档类而位移`,
+    );
+  }
+});
+
+test("增补五B-② 样式面：六档左缘 3px 色条 + soft 底色 · 取色只引 --b- token（零新色值负钉）· 压暗降至 .75", () => {
+  const page = renderPage({ title: "t", active: "features", bodyHtml: renderSchedule([], []) });
+  const tiers = {
+    brand: "--b-brand",
+    warn: "--b-warn",
+    ok: "--b-ok",
+    locked: "--b-locked",
+    danger: "--b-danger",
+    neutral: "--b-line",
+  };
+  for (const [tier, token] of Object.entries(tiers)) {
+    assert.match(
+      page,
+      new RegExp(`\\.kcard\\.kst-${tier} \\{[^}]*border-left: 3px solid var\\(${token}\\)[^}]*background: var\\(`),
+      `${tier} 档：色条 + soft 底色`,
+    );
+    assert.doesNotMatch(
+      page,
+      new RegExp(`\\.kcard\\.kst-${tier} \\{[^}]*#[0-9a-fA-F]{3,8}`),
+      `${tier} 档不得出现新色值字面`,
+    );
+  }
+  assert.match(page, /\.kcard\.draglocked \{ opacity: \.75/);
+  assert.doesNotMatch(page, /\.kcard\.draglocked \{ opacity: \.55/, "旧压暗档已退役（色条优先可见）");
+  // 六档闭集不扩：档类名不得含 newver 子串（撞 w6 建版入口锚）
+  assert.doesNotMatch(page, /kst-[a-z]*newver/, "档类名不占用 newver 子串");
 });
 
 // ---------------------------------------------------------------------------
@@ -256,13 +364,14 @@ test("T5-① 卡片拖拽属性: 仅「stage=需求分析 ∧ approval=未发起
     [],
   );
   const idea = cardOf(html, "IDEA");
-  assert.match(idea, /^" draggable="true"/, "想法卡可拖（属性挂在卡根节点上）");
+  // 增补五 件B：卡根在 .kcard 之后追加 `kst-${档}`（纯显示类），拖拽属性紧随其后 ⇒ 锚容许档类
+  assert.match(idea, /^ kst-[a-z]+" draggable="true"/, "想法卡可拖（属性挂在卡根节点上）");
   assert.match(idea, /data-feature="IDEA"/);
   assert.match(idea, /data-version="v0\.9\.3"/, "卡片带现版本 ⇒ 拖同列 = 无操作（脚本早退）");
   assert.doesNotMatch(idea, /draglocked|🔒 排期已锁/, "放行卡不置灰、不出锁定标记");
   const locked = cardOf(html, "CONFIRMED");
   assert.doesNotMatch(locked, /draggable=/, "已确认卡不出拖拽属性（不是「拖了再拒」）");
-  assert.match(locked, /^ draglocked"/, "置灰类（cardOf 以 kcard 起头切段 ⇒ 段首是类名余部）");
+  assert.match(locked, /^ draglocked kst-[a-z]+"/, "置灰类（cardOf 以 kcard 起头切段 ⇒ 段首是类名余部）");
   // 增补 ① 降噪：卡面 = 紧凑标记（🔒 + 短文案），完整说明只随拖拽被拒的 409 错误卡呈现
   assert.match(locked, /<span class="kbadge draglock">🔒 排期已锁<\/span>/, "紧凑锁定标记在场");
   assert.doesNotMatch(locked, /需求确认单|本板不提供解除入口|Step 0/, "长文案（为何锁/解除入口/去处）不上卡面");
@@ -596,7 +705,9 @@ test("N4-② renderSchedule: 派生列（台账无该版）全终态卡 ⇒ 按�
 test("N4-③ renderSchedule: 徽标不吞版本号与卡片数（列头判据原样），需求池列无徽标", () => {
   const html = renderSchedule(groupFeaturesByVersion([feature("F1", "v0.9.1")]), [feature("F2", null)], ["v0.9.1"]);
   assert.match(html, /<h3>v0\.9\.1 <span class="kbadge vbadge locked"[^>]*>🔒 已发版<\/span> <span class="muted">\(1\)<\/span><\/h3>/);
-  const poolH3 = html.slice(html.indexOf("<h3>需求池"));
+  // 件3 起需求池是**首列** ⇒ 池列段以「下一枚 `<div class="kcol"`」为右界（不得切到文档尾，否则会把版本列头的 vbadge 误算进来）
+  const poolAt = html.indexOf("<h3>需求池");
+  const poolH3 = html.slice(poolAt, html.indexOf('<div class="kcol"', poolAt));
   assert.doesNotMatch(poolH3, /vbadge/, "需求池列不出版本徽标");
 });
 
@@ -623,7 +734,7 @@ async function withScheduleServer(client, run) {
   }
 }
 
-test("M4-⑥（B5a 重指空间排期页）GET /org/alpha/schedule: 200 + 空间导航「排期」为当前项 + 版本列有序；未排期卡在需求池列、不占版本列", async () => {
+test("M4-⑥（B5a 重指空间排期页）GET /org/alpha/schedule: 200 + 空间导航「排期」为当前项 + 列序（需求池最左 · 版本由大到小）；未排期卡在需求池列、不占版本列", async () => {
   const client = fakeClient([
     feature("F1", "v0.10.0"),
     feature("F2", "v0.9.2"),
@@ -636,11 +747,11 @@ test("M4-⑥（B5a 重指空间排期页）GET /org/alpha/schedule: 200 + 空间
     assert.equal(res.status, 200);
     assert.match(text, /<a class="fl on" href="\/org\/alpha\/schedule" style="font-weight:700">排期<\/a>/, "空间导航当前项 = 排期（B5a 起 NAV 无排期条 ⇒ 锚落空间导航行）");
     assert.doesNotMatch(text, /<a href="\/schedule"/, "NAV 不含 /schedule（B5a 摘条）");
-    assert.match(text, /<h3>v0\.9\.2/, "v0.9.2 列在左");
-    assert.match(text, /<h3>v0\.10\.0/, "v0.10.0 列在右（数值序）");
+    assert.match(text, /<h3>v0\.10\.0/, "v0.10.0 列在左（件3 由大到小）");
+    assert.match(text, /<h3>v0\.9\.2/, "v0.9.2 列在右（较大版之后）");
     assert.ok(
-      text.indexOf("<h3>v0.9.2") < text.indexOf("<h3>v0.10.0"),
-      "列从左到右按 semver 数值序",
+      text.indexOf("<h3>v0.10.0") < text.indexOf("<h3>v0.9.2"),
+      "版本列从左到右 = semver 数值序降序（件3：大版在左）",
     );
     assert.match(text, /<h3>需求池 <span class="muted">\(2\)<\/span><\/h3>/, "F3/F4 入池");
     assert.ok(
@@ -649,8 +760,8 @@ test("M4-⑥（B5a 重指空间排期页）GET /org/alpha/schedule: 200 + 空间
     );
     assert.ok(text.indexOf("/features/F4") > text.indexOf("<h3>需求池"), "纯空格 version 同判未排期");
     assert.ok(
-      text.indexOf("<h3>v0.10.0") < text.indexOf("<h3>需求池"),
-      "需求池列在版本列右侧（并列末列）",
+      text.indexOf("<h3>需求池") < text.indexOf("<h3>v0.10.0"),
+      "件3 列序：需求池最左，版本列依次由大到小排其右",
     );
     assert.match(text, /<dialog class="fd" id="feat-dialog">/, "排期页带浮层骨架");
     assert.ok(

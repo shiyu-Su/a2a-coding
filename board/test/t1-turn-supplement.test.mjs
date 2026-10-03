@@ -245,7 +245,9 @@ test("C2-⑦ HTTP：桥读面失败 ⇒ 降级放行（补充文本照常透传�
 // ④ C6 锚对账：动作区 turn 档**渲染**出可选补充字段（与 HTTP / 纯函数用例互补）
 // ---------------------------------------------------------------------------
 
-test("C2-⑧ 页面：动作区 turn 档渲染可选补充字段（textarea name=supplement · 留空=纯触发）", () => {
+test("C2-⑧ 页面：动作区 turn 档渲染可选补充字段（textarea name=supplement · 留空=纯触发）· 非监视态", () => {
+  // 本锚语义边界（-04 §3⑥ 限定）：**非监视态下** turn 档出补充框（actionInput 缺省不带
+  // chainMonitoring = 未接线/缺席 ⇒ fail-open 走原路径）；监视态 ⇒ 整块离场，见 ⑧b。
   // 字段名单点 = write-guard 常量（渲染面与服务端解析面同一事实源，防两处漂移）
   assert.equal(TURN_FORM_SUPPLEMENT_FIELD, "supplement");
   const html = renderActionArea("F1", actionInput());
@@ -259,5 +261,22 @@ test("C2-⑧ 页面：动作区 turn 档渲染可选补充字段（textarea name
     renderActionArea("F1", actionInput({ approval: "待审批" })),
     new RegExp(TURN_FORM_SUPPLEMENT_FIELD),
     "确认档不得出现补充字段（固定模板）",
+  );
+});
+
+test("C2-⑧b 页面（-04 监视态负锚）：chainMonitoring=true ⇒ renderActionArea 空串（补充框随动作区整块离场）", () => {
+  // 补充框嵌在 renderActionArea 内部 ⇒ derive 的监视中短路返 null 即无，无需单独执法（-04 §2.1）；
+  // 本锚把「监视中 ⇒ 无补充框」钉死，防日后把补充框拆成独立区块绕过短路。
+  assert.equal(renderActionArea("F1", actionInput({ chainMonitoring: true })), "", "turn 档监视态：整块空串");
+  assert.equal(
+    renderActionArea("F1", actionInput({ chainMonitoring: true, approval: "待审批" })),
+    "",
+    "确认档监视态：一并离场（不开例外，-04 §2.2）",
+  );
+  // fail-open 负锚：显式 false 与缺席同档（补充框照旧在场）
+  assert.match(
+    renderActionArea("F1", actionInput({ chainMonitoring: false })),
+    new RegExp(`<textarea name="${TURN_FORM_SUPPLEMENT_FIELD}"`),
+    "chainMonitoring=false ⇒ 补充框照旧在场",
   );
 });

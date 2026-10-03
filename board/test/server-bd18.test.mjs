@@ -57,11 +57,18 @@ function fakeClient(featureOver = {}, traceReturn = undefined) {
 }
 
 /**
- * 最小假宿主面：详情页只触 `awaitingTurnOf` / `busyTurnOf` / `latestTurnOf`（C6 留痕行）；
- * 三者可控，缺省全空 ⇒ 页面无在飞轮、无待澄清、无历史轮次。
+ * 最小假宿主面：详情页只触 `awaitingTurnOf` / `busyTurnOf` / `latestTurnOf`（C6 留痕行）与
+ * `chainSnapshotOf`（REQ-2026-09-30-04 监视档）；前四者可控，缺省全空 ⇒ 页面无在飞轮、无待澄清、
+ * 无历史轮次、无链快照。
+ *
+ * **`chainSnapshotOf` 注入档（04 §3⑥）**：第四参 `chainSnapshot` 三态区分 ——
+ * - `undefined`（缺省）⇒ **假面不实现该方法**（服务端 `hostChainSnapshotOf` try/catch 兜成 null）
+ *   = fail-open 负锚的注入点（-04 页级：动作区照旧在场）；
+ * - `null` ⇒ 方法在场但返回 null（宿主面无链知识，快照缺席）；
+ * - 对象 ⇒ 直接透传（构造监视 / 停链两档）。
  */
-function fakeFace(awaiting = null, busyTurn = null, latest = null) {
-  return {
+function fakeFace(awaiting = null, busyTurn = null, latest = null, chainSnapshot = undefined) {
+  const face = {
     awaitingTurnOf() {
       return awaiting;
     },
@@ -93,6 +100,10 @@ function fakeFace(awaiting = null, busyTurn = null, latest = null) {
       return null;
     },
   };
+  if (chainSnapshot !== undefined) {
+    face.chainSnapshotOf = () => chainSnapshot;
+  }
+  return face;
 }
 
 async function withServer(run, { feature, hostFace, trace } = {}) {
@@ -199,12 +210,12 @@ const AWAITING = {
   updatedAt: "u",
 };
 
-test("C5-页面：存在 awaiting_answer 轮 ⇒ 引导行 = 回答（优先于 approval 分支）· 按钮换提交档（不撤回答框）", async () => {
+test("C5/REQ-03-页面：存在 awaiting_answer 轮 ⇒ 引导行 = 回答（优先于 approval 分支）· 澄清框在场 · 动作区不出 DOM（输入面互斥）", async () => {
   await withServer(async (base) => {
     const { text } = await detail(base);
     assert.match(text, /<p class="hint nextstep">下一步：等你回答上方问题/);
-    assert.match(text, /action="\/features\/F1\/answer"/);
-    assert.match(text, SUBMIT_TIER, "有待答 ⇒ 档位换「提交给 agent」，不是确认档也不是灰态");
+    assert.match(text, /action="\/features\/F1\/answer"/, "awaiting ⇒ 澄清框在场");
+    assert.equal(text.includes("<h2>动作</h2>"), false, "REQ-03 互斥：awaiting 时动作区不出 DOM（非隐藏）");
     assert.equal(text.includes('/features/F1/confirm'), false, "未发起仍不出确认块");
   }, { feature: { approval: "未发起" }, hostFace: fakeFace(AWAITING) });
 });
@@ -278,13 +289,133 @@ test("轨14-页面（正向锚）无占用轮 ⇒ 档位回到 approval 判据�
   }, { feature: { approval: "待审批" } });
 });
 
-test("轨14-页面：awaiting_answer 轮不算占用 ⇒ 动作区按钮仍可点（否则澄清链路被锁死）", async () => {
+test("轨14/REQ-03-页面：awaiting_answer 轮不算占用（busy 闸内核不丢）· 澄清框在场（澄清链路不锁死）· 动作区不出 DOM（互斥）", async () => {
   await withServer(async (base) => {
     const { text } = await detail(base);
-    assert.match(text, CONFIRM_TIER, "等人回答不占闸位 ⇒ 按钮不锁");
-    assert.doesNotMatch(actionBlock(text), /disabled/, "待澄清不算占用 ⇒ 动作区无 disabled");
-    assert.match(text, /action="\/features\/F1\/answer"/);
+    // busy 闸内核（原「按钮仍可点」在新形态下的等价断言）：awaiting 轮不得被当作出占用 / 在飞 / 排队
+    assert.doesNotMatch(text, /本轮进行中|本轮排队中/, "awaiting 轮不占 busy 闸 ⇒ 不出占用文案");
+    assert.doesNotMatch(text, CONFIRM_DISABLED, "awaiting 轮不得把确认档渲染成 disabled 占用态");
+    assert.doesNotMatch(text, IDLE_DISABLED, "awaiting 轮不得把闲置档渲染成 disabled 占用态");
+    // 澄清链路不锁死：输入面 = 澄清框在场且可用
+    assert.match(text, /action="\/features\/F1\/answer"/, "澄清框在场 = 澄清链路未被锁死");
+    // REQ-03 输入面互斥正向：存在 awaiting 轮 ⇒ 页面无 <h2>动作</h2>
+    assert.equal(text.includes("<h2>动作</h2>"), false, "awaiting ⇒ 动作区不出 DOM");
   }, { feature: { approval: "待审批" }, hostFace: fakeFace(AWAITING, null) });
+});
+
+// ---------------------------------------------------------------------------
+// REQ-2026-09-30-03：输入面互斥（动作区 ↔ 澄清框恒为一个）+ 件B 轮询锚防回归
+// ---------------------------------------------------------------------------
+
+test("REQ-03-页面（输入面互斥 · 恰一为真）：awaiting ⇒ 只出澄清框；无 awaiting ⇒ 只出动作区", async () => {
+  const faces = (t) => [t.includes("<h2>动作</h2>"), t.includes('action="/features/F1/answer"')];
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    const [action, answer] = faces(text);
+    assert.equal(action, false, "awaiting ⇒ 动作区不出 DOM");
+    assert.equal(answer, true, "awaiting ⇒ 澄清框在场");
+    assert.notEqual(action, answer, "两输入面恰一为真");
+  }, { feature: { approval: "待审批" }, hostFace: fakeFace(AWAITING, null) });
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    const [action, answer] = faces(text);
+    assert.equal(action, true, "无 awaiting ⇒ 动作区在场");
+    assert.equal(answer, false, "无 awaiting ⇒ 澄清框不出 DOM");
+    assert.notEqual(action, answer, "两输入面恰一为真");
+  }, { feature: { approval: "待审批" }, hostFace: fakeFace(null, null) });
+});
+
+test("REQ-03-页面（件B 轮询锚防回归）：awaiting 态提交后仍在飞 ⇒ .turn-progress 留在 main 且在互斥尾部之外", async () => {
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    const mainStart = text.indexOf("<main>");
+    const mainEnd = text.indexOf("</main>");
+    assert.ok(mainStart >= 0 && mainEnd > mainStart, "详情页有 <main>");
+    const tp = text.indexOf('class="hint turn-progress"');
+    assert.ok(tp > mainStart && tp < mainEnd, ".turn-progress 在 main 内（件B 收口判据锚不丢）");
+    // 互斥尾部 = 动作区 / 澄清框；turn-progress 须在其之前（不被收进 terminal-gated 互斥分支）
+    const answerPos = text.indexOf('action="/features/F1/answer"');
+    assert.ok(answerPos >= 0 && tp < answerPos, "turn-progress 出现在澄清框（互斥尾部）之外/之前");
+    assert.equal(text.includes("<h2>动作</h2>"), false, "awaiting ⇒ 动作区缺席，但 turn-progress 仍在");
+  }, { feature: { approval: "待审批" }, hostFace: fakeFace(AWAITING, BUSY_RUNNING) });
+});
+
+// ---------------------------------------------------------------------------
+// REQ-2026-09-30-04：监视中短路的页级断言（chainSnapshotOf 注入档 + fail-open 负锚）
+// ---------------------------------------------------------------------------
+
+test("04-页面（监视中短路 · 假面注入 monitoring）：无动作区 DOM ∧ 无补充框 ∧ 停链表单在场 ∧ 引导行落监视档", async () => {
+  const snap = { chainState: "monitoring", reason: null, source: null, pendingCount: 2 };
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.equal(text.includes("<h2>动作</h2>"), false, "监视中 ⇒ 动作区不出 DOM（renderActionArea 返空串）");
+    assert.equal(text.includes('name="supplement"'), false, "补充框在 renderActionArea 内部 ⇒ 随动作区整块离场");
+    assert.match(text, /链状态：<b>监视中<\/b>（等 2 个子任务）/, "快照事实如实渲染（含 pendingCount）");
+    assert.match(text, /<form method="post" action="\/features\/F1\/stop-chain"/, "停链表单在场 = 插话逃生门");
+    assert.match(text, /<button type="submit"[^>]*>停链/, "按钮文案在场（引导行指路的对象必须真在场）");
+    assert.match(text, /<p class="hint nextstep">下一步：链监视中（等 2 个子任务回传）/, "引导行落监视档");
+    assert.match(text, /动作区与提交口暂时退场/, "交代审批门/提交口退场（待审批组合一并说明）");
+    assert.match(text, /要插话请点本页链状态行的「停链」按钮/, "指路唯一在场入口");
+    assert.doesNotMatch(text, /<p class="hint nextstep">[^<]*自动接力/, "监视档不预测唤醒时机（不留第二套「等不等唤醒」口径）");
+  }, { feature: { approval: "已通过", state: "executing", stage: "改造" }, hostFace: fakeFace(null, null, null, snap) });
+});
+
+test("04-页面（待审批不开例外 · 页级）：monitoring ∧ approval=待审批 ⇒ 确认档一并退场，唯一入口 = 停链", async () => {
+  const snap = { chainState: "monitoring", reason: null, source: null, pendingCount: 1 };
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.equal(text.includes("<h2>动作</h2>"), false, "监视优先于 approval 三态：确认档一并退场");
+    assert.equal(text.includes("/features/F1/confirm"), false, "确认块不得渲染（无后门可点）");
+    assert.match(text, /action="\/features\/F1\/stop-chain"/, "唯一在场入口 = 停链");
+    assert.match(text, /<p class="hint nextstep">下一步：链监视中/, "引导行仍是监视档（不出待审批确认文案）");
+    assert.doesNotMatch(text, /核对后点「确认改造文档/, "待审批档文案被监视档遮蔽");
+  }, { feature: { approval: "待审批", state: "waiting_approval", stage: "改造方案" }, hostFace: fakeFace(null, null, null, snap) });
+});
+
+test("04-页面（fail-open 负锚 · 假面未实现 chainSnapshotOf）：方法缺席 ⇒ 服务端兜 null ⇒ 动作区照旧在场（缺省语义锁在页面层）", async () => {
+  await withServer(async (base) => {
+    const { status, text } = await detail(base);
+    assert.equal(status, 200, "假面缺方法不得带崩详情页（hostChainSnapshotOf try/catch 兜 null）");
+    assert.match(text, /<h2>动作<\/h2>/, "快照读不到 ⇒ fail-open：动作区照旧在场（未接线调用方不回归）");
+    assert.match(text, /<textarea name="supplement"/, "补充框照旧在场");
+    assert.doesNotMatch(text, /action="\/features\/F1\/stop-chain"/, "非监视档 ⇒ 停链表单不出");
+    assert.doesNotMatch(text, /链状态：/, "快照缺席 ⇒ 整行不渲染");
+    assert.match(text, /<p class="hint nextstep">[^<]*审批门已通过/, "引导行落回 approval 三态（照旧，非监视档）");
+  }, { feature: { approval: "已通过", state: "executing", stage: "改造" }, hostFace: fakeFace() });
+});
+
+test("04-页面（fail-open 负锚 · 方法在场但返回 null）：宿主面无链知识同样兜 null ⇒ 动作区照旧在场", async () => {
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.match(text, /<h2>动作<\/h2>/, "chainSnapshotOf() → null 与缺席同档：fail-open");
+    assert.doesNotMatch(text, /action="\/features\/F1\/stop-chain"/);
+    assert.doesNotMatch(text, /链状态：/);
+  }, { feature: { approval: "已通过", state: "executing", stage: "改造" }, hostFace: fakeFace(null, null, null, null) });
+});
+
+test("04-页面（stopped 快照档 · 非监视）：链状态行「链已停」在场 ∧ 无停链表单 ∧ 动作区照旧在场（球已回用户）", async () => {
+  const snap = { chainState: "stopped", reason: "用户经链状态行「停链」· 该需求无在飞 / 排队轮", source: "user", pendingCount: null };
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.match(text, /链状态：<b>链已停<\/b>/, "停链档仍渲染链状态行");
+    assert.doesNotMatch(text, /action="\/features\/F1\/stop-chain"/, "已停 ⇒ 无「再停一次」入口");
+    assert.match(text, /<h2>动作<\/h2>/, "chainMonitoring=false ⇒ 短路不触发，动作区回来（球在用户手里的读面）");
+  }, { feature: { approval: "已通过", state: "executing", stage: "改造" }, hostFace: fakeFace(null, null, null, snap) });
+});
+
+test("04-页面（监视 ∧ awaiting 优先序）：-03 锚不翻 · awaiting 短路排前 ⇒ 澄清框在场 + 停链表单并存", async () => {
+  const snap = { chainState: "monitoring", reason: null, source: null, pendingCount: 4 };
+  await withServer(async (base) => {
+    const { text } = await detail(base);
+    assert.equal(text.includes("<h2>动作</h2>"), false, "两条短路任一命中都撤动作区");
+    assert.match(text, /action="\/features\/F1\/answer"/, "awaiting ⇒ 澄清框在场（球在你手里 = 回答）");
+    assert.match(text, /action="\/features\/F1\/stop-chain"/, "停链表单同页在场（快照监视中）");
+    assert.match(text, /<p class="hint nextstep">下一步：等你回答上方问题/, "引导行判序 awaiting > 监视中");
+    assert.doesNotMatch(text, /<p class="hint nextstep">[^<]*链监视中/, "监视档文案被 awaiting 档遮蔽");
+    // 05 增补：链状态行同步感知 awaiting（消除「等你回答」引导行 vs 「监视中」链状态行同页矛盾）
+    assert.match(text, /链状态：<b>等你回答<\/b>（等 4 个子任务）/, "组合态链状态行换档标签、计数子串照旧");
+    assert.doesNotMatch(text, /链状态：<b>监视中<\/b>/, "组合态页面上「监视中」档位标签离场");
+  }, { feature: { approval: "待审批", state: "waiting_approval", stage: "改造方案" }, hostFace: fakeFace(AWAITING, null, null, snap) });
 });
 
 // ---------------------------------------------------------------------------
@@ -370,18 +501,26 @@ test("C5-页面（负锚）任何档位的详情页都不出现「触发一轮�
 });
 
 // ---------------------------------------------------------------------------
-// C4 页级：需求原文上详情页（第一屏 · 引导行之后 · 动作区之前）
+// C4 页级（件2 改版）：需求原文 = 主栏折叠层首节（默认收起，标题与原文形态不变）
 // ---------------------------------------------------------------------------
 
-test("C4-页面：桥详情出参含 requirement ⇒ 常驻层显示需求原文（截断 + 展开全文）；缺字段 ⇒ 整区不渲染", async () => {
+test("C4-页面：桥详情出参含 requirement ⇒ 需求原文在折叠层（截断 + 展开全文）；缺字段 ⇒ 整区不渲染", async () => {
   const long = "板「标记 released」的闸判据对曾有取消轨的版本永久失真：".repeat(6);
   await withServer(async (base) => {
     const { text } = await detail(base);
-    assert.match(text, /<h2>需求原文<\/h2>/);
+    assert.match(
+      text,
+      /<details class="fold"><summary>需求原文<\/summary>[\s\S]*?<h2>需求原文<\/h2>/,
+      "件2：需求原文进主栏折叠层（默认收起），区内标题仍在场",
+    );
     assert.match(text, /<details class="req-src">/, "超长原文走原生 details（零脚本）");
-    const block = text.slice(text.indexOf("<h2>需求原文</h2>"), text.indexOf("<h2>动作</h2>"));
-    assert.ok(block.indexOf("</summary>") < block.indexOf("<pre class=\"result\">"), "折叠态 = 截断、展开态 = 全文");
-    assert.ok(block.indexOf("nextstep") < block.indexOf("<h2>需求原文</h2>"), "位于引导行之后的常驻层");
+    const block = text.slice(text.indexOf("<summary>需求原文</summary>"), text.indexOf('<div class="feat-side">'));
+    assert.ok(block.indexOf("</summary>") < block.indexOf('<pre class="result">'), "折叠态 = 截断、展开态 = 全文");
+    assert.ok(block.indexOf("req-src") > 0, "原文块在主栏内（侧栏之前）");
+    assert.ok(
+      text.indexOf('<p class="hint nextstep">') < text.indexOf("<h2>需求原文</h2>"),
+      "件2 主栏序：引导卡在原文折叠层之前",
+    );
   }, { feature: { requirement: long } });
 
   await withServer(async (base) => {
@@ -398,21 +537,27 @@ test("C4-页面：桥详情出参含 requirement ⇒ 常驻层显示需求原文
 });
 
 // ---------------------------------------------------------------------------
-// C1 页级正锚：引导行上移第一屏（字段表之后 · 需求原文之前 · 动作区之前）
+// C1 页级正锚（件2 改版）：主栏序 = 步条 → 引导卡 → 动作区 → 最近一轮 → 折叠 → 侧栏元数据卡
 // ---------------------------------------------------------------------------
 
-test("C1-页面（正锚）：第一屏拼接序 = 字段表 → 引导行 → 需求原文 → 动作区/轮留痕", async () => {
+test("C1-页面（正锚）：两栏拼接序 = 阶段步条 → 引导行 → 动作区 → 最近一轮 → 侧栏元数据卡", async () => {
   await withServer(async (base) => {
     const { text } = await detail(base);
     const marks = [
-      text.indexOf("<th>审批门（approval）</th>"),
+      text.indexOf('<div class="b-steps">'),
       text.indexOf('<p class="hint nextstep">'),
-      text.indexOf("<h2>需求原文</h2>"),
-      text.indexOf("<h2>最近一轮</h2>"),
       text.indexOf("<h2>动作</h2>"),
+      text.indexOf("<h2>最近一轮</h2>"),
+      text.indexOf('<div class="feat-side">'),
+      text.indexOf("<dt>审批门（approval）</dt>"),
     ];
-    assert.equal(marks.every((i) => i >= 0), true, "五处结构锚都在场");
-    assert.deepEqual([...marks].sort((a, b) => a - b), marks, "引导行不在第一屏（字段表后、原文/动作区前）即回归");
+    assert.equal(marks.every((i) => i >= 0), true, "六处结构锚都在场");
+    assert.deepEqual(
+      [...marks].sort((a, b) => a - b),
+      marks,
+      "引导行不在动作区之前 / 元数据卡不在侧栏 ⇒ 件2 两栏序回归",
+    );
+    assert.equal(text.includes("<th>阶段（显示）</th>"), false, "阶段双行已由阶段步条替代");
   }, {
     feature: { approval: "待审批", requirement: "要一个只读的排期导出" },
     hostFace: fakeFace(null, null, {

@@ -319,3 +319,23 @@ test("BD10-⑤：默认组织未配置（defaultGroup = null，即 resolveDefaul
     await handle.close();
   }
 });
+
+// ---------------------------------------------------------------------------
+// REQ-2026-10-02-02 件B / REQ-2026-10-02-04 件B（回归锚）：notes 逐页摘除（门户 → 任务页），
+// 详情页 notes 正钉保留（防 sendPage 单点开关误伤其余页）；任务页口径折叠块一并补负钉
+// ---------------------------------------------------------------------------
+
+test("件B：页底 notes 门户 / 任务页摘除 · 详情页保留 · 任务页无口径折叠（增补四补负钉）", async () => {
+  await withServer(async (base) => {
+    const home = await get(base, "/");
+    assert.equal(home.status, 200);
+    assert.doesNotMatch(home.text, /<ul class="notes"/, "门户不收全局口径说明");
+    const detail = await get(base, "/features/F1");
+    assert.equal(detail.status, 200);
+    assert.match(detail.text, /<ul class="notes"/, "详情页的页底 notes 照旧保留（单点开关不误伤）");
+    const tasks = await get(base, "/tasks?project=p");
+    assert.equal(tasks.status, 200);
+    assert.doesNotMatch(tasks.text, /<ul class="notes"/, "增补四：全局任务页不收全站口径说明");
+    assert.doesNotMatch(tasks.text, /<details class="calib"/, "增补四：全局任务页口径折叠块已删");
+  });
+});

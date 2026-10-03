@@ -49,7 +49,7 @@ function feature(featureId, version, overrides = {}) {
 // ① （E1 撤除）虚列壳不再渲染 —— 负向锚
 // ---------------------------------------------------------------------------
 
-test("W6-①（E1 改版）renderSchedule 不再挂虚列壳：哨兵 data-newversion / newver 类 / 虚列头三处皆不出现；池列仍为尾列", () => {
+test("W6-①（E1 改版）renderSchedule 不再挂虚列壳：哨兵 data-newversion / newver 类 / 虚列头三处皆不出现；池列仍在（件3 起 = 首列）", () => {
   const html = renderSchedule(
     groupFeaturesByVersion([feature("F1", "v0.9.3")]),
     selectRequirementPool([feature("F2", null)]),
@@ -58,16 +58,16 @@ test("W6-①（E1 改版）renderSchedule 不再挂虚列壳：哨兵 data-newve
   assert.doesNotMatch(html, /kcol newver/, "虚列壳 class 已撤");
   assert.doesNotMatch(html, /<h3>＋ 新版本/, "虚列头已撤（页头按钮那枚不算，见 W6-④）");
   assert.doesNotMatch(html, /拖卡到此/, "拖卡建版本口径文案已撤");
-  // 池列仍以 data-version="" 标记，且是看板最后一列
+  // 池列仍以 data-version="" 标记；件3 起它是看板**首列**（最左）
   assert.match(html, /<div class="kcol" data-version="">/, "池列 data-version 空串不变（清空排期落点）");
   const board = html.slice(html.indexOf('<div class="kanban" id="schedule-board">'), html.indexOf("<dialog"));
   assert.ok(
-    board.lastIndexOf('<div class="kcol"') === board.lastIndexOf('<div class="kcol" data-version=""'),
-    "池列是看板尾列（其后无其它列）",
+    board.indexOf('<div class="kcol"') === board.indexOf('<div class="kcol" data-version=""'),
+    "池列是看板首列（件3：需求池最左，其右为版本列）",
   );
 });
 
-test("W6-①b（E1 改版）空看板同样不出虚列壳（尾列只剩需求池）", () => {
+test("W6-①b（E1 改版）空看板同样不出虚列壳（列只剩需求池）", () => {
   const html = renderSchedule([], []);
   assert.doesNotMatch(html, /data-newversion/);
   assert.equal((html.match(/<div class="kcol"/g) ?? []).length, 1, "空看板列数 = 1（仅需求池）");
@@ -172,7 +172,7 @@ test("W6-④b（增补七 a）GET /：门户页头**不再**渲染「＋ 新版�
   await withServer(fakeClient([feature("F1", "v0.9.3")]), async (base) => {
     const html = await (await fetch(`${base}/`)).text();
     assert.doesNotMatch(html, /id="new-version-open"/, "门户撤除新版本入口");
-    assert.match(html, /id="new-org-open"/, "门户「＋ 建组织」入口不受影响");
+    assert.match(html, /id="new-org-open"/, "门户「＋ 建项目组」入口不受影响");
     // 闭集不扩：门户仍 = 提交守卫 + 泛化弹窗脚本两枚
     assert.equal((html.match(/<script>/g) ?? []).length, 2, "门户可执行内联脚本 = 两枚（未新增第七枚）");
     assert.doesNotMatch(html, /<script[^>]*src=/, "无外源脚本（CSP 不动）");

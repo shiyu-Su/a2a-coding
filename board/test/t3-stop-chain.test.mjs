@@ -492,6 +492,43 @@ test("T3-⑫ HTTP：接力未装配 ⇒ 503 board_relay_not_assembled（结构�
   }, { face });
 });
 
+test("04-③ HTTP HTML 档成功 ⇒ 303 回详情页（PRG：停链反馈由链状态行 + 动作区回来承载，刷新不重复置标志）", async () => {
+  const { face, calls } = fakeServerFace();
+  await withServer(async (base) => {
+    const res = await post(base, "/features/F1/stop-chain", {
+      referer: `${base}/features/F1`,
+      accept: "text/html",
+    });
+    assert.equal(res.status, 303, "浏览器表单档（同源 Referer 过 CSRF）成功 ⇒ 跳转，不出独立结果页");
+    assert.equal(res.headers.get("location"), "/features/F1");
+    assert.equal(await res.text(), "", "跳转档不发 body");
+    assert.deepEqual(calls.stopChain, ["F1"], "303 不改写受理：仍恰好一次触宿主面");
+  }, { face });
+});
+
+test("04-④ HTTP HTML 档失败 ⇒ 仍出整页（有内容回执、不 303：跳转会吞根因）", async () => {
+  const { face } = fakeServerFace((featureId) => ({
+    ok: false,
+    featureId,
+    chainStopped: false,
+    cancelledTurnId: null,
+    cancelDisplay: null,
+    error: { code: "board_relay_not_assembled", message: "自动接力驱动器未装配（宿主面在、但接力未起）⇒ 无内存链可停，不假装已停" },
+    display: "停链失败：自动接力未装配",
+  }));
+  await withServer(async (base) => {
+    const res = await post(base, "/features/F1/stop-chain", {
+      referer: `${base}/features/F1`,
+      accept: "text/html",
+    });
+    assert.equal(res.status, 503);
+    assert.equal(res.headers.get("location"), null, "失败档不跳转");
+    const text = await res.text();
+    assert.match(text, /停链失败：自动接力未装配/, "根因整页可见");
+    assert.match(text, /board_relay_not_assembled/, "结构化错误码随页显示");
+  }, { face });
+});
+
 test("T3-⑬ 停链标志落内存、不跨重启：宿主面实例间零共享（新实例/新接力 ⇒ 未停）", async () => {
   const { turns } = fakeTurns();
   const faceA = createHostFace(faceDeps(turns));

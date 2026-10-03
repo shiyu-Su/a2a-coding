@@ -318,7 +318,10 @@ test("T3-⑬ GET /agents: 200 + 「Agent」导航高亮 + 页头桥身份行 + �
     const res = await getHtml(base, "/agents");
     assert.equal(res.status, 200);
     assert.match(res.text, /<title>Agent View · board<\/title>/);
-    assert.match(res.text, /<a href="\/agents" class="on">Agent<\/a>/, "导航含 Agent 且高亮");
+    // 件1：「运行监控」撤出侧栏导航（页面保留、深链可达）⇒ 原「导航含 Agent 且高亮」锚改钉
+    // 「侧栏一级菜单 = 项目组门户一枚，且 nav 段内不出 /agents」。
+    assert.match(res.text, /<a href="\/">项目组门户<\/a>/, "深链页仍是板壳（侧栏一级菜单在位，本页不高亮任何条）");
+    assert.doesNotMatch((/<nav>([\s\S]*?)<\/nav>/.exec(res.text) ?? [, ""])[1], /href="\/agents"/, "件1：/agents 撤出导航");
     assert.match(res.text, /<h2>Agent View · 机器与在飞<\/h2>/);
     assert.match(
       res.text,
@@ -423,7 +426,9 @@ test("T3-⑲ 桥宕: GET /agents ⇒ 502 浮层版式，高亮随发起页「Age
     const res = await getHtml(base, "/agents");
     assert.equal(res.status, 502);
     assert.match(res.text, /bridge_unreachable/);
-    assert.match(res.text, /<a href="\/agents" class="on">Agent<\/a>/, "宕页高亮留在「Agent」");
+    // 件1：宕页高亮锚原钉「留在 Agent」⇒ 该条已撤出导航，改钉「板壳侧栏一级菜单在位」（高亮不落任何撤出的条）
+    assert.match(res.text, /<a href="\/">项目组门户<\/a>/, "宕页仍是板壳");
+    assert.doesNotMatch((/<nav>([\s\S]*?)<\/nav>/.exec(res.text) ?? [, ""])[1], /href="\/agents"/, "件1：宕页也不给撤出的条留导航入口");
   });
 });
 

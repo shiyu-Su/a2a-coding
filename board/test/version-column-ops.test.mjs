@@ -198,15 +198,13 @@ test("A2-⑤ 表单都打既有的 POST /versions（隐藏字段 action 分流�
   assert.doesNotMatch(nasty, /<script>alert/, "台账脏值进隐藏字段与 title 必须转义");
 });
 
-test("A2-⑥ 零脚本（内联闭集六元不扩）+ 闸文案在框头与页提示双处可辨", () => {
+test("A2-⑥ 零脚本（内联闭集六元不扩）+ 闸文案由框头 title/aria 写明", () => {
   const ledger = ledgerWith([["v0.9.7", "notstart"], ["v0.9.3", "released"]]);
   const html = renderSchedule(groupFeaturesByVersion([], ["v0.9.7", "v0.9.3"]), [], [], ledger);
   assert.doesNotMatch(html, /<script/, "本件纯 SSR：删除入口不引入任何脚本常量");
   assert.match(delOf(html, "v0.9.7"), /title="[^"]*仅未开始的版本可删[^"]*"/, "× 的 title 写明闸");
   assert.match(delOf(html, "v0.9.7"), /aria-label="删除版本 v0\.9\.7"/, "× 有无障碍标签（按钮正文只有符号）");
   assert.doesNotMatch(html, /<div class="vops">|class="inline vop"/, "E3：整页不再有列头操作行（含已发版列）");
-  assert.match(html, /<b>删除版本<\/b>[\s\S]*<b>本版撤除「标记已发版」前台入口<\/b>[\s\S]*<b>已发版（🔒）列为纯只读<\/b>/, "页提示写明删除入口 + 发版入口已撤 + 已发版只读（执法在服务端）");
-  assert.match(html, /版本框头右上角的 <b>×<\/b>/, "页提示写明删除入口位置");
   assert.doesNotMatch(html, /<b>重开<\/b>/, "负向锚：页提示不再把「重开」当前台入口");
   assert.match(html, /<h3>v0\.9\.7 <span class="kbadge vbadge notstart"/, "列头徽标不被 × 挤掉（h3 结构原样）");
 });

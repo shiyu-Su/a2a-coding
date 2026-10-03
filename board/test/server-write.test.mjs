@@ -541,7 +541,7 @@ test("BD7-⑦（BD11 反转 · B5a 重指空间排期页）：提需求表单在
   }, { defaultGroup: "board-default-org" });
 });
 
-test("N3（真 HTTP）：提需求表单旁 orgsDir 提示随宿主面状态三档渲染（就绪 / 配了但不可用）", async () => {
+test("N3（真 HTTP）：提需求表单旁 orgsDir 提示随宿主面状态渲染（故障档可见；增补三起 ready 档不再展示）", async () => {
   const faceWith = (orgsDir, problem) => ({
     configView: () => ({ orgsDir, defaultOrg: null, kind: "claude" }),
     orgsDirProblem: () => problem,
@@ -549,8 +549,6 @@ test("N3（真 HTTP）：提需求表单旁 orgsDir 提示随宿主面状态三�
   await withServer(async (base) => {
     const res = await req(base, "/");
     assert.equal(res.status, 200);
-    assert.match(res.text, /组织目录根（orgsDir）<b>就绪<\/b>/);
-    assert.match(res.text, /C:\/orgs\/live/);
   }, { hostFace: faceWith("C:/orgs/live", null) });
   await withServer(async (base) => {
     const res = await req(base, "/");

@@ -164,11 +164,41 @@ test("D2-② 停链口（route）置的来源 = user：face.stopChain 与 reques
   assert.notEqual(relay, null);
 
   await face.stopChain("F1");
-  assert.deepEqual(relay.stopView("F1"), { reason: "route", source: "user" }, "HTTP 停链口 = 用户显式停链");
+  const stop = relay.stopView("F1");
+  assert.equal(stop.source, "user", "HTTP 停链口 = 用户显式停链");
+  assert.equal(
+    stop.reason,
+    "用户经链状态行「停链」· 该需求无在飞 / 排队轮",
+    "停链原因人话化（04 §2.5）：无占用轮档如实交代，供链状态行直接显示",
+  );
+  assert.equal(stop.reason.includes("route"), false, "机器词不上面");
 
   face.clearStopChain("F1");
   face.requestStopChain("F2");
   assert.equal(relay.stopView("F2").source, "user", "写面口一律 user 来源");
+});
+
+test("D2-②b 停链原因含被取消轮次（04 §2.5 三档：有占用轮 + 取消可用 ⇒ 原因带第 N 轮与 turnId）", async () => {
+  const { turns } = fakeTurns({
+    busyTurnOf: (id) => ({
+      turnId: "turn-busy",
+      requirementId: id,
+      org: "g",
+      contextId: "ctx-1",
+      round: 3,
+      state: "queued",
+      queuedAt: "q",
+      startedAt: null,
+    }),
+  });
+  const face = createHostFace(faceDeps(turns));
+  const relay = face.startRelay();
+  await face.stopChain("F1");
+  assert.equal(
+    relay.stopView("F1").reason,
+    "用户经链状态行「停链」· 同时取消第 3 轮（turn-busy）",
+    "原因带「第 N 轮 + turnId」（原独立结果页的信息量迁到链状态行）",
+  );
 });
 
 test("D2-③ 负例：`user` 停链**不被人工动作清除**（三种人工动作都不解），且点火仍被拒", () => {
@@ -294,6 +324,63 @@ test("D2-⑪ 监视档的「读不到就不说」：pendingCount = null ⇒ 无�
     const view = deriveChainStateLine({ chainState: "monitoring", pendingCount: bad });
     assert.equal(view.pendingCount, null, `pendingCount = ${String(bad)} ⇒ 按读不到处理`);
   }
+});
+
+test("04-① 监视档 + featureId 在场 ⇒ 链状态行挂停链表单（空表单 POST 既有写口，零脚本零新写面）", () => {
+  const html = renderChainStateLine(
+    deriveChainStateLine({ chainState: "monitoring", reason: null, source: null, pendingCount: 2 }),
+    "F1",
+  );
+  assert.match(html, /<b>监视中<\/b>/);
+  assert.match(html, /等 2 个子任务/);
+  assert.match(html, /<form method="post" action="\/features\/F1\/stop-chain"/, "纯表单过 CSRF Origin/Referer 档");
+  assert.match(html, /data-submit="[^"]+"/, "提交即时反馈口（v0.9.5 复用）");
+  assert.match(html, /<button type="submit"[^>]*>停链/, "按钮文案含「停链」（引导行指路的对象必须真在场）");
+  assert.equal(html.includes("name="), false, "空表单：零 body 字段（停链按需求定位，id 走路径）");
+  assert.equal(html.includes("<script"), false, "零脚本（内联脚本闭集不扩）");
+});
+
+test("04-② 停链表单的 fail-open 三档：不传 featureId / 空白标识 / 非监视档 ⇒ 均不出表单", () => {
+  const mon = deriveChainStateLine({ chainState: "monitoring", reason: null, source: null, pendingCount: 1 });
+  assert.equal(renderChainStateLine(mon).includes("stop-chain"), false, "既有 8 处调用点（不传第二参）零改动");
+  assert.equal(renderChainStateLine(mon, "").includes("stop-chain"), false, "空串标识 ⇒ 不出表单");
+  assert.equal(renderChainStateLine(mon, "   ").includes("stop-chain"), false, "纯空白标识 ⇒ 不出表单");
+  const stopped = renderChainStateLine(
+    deriveChainStateLine({ chainState: "stopped", reason: "用户经链状态行「停链」", source: "user", pendingCount: null }),
+    "F1",
+  );
+  assert.equal(stopped.includes("stop-chain"), false, "链已停 ⇒ 无「再停一次」入口（球已在用户手里）");
+  assert.equal(deriveChainStateLine(null), null, "快照缺席 ⇒ 整行不渲染（含表单）");
+  assert.equal(renderChainStateLine(deriveChainStateLine(null), "F1"), "", "缺席档即便传 id 也不出表单");
+});
+
+test("05-① 监视档感知 awaiting：monitoring ∧ awaiting=true ⇒ 标签换「等你回答」、计数子串与停链入口照旧", () => {
+  const mon = deriveChainStateLine({ chainState: "monitoring", reason: null, source: null, pendingCount: 2 });
+  const html = renderChainStateLine(mon, "F1", true);
+  assert.match(html, /链状态：<b>等你回答<\/b>/, "组合态档位标签 = 等你回答");
+  assert.match(html, /等 2 个子任务/, "waiting 计数子串逐字不动（链仍在监视）");
+  assert.match(html, /要插话请点「停链」/, "stopHint 逐字保留");
+  assert.match(html, /<form method="post" action="\/features\/F1\/stop-chain"/, "停链表单出条件不变（monitoring ∧ featureId 在场）");
+  assert.equal(html.includes("<b>监视中</b>"), false, "组合态不再显示「监视中」");
+});
+
+test("05-② 组合态负锚：awaiting=true ∧ 不传 featureId ⇒ 换标签但不臆造停链入口（指路文案与表单同进同出）", () => {
+  const mon = deriveChainStateLine({ chainState: "monitoring", reason: null, source: null, pendingCount: 2 });
+  const noId = renderChainStateLine(mon, undefined, true);
+  assert.match(noId, /<b>等你回答<\/b>/, "档位标签与 awaiting 无关地渲染");
+  assert.equal(noId.includes("stop-chain"), false, "无表单 ⇒ 不出停链表单");
+  assert.equal(noId.includes("要插话请点「停链」"), false, "无表单 ⇒ 指路文案同离场");
+});
+
+test("05-③ 纯监视档逐字不变负锚：第三参缺省 / false ⇒ 输出与既往逐字一致（既有调用点零改动）", () => {
+  const mon = deriveChainStateLine({ chainState: "monitoring", reason: null, source: null, pendingCount: 3 });
+  const baseline = renderChainStateLine(mon, "F1");
+  assert.equal(renderChainStateLine(mon, "F1", false), baseline, "显式 false ⇒ 逐字一致");
+  assert.equal(renderChainStateLine(mon, "F1", undefined), baseline, "显式 undefined ⇒ 逐字一致");
+  assert.match(baseline, /<b>监视中<\/b>/);
+  const nullMon = renderChainStateLine(deriveChainStateLine({ chainState: "monitoring", pendingCount: null }), "F1", true);
+  assert.equal(nullMon.includes("个子任务"), false, "awaiting 档不改变 pendingCount null 的「读不到不臆造」");
+  assert.match(nullMon, /<b>等你回答<\/b>/);
 });
 
 test("D2-⑫ 读面三态之二 / 之三：链已停 · 来源 user（不解冻）/ 来源 auto（可解冻），均带原因", () => {
@@ -494,12 +581,18 @@ test("D2-⑳ HTTP 详情页：停链后渲染「链已停 · 来源」一行；�
     assert.equal(monitoring.status, 200);
     assert.match(monitoring.text, /链状态：<b>监视中<\/b>/);
     assert.equal(monitoring.text.includes("链已停"), false);
+    // -04 页级复核：监视档 ⇒ 停链表单在场（同一 `chainStateHtml` 单元，`workspace` 拼装顺序不变）
+    assert.match(monitoring.text, /<form method="post" action="\/features\/F1\/stop-chain"/, "04 §3⑥：监视态页级出表单");
+    assert.equal(monitoring.text.includes("<h2>动作</h2>"), false, "04 §3⑥：监视中 ⇒ 动作区不出 DOM（页级短路）");
 
     await face.stopChain("F1");
     const stopped = await getDetail(base);
     assert.equal(stopped.status, 200);
     assert.match(stopped.text, /链状态：<b>链已停<\/b>/);
     assert.match(stopped.text, /来源：用户（停链口）· 人工动作不解冻/);
+    // -04 页级负锚：stopped 档不出停链表单（球已回用户手里 ⇒ 无「再停一次」入口）∧ 动作区回来
+    assert.equal(stopped.text.includes("/features/F1/stop-chain"), false, "04 §3⑥：stopped 档无停链表单（页级负锚）");
+    assert.match(stopped.text, /<h2>动作<\/h2>/, "04 §3⑥：停链后动作区回来（页级）");
   }, face);
 
   const noRelay = createHostFace(faceDeps(fakeTurns().turns));
@@ -507,12 +600,15 @@ test("D2-⑳ HTTP 详情页：停链后渲染「链已停 · 来源」一行；�
     const res = await getDetail(base);
     assert.equal(res.status, 200, "接力未装配 ⇒ 不报错");
     assert.equal(res.text.includes("链状态："), false, "快照缺席 ⇒ 整行不渲染");
+    assert.equal(res.text.includes("/features/F1/stop-chain"), false, "快照缺席 ⇒ 表单同离场");
+    assert.match(res.text, /<h2>动作<\/h2>/, "04 fail-open 页级：快照缺席 ⇒ 动作区照旧在场");
   }, noRelay);
 
   await withServer(async (base) => {
     const res = await getDetail(base);
     assert.equal(res.status, 200);
     assert.equal(res.text.includes("链状态："), false, "宿主面未装配 ⇒ 同样不出该行");
+    assert.equal(res.text.includes("/features/F1/stop-chain"), false, "宿主面未装配 ⇒ 无表单");
   }, null);
 });
 
@@ -525,6 +621,12 @@ test("D2-ㄑ 详情页既有档位与按钮文案未被本节点改动（5c73939
     assert.equal(res.status, 200);
     assert.equal(res.text.includes("触发一轮"), false, "底层机制词仍不得上页（C5 负锚）");
     assert.match(res.text, /轮次进度：|链状态：/, "轮次进度区与链状态行同区渲染");
+    // -04 §3⑥：`workspace` 拼装顺序不变 —— turnTrace → turnProgress → chainState（含停链表单）→ 动作区/澄清框
+    // 监视态页面上：链状态行的 stop-chain 表单必须**早于**任何动作区/澄清框锚点（此处后者缺席，只钉前者在场）。
+    const stopChainPos = res.text.indexOf("/features/F1/stop-chain");
+    const chainStatePos = res.text.indexOf("链状态：");
+    assert.ok(chainStatePos >= 0 && stopChainPos > chainStatePos, "停链表单紧随链状态行（chainStateHtml 内部序）");
+    assert.equal(res.text.includes("<h2>动作</h2>"), false, "监视态 ⇒ 动作区在 workspace 尾部整块缺席（顺序不变、内容退场）");
   }, face);
 });
 

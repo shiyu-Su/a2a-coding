@@ -162,7 +162,7 @@ test("C1-⑥（B5a 改版：全局 /schedule 退役 ⇒ 宿主 = 空间排期页
     assert.match(headOf(text, "v0.9.9"), /<span class="kbadge vbadge notstart"[^>]*>未开始<\/span>/, "台账 notstart 空列照旧");
     assert.match(text, /<h3>需求池 <span class="muted">\(1\)<\/span><\/h3>/, "需求池列无版本徽标");
     const poolAt = text.indexOf("<h3>需求池");
-    assert.doesNotMatch(text.slice(poolAt, text.indexOf("</h3>", poolAt)), /vbadge/);
+    assert.doesNotMatch(text.slice(poolAt, text.indexOf('<div class="kcol"', poolAt)), /vbadge/, "件3 起池列是最左列 ⇒ 右界取下一枚 kcol（不吞版本列头徽标）");
     assert.doesNotMatch(text, /data-newversion/, "新版本虚列已撤（E1 §9.6）⇒ 徽标派生不受影响");
   } finally {
     await handle.close();

@@ -58,10 +58,11 @@ export function escapeHtml(value: unknown): string {
 export type NavKey = "home" | "features" | "schedule" | "tasks" | "projects" | "agents" | "host";
 
 /**
- * **组织上下文（v0.9.4 D 档 · BD7）**：`renderPage` 的 NAV 组织感知与顶栏组织切换器的唯一输入。
+ * **组织上下文（v0.9.4 D 档 · BD7；REQ-2026-09-30-04 件1 起 = 侧栏二级菜单的唯一输入）**：
+ * `renderPage` 侧栏项目组清单与当前空间高亮的唯一输入。
  *
- * - `org` = 当前页面所处的组织空间（`null` ⇒ 全局页面，NAV 落全局路径）；
- * - `orgs` = 顶栏切换器的组织清单（**服务端渲染的链接列表**，跳转 = 全页刷新 ⇒
+ * - `org` = 当前页面所处的组织空间（`null` ⇒ 全局页面，侧栏不出当前态）；
+ * - `orgs` = 侧栏二级菜单的项目组清单（**服务端渲染的链接列表**，跳转 = 全页刷新 ⇒
  *   零新脚本，内联脚本闭集保持六元，见 {@link PageParams.orgNav}）。
  */
 export interface PageOrgNav {
@@ -69,8 +70,9 @@ export interface PageOrgNav {
   orgs: readonly string[];
 }
 
-/** NAV 全局路径 → 组织空间路径的映射（`ORG_SPACE_VIEWS`）与 {@link navHrefFor} 已随 v0.9.6 B5a 退役：
- * NAV 收三枚后全站同形，组织空间不再派生 NAV 落点（空间内导航 = `renderSpaceNav` 自己的链接行）。 */
+/** NAV 全局路径 → 组织空间路径的映射（`ORG_SPACE_VIEWS`）与 {@link navHrefFor} 已随 v0.9.6 B5a 退役；
+ * REQ-2026-09-30-04 件1 起「项目 / Agent」两条也撤出导航（页面保留、深链可达）⇒ 一级菜单仅「项目组门户」一枚，
+ * 组织切换的形态由「顶栏文字组」改为**侧栏二级菜单**（{@link renderSideOrgs}，功能语义不变）。 */
 
 /**
  * **提交守卫**（收口轨 14 ①）：页面全部写表单共用的**一段内联脚本**。
@@ -260,7 +262,8 @@ export const SUBMIT_GUARD_SCRIPT = `<script>
  *   直到 fetch 返回（触发一轮可数分钟）界面毫无反应 ⇒ 用户以为没生效而连点。提示行的使命到
  *   响应回来为止：成功档整个动作区被服务端重渲染换新（禁用态与提示行随之离场），此后进度由件B 承载；
  *   失败档（409 等）由 `restoreForm` 复位表单供改后重提。
- * - **件B（真实进度）**：成功换页后若回包动作区仍含 `.turn-progress`（= 本轮仍 `running` / `queued`），
+ * - **件B（真实进度）**：成功换页后若回包 `<main>` 仍含 `.turn-progress`（收口判据 `stillBusy`
+ *   实查**整个 `<main>`**〔页面级，非仅动作区——见下方 `stillBusy`〕，= 本轮仍 `running` / `queued`），
  *   起一条**有界**轮询（{@link POLL_INTERVAL_MS} × {@link POLL_MAX_TICKS}，20 分钟量级 = 与宿主 turn
  *   窗口同量级），每拍 `GET` 本详情 URL（带 `Accept: "text/html"`，与 `open()` 同规格）经 `swapPage`
  *   刷回动作区，用户看到真实「第 N 轮 在飞 / 排队中」。收口判据 = 回包**不再**含在飞 / 排队的
@@ -751,32 +754,33 @@ export const DRAG_SCHEDULE_SCRIPT = `<script>
 })();
 </script>`;
 
-/** 导航单点（三条 = 全局路径单点事实源；v0.9.6 B5a 起全站同形，空间落点不再派生）。 */
+/**
+ * 一级导航单点（REQ-2026-09-30-04 件1 · 件1 口径：全站唯一侧栏的**一级菜单仅一枚**）。
+ * 历史：v0.9.4 §9-b 首页 = 组织门户；v0.9.6 B5a 闭集六 → 三枚（摘排期 / 任务 / 宿主桥）；
+ * 本轮三 → 一枚 —— 「项目」（`/projects`）与「Agent」（`/agents`）**只撤导航、不撤路由**
+ * （深链与正文链接照常可达，口径 33/38 同款处置）。
+ */
 const NAV: ReadonlyArray<{ key: NavKey; href: string; text: string }> = [
-  // v0.9.4 §9-b（首页形态 B→A）：「门户」= 组织门户 `/`（不再是排期看板）。
-  // v0.9.6 B5a（口径 37/38）闭集六 → 三枚：摘「排期」（`/schedule` 页退役）、「任务」（路由留、口径 33 深链可达）、
-  // 「宿主桥」（口径 38：`/host` 路由不退、NAV 摘条）；「项目 / 机器」→「项目」（全局 `/tasks*` 高亮并入本条）。
-  { key: "home", href: "/", text: "门户" },
-  { key: "projects", href: "/projects", text: "项目" },
-  // v0.9.3 B-T3：Agent View（机器表 + 逐项目在飞任务 + 3300 收编的桥身份头）
-  { key: "agents", href: "/agents", text: "Agent" },
+  { key: "home", href: "/", text: "项目组门户" },
 ];
 
 /**
- * **顶栏组织切换器**（BD7 · §9-d 起清单口径与组织门户同源 = 台账未停用 ∪ 需求归属）：
- * 各组织 → `/org/<名>/` 的**服务端渲染链接**（跳转即全页刷新）⇒ **零新脚本**，
- * 不扩内联脚本闭集；清单为空 ⇒ 整块不渲染（无组织可切时不留空占位）。
- * 导出 = B5b 起空间二级导航行也复用本函数（同一实现，不在空间侧复制 HTML）。
- * `extraClass` = 挂位修饰类（空间正文的二级导航行传 `"right"` 靠右；顶栏调用不传 ⇒ 输出与移位前逐字节相同）。
+ * **侧栏二级菜单 = 各项目组**（REQ-2026-09-30-04 件1，替换原「顶栏组织切换器」形态）：
+ * 各组织 → `/org/<名>/`（= 该空间排期）的**服务端渲染链接列表**，当前空间项挂 `class="on"`
+ * （样式给出左侧圆点高亮）⇒ **零新脚本**，内联脚本闭集保持**六元**（N3-⑦/⑧ 纪律锚）。
+ * 清单为空 ⇒ 整块不渲染（无组可切时不留空占位，同原切换器口径）。
+ * 原 {@link renderOrgSwitcher}（顶栏文字组 + 空间正文行右档）随本形态变更删除 ——
+ * 空间正文的二级导航行（`server.ts` 的 `renderSpaceNav`）不再重复挂组清单。
  */
-export function renderOrgSwitcher(orgNav: PageOrgNav, extraClass = ""): string {
+function renderSideOrgs(orgNav: PageOrgNav | undefined): string {
+  if (orgNav === undefined || orgNav.orgs.length === 0) return "";
   const items = orgNav.orgs
     .map(
       (o) =>
         `<a href="/org/${encodeURIComponent(o)}/"${o === orgNav.org ? ' class="on"' : ""}>${escapeHtml(o)}</a>`,
     )
     .join("");
-  return `<span class="org-switch${extraClass === "" ? "" : ` ${extraClass}`}"> <span class="muted">组织</span> ${items}</span>`;
+  return `<div class="side-orgs"><p class="side-orgs-label">项目组</p>${items}</div>`;
 }
 
 export interface PageParams {
@@ -791,17 +795,13 @@ export interface PageParams {
   /** 错误浮层（REQ 弹窗化 · 表单档错误出口专用；全部字段在本函数内 escapeHtml，调用方传原始值） */
   errorOverlay?: ErrorOverlayParams;
   /**
-   * **组织上下文（BD7）**：给出当前组织空间（可空）+ 切换器组织清单。
-   * 切换器 = **纯服务端渲染的链接列表**（各组织 → `/org/<名>/` 整页跳转）⇒
-   * 零新脚本，内联脚本闭集保持**六元**（N3-⑦/⑧ 纪律锚）。
+   * **组织上下文（BD7；REQ-2026-09-30-04 件1 起 = 侧栏二级菜单数据源）**：
+   * 给出当前组织空间（可空）+ 项目组清单。清单 = **纯服务端渲染的链接列表**
+   * （各组织 → `/org/<名>/` 整页跳转）⇒ 零新脚本，内联脚本闭集保持**六元**（N3-⑦/⑧ 纪律锚）。
+   * 件1 起原「组织切换器挂位三态」（`orgSwitcher`）随顶栏形态一并退役：全站只有一处侧栏，
+   * 组清单不再需要在正文里重复挂载。
    */
   orgNav?: PageOrgNav;
-  /**
-   * **组织切换器的挂位三态（v0.9.6 B5b）**：`top`（缺省，顶栏渲）/ `body`（正文的二级导航行已挂，顶栏不重复）/ `none`（整页不渲）。
-   * 判据 = 「本页是否渲 `renderSpaceNav`」，**不得**按「org 非空」隐藏 —— 空间内详情页 / 桥宕页 / 410 页的
-   * 唯一组织出路就在顶栏切换器上。
-   */
-  orgSwitcher?: "top" | "body" | "none";
 }
 
 export interface ErrorOverlayField {
@@ -864,13 +864,7 @@ export function renderPage(params: PageParams): string {
   const nav = NAV.map(
     (n) => `<a href="${n.href}"${n.key === params.active ? ' class="on"' : ""}>${escapeHtml(n.text)}</a>`,
   ).join("");
-  const switcher =
-    params.orgNav === undefined ||
-    params.orgNav.orgs.length === 0 ||
-    params.orgSwitcher === "body" ||
-    params.orgSwitcher === "none"
-      ? ""
-      : renderOrgSwitcher(params.orgNav);
+  const sideOrgs = renderSideOrgs(params.orgNav);
   const notes =
     params.notes && params.notes.length > 0
       ? `<ul class="notes">${params.notes.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>`
@@ -884,19 +878,88 @@ export function renderPage(params: PageParams): string {
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>${escapeHtml(params.title)} · board</title>
 <style>
-  :root { color-scheme: light dark; }
+  /* REQ-2026-09-30-04 §2.0：--b- 设计 token 层（浅色单档，值取自原型稿 v2.3）。
+     本层是「唯一取色/取尺度入口」的预备件：既有规则内的字面量替换属后续节点，本轮只建层。 */
+  :root {
+    color-scheme: light;
+    /* 品牌 */
+    --b-brand: #2f6f9e;
+    --b-brand-ink: #1f4f73;
+    --b-brand-soft: #e8f1f8;
+    --b-brand-line: #b7d2e6;
+    /* 语义（前景 / 底 / 线 三档一组）：ok · warn · danger · locked */
+    --b-ok: #1f7a44;
+    --b-ok-bg: #e7f4ec;
+    --b-ok-line: #a9d8ba;
+    --b-warn: #9a6100;
+    --b-warn-bg: #fbf1e0;
+    --b-warn-line: #e6c489;
+    --b-danger: #b42318;
+    --b-danger-bg: #fbe9e7;
+    --b-danger-line: #e8a29c;
+    --b-locked: #6f4e21;
+    --b-locked-bg: #f3e5d0;
+    --b-locked-line: #a67c52;
+    /* 文本（1 主 · 2 次 · 3 弱 · 4 最弱） */
+    --b-text: #28323c;
+    --b-text-2: #46586a;
+    --b-text-3: #64727d;
+    --b-text-4: #7d8794;
+    /* 面与线 */
+    --b-bg: #f4f6f8;
+    --b-surface: #ffffff;
+    --b-surface-2: #f8fafc;
+    --b-line: #d8dee4;
+    --b-overlay: rgba(15, 23, 32, .45);
+    /* 尺度 · 字号 */
+    --b-fs-11: 11px;
+    --b-fs-12: 12px;
+    --b-fs-13: 13px;
+    --b-fs-14: 14px;
+    --b-fs-15: 15px;
+    --b-fs-18: 18px;
+    /* 尺度 · 间距 */
+    --b-sp-4: 4px;
+    --b-sp-6: 6px;
+    --b-sp-8: 8px;
+    --b-sp-12: 12px;
+    --b-sp-16: 16px;
+    --b-sp-24: 24px;
+    /* 尺度 · 圆角 */
+    --b-r-3: 3px;
+    --b-r-4: 4px;
+    --b-r-6: 6px;
+    --b-r-8: 8px;
+    /* 尺度 · 列宽与投影 */
+    --b-kcol-w: 264px;
+    --b-feat-side: 320px;
+    --b-shadow-1: 0 1px 2px rgba(15, 23, 32, .08);
+    --b-shadow-2: 0 6px 24px rgba(15, 23, 32, .16);
+  }
   * { box-sizing: border-box; }
-  body { margin: 0; padding: 16px 20px 48px; font: 14px/1.55 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; }
+  /* REQ-2026-09-30-04 件1：全站外壳 = grid〔216px 固定侧栏 | 主区〕（原型 v2.3 样张①） */
+  body { margin: 0; display: grid; grid-template-columns: 216px minmax(0, 1fr); min-height: 100vh; font: 14px/1.55 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; color: var(--b-text); background: var(--b-bg); }
   h1 { font-size: 18px; margin: 0 0 6px; }
   h2 { font-size: 15px; margin: 24px 0 8px; border-bottom: 1px solid #8884; padding-bottom: 4px; }
-  nav { display: flex; gap: 12px; margin: 0 0 14px; }
-  nav a { color: #567; text-decoration: none; padding: 2px 8px; border-radius: 4px; }
-  nav a.on { background: #8882; color: inherit; }
-  .org-switch { margin-left: 8px; font-size: 12px; }
-  .org-switch a { color: #567; text-decoration: none; padding: 1px 6px; border-radius: 4px; }
-  .org-switch a.on { background: #5b86a8; color: #fff; }
-  /* v0.9.6 B5b（口径 20）：空间二级导航行的切换器靠行右（只此一处挂 right；顶栏不浮） */
-  .org-switch.right { float: right; }
+  /* ── 件1 外壳：侧栏（品牌 / 一级菜单 / 二级项目组菜单）── */
+  .sidebar { position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto; background: var(--b-surface); border-right: 1px solid var(--b-line); padding: var(--b-sp-16) 0 var(--b-sp-24); }
+  .brand { padding: 0 var(--b-sp-16) var(--b-sp-12); font-size: var(--b-fs-15); font-weight: 700; letter-spacing: .02em; color: var(--b-brand-ink); }
+  nav { display: block; margin: 0 0 var(--b-sp-4); }
+  nav a { display: block; padding: var(--b-sp-6) var(--b-sp-16); font-size: var(--b-fs-13); color: var(--b-text-2); text-decoration: none; border-left: 2px solid transparent; }
+  /* 当前态 = 品牌浅底 + 左侧 2px 色条 */
+  nav a.on { background: var(--b-brand-soft); border-left-color: var(--b-brand); color: var(--b-brand-ink); font-weight: 600; }
+  .side-orgs { margin-top: var(--b-sp-12); }
+  .side-orgs-label { margin: 0 var(--b-sp-16) var(--b-sp-4); font-size: var(--b-fs-11); color: var(--b-text-4); }
+  .side-orgs a { display: block; padding: var(--b-sp-4) var(--b-sp-16) var(--b-sp-4) var(--b-sp-24); font-size: var(--b-fs-13); color: var(--b-text-2); text-decoration: none; }
+  /* 当前空间 = 缩进项高亮圆点 */
+  .side-orgs a.on { color: var(--b-brand-ink); font-weight: 600; }
+  .side-orgs a.on::before { content: "●"; font-size: 8px; color: var(--b-brand); margin-right: var(--b-sp-6); vertical-align: 2px; }
+  /* ── 件1 外壳：主区（页标题栏 + 内容画布）── */
+  .main-col { min-width: 0; padding: var(--b-sp-16) var(--b-sp-24) 0; }
+  .page-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--b-sp-12); margin: 0 0 var(--b-sp-12); }
+  .page-head h1 { margin: 0; }
+  .page-actions { display: flex; gap: var(--b-sp-8); }
+  main { padding-bottom: var(--b-sp-24); }
   .hint { color: #777; margin: 6px 0; }
   .hint.err { color: #b42318; }
   .hint.warn { color: #b26a00; }
@@ -978,11 +1041,33 @@ export function renderPage(params: PageParams): string {
   .err-ov-card button { margin-top: 10px; }
   .kanban { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; padding-bottom: 6px; }
   .kcol { flex: 0 0 260px; border: 1px solid #8884; border-radius: 6px; background: #8881; padding: 6px 8px 8px; }
-  .kcol > h3 { font-size: 13px; margin: 2px 0 8px; border-bottom: 1px solid #8884; padding-bottom: 4px; position: relative; padding-right: 22px; }
+  /* 件3（REQ-2026-09-30-04）：卡两层化（标题行 ≤2 行截断 + 一行元信息）
+     增补五 件A（REQ-2026-10-02-05）：卡内固定四行序（名称 → id 行 → 状态徽标 → 阶段+任务数）
+     —— 行为类 .kcard / .kcard[draggable="true"] / .kcol / .kcol.dragover 逐字未改（拖拽双条件闸契约） */
+  .kcol > h3 { font-size: 13px; margin: 2px 0 8px; border-bottom: 1px solid #8884; padding: 2px 22px 4px 2px; position: sticky; top: 0; z-index: 1; background: var(--b-surface); border-radius: 4px; }
+  /* 件3 列头 sticky 的滚动面：.kanban 的 overflow-x:auto 使它成为滚动祖先，而它纵向永不滚 ⇒ 列内 sticky 悬不住。
+     故把纵向滚动收到列上（max-height + overflow-y），列头随列内滚动常驻。
+     选择器锁 #schedule-board ⇒ 组织门户（#org-portal）版式零影响。 */
+  #schedule-board > .kcol { max-height: calc(100vh - 120px); overflow-y: auto; padding-top: 0; }
+  #schedule-board > .kcol > h3 { margin-top: 0; padding-top: 6px; }
   .kcard { border: 1px solid #8884; border-radius: 6px; background: Canvas; padding: 6px 8px; margin: 0 0 6px; font-size: 12px; }
+  .kcard > .khd { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; }
+  .kcard > .khd > a { overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; word-break: break-word; }
+  /* 增补五 件A：状态徽标搬出 .khd 独立成行 ⇒ 行内容右靠（.kbadge 的全局 float: right 在 flex 容器内不生效，无需改基元） */
+  .kcard > .kbadge-line { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 2px 6px; margin: 4px 0 0; }
   .kcard[draggable="true"] { cursor: grab; }
-  .kcard.draglocked { opacity: .55; }
+  /* 增补五 件B（REQ-2026-10-02-05）：按状态着色 —— 卡根档类 kst-档（六档闭集，
+     规则源 derive.ts 的 deriveCardColorTier）= 左缘 3px 色条 + soft 底色；
+     取色一律引既有 --b- token，零新色值。locked 档为显式锁定语义预留；
+     「已发版」（completed ∧ stage=发版）的派生显示归 ok。 */
+  .kcard.draglocked { opacity: .75; } /* 件B：.55 → .75 —— 状态色条优先，避免双层压暗致色条不可见 */
   .kcard .draglock { color: #b26a00; border-color: #b26a0088; }
+  .kcard.kst-brand { border-left: 3px solid var(--b-brand); background: var(--b-brand-soft); }
+  .kcard.kst-warn { border-left: 3px solid var(--b-warn); background: var(--b-warn-bg); }
+  .kcard.kst-ok { border-left: 3px solid var(--b-ok); background: var(--b-ok-bg); }
+  .kcard.kst-locked { border-left: 3px solid var(--b-locked); background: var(--b-locked-bg); }
+  .kcard.kst-danger { border-left: 3px solid var(--b-danger); background: var(--b-danger-bg); }
+  .kcard.kst-neutral { border-left: 3px solid var(--b-line); background: var(--b-surface-2); }
   .kcol.dragover { outline: 2px dashed #5b86a8; outline-offset: -2px; }
   .err-ov-card.drag-err-overlay { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; width: min(560px, 92vw); z-index: 70; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }
   /* 增补二 §9.1-②：data-ov 写表单 fetch 报错的浮层卡（与拖拽错误卡同款版式，不跳页） */
@@ -1006,17 +1091,96 @@ export function renderPage(params: PageParams): string {
   dialog.fd > button { margin: 0 0 8px; }
   dialog.fd .fd-body > h2:first-child { margin-top: 0; }
   dialog.fd > .err-ov-card { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; z-index: 60; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }
-  .header-actions { float: right; margin-top: 2px; }
+  /* 件1：页头动作钮改由 .page-head 的 flex 归位到标题右侧（原 float: right 随顶栏形态退役） */
+  /* ── 件5（REQ-2026-09-30-04）：页面卡片基元（空间·任务页 / 空间·管理页）──
+     取色与取尺度一律走 --b- token；与看板 .kcard 分立（看板卡有拖拽语义，不互用）。 */
+  .b-card { border: 1px solid var(--b-line); border-radius: var(--b-r-8); background: var(--b-surface); box-shadow: var(--b-shadow-1); padding: var(--b-sp-12) var(--b-sp-16) var(--b-sp-16); margin: 0 0 var(--b-sp-16); }
+  .b-card > .b-card-h { display: flex; align-items: baseline; justify-content: space-between; gap: var(--b-sp-8); margin: 0 0 var(--b-sp-12); padding-bottom: var(--b-sp-6); border-bottom: 1px solid var(--b-line); font-size: var(--b-fs-14); font-weight: 600; color: var(--b-brand-ink); }
+  .b-card-h > .b-card-meta { font-weight: 400; font-size: var(--b-fs-12); color: var(--b-text-4); }
+  .b-card > :last-child { margin-bottom: 0; }
+  .b-card th { background: var(--b-surface-2); }
+  .b-card th, .b-card td { border-color: var(--b-line); }
+  /* 过滤卡：GET 查询表单不加任何属性（写/读面表单锚逐字保留），靠后代选择器排版 */
+  .b-filter form { flex-wrap: wrap; align-items: flex-end; margin: 0; }
+  .b-filter form label { display: flex; flex-direction: column; gap: 2px; font-size: var(--b-fs-12); color: var(--b-text-3); }
+  .b-filter form input, .b-filter form select { min-width: 150px; }
+  /* 快捷项目 chips（当前项 = 品牌浅底） */
+  .b-chips { display: flex; flex-wrap: wrap; gap: var(--b-sp-6); align-items: center; margin: var(--b-sp-8) 0 0; }
+  .b-chips-label { font-size: var(--b-fs-11); color: var(--b-text-4); margin-right: var(--b-sp-4); }
+  .b-chips a { display: inline-block; padding: 2px 10px; border: 1px solid var(--b-line); border-radius: 999px; background: var(--b-surface-2); color: var(--b-text-2); font-size: var(--b-fs-12); text-decoration: none; }
+  .b-chips a:hover { border-color: var(--b-brand-line); color: var(--b-brand-ink); }
+  .b-chips a.on { border-color: var(--b-brand-line); background: var(--b-brand-soft); color: var(--b-brand-ink); font-weight: 600; }
+  /* 并列表单（加 / 减成员双卡）；嵌套在卡内的子卡换浅面，避免与外卡同色失边 */
+  .b-forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--b-sp-12); align-items: start; }
+  .b-forms > .b-card { margin: 0; }
+  .b-card .b-card { background: var(--b-surface-2); }
+  /* 卡内警示条（缺文件 / 末位成员 409 口径 / 齐备态一行） */
+  .b-note { border: 1px solid var(--b-warn-line); border-left: 3px solid var(--b-warn); background: var(--b-warn-bg); color: var(--b-warn); border-radius: var(--b-r-6); padding: var(--b-sp-6) var(--b-sp-12); margin: var(--b-sp-8) 0; font-size: var(--b-fs-12); }
+  .b-note.danger { border-color: var(--b-danger-line); border-left-color: var(--b-danger); background: var(--b-danger-bg); color: var(--b-danger); }
+  .b-note.ok { border-color: var(--b-ok-line); border-left-color: var(--b-ok); background: var(--b-ok-bg); color: var(--b-ok); }
+  /* 状态徽标（任务态 / 核对态） */
+  .b-badge { display: inline-block; padding: 0 var(--b-sp-6); border: 1px solid var(--b-line); border-radius: var(--b-r-3); background: var(--b-surface-2); color: var(--b-text-2); font-size: var(--b-fs-11); white-space: nowrap; }
+  .b-badge.run { border-color: var(--b-brand-line); background: var(--b-brand-soft); color: var(--b-brand-ink); }
+  .b-badge.ok { border-color: var(--b-ok-line); background: var(--b-ok-bg); color: var(--b-ok); }
+  .b-badge.warn { border-color: var(--b-warn-line); background: var(--b-warn-bg); color: var(--b-warn); }
+  .b-badge.danger { border-color: var(--b-danger-line); background: var(--b-danger-bg); color: var(--b-danger); }
+  .b-badge.mute { color: var(--b-text-4); }
+  /* ── 件2（REQ-2026-09-30-04）：空间 tab 行 / 阶段步条 / 需求详情主·侧两栏 ──
+     取色与取尺度一律走 --b- token；**零新脚本**（tab 高亮 = 服务端渲染的 class，折叠仍是原生 details）。 */
+  /* 空间 tab 行（当前 tab = 品牌浅底 + 下沿 2px；详情页携带本行时无激活态 ⇒ 三枚皆为普通链接） */
+  .b-tabs { margin: 0 0 var(--b-sp-12); padding: 0 var(--b-sp-4) var(--b-sp-4); border-bottom: 1px solid var(--b-line); }
+  .b-tabs > .hint { margin: 0; }
+  .b-tabs a.fl { display: inline-block; margin: 0 var(--b-sp-4); padding: var(--b-sp-4) var(--b-sp-12); border-radius: var(--b-r-4) var(--b-r-4) 0 0; border-bottom: 2px solid transparent; color: var(--b-text-2); text-decoration: none; }
+  .b-tabs a.fl:hover { color: var(--b-brand-ink); background: var(--b-surface-2); }
+  .b-tabs a.fl.on { background: var(--b-brand-soft); border-bottom-color: var(--b-brand); color: var(--b-brand-ink); }
+  /* 阶段步条：五段圆点 + 连线（完成段打勾、当前段实底），替代元数据表的阶段双行 */
+  .b-steps { display: flex; flex-wrap: wrap; align-items: center; gap: var(--b-sp-4); margin: 0 0 var(--b-sp-16); padding: var(--b-sp-8) var(--b-sp-12); border: 1px solid var(--b-line); border-radius: var(--b-r-8); background: var(--b-surface); box-shadow: var(--b-shadow-1); font-size: var(--b-fs-12); }
+  .b-step { display: inline-flex; align-items: center; gap: var(--b-sp-4); color: var(--b-text-3); white-space: nowrap; }
+  .b-step-dot { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border: 1px solid var(--b-line); border-radius: 50%; background: var(--b-surface-2); color: var(--b-ok); font-size: var(--b-fs-11); font-style: normal; }
+  .b-step-name { font-weight: 400; }
+  .b-step.done .b-step-dot { border-color: var(--b-ok-line); background: var(--b-ok-bg); }
+  .b-step.done .b-step-name { color: var(--b-text-2); }
+  .b-step.cur .b-step-dot { border-color: var(--b-brand); background: var(--b-brand); }
+  .b-step.cur .b-step-name { color: var(--b-brand-ink); font-weight: 600; }
+  .b-step-line { display: inline-block; width: 18px; height: 1px; background: var(--b-line); }
+  .b-step-line.done { background: var(--b-brand-line); }
+  .b-steps-cur { margin-left: auto; color: var(--b-text-3); }
+  /* 两栏：主栏自适应 + 侧栏定宽；窄窗（含浮层 dialog 收窄时）回落单列 */
+  .feat-cols { display: grid; grid-template-columns: minmax(0, 1fr) var(--b-feat-side); gap: var(--b-sp-16); align-items: start; }
+  .feat-main, .feat-side { min-width: 0; }
+  .feat-side { position: sticky; top: var(--b-sp-16); }
+  @media (max-width: 900px) {
+    .feat-cols { grid-template-columns: minmax(0, 1fr); }
+    .feat-side { position: static; }
+  }
+  /* 各块自带原生 <h2> ⇒ 卡头就是它（不叠第二层标题，标题文案与 class 一律不动） */
+  .feat-card > h2:first-child { margin: 0 0 var(--b-sp-12); padding-bottom: var(--b-sp-6); border-bottom: 1px solid var(--b-line); border-radius: 0; font-size: var(--b-fs-14); color: var(--b-brand-ink); }
+  /* 引导卡 = 品牌浅底（引导行文案与 class 不变，只换承载面） */
+  .feat-guide { background: var(--b-brand-soft); border-color: var(--b-brand-line); }
+  .feat-guide > .nextstep { margin: 0; border-left-color: var(--b-brand); background: transparent; }
+  /* 侧栏元数据卡：compact 两列（名 / 值），替代原 4×2 大表 */
+  .b-meta { display: grid; gap: var(--b-sp-4); margin: 0; font-size: var(--b-fs-12); }
+  .b-meta-row { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: var(--b-sp-8); }
+  .b-meta-row dt { color: var(--b-text-3); }
+  .b-meta-row dd { margin: 0; font-family: ui-monospace, Consolas, monospace; word-break: break-word; }
+  /* 侧栏定宽里的表与 mermaid 图：横向滚动由既有 .dep-graph 口径承担，表不撑破卡 */
+  .feat-side table { font-size: var(--b-fs-11); }
 </style>
 </head>
 <body>
-<header>
-  <h1>${escapeHtml(params.title)}</h1>${params.headerActions ?? ""}
-  <nav>${nav}${switcher}</header>
+<aside class="sidebar">
+<div class="brand">board</div>
+<nav>${nav}</nav>
+${sideOrgs}</aside>
+<div class="main-col">
+<header class="page-head">
+<h1>${escapeHtml(params.title)}</h1><div class="page-actions">${params.headerActions ?? ""}</div>
+</header>
 <main>
 ${params.bodyHtml}
 ${notes}
 </main>
+</div>
 ${overlay}
 ${SUBMIT_GUARD_SCRIPT}
 </body>
