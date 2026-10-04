@@ -101,7 +101,7 @@ test("BD1-①（正向）：建组织 201 —— 台账落 .data/orgs.json（dis
     assert.equal(res.status, 201);
     const json = await res.json();
     assert.deepEqual(json, { ok: true, org: "新组织", ledgerFile: env.ledgerFile });
-    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "新组织", disabledAt: null }]);
+    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "新组织", disabledAt: null, agentKind: null, agentModel: null }]);
   });
 });
 
@@ -111,7 +111,7 @@ test("BD1-①b（正向）：表单档成功 = 303 回 /orgs（PRG，刷新不�
     assert.equal(res.status, 303);
     assert.equal(res.headers.get("location"), "/orgs");
     assert.equal(res.headers.get("cache-control"), "no-store");
-    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "flow-team", disabledAt: null }]);
+    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "flow-team", disabledAt: null, agentKind: null, agentModel: null }]);
   });
 });
 
@@ -137,7 +137,7 @@ test("BD1-①d（幂等 · §9-a）：停用后同名重建 = 复活 ⇒ 目录�
     const revive = await postOrg(base, "复活组", WRITE_HEADERS);
     assert.equal(revive.status, 201);
     assert.equal(readFileSync(join(dir, "keep.txt"), "utf8"), "目录里的既有产出", "幂等：既不清空也不覆盖既有目录");
-    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "复活组", disabledAt: null }]);
+    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "复活组", disabledAt: null, agentKind: null, agentModel: null }]);
   });
 });
 
@@ -149,7 +149,7 @@ test("BD1-①e（负向 · §9-a）：目录位被文件占用 ⇒ 503 board_org
     assert.equal(json.code, "board_org_dir_create_failed");
     assert.match(json.error, /已写入板台账，但组织目录建不出来/);
     assert.match(json.error, /同名重建/);
-    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "占位文件", disabledAt: null }], "台账与目录两面各自如实，不假装一致");
+    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "占位文件", disabledAt: null, agentKind: null, agentModel: null }], "台账与目录两面各自如实，不假装一致");
   });
 });
 
@@ -291,5 +291,113 @@ test("BD1-⑦（方法门锚）：PUT /orgs ⇒ 405 且文案列全写路径（B
     for (const p of ["POST /requirements", "POST /features/{id}/turn", "POST /host/{org}/stop", "POST /features/{id}/confirm", "POST /features/{id}/answer", "POST /features/{id}/schedule"]) {
       assert.ok(text.includes(p), `405 文案须含 ${p}`);
     }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.8 按项目组配 agent：POST /orgs 的 action=setHostAgent 分支（T1）
+// ---------------------------------------------------------------------------
+
+function postHostAgent(base, org, fields, headers = WRITE_HEADERS) {
+  return fetch(`${base}/orgs`, {
+    method: "POST",
+    redirect: "manual",
+    headers: { "content-type": "application/x-www-form-urlencoded", ...headers },
+    body: new URLSearchParams({ org, action: "setHostAgent", ...fields }).toString(),
+  });
+}
+
+test("HA-①（正向 · JSON 档）：建组织后写两键 ⇒ 200 回显 + 台账落 agentKind/agentModel；成功 303 档回 manage 页", async () => {
+  await withOrgServer({}, async (base, env) => {
+    assert.equal((await postOrg(base, "配置组", WRITE_HEADERS)).status, 201);
+    const res = await postHostAgent(base, "配置组", { agentKind: "qoder", agentModel: "m-1" });
+    assert.equal(res.status, 200);
+    const json = await res.json();
+    assert.deepEqual(json, { ok: true, org: "配置组", agentKind: "qoder", agentModel: "m-1", ledgerFile: env.ledgerFile });
+    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "配置组", disabledAt: null, agentKind: "qoder", agentModel: "m-1" }]);
+  });
+  await withOrgServer({}, async (base, env) => {
+    assert.equal((await postOrg(base, "配置组2", { origin: base })).status, 303);
+    const form = await postHostAgent(base, "配置组2", { agentKind: "opencode", agentModel: "" }, { origin: base });
+    assert.equal(form.status, 303, "表单档成功 = 303 PRG（刷新不重复写）");
+    assert.equal(form.headers.get("location"), "/org/" + encodeURIComponent("配置组2") + "/manage", "303 回本组织 manage 页");
+    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "配置组2", disabledAt: null, agentKind: "opencode", agentModel: null }]);
+  });
+});
+
+test("HA-②（留空提交）：整体覆盖语义 —— 两键留空 ⇒ 置 null 恢复全局回落（不做增量 PATCH）", async () => {
+  await withOrgServer({}, async (base, env) => {
+    assert.equal((await postOrg(base, "覆盖组", WRITE_HEADERS)).status, 201);
+    assert.equal((await postHostAgent(base, "覆盖组", { agentKind: "qoder", agentModel: "m-1" })).status, 200);
+    const clear = await postHostAgent(base, "覆盖组", { agentKind: "", agentModel: "" });
+    assert.equal(clear.status, 200);
+    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "覆盖组", disabledAt: null, agentKind: null, agentModel: null }]);
+  });
+});
+
+test("HA-③（分流位序）：setHostAgent 在 orgsDir 根闸与三源重名闸之前 return —— 根未配置 / 台账有盘无 都照常 200（漏分流转而会 503/409/走建组织）", async () => {
+  await withOrgServer({ createRoot: false }, async (base, env) => {
+    // 根不存在：建组织会 503（BD1-①f），但 setHostAgent 不碰目录 ⇒ 台账在即可写
+    mkdirSync(join(env.dir, "data"), { recursive: true });
+    writeFileSync(env.ledgerFile, JSON.stringify({ version: 2, orgs: [{ org: "无根组", disabledAt: null, agentKind: null, agentModel: null }] }, null, 2) + "\n", "utf8");
+    const res = await postHostAgent(base, "无根组", { agentKind: "qoder", agentModel: "m" });
+    assert.equal(res.status, 200, "根闸不得挡配置写");
+    assert.match(readFileSync(env.ledgerFile, "utf8"), /"agentKind": "qoder"/);
+  });
+  await withOrgServer({}, async (base, env) => {
+    // 台账有、盘无目录：create 会被三源重名闸（台账源）409，setHostAgent 分支须先于该闸
+    mkdirSync(join(env.dir, "data"), { recursive: true });
+    writeFileSync(env.ledgerFile, JSON.stringify({ version: 2, orgs: [{ org: "仅台账组", disabledAt: null, agentKind: null, agentModel: null }] }, null, 2) + "\n", "utf8");
+    const byCreate = await postOrg(base, "仅台账组", WRITE_HEADERS);
+    assert.equal(byCreate.status, 409, "对照：同名录走 create 命中台账源被拒");
+    const res = await postHostAgent(base, "仅台账组", { agentKind: "claude", agentModel: "x" });
+    assert.equal(res.status, 200, "重名闸不得挡配置写");
+    assert.match(readFileSync(env.ledgerFile, "utf8"), /"agentModel": "x"/);
+  });
+});
+
+test("HA-④（负向）：组织不在台账 ⇒ 404 board_org_host_agent_not_found，零写入", async () => {
+  await withOrgServer({}, async (base, env) => {
+    const res = await postHostAgent(base, "从未建过", { agentKind: "qoder", agentModel: "m" });
+    assert.equal(res.status, 404);
+    const json = await res.json();
+    assert.equal(json.code, "board_org_host_agent_not_found");
+    assert.equal(existsSync(env.ledgerFile), false, "404 分支不得创建台账");
+  });
+});
+
+test("HA-⑤（负向）：已停用组织 ⇒ 409 board_org_disabled，配置不动", async () => {
+  await withOrgServer({}, async (base, env) => {
+    assert.equal((await postOrg(base, "停用配组", WRITE_HEADERS)).status, 201);
+    assert.equal((await postHostAgent(base, "停用配组", { agentKind: "qoder", agentModel: "m-9" })).status, 200);
+    assert.equal((await postOrgAction(base, "停用配组", "disable")).status, 200);
+    const res = await postHostAgent(base, "停用配组", { agentKind: "opencode", agentModel: "zz" });
+    assert.equal(res.status, 409);
+    assert.equal((await res.json()).code, "board_org_disabled");
+    assert.match(readFileSync(env.ledgerFile, "utf8"), /"agentKind": "qoder"/, "停用后配置原样保留（复活时沿用，用户裁①）");
+    assert.doesNotMatch(readFileSync(env.ledgerFile, "utf8"), /zz/);
+  });
+});
+
+test("HA-⑥（负向）：单字段超 8 KiB ⇒ 400 board_org_host_agent_invalid（刻意非 413），台账不动", async () => {
+  await withOrgServer({}, async (base, env) => {
+    assert.equal((await postOrg(base, "超限组", WRITE_HEADERS)).status, 201);
+    const res = await postHostAgent(base, "超限组", { agentKind: "k".repeat(8193), agentModel: "m" });
+    assert.equal(res.status, 400);
+    assert.equal((await res.json()).code, "board_org_host_agent_invalid");
+    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "超限组", disabledAt: null, agentKind: null, agentModel: null }]);
+  });
+});
+
+test("HA-⑦（CSRF 前置）：跨站 Origin ⇒ 403 先于表单解析与台账写", async () => {
+  await withOrgServer({}, async (base, env) => {
+    const res = await fetch(`${base}/orgs`, {
+      method: "POST",
+      redirect: "manual",
+      headers: { "content-type": "application/x-www-form-urlencoded", origin: "http://evil.example:80" },
+      body: new URLSearchParams({ org: "任何组", action: "setHostAgent", agentKind: "qoder" }).toString(),
+    });
+    assert.equal(res.status, 403);
+    assert.equal(existsSync(env.ledgerFile), false, "被 CSRF 拒的请求不得触达台账");
   });
 });

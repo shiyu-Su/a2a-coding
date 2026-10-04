@@ -408,7 +408,7 @@ test("BD10-②c：defaultOrg = null 但桥侧给了 ownerGroup ⇒ 照常触发�
 
 test("BD10-②d configView：组织名未配置如实报 null（状态页显示「未配置」，不伪装成兜底组名）", () => {
   const { face: h } = face({ turns: fakeTurns(), defaultOrg: null });
-  assert.deepEqual(h.configView(), { orgsDir: "C:/tmp/orgs", defaultOrg: null, kind: "claude" });
+  assert.deepEqual(h.configView(), { orgsDir: "C:/tmp/orgs", defaultOrg: null, kind: "claude", hostModel: null });
 });
 
 test("BD9-④c 续推时桥已断 ⇒ 如实 bridge_down（宿主桥已断一族），不吞不假成功", async () => {

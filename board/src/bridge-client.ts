@@ -28,6 +28,12 @@ export interface BridgeClient {
   getFeature(featureId: string): Promise<FeatureDetailView>;
   getFeatureTrace(featureId: string): Promise<FeatureTraceView>;
   getProjects(): Promise<ProjectsView>;
+  /**
+   * `GET /api/registry/projects`（v0.9.8 N1 新只读面）：以 **runners 表为遍历源**的项目清单 ——
+   * 离线机及其项目照常列出（机级 `runnerState=offline`），无组布尔（C-2）。
+   * **缺 `machines[]` ⇒ 抛 `response_invalid`（fail-closed，绝不降级成空池）**。
+   */
+  getRegistryProjects(): Promise<RegistryProjectsView>;
   getTasks(projectId: string, options?: GetTasksOptions): Promise<ProjectTasksView>;
   /**
    * **单任务 state 只读探针**（v0.9.5 C8 · T8）：`GET /api/tasks/:taskId`（与宿主 `watch-task.mjs`
@@ -198,6 +204,39 @@ export interface ProjectsView {
   observedAt: string | null;
   machines: ProjectMachineEntry[];
   runners: RunnerEntry[];
+}
+
+/**
+ * `GET /api/registry/projects`（v0.9.8 N2）归一视图 —— 与 {@link ProjectsView} **是两个独立读路**
+ * （C-6：本面直连 orch `listRunners` / `listRunnerProjects`，与 `/api/projects` 不交叉复用）。
+ *
+ * 契约要点（C-1…C-5，边界 3 轮收敛产物，实现期不得越界）：
+ * - 遍历源 = runners 表：在线机、**离线机含其项目**、注册过但零项目（`projects: []`）均出现；
+ * - 出参**无任何组布尔**（declared / inGroup / group / groups / ownerGroupName），本面也不消费；
+ * - 机级无 `error` 字段（离线机不发 error 文案，靠 `runnerState="offline"` + `lastHeartbeatAt`）；
+ * - 项目级字段与 {@link ProjectEntry} 逐字兼容（C-5）＋ `lastReportedAt`（C-4），**无 `runnerId`**。
+ */
+export interface RegistryProjectEntry extends ProjectEntry {
+  /** 项目最后一次上报时刻（`runnerProjectsReplace` 写入）；缺键 ⇒ null。 */
+  lastReportedAt: string | null;
+}
+
+export interface RegistryMachineEntry {
+  machineId: string;
+  /** 值域 = `online` / `offline`（值域归桥，板不自造中文词、不做实时探测）。 */
+  runnerState: string | null;
+  lastHeartbeatAt: string | null;
+  firstRegisteredAt: string | null;
+  projects: RegistryProjectEntry[];
+}
+
+export interface RegistryProjectsView {
+  source: string | null;
+  note: string | null;
+  observedAt: string | null;
+  machines: RegistryMachineEntry[];
+  /** 桥侧自报计数（缺键 / 非数字 ⇒ null，不作校验、不参与差集）。 */
+  counts: { machines: number | null; projects: number | null };
 }
 
 /** `GET /api/tasks?project=…` 归一视图（`project` 为桥侧必填参数） */
@@ -518,6 +557,51 @@ export function parseProjects(json: unknown): ProjectsView {
   };
 }
 
+/**
+ * `GET /api/registry/projects` → 注册表项目视图（纯函数）。
+ *
+ * **独立解析，不委派 `parseProjects`**（C-6 两条读路不交叉复用）：字段白名单按本面契约，
+ * 多余字段容忍不消费。与 `parseProjects` 的关键差别在**缺 `machines[]` 时抛错**（fail-closed）——
+ * 老面把缺字段归一为空数组，本面若照做会把「桥面异常」显示成「一个项目都没有」的项目池恒空。
+ */
+export function parseRegistryProjects(json: unknown): RegistryProjectsView {
+  const body = expectOk(json, "registry projects 快照");
+  if (!Array.isArray(body.machines)) {
+    throw new BridgeResponseError("registry projects 快照：machines[] 缺失或非数组（拒绝降级为空池）");
+  }
+  const machines: RegistryMachineEntry[] = body.machines.map((entry) => {
+    const m = isRecord(entry) ? entry : {};
+    const rawProjects = Array.isArray(m.projects) ? m.projects : [];
+    const projects: RegistryProjectEntry[] = rawProjects.map((pe) => {
+      const p = isRecord(pe) ? pe : {};
+      return {
+        projectId: reqStr(p.projectId, "registryProject.projectId"),
+        agentKind: str(p.agentKind),
+        a2aPort: num(p.a2aPort),
+        status: str(p.status),
+        endpoint: str(p.endpoint),
+        startedAt: str(p.startedAt),
+        lastReportedAt: str(p.lastReportedAt),
+      };
+    });
+    return {
+      machineId: reqStr(m.machineId, "registryMachine.machineId"),
+      runnerState: str(m.runnerState),
+      lastHeartbeatAt: str(m.lastHeartbeatAt),
+      firstRegisteredAt: str(m.firstRegisteredAt),
+      projects,
+    };
+  });
+  const counts = isRecord(body.counts) ? body.counts : {};
+  return {
+    source: str(body.source),
+    note: str(body.note),
+    observedAt: str(body.observedAt),
+    machines,
+    counts: { machines: num(counts.machines), projects: num(counts.projects) },
+  };
+}
+
 /** `GET /api/tasks?project=…` → 单项目任务列表（纯函数；`project` 必填由调用方保证）。 */
 export function parseTasks(json: unknown): ProjectTasksView {
   const body = expectOk(json, "tasks 列表");
@@ -608,6 +692,9 @@ export function createBridgeClient(options: BridgeClientOptions = {}): BridgeCli
     },
     async getProjects(): Promise<ProjectsView> {
       return parseProjects(await getJson(opts, "/api/projects"));
+    },
+    async getRegistryProjects(): Promise<RegistryProjectsView> {
+      return parseRegistryProjects(await getJson(opts, "/api/registry/projects"));
     },
     async getTasks(projectId: string, options: GetTasksOptions = {}): Promise<ProjectTasksView> {
       const qs = new URLSearchParams({ project: projectId });

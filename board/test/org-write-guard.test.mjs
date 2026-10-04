@@ -9,10 +9,14 @@ import {
   validateOrgName,
   findOrgNameConflict,
   parseOrgForm,
+  parseOrgHostAgentForm,
   ORG_NAME_INVALID_CODE,
   ORG_EXISTS_CODE,
   ORG_ACTION_INVALID_CODE,
+  ORG_ACTION_SET_HOST_AGENT,
+  ORG_HOST_AGENT_INVALID_CODE,
   MAX_REQUIREMENT_BODY_BYTES,
+  MAX_TURN_SUPPLEMENT_BYTES,
 } from "../dist/write-guard.js";
 
 // ---------------------------------------------------------------------------
@@ -116,10 +120,14 @@ test("A2-parseOrgForm：合法 org 经 URL 解码 + trim；缺键 = 空串 ⇒ 4
   assert.deepEqual(trimmed, { ok: true, name: "flow-team", action: "create" });
   assert.deepEqual(parseOrgForm("org=ok&action=disable"), { ok: true, name: "ok", action: "disable" });
   assert.deepEqual(parseOrgForm("org=ok&action=create"), { ok: true, name: "ok", action: "create" });
+  // v0.9.8 按项目组配 agent：action 闭集扩第三值（同一路由分流，白名单不扩条）
+  assert.equal(ORG_ACTION_SET_HOST_AGENT, "setHostAgent");
+  assert.deepEqual(parseOrgForm("org=ok&action=setHostAgent"), { ok: true, name: "ok", action: "setHostAgent" });
   const badAction = parseOrgForm("org=ok&action=delete");
   assert.equal(badAction.ok, false, "动作不在闭集 ⇒ 拒（不猜动作）");
   assert.equal(badAction.status, 400);
   assert.equal(badAction.code, ORG_ACTION_INVALID_CODE);
+  assert.match(badAction.error, /setHostAgent/, "闭集文案随值域同步（三值全列，不误导成二值）");
 
   const missing = parseOrgForm("title=x");
   assert.equal(missing.ok, false);
@@ -137,4 +145,32 @@ test("A2-parseOrgForm：合法 org 经 URL 解码 + trim；缺键 = 空串 ⇒ 4
   assert.equal(big.code, "payload_too_large");
   const byHeader = parseOrgForm("org=ok", MAX_REQUIREMENT_BODY_BYTES + 1);
   assert.equal(byHeader.status, 413, "content-length 超限同样拒（口径同 parseRequirementForm）");
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.8 按项目组配 agent：parseOrgHostAgentForm（action=setHostAgent 的字段解析，纯函数）
+// ---------------------------------------------------------------------------
+
+test("v0.9.8-parseOrgHostAgentForm 正例：两键 trim 后原样；缺键 / 空串 / 纯空白 ⇒ null（留空 = 恢复全局默认）", () => {
+  assert.deepEqual(parseOrgHostAgentForm("agentKind=+qoder+&agentModel=+m1+"), { ok: true, agentKind: "qoder", agentModel: "m1" });
+  assert.deepEqual(parseOrgHostAgentForm("agentKind=qoder"), { ok: true, agentKind: "qoder", agentModel: null }, "缺 model 键 = null");
+  assert.deepEqual(parseOrgHostAgentForm("agentKind=&agentModel=++"), { ok: true, agentKind: null, agentModel: null }, "空串 / 纯空白 ⇒ null");
+  assert.deepEqual(parseOrgHostAgentForm(""), { ok: true, agentKind: null, agentModel: null }, "空表单 = 两键全置回全局");
+});
+
+test("v0.9.8-parseOrgHostAgentForm 负例：单字段超 8 KiB ⇒ 400 board_org_host_agent_invalid（刻意非 413）；body 超 256 KiB / content-length 超限 ⇒ 413（口径同其余写表单）", () => {
+  assert.equal(MAX_TURN_SUPPLEMENT_BYTES, 8192);
+  const tooLong = "agentKind=" + "x".repeat(MAX_TURN_SUPPLEMENT_BYTES + 1) + "&agentModel=m1";
+  const r = parseOrgHostAgentForm(tooLong);
+  assert.equal(r.ok, false);
+  assert.equal(r.status, 400, "字段级超限 400 非 413（与 parseTurnForm 同口径）");
+  assert.equal(r.code, ORG_HOST_AGENT_INVALID_CODE);
+  const modelTooLong = parseOrgHostAgentForm("agentModel=" + "y".repeat(MAX_TURN_SUPPLEMENT_BYTES + 1));
+  assert.equal(modelTooLong.status, 400);
+  assert.equal(modelTooLong.code, ORG_HOST_AGENT_INVALID_CODE);
+  const boundary = parseOrgHostAgentForm("agentKind=" + "x".repeat(MAX_TURN_SUPPLEMENT_BYTES));
+  assert.equal(boundary.ok, true, "恰好 8 KiB = 界内（上限按 utf8 字节 ≥ 判定）");
+  const bigBody = "agentKind=" + "z".repeat(MAX_REQUIREMENT_BODY_BYTES + 1);
+  assert.equal(parseOrgHostAgentForm(bigBody).status, 413, "整体 body 超 256 KiB 先按 413");
+  assert.equal(parseOrgHostAgentForm("agentKind=ok", MAX_REQUIREMENT_BODY_BYTES + 1).status, 413);
 });

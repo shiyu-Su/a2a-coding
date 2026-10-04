@@ -7,7 +7,9 @@
  * - **路由形状**：path / method / 状态码 / 出参形状（含 404 / 405 / 400）；
  * - **字段白名单**：`/api/projects` 剔除 `workspace`（绝对路径）与 `agentConfig`；
  * - **事件游标隔离**：`/api/events` 直连 `store.listEvents`（`since` 由前端传参、缺省从头、反复读幂等）；
- * - **降级**：端口被占 / 非 loopback host ⇒ 不 throw，返回「未启用」句柄。
+ * - **降级**：端口被占 / 非 loopback host ⇒ 不 throw，返回「未启用」句柄；
+ * - **注册表全量投影**（REQ-2026-10-03-02）：`/api/registry/projects` 契约 C-1…C-6
+ *   （遍历源 = runners 表 / 零组语义负向 / 字符串逐字 / 字段名对齐 / 两条读路不交叉）。
  *
  * 关于「游标隔离」这条断言为什么这样写（**宿主游标不可直接观测**）：
  * `eventsCursor` 是 `bridge/index.ts` 的**模块私有**变量（未导出），且 `bridge/index.ts` 顶层
@@ -27,7 +29,15 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer as createHttpServer, request as httpRequest } from "node:http";
 import type { Server } from "node:http";
-import { appendEvent, createFeature, createTask, latestEventId } from "../session/store.js";
+import {
+  appendEvent,
+  createFeature,
+  createTask,
+  latestEventId,
+  markRunnerOffline,
+  runnerProjectsReplace,
+  upsertRunner,
+} from "../session/store.js";
 import type { ProjectStatus } from "../types.js";
 import { resetWarnOnceCache } from "../config.js";
 import { handleFeatureStatus, projectTaskVisibility } from "../bridge/feature-tools.js";
@@ -773,6 +783,230 @@ test("GET /api/groups → 配置坏 / 无源：500 machines_config_error；非 G
   // 坏配置只影响 groups 路由，不回伤 core 数据面
   const okProjects = await get(bad.port, "/api/projects");
   assert.equal(okProjects.status, 200);
+});
+
+// ---------------------------------------------------------------------------
+// GET /api/registry/projects（REQ-2026-10-03-02：注册表全量投影，契约 C-1…C-6）
+// ---------------------------------------------------------------------------
+
+interface RegistryBody {
+  ok: boolean;
+  source: string;
+  note: string;
+  observedAt: string;
+  machines: Array<Record<string, unknown>>;
+  counts: { machines: number; projects: number };
+  code?: string;
+  error?: string;
+}
+
+/** 注册一台机（`runnerId` 与 `machineId` 同源 = 注册路径的实际形状，见 `bridge/runner.ts`） */
+function seedRunner(
+  machineId: string,
+  opts: { state?: "online" | "offline"; projects?: number } = {},
+): void {
+  upsertRunner({
+    runnerId: machineId,
+    machineId,
+    protocolVersion: "2.0",
+    version: "test",
+    state: opts.state ?? "online",
+    registeredAt: "2026-09-01T00:00:00Z",
+    lastHeartbeatAt: "2026-09-30T00:00:00Z",
+  });
+  runnerProjectsReplace(
+    machineId,
+    Array.from({ length: opts.projects ?? 1 }, (_, i) => ({
+      projectId: `${machineId}-p${i}`,
+      workspace: `G:/hidden/${machineId}-p${i}`,
+      agentKind: "opencode" as const,
+      a2aPort: 3100 + i,
+      risk: "read" as const,
+      status: "online" as const,
+      endpoint: `http://127.0.0.1:${3100 + i}`,
+      startedAt: "2026-09-20T00:00:00Z",
+    })),
+  );
+}
+
+/** 递归收集响应体全部键名（C-2 负向断言用：键集合上判，不靠全文子串误伤中文文案） */
+function collectKeys(value: unknown, into: string[] = []): string[] {
+  if (Array.isArray(value)) {
+    for (const item of value) collectKeys(item, into);
+    return into;
+  }
+  if (typeof value === "object" && value !== null) {
+    for (const [k, v] of Object.entries(value)) {
+      into.push(k);
+      collectKeys(v, into);
+    }
+  }
+  return into;
+}
+
+test("GET /api/registry/projects → 路由命中 + 冻结形状（ok/source/observedAt/note/machines[]/counts）", async () => {
+  seedRunner("reg-shape", { projects: 2 });
+  // C-6：本面直连 store，**不得**复用 `core.projects()` —— 桩里让它直接抛，命中即 500
+  const handle = await startWeb(
+    fakeCore({
+      projects: async () => {
+        throw new Error("C-6 违规：registry/projects 复用了 handleProjects 读路");
+      },
+    }),
+  );
+  const res = await get(handle.port, "/api/registry/projects");
+  assert.equal(res.status, 200);
+  const body = json<RegistryBody>(res);
+  assert.equal(body.ok, true);
+  assert.equal(body.source, "桥注册表（Runner 上报全量投影，未经组过滤）");
+  assert.match(body.note, /lastReportedAt/, "note 须点明陈旧性以最后上报时刻表达（非实时探测）");
+  assert.match(body.observedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+  const machine = body.machines.find((m) => m["machineId"] === "reg-shape");
+  assert.ok(machine !== undefined, "注册过的机须出现在投影内");
+  assert.deepEqual(
+    Object.keys(machine).sort(),
+    ["firstRegisteredAt", "lastHeartbeatAt", "machineId", "projects", "runnerState"],
+    "机级键集合冻结（无 error / 无 runnerId）",
+  );
+  assert.deepEqual(
+    Object.keys(at(machine["projects"] as Array<Record<string, unknown>>, 0)).sort(),
+    ["a2aPort", "agentKind", "endpoint", "lastReportedAt", "projectId", "startedAt", "status"],
+  );
+  assert.equal(typeof body.counts.machines, "number");
+  assert.equal(
+    body.counts.projects,
+    body.machines.reduce((n, m) => n + (m["projects"] as unknown[]).length, 0),
+  );
+});
+
+test("C-1 离线机照常出现：runnerState=offline + lastHeartbeatAt，其项目照常列出，机级不发 error 文案", async () => {
+  seedRunner("reg-offline", { projects: 3 });
+  markRunnerOffline("reg-offline");
+  const handle = await startWeb(fakeCore());
+  const body = json<RegistryBody>(await get(handle.port, "/api/registry/projects"));
+  const machine = body.machines.find((m) => m["machineId"] === "reg-offline");
+  assert.ok(machine !== undefined);
+  assert.equal(machine["runnerState"], "offline");
+  assert.equal(machine["lastHeartbeatAt"], "2026-09-30T00:00:00Z");
+  assert.equal((machine["projects"] as unknown[]).length, 3, "离线不抹掉其项目投影");
+  assert.equal("error" in machine, false, "离线机不得发 error 文案");
+});
+
+test("C-1 注册过但零项目的机 → projects: []（不缺键、不 404、不计入 counts.projects）", async () => {
+  seedRunner("reg-empty", { projects: 0 });
+  const handle = await startWeb(fakeCore());
+  const body = json<RegistryBody>(await get(handle.port, "/api/registry/projects"));
+  const machine = body.machines.find((m) => m["machineId"] === "reg-empty");
+  assert.ok(machine !== undefined, "零项目机仍须出现");
+  assert.deepEqual(machine["projects"], []);
+});
+
+test("C-1 遍历源 = runners 表：config 里有但从未注册的机器不出现在投影内", async () => {
+  seedRunner("reg-registered", { projects: 1 });
+  const handle = await startWeb(fakeCore());
+  const res = await get(handle.port, "/api/registry/projects");
+  const body = json<RegistryBody>(res);
+  assert.ok(
+    body.machines.some((m) => m["machineId"] === "reg-registered"),
+    "注册过的机须出现在投影内",
+  );
+  // 本面无 config 入参 ⇒ 「配置里有但从未注册」的机器在投影里根本没有行（不出现、也不报错）
+  assert.equal(
+    body.machines.some((m) => String(m["machineId"]).includes("never-registered")),
+    false,
+  );
+  assert.ok(!JSON.stringify(body).includes("never-registered"));
+});
+
+test("C-2 零组语义（负向）+ 渲染层白名单：无组布尔、无 workspace / risk / runnerId / agentConfig", async () => {
+  seedRunner("reg-nogroup", { projects: 1 });
+  const handle = await startWeb(fakeCore());
+  const body = json<RegistryBody>(await get(handle.port, "/api/registry/projects"));
+  const keys = new Set(collectKeys(body));
+  for (const forbidden of [
+    "declared",
+    "inGroup",
+    "group",
+    "groups",
+    "ownerGroupName",
+    "selective",
+    "memberMachineIds",
+    "runnerId",
+    "workspace",
+    "risk",
+    "agentConfig",
+    "token",
+  ]) {
+    assert.equal(keys.has(forbidden), false, `键 ${forbidden} 不得出口`);
+  }
+});
+
+test("C-3/C-4/C-5 字符串逐字透出 + 字段名对齐落库语义（lastReportedAt ← updated_at；firstRegisteredAt 保首值；ProjectView 六字段兼容）", async () => {
+  const machineId = "reg-verbatim";
+  upsertRunner({
+    runnerId: machineId,
+    machineId,
+    protocolVersion: "2.0",
+    version: "test",
+    registeredAt: "2026-08-01T00:00:00Z",
+    lastHeartbeatAt: "2026-09-30T00:00:00Z",
+  });
+  runnerProjectsReplace(machineId, [
+    {
+      projectId: " Mixed_Case_Project ",
+      agentKind: "qoder-cn",
+      a2aPort: 3014,
+      status: "online",
+      endpoint: "http://127.0.0.1:3014",
+      startedAt: null,
+    },
+  ]);
+  // 重注册不得刷新首次注册时刻（COALESCE 保首值）⇒ firstRegisteredAt 仍是 8-01
+  upsertRunner({
+    runnerId: machineId,
+    machineId,
+    protocolVersion: "2.0",
+    version: "test",
+    registeredAt: "2026-10-04T00:00:00Z",
+    lastHeartbeatAt: "2026-10-04T00:00:00Z",
+  });
+
+  const handle = await startWeb(fakeCore());
+  const body = json<RegistryBody>(await get(handle.port, "/api/registry/projects"));
+  const machine = body.machines.find((m) => m["machineId"] === machineId);
+  assert.ok(machine !== undefined);
+  assert.equal(machine["firstRegisteredAt"], "2026-08-01T00:00:00Z", "首值不得被重注册覆盖");
+  const project = at(machine["projects"] as Array<Record<string, unknown>>, 0);
+  assert.equal(project["projectId"], " Mixed_Case_Project ", "不得 trim、不得大小写折叠");
+  assert.equal(project["agentKind"], "qoder-cn");
+  assert.equal(project["startedAt"], null);
+  assert.match(
+    String(project["lastReportedAt"]),
+    /^\d{4}-\d{2}-\d{2}T/,
+    "lastReportedAt 必须是时刻串",
+  );
+});
+
+test("回归：3300 路由枚举含 /api/registry/projects（全部已注册路径命中非 404；新路径非 GET ⇒ 405）", async () => {
+  const handle = await startWeb(fakeCore());
+  const registered = [
+    "/api/projects",
+    "/api/features",
+    "/api/tasks",
+    "/api/events",
+    "/api/groups",
+    "/api/registry/projects",
+  ];
+  for (const path of registered) {
+    const res = await get(handle.port, path);
+    assert.notEqual(res.status, 404, `${path} 应在路由表内（不得 404）`);
+  }
+  const notGet = await get(handle.port, "/api/registry/projects", "POST");
+  assert.equal(notGet.status, 405);
+  assert.equal(json<ErrorBody>(notGet).code, "method_not_allowed");
+  // 前缀相似但**未注册**的路径仍须 404（新路径不得吞子树）
+  assert.equal((await get(handle.port, "/api/registry")).status, 404);
+  assert.equal((await get(handle.port, "/api/registry/projects/extra")).status, 404);
 });
 
 test("非 loopback host ⇒ 拒起（不 throw，返回未启用）", async () => {

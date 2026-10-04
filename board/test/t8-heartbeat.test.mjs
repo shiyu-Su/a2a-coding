@@ -8,7 +8,9 @@
  * - ③ 去重键（同一条件只唤一次）；
  * - ④ R2 规格①定时器生命周期（stop 后不再点火）；②in-flight 防叠拍；⑤sweepIdle 确被调用（回归断言）；
  * - ⑤ 兜底条三条规格（阈值 ≥ 数分钟量级可注入 / (featureId,stage) 去重只兜底一次 / 唤醒词显式标签）；
- * - ⑥ `BridgeClient.getTask` 只读探针（404 ⇒ null），供 pending 就绪判定。
+ * - ⑥ `BridgeClient.getTask` 只读探针（404 ⇒ null），供 pending 就绪判定；
+ * - ⑦ **交人闸（v0.9.8 心跳自火交人闸）**：板侧有待澄清轮 ⇒ 三档命中（pending-ready / fallback / 引擎终态）
+ *   一律不自火，且**绝不记去重键**（解除后同条件照唤）；谓词抛错 fail-closed；未注入 ⇒ 行为零变更。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -531,4 +533,118 @@ test("T8-⑳（回归）心跳只读：源码不触碰桥活动时间写入面�
   for (const token of [".beginRound(", ".endRound(", ".ensureStarted(", ".lastActivityAt", ".stopInternal("]) {
     assert.ok(!src.includes(token), `heartbeat.js 不得出现桥活动 / 生命周期写面 ${token}`);
   }
+});
+
+// ---------------------------------------------------------------------------
+// ⑨ 交人闸（v0.9.8 心跳自火交人闸）：板侧有待澄清轮 ⇒ 本拍不自火
+// ---------------------------------------------------------------------------
+
+test("T8-㉑ 交人闸：pending-ready 已命中但 awaitingHeld=true ⇒ 不自火（不 fire、不计入 fired[]、**不记 firedKeys**）", async () => {
+  const fires = [];
+  const logs = [];
+  const ledger = fakeLedger([{ featureId: "F1", turnId: "turn-1", contextId: "ctx-1", pending: ["t1"] }]);
+  const hb = createHeartbeat(baseDeps({
+    ledger,
+    awaitingHeld: () => true,
+    fire: (i) => { fires.push(i); return { ok: true, reason: "fired" }; },
+    log: (line) => { logs.push(line); },
+  }));
+  const r = await hb.tick();
+  assert.equal(r.fired.length, 0, "被挡 ⇒ 不计入 fired[]（同 no-hit 形态）");
+  assert.equal(fires.length, 0, "不组装提示词、不调 fire");
+  assert.deepEqual(ledger.get("F1").firedKeys, [], "绝不记去重键（记了会让答完后的同一条件永久失声）");
+  assert.ok(
+    logs.some((l) => l.includes("verdict=awaiting-held")),
+    `须经 evalTrace 留痕 verdict=awaiting-held（实际：${logs.join(" / ")}）`,
+  );
+});
+
+test("T8-㉒ 交人闸：被挡后 awaitingHeld 解除 ⇒ 同条件可正常唤（反证未记去重键；挡后下一拍照旧重评）", async () => {
+  const fires = [];
+  let held = true;
+  const ledger = fakeLedger([{ featureId: "F1", turnId: "turn-1", contextId: "ctx-1", pending: ["t1"] }]);
+  const hb = createHeartbeat(baseDeps({
+    ledger,
+    awaitingHeld: () => held,
+    fire: (i) => { fires.push(i); return { ok: true, reason: "fired" }; },
+  }));
+  assert.equal((await hb.tick()).fired.length, 0, "有待澄清轮 ⇒ 本拍不自火");
+  assert.equal(fires.length, 0);
+
+  held = false; // 用户已回答
+  const after = await hb.tick();
+  assert.equal(after.fired.length, 1, "解除后同条件照唤（去重键未被挡时消费）");
+  assert.equal(after.fired[0].kind, "pending-ready");
+  assert.equal(fires.length, 1);
+  assert.deepEqual(ledger.get("F1").firedKeys, ["pending:t1"], "点火成功才记去重位");
+});
+
+test("T8-㉓ 交人闸：fallback（⑤ 兜底）路径同样被挡，解除后自动目标照唤", async () => {
+  let now = 1_000_000;
+  const fires = [];
+  let held = true;
+  const hb = createHeartbeat(baseDeps({
+    now: () => now,
+    fallbackThresholdMs: 60_000,
+    awaitingHeld: () => held,
+    readEngine: async () => ({ state: "executing", stage: "需求分析", approval: "已通过", ownerGroup: "o" }),
+    fire: (i) => { fires.push(i); return { ok: true, reason: "fired" }; },
+  }));
+  hb.noteMonitor({ featureId: "F1", kind: "auto", org: "o", stage: "需求分析" });
+  now += 60_000;
+  assert.equal((await hb.tick()).fired.length, 0, "兜底命中也被交人闸挡（不烧掉自动目标的一轮）");
+  assert.equal(fires.length, 0);
+
+  held = false;
+  now += 1;
+  const after = await hb.tick();
+  assert.equal(after.fired.length, 1, "自动目标自己的 firedKeys 同样不得在挡时记录");
+  assert.equal(after.fired[0].kind, "fallback");
+});
+
+test("T8-㉔ 交人闸：引擎终态路径（dag-terminal · 待裁 C4）一并挡 —— 有待澄清轮时不自火去收尾", async () => {
+  const fires = [];
+  const ledger = fakeLedger([{ featureId: "F1", turnId: "turn-1", contextId: "ctx-1", pending: [] }]);
+  const hb = createHeartbeat(baseDeps({
+    ledger,
+    awaitingHeld: () => true,
+    readEngine: async () => ({ state: "completed", stage: "改造", approval: "已通过", ownerGroup: "o" }),
+    fire: (i) => { fires.push(i); return { ok: true, reason: "fired" }; },
+  }));
+  const r = await hb.tick();
+  assert.equal(r.fired.length, 0);
+  assert.equal(fires.length, 0, "引擎终态命中同样交人");
+  assert.deepEqual(ledger.get("F1").firedKeys, [], "不记 state:completed 去重键");
+});
+
+test("T8-㉕ 交人闸：awaitingHeld 抛错 ⇒ fail-closed 按「有待澄清轮」处置（不点火、不记去重键）", async () => {
+  const fires = [];
+  const ledger = fakeLedger([{ featureId: "F1", turnId: "turn-1", contextId: "ctx-1", pending: ["t1"] }]);
+  const hb = createHeartbeat(baseDeps({
+    ledger,
+    awaitingHeld: () => {
+      throw new Error("turn 读面炸了");
+    },
+    fire: (i) => { fires.push(i); return { ok: true, reason: "fired" }; },
+  }));
+  const r = await hb.tick();
+  assert.equal(r.fired.length, 0, "谓词抛错不得放行自火（宁可不唤）");
+  assert.equal(fires.length, 0);
+  assert.deepEqual(ledger.get("F1").firedKeys, []);
+});
+
+test("T8-㉖ 交人闸：未注入 awaitingHeld ⇒ 既有行为零变更（向后兼容 + 可选字段）", async () => {
+  const fires = [];
+  const logs = [];
+  const ledger = fakeLedger([{ featureId: "F1", turnId: "turn-1", contextId: "ctx-1", pending: ["t1"] }]);
+  const hb = createHeartbeat(baseDeps({
+    ledger,
+    fire: (i) => { fires.push(i); return { ok: true, reason: "fired" }; },
+    log: (line) => { logs.push(line); },
+  }));
+  const r = await hb.tick();
+  assert.equal(r.fired.length, 1, "未注入 ⇒ 照旧点火");
+  assert.equal(fires.length, 1);
+  assert.deepEqual(ledger.get("F1").firedKeys, ["pending:t1"]);
+  assert.ok(!logs.some((l) => l.includes("awaiting-held")), "未注入 ⇒ 不出 awaiting-held 留痕");
 });

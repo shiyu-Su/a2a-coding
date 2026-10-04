@@ -6,7 +6,9 @@
  * 纪律钉 = `test/n3-regression-anchors.test.mjs` N3-⑦/⑧，闭集 = 提交守卫 {@link SUBMIT_GUARD_SCRIPT}
  * + 错误浮层关闭 + mermaid 渲染 + 排期页详情浮层 {@link FEATURE_DETAIL_OVERLAY_SCRIPT}
  * + 新增需求弹窗 {@link NEW_REQUIREMENT_DIALOG_SCRIPT}
- * + 排期拖拽 {@link DRAG_SCHEDULE_SCRIPT}（v0.9.3 B-T5，闭集五→六元；与弹窗常量分立、不可共置））；
+ * + 排期拖拽 {@link DRAG_SCHEDULE_SCRIPT}（v0.9.3 B-T5 增枚；与弹窗常量分立、不可共置）
+ * + 成员两栏拖拽 {@link MEMBER_DRAG_SCRIPT}（v0.9.8 REQ-2026-10-03-02，闭集六→**七元**；
+ *   与排期拖拽常量分立、不可共置 —— 那枚的入口守卫 `#schedule-board` 不因本页而扩））；
  * 刷新 = 浏览器重载；**唯一例外** = 浮层动作区提交后的**有界进度轮询**（复用既有详情读面 +
  * 既有 {@link FEATURE_DETAIL_OVERLAY_SCRIPT} 的 `swapPage` 通路，零新端点、零新枚脚本，见该常量注记）。
  */
@@ -63,7 +65,7 @@ export type NavKey = "home" | "features" | "schedule" | "tasks" | "projects" | "
  *
  * - `org` = 当前页面所处的组织空间（`null` ⇒ 全局页面，侧栏不出当前态）；
  * - `orgs` = 侧栏二级菜单的项目组清单（**服务端渲染的链接列表**，跳转 = 全页刷新 ⇒
- *   零新脚本，内联脚本闭集保持六元，见 {@link PageParams.orgNav}）。
+ *   零新脚本，内联脚本闭集保持七元，见 {@link PageParams.orgNav}）。
  */
 export interface PageOrgNav {
   org: string | null;
@@ -85,7 +87,7 @@ export interface PageOrgNav {
  *
  * 与页面同字面量渲染（不含用户数据 ⇒ 无注入面；脚本内不得出现 `</script` 字面量）。
  *
- * **增补二 §9.1-② 的扩写（闭集六元不扩，在本常量体内扩）**：带 `data-ov="1"` 标记的写表单
+ * **增补二 §9.1-② 的扩写（闭集不扩，在本常量体内扩）**：带 `data-ov="1"` 标记的写表单
  * （manage 成员增删 / 停用 + 门户建组织）改 **fetch 提交 + 浮层报错**，口径对齐改版排期表单：
  * - **2xx/3xx（303 被 fetch 自动跟随 ⇒ 最终页 ok）⇒ 整页刷新**（成功回执以服务端重渲染为事实源）；
  * - **4xx/5xx ⇒ 页面不跳**：抽错误页 `.err-ov-card` 叠加为 `document.body` 直接子元素
@@ -102,14 +104,14 @@ export interface PageOrgNav {
  * 遮蔽 `action` 属性，直读拿到的是 input 元素 ⇒ 强转成伪 URL（405 实证根因）；
  * 属性读为空 ⇒ 回落 `form.submit()` 原生提交（不劣化）。负向锚见 `test/web.test.mjs`。
  *
- * **增补四 §9.3 的扩写（闭集六元不扩，在本常量体内扩）**：注入卡上的「知道了」按钮点了不关
+ * **增补四 §9.3 的扩写（闭集不扩，在本常量体内扩）**：注入卡上的「知道了」按钮点了不关
  * —— 关闭逻辑原靠「错误页自带脚本」（`renderErrorOverlay` 的直接绑定），而卡片是经
  * `DOMParser` 惰性文档摘入本文档的：**搬运节点不跑 `<script>`** ⇒ 按钮无处理器
  * （manage / 门户两页各只注入本枚脚本，没有 /schedule 侧三枚浮层脚本的委托兜底）。
  * 补一条 **document 级 click 委托**：命中 `#err-ov-close` ⇒ `closest(".err-ov-card")` 摘除该卡
  * （动态注入天然覆盖），口径对齐 /schedule 侧 `closest(...err-ov-card...)` 委托先例。
  *
- * **增补五 §9.4-② 的扩写（闭集六元不扩，在本常量体内扩）**：成功路径支持 `data-ov-redirect` 属性
+ * **增补五 §9.4-② 的扩写（闭集不扩，在本常量体内扩）**：成功路径支持 `data-ov-redirect` 属性
  * —— 停用表单提交成功后**当前页就是刚被关掉的空间页**，`reload()` 必落 410 ⇒ 有该属性则
  * `location.href = 该值`（停用表单给 `/` = 门户，与服务端 303 落点同口径），
  * 无该属性 ⇒ 维持原 reload 行为（建组织 / 成员增删的成功页就在本处）。
@@ -516,7 +518,7 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
  * `Referer`），`checkWriteAuth` 两档原样工作。脚本字面量不含用户数据 ⇒ 无注入面
  * （与 {@link SUBMIT_GUARD_SCRIPT} 同规格：单点常量、纯内联、无 `src=`、无 `</script` 字面量）。
  *
- * **v0.9.4 增补六 §9.5 的泛化（闭集六元不扩，在本常量体内泛化）**：门户页 `/` 的「＋ 建组织」按钮
+ * **v0.9.4 增补六 §9.5 的泛化（闭集不扩，在本常量体内泛化）**：门户页 `/` 的「＋ 建组织」按钮
  * 需另一枚 `<dialog id="new-org-dialog">`（表单同 `renderCreateOrgForm`）—— 本常量由「单 dialog」
  * 泛化为**一个 `wire(dlg, openBtn, inline)` 同时接两枚 dialog**（`new-req-dialog` / `new-org-dialog`），
  * **不新增第七枚脚本常量、CSP 一律不动**。原 `new-req-*` 行为逐条不变；新增两点：
@@ -525,7 +527,7 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
  * - **关闭钮改按 dialog 自身子按钮绑定**（`dlg.querySelector("button")` = 骨架上第一枚 `*-close`），
  *   「知道了」摘卡委托按 `dlgId` 派生选择器（替换原写死的 `#new-req-dialog #err-ov-close`）。
  *
- * **v0.9.4 W6（§2.6）入口交互扩写（仍在闭集六元内，不新枚；增补七 a §9.1-a 把落点由门户迁到排期看板；
+ * **v0.9.4 W6（§2.6）入口交互扩写（仍在闭集内，不新枚；增补七 a §9.1-a 把落点由门户迁到排期看板；
  * 增补八 §9.3 把交互由原生 `prompt()` 改为同款弹窗）**：
  * 排期看板页头挂一枚 `#new-version-open` 按钮（server 渲染、服务端 `hidden`；无 JS 不显死按钮），
  * `wireNewVersion` 经 `wire()` 接第三枚 `#new-version-dialog`（骨架 = `views.renderNewVersionDialog`，
@@ -755,6 +757,128 @@ export const DRAG_SCHEDULE_SCRIPT = `<script>
 </script>`;
 
 /**
+ * **成员两栏拖拽**（v0.9.8 · REQ-2026-10-03-02 · 页面脚本闭集**第七枚**）：
+ * `/org/<名>/manage` 的「加 / 删项目（两栏拖拽）」区（`views.ts` 的 {@link renderMemberPoolColumns}）
+ * 的**体验层增强** —— 拖左→右 = `action=add`、拖右→左 = `action=remove`，落定走**既有**写路由
+ * `POST /orgs/{org}/members`（urlencoded `action` / `machineId` / `projectId`，**与手填表单同参数**，
+ * 服务端零改动、不新增预检闸）。
+ *
+ * 口径逐条对齐排期拖拽先例 {@link DRAG_SCHEDULE_SCRIPT}（**不复用它、也不扩它** —— 那枚常量的入口守卫
+ * `#schedule-board` 与页隔离锚一旦扩，排期页与本页互相牵连，故本枚独立立）：
+ * - 入口守卫 = `getElementById("member-pool")`（**仅 manage 页有此锚** ⇒ 页隔离即由它承担，
+ *   注入单点 = `server.ts` 的 `pageOrgSpaceManage` 的 `Page.extraScripts`）；
+ *   `typeof fetch` / `typeof DragEvent` 任一缺失 ⇒ 直接 return（无 JS / 老浏览器 = 两栏静态清单 + 表单照常）；
+ * - `dataTransfer` 走 `text/plain`，载荷 = `URLSearchParams` 序列化的 `action` / `machineId` / `projectId`
+ *   （值全部来自**服务端渲染的 `data-*` 属性** ⇒ 脚本字面量本身不含用户数据）；
+ * - 提交 = 同源 `fetch`（`credentials:"same-origin"`，**不带 `x-board-write` 头** ⇒ CSRF 走 Origin 同源档，
+ *   与 `SUBMIT_GUARD_SCRIPT` 的表单档同一条防线）；
+ * - **成功 ⇒ `location.reload()`**（声明面回读为事实源，板不做乐观 DOM 移动）；
+ * - **失败 ⇒ 抽响应 `.err-ov-card` 叠既有浮层**（`.drag-err-overlay`，「知道了」同款委托摘卡）——
+ *   409 `board_member_group_conflict` 冲突卡自带所属组链接、409 `board_last_member_remove` 自带引导；
+ *   **DOM 从未被移动 ⇒ 失败无需回弹**；抽不到卡 / 网络异常 ⇒ reload 兜底（错误可见，不静默）。
+ *
+ * 执法永远在服务端与桥 O1（本脚本只是体验层）：**能不能拖由服务端渲染判据决定** ——
+ * 末位成员行不带 `draggable`、池不可用时整块不带 `data-machine`，拖不动即拖不了。
+ * 顺带一件：JS 可用时把**手填表单的宿主** `#member-forms-fold` 收起（`open = false`，**只折叠不删 DOM**，
+ * 口径照门户 `#new-org-inline` 先例）⇒ 输入面恒为一个；无 JS 时 `<details open>` 原样可见。
+ *
+ * 与 {@link DRAG_SCHEDULE_SCRIPT} 同规格：单点常量、纯内联、无 `src=`、不含用户数据、
+ * 体内无 `</script` 字面量；**闭集钉「每枚恰好 1 处」**（N3-⑦/⑧/⑨）。
+ */
+export const MEMBER_DRAG_SCRIPT = `<script>
+(function () {
+  var pool = document.getElementById("member-pool");
+  if (pool === null || typeof fetch !== "function" || typeof DragEvent !== "function") return;
+  var org = pool.getAttribute("data-org");
+  if (org === null || org === "") return;
+  var fold = document.getElementById("member-forms-fold");
+  if (fold !== null) fold.open = false;
+  function colOf(node) {
+    var el = node;
+    while (el !== null && el !== document) {
+      if (el.nodeType === 1 && typeof el.getAttribute === "function" && el.getAttribute("data-side") !== null) return el;
+      el = el.parentNode;
+    }
+    return null;
+  }
+  function dropCard() {
+    var kids = document.body.children;
+    for (var i = kids.length - 1; i >= 0; i -= 1) {
+      if (kids[i].classList && kids[i].classList.contains("err-ov-card") && kids[i].parentNode !== null) { kids[i].parentNode.removeChild(kids[i]); }
+    }
+  }
+  function showCard(card) {
+    dropCard();
+    card.classList.add("drag-err-overlay");
+    document.body.appendChild(card);
+    var btn = card.querySelector("#err-ov-close");
+    if (btn !== null) btn.addEventListener("click", dropCard);
+  }
+  function submitMember(action, machineId, projectId) {
+    fetch("/orgs/" + encodeURIComponent(org) + "/members", {
+      method: "POST",
+      body: new URLSearchParams({ action: action, machineId: machineId, projectId: projectId }),
+      credentials: "same-origin",
+      headers: { Accept: "text/html" }
+    }).then(function (res) {
+      if (res.ok) { window.location.reload(); return null; }
+      return res.text();
+    }).then(function (text) {
+      if (text === null || text === undefined) return;
+      var doc = new DOMParser().parseFromString(text, "text/html");
+      var card = doc.querySelector(".err-ov-card");
+      if (card === null) { window.location.reload(); return; }
+      showCard(card);
+    }).catch(function () { window.location.reload(); });
+  }
+  document.addEventListener("dragstart", function (e) {
+    var row = e.target !== null && typeof e.target.closest === "function" ? e.target.closest(".mrow[draggable=true]") : null;
+    if (row === null || e.dataTransfer === null) return;
+    var machineId = row.getAttribute("data-machine");
+    var projectId = row.getAttribute("data-project");
+    if (machineId === null || projectId === null) return;
+    var from = colOf(row);
+    if (from === null) return;
+    var action = from.getAttribute("data-side") === "pool" ? "add" : "remove";
+    e.dataTransfer.setData("text/plain", new URLSearchParams({ action: action, machineId: machineId, projectId: projectId }).toString());
+    e.dataTransfer.effectAllowed = "move";
+  });
+  document.addEventListener("dragover", function (e) {
+    var col = colOf(e.target);
+    if (col === null) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    col.classList.add("dragover");
+  });
+  document.addEventListener("dragleave", function (e) {
+    var col = colOf(e.target);
+    if (col !== null) col.classList.remove("dragover");
+  });
+  document.addEventListener("drop", function (e) {
+    var col = colOf(e.target);
+    if (col === null) return;
+    e.preventDefault();
+    col.classList.remove("dragover");
+    var raw = e.dataTransfer.getData("text/plain");
+    if (raw === "") return;
+    var qs = new URLSearchParams(raw);
+    var action = qs.get("action");
+    var machineId = qs.get("machineId");
+    var projectId = qs.get("projectId");
+    if (action !== "add" && action !== "remove") return;
+    if (machineId === null || projectId === null || machineId === "" || projectId === "") return;
+    if (action === "add" && col.getAttribute("data-side") !== "own") return;
+    if (action === "remove" && col.getAttribute("data-side") !== "pool") return;
+    submitMember(action, machineId, projectId);
+  });
+  document.addEventListener("dragend", function () {
+    var cols = pool.querySelectorAll(".mcol.dragover");
+    for (var i = 0; i < cols.length; i += 1) cols[i].classList.remove("dragover");
+  });
+})();
+</script>`;
+
+/**
  * 一级导航单点（REQ-2026-09-30-04 件1 · 件1 口径：全站唯一侧栏的**一级菜单仅一枚**）。
  * 历史：v0.9.4 §9-b 首页 = 组织门户；v0.9.6 B5a 闭集六 → 三枚（摘排期 / 任务 / 宿主桥）；
  * 本轮三 → 一枚 —— 「项目」（`/projects`）与「Agent」（`/agents`）**只撤导航、不撤路由**
@@ -767,7 +891,7 @@ const NAV: ReadonlyArray<{ key: NavKey; href: string; text: string }> = [
 /**
  * **侧栏二级菜单 = 各项目组**（REQ-2026-09-30-04 件1，替换原「顶栏组织切换器」形态）：
  * 各组织 → `/org/<名>/`（= 该空间排期）的**服务端渲染链接列表**，当前空间项挂 `class="on"`
- * （样式给出左侧圆点高亮）⇒ **零新脚本**，内联脚本闭集保持**六元**（N3-⑦/⑧ 纪律锚）。
+ * （样式给出左侧圆点高亮）⇒ **零新脚本**，内联脚本闭集不扩（现七元）（N3-⑦/⑧ 纪律锚）。
  * 清单为空 ⇒ 整块不渲染（无组可切时不留空占位，同原切换器口径）。
  * 原 {@link renderOrgSwitcher}（顶栏文字组 + 空间正文行右档）随本形态变更删除 ——
  * 空间正文的二级导航行（`server.ts` 的 `renderSpaceNav`）不再重复挂组清单。
@@ -797,7 +921,7 @@ export interface PageParams {
   /**
    * **组织上下文（BD7；REQ-2026-09-30-04 件1 起 = 侧栏二级菜单数据源）**：
    * 给出当前组织空间（可空）+ 项目组清单。清单 = **纯服务端渲染的链接列表**
-   * （各组织 → `/org/<名>/` 整页跳转）⇒ 零新脚本，内联脚本闭集保持**六元**（N3-⑦/⑧ 纪律锚）。
+   * （各组织 → `/org/<名>/` 整页跳转）⇒ 零新脚本，内联脚本闭集不扩（现七元）（N3-⑦/⑧ 纪律锚）。
    * 件1 起原「组织切换器挂位三态」（`orgSwitcher`）随顶栏形态一并退役：全站只有一处侧栏，
    * 组清单不再需要在正文里重复挂载。
    */
@@ -1069,6 +1193,18 @@ export function renderPage(params: PageParams): string {
   .kcard.kst-danger { border-left: 3px solid var(--b-danger); background: var(--b-danger-bg); }
   .kcard.kst-neutral { border-left: 3px solid var(--b-line); background: var(--b-surface-2); }
   .kcol.dragover { outline: 2px dashed #5b86a8; outline-offset: -2px; }
+  /* v0.9.8 两栏拖拽增删项目（REQ-2026-10-03-02）：池 / 本组两栏与拖拽态 ——
+     行为类另立一族（.m-pool / .mcol / .mrow），.kcol / .kcard 的排期拖拽契约逐字不动；
+     取色一律引既有 --b- token（同增补五 件B 口径）。 */
+  .m-pool { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
+  .mcol { flex: 1 1 240px; min-width: 0; border: 1px solid var(--b-line); border-radius: 6px; background: var(--b-surface-2); padding: 6px 8px 8px; min-height: 84px; }
+  .mcol-h { font-size: 12px; font-weight: 600; margin: 0 0 6px; color: #567; }
+  .mcol-sub { font-weight: 400; color: #778; font-size: 11px; margin-left: 6px; }
+  .mrow { border: 1px solid #8884; border-radius: 6px; background: Canvas; padding: 4px 7px; margin: 0 0 5px; font-size: 12px; }
+  .mrow[draggable="true"] { cursor: grab; }
+  .mcol.dragover { outline: 2px dashed #5b86a8; outline-offset: -2px; }
+  .m-fold { margin: 6px 0 0; }
+  .m-fold > summary { cursor: pointer; color: #567; font-size: 12px; }
   .err-ov-card.drag-err-overlay { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; width: min(560px, 92vw); z-index: 70; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }
   /* 增补二 §9.1-②：data-ov 写表单 fetch 报错的浮层卡（与拖拽错误卡同款版式，不跳页） */
   .err-ov-card.ov-err-overlay { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; width: min(560px, 92vw); z-index: 70; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }

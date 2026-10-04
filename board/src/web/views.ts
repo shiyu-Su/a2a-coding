@@ -41,8 +41,8 @@ import {
 import type { HostStatusEntry, StopBridgeOutcome, TriggerDisposition, TriggerTurnOutcome } from "../host-face.js";
 import { NO_OWNER_GROUP_LABEL } from "../orgs-view.js";
 import { orgSpaceLink } from "../org-space.js";
-import type { GroupRow, OrgGroupsOutcome, OrgProjectsOutcome } from "../orgs-view.js";
-import { LAST_MEMBER_REMOVE_CODE, LAST_MEMBER_REMOVE_DISPLAY, MEMBER_ADD_RESIDENCY_NOTE } from "../group-admin.js";
+import type { GroupRow, OrgGroupsOutcome, OrgPoolOutcome, OrgProjectsOutcome } from "../orgs-view.js";
+import { LAST_MEMBER_REMOVE_CODE, LAST_MEMBER_REMOVE_DISPLAY, MEMBER_ADD_RESIDENCY_NOTE, MEMBER_GROUP_CONFLICT_CODE } from "../group-admin.js";
 import type {
   AgentInflightModel,
   AgentInflightProject,
@@ -244,7 +244,7 @@ export function renderVersionSwitchWarningLine(
 }
 
 /**
- * 折叠层的一节（v0.9.5 C3）：原生 `<details>`（服务端渲染、**零脚本**，不碰页面脚本六元闭集锚）·
+ * 折叠层的一节（v0.9.5 C3）：原生 `<details>`（服务端渲染、**零脚本**，不碰页面脚本闭集锚）·
  * 默认收起 ⇒ summary 只给「这是什么 + 有多少」，正文（含口径长文）展开才见。
  * `content` 为空 ⇒ 整节不渲染（C2 空区块短路的落点）。
  */
@@ -459,7 +459,7 @@ export function renderNewRequirementDialog(
  * **新增版本弹窗骨架**（v0.9.4 增补八 §9.3 · REQ-2026-09-28-02）：排期页注入的
  * `<dialog id="new-version-dialog">`，与 {@link renderNewRequirementDialog} **同款结构**
  * （`dialog.fd` + 首枚「关闭」按钮 + `.fd-body` 内表单）；开/关与 fetch 提交由
- * `layout.NEW_REQUIREMENT_DIALOG_SCRIPT` 的 `wire()` 承载（闭集六元不扩、CSP 不动）。
+ * `layout.NEW_REQUIREMENT_DIALOG_SCRIPT` 的 `wire()` 承载（闭集枚数不扩、CSP 不动）。
  * 表单 = SSR 原生可提交（无 JS 回落整页 PRG）：隐藏字段 `action=create` 分流 ——
  * **服务端写口与闸零改动**；semver 收口（`x.y.z`）执法在服务端，字段仍可输入。
  * 复用 `dialog.fd` 样式类 ⇒ 4xx 错误卡叠加规则（`dialog.fd > .err-ov-card`）同款生效。
@@ -1144,6 +1144,30 @@ export interface OrgSpaceManageInput {
    * **本页其余照常渲染**（宕机不得阻断管理页）。与逐组 `a2a_projects`（运行态）**并存、不替代**。
    */
   groupsOutcome: OrgGroupsOutcome | null;
+  /**
+   * **项目池**（v0.9.8 两栏拖拽 · REQ-2026-10-03-02）= 全量机器项目快照 − 全组（含本组）声明面成员对
+   * （{@link computeProjectPool}）。`null` = 全量快照读面未装配 ⇒ 池区标「未查询」；
+   * `ok=false` = 快照或声明面任一读失败 ⇒ 池区**整块灰化**（**不给拖拽载荷、不编造假池**），
+   * 手填表单照常可用。页面其余照常渲染。
+   */
+  poolOutcome?: OrgPoolOutcome | null;
+  /**
+   * **池左集规模**（v0.9.8 · REQ-2026-10-03-02 · B-3）= 差集被减之前的桥注册表全集投影行数
+   * （`snapshot.rows.length`）。只服务空态两分支的字面（左集零行 ⇒「机器注册表暂无项目记录」）；
+   * 省略 / `null` = 未随池装配 ⇒ 不据此编造「暂无记录」。不参与任何判定、不入差集。
+   */
+  poolSourceCount?: number | null;
+  /**
+   * 本组织 agent 配置卡的入参数据源（v0.9.8 · 按项目组配 agent）：组织两键 = 本次已读台账记录、
+   * 全局两键 = `configView()`（**零新读面**）。`globalKind/globalModel` 为 null ⇒ 宿主面未装配
+   * （如实显示「宿主面未装配」，不伪装成有全局值）；整个字段省略 ⇒ 按全未配置渲染（测试替身口径）。
+   */
+  hostAgent?: {
+    orgKind: string | null;
+    orgModel: string | null;
+    globalKind: string | null;
+    globalModel: string | null;
+  };
 }
 
 function renderOrgFeaturesTable(features: readonly FeatureListItem[]): string {
@@ -1316,6 +1340,110 @@ ${removeCard}
   )}`;
 }
 
+/**
+ * 手填表单的**折叠宿主**（v0.9.8 · REQ-2026-10-03-02 · 渐进增强，照门户 `#new-org-inline` 先例）：
+ * SSR 直出 `open` 的 `<details>` ⇒ **无 JS 时两枚表单原样可见、照常原生提交**（回路面不劣化）；
+ * JS 可用时 {@link MEMBER_DRAG_SCRIPT} 把 `open` 置 `false` 收起（**只折叠、不移除 DOM** ——
+ * 「输入面恒为一个」口径：拖拽面在场时手填面收进折叠条，展开即回落）。
+ */
+function renderMemberFormsFold(org: string): string {
+  return `<details class="m-fold" id="member-forms-fold" open>
+<summary>手填表单（加 / 删成员）</summary>
+${renderMemberForms(org)}
+</details>`;
+}
+
+/**
+ * 两栏拖拽池的行卡（v0.9.8 · REQ-2026-10-03-02）。
+ * **`draggable` 由服务端渲染判据控制**（执法在服务端与桥 O1，脚本只是体验层）：
+ * - 池行恒 `draggable="true"` —— 加入若撞别组，由 409 `board_member_group_conflict` 浮层兜底；
+ * - 本组**末位成员行不给 `draggable`**（同写前闸 `board_last_member_remove` 判据）⇒ 拖不动即拖不了。
+ * `data-machine` / `data-project` 只作拖拽载荷来源（`dataTransfer text/plain`），不承载样式判定。
+ * **池行的唯一时间提示位（B-4 · REQ-2026-10-03-02）**：`lastReportedAt` 非空时在行内**服务端渲染**
+ * 「最后上报于 …（非实时探测）」—— 注册表投影的语义 = 最后一次随 Runner 注册全量替换写入的时刻，
+ * **不是实时探测**，故**不采信也不渲染** `status` / `online`（会冒充在线）。缺值 ⇒ 不渲（不臆造时刻）；
+ * 右栏成员行不带该位 ⇒ 行字面逐字不变。
+ */
+function memberDragRow(
+  machineId: string,
+  projectId: string,
+  draggable: boolean,
+  lastReportedAt: string | null = null,
+): string {
+  const stamp =
+    typeof lastReportedAt === "string" && lastReportedAt !== ""
+      ? ` <span class="muted">最后上报于 ${escapeHtml(lastReportedAt)}（非实时探测）</span>`
+      : "";
+  const inner = `<span class="mono">${escapeHtml(machineId)}</span> / <span class="mono">${escapeHtml(projectId)}</span>${stamp}`;
+  if (!draggable) return `<div class="mrow">${inner}</div>`;
+  return `<div class="mrow" draggable="true" data-machine="${escapeHtml(machineId)}" data-project="${escapeHtml(projectId)}">${inner}</div>`;
+}
+
+/**
+ * **两栏拖拽区**（v0.9.8 · REQ-2026-10-03-02 · SSR 直出，拖拽仅作增强）：
+ * 左「项目池」= 全量机器项目 − **全组（含本组）声明面**（{@link poolProjects} 的集合差，
+ * 故别组成员在池里**完全不显示** —— 显示层过滤，不是写入闸门）；右「本组项目」= 声明面 members
+ * （与上方「成员（声明态）」区同源，两栏同源不另立事实）。
+ * 降级照「成员（声明态）」区四档先例：快照未装配 ⇒「未查询」；读失败 / 声明面不可达 ⇒「不可用」整块灰化
+ * （**不给拖拽载荷** ⇒ 不给假池编造归属）；两种降级下**下方手填表单照常可用**（回路面不劣化）。
+ * `#member-pool` + `data-org` = {@link MEMBER_DRAG_SCRIPT} 的入口锚与提交目标（页隔离锚点，N3-⑦/⑧）。
+ * `sourceCount` = **左集规模**（差集被减之前的桥注册表全集投影行数），只服务空态两分支的字面（B-3）：
+ * 左集本身零行 ⇒「机器注册表暂无项目记录」；左集有行但全被减 ⇒「已全部归属某个项目组」。二者不串台。
+ * `null`（未随池装配）⇒ 无从判左集，按后者如实回退，**不编造**「暂无记录」。
+ */
+function renderMemberPoolColumns(
+  org: string,
+  pool: OrgPoolOutcome | null,
+  groupsOutcome: OrgGroupsOutcome | null,
+  sourceCount: number | null = null,
+): string {
+  const title = `加 / 删项目（两栏拖拽）`;
+  if (pool === null) {
+    return cardShell(
+      title,
+      "未查询",
+      `<p class="hint muted"><b>未查询</b>：全量机器项目快照未装配 ⇒ 本区不呈现池与本组清单（不编造「无项目」）；下方两枚手填表单照常可用。</p>`,
+    );
+  }
+  if (!pool.ok) {
+    return cardShell(
+      title,
+      "不可用",
+      `<p class="hint warn muted"><b>池数据不可用</b>（<code>${escapeHtml(pool.code)}</code>）：${escapeHtml(pool.error)} —— 项目归属未知 ⇒ 本区整块灰化、<b>不给拖拽</b>（刷新本页重查；下方两枚手填表单照常可用）。</p>`,
+    );
+  }
+  const declared = groupsOutcome !== null && groupsOutcome.ok;
+  const own = declared ? (groupsOutcome.groups.find((g) => g.name === org)?.members ?? []) : [];
+  const canRemove = own.length > 1;
+  const poolBody =
+    pool.rows.length === 0
+      ? sourceCount === 0
+        ? `<p class="hint muted">（机器注册表暂无项目记录）</p>`
+        : `<p class="hint muted">（池为空：桥注册表全集投影中的机器项目已全部归属某个项目组）</p>`
+      : pool.rows.map((r) => memberDragRow(r.machineId, r.projectId, true, r.lastReportedAt)).join("\n");
+  const ownBody = !declared
+    ? `<p class="hint muted">（声明面不可用 ⇒ 本组清单未知，不编造「无项目」）</p>`
+    : own.length === 0
+      ? `<p class="hint muted">（本组暂无项目：左栏拖入即建组带首成员）</p>`
+      : own.map((r) => memberDragRow(r.machineId, r.projectId, canRemove)).join("\n");
+  const ownMeta = own.length === 1 ? `${String(own.length)} 项 · 末位不可移出` : `${String(own.length)} 项`;
+  return cardShell(
+    title,
+    `池 ${String(pool.rows.length)} 项 · 本组 ${ownMeta}${pool.observedAt === null ? "" : ` · 观测时刻 ${escapeHtml(pool.observedAt)}`}`,
+    `<div class="m-pool" id="member-pool" data-org="${escapeHtml(org)}">
+<div class="mcol" data-side="pool">
+<p class="mcol-h">项目池 <span class="mcol-sub">拖到右栏 = 加入本组</span></p>
+${poolBody}
+</div>
+<div class="mcol" data-side="own">
+<p class="mcol-h">本组项目 <span class="mcol-sub">拖到左栏 = 移出本组</span></p>
+${ownBody}
+</div>
+</div>
+<p class="hint">两栏与上方「成员（声明态）」<b>同源</b>（3300 全组枚举），左栏另加一次全量项目快照；<b>三个数据源各有自己的观测时刻</b> ⇒ 刚移出的项目在本栏的归属可能瞬时滞后。<b>落点以服务端投影与 409 为准</b>：撞别组 ⇒ 409 <code>${escapeHtml(MEMBER_GROUP_CONFLICT_CODE)}</code>（浮层点名所属组），末位不可删 ⇒ 409 <code>${escapeHtml(LAST_MEMBER_REMOVE_CODE)}</code>。拖拽只做增强 —— 无 JS 时两栏退化为静态清单，下方手填表单照常提交。</p>`,
+  );
+}
+
 /** {@link renderMemberWriteCard} 的入参（成员写成功回执，表单档整页顶部卡片）。 */
 export interface MemberWriteCardInput {
   org: string;
@@ -1467,6 +1595,59 @@ ${summary}`,
 }
 
 /**
+ * agentKind 输入框的**建议清单**（REQ-2026-10-04-01 增补 · `<datalist>` 唯一数据源）：
+ * **板侧自持、非闭集**（写面不校验值域，清单外的值仍可手填），序 = 字母序（用户裁定①，
+ * 故不得改成后端声明序）；与规范源 `PROTOCOL.md` 锚点 `<!-- agent-kinds: … -->` 的集合一致性
+ * 由回归断言锁定（`test/piece5-space-cards.test.mjs`）。
+ * 不放 `write-guard.ts`（那是写面校验，显示层常量放此处会被误读成值域执法）。
+ */
+export const ORG_HOST_AGENT_KIND_SUGGESTIONS = ["claude", "codex", "opencode", "qoder-cn"];
+
+/**
+ * **本组织 agent 配置卡**（v0.9.8 · 按项目组配 agent · 纯 SSR，零新脚本常量）：
+ * 两枚文本框（agentKind / agentModel）**预填该组织当前值**，提交到同一条 `POST /orgs`
+ * 靠隐藏 `action=setHostAgent` 分流（写路由白名单不扩条）；**整体覆盖两键**（不做增量 PATCH，
+ * 留空 = 置 null 恢复全局默认）。回显行 = 每项生效值 + 来源标注（本组织 / 全局默认 / 后端缺省），
+ * 缓解「只配 kind ⇒ 全局 model 对该组织静默失效」（改造文档 §6 遗留，不改成对回落）。
+ * hint 三条固定口径见改造文档 §3（取值热生效等新建桥 / kind 写错 502 指引 / 种子 AGENTS.md 遗留）。
+ * agentKind 一枚带 {@link ORG_HOST_AGENT_KIND_SUGGESTIONS} 的 `<datalist>` 建议下拉（REQ-2026-10-04-01
+ * 增补）：**仍是可手填的文本框**，无 JS / 不支持 datalist 时原生退化为纯文本框。
+ */
+function renderOrgHostAgentCard(
+  org: string,
+  cfg: { orgKind: string | null; orgModel: string | null; globalKind: string | null; globalModel: string | null },
+): string {
+  // 生效值与回落序逐字对齐 `orgBridgeConfig`（R1 命名空间规则：组织配了 kind 未配 model ⇒ 不沿用全局 model）
+  const kindSource = cfg.orgKind !== null ? "本组织" : "全局默认";
+  const effKind = cfg.orgKind ?? cfg.globalKind ?? "（宿主面未装配）";
+  const modelSource =
+    cfg.orgModel !== null ? "本组织" : cfg.orgKind !== null ? "后端缺省" : cfg.globalModel !== null ? "全局默认" : "后端缺省";
+  const effModel =
+    cfg.orgModel ?? (cfg.orgKind === null && cfg.globalModel !== null ? cfg.globalModel : "（后端缺省）");
+  const globalLine =
+    `全局默认：kind = <code>${escapeHtml(cfg.globalKind ?? "（宿主面未装配）")}</code> · ` +
+    `model = <code>${escapeHtml(cfg.globalModel ?? "（未配置 ⇒ 后端缺省）")}</code>`;
+  return cardShell(
+    "本组织 agent 配置",
+    `<span class="mono">POST /orgs</span> · action=setHostAgent`,
+    `<p class="hint">生效值回显：kind = <code>${escapeHtml(effKind)}</code>（来源：${kindSource}）· model = <code>${escapeHtml(effModel)}</code>（来源：${modelSource}）· ${globalLine}。未配置的键回落全局；<b>组织改过 kind 而未配 model ⇒ 不沿用全局 model</b>（全局 model 按全局 kind 命名空间配置，跨适配器必错），由该 kind 适配器的后端缺省接管。</p>
+<form method="post" action="/orgs" class="w" data-submit="已提交，保存配置中…" data-ov="1">
+<input type="hidden" name="action" value="setHostAgent">
+<input type="hidden" name="org" value="${escapeHtml(org)}">
+<label>agentKind（后端适配器）<input name="agentKind" value="${escapeHtml(cfg.orgKind ?? "")}" list="org-host-agent-kind-list" placeholder="留空 = 回落全局默认"></label>
+<datalist id="org-host-agent-kind-list">${ORG_HOST_AGENT_KIND_SUGGESTIONS.map((kind) => `<option value="${escapeHtml(kind)}"></option>`).join("")}</datalist>
+<label>agentModel（后端模型）<input name="agentModel" value="${escapeHtml(cfg.orgModel ?? "")}" placeholder="留空 = 回落全局默认 / 后端缺省"></label>
+<button type="submit">保存 agent 配置</button>
+</form>
+<ul class="hint muted">
+<li>改后对<b>已在线的该组织桥无效</b>：取值热、生效等新建桥 —— 须停桥后下一轮才用新值（与 config.json「仅对新建桥生效」同口径）。</li>
+<li><b>kind 写错</b> ⇒ 该组织下一轮起桥报 502 <code>spawn_failed</code>（页面显示为「宿主桥已断」）；板不预校验值域，<b>停桥改回即可</b>。下拉为<b>板侧维护的建议清单</b>（非闭集）：清单外的值仍可手填；后端新增适配器时需同步本清单。</li>
+<li>建组织种子 <code>AGENTS.md</code> 内的后端标识仍为<b>全局值</b>，不随本配置更新（已知遗留，登记于改造文档 §6）。</li>
+</ul>`,
+  );
+}
+
+/**
  * `GET /org/<名>/manage` **空间内管理页**（v0.9.4 §9-c · REQ-2026-09-27-06 N3）：
  * `/orgs` 组织管理页退役后，逐组织的管理职能落到该组织空间内（复用归一层上下文：
  * 组织不存在 404 / **已停用 410** 同 `org-space.resolveOrgSpaceRoute` 口径，本页只在「在用」组织上渲染）。
@@ -1477,12 +1658,16 @@ ${summary}`,
  * **需求卡** = 归一层已持有的该组需求投影（零新触桥面）；**项目卡** = 逐组只读 `a2a_projects`
  *   （运行态，与声明态成员并存）；项目深链落**空间任务页**
  *   `/org/<名>/tasks?project=…`（v0.9.6 C3：manage 页内 org 已知，不再指全局 `/tasks`）。
- * **纯 SSR**：不挂任何可执行内联脚本（内联脚本闭集六元不动，纪律锚 N3-⑦/⑧）。
+ * **两栏拖拽（v0.9.8 · REQ-2026-10-03-02）**：成员区之下插 {@link renderMemberPoolColumns}（左池 / 右本组），
+ * 手填表单由 {@link renderMemberFormsFold} 折叠收纳（**DOM 原样保留**，无 JS 即常态可见）；
+ * 本页是全站**唯一**注入第七枚内联脚本 {@link MEMBER_DRAG_SCRIPT} 的页（`Page.extraScripts` 页隔离）。
  */
 export function renderOrgSpaceManagePage(input: OrgSpaceManageInput): string {
   return `<h2>管理 · ${escapeHtml(input.org)}</h2>
 ${renderOrgMemberSection(input.org, input.groupsOutcome)}
-${renderMemberForms(input.org)}
+${renderMemberPoolColumns(input.org, input.poolOutcome ?? null, input.groupsOutcome, input.poolSourceCount ?? null)}
+${renderMemberFormsFold(input.org)}
+${renderOrgHostAgentCard(input.org, input.hostAgent ?? { orgKind: null, orgModel: null, globalKind: null, globalModel: null })}
 ${renderDisableOrgCard(input.org)}
 ${renderOrgConfigCheckCard(input.groupsOutcome, input.projectsOutcome)}
 ${renderOrgFeaturesTable(input.features)}
@@ -1604,7 +1789,7 @@ export function buildOrgPortalCards(
  * **件B（REQ-2026-10-02-01 增补）**：正文不再有 `<h2>` 标题（页头 page-head `<h1>` 已承载，去重）。
  * **增补三（REQ-2026-10-02-03）**：一句话摘要行与「ⓘ 门户口径说明」折叠体撤除 —— 正文只剩故障状态行 + 组织卡区 + 建项目组。
  * **零外源脚本**：本视图自身不挂可执行内联脚本；页头按钮的开/关由**已泛化**的
- * `NEW_REQUIREMENT_DIALOG_SCRIPT`（页面脚本闭集**六元**内既有常量，非新增第七枚）随宿主页注入承载。
+ * `NEW_REQUIREMENT_DIALOG_SCRIPT`（页面脚本闭集**七元**内既有常量，非本轮新增的第七枚）随宿主页注入承载。
  */
 export function renderOrgPortal(cards: readonly OrgPortalCard[], orgsStatus?: OrgsDirStatus | null): string {
   const orgsLine =
@@ -1822,7 +2007,7 @@ export function renderVersionBadge(
  *
  * 台账无该版（历史脏列 = 只由卡片派生）⇒ 不出 ×（台账里没有可删的条目）；
  * `released` 条目 ⇒ 不出 ×（已发版为终态、服务端不可删，同增补十的纯只读口径）。
- * 删除类操作不走脚本二次确认（内联脚本闭集六元不扩），由 `title` + `data-submit` 明确文案承担。
+ * 删除类操作不走脚本二次确认（内联脚本闭集枚数不扩），由 `title` + `data-submit` 明确文案承担。
  * **v0.9.6 B3**：条目按 `(org, version)` 取（`org` 省略 = 不限组织）—— 他组织的同版号条目不得
  * 决定本列的 × 出现，也不得被本列的 × 删掉。
  * **v0.9.6 B4**：`org` 非空（空间档）⇒ 表单 `action` 同带空间前缀（口径 4 的同一条通路）——
@@ -2437,6 +2622,8 @@ const ERROR_FAMILY_LABELS: Readonly<Record<string, string>> = {
   board_org_exists: "组织已存在",
   board_org_action_invalid: "组织写动作不合法",
   board_org_disabled: "组织已停用",
+  board_org_host_agent_not_found: "组织不在台账",
+  board_org_host_agent_invalid: "agent 配置表单校验失败",
   board_org_space_not_found: "组织空间不存在",
   board_org_space_gone: "组织空间已关闭（组织停用）",
   board_org_mismatch: "组织空间归属不一致",

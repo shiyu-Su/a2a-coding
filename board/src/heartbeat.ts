@@ -28,6 +28,18 @@
  * - 去重键 `(featureId, stage)`：同一条件只兜底一次，二次不唤（交人裁决）；
  * - 唤醒词显式声明 {@link FALLBACK_WAKE_LABEL}，防正常长任务被误判。
  *
+ * ## ⑥ 交人闸（v0.9.8 心跳自火交人闸）
+ * 点火前经窄读面 {@link HeartbeatDeps.awaitingHeld} 查板侧**当前待澄清的一轮**（`awaiting_answer` ∧
+ * 未被更新轮取代 = `BoardHostFace.awaitingTurnOf`）：存在 ⇒ 本拍对该需求**不自火**（不组装提示词、
+ * 不调 fire、返 `null` 不计入 `fired[]`），保住用户手里的待答问题。
+ * - **绝不记去重键**（`firedKeys` / `scope.record`）：记了会让用户答完后的同一条件**永久失声**；
+ *   挡后下一拍照旧重评；
+ * - 位置在**去重判定之后、组装提示词之前**（不前移到 `readEngine` 之前 ⇒ 不每拍多读盘；不进
+ *   {@link evaluateWake} ⇒ 纯评估器的引擎事实不掺板侧会话态）；
+ * - **fail-closed**：谓词抛错 ⇒ 按「有待澄清轮」处置（不点火）并留痕；
+ * - 未注入谓词 ⇒ 行为零变更（向后兼容，故本字段**必须可选**）；
+ * - 经 `evalTrace` 留一行 `verdict=awaiting-held`。
+ *
  * ## 与 watch 脚本同构
  * 退出判据用 watch-task 同一份闭集 {@link SETTLED_TASK_STATES}（未知 state 一律按「未完成」）。
  * **判据分档（v0.9.5 增补 · D3）**：**有 `pending` 清单 ⇒ 一律按 pending 是否全就绪判**，
@@ -340,6 +352,12 @@ export interface HeartbeatDeps {
   /** 经接力驱动器点火（同 `contextId` 新一轮；**自会自增链内计数**）。 */
   fire(input: HeartbeatFireInput): HeartbeatFireResult;
   relay: HeartbeatRelayView;
+  /**
+   * **交人闸窄读面**（⑥）：该需求当前是否存在「待澄清的一轮」（板侧 `awaiting_answer` ∧ 未被更新轮取代）。
+   * 返回 `true` ⇒ 本拍对该需求**不自火**（见文件头 ⑥）。
+   * **必须可选** —— 装配层之外（含 t9 锚点用例）以字面量 deps 构造心跳，非可选会连带改替身。
+   */
+  awaitingHeld?: (featureId: string) => boolean;
   /** `sweepIdle` 欠账补调用点（同拍驱动空闲回收）。 */
   sweepIdle(): Promise<string[]>;
   /** `ownerGroup` 缺失时的显式回退组织（板级默认）；`null` ⇒ 不猜。 */
@@ -628,6 +646,21 @@ export class Heartbeat {
       );
       return null;
     }
+    // ⑥ 交人闸：本需求有「当前待澄清的一轮」⇒ 本拍不自火（**不记去重键**，答完后同一条件仍可唤）。
+    const held = this.awaitingHeldCheck(featureId);
+    if (held !== "clear") {
+      this.evalTrace(
+        featureId,
+        scope.turnId,
+        key,
+        null,
+        "awaiting-held",
+        held === "threw"
+          ? `交人闸谓词抛错 ⇒ fail-closed 不点火（不记去重位）：${decision.reason}`
+          : `板侧有待澄清轮 ⇒ 本拍不自火，保住用户手里的待答问题（不记去重位）：${decision.reason}`,
+      );
+      return null;
+    }
     const prompt = buildWakePrompt({
       featureId,
       org,
@@ -651,6 +684,21 @@ export class Heartbeat {
     scope.record(key);
     this.evalTrace(featureId, scope.turnId, key, occupant, "fired", `已唤醒（${decision.kind}）：${decision.reason}`);
     return { featureId, key, kind: decision.kind, fired: true, reason: result.reason, occupantTurnId: occupant };
+  }
+
+  /**
+   * ⑥ 交人闸判据（三档）：未注入谓词 ⇒ `"clear"`（行为零变更）；谓词 `true` ⇒ `"held"`；
+   * 谓词抛错 ⇒ `"threw"`，**按「有待澄清轮」处置（fail-closed）**并留痕。
+   */
+  private awaitingHeldCheck(featureId: string): "clear" | "held" | "threw" {
+    const predicate = this.deps.awaitingHeld;
+    if (predicate === undefined) return "clear";
+    try {
+      return predicate(featureId) ? "held" : "clear";
+    } catch (err: unknown) {
+      this.trace(featureId, `交人闸谓词抛错（fail-closed ⇒ 按有待澄清轮处置、不点火）：${errorText(err)}`);
+      return "threw";
+    }
   }
 
   private async readEngine(featureId: string): Promise<HeartbeatEngineSnapshot | null> {

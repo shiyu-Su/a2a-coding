@@ -293,7 +293,7 @@ test("P-④（B5a + 件1 改版 + 件A 改名）GET / = 项目组门户（高亮
       assert.match(homeHtml, /<button type="button" id="new-org-open" class="header-actions" hidden>＋ 建项目组<\/button>/, "页头「＋ 建项目组」按钮（服务端 hidden）");
       assert.match(homeHtml, /<dialog class="fd" id="new-org-dialog">/, "建项目组弹窗骨架");
       assert.match(homeHtml, /<div id="new-org-inline">/, "无 JS 内联回退表单保留");
-      assert.ok(homeHtml.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), "泛化弹窗脚本随门户注入（闭集仍六元）");
+      assert.ok(homeHtml.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), "泛化弹窗脚本随门户注入（闭集仍七元）");
       assert.doesNotMatch(homeHtml, /<script[^>]*src=/, "门户无外源脚本（CSP 未动）");
       assert.doesNotMatch(homeHtml, /id="schedule-board"|id="new-req-dialog"/, "门户不渲染看板正文 / 新增需求骨架");
       // 件B（REQ-2026-10-02-02）：全局口径说明（页底 `ul.notes`）只从门户摘除；其余页保留由 server.test.mjs 正向锚守

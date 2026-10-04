@@ -6,6 +6,7 @@ import {
   parseFeatureDetail,
   parseTrace,
   parseProjects,
+  parseRegistryProjects,
   parseTasks,
   createBridgeClient,
   BridgeResponseError,
@@ -464,4 +465,146 @@ test("createBridgeClient.getProjects / getTasks: 仅 GET + query 编码", async 
   assert.equal(urls[0].method, "GET");
   assert.equal(urls[1].url, "http://127.0.0.1:3300/api/tasks?project=p%2F1&state=working&limit=50");
   assert.equal(urls[1].method, "GET");
+});
+
+// ---------------------------------------------------------------------------
+// v0.9.8 N2（REQ-2026-10-03-02）：GET /api/registry/projects 独立取数面
+// ---------------------------------------------------------------------------
+
+/** 契约形状（C-1…C-6）+ 刻意混入的多余字段（须容忍不消费）。 */
+function registryFixture() {
+  return {
+    ok: true,
+    source: "runners",
+    observedAt: "2026-10-04T00:00:00Z",
+    note: "非实时探测",
+    machines: [
+      {
+        machineId: "m1",
+        runnerId: "m1",
+        runnerState: "online",
+        lastHeartbeatAt: "2026-10-04T00:00:00Z",
+        firstRegisteredAt: "2026-09-01T00:00:00Z",
+        declared: true,
+        inGroup: true,
+        projects: [
+          {
+            projectId: "orch",
+            agentKind: "claude",
+            a2aPort: 3017,
+            status: "online",
+            endpoint: "http://127.0.0.1:3017",
+            startedAt: "2026-10-01T00:00:00Z",
+            lastReportedAt: "2026-10-04T00:00:00Z",
+            ownerGroupName: "g1",
+          },
+          { projectId: "board", lastReportedAt: "2026-10-03T23:00:00Z" },
+        ],
+      },
+      {
+        machineId: "m2",
+        runnerState: "offline",
+        lastHeartbeatAt: "2026-10-02T10:00:00Z",
+        firstRegisteredAt: "2026-09-02T00:00:00Z",
+        projects: [{ projectId: "flow", lastReportedAt: "2026-10-02T10:00:00Z" }],
+      },
+      {
+        machineId: "m3",
+        runnerState: "offline",
+        lastHeartbeatAt: null,
+        firstRegisteredAt: "2026-09-03T00:00:00Z",
+        projects: [],
+      },
+    ],
+    counts: { machines: 3, projects: 3 },
+  };
+}
+
+test("parseRegistryProjects: 展平行数与 counts.projects 一致（在线 / 离线 / 零项目三态机器都在遍历源内）", () => {
+  const view = parseRegistryProjects(registryFixture());
+  const flat = view.machines.flatMap((m) => m.projects);
+  assert.equal(flat.length, view.counts.projects, "展平行数 == counts.projects（项目池左集不再构造性恒空）");
+  assert.equal(view.machines.length, view.counts.machines);
+  assert.deepEqual(view.machines.map((m) => m.machineId), ["m1", "m2", "m3"]);
+  assert.equal(view.machines[1].runnerState, "offline", "C-1：离线机照常列出");
+  assert.equal(view.machines[1].projects.length, 1, "C-1：离线机的项目照常列出");
+  assert.equal(view.machines[2].projects.length, 0, "C-1：注册过但零项目 ⇒ 空数组，不是缺位");
+  assert.equal(flat[0].lastReportedAt, "2026-10-04T00:00:00Z", "C-4：项目级时间键 = lastReportedAt");
+  assert.equal(flat[1].agentKind, null, "缺字段容错 null（不臆造）");
+});
+
+test("parseRegistryProjects: 多余字段容忍不消费（runnerId / declared / inGroup / ownerGroupName 一律不带出）", () => {
+  const view = parseRegistryProjects(registryFixture());
+  assert.deepEqual(Object.keys(view.machines[0]).sort(), ["firstRegisteredAt", "lastHeartbeatAt", "machineId", "projects", "runnerState"]);
+  assert.deepEqual(Object.keys(view.machines[0].projects[0]).sort(), [
+    "a2aPort",
+    "agentKind",
+    "endpoint",
+    "lastReportedAt",
+    "projectId",
+    "startedAt",
+    "status",
+  ]);
+  assert.equal("error" in view.machines[1], false, "机级无 error 字段（离线不发 error 文案）");
+});
+
+test("parseRegistryProjects: 字符串逐字透出（C-3 不 trim、不大小写折叠）", () => {
+  const view = parseRegistryProjects({
+    ok: true,
+    machines: [{ machineId: "  M1_x ", runnerState: "Offline", projects: [{ projectId: " Proj A " }] }],
+  });
+  assert.equal(view.machines[0].machineId, "  M1_x ");
+  assert.equal(view.machines[0].runnerState, "Offline");
+  assert.equal(view.machines[0].projects[0].projectId, " Proj A ");
+});
+
+test("parseRegistryProjects: 缺 machines[] / 非数组 ⇒ 抛 response_invalid（fail-closed，绝不返回空池）", () => {
+  for (const body of [
+    { ok: true },
+    { ok: true, counts: { machines: 0, projects: 0 } },
+    { ok: true, machines: null },
+    { ok: true, machines: "no" },
+    { ok: true, machines: {} },
+  ]) {
+    assert.throws(
+      () => parseRegistryProjects(body),
+      (err) => err instanceof BridgeResponseError && err.code === "response_invalid",
+      `机器/项目面缺失时必须抛，不得归一成空数组：${JSON.stringify(body)}`,
+    );
+  }
+  const empty = parseRegistryProjects({ ok: true, machines: [] });
+  assert.deepEqual(empty.machines, [], "在场且为空 = 真实的零注册机，与「缺字段」可区分");
+});
+
+test("parseRegistryProjects: ok:false 抛并带桥 code；counts 缺键容错 null（不校验、不抛）", () => {
+  assert.throws(
+    () => parseRegistryProjects({ ok: false, code: "registry_unavailable", error: "不可用" }),
+    (err) => err instanceof BridgeResponseError && err.code === "registry_unavailable",
+  );
+  const view = parseRegistryProjects({ ok: true, machines: [{ machineId: "m1", projects: [] }] });
+  assert.deepEqual(view.counts, { machines: null, projects: null });
+  assert.equal(view.source, null);
+});
+
+test("createBridgeClient.getRegistryProjects: 仅 GET /api/registry/projects（无查询、无身份参数）", async () => {
+  const calls = [];
+  const fetchImpl = async (url, init) => {
+    calls.push({ url: String(url), method: init?.method });
+    return new Response(JSON.stringify(registryFixture()), { status: 200 });
+  };
+  const client = createBridgeClient({ baseUrl: "http://127.0.0.1:3300/", fetchImpl });
+  const view = await client.getRegistryProjects();
+  assert.equal(calls.length, 1);
+  assert.equal(calls[0].url, "http://127.0.0.1:3300/api/registry/projects");
+  assert.equal(calls[0].method, "GET");
+  assert.equal(view.counts.projects, 3);
+});
+
+test("createBridgeClient.getRegistryProjects: 桥响应无 machines[] ⇒ reject（不解析成空池）", async () => {
+  const fetchImpl = async () => new Response(JSON.stringify({ ok: true, counts: { machines: 0, projects: 0 } }), { status: 200 });
+  const client = createBridgeClient({ baseUrl: "http://127.0.0.1:3300", fetchImpl });
+  await assert.rejects(
+    () => client.getRegistryProjects(),
+    (err) => err instanceof BridgeResponseError && err.code === "response_invalid",
+  );
 });

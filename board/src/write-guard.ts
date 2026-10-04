@@ -545,9 +545,14 @@ export const ORG_FORM_FIELD = "org";
 export const ORG_ACTION_FIELD = "action";
 export const ORG_ACTION_CREATE = "create";
 export const ORG_ACTION_DISABLE = "disable";
-export type OrgWriteAction = typeof ORG_ACTION_CREATE | typeof ORG_ACTION_DISABLE;
+/** v0.9.8 按项目组配 agent：写本组织 agent 配置两键（同一 `POST /orgs` 分流，白名单不扩条）。 */
+export const ORG_ACTION_SET_HOST_AGENT = "setHostAgent";
+export type OrgWriteAction =
+  | typeof ORG_ACTION_CREATE
+  | typeof ORG_ACTION_DISABLE
+  | typeof ORG_ACTION_SET_HOST_AGENT;
 
-/** 动作值不在闭集（既非 create 也非 disable）的结构化错误码（400）—— 不猜动作。 */
+/** 动作值不在闭集的结构化错误码（400）—— 不猜动作。 */
 export const ORG_ACTION_INVALID_CODE = "board_org_action_invalid";
 
 export type OrgFormOk = { ok: true; name: string; action: OrgWriteAction };
@@ -572,15 +577,78 @@ export function parseOrgForm(raw: string, contentLength?: number): OrgFormResult
   if (!name.ok) return { ok: false, status: 400, code: name.code, error: name.error };
   const rawAction = (f.get(ORG_ACTION_FIELD) ?? "").trim();
   if (rawAction === "") return { ok: true, name: name.name, action: ORG_ACTION_CREATE };
-  if (rawAction === ORG_ACTION_CREATE || rawAction === ORG_ACTION_DISABLE) {
+  if (rawAction === ORG_ACTION_CREATE || rawAction === ORG_ACTION_DISABLE || rawAction === ORG_ACTION_SET_HOST_AGENT) {
     return { ok: true, name: name.name, action: rawAction };
   }
   return {
     ok: false,
     status: 400,
     code: ORG_ACTION_INVALID_CODE,
-    error: `组织写动作不合法：${rawAction} ⇒ 闭集 = ${ORG_ACTION_CREATE} / ${ORG_ACTION_DISABLE}（不猜动作）`,
+    error:
+      `组织写动作不合法：${rawAction} ⇒ 闭集 = ${ORG_ACTION_CREATE} / ${ORG_ACTION_DISABLE} / ` +
+      `${ORG_ACTION_SET_HOST_AGENT}（不猜动作）`,
   };
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.8 按项目组配 agent：本组织 agent 配置写表单（POST /orgs 的 action=setHostAgent 分支）
+// ---------------------------------------------------------------------------
+
+/** 本组织 agent 配置两键的表单字段名。 */
+export const ORG_HOST_AGENT_KIND_FIELD = "agentKind";
+export const ORG_HOST_AGENT_MODEL_FIELD = "agentModel";
+
+/** 字段缺失 / 超 8 KiB 上限 ⇒ 结构化错误码（400 —— **刻意非 413**：单字段超限不豁免整体 body 预算）。 */
+export const ORG_HOST_AGENT_INVALID_CODE = "board_org_host_agent_invalid";
+
+export type OrgHostAgentFormOk = {
+  ok: true;
+  /** 已 `trim()` 的适配器名；空串 / 纯空白 / 缺键 ⇒ null（= 置回全局回落）。 */
+  agentKind: string | null;
+  /** 已 `trim()` 的模型名；空串 / 纯空白 / 缺键 ⇒ null。 */
+  agentModel: string | null;
+};
+export type OrgHostAgentFormFail = { ok: false; status: 400 | 413; code: string; error: string };
+export type OrgHostAgentFormResult = OrgHostAgentFormOk | OrgHostAgentFormFail;
+
+/**
+ * urlencoded 表单 → {agentKind, agentModel}（与 {@link parseMemberForm} 同款口径，**纯函数**）：
+ * - 整体 body 预算同其余写表单（超 {@link MAX_REQUIREMENT_BODY_BYTES} ⇒ 413）；
+ * - **单字段独立上限** {@link MAX_TURN_SUPPLEMENT_BYTES}（8 KiB，按 utf8 字节计）⇒ 超限 400
+ *   {@link ORG_HOST_AGENT_INVALID_CODE}（非 413 —— 与补充说明字段同口径）；
+ * - 空串 / 纯空白 ⇒ **null**（提交即整体覆盖：留空 = 恢复全局默认，不做增量 PATCH）；
+ * - 目标组织名不在本函数校验（经 {@link parseOrgForm} 的 `org` 字段走 `validateOrgName` 单一事实源）。
+ */
+export function parseOrgHostAgentForm(raw: string, contentLength?: number): OrgHostAgentFormResult {
+  if (
+    (contentLength !== undefined && contentLength > MAX_REQUIREMENT_BODY_BYTES) ||
+    Buffer.byteLength(raw, "utf8") > MAX_REQUIREMENT_BODY_BYTES
+  ) {
+    return { ok: false, status: 413, code: "payload_too_large", error: "请求体超过板写面上限（256 KiB）" };
+  }
+  const f = new URLSearchParams(raw);
+  const field = (name: string): string | null => {
+    const value = (f.get(name) ?? "").trim();
+    const bytes = Buffer.byteLength(value, "utf8");
+    if (bytes > MAX_TURN_SUPPLEMENT_BYTES) {
+      throw new Error(`${name} 超过单字段上限：${String(bytes)} 字节 > ${String(MAX_TURN_SUPPLEMENT_BYTES)} 字节`);
+    }
+    return value === "" ? null : value;
+  };
+  let agentKind: string | null;
+  let agentModel: string | null;
+  try {
+    agentKind = field(ORG_HOST_AGENT_KIND_FIELD);
+    agentModel = field(ORG_HOST_AGENT_MODEL_FIELD);
+  } catch (err) {
+    return {
+      ok: false,
+      status: 400,
+      code: ORG_HOST_AGENT_INVALID_CODE,
+      error: err instanceof Error ? err.message : String(err),
+    };
+  }
+  return { ok: true, agentKind, agentModel };
 }
 
 // ---------------------------------------------------------------------------

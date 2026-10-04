@@ -382,7 +382,7 @@ test("BD2-①（§9-b 翻向 · §9-c 再翻）建组织表单渲染锚在门户
     assert.match(home.text, /<label>项目组名 \*<input name="org" required/, "字段名 = write-guard.ORG_FORM_FIELD = org（标签文案 v0.9.7 增补改「项目组名」，字段名不变）");
     assert.match(home.text, /中文 \/ 字母（Latin）\/ 数字/, "闭集 hint 上板");
     assert.match(home.text, /不触桥、不写状态机、不写 machine 配置/, "写面口径上板");
-    assert.doesNotMatch(home.text, /<script src>/, "无外源脚本（§9.5 复用的仍是既有六元常量，未引入新枚）");
+    assert.doesNotMatch(home.text, /<script src>/, "无外源脚本（§9.5 复用的仍是既有七元闭集内的常量，未引入新枚）");
     const res = await fetch(`${base}/orgs`, { redirect: "manual" });
     assert.equal(res.status, 303, "§9-c：/orgs 页退役 ⇒ 无任何页面结构可断言（原「不再渲染表单」的负向锚升级为整页下架）");
     assert.equal(res.headers.get("location"), "/");

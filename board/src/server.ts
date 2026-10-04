@@ -167,6 +167,8 @@ import {
   MAX_REQUIREMENT_BODY_BYTES,
   ORG_EXISTS_CODE,
   ORG_ACTION_DISABLE,
+  ORG_ACTION_SET_HOST_AGENT,
+  parseOrgHostAgentForm,
   MEMBER_ACTION_ADD,
   VERSION_ACTION_CREATE,
   VERSION_ACTION_REMOVE,
@@ -194,7 +196,7 @@ import {
   type GroupMemberWriteOutcome,
   type GroupMemberWriteOptions,
 } from "./group-admin.js";
-import { OrgsLedgerStore, defaultOrgsLedgerFile, enabledOrgNames, ledgerOrgNames, disabledOrgNames, isOrgDisabled } from "./orgs-ledger.js";
+import { OrgsLedgerStore, defaultOrgsLedgerFile, enabledOrgNames, findOrgRecord, ledgerOrgNames, disabledOrgNames, isOrgDisabled } from "./orgs-ledger.js";
 import { VersionsLedgerStore, defaultVersionsLedgerFile, findVersionRecord, ledgerVersionNames, releasedVersionNames, type VersionOrgFilter, type VersionsLedger } from "./versions-ledger.js";
 import { SuspendLedgerStore, defaultSuspendLedgerFile, type SuspendedEntry } from "./suspend-ledger.js";
 import {
@@ -211,16 +213,19 @@ import { docsMoveRegistrations, executeDocsMove, planDocsMove, type DocsMoveResu
 import { defaultStaticRoot, findVendoredAsset, VENDORED_ASSETS, MERMAID_ASSET, mermaidAssetScriptTag, mermaidRenderScript, vendoredAssetExists } from "./docs-render.js";
 import { renderDependencyGraphSection } from "./graph-view.js";
 import {
+  computeProjectPool,
   createOrgGroupsFetcher,
   createOrgProjectsFetcher,
   featuresOfOrg,
   listOrgDirs,
   portalOrgNames,
+  poolRowsFromSnapshot,
   type GroupRow,
   type OrgGroupsFetcher,
   type OrgGroupsOutcome,
   type OrgProjectsFetcher,
   type OrgProjectsOutcome,
+  type ProjectSnapshotOutcome,
 } from "./orgs-view.js";
 import {
   ORG_SPACE_GONE_CODE,
@@ -260,6 +265,7 @@ import {
   FEATURE_DETAIL_OVERLAY_SCRIPT,
   NEW_REQUIREMENT_DIALOG_SCRIPT,
   DRAG_SCHEDULE_SCRIPT,
+  MEMBER_DRAG_SCRIPT,
   type ErrorOverlayField,
   type ErrorOverlayParams,
   type NavKey,
@@ -786,7 +792,7 @@ function renderScheduleBoard(
  * REQ-2026-09-26-04 Q1：新增需求弹窗脚本同页、同 extraScripts 通路注入（两枚各管各的 dialog）。
  * v0.9.3 B-T5：排期拖拽脚本同页、同通路（第三枚，常量分立不可共置；无 #schedule-board 的页面自然空转）。
  * v0.9.4 增补六 §9.5：弹窗脚本已泛化为两枚 dialog 共用 ⇒ 门户 `/` 亦注入**同一枚**
- * `NEW_REQUIREMENT_DIALOG_SCRIPT`（那边接 `#new-org-dialog`），故本常量注入点由一处变两处；闭集仍六元。
+ * `NEW_REQUIREMENT_DIALOG_SCRIPT`（那边接 `#new-org-dialog`），故本常量注入点由一处变两处；闭集枚数不扩。
  * v0.9.3 增补 ②：浮层换入的详情页依赖图/文档 mermaid 不经脚本执行（搬运节点不跑 `<script>`）⇒
  * 本页同挂 vendored 库 + 渲染脚本，浮层经 window.a2aRenderMermaid 钩子补渲（缺资产 ⇒ 不挂，源文本降级）。
  */
@@ -809,13 +815,13 @@ function schedulePageScripts(ctx: Ctx): string {
  * `/org/<名>/`（D 档空间），点卡即达；建组织 = 页头按钮（**服务端 `hidden`**，无 JS 不显死按钮）
  * + {@link renderCreateOrgDialog} 骨架（正文另留 `#new-org-inline` 内联回退表单）；
  * 写口仍 `POST /orgs` **零改动**。开/关 = `NEW_REQUIREMENT_DIALOG_SCRIPT`（§9.5 已泛化为两枚
- * dialog 共用，闭集**六元不扩**）。
+ * dialog 共用，闭集枚数不扩）。
  * **v0.9.4 W6（§2.6）→ 增补七 a（§9.1-a）**：「＋ 新版本」按钮曾挂在本页页头，现**迁往排期看板**
  * （`/schedule` 页头，全站唯一入口）—— 本页不再渲染该按钮（弹窗脚本内的 `wireNewVersion` 因无此 id 空转）。
  * **不注入**排期看板的浮层 / 拖拽 / mermaid 三枚脚本（它们随 `/schedule` 走）。
  * **B6**：门户不另挂组清单（件1 起全站唯一处 = 侧栏二级菜单）；卡增「已发版 / 进行中」版本摘要行
  * （台账只读喂入，纯读面不做自动点亮，派生档带 `*`）。
- * 内联脚本闭集保持**六元**（N3-⑦/⑧ 纪律锚；门户新增的这点脚本是既有第六枚内的泛化，非新枚）。
+ * 内联脚本闭集保持**七元**（N3-⑦/⑧ 纪律锚；门户新增的这点脚本是既有第五枚内的泛化，非新枚）。
  * **件B（REQ-2026-10-02-02）**：门户不收全站口径说明（页底 `ul.notes`）—— 经 `noNotes` 单点开关摘除
  * （`VIEW_NOTES` 常量与数据源不动，其余 `sendPage` 调用点照旧渲染；增补三 件B 起排期页同挂本开关）。
  */
@@ -1934,13 +1940,37 @@ async function pageOrgSpaceManage(ctx: Ctx, org: string, all: readonly FeatureLi
           code: "org_query_failed",
           error: err instanceof Error ? err.message : String(err),
         }));
-  const [groups, projects] = await Promise.all([groupsOutcome, projectsOutcome]);
+  // v0.9.8 项目池恒空修复（REQ-2026-10-03-02 · N3）：左栏「项目池」= **注册表全量机器项目** − 全组声明面。
+  // 左集换源为 N2 的 `getRegistryProjects()`（`GET /api/registry/projects`，遍历源 = runners 表，含离线机项目、
+  // 无组布尔）。旧面 `getProjects()`（`/api/projects`）在服务端是**全组声明成员的并集**，与减集
+  // （`/api/groups`，同样是声明面）**同域 ⇒ 差集构造性恒空**（无组归属者根本进不了左集）；换源后
+  // 未归属项才落到池面。**减集仍取 `/api/groups`**（组声明面），板为**唯一**差集执行处（B-7）。
+  // 读失败 / 形状不合（缺 `machines[]` ⇒ `parseRegistryProjects` fail-closed 抛出）⇒ 快照 `ok=false`，
+  // 由 `computeProjectPool` 连带降级（**不给假池、更不降级成空池**），页面其余照常。
+  // **`await` 在 try 内**：快照读的任何失败（含同步抛出 —— 注入的 client 缺该方法即 TypeError）
+  // 一律收口为降级；否则整页 502（本区四档灰化先例：单面不可用不炸页）。
+  const snapshotOutcome = (async (): Promise<ProjectSnapshotOutcome> => {
+    try {
+      const view = await ctx.client.getRegistryProjects();
+      return { ok: true, rows: poolRowsFromSnapshot(view), observedAt: view.observedAt };
+    } catch (err: unknown) {
+      return { ok: false, code: "snapshot_unreachable", error: errText(err) };
+    }
+  })();
+  const [groups, projects, snapshot] = await Promise.all([groupsOutcome, projectsOutcome, snapshotOutcome]);
+  const poolOutcome = computeProjectPool(snapshot, groups);
+  // v0.9.8 按项目组配 agent：配置卡数据源 = 本次已读台账记录 + configView（零新读面；宿主面未装配 ⇒ 全局两键 null）
+  const orgRec = findOrgRecord(ctx.orgsLedger.load().ledger, org);
+  const faceConfig = ctx.host === null ? null : ctx.host.configView();
   return {
     title: `空间 · ${org} · 管理`,
     active: SPACE_ACTIVE,
     orgNav,
     // 增补四 件B（REQ-2026-10-02-04）：管理页不收全站口径说明（复用 `noNotes` 单点开关；成员写回执入口复用本函数 ⇒ 两入口同效）
     noNotes: true,
+    // v0.9.8 两栏拖拽（REQ-2026-10-03-02）：第七枚脚本**仅本页**注入（页隔离由入口守卫 `#member-pool` 承担；
+    // 成员写成功回执也复用本函数 ⇒ 回执页同样可继续拖拽）
+    extraScripts: MEMBER_DRAG_SCRIPT,
     bodyHtml:
       renderSpaceNav(org, "manage") +
       renderOrgSpaceManagePage({
@@ -1948,6 +1978,15 @@ async function pageOrgSpaceManage(ctx: Ctx, org: string, all: readonly FeatureLi
         features: featuresOfOrg(all, org),
         groupsOutcome: groups,
         projectsOutcome: projects,
+        poolOutcome,
+        // B-3（REQ-2026-10-03-02）：左集规模只服务空态两分支的字面（不入差集、不参与判定）。
+        poolSourceCount: snapshot.ok ? snapshot.rows.length : null,
+        hostAgent: {
+          orgKind: orgRec?.agentKind ?? null,
+          orgModel: orgRec?.agentModel ?? null,
+          globalKind: faceConfig?.kind ?? null,
+          globalModel: faceConfig?.hostModel ?? null,
+        },
       }),
   };
 }
@@ -2243,6 +2282,12 @@ async function handleWriteOrg(req: IncomingMessage, res: ServerResponse, ctx: Ct
     await handleDisableOrg(res, headers, ctx, form.name, body);
     return;
   }
+  // ③″ v0.9.8 按项目组配 agent：`setHostAgent` 只写台账两键，**不建组织** ⇒ 必须先于 orgsDir 根闸与
+  // 三源重名闸 return（照 disable 先例；漏分流转而会走建组织）。
+  if (form.action === ORG_ACTION_SET_HOST_AGENT) {
+    await handleSetOrgHostAgent(res, headers, ctx, form.name, body);
+    return;
+  }
   // ③ 写入前置闸：组织目录**根必须存在**（diagnoseOrgsDir 口径；未配置与不可用是两回事，**根不代建、不回落**）
   const orgsDir = ctx.docs.orgsDir;
   if (orgsDir === null) {
@@ -2417,6 +2462,76 @@ async function handleDisableOrg(
     return;
   }
   res.writeHead(303, { location: "/", "cache-control": "no-store" });
+  res.end();
+}
+
+// ---------------------------------------------------------------------------
+// v0.9.8 按项目组配 agent：POST /orgs 的 action=setHostAgent 分支（写本组织 agent 配置两键）
+// ---------------------------------------------------------------------------
+
+/** 目标组织不在板台账 ⇒ 结构化错误码（404）。 */
+const ORG_HOST_AGENT_NOT_FOUND = "board_org_host_agent_not_found";
+
+/**
+ * 写本组织 agent 配置（`agentKind` / `agentModel` 两键，**整体覆盖**，留空 = 置 null 恢复全局回落）。
+ * 由 {@link handleWriteOrg} 在 disable 分流之后、orgsDir 根闸与三源重名闸**之前**转进来
+ * （本分支不建组织、不碰目录，两道建组织闸与本分支无关）：
+ * - 目标组织判据：**在台账**（不在 ⇒ 404 {@link ORG_HOST_AGENT_NOT_FOUND}）∧ **未停用**
+ *   （已停用 ⇒ 409 `board_org_disabled`，恢复配置须先同名复活）；
+ * - 成功 = {@link OrgsLedgerStore.setOrgHostAgent} 一次 RMW 写两键（板唯一台账写封装）；
+ * - 回显：JSON ⇒ 200，表单 ⇒ **303 回本组织管理页**（配置卡就在本页，PRG 刷新不重复写）。
+ */
+async function handleSetOrgHostAgent(
+  res: ServerResponse,
+  headers: Record<string, string | undefined>,
+  ctx: Ctx,
+  name: string,
+  body: string,
+): Promise<void> {
+  const form = parseOrgHostAgentForm(body, Number(headers["content-length"] ?? NaN));
+  if (!form.ok) {
+    respondError(res, headers.accept, form.status, form.code, form.error, undefined, orgBackfillFields(body));
+    return;
+  }
+  const { ledger } = ctx.orgsLedger.load();
+  const rec = findOrgRecord(ledger, name);
+  if (rec === null) {
+    respondError(
+      res,
+      headers.accept,
+      404,
+      ORG_HOST_AGENT_NOT_FOUND,
+      `组织 ${name} 不在板台账 ⇒ 没有可写 agent 配置的记录（先建组织，再配置）`,
+      undefined,
+      orgBackfillFields(body),
+    );
+    return;
+  }
+  if (rec.disabledAt !== null) {
+    respondError(
+      res,
+      headers.accept,
+      409,
+      ORG_DISABLED,
+      `组织 ${name} 已停用 ⇒ 不改其 agent 配置；恢复 = 同名重新建组织（复活保留旧配置）`,
+      undefined,
+      orgBackfillFields(body),
+    );
+    return;
+  }
+  const written = ctx.orgsLedger.setOrgHostAgent(name, form.agentKind, form.agentModel);
+  const accept = headers.accept ?? "";
+  if (accept.includes("application/json")) {
+    respondJson(res, 200, {
+      ok: true,
+      org: name,
+      agentKind: written.found ? form.agentKind : null,
+      agentModel: written.found ? form.agentModel : null,
+      ledgerFile: ctx.orgsLedger.file,
+    });
+    return;
+  }
+  res.writeHead(303, { location: orgSpaceLink(name, "manage"), "cache-control": "no-store" });
   res.end();
 }
 

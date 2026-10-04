@@ -10,11 +10,17 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join } from "node:path";
+import { fileURLToPath } from "node:url";
 
-import { renderTasksPick, renderTasks, renderOrgSpaceManagePage } from "../dist/web/views.js";
+import {
+  renderTasksPick,
+  renderTasks,
+  renderOrgSpaceManagePage,
+  ORG_HOST_AGENT_KIND_SUGGESTIONS,
+} from "../dist/web/views.js";
 import { LAST_MEMBER_REMOVE_CODE, LAST_MEMBER_REMOVE_DISPLAY } from "../dist/group-admin.js";
 import { createBoardServer } from "../dist/server.js";
 
@@ -100,8 +106,102 @@ test("件5-③（管理页 · 正常态）：成员表卡 + 双表单卡 + 末�
   );
   assert.ok(html.includes(LAST_MEMBER_REMOVE_DISPLAY), "警示条文案 = 常量逐字（锚同步不重写）");
   assert.match(html, /<p class="b-note ok">配置齐备 · 上次核对时间 2026-10-02T01:00:00\.000Z<\/p>/, "两源齐备 ⇒ 正常态一行");
-  assert.equal((html.match(/data-ov="1"/g) ?? []).length, 3, "写面浮层档闭集不劣化（加 / 删 / 停用恰三枚）");
+  assert.equal((html.match(/data-ov="1"/g) ?? []).length, 4, "写面浮层档闭集不劣化（加 / 删 / 停用 / agent 配置恰四枚，v0.9.8 增补）");
   assert.match(html, /<form method="post" action="\/orgs" class="inline" data-submit="已提交，停用中…" data-ov="1" data-ov-redirect="\/">/, "停用表单标记逐字不动");
+});
+
+test("v0.9.8-agent 配置卡（已配档）：预填当前值 + 来源标注「本组织」；只配 kind ⇒ model 标「后端缺省」（不沿用全局）", () => {
+  const html = renderOrgSpaceManagePage({
+    org: "alpha",
+    features: [],
+    projectsOutcome: null,
+    groupsOutcome: null,
+    hostAgent: { orgKind: "qoder", orgModel: null, globalKind: "claude", globalModel: "glob-m" },
+  });
+  assert.match(html, /<input type="hidden" name="action" value="setHostAgent">/, "分流到既有 POST /orgs（白名单不扩条）");
+  assert.match(html, /<label>agentKind（后端适配器）<input name="agentKind" value="qoder"/, "kind 预填当前值");
+  assert.match(html, /<label>agentModel（后端模型）<input name="agentModel" value=""/, "model 未配 ⇒ 预填空串");
+  assert.match(html, /kind = <code>qoder<\/code>（来源：本组织）/, "回显标「本组织」");
+  assert.match(html, /model = <code>（后端缺省）<\/code>（来源：后端缺省）/, "只配 kind ⇒ 全局 model 不沿用（回显缓解静默失效，改造文档 §6）");
+  assert.match(html, /全局默认：kind = <code>claude<\/code> · model = <code>glob-m<\/code>/, "全局默认值随卡回显");
+  assert.match(html, /停桥后下一轮才用新值/, "hint① 生效口径");
+  assert.match(html, /502 <code>spawn_failed<\/code>/, "hint② kind 写错指引");
+  assert.match(html, /AGENTS\.md<\/code> 内的后端标识仍为<b>全局值<\/b>/, "hint③ 种子 AGENTS.md 遗留");
+});
+
+test("v0.9.8-agent 配置卡（未配档）：两键 null ⇒ 空预填 + 回落全局回显；宿主面未装配如实标注不伪装", () => {
+  const html = renderOrgSpaceManagePage({
+    org: "alpha",
+    features: [],
+    projectsOutcome: null,
+    groupsOutcome: null,
+    hostAgent: { orgKind: null, orgModel: null, globalKind: "claude", globalModel: null },
+  });
+  assert.match(html, /kind = <code>claude<\/code>（来源：全局默认）/, "kind 未配 ⇒ 回显全局值");
+  assert.match(html, /model = <code>（后端缺省）<\/code>（来源：后端缺省）/, "全局 hostModel 未配置 ⇒ 后端缺省");
+  assert.match(html, /placeholder="留空 = 回落全局默认"/, "留空语义写进 placeholder");
+  const absent = renderOrgSpaceManagePage({ org: "alpha", features: [], projectsOutcome: null, groupsOutcome: null });
+  assert.match(absent, /kind = <code>（宿主面未装配）<\/code>/, "省略 hostAgent（宿主面未装配）⇒ 不伪装成有全局值");
+});
+
+test("v0.9.8-增补（REQ-2026-10-04-01）：agentKind 带板侧建议下拉 —— list 属性 + 同 form 内 datalist 四条 option", () => {
+  const html = renderOrgSpaceManagePage({
+    org: "alpha",
+    features: [],
+    projectsOutcome: null,
+    groupsOutcome: null,
+    hostAgent: { orgKind: "claude", orgModel: null, globalKind: "claude", globalModel: null },
+  });
+  assert.match(
+    html,
+    /<label>agentKind（后端适配器）<input name="agentKind" value="claude" list="org-host-agent-kind-list" placeholder="留空 = 回落全局默认"><\/label>/,
+    "input 仅追加 list（name / value / placeholder 与属性序不动）",
+  );
+  assert.match(
+    html,
+    /<\/label>\n<datalist id="org-host-agent-kind-list">/,
+    "datalist 紧随该 label 之后（同一 form 内）",
+  );
+  assert.match(
+    html,
+    /<datalist id="org-host-agent-kind-list"><option value="claude"><\/option><option value="codex"><\/option><option value="opencode"><\/option><option value="qoder-cn"><\/option><\/datalist>/,
+    "四条 option = 板侧常量逐字（序 = 字母序，用户裁定①）",
+  );
+  assert.match(
+    html,
+    /<\/datalist>\n<label>agentModel（后端模型）/,
+    "datalist 落在 agentKind 与 agentModel 之间（agentModel 一字未改）",
+  );
+  assert.match(
+    html,
+    /下拉为<b>板侧维护的建议清单<\/b>（非闭集）：清单外的值仍可手填；后端新增适配器时需同步本清单。<\/li>/,
+    "hint② 尾部追加建议清单口径（措辞中性、板侧自持，裁定②）",
+  );
+  assert.match(
+    html,
+    /<datalist id="org-host-agent-kind-list">[\s\S]*?<button type="submit">保存 agent 配置<\/button>\n<\/form>/,
+    "datalist 仍在该 form 内（提交钮与 </form> 均在其后）",
+  );
+});
+
+test("v0.9.8-增补 K-5（优先档）：板侧建议清单 == 规范源 PROTOCOL.md `agent-kinds` 锚点（集合比对，不比顺序）", () => {
+  // 路径按 test 文件自身位置解析：board/test → board → 仓根（不依赖 process.cwd()）
+  const protocolPath = join(dirname(fileURLToPath(import.meta.url)), "..", "..", "PROTOCOL.md");
+  const protocol = readFileSync(protocolPath, "utf8");
+  const m = /^<!--\s*agent-kinds:\s*(.+?)\s*-->$/m.exec(protocol);
+  assert.ok(m !== null, `${protocolPath} 未匹配到机器可解析规范源锚点 \`<!-- agent-kinds: … -->\`（锚点格式变更须同步本断言）`);
+  const specKinds = m[1].split(",").map((s) => s.trim()).filter(Boolean);
+  assert.notEqual(specKinds.length, 0, `锚点捕获到空清单（原值 = ${JSON.stringify(m[1])}）`);
+  assert.deepEqual(
+    [...ORG_HOST_AGENT_KIND_SUGGESTIONS].sort(),
+    [...specKinds].sort(),
+    "板侧建议清单与规范源集合不一致（后端新增 / 更名适配器后须同步 ORG_HOST_AGENT_KIND_SUGGESTIONS）",
+  );
+  assert.deepEqual(
+    ORG_HOST_AGENT_KIND_SUGGESTIONS,
+    [...ORG_HOST_AGENT_KIND_SUGGESTIONS].sort(),
+    "板侧清单序 = 字母序（用户裁定①，不得改成后端声明序）",
+  );
 });
 
 test("件5-③b（管理页 · warn 档）：warnings 落配置核对卡警示条，仍纯呈现", () => {

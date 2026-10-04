@@ -219,7 +219,7 @@ test("BD3-①（拒删闸 · 正向）：无活跃桥 ⇒ 停用 303 回组织�
     const res = await postOrg(base, { action: "disable", org: "停用组" }, FORM_ORIGIN(base));
     assert.equal(res.status, 303);
     assert.equal(res.headers.get("location"), "/", "§9.4-②：停用 303 落点 = 组织门户 /（不再回已退役的 /orgs）");
-    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "停用组", disabledAt: NOW_ISO }]);
+    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "停用组", disabledAt: NOW_ISO, agentKind: null, agentModel: null }]);
     assert.equal(existsSync(join(env.orgsRoot, "停用组")), true, "停用 = 台账标记，不得物理删组织目录");
   }, { hostFace: fakeHostFace({ bridges: [{ org: "停用组", state: "exited" }] }) });
 });
@@ -284,7 +284,7 @@ test("§9.4-①（停用释放成员 · 序列）：停用先调 O1 group.remove
     assert.equal(release.calls.length, 1, "停用恰调一次释放（不经成员表单）");
     assert.deepEqual(release.calls[0].input, { groupName: "释放组" }, "入参 = {groupName}（group.remove 不消费成员集）");
     assert.equal(release.calls[0].options.group, "释放组", "组身份 = 目标组织名（显式身份）");
-    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "释放组", disabledAt: NOW_ISO }], "台账在 O1 成功后才落");
+    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "释放组", disabledAt: NOW_ISO, agentKind: null, agentModel: null }], "台账在 O1 成功后才落");
   }, { hostFace: fakeHostFace({}), release });
 });
 
@@ -325,7 +325,7 @@ test("§9.4-①（组段不存在 · 幂等放行）：O1 回 changed:false 成�
     assert.equal(res.status, 200, "组段本不存在 = 无成员可释放 ⇒ 幂等放行视为成功");
     const json = await res.json();
     assert.equal(json.membersReleased, false, "changed:false 如实回显（无实际变更）");
-    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "空组", disabledAt: NOW_ISO }]);
+    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "空组", disabledAt: NOW_ISO, agentKind: null, agentModel: null }]);
   }, { hostFace: fakeHostFace({}), release });
 });
 
@@ -404,7 +404,7 @@ test("BD3-③（过滤 · 页面 · §9-c 翻向）：在用组织管理页给�
     const text = await on.text();
     assert.match(text, /<input type="hidden" name="action" value="disable">/, "停用 = 同一条 POST /orgs 的动作分流");
     assert.match(text, /action="\/orgs"[\s\S]*?<input type="hidden" name="org" value="在用组"/, "在用组织管理页给停用按钮");
-    assert.doesNotMatch(text, /<script src>/, "纯 SSR：零新脚本常量（N3 六元闭集不动）");
+    assert.doesNotMatch(text, /<script src>/, "纯 SSR：零新脚本常量（N3 七元闭集不动）");
 
     const off = await fetch(`${base}/org/${encodeURIComponent("停用组")}/manage`);
     assert.equal(off.status, 410, "停用组织的空间不再开放 ⇒ 管理页同档位（不另立「置灰」形态）");
@@ -427,7 +427,7 @@ test("BD3-③b（过滤 · 查重豁免）：停用名同名重建 = 复活（30
     assert.equal(res.status, 201, "停用名豁免三源查重 ⇒ 同名重建放行");
     const json = await res.json();
     assert.equal(json.org, "复活组");
-    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "复活组", disabledAt: null }]);
+    assert.deepEqual(readLedgerOrgs(env.ledgerFile), [{ org: "复活组", disabledAt: null, agentKind: null, agentModel: null }]);
     assert.equal(existsSync(join(env.orgsRoot, "复活组")), true, "零迁移：目录原样");
     // 复活后回到在用态 ⇒ 再次同名 = BD1 幂等拒
     const dup = await postOrg(base, { org: "复活组" }, JSON_HEADERS);

@@ -23,6 +23,7 @@
  * | `/api/tasks/:taskId` | `store.getQueuedTask`（本地库只读） | 单任务详情（含三时刻 + 队列四字段；见下「已知偏离」） |
  * | `/api/events?since=&limit=&featureId=` | `store.listEvents({ since, limit, featureId })` | **直连 store**；游标由前端传参；`featureId` = 按需求收窄（v0.9.0 B3″，仍纯读） |
  * | `/api/groups` | `loadMachinesConfig(configPath).groups`（每请求现读） | **全组枚举**（v0.9.4 O2）：组结构声明面（`projectGroup` 段），与 `/api/projects`（运行态）语义不同，刻意不合并；配置坏 → 500 `machines_config_error` |
+ * | `/api/registry/projects` | `store.listRunners` + `store.listRunnerProjects`（每请求现读，直连） | **注册表全量投影**（REQ-2026-10-03-02）：`runners` 表遍历源，含离线机与其项目，**未经组过滤、无组语义**；与 `/api/projects` 两条读路刻意不交叉复用（C-6） |
  *
  * ## 硬约束：读事件**绝不移动宿主收件箱游标**
  *
@@ -67,8 +68,13 @@
  */
 import { createServer as createHttpServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
-import { getQueuedTask, listEvents } from "../../session/store.js";
-import type { QueueState, QueuedTaskRecord } from "../../session/store.js";
+import { getQueuedTask, listEvents, listRunnerProjects, listRunners } from "../../session/store.js";
+import type {
+  QueueState,
+  QueuedTaskRecord,
+  RunnerProjectRecord,
+  RunnerState,
+} from "../../session/store.js";
 import type {
   EventRecord,
   ProjectGroup,
@@ -107,6 +113,9 @@ const PROJECTS_NOTE =
   "快照语义：由桥注册表（Runner 上报投影 runners / runner_projects）派生 + 观测时间；非实时在线";
 const EVENTS_NOTE = "游标由前端传参（since）；本接面不读写宿主 a2a_events 收件箱游标";
 const GROUPS_SOURCE = "config.json `projectGroup` 段（每请求现读，热改即时生效）";
+const REGISTRY_PROJECTS_SOURCE = "桥注册表（Runner 上报全量投影，未经组过滤）";
+const REGISTRY_PROJECTS_NOTE =
+  "全量投影语义：遍历源 = runners 注册表（含离线机及其项目、含零项目机），未经组过滤、不认识组；非实时在线探测，项目陈旧性以 lastReportedAt（最后一次 Runner 上报时刻）表达";
 
 /** 网页端最小内核依赖（`Pick<BridgeCore, …>`：N4 直接传完整 core，结构性兼容） */
 export type WebCore = Pick<BridgeCore, "projects" | "tasks" | "featureStatus">;
@@ -156,6 +165,28 @@ export interface ProjectView {
   status: ProjectStatus["status"];
   endpoint: string | null;
   startedAt: string | null;
+}
+
+/**
+ * `GET /api/registry/projects` 项目级出参（REQ-2026-10-03-02 C-4 / C-5）：
+ * `ProjectView` 六字段**逐字兼容**（板可复用现有渲染类型），其上仅加
+ * `lastReportedAt` = `runner_projects.updated_at`（每次 Runner 全量上报统一盖章 ⇒ 「最后上报于」）。
+ */
+export interface RegistryProjectView extends ProjectView {
+  lastReportedAt: string;
+}
+
+/**
+ * `GET /api/registry/projects` 机级出参（遍历源 = `runners` 表）。
+ * **无 `error` 字段**（离线机照常列出其项目，不发错误文案）；**无 `runnerId`**（注册即恒等
+ * `machineId`，`ON CONFLICT(machine_id)` 单行 ⇒ 纯冗余）。
+ */
+export interface RegistryMachineView {
+  machineId: string;
+  runnerState: RunnerState;
+  lastHeartbeatAt: string;
+  firstRegisteredAt: string;
+  projects: RegistryProjectView[];
 }
 
 /** 单任务详情出参（**渲染层白名单**：本地库字段，无 workspace 绝对路径 / 无 agentConfig） */
@@ -263,7 +294,7 @@ export async function startWebTransport(
     bridgeLog.error("a2a-bridge", `网页接面错误：${toMessage(err)}`);
   });
   bridgeLog.info("a2a-bridge", `只读网页接面已监听 http://${host}:${boundPort}/`, {
-    api: "/api/projects, /api/features, /api/tasks, /api/events, /api/groups",
+    api: "/api/projects, /api/features, /api/tasks, /api/events, /api/groups, /api/registry/projects",
     refreshMs: resolveRefreshMs(options.refreshMs),
   });
 
@@ -345,11 +376,14 @@ type WebRoute =
   | { kind: "featureTrace"; featureId: string }
   | { kind: "tasks"; taskId: string | null }
   | { kind: "events" }
-  | { kind: "groups" };
+  | { kind: "groups" }
+  | { kind: "registryProjects" };
 
 const FEATURES_PREFIX = "/api/features/";
 const TRACE_SUFFIX = "/trace";
 const TASKS_PREFIX = "/api/tasks/";
+/** 注册表全量投影路径（REQ-2026-10-03-02 C-1…C-6；无查询参数、无身份参数） */
+const REGISTRY_PROJECTS_PATH = "/api/registry/projects";
 
 function matchRoute(path: string): WebRoute | null {
   if (path === "/api/projects") return { kind: "projects" };
@@ -371,6 +405,7 @@ function matchRoute(path: string): WebRoute | null {
   }
   if (path === "/api/events") return { kind: "events" };
   if (path === "/api/groups") return { kind: "groups" };
+  if (path === REGISTRY_PROJECTS_PATH) return { kind: "registryProjects" };
   return null;
 }
 
@@ -445,6 +480,9 @@ async function handleRequest(
       return;
     case "groups":
       sendGroups(res, options);
+      return;
+    case "registryProjects":
+      sendRegistryProjects(res);
       return;
   }
 }
@@ -755,6 +793,80 @@ function toGroupView(group: ProjectGroup): GroupView {
     members.push({ machineId: m.machineId, projectId: m.projectId });
   }
   return { name: group.name, memberCount: members.length, members };
+}
+
+/**
+ * `GET /api/registry/projects`：**注册表全量投影只读面**（REQ-2026-10-03-02，契约 C-1…C-6）。
+ *
+ * 存在理由：`/api/projects` 走 `handleProjects`，其机器遍历源是 **config `machines[]` 且经组过滤**
+ * ⇒ 板侧「注册表全集 − 组成员」的差集与减集同域、构造性恒空。本面把遍历源换成 `runners` 表，
+ * 让差集的左集真正等于「上报过的全量」。
+ *
+ * - **C-1 遍历源 = `runners` 表**：在线机 ✅；离线机 ✅ 且其项目照常列出（机级 `runnerState=offline`
+ *   + `lastHeartbeatAt`，**不发 `error` 文案**）；注册过但零项目 ✅ `projects: []`；
+ *   config 里有但**从未注册**的机器 ❌ 不出现（本面不表「配置里有谁」）；
+ * - **C-2 零组语义**：出参不含 `declared` / `inGroup` / `group` / `groups` / `ownerGroupName`
+ *   或任何「是否属于某组」的布尔 —— 本面对组的唯一关系 = **不认识**（组视野仍只由
+ *   `/api/projects` 默认档与 MCP `a2a_projects` 承载）；
+ * - **C-3 字符串逐字透出**：不 trim、不大小写折叠、不做任何规范化；
+ * - **C-6 与 `/api/projects` 两条读路不交叉复用**：直连 `listRunners` / `listRunnerProjects`
+ *   （每请求现读，与 `loadMachines()` 同纪律），**不经 `core.projects()` / `handleProjects`**；
+ * - **无查询参数、无身份参数**：3300 = 运维全量视图、非身份面（§2.7 口径，照 `sendGroups`）；
+ * - **不刷新注册表、不加 TTL**：陈旧性由 `lastReportedAt` 表达（板侧提示「最后上报于 …」）；
+ * - 注册表读失败（库损坏 / 非法列值）⇒ 500 `registry_read_error`，**绝不 fail-open 成空池**。
+ */
+function sendRegistryProjects(res: ServerResponse): void {
+  // 观测时刻：内存态（不落库）；先取时刻再取数据 = 「本次观测的时刻」
+  const observedAt = new Date().toISOString();
+  let machines: RegistryMachineView[];
+  let projectCount: number;
+  try {
+    machines = [];
+    projectCount = 0;
+    for (const runner of listRunners()) {
+      // 项目行的外键键 = `runner_id`（注册时 `runnerId = machineId`，见 `bridge/runner.ts`）
+      const records = listRunnerProjects(runner.runnerId);
+      projectCount += records.length;
+      machines.push({
+        machineId: runner.machineId,
+        runnerState: runner.state,
+        lastHeartbeatAt: runner.lastHeartbeatAt,
+        firstRegisteredAt: runner.registeredAt,
+        projects: records.map(toRegistryProjectView),
+      });
+    }
+  } catch (err) {
+    respondJson(res, 500, {
+      ...failure("registry_read_error", `读取 Runner 注册表失败：${toMessage(err)}`),
+      source: REGISTRY_PROJECTS_SOURCE,
+      observedAt,
+    });
+    return;
+  }
+  respondJson(res, 200, {
+    ok: true,
+    source: REGISTRY_PROJECTS_SOURCE,
+    observedAt,
+    note: REGISTRY_PROJECTS_NOTE,
+    machines,
+    counts: { machines: machines.length, projects: projectCount },
+  });
+}
+
+/**
+ * Runner 项目行 → 渲染层视图（**逐字段显式取值**，白名单之外一律不出口：`workspace`（绝对路径）、
+ * `risk`、`runnerId` 均不出口；形状与 `toProjectView` 同款防御）。
+ */
+function toRegistryProjectView(project: RunnerProjectRecord): RegistryProjectView {
+  return {
+    projectId: project.projectId,
+    agentKind: project.agentKind,
+    a2aPort: project.a2aPort,
+    status: project.status,
+    endpoint: project.endpoint,
+    startedAt: project.startedAt,
+    lastReportedAt: project.updatedAt,
+  };
 }
 
 // ---------------------------------------------------------------------------

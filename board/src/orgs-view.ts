@@ -14,7 +14,7 @@
 import { readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { callToolRaw, McpConfigError } from "./mcp-client.js";
-import type { FeatureListItem } from "./bridge-client.js";
+import type { FeatureListItem, RegistryProjectsView } from "./bridge-client.js";
 import type { DirKindProbeFn } from "./host-runtime.js";
 import { statDirKind } from "./host-runtime.js";
 
@@ -354,4 +354,102 @@ export function createOrgGroupsFetcher(options: OrgGroupsFetcherOptions): OrgGro
       return { ok: false, code: timedOut ? "groups_timeout" : "groups_unreachable", error: message };
     }
   };
+}
+
+// ---------------------------------------------------------------------------
+// 项目池集合差（v0.9.8 两栏拖拽增删项目 · REQ-2026-10-03-02 · 纯函数）
+// ---------------------------------------------------------------------------
+
+/**
+ * 池的一行 = 一个**机器项目对**（键形与 O1 成员对 `{machineId, projectId}` 一致）。
+ * 机段随行保留：配对 / 去重按 (machineId, projectId)，**绝不塌成裸 projectId 集**。
+ * `lastReportedAt` = 该行在项目池里的唯一时间提示位（显示层「最后上报于」，非实时探测；供 N4 消费）；
+ * 仍**不带**运行态字段（agentKind / status / runnerState / online 归下方「项目」区，两栏不重复）。
+ */
+export interface PoolProjectRow {
+  machineId: string;
+  projectId: string;
+  /** 项目最后一次上报时刻（注册表 `runnerProjectsReplace` 写入）；缺键 ⇒ null。 */
+  lastReportedAt: string | null;
+}
+
+/**
+ * 成员对 / 项目对的复合键（两侧各 trim，口径同 `group-admin.isSameMemberPair` 的「trim 后逐字相等」）。
+ * 用 `JSON.stringify` 而非拼接分隔符 —— 定长分隔符会被含该字符的 id 伪造出撞键（machine 与 project 两段各转义）。
+ */
+export function memberPairKey(machineId: string, projectId: string): string {
+  return JSON.stringify([machineId.trim(), projectId.trim()]);
+}
+
+/**
+ * 项目池集合差（**纯函数**）：注册表全量机器项目 − 全组（**含本组**）声明面成员对。
+ * - 去重键 = {@link memberPairKey}（同一机同 projectId 在快照里只出现一次，跨组声明面可重复）；
+ * - `lastReportedAt` 随行透传（作池行时间提示，不参与配对键）；
+ * - 输入顺序不保证 ⇒ 输出按 (machineId, projectId) 字典序，与渲染同单点（避免逐次渲染抖动）；
+ * - **「池里不显示」只是显示过滤，不是写入闸门** —— 执法仍在桥 O1 原子拒 + 板 409
+ *   `board_member_group_conflict`（REQ-2026-10-03-02 §3.1 分层口径）。
+ */
+export function poolProjects(
+  allProjects: readonly PoolProjectRow[],
+  groups: readonly GroupRow[],
+): PoolProjectRow[] {
+  const owned = new Set<string>();
+  for (const g of groups) {
+    for (const m of g.members) owned.add(memberPairKey(m.machineId, m.projectId));
+  }
+  const seen = new Set<string>();
+  const rows: PoolProjectRow[] = [];
+  for (const p of allProjects) {
+    const key = memberPairKey(p.machineId, p.projectId);
+    if (owned.has(key) || seen.has(key)) continue;
+    seen.add(key);
+    rows.push({ machineId: p.machineId.trim(), projectId: p.projectId.trim(), lastReportedAt: p.lastReportedAt });
+  }
+  return rows.sort((a, b) => {
+    if (a.machineId !== b.machineId) return a.machineId < b.machineId ? -1 : 1;
+    if (a.projectId === b.projectId) return 0;
+    return a.projectId < b.projectId ? -1 : 1;
+  });
+}
+
+/** 注册表全量机器项目快照的读取结论（`ctx.client.getRegistryProjects()` 出口；`ok=false` = 快照不可用）。 */
+export type ProjectSnapshotOutcome =
+  | { ok: true; rows: PoolProjectRow[]; observedAt: string | null }
+  | { ok: false; code: string; error: string };
+
+/**
+ * 池区的降级结论（视图入参）：任一侧读不到 ⇒ `ok=false`，视图整块灰化并回落到手填表单常态。
+ * `ok:true ∧ rows=[]` 是**真实空池**（全量项目已全部归属某组），与「不可用」不得混写。
+ */
+export type OrgPoolOutcome =
+  | { ok: true; rows: PoolProjectRow[]; observedAt: string | null }
+  | { ok: false; code: string; error: string };
+
+/**
+ * 组装池（**纯函数**，快照 / 声明面两源任一缺席即降级，不臆造空池）：
+ * 声明面 `null` = 查询器未装配、`ok=false` = 3300 宕机 / 配置坏 —— 两种情形下「哪些项目已归属」**未知**，
+ * 此时若把全量项目当池渲染，会把别组项目重新摆上池面（REQ-2026-10-03-02 用户裁「完全不显示」的反面）。
+ */
+export function computeProjectPool(snapshot: ProjectSnapshotOutcome, groups: OrgGroupsOutcome | null): OrgPoolOutcome {
+  if (!snapshot.ok) return { ok: false, code: snapshot.code, error: snapshot.error };
+  if (groups === null) return { ok: false, code: "groups_not_configured", error: "全组枚举查询器未装配 ⇒ 项目归属未知" };
+  if (!groups.ok) return { ok: false, code: groups.code, error: groups.error };
+  return { ok: true, rows: poolProjects(snapshot.rows, groups.groups), observedAt: snapshot.observedAt };
+}
+
+/**
+ * 注册表全量机器项目快照（`getRegistryProjects()` 的 `machines[].projects[]`）→ 池候选行（**纯投影**）。
+ * 遍历源 = runners 表：在线机与**离线机**的项目一视同仁入行（B-8：归属事实面，不因 runnerState 过滤）；
+ * 机段随行保留（不塌成裸 projectId），并透传 `lastReportedAt` 作池行时间提示。
+ * 注册表面**无机器级 `error` 条目**（离线机不发 error 文案），故无需 error 分支 —— 快照健康度由
+ * `parseRegistryProjects` 的 fail-closed（缺 `machines[]` ⇒ 抛错）在读取侧承载，本函数只投影键，不臆造也不过滤。
+ */
+export function poolRowsFromSnapshot(view: RegistryProjectsView): PoolProjectRow[] {
+  const rows: PoolProjectRow[] = [];
+  for (const machine of view.machines) {
+    for (const project of machine.projects) {
+      rows.push({ machineId: machine.machineId, projectId: project.projectId, lastReportedAt: project.lastReportedAt });
+    }
+  }
+  return rows;
 }

@@ -37,7 +37,7 @@ import type { ChainStateSnapshot } from "./derive.js";
 import type { EngineStateProbe, HostRelay } from "./host-relay.js";
 import { SuspendLedgerStore, defaultSuspendLedgerFile } from "./suspend-ledger.js";
 import { type Heartbeat, createHeartbeat } from "./heartbeat.js";
-import { OrgsLedgerStore, defaultOrgsLedgerFile, isOrgDisabled as ledgerIsOrgDisabled } from "./orgs-ledger.js";
+import { OrgsLedgerStore, defaultOrgsLedgerFile, findOrgRecord, isOrgDisabled as ledgerIsOrgDisabled } from "./orgs-ledger.js";
 import {
   VersionsLedgerStore,
   defaultVersionsLedgerFile,
@@ -143,6 +143,11 @@ export function buildHostFace(input: {
    */
   isOrgDisabled?: (org: string) => boolean;
   /**
+   * **本组织 agent 配置现读闭包**（v0.9.8 · 按项目组配 agent）：单闭包一次读台账同时返回
+   * {kind, model} 两键（不拆两次读）；未注入 ⇒ 起桥取值恒全局（逐字节同 v0.9.7）。
+   */
+  orgHostAgent?: (org: string) => { kind: string | null; model: string | null };
+  /**
    * **v0.9.5 C3 只读引擎态探针**：接力的点火判据（收口后一跳 `getFeature` 重取
    * `state/stage/approval`）。由 `main()` 用读面 `BridgeClient` 装配后传入；
    * 未注入 ⇒ 接力决策判不了引擎态 ⇒ 保守停链（既有行为不变）。
@@ -162,6 +167,7 @@ export function buildHostFace(input: {
     ...(input.turnTimeoutMs !== undefined ? { turnTimeoutMs: input.turnTimeoutMs } : {}),
     ...(input.hostModel !== undefined ? { hostModel: input.hostModel } : {}),
     ...(input.isOrgDisabled !== undefined ? { isOrgDisabled: input.isOrgDisabled } : {}),
+    ...(input.orgHostAgent !== undefined ? { orgHostAgent: input.orgHostAgent } : {}),
     ...(input.engineProbe !== undefined ? { engineProbe: input.engineProbe } : {}),
     ...(input.chainSnapshot !== undefined ? { chainSnapshot: input.chainSnapshot } : {}),
     mcpUrlFor: (org: string) => defaultMcpUrlForOrg(org, input.mcpBaseUrl),
@@ -254,6 +260,12 @@ async function main(): Promise<void> {
     ...(cfg.turnTimeoutMs !== null ? { turnTimeoutMs: cfg.turnTimeoutMs } : {}),
     ...(cfg.hostModel !== null ? { hostModel: cfg.hostModel } : {}),
     isOrgDisabled: (org) => ledgerIsOrgDisabled(orgsLedger.load().ledger, org),
+    // v0.9.8 按项目组配 agent：单闭包一次读台账同时取 {kind, model}（照上条 isOrgDisabled 现读先例；
+    // 装配点唯一 ⇒ 触发建桥与轮内重拉桥两条路同值）。
+    orgHostAgent: (org) => {
+      const rec = findOrgRecord(orgsLedger.load().ledger, org);
+      return { kind: rec?.agentKind ?? null, model: rec?.agentModel ?? null };
+    },
     engineProbe,
     // v0.9.5 增补二 · D2：链状态行只读快照（relay / 台账 / 心跳晚绑定，故用可变盒）
     chainSnapshot: (featureId) => composeChainSnapshot(chainSources, featureId),
@@ -379,16 +391,21 @@ async function main(): Promise<void> {
       },
       fire: (input) => hostFace.face.wakeTurn(input),
       relay,
+      // ⑥ 交人闸：板侧有「当前待澄清的一轮」⇒ 心跳不自火。判据 = awaitingTurnOf（含取代校验，
+      // 与详情页回答框同源）；**不得**换成 latestTurnOf / 扫台账 —— 陈旧 awaiting 残留会把心跳永久焊死。
+      awaitingHeld: (featureId) => hostFace.face.awaitingTurnOf(featureId) !== null,
       sweepIdle: () => hostFace.bridges.sweepIdle(),
       defaultOrg: group,
       log: relayLog,
     });
     chainSources.heartbeat = heartbeat;
     heartbeat.start();
+    // 时间戳前缀按 write 落一个（`patchStreamTimestamp` 不拆行）⇒ 横幅每行必须各自一次 write，不得合并。
     process.stdout.write(
       "心跳监视已装配（v0.9.5 C8）：单 setInterval 扫 suspended 台账 + 自动 armed 目标；命中经接力点火" +
         "（同 contextId 新一轮，计入链内计数）；同条件只唤一次；顺带驱动 sweepIdle 空闲回收\n",
     );
+    process.stdout.write("板侧口径：本需求有待澄清轮（等你回答）⇒ 心跳不自火，回答后下一拍照旧重评\n");
   }
 
   // BD13″ 优雅停机（SIGINT / SIGTERM 与 POST /shutdown **共用一条链**，重入幂等）：

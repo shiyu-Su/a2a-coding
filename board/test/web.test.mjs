@@ -216,7 +216,7 @@ test("轨14-守卫脚本：一段内联 · 零外源 · 零求值 · 只作用�
   assert.match(SUBMIT_GUARD_SCRIPT, /\.disabled = true/, "禁用的是提交按钮");
 });
 
-// --- v0.9.4 增补二 §9.1-②：data-ov 写表单的 fetch 报错呈现（闭集六元内扩写，不新枚） -------
+// --- v0.9.4 增补二 §9.1-②：data-ov 写表单的 fetch 报错呈现（闭集七元内扩写，不新枚） -------
 
 test("增补二/五-守卫脚本扩写：data-ov 表单 = fetch 提交 · 成功按 data-ov-redirect 跳转（缺省 reload）· 4xx 抽 .err-ov-card 浮层不跳页 · 让位已拦截事件", () => {
   const s = SUBMIT_GUARD_SCRIPT;
@@ -229,7 +229,7 @@ test("增补二/五-守卫脚本扩写：data-ov 表单 = fetch 提交 · 成功
   assert.match(s, /ovShowCard\(card\)/, "失败不跳页：卡叠加为 body 直接子元素");
   assert.match(s, /e\.defaultPrevented/, "详情浮层 / 新增需求弹窗已拦截时让位（不抢事件）");
   assert.match(s, /data-ov-pending/, "提交标记防连点双发");
-  assert.doesNotMatch(s, /getElementById\("(feat-dialog|new-req-dialog|schedule-board|err-ov)"\)/, "不踩其它五枚常量的单点标记（N3-⑦ 闭集归类唯一）");
+  assert.doesNotMatch(s, /getElementById\("(feat-dialog|new-req-dialog|schedule-board|err-ov|member-pool)"\)/, "不踩其它六枚常量的单点标记（N3-⑦ 闭集归类唯一）");
 });
 
 // --- v0.9.4 增补三 §9.2：form.action 同名遮蔽修复（双锚 = 正向取属性 + 负向禁直读） -------
@@ -243,7 +243,7 @@ test("增补三-ovSubmit 目标 URL = getAttribute(\"action\") 属性值 · 空 
   assert.match(s, /if \(data === null \|\| action === ""\) \{ ovRestore\(form\); form\.submit\(\); return; \}/, "action 属性缺失 ⇒ 回落原生提交（不劣化）");
 });
 
-// --- v0.9.4 增补四 §9.3：浮层卡「知道了」委托关闭（闭集六元内扩写，不新枚） -------
+// --- v0.9.4 增补四 §9.3：浮层卡「知道了」委托关闭（闭集七元内扩写，不新枚） -------
 
 test("增补四-守卫脚本扩写：document 级委托摘 .err-ov-card「知道了」（closest 口径对齐 /schedule 侧）", () => {
   const s = SUBMIT_GUARD_SCRIPT;
@@ -251,8 +251,8 @@ test("增补四-守卫脚本扩写：document 级委托摘 .err-ov-card「知道
   assert.match(s, /closest\("#err-ov-close"\)/, "只认「知道了」按钮（与 /schedule 侧浮层脚本同款 id 判据）");
   assert.match(s, /closest\("\.err-ov-card"\)/, "委托关闭 = closest + err-ov-card 组合");
   assert.match(s, /card\.parentNode\.removeChild\(card\)/, "命中 ⇒ 从 DOM 摘除该卡片");
-  // 闭集六元不扩：不引入其它五枚常量的单点标记
-  assert.doesNotMatch(s, /getElementById\("(feat-dialog|new-req-dialog|schedule-board|err-ov)"\)/, "不踩其余五枚常量归类标记（N3-⑦ 闭集唯一）");
+  // 闭集七元不扩：不引入其它六枚常量的单点标记
+  assert.doesNotMatch(s, /getElementById\("(feat-dialog|new-req-dialog|schedule-board|err-ov|member-pool)"\)/, "不踩其余六枚常量归类标记（N3-⑦ 闭集唯一）");
 });
 
 test("增补三-负向锚：三枚 fetch 拦截常量直读 form.action 零出现（遮蔽缺陷防复发）", () => {
@@ -267,7 +267,7 @@ test("增补三-负向锚：三枚 fetch 拦截常量直读 form.action 零出�
 
 test("增补二-表单标记：manage 成员增删 / 停用 + 门户建组织带 data-ov=\"1\"（其余写表单不扩）", () => {
   const manage = renderOrgSpaceManagePage({ org: "alpha", features: [], projectsOutcome: null, groupsOutcome: null });
-  assert.equal((manage.match(/data-ov="1"/g) ?? []).length, 3, "加 / 删 / 停用三枚表单");
+  assert.equal((manage.match(/data-ov="1"/g) ?? []).length, 4, "加 / 删 / 停用 / agent 配置四枚表单（v0.9.8 按项目组配 agent +1）");
   assert.match(manage, /action="\/orgs\/alpha\/members"[^>]*data-ov="1"/);
   assert.match(manage, /action="\/orgs" class="inline" data-submit="已提交，停用中…" data-ov="1" data-ov-redirect="\/"/, "停用表单带 data-ov-redirect=/（§9.4-② 成功跳门户）");
   const portal = renderOrgPortal(buildOrgPortalCards(["甲"], []));

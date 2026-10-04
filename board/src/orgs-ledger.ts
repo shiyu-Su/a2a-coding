@@ -13,19 +13,25 @@ import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
 import { writeFileAtomic } from "./host-bridge-ledger.js";
 
-/** 台账 schema 版本（未来加字段时用于迁移判定）。 */
-export const ORGS_LEDGER_VERSION = 1;
+/** 台账 schema 版本（v0.9.8：记录扩 `agentKind`/`agentModel` 两键 ⇒ 1→2。**零迁移** —— 读侧不设版本门、
+ * 不做读时升级（{@link parseOrgsLedger} 保留文件自带 version，{@link serializeOrgsLedger} 恒写本常量
+ * ⇒ 旧 v1 文件读到即认、下次落盘自动升 2；口径同 `versions-ledger.ts` 序列化注释）。 */
+export const ORGS_LEDGER_VERSION = 2;
 
 /** 缺省台账落点：`<board>/.data/orgs.json`（`.data/` 已在 `.gitignore`）。 */
 export function defaultOrgsLedgerFile(cwd: string = process.cwd()): string {
   return join(resolve(cwd), ".data", "orgs.json");
 }
 
-/** 一个组织一条记录；本台账**唯一**承载的状态 = 停用时刻（null ⇒ 未停用）。 */
+/** 一个组织一条记录；停用时刻 + **本组织 agent 配置两键**（v0.9.8 · 按项目组配 agent）。 */
 export interface OrgLedgerRecord {
   org: string;
   /** ISO 时刻；null = 未停用。停用写入见 {@link disableOrg}（BD3 A3）。 */
   disabledAt: string | null;
+  /** 本组织后端适配器（agentKind）；null = 未配 ⇒ 起桥回落全局 kind。 */
+  agentKind: string | null;
+  /** 本组织宿主后端模型（agentModel）；null = 未配 ⇒ 起桥回落全局 hostModel / 后端缺省。 */
+  agentModel: string | null;
 }
 
 export interface OrgsLedger {
@@ -45,13 +51,21 @@ function str(v: unknown): string | null {
   return typeof v === "string" && v.trim() !== "" ? v.trim() : null;
 }
 
-/** 单条记录的容错解析（org 缺失 / 空白 ⇒ null；disabledAt 非字符串 ⇒ null，**不臆造**）。 */
+/**
+ * 单条记录的容错解析（org 缺失 / 空白 ⇒ null；disabledAt / agentKind / agentModel 非字符串或空白 ⇒ null，
+ * **不臆造**）。两 agent 键**恒写显式 null 不省略**（照 versions 台账形态；旧 v1 文件无这两键 ⇒ 读到即 null）。
+ */
 export function parseOrgRecord(input: unknown): OrgLedgerRecord | null {
   if (typeof input !== "object" || input === null || Array.isArray(input)) return null;
   const r = input as Record<string, unknown>;
   const org = str(r.org);
   if (org === null) return null;
-  return { org, disabledAt: typeof r.disabledAt === "string" ? r.disabledAt : null };
+  return {
+    org,
+    disabledAt: typeof r.disabledAt === "string" ? r.disabledAt : null,
+    agentKind: str(r.agentKind),
+    agentModel: str(r.agentModel),
+  };
 }
 
 /** 整本台账的容错解析（坏 JSON / 非对象 ⇒ 空台账；同名记录后读到覆盖前者）。 */
@@ -89,18 +103,24 @@ export function ledgerOrgNames(ledger: OrgsLedger): string[] {
 
 /**
  * 建组织（**纯函数**）：
- * - 同名记录不存在 ⇒ 追加 `{org, disabledAt: null}`，`added: true`；
+ * - 同名记录不存在 ⇒ 追加 `{org, disabledAt: null, agentKind: null, agentModel: null}`，`added: true`；
  * - 同名记录**已停用** ⇒ **复活**为未停用（`disabledAt = null`），同样 `added: true` —— 这是 A3 的
  *   「不物理删目录 ⇒ 同名重建零迁移」：目录与工作区原样不动，台账只把停用标记抹掉；
+ *   **复活保留旧 agent 配置**（v0.9.8 用户裁①：spread 既有记录，只改 `disabledAt`）；
  * - 同名记录**未停用** ⇒ 原样返回 + `added: false`（重名闸在 handler 层已先行拒绝，这里只是幂等兜底）。
  */
 export function addOrg(ledger: OrgsLedger, org: string): { ledger: OrgsLedger; added: boolean } {
   const index = ledger.orgs.findIndex((o) => o.org === org);
-  if (index < 0) return { ledger: { version: ledger.version, orgs: [...ledger.orgs, { org, disabledAt: null }] }, added: true };
+  if (index < 0) {
+    return {
+      ledger: { version: ledger.version, orgs: [...ledger.orgs, { org, disabledAt: null, agentKind: null, agentModel: null }] },
+      added: true,
+    };
+  }
   const existing = ledger.orgs[index] as OrgLedgerRecord;
   if (existing.disabledAt === null) return { ledger, added: false };
   const next = [...ledger.orgs];
-  next[index] = { org, disabledAt: null };
+  next[index] = { ...existing, disabledAt: null };
   return { ledger: { version: ledger.version, orgs: next }, added: true };
 }
 
@@ -116,12 +136,38 @@ export function disableOrg(
   disabledAt: string,
 ): { ledger: OrgsLedger; changed: boolean } {
   const index = ledger.orgs.findIndex((o) => o.org === org);
-  if (index < 0) return { ledger: { version: ledger.version, orgs: [...ledger.orgs, { org, disabledAt }] }, changed: true };
+  if (index < 0) {
+    return {
+      ledger: { version: ledger.version, orgs: [...ledger.orgs, { org, disabledAt, agentKind: null, agentModel: null }] },
+      changed: true,
+    };
+  }
   const existing = ledger.orgs[index] as OrgLedgerRecord;
   if (existing.disabledAt !== null) return { ledger, changed: false };
   const next = [...ledger.orgs];
-  next[index] = { org: existing.org, disabledAt };
+  // spread 保留既有键（v0.9.8：停用不得吞掉本组织 agent 配置 —— 复活时照旧生效，用户裁①的另一半）
+  next[index] = { ...existing, disabledAt };
   return { ledger: { version: ledger.version, orgs: next }, changed: true };
+}
+
+/**
+ * 写本组织 agent 配置两键（v0.9.8 · 按项目组配 agent，**纯函数**）：**整体覆盖**（传 null = 置 null =
+ * 恢复全局回落），不做增量 PATCH。
+ * - 记录不存在 ⇒ 原样返回 + `found: false`（目标组织「须在台账」由 handler 判 404）；
+ * - 命中 ⇒ 只改 `agentKind` / `agentModel` 两键（spread 保留 `disabledAt` 等其余键），**不改动入参**。
+ */
+export function setOrgHostAgent(
+  ledger: OrgsLedger,
+  org: string,
+  agentKind: string | null,
+  agentModel: string | null,
+): { ledger: OrgsLedger; found: boolean } {
+  const index = ledger.orgs.findIndex((o) => o.org === org);
+  if (index < 0) return { ledger, found: false };
+  const existing = ledger.orgs[index] as OrgLedgerRecord;
+  const next = [...ledger.orgs];
+  next[index] = { ...existing, agentKind, agentModel };
+  return { ledger: { version: ledger.version, orgs: next }, found: true };
 }
 
 /** 该组织是否已停用（**唯一判据** = 台账里有记录且 `disabledAt !== null`；无记录 ⇒ 未停用）。 */
@@ -188,6 +234,21 @@ export class OrgsLedgerStore {
     const { ledger } = this.load();
     const next = disableOrg(ledger, org, now());
     if (next.changed) this.save(next.ledger);
+    return next;
+  }
+
+  /**
+   * 一次 read-modify-write 写本组织 agent 配置两键（v0.9.8 · 板唯一台账写封装之一）：
+   * 记录不在台账 ⇒ `found: false`，**文件零写**（404 语义由 handler 承担）。
+   */
+  setOrgHostAgent(
+    org: string,
+    agentKind: string | null,
+    agentModel: string | null,
+  ): { ledger: OrgsLedger; found: boolean } {
+    const { ledger } = this.load();
+    const next = setOrgHostAgent(ledger, org, agentKind, agentModel);
+    if (next.found) this.save(next.ledger);
     return next;
   }
 }

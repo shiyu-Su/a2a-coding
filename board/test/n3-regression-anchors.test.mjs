@@ -12,9 +12,11 @@
  * ② 浮层三锚（N2）：排期页含 `<dialog` 骨架（详情浮层 + 新增需求弹窗）；开关脚本 = 单点内联字面量
  *    常量（`^<script>`、无 `src=`、不含用户数据）；卡片保留 `<a href="/features/:id">` 无 JS 回退。
  * ③ 纪律钉（本需求最重要的长效锚，BD14 mermaid 白名单先例模式复制）：
- *    「全站 `src/**` 可执行内联脚本字面量清单 ⊆ {提交守卫, err-ov 关闭, mermaid 渲染, 浮层开关, 新增需求弹窗, 排期拖拽}」
+ *    「全站 `src/**` 可执行内联脚本字面量清单 ⊆ {提交守卫, err-ov 关闭, mermaid 渲染, 浮层开关, 新增需求弹窗, 排期拖拽, 成员两栏拖拽}」
  *    —— 防 JS 野长；mermaid 的 `<script type="application/json">` 数据通道不是可执行脚本，不在闭集。
- *    v0.9.3 B-T5 起闭集 = **六元**（新增「排期拖拽」`DRAG_SCHEDULE_SCRIPT`，与弹窗常量分立、不可共置）。
+ *    v0.9.3 B-T5 起增「排期拖拽」`DRAG_SCHEDULE_SCRIPT`（当时六枚，与弹窗常量分立、不可共置）；
+ *    **v0.9.8 REQ-2026-10-03-02 起 = 七元**（新增「成员两栏拖拽」`MEMBER_DRAG_SCRIPT`，
+ *    与排期拖拽常量分立、不可共置 —— 那枚的入口守卫 `#schedule-board` 不因其扩）。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -26,6 +28,7 @@ import { fileURLToPath } from "node:url";
 import {
   DRAG_SCHEDULE_SCRIPT,
   FEATURE_DETAIL_OVERLAY_SCRIPT,
+  MEMBER_DRAG_SCRIPT,
   NEW_REQUIREMENT_DIALOG_SCRIPT,
   SUBMIT_GUARD_SCRIPT,
 } from "../dist/web/layout.js";
@@ -182,7 +185,7 @@ test("N3-②（§9-b 翻向 · §9.5 泛化 · B5a 重指空间排期页）`/org
     assert.match(alias.text, /<dialog class="fd" id="new-req-dialog">/, "看板 = 新增需求弹窗骨架");
     assert.doesNotMatch(root.text, /id="new-req-dialog"/, "门户不渲染新增需求骨架（提需求在空间排期页）");
     assert.doesNotMatch(alias.text, /id="new-org-dialog"/, "看板不渲染建项目组骨架");
-    assert.doesNotMatch(root.text, /<script[^>]*src=/, "门户无外源脚本（CSP 未动；闭集仍六元）");
+    assert.doesNotMatch(root.text, /<script[^>]*src=/, "门户无外源脚本（CSP 未动；闭集仍七元）");
   });
 });
 
@@ -342,7 +345,12 @@ test("N3-⑤c（B5a 新增 · C1 收编 /tasks）退役页非 GET ⇒ 405 且文
 // ---------------------------------------------------------------------------
 
 test("N3-⑥ 浮层/弹窗/拖拽脚本 = 单点内联字面量常量（规格钉：^<script>、无 src=、可执行体不含用户数据插值）", async () => {
-  for (const script of [FEATURE_DETAIL_OVERLAY_SCRIPT, NEW_REQUIREMENT_DIALOG_SCRIPT, DRAG_SCHEDULE_SCRIPT]) {
+  for (const script of [
+    FEATURE_DETAIL_OVERLAY_SCRIPT,
+    NEW_REQUIREMENT_DIALOG_SCRIPT,
+    DRAG_SCHEDULE_SCRIPT,
+    MEMBER_DRAG_SCRIPT,
+  ]) {
     assert.match(script, /^<script>/);
     assert.match(script, /<\/script>$/);
     assert.doesNotMatch(script, /<script[^>]*src=/);
@@ -427,13 +435,51 @@ test("N3-⑥c（B-T5）DRAG_SCHEDULE_SCRIPT 行为锚：POST 复用 /features/:i
   assert.doesNotMatch(s, /stage|approval/, "拖拽载荷仍仅 version（stage/approval 只作服务端读判）");
 });
 
+// v0.9.8 REQ-2026-10-03-02：第七枚常量 MEMBER_DRAG_SCRIPT 的行为锚（提交 = 既有成员写路由、参数与手填表单一致）
+test("N3-⑥d（REQ-2026-10-03-02）MEMBER_DRAG_SCRIPT 行为锚：入口守卫 #member-pool · POST /orgs/{org}/members · urlencoded action/machineId/projectId · 成功 reload · 失败抽 .err-ov-card 叠加 · 只认 draggable=true 行 · 不带 x-board-write · 折叠手填表单不删 DOM", () => {
+  const s = MEMBER_DRAG_SCRIPT;
+  assert.match(s, /getElementById\("member-pool"\)/, "入口守卫 = manage 页独有的两栏容器锚（非该页整段空转 ⇒ 页隔离）");
+  assert.match(s, /typeof fetch !== "function" \|\| typeof DragEvent !== "function"/, "无 fetch / 无 DnD ⇒ 直接 return（回退面 = 静态清单 + 表单照常）");
+  assert.match(
+    s,
+    /fetch\("\/orgs\/" \+ encodeURIComponent\(org\) \+ "\/members"/,
+    "提交 = 复用既有写路由（不新增写路由、不落第二种 kind；org 来自服务端渲染的 data-org，常量本身不含用户数据）",
+  );
+  assert.match(s, /method: "POST"/);
+  assert.match(
+    s,
+    /new URLSearchParams\(\{ action: action, machineId: machineId, projectId: projectId \}\)/,
+    "载荷 = 与手填表单同三参数（action=add|remove · machineId · projectId），服务端解析路径零改动",
+  );
+  assert.match(s, /credentials: "same-origin"/, "同源凭据（CSRF 走 Origin 同源档）");
+  assert.doesNotMatch(s, /x-board-write/, "不带自定义写头（头档会要求预检；本径靠同源 Origin）");
+  assert.match(s, /headers: \{ Accept: "text\/html" \}/, "错误页整页档须含 text/html ⇒ .err-ov-card 可摘");
+  assert.match(s, /if \(res\.ok\) \{ window\.location\.reload\(\); return null; \}/, "成功 = 整页刷新（声明面回读为事实源，不做乐观 DOM 移动）");
+  assert.match(s, /doc\.querySelector\("\.err-ov-card"\)/, "失败 = 抽错误卡（409 冲突卡自带所属组链接）");
+  assert.match(s, /document\.body\.appendChild\(card\)/, "错误卡叠加到 body（DOM 未动 ⇒ 无需回弹）");
+  assert.match(s, /closest\("\.mrow\[draggable=true\]"\)/, "只响应服务端放行（draggable）的行 ⇒ 末位成员拖不动");
+  // 方向 = 语义：动作由**出发栏**决定（池→本组 = add，本组→池 = remove），落点再校验一次
+  assert.match(s, /var action = from\.getAttribute\("data-side"\) === "pool" \? "add" : "remove";/, "动作派发自出发栏（不看鼠标姿态）");
+  assert.match(s, /setData\("text\/plain"/, "载荷走 dataTransfer text/plain");
+  assert.match(s, /if \(action !== "add" && action !== "remove"\) return;/, "drop 侧再校 action 闭集（外部拖入的脏载荷不提交）");
+  assert.match(s, /if \(action === "add" && col\.getAttribute\("data-side"\) !== "own"\) return;/, "add 只落在本组栏（拖回池列不发 add）");
+  assert.match(s, /if \(action === "remove" && col\.getAttribute\("data-side"\) !== "pool"\) return;/, "remove 只落在池栏（同栏往返零请求）");
+  assert.match(s, /e\.preventDefault\(\);\s*\n\s*e\.dataTransfer\.dropEffect = "move";/, "dragover 需 preventDefault 才能落地");
+  assert.match(s, /getElementById\("member-forms-fold"\)/, "手填表单宿主 = 折叠收纳（JS 可用时收起）");
+  assert.match(s, /fold\.open = false/, "只收起、不删 DOM（无 JS 回路面不劣化）");
+  assert.doesNotMatch(s, /removeChild\(fold\)|innerHTML = ""/, "不得删除手填表单节点（范围外红线）");
+  // 拖拽载荷闭集 = 三键，不得夹带登记字段
+  assert.doesNotMatch(s, /stage|approval/, "载荷仅 action/machineId/projectId（stage/approval 不进写面）");
+});
+
 // ---------------------------------------------------------------------------
 // ③ 纪律钉：全站内联脚本字面量闭集
 // ---------------------------------------------------------------------------
 /**
  * 可执行内联脚本闭集：字面量必须命中且只命中下列一枚体标记（多余命中 = 归类歧义，同样红）。
  * 标记取**转义无关**片段（源码模板字面量里的引号带 `\`，运行时常量不带，两种形态都含这些子串）。
- * v0.9.3 B-T5 起闭集 = **六元**（新增「排期拖拽」，与「新增需求弹窗」分立两枚、不可共置）。
+ * v0.9.3 B-T5 起增「排期拖拽」（当时六枚，与「新增需求弹窗」分立两枚、不可共置）；
+ * **v0.9.8 REQ-2026-10-03-02 起 = 七元**（新增「成员两栏拖拽」，入口锚 `#member-pool` 仅 manage 页有）。
  */
 const INLINE_SCRIPT_ALLOWLIST = [
   { key: "提交守卫", marker: "button[type=submit]" },
@@ -442,6 +488,7 @@ const INLINE_SCRIPT_ALLOWLIST = [
   { key: "浮层开关", marker: 'getElementById(\\"feat-dialog\\")', runtime: 'getElementById("feat-dialog")' },
   { key: "新增需求弹窗", marker: 'getElementById(\\"new-req-dialog\\")', runtime: 'getElementById("new-req-dialog")' },
   { key: "排期拖拽", marker: 'getElementById(\\"schedule-board\\")', runtime: 'getElementById("schedule-board")' },
+  { key: "成员两栏拖拽", marker: 'getElementById(\\"member-pool\\")', runtime: 'getElementById("member-pool")' },
 ];
 
 function listTsFiles(dir) {
@@ -474,7 +521,7 @@ function collectInlineScriptBlocks() {
   return blocks;
 }
 
-test("N3-⑦（纪律钉）全站可执行内联脚本字面量 ⊆ 六元闭集，且每枚恰好 1 处（防 JS 野长 / 防复制）", () => {
+test("N3-⑦（纪律钉）全站可执行内联脚本字面量 ⊆ 七元闭集，且每枚恰好 1 处（防 JS 野长 / 防复制）", () => {
   const blocks = collectInlineScriptBlocks();
   assert.ok(blocks.length > 0, "扫描器必须真的见到字面量（0 = 扫描失效，本锚不许空转）");
   const tally = new Map(INLINE_SCRIPT_ALLOWLIST.map((e) => [e.key, 0]));
@@ -499,7 +546,7 @@ test("N3-⑦（纪律钉）全站可执行内联脚本字面量 ⊆ 六元闭集
   }
 });
 
-test("N3-⑧（纪律钉·单点钉）四枚导出常量：声明唯一、renderPage 注入点只引常量，正文不在他处复制", () => {
+test("N3-⑧（纪律钉·单点钉）五枚导出常量：声明唯一、注入点只引常量，正文不在他处复制", () => {
   const layout = readFileSync(join(srcRoot, "web", "layout.ts"), "utf8");
   const server = readFileSync(join(srcRoot, "server.ts"), "utf8");
   const count = (s, re) => (s.match(re) ?? []).length;
@@ -508,6 +555,7 @@ test("N3-⑧（纪律钉·单点钉）四枚导出常量：声明唯一、render
     "FEATURE_DETAIL_OVERLAY_SCRIPT",
     "NEW_REQUIREMENT_DIALOG_SCRIPT",
     "DRAG_SCHEDULE_SCRIPT",
+    "MEMBER_DRAG_SCRIPT",
   ]) {
     assert.equal(
       count(layout, new RegExp(`export const ${name} = \`<script>`, "g")),
@@ -532,6 +580,12 @@ test("N3-⑧（纪律钉·单点钉）四枚导出常量：声明唯一、render
     2,
     "mermaid 资产+渲染脚本常量注入 = pageSchedule（浮层补渲）与 pageFeatureDetail（整页档）两处",
   );
+  // v0.9.8 REQ-2026-10-03-02：第七枚**仅 manage 页**注入（页隔离 = 单点，照门户 / 排期页先例）
+  assert.equal(
+    count(server, /extraScripts: MEMBER_DRAG_SCRIPT/g),
+    1,
+    "server.ts 只在 pageOrgSpaceManage 一处经 extraScripts 注入成员两栏拖拽常量（其它页不得带）",
+  );
 });
 
 // v0.9.4 增补三 §9.2：全站内联脚本负向锚 —— HTMLFormElement [LegacyOverrideBuiltIns] 使
@@ -542,6 +596,7 @@ test("N3-⑨（增补三 · 负向锚）全站可执行内联脚本零 `form.act
     FEATURE_DETAIL_OVERLAY_SCRIPT,
     NEW_REQUIREMENT_DIALOG_SCRIPT,
     DRAG_SCHEDULE_SCRIPT,
+    MEMBER_DRAG_SCRIPT,
   ]) {
     assert.doesNotMatch(script, /form\.action/, "运行时常量不得直读 form.action（同名字段遮蔽 ⇒ 伪 URL [object HTMLInputElement]）");
   }

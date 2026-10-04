@@ -489,6 +489,14 @@ export interface HostFaceDeps {
    */
   isOrgDisabled?: (org: string) => boolean;
   /**
+   * **本组织 agent 配置现读闭包**（v0.9.8 · 按项目组配 agent）：起桥装配时按组织现读台账
+   * `.data/orgs.json` 的 `agentKind` / `agentModel` 两键（事实源 = 板组织台账，本文件不碰文件，
+   * 由装配方 `index.ts` 注入 —— 与 {@link isOrgDisabled} 同款注入面）。
+   * 返回项为 null ⇒ 该键**独立**回落全局（`deps.kind` / `deps.hostModel`），**两项绝不成对**。
+   * 未注入 ⇒ 完全保持今日行为（全局值，逐字节同 v0.9.7）—— 存量测试与不配台账的部署零变化。
+   */
+  orgHostAgent?: (org: string) => { kind: string | null; model: string | null };
+  /**
    * **v0.9.5 C3 只读引擎态探针**（自动接力点火判据）：轮收口后一跳 `getFeature` 重取
    * `state/stage/approval`。由装配方（`index.ts`，`BridgeClient` 的所有者）注入只读实现；
    * 未注入 ⇒ 接力决策判不了引擎态 ⇒ **保守停链、不点火**（既有行为不变）。
@@ -520,7 +528,7 @@ export interface HostFaceDeps {
  * 「触发一轮」与「轮内重拉」两条路同闸。**`prepareWorkspace` 纯函数不动**（mkdir 供给语义保持无组织状态知识）。
  */
 export function orgBridgeConfig(
-  deps: Pick<HostFaceDeps, "orgsDir" | "kind" | "idleStopMs" | "mcpUrlFor" | "isOrgDisabled" | "hostModel">,
+  deps: Pick<HostFaceDeps, "orgsDir" | "kind" | "idleStopMs" | "mcpUrlFor" | "isOrgDisabled" | "hostModel" | "orgHostAgent">,
   org: string,
 ): HostBridgeConfig | { error: { code: string; message: string } } {
   if (deps.orgsDir === null) {
@@ -541,15 +549,22 @@ export function orgBridgeConfig(
       },
     };
   }
+  // v0.9.8 按项目组配 agent（R1 回落序，确认单 §2）：kind / model 两键**各自取值、各自回落**，
+  // 但带一条命名空间规则：**组织换了适配器（kind 非 null）而未配自己的 model ⇒ 不沿用全局 hostModel**
+  // （全局 model 按全局 kind 的命名空间配置，跨适配器塞过去必错 —— 该 kind 适配器的后端缺省接管；
+  // 此形态在管理页回显行标注来源缓解，登记改造文档 §6，不改改成对回落）。
+  // 闭包未注入 / 两键皆 null ⇒ kind = deps.kind ?? 缺省、model = deps.hostModel —— 逐字节同 v0.9.7。
+  const orgAgent = deps.orgHostAgent?.(org.trim());
   const config: HostBridgeConfig = {
     org,
     workspace: ws.workspace,
-    kind: deps.kind ?? DEFAULT_HOST_AGENT_KIND,
+    kind: orgAgent?.kind ?? deps.kind ?? DEFAULT_HOST_AGENT_KIND,
     idleStopMs: deps.idleStopMs ?? DEFAULT_IDLE_STOP_MS,
   };
   if (deps.mcpUrlFor !== undefined) config.mcpUrl = deps.mcpUrlFor(org);
   // v0.9.5 C2：宿主后端模型透传 —— **有值才带**，只放 `model` 一键（`backendCmd` 等不在本次范围）。
-  if (deps.hostModel != null && deps.hostModel !== "") config.agentConfig = { model: deps.hostModel };
+  const model = orgAgent?.model ?? (orgAgent?.kind != null ? null : deps.hostModel);
+  if (model != null && model !== "") config.agentConfig = { model };
   return config;
 }
 
@@ -768,12 +783,13 @@ export class BoardHostFace {
     return outcome;
   }
 
-  /** 配置面（状态页如实显示「组织目录未配置 ⇒ 宿主面不可用」，不得静默）。 */
-  configView(): { orgsDir: string | null; defaultOrg: string | null; kind: string } {
+  /** 配置面（状态页如实显示「组织目录未配置 ⇒ 宿主面不可用」，不得静默；v0.9.8 用户裁②补全局 hostModel 读面）。 */
+  configView(): { orgsDir: string | null; defaultOrg: string | null; kind: string; hostModel: string | null } {
     return {
       orgsDir: this.deps.orgsDir,
       defaultOrg: this.deps.defaultOrg,
       kind: this.deps.kind ?? DEFAULT_HOST_AGENT_KIND,
+      hostModel: this.deps.hostModel ?? null,
     };
   }
 
