@@ -41,7 +41,6 @@ import {
   EVENT_VERSION_LEDGER_MIGRATED,
   openStoreDatabase,
   SessionStore,
-  versionLedgerList,
   versionsLedgerMigrationDone,
 } from "../session/store.js";
 import type { VersionLedgerWriteResult } from "../session/store.js";

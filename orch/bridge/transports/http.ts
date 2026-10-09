@@ -23,6 +23,9 @@
  * - `/api/versions*`（v0.10.0 O2a + O2c）：**同款委托** `options.versions`
  *   （`bridge/versions-endpoints.ts`）—— 版本台账读投影 + 建 / 删 / **设状态**写口。
  *   本层同样不做判断；未注入时落 404（兜底）。
+ * - `/api/project-versions*`（v0.10.1 O5）：再一层同款委托 `options.projectVersions`
+ *   （`bridge/project-versions-endpoints.ts`）—— project 档台账读投影 + 建 / 删写口
+ *   （**无设状态口**：project 侧 `released` 只由 Group 级发版同事务级联置入）。
  *
  * 实现边界：HTTP 层用 `node:http`（SDK 的 express 助手依赖 express，而 orch 未声明该依赖，
  * 「不得新增第三方依赖」故不用）；绑定默认 loopback，非 loopback 地址打 warn（跨机鉴权待 v0.7.0）。
@@ -36,6 +39,7 @@ import { bridgeLog } from "../bridge-log.js";
 import type { BridgeCore, DegradedItem } from "../index.js";
 import { createServer } from "../register-tools.js";
 import type { RunnerEndpointHandle } from "../runner.js";
+import type { ProjectVersionsEndpointHandle } from "../project-versions-endpoints.js";
 import type { VersionsEndpointHandle } from "../versions-endpoints.js";
 
 /**
@@ -123,6 +127,12 @@ export interface HttpTransportOptions {
    * 委托形态照 `/runner/*` 先例（本层不做判断，处理器自检路由 / owner / 方法）。
    */
   versions?: VersionsEndpointHandle;
+  /**
+   * Project Version 台账端点处理器（v0.10.1 O5；可选）：`/api/project-versions`（GET / POST）与
+   * `/api/project-versions/{project_id}/{version}`（DELETE）。注入形态与委托语义同 `versions`
+   * （本层不做判断，处理器自检路由 / 方法 / owner 门闩）；缺省时自然落 404。
+   */
+  projectVersions?: ProjectVersionsEndpointHandle;
 }
 
 export interface HttpTransportHandle {
@@ -301,6 +311,11 @@ async function handleRequest(
   // 不认领的路径 ⇒ 继续往下落 404
   if (options.versions !== undefined) {
     if (await options.versions.handle(req, res, path)) return;
+  }
+  // project 档台账分支（v0.10.1 O5）：同款委托；路径前缀 `/api/project-versions` 与 Group 档
+  // `/api/versions` 无重合（前者不以 `…/versions/` 开头），先后顺序不影响认领
+  if (options.projectVersions !== undefined) {
+    if (await options.projectVersions.handle(req, res, path)) return;
   }
   respondJson(res, 404, { ok: false, error: "not_found" });
 }

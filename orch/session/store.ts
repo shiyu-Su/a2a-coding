@@ -182,11 +182,16 @@ export const EVENT_VERSION_STATUS_CHANGED = "version.status_changed";
 /**
  * 事件 kind：**版本发版**（v0.10.0 O7 · 改造文档 §2.1(1)）—— 由
  * {@link SessionStore.versionLedgerMarkReleased} 在「`versions.status` 迁 `released` +
- * `releases` 落快照」的**同一事务内**发出 ⇒ 事件与两行写同时成立或同时不成立。
+ * `releases` 落快照 + **级联 project 版本置 `released`**（v0.10.1 C-4）」的**同一事务内**发出
+ * ⇒ 事件与各笔写同时成立或同时不成立。
  *
  * `payload.backfilled = true` ⇒ 台账行原本已是 `released`、本次只补写缺失的快照
  * （迁移主源导入的历史 `released` 行无快照，见 `需求流程.md` §8 标记 `released` 条），
  * 读账时据此区分「发版那一刻」与「事后补登」。
+ *
+ * `payload.projectVersionsTargeted` / `projectVersionsReleased`（v0.10.1 O4，只增键）= 级联的
+ * 「触达集大小」与「本次真的迁入 `released` 的行数」⇒ 后者为 0 可能是「本就都 `released`」，
+ * 不是失败。
  */
 export const EVENT_VERSION_RELEASED = "version.released";
 /**
@@ -518,6 +523,13 @@ export interface VersionLedgerRecord {
 
 /** `releases.projects_json` 单项（**原值入快照、不归一**，改造文档 §2.1(6)） */
 export interface ReleaseSnapshotProject {
+  /**
+   * 发版意图带入的 project 标识（v0.10.1 O4 · C-5）。**缺省即不写键** —— 历史旧形状行
+   * （`{repoId, ref}`）读回时不得多出 `projectId: null`，否则既有快照的可读形状被改写。
+   */
+  projectId?: string | null;
+  /** 该 project 本次发版的 Project Version（同上：缺省即不写键，不回填） */
+  version?: string | null;
   repoId: string | null;
   ref: string | null;
 }
@@ -544,6 +556,11 @@ export interface ReleaseSnapshotRecord {
  *   拿它当快照数据源会把「上报缺位」写成「该版无仓库」，是**假事实**；
  * - `projects[].ref` —— 发版动作产生的 commit / tag（引擎不解析、不校验形状，同 §2.1(6) 口径）；
  * - `changelogAnchor` —— CHANGELOG 锚点（同上：引擎不解析文档）。
+ *
+ * `projects[].projectId` / `projects[].version`（v0.10.1 O4 · C-5）= 快照项的**新增可选键**
+ * （四元形状 `{projectId, version, repoId, ref}`）—— 同样**只取发版动作带入的原值**，引擎
+ * **不从归属表 / `project_versions` 反查填充**（级联写的是台账，快照承载的是发版意图的原样）。
+ * **缺省即不写该键**（不写 `null`）⇒ 历史旧形状 `{repoId, ref}` 行读写两端形状一致、不回填。
  *
  * `projects` 缺省 = 空数组（单仓未配 `repo` 的现状 ⇒ 快照仍落行，`projects_json = "[]"`，
  * 与「非 released 阶段无快照行」的判据不冲突）。
@@ -628,6 +645,126 @@ export interface VersionCardCounts {
 }
 
 /**
+ * **project 台账两态**（v0.10.1 O1 · 改造文档 §2.2）—— 闭集**本文件自持**，不进 `types.ts`：
+ * 组档三态（`VERSION_LEDGER_STATUSES`）是 v0.10.0 已冻结的面，而本态**不进** `notstart → active`
+ * 自动转换、也**不动** `versions-activation` 节流键（§2.2 硬约束），两者不是同一套值域。
+ *
+ * - `open` —— 建版即此态，也是**唯一可建态**；
+ * - `released` —— 只能由 **Group 级发版动作在同事务内级联置入**（C-4，写入归后续节点）；
+ *   一经置入即冻结、不得复用为后续归属目标（C-6 ④）。
+ */
+export const PROJECT_VERSION_STATUSES = ["open", "released"] as const;
+export type ProjectVersionStatus = (typeof PROJECT_VERSION_STATUSES)[number];
+export function isProjectVersionStatus(value: unknown): value is ProjectVersionStatus {
+  return (
+    typeof value === "string" &&
+    (PROJECT_VERSION_STATUSES as readonly string[]).includes(value)
+  );
+}
+
+/** project 台账行（`project_versions` 表；**可编辑**，`released` 由 Group 级联置入） */
+export interface ProjectVersionRecord {
+  /** 归属组 = `projectGroup` 组名；`null` = 匿名档（与 `versions.owner_group` / `features.owner_group` 同口径） */
+  ownerGroup: string | null;
+  projectId: string;
+  /** Project Version（**不要求**与 Group Version 一致，C-1） */
+  version: string;
+  status: ProjectVersionStatus;
+  /** 发版日期（自由文本，板侧展示用；引擎不解析、不参与判定 —— 照组档同口径） */
+  date: string | null;
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/**
+ * `projectVersionCreate` 入参（v0.10.1 O1）。
+ *
+ * **没有 `status` 参数**：建版恒 `open` —— `released` 是发版的结果、不是建版参数（组档同一条判据
+ * 在这里由**入参形状**直接承载，因此 C-13 闭集不需要 project 档的 `…_status_invalid` 码）。
+ */
+export interface ProjectVersionCreateInput {
+  ownerGroup: string | null;
+  projectId: string;
+  version: string;
+  date?: string | null;
+  note?: string | null;
+}
+
+/**
+ * project 档写口出参（v0.10.1 O1）—— 形状照 {@link VersionLedgerWriteResult}：
+ * 失败分支的 `code` 是 `orch_*` 闭集成员，供 HTTP / MCP 面直接映射状态码与信封。
+ */
+export type ProjectVersionWriteResult =
+  | { ok: true; record: ProjectVersionRecord }
+  | { ok: false; code: string; message: string; status: number };
+
+/**
+ * 归属（承诺集）行（`feature_projects` 表）—— **不进 prune、不随 Feature 终态 / `cancel` 级联删**
+ * （C-16；它替代 `tasks.project_id` 承担「需求触达哪些 project」的长期事实源，K-1）。
+ */
+export interface FeatureProjectRecord {
+  ownerGroup: string | null;
+  featureId: string;
+  projectId: string;
+  /** 本需求把该 project 承接进哪个 Project Version */
+  projectVersion: string;
+  /**
+   * 写入时刻的 Group Version 快照（NOT NULL ⇒ **无 Group Version 落不下归属**，C-21）。
+   * 与 `features.version` **同单写定、此后不漂移**（派生不变式，不是流程动作）。
+   */
+  groupVersion: string;
+  /** 写入来源（自由文本，供「可改须留痕」对照；引擎不解析、不校验形状，C-3） */
+  source: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** `featureProjectUpsert` 入参（v0.10.1 O1） */
+export interface FeatureProjectUpsertInput {
+  ownerGroup: string | null;
+  featureId: string;
+  projectId: string;
+  projectVersion: string;
+  groupVersion: string;
+  source?: string | null;
+}
+
+/**
+ * 归属写口出参（v0.10.1 O1）—— 两个布尔把「**重发安全**」拆开（C-3 ★R3：新增执行节点同轮
+ * 必须重发**全量**归属 ⇒ 同一行会被反复写）：
+ * - `created = true` ⇒ 本次新落一行；
+ * - `created = false` ∧ `changed = true` ⇒ 同键改写（承诺集**可改**，C-3）；
+ * - `created = false` ∧ `changed = false` ⇒ 同值幂等重发 ⇒ **零写入、不改 `updated_at`**（重发不制造活动痕迹）。
+ */
+export type FeatureProjectUpsertResult =
+  | { ok: true; record: FeatureProjectRecord; created: boolean; changed: boolean }
+  | { ok: false; code: string; message: string; status: number };
+
+/**
+ * 归属删口出参（v0.10.1 O1）：键不存在 ⇒ `deleted = false` ∧ `record = null` —— **幂等零副作用**
+ * （全量重发的差量删除路径会删到不存在的行，不得当作错误）。
+ */
+export interface FeatureProjectDeleteResult {
+  deleted: boolean;
+  record: FeatureProjectRecord | null;
+}
+
+/**
+ * **project 档收口计数**（v0.10.1 O2 · 改造文档 C-4）—— 三桶口径与 {@link VersionCardCounts}
+ * **逐字一致**（`open` 含 `failed`），但**身份不同级**：Group 计数由 `features.version` 派生、
+ * 本计数由归属表派生，是同一批卡的两张正交投影 ⇒ **不得横向相加、不得相等校验、不得互校**（C-4 ★R2）。
+ * 故**不复用** {@link VersionCardCounts} 这一类型名，避免「同一个类型 ⇒ 可以互相比较」的误读。
+ */
+export interface ProjectVersionCardCounts {
+  total: number;
+  completed: number;
+  cancelled: number;
+  /** 未收口 = 其余全部态（含 `failed` 与主链中间态） */
+  open: number;
+}
+
+/**
  * `versions` 表的**列清单单一串**（读口共用；SELECT 列序 = {@link rowToVersionLedger} 的取值键序）。
  * 抽成常量：新增列时只需改 DDL + 这一串，避免各读口 SQL 分散漏改。
  */
@@ -640,6 +777,17 @@ const VERSION_LEDGER_COLUMNS =
  */
 const RELEASE_COLUMNS =
   "owner_group, version, changelog_anchor, projects_json, note, created_at";
+
+/**
+ * `project_versions` 表的**列清单单一串**（v0.10.1 O1；同 {@link VERSION_LEDGER_COLUMNS} 的抽常理由）。
+ * 列序 = {@link rowToProjectVersion} 的取值键序。
+ */
+const PROJECT_VERSION_COLUMNS =
+  "owner_group, project_id, version, status, date, note, created_at, updated_at";
+
+/** `feature_projects` 表的**列清单单一串**（v0.10.1 O1；同上）。 */
+const FEATURE_PROJECT_COLUMNS =
+  "owner_group, feature_id, project_id, project_version, group_version, source, created_at, updated_at";
 
 /**
  * 版本台账写口的 **`orch_*` 错误码闭集**（v0.10.0 O2a）。
@@ -658,6 +806,18 @@ export const ERR_VERSION_OPEN_CARDS = "orch_version_open_cards";
  * 校验落**边界**（HTTP / MCP 入参是 JSON，形状不可信），见 `bridge/versions-release.ts`。
  */
 export const ERR_RELEASE_PROJECTS = "orch_release_projects_invalid";
+
+/**
+ * project 档写口的 **`orch_*` 错误码**（v0.10.1 O1 · 改造文档 C-13 闭集的**数据面子集**）。
+ *
+ * C-13 的保留码里，本节点只用「建 / 删 / 写 的数据判据」必然要用的这三个；
+ * `_released_locked` / `orch_project_attribution_conflict` / `orch_project_attribution_state_locked`
+ * 属**门 / 闸**判据（归属写执法、released 门）⇒ 由后续节点落地，本节点**不预定义**（不留无人产的死码）。
+ * 码值即契约：HTTP 信封 `error.code` 与 MCP 面共用，**未知码原样展示、不 fail-closed**（板侧口径）。
+ */
+export const ERR_PROJECT_VERSION_SHAPE = "orch_project_version_invalid_shape";
+export const ERR_PROJECT_VERSION_EXISTS = "orch_project_version_exists";
+export const ERR_PROJECT_VERSION_UNKNOWN = "orch_project_version_unknown";
 
 /** `pruneTasks` 入参：保留策略阈值覆盖（缺省用环境变量 / 内置默认） */
 export interface PruneTasksOptions {
@@ -1383,8 +1543,11 @@ function rowToVersionLedger(row: Record<string, unknown>): VersionLedgerRecord {
  * 解析 `releases.projects_json` 列（`ReleaseSnapshotProject[]` JSON 字符串）。
  *
  * 快照列**原值入、不归一**（改造文档 §2.1(6)）⇒ 这里**只做形状校验**（数组 / 元素是对象 /
- * `repoId` `ref` 是 `string | null`），**不做** trim、大小写折叠、去重、排序 —— 脏值 = 库被手工
+ * 四个键各自是 `string | null`），**不做** trim、大小写折叠、去重、排序 —— 脏值 = 库被手工
  * 改过 ⇒ fail-fast（与 {@link rowToVersionLedger} 同一口径，快照是发版事实、不得静默兜缺省）。
+ *
+ * **向后兼容**（v0.10.1 O4 · C-5）：`projectId` / `version` 是**后加的可选键** ⇒ 历史旧形状行
+ * （只有 `repoId` / `ref`）仍可读，且**读回形状与写入时逐字一致**（缺键不补 `null`、不回填）。
  */
 function readReleaseProjects(row: Record<string, unknown>): ReleaseSnapshotProject[] {
   const raw = readNullableString(row, "projects_json");
@@ -1404,16 +1567,19 @@ function readReleaseProjects(row: Record<string, unknown>): ReleaseSnapshotProje
       throw new Error(`[session-store] 列 projects_json 数据损坏：数组元素非对象`);
     }
     const item = v as Record<string, unknown>;
-    for (const key of ["repoId", "ref"] as const) {
+    for (const key of ["repoId", "ref", "projectId", "version"] as const) {
       const value = item[key];
       if (value !== null && value !== undefined && typeof value !== "string") {
         throw new Error(`[session-store] 列 projects_json 数据损坏：${key} 非 string | null`);
       }
     }
-    projects.push({
+    const project: ReleaseSnapshotProject = {
       repoId: (item["repoId"] ?? null) as string | null,
       ref: (item["ref"] ?? null) as string | null,
-    });
+    };
+    if (item["projectId"] !== undefined) project.projectId = item["projectId"] as string | null;
+    if (item["version"] !== undefined) project.version = item["version"] as string | null;
+    projects.push(project);
   }
   return projects;
 }
@@ -1426,6 +1592,43 @@ function rowToReleaseSnapshot(row: Record<string, unknown>): ReleaseSnapshotReco
     projects: readReleaseProjects(row),
     note: readNullableString(row, "note"),
     createdAt: readString(row, "created_at"),
+  };
+}
+
+/**
+ * `project_versions` 行 → project 台账记录（v0.10.1 O1）。
+ *
+ * `status` 脏值 ⇒ **fail-fast**（照 {@link rowToVersionLedger} 口径：本表只由引擎写口写，
+ * 脏值 = 库被手工改过 ⇒ 必须可见，不得静默兜成 `open`）。
+ */
+function rowToProjectVersion(row: Record<string, unknown>): ProjectVersionRecord {
+  const status = readString(row, "status");
+  if (!isProjectVersionStatus(status)) {
+    throw new Error(`[session-store] 列 status 数据损坏：非法 project 台账态 ${status}`);
+  }
+  return {
+    ownerGroup: readNullableString(row, "owner_group"),
+    projectId: readString(row, "project_id"),
+    version: readString(row, "version"),
+    status,
+    date: readNullableString(row, "date"),
+    note: readNullableString(row, "note"),
+    createdAt: readString(row, "created_at"),
+    updatedAt: readString(row, "updated_at"),
+  };
+}
+
+/** `feature_projects` 行 → 归属记录（v0.10.1 O1；四列身份字段脏值 ⇒ 同 {@link rowToProjectVersion} 的 fail-fast） */
+function rowToFeatureProject(row: Record<string, unknown>): FeatureProjectRecord {
+  return {
+    ownerGroup: readNullableString(row, "owner_group"),
+    featureId: readString(row, "feature_id"),
+    projectId: readString(row, "project_id"),
+    projectVersion: readString(row, "project_version"),
+    groupVersion: readString(row, "group_version"),
+    source: readNullableString(row, "source"),
+    createdAt: readString(row, "created_at"),
+    updatedAt: readString(row, "updated_at"),
   };
 }
 
@@ -1577,6 +1780,63 @@ CREATE TABLE IF NOT EXISTS releases (
   note             TEXT,
   created_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
   PRIMARY KEY (owner_group, version)
+)`;
+
+/**
+ * **project 台账表**（v0.10.1 O1 · 改造文档 §2.2）—— **可编辑**，Project Version 的身份与落库面。
+ *
+ * 键 = `(owner_group, project_id, version)`（C-2）⇒ 同名版号可分属不同 project / 不同组，
+ * **不要求**与 Group Version 一致（C-1）。project **不能跨组**（配置期 fail-fast 互斥，
+ * `config.ts` 组间成员断言）⇒ 该键良定义、无跨组歧义。
+ *
+ * `status` **两态** `open` / `released`（默认 `open`）：不进组档的 `notstart → active` 自动转换，
+ * `released` **只由 Group 级发版动作在同事务内级联置入**（C-4）⇒ 本节点的建版口连 `status`
+ * 参数都不收（见 {@link ProjectVersionCreateInput}）。
+ *
+ * `owner_group` 可空（NULL = 未配组的匿名档）⇒ 与 {@link VERSIONS_DDL} 同一条硬约束：
+ * **SQLite 的 PK / UNIQUE 把 NULL 视为互不相等**，故「重复 ⇒ 409」**不得**依赖 `ON CONFLICT`
+ * 或 `INSERT OR REPLACE`（匿名档会静默插出第二行），一律 **NULL-safe `IS` 自查 + 再插**。
+ */
+const PROJECT_VERSIONS_DDL = `
+CREATE TABLE IF NOT EXISTS project_versions (
+  owner_group TEXT,
+  project_id  TEXT NOT NULL,
+  version     TEXT NOT NULL,
+  status      TEXT NOT NULL DEFAULT 'open',
+  date        TEXT,
+  note        TEXT,
+  created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (owner_group, project_id, version)
+)`;
+
+/**
+ * **归属（承诺集）表**（v0.10.1 O1 · 改造文档 §2.2 / C-3 / C-16）—— 一条需求在本 Group Version
+ * 内触达哪些 project、各自落哪个 Project Version。
+ *
+ * 键 = `(owner_group, feature_id, project_id)` ⇒ 一个需求对同一 project 只有一条承诺（可改、
+ * 改后仍是一行，`updated_at` 承载最近一次改动）。
+ *
+ * **为什么必须显式落库而不由 `tasks` 派生**（K-1）：`tasks.project_id` 是**执行期日志** ——
+ * 收口 7 天后被 {@link SessionStore.pruneTasks} 删、不含「规划要触及但未派发」的 project、
+ * 且无 version 列。**本表不进 `pruneTasks`（该函数只删 `tasks` 行）**，Feature 终态 / `cancel`
+ * 也**不级联删**归属行（C-16）⇒ 归属是长期事实源。
+ *
+ * `group_version` **NOT NULL**：无 Group Version ⇒ 落不下归属（C-21 的 schema 表达）；
+ * 与 `features.version` 同单写定、此后不漂移。匿名档同 {@link PROJECT_VERSIONS_DDL} 的
+ * NULL-safe `IS` 口径。
+ */
+const FEATURE_PROJECTS_DDL = `
+CREATE TABLE IF NOT EXISTS feature_projects (
+  owner_group     TEXT,
+  feature_id      TEXT NOT NULL,
+  project_id      TEXT NOT NULL,
+  project_version TEXT NOT NULL,
+  group_version   TEXT NOT NULL,
+  source          TEXT,
+  created_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at      TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (owner_group, feature_id, project_id)
 )`;
 
 
@@ -1858,6 +2118,12 @@ export class SessionStore {
     // 存量数据由一次性迁移脚本 `scripts/migrate-versions-ledger.mjs` 导入（运行时不读板文件）。
     this.db.exec(VERSIONS_DDL);
     this.db.exec(RELEASES_DDL);
+    // 段 2‴ / 段 3″：版本面**两级**新增两表（v0.10.1 O1 · 改造文档 §2.2）。
+    // `project_versions` = project 档可编辑台账（两态）；`feature_projects` = 归属（承诺集）。
+    // 同为**新建表** ⇒ `IF NOT EXISTS` 幂等；**历史不回填**（C-11：旧版号 task 已 prune、不可复原）
+    // ⇒ 无一次性迁移脚本，新版本起生效。
+    this.db.exec(PROJECT_VERSIONS_DDL);
+    this.db.exec(FEATURE_PROJECTS_DDL);
     // 段 4：索引 —— 队列候选（claim 热路径）/ claim_token 唯一 / 项目投影按 Runner
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_state, queued_at)");
     // claim_token 唯一：SQLite 唯一索引允许多个 NULL ⇒ 未领取行不受限，领取行令牌唯一。
@@ -1888,6 +2154,15 @@ export class SessionStore {
       "CREATE INDEX IF NOT EXISTS idx_artifacts_producer ON artifacts(producer_task_id)",
     );
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_events_feature ON events(feature_id, event_id)");
+    // v0.10.1 O1：归属表的**两个查询方向**各有非 PK 前缀的读口 ⇒ 各建一条索引
+    // （PK = `(owner_group, feature_id, project_id)` 只覆盖「按 feature 定位某 project」，
+    //   继承判据 `(owner_group, group_version, project_id)` 与「按 feature_id 列全归属」都在 PK 之外）。
+    this.db.exec(
+      "CREATE INDEX IF NOT EXISTS idx_feature_projects_group_version ON feature_projects(owner_group, group_version, project_id)",
+    );
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_feature_projects_feature ON feature_projects(feature_id)");
+    // `project_versions` **不另建索引**：单行读走全 PK、列表读走 `owner_group` 前缀，
+    // 两者都由 PK 的 autoindex 覆盖（多建一条 = 纯写放大）。
   }
 
   /** 查询会话映射；不存在返回 null */
@@ -3670,20 +3945,28 @@ export class SessionStore {
    * **为什么必须同事务**：`versions.status = released` 是**排期锁**的事实源，`releases` 行是
    * **发版事实**（哪些仓、哪个 ref、CHANGELOG 锚点）的唯一承载。两者分开写 ⇒ 任一步崩在半路都会
    * 留下「已锁但无事实」或「有事实但未锁」的半成品版本，而两者都不可事后自动补齐（前者板会放行
-   * 排期、后者发版闸拿不到清单）。故一个事务内做完：UPDATE 台账 + INSERT 快照 + 事件留痕。
+   * 排期、后者发版闸拿不到清单）。故一个事务内做完：UPDATE 台账 + INSERT 快照 + **级联 project
+   * 版本置 `released`**（v0.10.1 O4 · C-4，见
+   * {@link SessionStore.cascadeProjectVersionsReleased}）+ 事件留痕。
+   *
+   * **发版只有一个动作**（C-4）：本口即该动作的唯一写口 —— **不存在**「project 自己发自己的版」
+   * 的第二入口，也**不存在**「Group 已 `released` 而其触达的 project 版本仍 `open`」的存续形态。
+   * 级联任一步失败 ⇒ 整个事务回滚（Group 状态**不落**），不留半成品。
    *
    * **本写口不判发版闸**（判据在 O4 `evaluateReleaseGate`，由调用方在进事务**之前**评）——
    * 闸要读 `features` 聚合（O3 面），搬进事务会把「聚合读」纳入写锁窗口；SQLite 单写者 +
    * 同进程同步 API ⇒ 「闸后写」的并发窗口与 {@link SessionStore.versionLedgerCreate}
    * 的「先 get 再 INSERT」同一口径（同一套护栏，不另立）。
    *
-   * 语义（四种入参落点，全部**只写 `releases` 的 INSERT、绝不 UPDATE/DELETE**）：
-   * 1. 台账未 `released` ∧ 无快照 ⇒ **正常发版**：UPDATE status + INSERT 快照 + 事件
-   *    （`backfilled = false`），两写同事务；
+   * 语义（四种入参落点，`releases` **只 INSERT、绝不 UPDATE/DELETE**；级联只 UPDATE
+   * `project_versions.status`）：
+   * 1. 台账未 `released` ∧ 无快照 ⇒ **正常发版**：UPDATE status + INSERT 快照 + 级联 + 事件
+   *    （`backfilled = false`），三写同事务；
    * 2. 台账已 `released` ∧ 无快照 ⇒ **补写**（迁移主源导入的历史 `released` 行本就无快照，
-   *    §2.1(7)）：只 INSERT 快照 + 事件（`backfilled = true`），status 不动 ⇒ 幂等；
-   * 3. 已 `released` ∧ 快照已存在 ⇒ **纯幂等**：零写入、零事件，原样回读既有快照
-   *    （不可变 = 第二次标记**不得**改写任何一列，入参被忽略）；
+   *    §2.1(7)）：只 INSERT 快照 + 级联 + 事件（`backfilled = true`），status 不动 ⇒ 幂等；
+   * 3. 已 `released` ∧ 快照已存在 ⇒ **纯幂等**：`releases` 零写入，级联照跑（触达行已 `released`
+   *    ⇒ `changes = 0`），无迁移动作即零事件，原样回读既有快照
+   *    （不可变 = 第二次标记**不得**改写快照任何一列，入参被忽略）；
    * 4. 台账无此行 ⇒ 404 {@link ERR_VERSION_UNKNOWN}，零写入（发版只能对着已登记的版号发生；
    *    建版归 O2a，本口不代发）。
    *
@@ -3751,7 +4034,13 @@ export class SessionStore {
           )
           .run(at, ownerGroup, version);
       }
-      if (snapshotWritten || statusMigrated) {
+      // **级联**（v0.10.1 O4 · C-4）：发版只有一个动作 = 标 Group `released`，引擎在**同一事务**内
+      // 把它名下**被触达**的 project 版本一并置 `released`（随即冻结 —— released 门由 O2 执法）。
+      // 数据源 = 归属表（不是 `project_versions` 全表、也不是 `tasks`）：未被该版任何需求触达的
+      // project **不产生行、不被发版**（UPDATE 天然不建行）。与状态迁移无条件一起跑：幂等重标记 /
+      // 补写路径也跑 ⇒ 「Group 已 `released` 而触达的 project 仍 `open`」这一形态在事务结束时不可能存续。
+      const cascade = this.cascadeProjectVersionsReleased(ownerGroup, version, at);
+      if (snapshotWritten || statusMigrated || cascade.released > 0) {
         this.appendEvent({
           featureId: null,
           taskId: null,
@@ -3765,6 +4054,9 @@ export class SessionStore {
             backfilled: !statusMigrated,
             changelogAnchor: snapshot.changelogAnchor,
             projects: snapshot.projects.length,
+            // 级联留痕（★只增键，不改既有键语义）：targeted = 触达集大小，released = 本次真的迁了的行数
+            projectVersionsTargeted: cascade.targeted,
+            projectVersionsReleased: cascade.released,
           }),
         });
       }
@@ -3784,6 +4076,50 @@ export class SessionStore {
       }
       throw err;
     }
+  }
+
+  /**
+   * **Group 发版级联：置 `released` 到该组版名下被触达的 project 版本**（v0.10.1 O4 ·
+   * 改造文档 C-4 / §2.2）—— **只在 {@link SessionStore.versionLedgerMarkReleased} 的事务内调用**，
+   * 不对外暴露（独立调用会造出「project 自己发自己的版」这一 C-4 明确否认的动作）。
+   *
+   * 触达集 = `feature_projects` 里 `(owner_group, group_version)` 名下 **去重**的
+   * `(project_id, project_version)`（一条需求触达多 project ⇒ 多项；多需求同 project 同版 ⇒ 一项）。
+   * `owner_group` 是键的一部分 ⇒ NULL-safe `IS`（`null` = 匿名档），同
+   * {@link SessionStore.featureProjectListByVersion} 口径。
+   *
+   * **不隐式建版**：只对**已存在**的 `project_versions` 行发 UPDATE，且不写 `status` 之外的列；
+   * 归属指向一个不存在的 project 版本行（C-15 由 O2 的归属门挡，历史脏数据可能残留）⇒ 本口
+   * **不补、不报错**（发版不替台账造行）。已 `released` 的行不重复迁（`changes = 0`），
+   * 故幂等重标记不产生第二次留痕。
+   */
+  private cascadeProjectVersionsReleased(
+    ownerGroup: string | null,
+    groupVersion: string,
+    at: string,
+  ): { targeted: number; released: number } {
+    const touched = this.db
+      .prepare(
+        `SELECT DISTINCT project_id, project_version
+         FROM feature_projects WHERE owner_group IS ? AND group_version = ?
+         ORDER BY project_id, project_version`,
+      )
+      .all(ownerGroup, groupVersion) as Array<Record<string, unknown>>;
+    const stmt = this.db.prepare(
+      `UPDATE project_versions SET status = 'released', updated_at = ?
+       WHERE owner_group IS ? AND project_id = ? AND version = ? AND status <> 'released'`,
+    );
+    let released = 0;
+    for (const row of touched) {
+      const info = stmt.run(
+        at,
+        ownerGroup,
+        readString(row, "project_id"),
+        readString(row, "project_version"),
+      );
+      released += Number(info.changes);
+    }
+    return { targeted: touched.length, released };
   }
 
   /**
@@ -3849,6 +4185,416 @@ export class SessionStore {
       if (msg.includes("no such table")) return { status: null, ledgerReady: false };
       throw err;
     }
+  }
+
+  // ===========================================================================
+  // v0.10.1 O1：版本面第二级 —— project 台账（`project_versions`）+ 归属 / 承诺集
+  // （`feature_projects`）读写口。
+  //
+  // 本区是**纯数据面**（建版 / 删版 / 取 / 列 / 写归属 / 删归属 / 两方向查归属）。
+  // 门与闸 —— C-3「未过门挡归属写」、C-4「Group 发版同事务级联置 released」、
+  // C-6 ③④「已归属不可改 / released 即冻结复用」、C-15「归属须指向已存在的版本行」、
+  // project 侧 `releasable`（展示判据）—— **一律不在本层**，由后续节点在这组口之上执法。
+  // ===========================================================================
+
+  /**
+   * **project 台账单行读**（v0.10.1 O1）。定位用 **NULL-safe `IS`**，同 {@link versionLedgerGet}：
+   * `owner_group = ?` 对 NULL 行恒不成立 ⇒ 拿它查匿名档会读成「不存在」。
+   * `ownerGroup` 是**键的一部分**、不是过滤器 ⇒ 不接受 `undefined`（`null` = 未配组的匿名档）。
+   */
+  projectVersionGet(
+    ownerGroup: string | null,
+    projectId: string,
+    version: string,
+  ): ProjectVersionRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT ${PROJECT_VERSION_COLUMNS}
+         FROM project_versions WHERE owner_group IS ? AND project_id = ? AND version = ?`,
+      )
+      .get(ownerGroup, projectId, version) as Record<string, unknown> | undefined;
+    return row === undefined ? null : rowToProjectVersion(row);
+  }
+
+  /**
+   * **project 台账列表读**（v0.10.1 O1 · C-7）—— `GET /api/versions` 顶层 `projectVersions[]`
+   * 的唯一来源（**缺省全表**、可选本组 / 仅匿名档）。过滤语义与 {@link versionLedgerList}
+   * 逐字对齐；排序 = `(owner_group, project_id, version)` 字典序 —— **顺序只由键决定**，
+   * 同组档理由（读投影要做集合可比对，否则一次改版会把行挤出列表中段）。
+   */
+  projectVersionList(ownerGroup?: string | null): ProjectVersionRecord[] {
+    const clause =
+      ownerGroup === undefined
+        ? ""
+        : ownerGroup === null
+          ? "WHERE owner_group IS NULL"
+          : "WHERE owner_group = ?";
+    const rows = this.db
+      .prepare(
+        `SELECT ${PROJECT_VERSION_COLUMNS} FROM project_versions ${clause}
+         ORDER BY owner_group, project_id, version`,
+      )
+      .all(...(ownerGroup === undefined || ownerGroup === null ? [] : [ownerGroup])) as Array<
+      Record<string, unknown>
+    >;
+    return rows.map(rowToProjectVersion);
+  }
+
+  /**
+   * **建版（project 台账建行）**（v0.10.1 O1 · C-6 ②）—— 后续 `POST /api/project-versions` 的写口。
+   *
+   * 判据（任一不过 ⇒ **零写入**，结构化失败供 HTTP / MCP 面直接映射状态码）：
+   * 1. **身份非空**：`project_id` / `version` trim 后不得为空串 ⇒ 400
+   *    {@link ERR_PROJECT_VERSION_SHAPE}（两列皆 PK 成员且 NOT NULL，空串进来只会让 SQLite 抛裸错）；
+   * 2. **shape**：`version` 复用组档同一条 semver 判据 {@link isVersionShapeValid} —— C-6 未为
+   *    project 档另立形状，缺省档又「继承当时 Group Version 数值」⇒ 同形；
+   * 3. **重复 ⇒ 409 {@link ERR_PROJECT_VERSION_EXISTS}**：同 `(owner_group, project_id, version)`
+   *    已存在即拒，**幂等**（二次建不产生第二行、不改第一行任何列）。
+   *
+   * ⚠ 判重**不得依赖 `ON CONFLICT` / `INSERT OR REPLACE`**：PK 含可空列 `owner_group`，而 SQLite
+   * 的唯一约束把 NULL 视为互不相等 ⇒ 匿名档会**静默插出第二行**（照 {@link versionLedgerCreate}
+   * 现例：先 get 再插；并发窗口由 SQLite 单写者 + 同进程同步 API 兜住）。
+   *
+   * 落 `status = "open"`（唯一可建态，{@link ProjectVersionCreateInput} 连 status 参数都不收）；
+   * **不做** released 门 / 引用完整性（C-6 ④、C-15 = 后续节点）。**不写事件**（project 档事件面
+   * 未进本版契约，C-7 / C-13 未定义 ⇒ 留待端点节点定）。
+   */
+  projectVersionCreate(input: ProjectVersionCreateInput): ProjectVersionWriteResult {
+    const projectId = input.projectId.trim();
+    if (projectId.length === 0) {
+      return {
+        ok: false,
+        code: ERR_PROJECT_VERSION_SHAPE,
+        message: "project_id 不得为空串（project 版本身份 = (owner_group, project_id, version)）",
+        status: 400,
+      };
+    }
+    const version = input.version.trim();
+    if (version.length === 0) {
+      return {
+        ok: false,
+        code: ERR_PROJECT_VERSION_SHAPE,
+        message: "version 不得为空串（撤排期不进 project 台账，属 features.version 语义）",
+        status: 400,
+      };
+    }
+    if (!isVersionShapeValid(version)) {
+      return {
+        ok: false,
+        code: ERR_PROJECT_VERSION_SHAPE,
+        message: `非法 project version "${input.version}"：期望 semver 形状 vX.Y.Z（可省 v、可带 -prerelease/+build）`,
+        status: 400,
+      };
+    }
+    if (this.projectVersionGet(input.ownerGroup, projectId, version) !== null) {
+      return {
+        ok: false,
+        code: ERR_PROJECT_VERSION_EXISTS,
+        message: `project 版本已存在（owner_group=${input.ownerGroup === null ? "NULL" : `"${input.ownerGroup}"`} · project_id=${projectId} · version=${version}）`,
+        status: 409,
+      };
+    }
+    const at = nowIso();
+    const record: ProjectVersionRecord = {
+      ownerGroup: input.ownerGroup,
+      projectId,
+      version,
+      status: "open",
+      date: input.date ?? null,
+      note: input.note ?? null,
+      createdAt: at,
+      updatedAt: at,
+    };
+    this.db
+      .prepare(
+        `INSERT INTO project_versions (owner_group, project_id, version, status, date, note, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.ownerGroup,
+        record.projectId,
+        record.version,
+        record.status,
+        record.date,
+        record.note,
+        record.createdAt,
+        record.updatedAt,
+      );
+    return { ok: true, record };
+  }
+
+  /**
+   * **删版（project 台账删行）**（v0.10.1 O1）—— 未发版 project 版本的撤销 / 重建路径（C-6 ③）。
+   *
+   * 本口**只承载存在性判据**（无此行 ⇒ 404 {@link ERR_PROJECT_VERSION_UNKNOWN}）：
+   * C-6 ③ 的「未发版 ∧ 无任何归属才可删」、C-6 ④ 的「一经 `released` 即冻结」是**门判据**，
+   * 由后续节点在本口之上执法（本节点边界 =「不做闸 / 门」）。删**不级联**归属行（C-16）。
+   */
+  projectVersionDelete(
+    ownerGroup: string | null,
+    projectId: string,
+    version: string,
+  ): ProjectVersionWriteResult {
+    const row = this.projectVersionGet(ownerGroup, projectId, version);
+    if (row === null) {
+      return {
+        ok: false,
+        code: ERR_PROJECT_VERSION_UNKNOWN,
+        message: `project 台账无此行（owner_group=${ownerGroup === null ? "NULL" : `"${ownerGroup}"`} · project_id=${projectId} · version=${version}）`,
+        status: 404,
+      };
+    }
+    this.db
+      .prepare(
+        "DELETE FROM project_versions WHERE owner_group IS ? AND project_id = ? AND version = ?",
+      )
+      .run(ownerGroup, projectId, version);
+    return { ok: true, record: row };
+  }
+
+  /**
+   * **归属单行读**（键定位，NULL-safe `IS`）—— 写口的判重 / 幂等凭据。
+   * 对外读面走 {@link featureProjectListByFeature} / {@link featureProjectListByVersion}。
+   */
+  private featureProjectGet(
+    ownerGroup: string | null,
+    featureId: string,
+    projectId: string,
+  ): FeatureProjectRecord | null {
+    const row = this.db
+      .prepare(
+        `SELECT ${FEATURE_PROJECT_COLUMNS}
+         FROM feature_projects WHERE owner_group IS ? AND feature_id = ? AND project_id = ?`,
+      )
+      .get(ownerGroup, featureId, projectId) as Record<string, unknown> | undefined;
+    return row === undefined ? null : rowToFeatureProject(row);
+  }
+
+  /**
+   * **不变式继承判据读**（v0.10.1 O1 · C-2）：列出 `(owner_group, group_version, project_id)`
+   * 名下已有的归属行 —— 「同一 Group Version + 同一 Project ⇒ 同一 Project Version」的**读凭据**：
+   * 调用方（归属写执法）据此「已存在则继承、不存在则新建」。
+   *
+   * **多行是常态**（实测：一版一 project 名下可挂多条需求，如 `v0.9.8`+`board` = 10 Feature），
+   * 「同一 RC」是**归并**语义 ⇒ 本口只回行集、**不判一致**（一致校验 = 后续节点的执法面）。
+   * 排序 = `feature_id` 字典序（顺序只由键决定，同上）。
+   */
+  featureProjectListByVersion(
+    ownerGroup: string | null,
+    groupVersion: string,
+    projectId: string,
+  ): FeatureProjectRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${FEATURE_PROJECT_COLUMNS}
+         FROM feature_projects WHERE owner_group IS ? AND group_version = ? AND project_id = ?
+         ORDER BY feature_id`,
+      )
+      .all(ownerGroup, groupVersion, projectId) as Array<Record<string, unknown>>;
+    return rows.map(rowToFeatureProject);
+  }
+
+  /**
+   * **按需求列归属**（v0.10.1 O1 · C-19 feature 详情 / 列表只读面的数据源）。
+   * `feature_id` 全局唯一 ⇒ **不带** `owner_group` 过滤（可见性由调用方的 Feature 读面把关）。
+   * 排序 = `project_id` 字典序（集合可比对）。
+   */
+  featureProjectListByFeature(featureId: string): FeatureProjectRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${FEATURE_PROJECT_COLUMNS} FROM feature_projects WHERE feature_id = ? ORDER BY project_id`,
+      )
+      .all(featureId) as Array<Record<string, unknown>>;
+    return rows.map(rowToFeatureProject);
+  }
+
+  /**
+   * **按需求批量列归属**（v0.10.1 O7 · C-19 feature 列表只读面的数据源）：**一条 SQL** 取可见范围内
+   * 全部 Feature 的归属行，替掉「列表每行 Feature 再查一次 {@link featureProjectListByFeature}」
+   * （1+N → O(1)，照 {@link featureTaskStateCounts} 的 v0.9.0 B3″ 先例）。
+   *
+   * ★ **归属谓词与 {@link listFeatures} 同源**（{@link featureOwnershipPredicate}）—— 归属条件另写
+   * 一份就是两处判据漂移，会把不可见 Feature 的归属塞进只读面（静默放宽可见性）。
+   * `ownerGroup` 语义与 `listFeatures` 逐字一致：给定组名 ⇒ 仅本组（`owner_group = ?`，NULL 无归属
+   * 行被排除 = fail-closed）；`undefined` ⇒ 全量（未配组环境匿名入口 / 3300 运维视图）。
+   *
+   * 返回 `Map<featureId, FeatureProjectRecord[]>`：**无归属的 Feature 不出现在 map 里**
+   * （调用方按空数组处理 ⇒ 与 {@link featureProjectListByFeature} 查回空数组同语义）。
+   * 行序 = `feature_id`, `project_id` 字典序 ⇒ 每个需求桶内 `project_id` 升序，与单需求读口同序
+   * （两个面的清单可直接比对）。
+   */
+  featureProjectListByFeatures(ownerGroup?: string): Map<string, FeatureProjectRecord[]> {
+    const owner = featureOwnershipPredicate(ownerGroup, true);
+    const rows = this.db
+      .prepare(
+        `SELECT ${FEATURE_PROJECT_COLUMNS}
+         FROM feature_projects ${owner.clause.trim() || "WHERE 1=1"}
+         ORDER BY feature_id, project_id`,
+      )
+      .all(...owner.params) as Array<Record<string, unknown>>;
+    const out = new Map<string, FeatureProjectRecord[]>();
+    for (const row of rows) {
+      const record = rowToFeatureProject(row);
+      const bucket = out.get(record.featureId);
+      if (bucket === undefined) out.set(record.featureId, [record]);
+      else bucket.push(record);
+    }
+    return out;
+  }
+
+  /**
+   * **project 档三桶计数**（v0.10.1 O2 · 改造文档 C-4 / §4「project 侧 `releasable` 判据」的读凭据）——
+   * 归属到 `(owner_group, project_id, project_version)` 名下的 Feature 按态归并成
+   * `{total, completed, cancelled, open}` 三桶。
+   *
+   * **桶口径与 Group 侧同源**：`completed` / `cancelled` 各自成桶，**其余态（含 `failed` 与主链
+   * 中间态）一律进 `open`** —— 照 {@link aggregateFeaturesByVersion} 的「`failed` 不算收口」口径。
+   * 但**两套计数不得横向相加 / 相等校验**（C-4 ★R2：Group 由 `features.version` 派生、project 由
+   * 归属表派生，是同一批卡的两个正交投影）。
+   *
+   * **单条 GROUP BY、无 N+1**：归属表按 project 版本定位行集 + JOIN `features` 取态，聚合在 SQL 侧完成。
+   * **`INNER JOIN`** ⇒ Feature 行已不存在（归属是长期事实源、不随 Feature 删除而级联，C-16）时
+   * 该条**不计入**任何桶 —— 没有态可归并，不得凭归属行猜一个态。
+   *
+   * `ownerGroup` 是**键的一部分**（`null` = 匿名档，NULL-safe `IS`，同 {@link featureProjectListByVersion}）。
+   */
+  featureProjectStateCounts(
+    ownerGroup: string | null,
+    projectId: string,
+    projectVersion: string,
+  ): ProjectVersionCardCounts {
+    const rows = this.db
+      .prepare(
+        `SELECT f.state AS state, COUNT(*) AS n
+         FROM feature_projects p
+         JOIN features f ON f.feature_id = p.feature_id
+         WHERE p.owner_group IS ? AND p.project_id = ? AND p.project_version = ?
+         GROUP BY f.state`,
+      )
+      .all(ownerGroup, projectId, projectVersion) as Array<Record<string, unknown>>;
+    const counts: ProjectVersionCardCounts = { total: 0, completed: 0, cancelled: 0, open: 0 };
+    for (const row of rows) {
+      const n = Number(row["n"] ?? 0);
+      counts.total += n;
+      const state = readString(row, "state");
+      if (state === "completed") counts.completed += n;
+      else if (state === "cancelled") counts.cancelled += n;
+      else counts.open += n;
+    }
+    return counts;
+  }
+
+  /**
+   * **写归属（建行 / 改行）**（v0.10.1 O1 · C-3）—— 后续 MCP `advance(projectVersions[])` 与板
+   * 意图的共同落库口。
+   *
+   * 三档落点（**同键恒一行**；判重照 {@link projectVersionCreate} 的 NULL-safe `IS` 口径，
+   * **不用 `ON CONFLICT`**）：
+   * - 键不存在 ⇒ INSERT（`created = true`）；
+   * - 键存在 ∧ 值有变 ⇒ UPDATE 三值列 + `updated_at`（`created = false` ∧ `changed = true`）
+   *   = 承诺集「**可改须留痕**」（`created_at` 保留首值，照 {@link upsertSession} 口径）；
+   * - 键存在 ∧ 值全同 ⇒ **零写入**（两布尔皆 `false`，**不改 `updated_at`**）
+   *   = 「新增执行节点同轮重发**全量**、同值幂等、重发安全」（C-3 ★R3）。
+   *
+   * 身份四列 trim 后不得为空串 ⇒ 400 {@link ERR_PROJECT_VERSION_SHAPE}（PK / NOT NULL 成员）。
+   *
+   * **本口不校验**：Feature 是否已 `approve`（C-3 未过门挡写）、目标 project 版本行是否存在
+   * （C-15 ⇒ `orch_project_version_unknown`）、该版本是否已 `released`（C-6 ④）—— 全部是后续
+   * 节点的执法面。本层唯一硬约束 = `group_version` NOT NULL（C-21「无 Group Version ⇒ 无归属」
+   * 的 schema 表达）。
+   */
+  featureProjectUpsert(input: FeatureProjectUpsertInput): FeatureProjectUpsertResult {
+    const featureId = input.featureId.trim();
+    const projectId = input.projectId.trim();
+    const projectVersion = input.projectVersion.trim();
+    const groupVersion = input.groupVersion.trim();
+    const source = input.source ?? null;
+    for (const [column, value] of [
+      ["feature_id", featureId],
+      ["project_id", projectId],
+      ["project_version", projectVersion],
+      ["group_version", groupVersion],
+    ] as const) {
+      if (value.length === 0) {
+        return {
+          ok: false,
+          code: ERR_PROJECT_VERSION_SHAPE,
+          message: `归属写入的 ${column} 不得为空串（承诺集身份键成员）`,
+          status: 400,
+        };
+      }
+    }
+    const existing = this.featureProjectGet(input.ownerGroup, featureId, projectId);
+    if (existing !== null) {
+      const changed =
+        existing.projectVersion !== projectVersion ||
+        existing.groupVersion !== groupVersion ||
+        existing.source !== source;
+      if (!changed) return { ok: true, record: existing, created: false, changed: false };
+      const at = nowIso();
+      this.db
+        .prepare(
+          `UPDATE feature_projects
+           SET project_version = ?, group_version = ?, source = ?, updated_at = ?
+           WHERE owner_group IS ? AND feature_id = ? AND project_id = ?`,
+        )
+        .run(projectVersion, groupVersion, source, at, input.ownerGroup, featureId, projectId);
+      return {
+        ok: true,
+        record: { ...existing, projectVersion, groupVersion, source, updatedAt: at },
+        created: false,
+        changed: true,
+      };
+    }
+    const at = nowIso();
+    const record: FeatureProjectRecord = {
+      ownerGroup: input.ownerGroup,
+      featureId,
+      projectId,
+      projectVersion,
+      groupVersion,
+      source,
+      createdAt: at,
+      updatedAt: at,
+    };
+    this.db
+      .prepare(
+        `INSERT INTO feature_projects (owner_group, feature_id, project_id, project_version, group_version, source, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.ownerGroup,
+        record.featureId,
+        record.projectId,
+        record.projectVersion,
+        record.groupVersion,
+        record.source,
+        record.createdAt,
+        record.updatedAt,
+      );
+    return { ok: true, record, created: true, changed: true };
+  }
+
+  /**
+   * **删归属**（v0.10.1 O1）—— 从「全量重发」的集合里移除一条承诺（不再触达该 project）。
+   *
+   * **幂等**：键不存在 ⇒ `deleted = false` ∧ `record = null` ∧ 零副作用（重发时删到不存在的行
+   * 不是错误，不产码）。不做任何门判据（Feature 是否 `cancelled`、是否已过门、版本是否已
+   * `released` ⇒ 后续节点执法）。
+   */
+  featureProjectDelete(
+    ownerGroup: string | null,
+    featureId: string,
+    projectId: string,
+  ): FeatureProjectDeleteResult {
+    const existing = this.featureProjectGet(ownerGroup, featureId, projectId);
+    if (existing === null) return { deleted: false, record: null };
+    this.db
+      .prepare(
+        "DELETE FROM feature_projects WHERE owner_group IS ? AND feature_id = ? AND project_id = ?",
+      )
+      .run(ownerGroup, featureId, projectId);
+    return { deleted: true, record: existing };
   }
 
   /** 列出 Feature（updated_at 倒序；可选状态 / 版号 / 归属组过滤；limit 默认 100，clamp 到 [1,1000]） */
@@ -4598,6 +5344,108 @@ export function versionLedgerMarkReleased(
  */
 export function versionsLedgerMigrationDone(): boolean {
   return getDefaultStore().versionsLedgerMigrationDone();
+}
+
+/**
+ * project 台账**单行读**（默认存储；v0.10.1 O1）—— 见 {@link SessionStore.projectVersionGet}。
+ * `ownerGroup` 是键的一部分：`null` = 匿名档（不接受 `undefined`）。
+ */
+export function projectVersionGet(
+  ownerGroup: string | null,
+  projectId: string,
+  version: string,
+): ProjectVersionRecord | null {
+  return getDefaultStore().projectVersionGet(ownerGroup, projectId, version);
+}
+
+/**
+ * project 台账**列表读**（默认存储；v0.10.1 O1）—— 见 {@link SessionStore.projectVersionList}。
+ * `undefined` ⇒ 全表 / 字符串 ⇒ 本组 / `null` ⇒ 仅匿名档。
+ */
+export function projectVersionList(ownerGroup?: string | null): ProjectVersionRecord[] {
+  return getDefaultStore().projectVersionList(ownerGroup);
+}
+
+/**
+ * project 台账**建版**（默认存储；v0.10.1 O1）—— 见 {@link SessionStore.projectVersionCreate}。
+ * 出参直接映射 HTTP 状态码与信封。
+ */
+export function projectVersionCreate(input: ProjectVersionCreateInput): ProjectVersionWriteResult {
+  return getDefaultStore().projectVersionCreate(input);
+}
+
+/**
+ * project 台账**删版**（默认存储；v0.10.1 O1）—— 见 {@link SessionStore.projectVersionDelete}
+ * （纯存在性判据；C-6 ③④ 的门判据由后续节点在本口之上执法）。
+ */
+export function projectVersionDelete(
+  ownerGroup: string | null,
+  projectId: string,
+  version: string,
+): ProjectVersionWriteResult {
+  return getDefaultStore().projectVersionDelete(ownerGroup, projectId, version);
+}
+
+/**
+ * **不变式继承判据读**（默认存储；v0.10.1 O1）—— 见
+ * {@link SessionStore.featureProjectListByVersion}（C-2「已存在则继承、不存在则新建」的读凭据）。
+ */
+export function featureProjectListByVersion(
+  ownerGroup: string | null,
+  groupVersion: string,
+  projectId: string,
+): FeatureProjectRecord[] {
+  return getDefaultStore().featureProjectListByVersion(ownerGroup, groupVersion, projectId);
+}
+
+/**
+ * **按需求列归属**（默认存储；v0.10.1 O1）—— 见
+ * {@link SessionStore.featureProjectListByFeature}（C-19 feature 侧归属只读面的数据源）。
+ */
+export function featureProjectListByFeature(featureId: string): FeatureProjectRecord[] {
+  return getDefaultStore().featureProjectListByFeature(featureId);
+}
+
+/**
+ * **按需求批量列归属**（默认存储；v0.10.1 O7）—— 见
+ * {@link SessionStore.featureProjectListByFeatures}（C-19 feature 列表只读面的数据源，
+ * **一条 SQL** 取全量 ⇒ 列表读不随 Feature 数增长）。
+ */
+export function featureProjectListByFeatures(
+  ownerGroup?: string,
+): Map<string, FeatureProjectRecord[]> {
+  return getDefaultStore().featureProjectListByFeatures(ownerGroup);
+}
+
+/**
+ * **project 档三桶计数**（默认存储；v0.10.1 O2）—— 见
+ * {@link SessionStore.featureProjectStateCounts}（`releasable` 判据的读凭据）。
+ */
+export function featureProjectStateCounts(
+  ownerGroup: string | null,
+  projectId: string,
+  projectVersion: string,
+): ProjectVersionCardCounts {
+  return getDefaultStore().featureProjectStateCounts(ownerGroup, projectId, projectVersion);
+}
+
+/**
+ * **写归属**（默认存储；v0.10.1 O1）—— 见 {@link SessionStore.featureProjectUpsert}
+ * （同键恒一行；同值重发 ⇒ `created = false` ∧ `changed = false` 零写入）。
+ */
+export function featureProjectUpsert(input: FeatureProjectUpsertInput): FeatureProjectUpsertResult {
+  return getDefaultStore().featureProjectUpsert(input);
+}
+
+/**
+ * **删归属**（默认存储；v0.10.1 O1）—— 见 {@link SessionStore.featureProjectDelete}（幂等）。
+ */
+export function featureProjectDelete(
+  ownerGroup: string | null,
+  featureId: string,
+  projectId: string,
+): FeatureProjectDeleteResult {
+  return getDefaultStore().featureProjectDelete(ownerGroup, featureId, projectId);
 }
 
 /** 清理保留策略（默认存储） */

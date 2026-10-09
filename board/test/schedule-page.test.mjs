@@ -28,7 +28,7 @@ import {
   renderPage,
 } from "../dist/web/layout.js";
 import { createBoardServer } from "../dist/server.js";
-import { engineNoLockFetcher } from "./engine-versions-fixture.mjs";
+import { engineNoLockFetcher, engineEnvelopeFetcher } from "./engine-versions-fixture.mjs";
 
 function feature(featureId, version, overrides = {}) {
   return {
@@ -930,4 +930,144 @@ test("M4-⑦（B5a 改版）方法门与错误面: GET /schedule ⇒ 303 回门�
     assert.match(text, /<nav>/, "宕页仍出板壳（导航结构在，不跳回需求）");
     assert.doesNotMatch(text, /<a href="\/schedule"/, "宕页不再给「排期」留 NAV 入口（退役闭集钉）");
   });
+});
+
+// ---------------------------------------------------------------------------
+// v0.10.1 B5（续）—— **排期锁侧的执法面钉**（改造文档 §2 C-1 / C-12 · §3 board 段
+//   「project 行混入 `versions[]` ⇒ 不命中排期锁」+「同名 group / project 版号互不染色」）。
+//   落点选本文件而非 v0101 系列 = 这里是「排期写执法」的既有回归宿主：
+//   `handleWriteSchedule` 里**版本锁（③）先判、状态锁（③c）后判** ⇒ 同一请求在两档信封下
+//   必然落到**不同错误码**，这个分流就是「锁有没有命中」的机械凭据（不需要读代码顺序即可证伪）。
+//   脏形状一律经夹具 `engineEnvelopeFetcher` 走**真解析层**喂入 —— 手拼 projection 会绕过那道裁撤。
+//   与 `versions-columns` 的 B5-①…③ **分立不重抄**：那三钉管读面（列 / 列头徽标 / 锁名单派生），
+//   本批三钉管写面执法（409 还是出网）。
+// ---------------------------------------------------------------------------
+
+/**
+ * 执法面装配的固定信封（三档）：**版号 v0.10.1 只在 project 档 released**（④）/ **同名改由 Group
+ * 档 released**（⑤ 对照组，证伪「④ 的放行不是因为没有锁」）/ **两档并置 + 另有一枚 Group 锁版**（⑥ 互不染色）。
+ * project 行的形状键必带 `project_id`（Group 行永不含，见 `bridge-client.ts#parseEngineVersions`）。
+ */
+const B5_LOCK_BASE_ROWS = [{ owner_group: "alpha", version: "v0.10.0", status: "active" }];
+const B5_TARGET = "v0.10.1";
+const B5_GROUP_LOCKED = "v0.9.9";
+
+/**
+ * 排期锁执法面的一次装配：本地台账喂空（不参与锁判，仅避免读开发机 `.data/versions.json`）+
+ * 引擎投影由 `envelope` 经**真解析层**喂入 + 出网口只记录不外发（`seen` = 「照旧出网」的机械凭据）。
+ * 卡面固定为**想法挪版档**（stage 需求分析 ∧ approval 未发起 ⇒ 状态锁 ③c 恒开）⇒ 落到哪个错误码
+ * 只由版本锁 ③b 决定；现版本 v0.10.0 在两档信封下都不是 Group released ⇒ 「目标锁 / 现版本锁」判据互不干扰。
+ * `defaultGroup` 显式配置（**已知修正②**：锁的 org 切片链路 = `spaceOrg ?? form.group ?? defaultGroup`，
+ * 全局路径 POST 且 body 不带 `group` 时不配 ⇒ 投影切不到 alpha，对照组不返 409、钉变成自证）。
+ */
+async function withScheduleLockServer(envelope, run) {
+  const dir = mkdtempSync(join(tmpdir(), "board-b5-lock-"));
+  const ledgerFile = join(dir, "versions.json");
+  writeFileSync(ledgerFile, JSON.stringify({ version: 1, versions: [] }, null, 2) + "\n", "utf8");
+  const seen = [];
+  const client = fakeClient([feature("F1", "v0.10.0")], {
+    async getFeature(featureId) {
+      return {
+        feature: {
+          featureId,
+          state: "executing",
+          title: "想法卡",
+          plan: null,
+          ownerGroup: "alpha",
+          stage: "需求分析",
+          version: "v0.10.0",
+          approval: "未发起",
+          decisions: null,
+          contracts: null,
+          createdAt: "c",
+          updatedAt: "u",
+        },
+        tasks: [],
+        acceptance: null,
+      };
+    },
+  });
+  const handle = await createBoardServer({
+    host: "127.0.0.1",
+    port: 0,
+    client,
+    versionsLedgerFile: ledgerFile,
+    defaultGroup: "alpha",
+    engineVersionsFetcher: engineEnvelopeFetcher(envelope),
+    scheduleFeatureImpl: async (input) => {
+      seen.push(input);
+      return { ok: true, featureId: input.featureId, state: input.to, version: input.version };
+    },
+  });
+  try {
+    await run(`http://127.0.0.1:${handle.port}`, seen);
+  } finally {
+    await handle.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/** 排期写 POST（JSON 档）：**已知修正①** —— 成功档断言 = `200`（`accept: application/json` 走
+ *  {@link wantsJson} 分支，对齐 `server-schedule-write` M3-①），表单档才 PRG 303。 */
+function scheduleLockPost(base, version) {
+  return fetch(`${base}/features/F1/schedule`, {
+    method: "POST",
+    redirect: "manual",
+    headers: {
+      origin: base,
+      "x-board-write": "1",
+      accept: "application/json",
+      "content-type": "application/x-www-form-urlencoded",
+    },
+    body: new URLSearchParams({ version }).toString(),
+  });
+}
+
+test("B5-④（执法面钉 a）仅 project 档 released 的版号 ⇒ 不命中排期锁：不 409、照旧出网一次", async () => {
+  await withScheduleLockServer(
+    { ok: true, versions: [...B5_LOCK_BASE_ROWS, { owner_group: "alpha", project_id: "board", version: B5_TARGET, status: "released" }] },
+    async (base, seen) => {
+      const res = await scheduleLockPost(base, B5_TARGET);
+      assert.equal(res.status, 200, "project 行整条不进 Group entries ⇒ 不进锁名单，排期写不得被版本锁挡（可证伪：锁若吃 project 行必 409）");
+      await res.body?.cancel();
+      assert.equal(seen.length, 1, "放行 = 真出网一次，不是错误面伪装");
+      assert.equal(seen[0].version, B5_TARGET, "出网装配仍取该版号（不被锁判据改写）");
+    },
+  );
+});
+
+test("B5-⑤（执法面钉 a 对照组）同名版号改由 Group 档 released ⇒ 409 board_version_released 且零出网", async () => {
+  await withScheduleLockServer(
+    { ok: true, versions: [...B5_LOCK_BASE_ROWS, { owner_group: "alpha", version: B5_TARGET, status: "released" }] },
+    async (base, seen) => {
+      const res = await scheduleLockPost(base, B5_TARGET);
+      assert.equal(res.status, 409, "对照组：同版号同卡同闸，唯一差别 = 锁记在 Group 档 ⇒ 必须挡（否则 ④ 是空钉）");
+      assert.match(await res.text(), /board_version_released/, "挡下时的错误码仍是版本锁那把（不是状态锁 board_schedule_state_locked）");
+      assert.equal(seen.length, 0, "版本锁零出网");
+    },
+  );
+});
+
+test("B5-⑥（执法面钉 b·两档并置）同名互不染色：project released 不染 Group 同名 active；Group released 不因 project 同名 open 退色", async () => {
+  await withScheduleLockServer(
+    {
+      ok: true,
+      versions: [
+        ...B5_LOCK_BASE_ROWS,
+        { owner_group: "alpha", version: B5_TARGET, status: "active" },
+        { owner_group: "alpha", project_id: "board", version: B5_TARGET, status: "released" },
+        { owner_group: "alpha", version: B5_GROUP_LOCKED, status: "released" },
+        { owner_group: "alpha", project_id: "machine", version: B5_GROUP_LOCKED, status: "open" },
+      ],
+    },
+    async (base, seen) => {
+      const noStain = await scheduleLockPost(base, B5_TARGET);
+      assert.equal(noStain.status, 200, "project released ∧ Group 同名 active ⇒ 排期写照旧放行（project 侧不把 Group 染成已发版）");
+      await noStain.body?.cancel();
+      const noFade = await scheduleLockPost(base, B5_GROUP_LOCKED);
+      assert.equal(noFade.status, 409, "Group released ∧ project 同名 open ⇒ 锁照常（project 侧不松 Group 的锁）");
+      assert.match(await noFade.text(), /board_version_released/);
+      assert.equal(seen.length, 1, "两档各自记账：只有未染色那版真出网");
+    },
+  );
 });

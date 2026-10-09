@@ -38,6 +38,14 @@ export type RiskLevel = "read" | "write" | "full";
 /** 单台机器上的一个项目 */
 export interface ProjectConfig {
   projectId: string;
+  /**
+   * **代码根**（v0.10.1 定型）：本项目 Agent 执行 / 会话的工作目录 —— 适配器经桥
+   * `--workspace` 下传，ACP 会话的 `cwd` 即取此值。
+   * 形态自由：**可为仓内子目录**（monorepo —— 各子项目各配一个 project、各指自己的子目录），
+   * **亦可自成一仓**（polyrepo —— 直接指向该仓根）。
+   * machine 侧只把它当「一个目录」：**不从本字段反推仓库标识**，也不校验目录形态 ——
+   * 仓身份由下面可选的 `repo` 键显式标注；本字段的唯一判据是拉起前的存在性检查。
+   */
   workspace: string;
   agentKind: AgentKind;
   /** 该项目的 A2A Server 监听端口 */

@@ -448,7 +448,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_feature_status",
     {
       description:
-        "查询 Feature 详情（state + tasks 摘要 + artifacts）；省略 featureId 时列出全部 Feature（含任务数）。",
+        "查询 Feature 详情（state + tasks 摘要 + artifacts + **归属** `projects`〔v0.10.1 O7：本需求触达哪些 project、各落哪个 Project Version，无归属 ⇒ 空数组〕）；省略 featureId 时列出全部 Feature（含任务数，并带 `attributionsByFeature` map = `featureId → 归属清单`，**一条 SQL** 批量取）。",
       inputSchema: {
         featureId: z.string().optional().describe("Feature ID；省略则列出全部"),
       },
@@ -467,7 +467,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_feature_advance",
     {
       description:
-        "orch agent 驱动 Feature 主链推进（如 integrating→testing→reviewing→completed）；状态机校验合法后继，非法流转被拒。**waiting_approval→executing 已禁用**（唯一准入 = a2a_feature_approve，错误码 feature_approval_required）。needs_input 恢复用 to=executing 并携带 answer。**重派失败节点**用 retryTaskIds（须显式 to=executing，与 answer 互斥；重派 + 解冻闭包外 blocked 下游，不改 Feature 态）。**登记字段**用 stage / version / approval（`to` = 当前态时 = 只写登记、不动主链；无终态守卫，completed 后仍可写「发版」）。",
+        "orch agent 驱动 Feature 主链推进（如 integrating→testing→reviewing→completed）；状态机校验合法后继，非法流转被拒。**waiting_approval→executing 已禁用**（唯一准入 = a2a_feature_approve，错误码 feature_approval_required）。needs_input 恢复用 to=executing 并携带 answer。**重派失败节点**用 retryTaskIds（须显式 to=executing，与 answer 互斥；重派 + 解冻闭包外 blocked 下游，不改 Feature 态）。**登记字段**用 stage / version / approval（`to` = 当前态时 = 只写登记、不动主链；无终态守卫，completed 后仍可写「发版」）。**归属（承诺集）**用 projectVersions（v0.10.1 O3 **独立分支**：非空即写全量归属、同值幂等可重发；`to` = 当前态时只补归属、主链零变更，与合法流转同单则归属 + 迁移同单生效；判据不过 ⇒ 整单拒绝且主链零迁移）。",
       inputSchema: {
         featureId: z.string().min(1).describe("Feature ID"),
         to: z
@@ -517,6 +517,34 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
             "审批门状态登记（闭集：未发起 / 待审批 / 已通过；非法值 ⇒ feature_invalid_approval）。" +
               "写完改造文档后置「待审批」= 过审的前置；a2a_feature_approve 放行时落「已通过」。",
           ),
+        // v0.10.1 O3 归属（承诺集）写：**独立分支**（不入登记字段特例判据），照 retryTaskIds 先例：
+        // `projectVersions` 非空即触发；`to` = 当前态时跳过 canTransition（转移表零改动、无自环）
+        projectVersions: z
+          .array(
+            z.object({
+              projectId: z.string().min(1).describe("被本需求触达的 project"),
+              version: z
+                .string()
+                .min(1)
+                .describe("该 project 的 **Project Version**（须已在 project 台账建版，不隐式建版）"),
+              // 归属表无此二列（C-16）；repoId / ref 只在交付快照回读方向存在（C-5）⇒ 接受即忽略
+              repoId: z
+                .string()
+                .optional()
+                .describe("**不落库**（归属面不持久化代码根标识；快照方向才带，C-5）"),
+              ref: z.string().optional().describe("**不落库**（同上）"),
+            }),
+          )
+          .optional()
+          .describe(
+            "归属（承诺集）**全量**重发（v0.10.1 O3 / C-17）：本需求触达哪些 project、各自落哪个 Project Version。" +
+              "**独立分支**：非空即写归属，`to` = 当前态时**不动主链**（照 retryTaskIds 先例，转移表零改动）；" +
+              "与合法流转同单时归属与迁移**一起生效**。空数组 = 零写 no-op（不是清空归属）。" +
+              "**全量重发安全**（同值幂等、不制造活动痕迹）；未过门 / released 门 / 继承冲突 / 异值改写" +
+              "⇒ **整单拒绝且主链零迁移**（orch_project_attribution_state_locked / " +
+              "orch_project_version_released_locked / orch_project_attribution_conflict / " +
+              "orch_project_version_unknown / orch_project_version_invalid_shape）。",
+          ),
       },
     },
     async (args) => {
@@ -532,6 +560,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           stage: args.stage,
           version: args.version,
           approval: args.approval,
+          projectVersions: args.projectVersions,
         });
         if (!outcome.ok) return errorResult(outcome);
         core.kickScheduler();

@@ -200,7 +200,7 @@ test("v0.9.3 O1 迁移：老库无 parent_feature_id 列 ⇒ ctor 补列，存�
 test("v0.9.3 O1：同 id 重跑 createFeature ⇒ parent_feature_id 不进 DO UPDATE SET（父不可变）", () => {
   close();
   const p1 = mustOk(handleFeatureCreate({ title: "父一" }));
-  const p2 = mustOk(handleFeatureCreate({ title: "父二" }));
+  mustOk(handleFeatureCreate({ title: "父二" }));
   createFeature({
     featureId: "child-once",
     title: "子",

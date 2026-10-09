@@ -47,20 +47,32 @@
  * ## 幂等 / 判据
  * 判据**全在 store 写口内做完**（`versionLedgerCreate` / `versionLedgerDelete`），本层只做
  * 「传输层形状 + 归属门闩 + 状态码映射」⇒ 同一请求重复发不产生第二行、也不改第一行。
+ *
+ * ## v0.10.1 O5 的两件事（改造文档 §2 C-7 / C-13 / C-17）
+ * 1. **`GET /api/versions` 增顶层字段 `projectVersions[]`**（{@link projectVersionsView}）——
+ *    **`versions[]` 的成员与语义逐字不变**（硬约束：板 Group 面 / 已发版锁零改动）；
+ *    project 档同样支持可选 `?owner_group=`，**缺省全表**（向后兼容）。
+ * 2. **本模块是 project 档端点（`bridge/project-versions-endpoints.ts`）的复用源** ——
+ *    归属解析三源、统一信封、JSON 体读取等传输层工具在本文件导出后**单处实现**
+ *    （C-17「`versions-endpoints.ts` 仅作归属解析复用」）。复用方向单向：
+ *    project 档 → 本模块，本模块**不**引 project 档模块（避免循环依赖）。
  */
 import type { IncomingMessage, ServerResponse } from "node:http";
 import type { CoreRole } from "../runtime/core-lease.js";
 import { isVersionLedgerStatus } from "../types.js";
 import {
+  projectVersionList,
   versionLedgerCreate,
   versionLedgerDelete,
   versionLedgerList,
   versionLedgerSetStatus,
+  type ProjectVersionRecord,
   type VersionLedgerCreateInput,
   type VersionLedgerRecord,
   type VersionLedgerSetStatusInput,
   type VersionLedgerWriteResult,
 } from "../session/store.js";
+import { evaluateProjectReleaseGate } from "./feature-tools.js";
 import {
   markVersionReleased,
   type MarkVersionReleasedInput,
@@ -80,7 +92,9 @@ const VERSIONS_STATUS_SUFFIX = "/status";
 const VERSIONS_MAX_BODY_BYTES = 1_048_576;
 
 /** GET 出参 `source` 串（读投影的事实源声明，与 `web.ts` 各面同风格） */
-const VERSIONS_SOURCE = "引擎版本台账 `versions` 表（每请求现读；板为读投影，非事实源）";
+const VERSIONS_SOURCE =
+  "引擎版本台账 `versions` 表（每请求现读；板为读投影，非事实源）" +
+  " + project 台账 `project_versions` 表（`projectVersions[]` = project 档，同请求现读；可选 `?owner_group=` 收窄、缺省全表）";
 
 /** 传输层自身的错误码（与 store 的 `orch_version_*` 业务码同前缀、同一映射表） */
 export const ERR_VERSIONS_BAD_REQUEST = "orch_versions_bad_request";
@@ -138,7 +152,7 @@ const defaultStorePort: VersionsStorePort = {
 };
 
 /** `owner_group` 查询参数 ⇒ store 入参（缺省 / 空串 ⇒ 全量，与 `web.ts` O3 面口径逐字一致） */
-function readOwnerGroupParam(req: IncomingMessage): string | undefined {
+export function readOwnerGroupParam(req: IncomingMessage): string | undefined {
   const raw = new URL(req.url ?? "/", "http://a2a-bridge.invalid").searchParams.get("owner_group");
   return raw === null || raw.length === 0 ? undefined : raw;
 }
@@ -146,12 +160,41 @@ function readOwnerGroupParam(req: IncomingMessage): string | undefined {
 /** 归属在 JSON 体里的两种写法（camelCase = 本仓既有约定；snake_case = 板 / 宿主实际发出形态） */
 const OWNER_GROUP_BODY_KEYS = ["ownerGroup", "owner_group"] as const;
 
-/** {@link readOwnerGroupSource} 的返回：`undefined` = 三源皆未提供；`"invalid"` = 提供了但类型非法 */
-type OwnerGroupSource = string | null | undefined | "invalid";
+/** {@link readFieldSource} 的返回：`undefined` = 各源皆未提供；`"invalid"` = 提供了但类型非法 */
+export type FieldSource = string | null | undefined | "invalid";
+
+/** {@link readOwnerGroupSource} 的返回（既有别名保留，语义 = {@link FieldSource}） */
+export type OwnerGroupSource = FieldSource;
 
 /** 归属缺失时回给调用方的 400 说明（body 两写法 + 查询参数，逐一点名） */
-const OWNER_GROUP_BAD_REQUEST =
+export const OWNER_GROUP_BAD_REQUEST =
   "ownerGroup / owner_group 必须是字符串或 null（body 任一键，或查询参数 ?owner_group=）";
+
+/**
+ * **三源解析的单一实现**（v0.10.1 O5 起对外导出）：body `camelKey` → body `snakeKey` →
+ * 查询参数 `paramKey`，取第一个**已提供**者。
+ *
+ * 语义与 {@link readOwnerGroupSource} 逐字一致（空串视同未提供、显式 `null` = 主叫指名、
+ * 不做 trim / 归一）；导出它是因为 **project 档端点的第四源 `project_id` 与归属解析同族**
+ * （C-17），复用同一实现而不是另抄一份循环。
+ */
+export function readFieldSource(
+  body: Record<string, unknown>,
+  req: IncomingMessage,
+  camelKey: string,
+  snakeKey: string,
+  paramKey: string,
+): FieldSource {
+  for (const key of [camelKey, snakeKey]) {
+    if (!(key in body)) continue;
+    const raw = body[key];
+    if (raw === null) return null;
+    if (typeof raw !== "string") return "invalid";
+    if (raw.length > 0) return raw;
+  }
+  const raw = new URL(req.url ?? "/", "http://a2a-bridge.invalid").searchParams.get(paramKey);
+  return raw === null || raw.length === 0 ? undefined : raw;
+}
 
 /**
  * **归属解析**（v0.10.0 F1 · 见文件头「归属解析」节）—— body `ownerGroup` → body `owner_group`
@@ -164,15 +207,61 @@ const OWNER_GROUP_BAD_REQUEST =
  * 显式 `null` = 主叫**指名**匿名档（与「未提供」区分，仅用于 warn 判定，落库同为 `NULL`）。
  * **不做 trim / 归一**（§2.1(4) 同口径）。
  */
-function readOwnerGroupSource(body: Record<string, unknown>, req: IncomingMessage): OwnerGroupSource {
-  for (const key of OWNER_GROUP_BODY_KEYS) {
-    if (!(key in body)) continue;
-    const raw = body[key];
-    if (raw === null) return null;
-    if (typeof raw !== "string") return "invalid";
-    if (raw.length > 0) return raw;
-  }
-  return readOwnerGroupParam(req);
+export function readOwnerGroupSource(
+  body: Record<string, unknown>,
+  req: IncomingMessage,
+): OwnerGroupSource {
+  return readFieldSource(body, req, OWNER_GROUP_BODY_KEYS[0], OWNER_GROUP_BODY_KEYS[1], "owner_group");
+}
+
+/**
+ * `projectVersions[]` 的**单条出参形状**（改造文档 C-7 最小键集，**snake_case** —— 板的
+ * `parseProjectVersionEntry` 认 snake / camel 两式，本处按契约的 snake 出）。
+ * **有行 ⇒ `releasable` 必给布尔**（★R3 时序档：缺位是「引擎闸未上线」的过渡档，板显示 `—` 不猜）。
+ */
+export interface ProjectVersionViewEntry {
+  owner_group: string | null;
+  project_id: string;
+  version: string;
+  status: ProjectVersionRecord["status"];
+  releasable: boolean;
+  open_count: number;
+  completed_count: number;
+  cancelled_count: number;
+  reason: string;
+}
+
+/** 单行 → 出参条目（`releasable` 判据唯一来源 = {@link evaluateProjectReleaseGate}，本层不重算）。 */
+function toProjectVersionViewEntry(record: ProjectVersionRecord): ProjectVersionViewEntry {
+  const gate = evaluateProjectReleaseGate({
+    ownerGroup: record.ownerGroup,
+    projectId: record.projectId,
+    projectVersion: record.version,
+  });
+  return {
+    owner_group: record.ownerGroup,
+    project_id: record.projectId,
+    version: record.version,
+    status: record.status,
+    releasable: gate.releasable,
+    open_count: gate.open,
+    completed_count: gate.completed,
+    cancelled_count: gate.cancelled,
+    reason: gate.reason,
+  };
+}
+
+/**
+ * **project 档读投影**（C-7 / C-17 的读面出口）—— `GET /api/versions` 顶层 `projectVersions[]`
+ * 与 `GET /api/project-versions` 的**同一实现**（形状单点，避免两处漂移）。
+ *
+ * 过滤语义与 {@link VersionsStorePort#list} 逐字对齐：`undefined` ⇒ **全表** / 字符串 ⇒ 本组 /
+ * `null` ⇒ 仅匿名档；排序由 `projectVersionList` 的键序决定（可比对）。
+ * **两档计数不得互校**（C-4）：本出参的计数从**归属表**派生，与 `versions[]` 的 Group 计数不同级，
+ * 因此 project 行**绝不混入 `versions[]`**（板的负向钉依赖「Group 行无 `project_id` 键」）。
+ */
+export function projectVersionsView(ownerGroup?: string | null): ProjectVersionViewEntry[] {
+  return projectVersionList(ownerGroup).map(toProjectVersionViewEntry);
 }
 
 export function createVersionsEndpoints(options: VersionsEndpointOptions): VersionsEndpointHandle {
@@ -245,7 +334,10 @@ class VersionsEndpoints implements VersionsEndpointHandle {
   /**
    * **板读投影唯一来源**（§2.1(2) / §2.3(1)）：台账整表（按 `owner_group` 过滤）。
    * 读路**不受 owner 门闩限制**（follower 读同一张表，无副作用）。
-   * 出参形状与 `features-by-version` 面同族：`{ ok, source, observedAt, ownerGroup, count, versions[] }`。
+   * 出参形状与 `features-by-version` 面同族：
+   * `{ ok, source, observedAt, ownerGroup, count, versions[], projectVersions[] }`
+   * （末键 = v0.10.1 O5 新增，**只加顶层键**；`versions[]` 的成员与语义逐字不变，
+   * `count` 仍是 **Group 档**行数 —— project 行数由 `projectVersions.length` 自持，两档计数不相加）。
    */
   private handleList(req: IncomingMessage, res: ServerResponse): void {
     const observedAt = new Date().toISOString();
@@ -257,6 +349,19 @@ class VersionsEndpoints implements VersionsEndpointHandle {
       respondError(res, 500, ERR_VERSIONS_STORE_ERROR, `版本台账读失败：${toMessage(err)}`);
       return;
     }
+    let projectRecords: ProjectVersionViewEntry[] | null;
+    try {
+      projectRecords = projectVersionsView(ownerGroup);
+    } catch (err) {
+      // **两档分立**（C-12 / C-7）：project 档读失败 ⇒ **不出该键**（板取「缺位」档 = 降级条 + 根因码），
+      // **不**用空数组冒充「在场无行」，也**不**牵连 Group 面（板的版本列 / 已发版锁只吃 `versions[]`）。
+      bridgeLog.warn(
+        "a2a-versions",
+        `project 台账读失败（Group 面照常返回，不出 projectVersions 键）：${toMessage(err)}`,
+        { ownerGroup: ownerGroup ?? null },
+      );
+      projectRecords = null;
+    }
     respondJson(res, 200, {
       ok: true,
       source: VERSIONS_SOURCE,
@@ -264,6 +369,7 @@ class VersionsEndpoints implements VersionsEndpointHandle {
       ownerGroup: ownerGroup ?? null,
       count: records.length,
       versions: records,
+      ...(projectRecords === null ? {} : { projectVersions: projectRecords }),
     });
   }
 
@@ -491,15 +597,17 @@ class VersionsEndpoints implements VersionsEndpointHandle {
 
 // ---------------------------------------------------------------------------
 // 传输层小工具（刻意自带，不从 `runner.ts` 引私有函数）
+// v0.10.1 O5 起本节**对外导出** = project 档端点（`project-versions-endpoints.ts`）的复用面
+// （统一信封 / JSON 体读取 / 路径段解码 ⇒ 单处实现，不另存一份）
 // ---------------------------------------------------------------------------
 
 /** 失败信封：`{ ok: false, error: { code, message } }`（§2.1(2) 统一信封） */
-function respondError(res: ServerResponse, status: number, code: string, message: string): void {
+export function respondError(res: ServerResponse, status: number, code: string, message: string): void {
   respondJson(res, status, { ok: false, error: { code, message } });
 }
 
 /** 成功但无资源表示：`204`（与 `runner.ts#sendNoContent` 同处理 `headersSent` 竞态） */
-function sendNoContent(res: ServerResponse): void {
+export function sendNoContent(res: ServerResponse): void {
   if (res.headersSent || res.writableEnded) return;
   try {
     res.writeHead(204);
@@ -509,7 +617,7 @@ function sendNoContent(res: ServerResponse): void {
   }
 }
 
-function respondJson(res: ServerResponse, status: number, payload: unknown): void {
+export function respondJson(res: ServerResponse, status: number, payload: unknown): void {
   if (res.headersSent || res.writableEnded) return;
   try {
     res.writeHead(status, {
@@ -522,7 +630,7 @@ function respondJson(res: ServerResponse, status: number, payload: unknown): voi
   }
 }
 
-function decodePathSegment(raw: string): string | null {
+export function decodePathSegment(raw: string): string | null {
   try {
     return decodeURIComponent(raw);
   } catch {
@@ -534,7 +642,7 @@ function decodePathSegment(raw: string): string | null {
  * 可选字符串字段：`undefined`（未提供 = 不写）/ `string` / `null` 三种合法；
  * 其它类型 ⇒ `"invalid"`（调用方据此 400）。
  */
-function readOptionalStringField(
+export function readOptionalStringField(
   body: Record<string, unknown>,
   key: string,
 ): string | null | undefined | "invalid" {
@@ -543,11 +651,11 @@ function readOptionalStringField(
   return typeof raw === "string" ? raw : "invalid";
 }
 
-type BodyOutcome =
+export type BodyOutcome =
   | { ok: true; body: Record<string, unknown> }
   | { ok: false; status: number; code: string; message: string };
 
-async function readJsonBody(req: IncomingMessage): Promise<BodyOutcome> {
+export async function readJsonBody(req: IncomingMessage): Promise<BodyOutcome> {
   const chunks: Buffer[] = [];
   let size = 0;
   try {
@@ -588,7 +696,7 @@ async function readJsonBody(req: IncomingMessage): Promise<BodyOutcome> {
   return { ok: true, body: parsed as Record<string, unknown> };
 }
 
-function toMessage(err: unknown): string {
+export function toMessage(err: unknown): string {
   if (err instanceof Error) return err.message;
   if (typeof err === "string") return err;
   try {

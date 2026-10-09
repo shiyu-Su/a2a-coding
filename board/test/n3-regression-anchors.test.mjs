@@ -17,12 +17,16 @@
  *    v0.9.3 B-T5 起增「排期拖拽」`DRAG_SCHEDULE_SCRIPT`（当时六枚，与弹窗常量分立、不可共置）；
  *    **v0.9.8 REQ-2026-10-03-02 起 = 七元**（新增「成员两栏拖拽」`MEMBER_DRAG_SCRIPT`，
  *    与排期拖拽常量分立、不可共置 —— 那枚的入口守卫 `#schedule-board` 不因其扩）。
+ * ④ **v0.10.1 C3 · project 版本面带来的纪律面（N3-⑩～⑬）**：区块容器恒在 `#schedule-board` 之外且
+ *    **恰一处**（C-18①）；内联闭集**字面枚数恒七**、区块零脚本；`WRITE_ROUTES` **恒 11 条**（C-18③）；
+ *    板本地台账源码**无 project 维键**（板不落库、project 面无本地缓存）。
+ *    本组是**回归面的结构 / 计数钉**（防后续版本顺手扩），不重抄 B1/B3/B4 各单元档的行为级断言。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
 import { mkdtempSync, readFileSync, readdirSync, rmSync, statSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { dirname, join, relative, sep } from "node:path";
+import { basename, dirname, join, relative, sep } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import {
@@ -33,7 +37,21 @@ import {
   SUBMIT_GUARD_SCRIPT,
 } from "../dist/web/layout.js";
 import { createBoardServer } from "../dist/server.js";
-import { engineNoLockFetcher, engineProjectionFetcher } from "./engine-versions-fixture.mjs";
+import { WRITE_ROUTES } from "../dist/write-guard.js";
+import {
+  VERSIONS_LEDGER_VERSION,
+  createVersion,
+  emptyVersionsLedger,
+  parseVersionRecord,
+  serializeVersionsLedger,
+} from "../dist/versions-ledger.js";
+import {
+  engineNoLockFetcher,
+  engineProjectionFetcher,
+  engineProjectEmptyField,
+  engineProjectionWithProjectAbsentFetcher,
+  engineProjectionWithProjectsFetcher,
+} from "./engine-versions-fixture.mjs";
 
 const srcRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "src");
 
@@ -620,3 +638,141 @@ test("N3-⑨（增补三 · 负向锚）全站可执行内联脚本零 `form.act
     );
   }
 });
+
+// ---------------------------------------------------------------------------
+// ④ v0.10.1 C3 · project 版本面的结构 / 计数纪律钉（改造文档 §2 C-18）
+//     本组只钉「结构位置 + 恒等计数」，行为级断言归 B1/B3/B4 各单元档，此处不重抄。
+// ---------------------------------------------------------------------------
+
+const BOARD_OPEN_TAG = '<div class="kanban" id="schedule-board">';
+const PV_BLOCK_OPEN = '<div class="b-card pv-block">';
+
+/** project 区块三档夹具（live / empty / absent ⇒ 三档都必须渲出**同一枚**容器）。 */
+function projectFixture() {
+  return engineProjectionWithProjectsFetcher(
+    [{ org: "alpha", version: "v0.10.1", status: "active" }],
+    [
+      { org: "alpha", projectId: "board", version: "v0.10.1", status: "open", releasable: true, openCount: 1, completedCount: 2, cancelledCount: 0, repoId: "board", ref: "board/v0.10.1" },
+      { org: "alpha", projectId: "orch", version: "v0.10.1", status: "open", releasable: null },
+      { org: "beta", projectId: "flow", version: "v9.9.9", status: "released", releasable: false },
+    ],
+  );
+}
+
+/** 带 project 档的板实例（tmp 台账 ⇒ 不碰开发机 `.data/versions.json`）。 */
+async function withProjectServer(fetcher, run) {
+  const dir = mkdtempSync(join(tmpdir(), "board-n3-pv-"));
+  const ledgerFile = join(dir, "versions.json");
+  writeFileSync(ledgerFile, JSON.stringify({ version: 2, versions: [] }, null, 2) + "\n", "utf8");
+  const handle = await createBoardServer({
+    host: "127.0.0.1",
+    port: 0,
+    client: fakeClient([feature("F1", "v0.10.1")]),
+    versionsLedgerFile: ledgerFile,
+    engineVersionsFetcher: fetcher,
+  });
+  try {
+    await run(`http://127.0.0.1:${handle.port}`);
+  } finally {
+    await handle.close();
+    rmSync(dir, { recursive: true, force: true });
+  }
+}
+
+/**
+ * 按 div 嵌套深度摘出 `openTag` 元素的区间 `[start, end)`（end = 闭合 `</div>` 之后一位）。
+ * **必须**用深度扫描而不是「切到下一个兄弟标记」：区块一旦嵌进看板，下一个同级标记会掩盖嵌位 ⇒
+ * 「不在看板内」这条判据只能靠**闭合位置**来判（可证伪性所在）。
+ */
+function elementRange(html, openTag, label) {
+  const start = html.indexOf(openTag);
+  assert.notEqual(start, -1, `${label} 必须渲出（缺位 = 锚失效，不许静默放行）`);
+  const scanner = /<div\b[^>]*>|<\/div>/g;
+  scanner.lastIndex = start;
+  let depth = 0;
+  for (let m = scanner.exec(html); m !== null; m = scanner.exec(html)) {
+    depth += m[0] === "</div>" ? -1 : 1;
+    if (depth === 0) return { start, end: scanner.lastIndex };
+  }
+  return assert.fail(`${label} 未闭合 ⇒ 结构锚失效`);
+}
+
+const countOf = (haystack, needle) => haystack.split(needle).length - 1;
+
+test("N3-⑩（C-18① 结构锚）project 版本区块 `pv-block` **恰一处**且**在看板闭合之后**（同级 section；把区块挪进看板内 ⇒ 本锚必红）", async () => {
+  await withProjectServer(projectFixture(), async (base) => {
+    const html = await (await fetch(`${base}/org/alpha/schedule`)).text();
+    assert.equal(countOf(html, PV_BLOCK_OPEN), 1, "区块容器恰一处（多渲 = 两档并置 / 重复接线）");
+    const board = elementRange(html, BOARD_OPEN_TAG, "看板容器");
+    const pv = elementRange(html, PV_BLOCK_OPEN, "project 区块");
+    assert.ok(pv.start > board.end, "区块起点必须落在 #schedule-board 的闭合之后（嵌进看板 = 拖拽脚本入口守卫会误触 POST）");
+    assert.ok(!html.slice(board.start, board.end).includes("pv-block"), "看板区间内不得出现区块容器类");
+    assert.ok(!html.slice(board.start, board.end).includes("各 project 版本"), "看板区间内不得出现区块标题");
+  });
+});
+
+test("N3-⑩b（C-18① 三档恒在）live / empty / absent 三档各自「恰一处 + 看板之外」；门户 `/` 零处（不扩摘要）", async () => {
+  const tiers = [
+    ["live", projectFixture()],
+    ["empty", engineProjectionFetcher([], "", engineProjectEmptyField())],
+    ["absent", engineProjectionWithProjectAbsentFetcher([])],
+  ];
+  for (const [label, fetcher] of tiers) {
+    await withProjectServer(fetcher, async (base) => {
+      const html = await (await fetch(`${base}/org/alpha/schedule`)).text();
+      assert.equal(countOf(html, PV_BLOCK_OPEN), 1, `${label} 档：区块必须渲出且恰一处（absent 档出降级条、不出容器 = 降级不可见）`);
+      const board = elementRange(html, BOARD_OPEN_TAG, `${label} 档看板`);
+      const pv = elementRange(html, PV_BLOCK_OPEN, `${label} 档区块`);
+      assert.ok(pv.start > board.end, `${label} 档：区块恒在看板闭合之后`);
+      const portal = await (await fetch(`${base}/`)).text();
+      assert.equal(countOf(portal, PV_BLOCK_OPEN), 0, `${label} 档：门户不挂区块（C-18④ 摘要不扩 project）`);
+    });
+  }
+});
+
+test("N3-⑪（C-18 零新增脚本）project 区块 = 纯 SSR：闭集仍**七元**、区块体内零 `<script`、无常量外泄", async () => {
+  assert.equal(INLINE_SCRIPT_ALLOWLIST.length, 7, "内联闭集枚数恒七（v0.9.8 起；project 面不得扩第八枚）");
+  const blocks = collectInlineScriptBlocks();
+  assert.equal(blocks.length, 7, `src/** 可执行内联字面量仍七处（实际 ${blocks.length}）`);
+  await withProjectServer(projectFixture(), async (base) => {
+    const html = await (await fetch(`${base}/org/alpha/schedule`)).text();
+    const pv = elementRange(html, PV_BLOCK_OPEN, "project 区块");
+    const block = html.slice(pv.start, pv.end);
+    assert.ok(!block.includes("<script"), "区块体内不得有任何脚本（纯读投影，无自有交互面）");
+    for (const marker of INLINE_SCRIPT_ALLOWLIST) {
+      assert.ok(!block.includes(marker.runtime ?? marker.marker), `区块体内不得内联「${marker.key}」常量正文（单点常量只在注入点出现一次）`);
+    }
+  });
+});
+
+test("N3-⑫（C-18③ 计数锚）`WRITE_ROUTES` 恒 11 条 · 全 POST · 零 project 维写路径（project 面不落库 ⇒ 无写口）", () => {
+  assert.equal(WRITE_ROUTES.length, 11, "写面清单恒 11 条（project 版本面不得新增写路由）");
+  assert.equal(new Set(WRITE_ROUTES).size, 11, "清单无重复条目");
+  for (const route of WRITE_ROUTES) {
+    assert.match(route, /^POST /, `${route} = 写面必为 POST`);
+    assert.doesNotMatch(route, /project/i, `${route} 含 project 维写路径（C-18③：板不接 project 写面）`);
+  }
+});
+
+test("N3-⑬（C-18 · 板不落库）板本地台账源文件零 project 维键 · 版本台账记录键白集六枚（project 面无本地缓存）", () => {
+  const ledgerFiles = listTsFiles(srcRoot).filter((f) => /ledger/i.test(basename(f)));
+  assert.ok(ledgerFiles.length >= 4, `台账源文件扫描必须真扫到文件（实际 ${ledgerFiles.length} = 扫描失效）`);
+  const offenders = [];
+  for (const file of ledgerFiles) {
+    const rel = relative(srcRoot, file).split(sep).join("/");
+    readFileSync(file, "utf8")
+      .split("\n")
+      .map((l) => l.trim())
+      .filter((l) => !l.startsWith("//") && !l.startsWith("*") && !l.startsWith("/*"))
+      .forEach((l) => {
+        if (/project_?id\b/i.test(l) || /\bproject\b\s*[?:]/.test(l)) offenders.push(`${rel}: ${l}`);
+      });
+  }
+  assert.deepEqual(offenders, [], "板本地台账不得出现 project 维键（project 事实源只在引擎）");
+  const keys = Object.keys(parseVersionRecord({ org: "g", version: "v1", status: "active" })).sort();
+  assert.deepEqual(keys, ["createdAt", "note", "org", "status", "updatedAt", "version"], "版本台账记录键白集固定六枚");
+  assert.equal(VERSIONS_LEDGER_VERSION, 2, "台账 schema 仍 2（project 维不落板侧 ⇒ 不抬 schema）");
+  const serialized = serializeVersionsLedger(createVersion(emptyVersionsLedger(), "v1", "2026-10-09T00:00:00.000Z", "g").ledger);
+  assert.doesNotMatch(serialized, /project/i, "序列化形态不含 project 维字段");
+});
+

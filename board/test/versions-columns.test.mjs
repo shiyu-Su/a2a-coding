@@ -13,15 +13,16 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { groupFeaturesByVersion, projectionVersionNames, renderSchedule } from "../dist/web/views.js";
+import { groupFeaturesByVersion, projectionLedgerOf, projectionVersionNames, renderSchedule } from "../dist/web/views.js";
 import {
   createVersion,
   emptyVersionsLedger,
+  releasedVersionNames,
   serializeVersionsLedger,
   setVersionStatus,
 } from "../dist/versions-ledger.js";
 import { createBoardServer } from "../dist/server.js";
-import { engineProjectionAbsentFetcher, engineProjectionFetcher } from "./engine-versions-fixture.mjs";
+import { engineProjectionAbsentFetcher, engineProjectionFetcher, engineEnvelopeFetcher, engineEnvelopeOf, engineProjectionOf, engineProjectLiveField } from "./engine-versions-fixture.mjs";
 
 const NOW = "2026-09-27T12:00:00.000Z";
 /**
@@ -285,4 +286,91 @@ test("N1-④ HTTP 降级档：投影从未读到（absent）⇒ 本地台账读�
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }
+});
+
+// ---------------------------------------------------------------------------
+// v0.10.1 B5 —— 版本列侧的**两族负向钉**（改造文档 §2 C-1 / C-7「`versions[]` 成员与语义零改动」
+//   / §3 board 段「project 行混入 versions[] ⇒ 不出列」+「同名 group / project 版号互不染色」）：
+//   ① 脏形状（project 行混进 `versions[]`）必须走**真解析层**才作数 —— 手拼 projection 会绕过
+//     解析层那道裁撤、断言变成自证 ⇒ 经夹具 `engineEnvelopeFetcher` / `engineEnvelopeOf` 喂原始信封；
+//   ② 同名版号在两级之间**互不染色**：project 侧 `released` 不把 Group 列头染成 🔒，
+//     Group 侧 `released` 也不因 project 侧 `open` 而退色。
+// ---------------------------------------------------------------------------
+
+/** 同一组 Group 行的干净信封与脏信封（脏 = 尾部混入两条 project 形状行）。 */
+const CLEAN_GROUP_ROWS = [
+  { owner_group: "alpha", version: "v0.10.0", status: "active" },
+  { owner_group: "alpha", version: "v0.9.9", status: "released" },
+];
+const DIRTY_ENVELOPE = {
+  ok: true,
+  versions: [
+    ...CLEAN_GROUP_ROWS,
+    { owner_group: "alpha", project_id: "board", version: "v9.9.9", status: "released" },
+    { owner_group: "alpha", project_id: "machine", version: "v8.8.8", status: "open" },
+  ],
+};
+
+test("B5-①（负向钉 a·纯函数面）project 行混入 versions[] ⇒ 整条不进投影 ⇒ 版本列清单无其版号；Group 面 entries 与干净信封逐字节同", () => {
+  const dirty = engineEnvelopeOf(DIRTY_ENVELOPE);
+  assert.equal(dirty.kind, "projection", "混入行不改变 Group 面的投影成立");
+  assert.deepEqual(
+    projectionVersionNames(dirty.projection),
+    ["v0.10.0", "v0.9.9"],
+    "project 版号 v9.9.9 / v8.8.8 一条都不进版本列清单（带非空白 project_id ⇒ 解析层整条丢弃）",
+  );
+  assert.deepEqual(
+    dirty.projection.entries,
+    engineEnvelopeOf({ ok: true, versions: CLEAN_GROUP_ROWS }).projection.entries,
+    "versions[] 成员与语义零改动：脏信封与干净信封解析出同一份 Group entries（同序、同状态）",
+  );
+});
+
+test("B5-②（负向钉 a·HTTP 面）脏信封喂空间排期页 ⇒ project 版号不成列；同名 project released 不把 Group 列头染成 🔒", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "board-b5-"));
+  try {
+    const ledgerFile = join(dir, "versions.json");
+    writeFileSync(ledgerFile, serializeVersionsLedger(emptyVersionsLedger()), "utf8");
+    const client = {
+      baseUrl: "http://fake",
+      async getFeatures() {
+        return { features: [feature("F1", "v0.10.0")], stateCounts: null };
+      },
+    };
+    // 脏信封：versions[] 混入 project 行（v9.9.9 released）+ projectVersions[] 另带同名 v0.10.0 released
+    const handle = await createBoardServer({
+      host: "127.0.0.1",
+      port: 0,
+      client,
+      versionsLedgerFile: ledgerFile,
+      engineVersionsFetcher: engineEnvelopeFetcher({
+        ok: true,
+        versions: [...CLEAN_GROUP_ROWS, { owner_group: "alpha", project_id: "board", version: "v9.9.9", status: "released" }],
+        projectVersions: [{ owner_group: "alpha", project_id: "board", version: "v0.10.0", status: "released" }],
+      }),
+    });
+    try {
+      const text = await (await fetch(`http://127.0.0.1:${handle.port}/org/${ORG}/schedule`)).text();
+      assert.doesNotMatch(text, /<h3>v9\.9\.9/, "混入的 project 版号不出现在版本列");
+      assert.match(text, /<h3>v0\.10\.0 <span class="kbadge vbadge wip"/, "同名互不染色：Group active ∧ project released ⇒ 列头仍是「进行中」");
+      assert.doesNotMatch(text, /<h3>v0\.10\.0 <span class="kbadge vbadge locked"/, "project 侧 released 不得把 Group 列头染成 🔒");
+      assert.match(text, /<h3>v0\.9\.9 <span class="kbadge vbadge locked"/, "Group 侧 released 照常上锁样式（对照组：本钉不是「一律不上锁」）");
+    } finally {
+      await handle.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("B5-③（负向钉 b·反向不染色）Group released ∧ project 同名未 released ⇒ 列头 🔒 照常（project 不松 Group）", () => {
+  const { projection } = engineProjectionOf(
+    [{ org: ORG, version: "v0.10.0", status: "released" }],
+    ORG,
+    engineProjectLiveField([{ org: ORG, projectId: "board", version: "v0.10.0", status: "open" }]),
+  );
+  const lockedVersions = releasedVersionNames(projectionLedgerOf(projection), ORG);
+  assert.deepEqual(lockedVersions, ["v0.10.0"], "锁名单只由 Group 条目派生（project 侧 open 不把它摘掉）");
+  const html = renderSchedule(groupFeaturesByVersion([feature("F1", "v0.10.0")], [], projectionVersionNames(projection)), [], lockedVersions, ledgerWith([]));
+  assert.match(headOf(html, "v0.10.0"), /<span class="kbadge vbadge locked"[^>]*>🔒 已发版<\/span>/);
 });

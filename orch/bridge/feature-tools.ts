@@ -8,19 +8,31 @@
  * - `handleFeatureCreate`  新建 Feature（**初态 `waiting_approval`** = 主链起点；落 `contextId` 到
  *                          `features.context_id`）
  * - `handleFeatureStatus`  查询单个 Feature 详情 / 全部列表（state + tasks 摘要 + artifacts；
- *                          v0.9.1 起单查增量扩 `acceptance` 聚合块 = 主链段轨迹 + 失败账单 + 节点态计数）
+ *                          v0.9.1 起单查增量扩 `acceptance` 聚合块 = 主链段轨迹 + 失败账单 + 节点态计数；
+ *                          v0.10.1 O7 起单查扩 `projects`、列表扩 `attributionsByFeature` = 归属（承诺集）
+ *                          只读面，两条面各走一条 SQL）
  * - `handleFeatureAdvance` orch agent 驱动主链推进（状态机校验合法后继；`note`→plan、
  *                          `decisions`/`contracts` 可选落 Feature Context；`answer` 用于 needs_input 补齐）；
  *                          **`waiting_approval → executing` 已禁用** —— 唯一准入 = `handleFeatureApprove`，
  *                          错误码 `feature_approval_required`；**`retryTaskIds`**（§2.3）走**显式特例**：
  *                          跳过 `canTransition`（转移表零改动、无自环）、重派指定 `failed` 节点 +
- *                          解冻闭包**外**的 `blocked` 下游，**不改 Feature 态**
+ *                          解冻闭包**外**的 `blocked` 下游，**不改 Feature 态**；
+ *                          **`projectVersions`**（v0.10.1 O3 / C-17）走**归属独立分支**：非空即写
+ *                          承诺集（全量重发、同值幂等），`to` = 当前态时同样跳过 `canTransition`，
+ *                          与合法流转同单时归属 + 迁移一起生效（归属拒 ⇒ 主链零迁移）
  * - `handleFeatureApprove` 审批门：`waiting_approval → executing`
  * - `handleFeatureCancel`  非收口态 → `cancelled`；**`failed` 亦可经此归档为 `cancelled`**
  *                          （v0.9.5 O1：仅迁 Feature 态、不动节点账面；`completed`/`cancelled` 拒）
  * - `handleFeatureTrace`   **只读**投影「这个 Feature 为什么还没完成」（在等谁 / 排队位次 / 占位档）；
  *                          **v0.8.10 O-N3 起挂成 MCP 工具 `a2a_feature_trace`**（Feature 工具组 5→6），
  *                          与工作台端点 `/api/features/:id/trace` 复用**同一实现**（两出口零第二套判据）
+ *
+ * 另含 **v0.10.1 O2 版本面第二级的执法面**（非 MCP 工具，接线归 O3 / O4）：
+ * `checkFeatureAttributionWrites` / `applyFeatureAttributions`（归属写执法：未过门挡写、
+ * released 门、不隐式建版、不变式继承、同值幂等 / 异值冲突）与
+ * `evaluateProjectReleaseGate`（project 侧收口判据 = **展示字段**，不作门、不产拒绝码）。
+ * **O3 已接线**（v0.10.1）：`handleFeatureAdvance` 的可选入参 `projectVersions[]` = **归属独立分支**
+ * （`to` = 当前态时跳过 `canTransition`、照 `retryTaskIds` 先例；**不入 `hasRegistration`**）。
  *
  * 另含 **② 可见面只读投影**（v0.8.9 §2.3，非 MCP 工具）：`projectTaskVisibility` =
  * 「派发包裹体积 + 触达次数 + machine diagnostics 透传」的**唯一实现**，
@@ -32,7 +44,14 @@ import {
   aggregateFeaturesByVersion,
   countQueuedBefore,
   createFeature,
+  ERR_PROJECT_VERSION_SHAPE,
+  ERR_PROJECT_VERSION_UNKNOWN,
   EVENT_FEATURE_STATE,
+  featureProjectListByFeature,
+  featureProjectListByFeatures,
+  featureProjectListByVersion,
+  featureProjectStateCounts,
+  featureProjectUpsert,
   featureTaskStateCounts,
   getFeature,
   getQueuedTask,
@@ -42,6 +61,7 @@ import {
   listFeatureTasks,
   listFeatures,
   listReadLaneTasksForProject,
+  projectVersionGet,
   rearmForRetry,
   rearmTask,
   updateFeatureContext,
@@ -55,6 +75,7 @@ import { EVENT_FAILURE_REPORT, planResume } from "./scheduler.js";
 import { activateVersionForFeature } from "./versions-activation.js";
 import type {
   FeatureContextPatch,
+  FeatureProjectRecord,
   FeatureRegistrationPatch,
   QueueState,
   QueuedTaskRecord,
@@ -628,6 +649,331 @@ export function evaluateReleaseGate(input: ReleaseGateInput): ReleaseGateResult 
 }
 
 // ---------------------------------------------------------------------------
+// v0.10.1 O2 · 归属写执法（C-3 / C-15 / C-2）+ project 侧 releasable 判据（C-4 展示档）
+// ---------------------------------------------------------------------------
+
+/**
+ * 归属写执法的 **`orch_*` 错误码**（改造文档 C-13 闭集的**门面子集**）。
+ *
+ * 数据面那三个（`_invalid_shape` / `_exists` / `_unknown`）由 store 侧导出并在此复用；本处三个是
+ * **门判据**（O1 刻意不预定义「无人产的死码」，落到本节点才定义）。码值即契约：HTTP 信封
+ * `error.code` 与 MCP 面共用；**未命中码原样展示、不 fail-closed**（板侧口径）。
+ */
+export const ERR_ATTRIBUTION_STATE_LOCKED = "orch_project_attribution_state_locked";
+export const ERR_ATTRIBUTION_CONFLICT = "orch_project_attribution_conflict";
+export const ERR_PROJECT_VERSION_RELEASED_LOCKED = "orch_project_version_released_locked";
+
+/**
+ * MCP `a2a_feature_advance` 入参 `projectVersions[]` 的**单条归属项**（C-17 入参形状）。
+ *
+ * `groupVersion` **不在入参里** —— 它由 Feature 当前的 `features.version` 派生（同单写定、此后
+ * 不漂移，C-21），入参带一份反而会造出「两个事实源」；`ownerGroup` 同理取 Feature 的归属组。
+ */
+export interface ProjectVersionAttribution {
+  projectId: string;
+  /** Project Version（须已在 project 台账存在，C-15 ⇒ {@link ERR_PROJECT_VERSION_UNKNOWN}） */
+  projectVersion: string;
+}
+
+/** 归属写执法入参（`applyFeatureAttributions` 用；`check*` 只吃后两件） */
+export interface AttributionWriteArgs {
+  featureId: string;
+  /**
+   * **全量**承诺集（C-3 ★R3：新增执行节点的同轮必须重发全量，配合同值幂等、重发安全）。
+   * 空数组 = **零写 no-op**，**不是**「清空归属」—— 撤销一条承诺是显式的「先删后建」两笔（见 {@link applyFeatureAttributions}）。
+   */
+  projectVersions: ProjectVersionAttribution[];
+  /** 写入来源（自由文本，落 `feature_projects.source`；供「可改须留痕」对照，引擎不解析） */
+  source?: string | null;
+}
+
+/** 校验通过后待落库的单条归属（`groupVersion` 已从 Feature 派生、`source` 已按幂等档定值） */
+interface AttributionPlanEntry {
+  projectId: string;
+  projectVersion: string;
+  groupVersion: string;
+  source: string | null;
+}
+
+export type AttributionWriteResult =
+  | {
+      ok: true;
+      featureId: string;
+      /** 本次新落行数 */
+      created: number;
+      /** 本次同键改写行数（值列不变时仅 `source` 变才走到，见 {@link AttributionPlanEntry} 的定值口径） */
+      updated: number;
+      /** 本次同值幂等重发 ⇒ 零写入的行数（C-3 ★R3「重发安全」的可观测面） */
+      noop: number;
+      attributions: FeatureProjectRecord[];
+    }
+  | FeatureToolFailure;
+
+/**
+ * **归属写执法（纯校验、零写入）**（改造文档 C-3 / C-15 / C-2 / C-6 ④）。
+ *
+ * 判据序（**任一不过 ⇒ 整单拒绝、零写入**；★N-8「归属拒 ⇒ 主链零迁移」的凭据就在这里 ——
+ * 本函数**不碰** `features` 表，接线方（O3）把它放在任何状态写入**之前**）：
+ *
+ * 0. **身份字段**：`projectId` / `projectVersion` trim 后不得为空串 ⇒ {@link ERR_PROJECT_VERSION_SHAPE}
+ *    （承诺集身份键成员；空串走到 store 只会抛裸错）；同批内同 `projectId` 出现**异值** ⇒
+ *    {@link ERR_ATTRIBUTION_CONFLICT}（**单内自相矛盾**，不得「后者覆盖前者」），同值重复 ⇒ 去重。
+ * 1. **(a) 未过门 ⇒ 挡**：判据 = `approval = 已通过`，**不看 `stage`**（C-3）。
+ *    附带两条同源判据：`cancelled` 卡**不得新写**（★R3；已存在的行仍可幂等重发、但本档一律挡，
+ *    不放开「只重发同值」的特例 —— 轨已终止，写归属会在版本面误导）；`features.version` 为空
+ *    （无 Group Version）⇒ 落不下归属（C-21，`group_version` NOT NULL 的门面表达）。
+ *    **`completed` 未发版仍可补写**（本档不看 `completed`，只认 `cancelled`）。
+ * 2. **(c) 版本行须已存在**（C-15）：`projectVersionGet(ownerGroup, projectId, projectVersion)`
+ *    为 `null` ⇒ {@link ERR_PROJECT_VERSION_UNKNOWN} —— **不隐式建版**，建版只走显式写口。
+ * 3. **(b) 归属 released 门**（C-6 ④）：查到的行 `status = released` ⇒
+ *    {@link ERR_PROJECT_VERSION_RELEASED_LOCKED} —— 一经 `released` 即冻结、不得复用为后续归属目标。
+ *    （(c) 在 (b) 之前**只是取行的先后**，二者对同一行互斥：`released` 的行必然已存在。）
+ * 4. **(d) 不变式继承判据**（C-2）：同 `(owner_group, group_version, project_id)` 名下
+ *    **其它需求**已有归属 ⇒ 本次该 project 的 `project_version` **必须继承同值**，否则
+ *    {@link ERR_ATTRIBUTION_CONFLICT}。**无父（主轨）不受额外约束** —— 本条读的是「已存在的承诺」，
+ *    与 `parent_feature_id` 无关：主轨首条归属时该读集为空 ⇒ 自选版号；一旦有承诺即进入继承档。
+ *    **不做前瞻**（只校验已落库的承诺，不猜「将来的需求该用哪个号」）。
+ * 5. **(e) 幂等 / 重放**：本需求 own row 已存在 ∧ `projectVersion` / `groupVersion` **同值** ⇒
+ *    no-op（`source` 沿用既有值，交 store 走「值全同 ⇒ 零写入、不改 `updated_at`」档，重发不制造活动痕迹）；
+ *    **异值** ⇒ {@link ERR_ATTRIBUTION_CONFLICT} —— 改归属须显式「先删后建」两笔、逐笔留痕，
+ *    不在写归属里隐式改口。
+ */
+export function checkFeatureAttributionWrites(
+  feature: FeatureRecord,
+  projectVersions: ProjectVersionAttribution[],
+  source: string | null = null,
+): { ok: true; entries: AttributionPlanEntry[] } | FeatureToolFailure {
+  const fail = (code: string, error: string): FeatureToolFailure => ({ ok: false, code, error });
+  const ownerGroup = feature.ownerGroup;
+  const groupVersion = feature.version.trim();
+
+  // (a) 未过门挡写 + cancelled 不得新写 + 无 Group Version 落不下归属（C-3 / ★R3 / C-21）
+  if (feature.approval !== "已通过") {
+    return fail(
+      ERR_ATTRIBUTION_STATE_LOCKED,
+      `归属写锁：Feature ${feature.featureId} approval=${feature.approval}（非「已通过」）⇒ 未过门不落归属；` +
+        `归属写点 = approve 过门之后（判据看 approval、不看 stage，改造文档 C-3）`,
+    );
+  }
+  if (feature.state === "cancelled") {
+    return fail(
+      ERR_ATTRIBUTION_STATE_LOCKED,
+      `归属写锁：Feature ${feature.featureId} 已 cancelled ⇒ 不得新写归属（★R3：该轨已终止、无交付可承诺）`,
+    );
+  }
+  if (groupVersion.length === 0) {
+    return fail(
+      ERR_ATTRIBUTION_STATE_LOCKED,
+      `归属写锁：Feature ${feature.featureId} 无 Group Version（features.version 为空）⇒ 无归属可落` +
+        `（C-21：须先经引擎排期写口把 version 写定）`,
+    );
+  }
+
+  // 0) 身份字段 + 单内重复（同值去重、异值判矛盾）
+  const seen = new Map<string, string>();
+  for (const raw of projectVersions) {
+    const projectId = raw.projectId.trim();
+    const projectVersion = raw.projectVersion.trim();
+    if (projectId.length === 0 || projectVersion.length === 0) {
+      return fail(
+        ERR_PROJECT_VERSION_SHAPE,
+        `归属项身份字段不得为空串（project_id / project_version 是承诺集身份键成员）：` +
+          `project_id="${raw.projectId}" project_version="${raw.projectVersion}"`,
+      );
+    }
+    const previous = seen.get(projectId);
+    if (previous !== undefined && previous !== projectVersion) {
+      return fail(
+        ERR_ATTRIBUTION_CONFLICT,
+        `同一批归属里 project "${projectId}" 出现两个不同 Project Version（${previous} / ${projectVersion}）；` +
+          `单内自相矛盾 ⇒ 整单拒绝（不得「后者覆盖前者」）`,
+      );
+    }
+    seen.set(projectId, projectVersion);
+  }
+
+  // 本需求已有归属（(e) 的读凭据）：一次读全、按 project 索引
+  const ownRows = new Map<string, FeatureProjectRecord>();
+  for (const row of featureProjectListByFeature(feature.featureId)) ownRows.set(row.projectId, row);
+
+  const entries: AttributionPlanEntry[] = [];
+  for (const [projectId, projectVersion] of seen) {
+    const where =
+      `project_id="${projectId}" project_version="${projectVersion}" ` +
+      `owner_group=${ownerGroup === null ? "NULL" : `"${ownerGroup}"`} group_version="${groupVersion}"`;
+
+    // (c) 版本行须已存在（不隐式建版）
+    const ledger = projectVersionGet(ownerGroup, projectId, projectVersion);
+    if (ledger === null) {
+      return fail(
+        ERR_PROJECT_VERSION_UNKNOWN,
+        `归属要求 project 台账已有该行（C-15 不隐式建版）：无此版本（${where}）；` +
+          `建版只走显式写口（POST /api/project-versions）`,
+      );
+    }
+    // (b) 归属 released 门（C-6 ④：一经 released 即冻结）
+    if (ledger.status === "released") {
+      return fail(
+        ERR_PROJECT_VERSION_RELEASED_LOCKED,
+        `归属写 released 门（= project 级的归属写锁，与 Group 级「排期锁」显式分名，C-14）：` +
+          `project 版本已 released ⇒ 冻结、不得复用为后续归属目标（${where}）`,
+      );
+    }
+
+    // (d) 不变式继承判据：同 (owner_group, group_version, project_id) 的**其它需求**承诺 ⇒ 必须同值
+    for (const sibling of featureProjectListByVersion(ownerGroup, groupVersion, projectId)) {
+      if (sibling.featureId === feature.featureId) continue;
+      if (sibling.projectVersion !== projectVersion) {
+        return fail(
+          ERR_ATTRIBUTION_CONFLICT,
+          `不变式违例（C-2「同一 Group Version + 同一 project + 同一条主轨 ⇒ 同一 Project Version」）：` +
+            `${groupVersion} / ${projectId} 名下需求 ${sibling.featureId} 已承诺 ${sibling.projectVersion}，` +
+            `本次要落 ${projectVersion} ⇒ 必须继承同值（${where}）`,
+        );
+      }
+    }
+
+    // (e) own row 同值 ⇒ 幂等重发（source 沿用，交 store 走零写入档）；异值 ⇒ 拒（改归属须先删后建）
+    const own = ownRows.get(projectId);
+    if (own !== undefined && (own.projectVersion !== projectVersion || own.groupVersion !== groupVersion)) {
+      return fail(
+        ERR_ATTRIBUTION_CONFLICT,
+        `本需求对 project "${projectId}" 已有归属（${own.projectVersion} @ ${own.groupVersion}），` +
+          `本次要改写为 ${projectVersion} @ ${groupVersion} ⇒ 拒；` +
+          `改归属须显式「先删后建」两笔、逐笔留痕（C-3「可改须留痕」）`,
+      );
+    }
+    entries.push({
+      projectId,
+      projectVersion,
+      groupVersion,
+      source: own === undefined ? source : own.source,
+    });
+  }
+  return { ok: true, entries };
+}
+
+/**
+ * **归属写执法（含落库）**（C-3 / C-17 的 MCP 路径落点）—— `advance` 携带 `projectVersions[]`
+ * 时的**独立分支**实现体（接线 = O3：`to = 当前态 ∧ projectVersions` 非空即触发，
+ * **不要求同单携带登记字段**、**不入 `hasRegistration`**）。
+ *
+ * 两拍：**先全量校验（{@link checkFeatureAttributionWrites}，零写入）→ 全过才逐条落库**
+ * —— 校验期已排除 store 侧的 400 条件（身份列非空、group_version 非空），故写入期不再有
+ * 「拒在第二批、第一批已落库」的半摊状态（★N-8 fail-fast 的落地形态）。
+ */
+export function applyFeatureAttributions(
+  args: AttributionWriteArgs,
+  identity: string | null = null,
+): AttributionWriteResult {
+  const feature = getFeature(args.featureId);
+  if (feature === null) {
+    return { ok: false, code: "feature_not_found", error: `未知 Feature ${args.featureId}` };
+  }
+  const denied = ownershipFailure(feature, identity);
+  if (denied !== null) return denied;
+  if (args.projectVersions.length === 0) {
+    // 空集合 = 零写 no-op（**不是**清空归属；撤销承诺是显式删行）
+    return { ok: true, featureId: feature.featureId, created: 0, updated: 0, noop: 0, attributions: [] };
+  }
+  const plan = checkFeatureAttributionWrites(feature, args.projectVersions, args.source ?? null);
+  if (plan.ok === false) return plan;
+
+  let created = 0;
+  let updated = 0;
+  let noop = 0;
+  const attributions: FeatureProjectRecord[] = [];
+  for (const entry of plan.entries) {
+    const outcome = featureProjectUpsert({
+      ownerGroup: feature.ownerGroup,
+      featureId: feature.featureId,
+      projectId: entry.projectId,
+      projectVersion: entry.projectVersion,
+      groupVersion: entry.groupVersion,
+      source: entry.source,
+    });
+    if (outcome.ok === false) {
+      return { ok: false, code: outcome.code, error: `${outcome.message}（status=${outcome.status}）` };
+    }
+    if (outcome.created) created += 1;
+    else if (outcome.changed) updated += 1;
+    else noop += 1;
+    attributions.push(outcome.record);
+  }
+  return { ok: true, featureId: feature.featureId, created, updated, noop, attributions };
+}
+
+/** `evaluateProjectReleaseGate` 入参（project 台账行的身份三元组） */
+export interface ProjectReleaseGateInput {
+  /** 键的一部分：`null` = 匿名档（照 store 侧 project 读口口径） */
+  ownerGroup: string | null;
+  projectId: string;
+  projectVersion: string;
+}
+
+/**
+ * **project 侧收口判据的出参**（C-4 / C-7）—— **展示字段**，不是门：
+ * 本结构里**没有 `ok` / `code`**，调用方拿到的永远是「计数 + 一句原因」。
+ */
+export interface ProjectReleaseGateResult {
+  releasable: boolean;
+  total: number;
+  completed: number;
+  cancelled: number;
+  open: number;
+  /** 判据说明（人类可读，供板 / 投影直接展示；**不是**错误码） */
+  reason: string;
+}
+
+/**
+ * **project 级收口判据 = 展示字段 `releasable`**（改造文档 C-4 ★用户 2026-10-09 裁定「级联档」）。
+ *
+ * 判据 = `total > 0 ∧ completed + cancelled === total`（**不含 `completed > 0`** —— 这是与 Group 闸
+ * {@link evaluateReleaseGate} 的**唯一**判据差）。差别的由来：发版只有**一个动作**（标 Group
+ * `released`），project 版本由引擎在**同一事务内级联**置 `released` ⇒ project 侧**不构成第二道发版门**、
+ * **不产生拒绝码**，只供板 / 人对照。**「全 `cancelled` 的 project 也判 `releasable = true`」是级联档的
+ * 前提** —— 若此处要求 `completed > 0`，全取消轨的 project 会永久 `open`，与「Group 已发版 ⇒ 名下
+ * project 一律 `released`」的级联互斥（结构性死锁）。
+ *
+ * **两套计数不得横向相加 / 相等校验**（C-4 ★R2）：本判据从**归属表**派生，Group 闸从
+ * `features.version` 派生，同名版号在两级里互不染色。
+ * **project 面无本地读缓存 / 判定唯一在引擎**（C-7 / C-18）⇒ 板只投影本结构，**不重算**。
+ */
+export function evaluateProjectReleaseGate(input: ProjectReleaseGateInput): ProjectReleaseGateResult {
+  const counts = featureProjectStateCounts(input.ownerGroup, input.projectId, input.projectVersion);
+  const converged = counts.total > 0 && counts.completed + counts.cancelled === counts.total;
+  const where =
+    `project_id="${input.projectId}" project_version="${input.projectVersion}" ` +
+    `owner_group=${input.ownerGroup === null ? "NULL" : `"${input.ownerGroup}"`}`;
+  if (counts.total === 0) {
+    return {
+      ...counts,
+      releasable: false,
+      reason:
+        `project 版本名下无归属需求（${where}）⇒ 未触达、不产生发版事实；` +
+        `本字段仅展示，不构成发版口（C-4）`,
+    };
+  }
+  if (!converged) {
+    return {
+      ...counts,
+      releasable: false,
+      reason:
+        `未收口（${where}）：total=${counts.total} completed=${counts.completed} ` +
+        `cancelled=${counts.cancelled} open=${counts.open}（open 含 failed —— 须先 cancel 归档）`,
+    };
+  }
+  return {
+    ...counts,
+    releasable: true,
+    reason:
+      `已收口（${where}）：total=${counts.total} completed=${counts.completed} cancelled=${counts.cancelled}；` +
+      `发版凭 Group 级动作同事务级联置 released，本判据不作门` +
+      (counts.completed === 0 ? "（全 cancelled ⇒ 无交付仍判 releasable，级联档前提）" : ""),
+  };
+}
+
+// ---------------------------------------------------------------------------
 // create
 // ---------------------------------------------------------------------------
 
@@ -797,6 +1143,12 @@ export interface FeatureStatusSuccess {
    */
   acceptance?: FeatureAcceptance;
   /**
+   * **归属（承诺集）只读面**（v0.10.1 O7 / C-19；**仅单 Feature 查询返回**）——
+   * 本需求触达哪些 project、各自落哪个 Project Version。
+   * **无归属 ⇒ 空数组**（键恒在，不省略、不报错）；排序 = `projectId` 字典序。
+   */
+  projects?: FeatureProjectAttributionItem[];
+  /**
    * 列表分支出参（v0.9.0 B3″ 起 **additive** 增 `stateCounts`）。
    *
    * - `stateCounts`：各**任务态**的节点数（事实源 = 一条 `GROUP BY feature_id, state` 聚合 SQL）；
@@ -804,7 +1156,35 @@ export interface FeatureStatusSuccess {
    * - 两者都**只走列表读的视野判据**（归属谓词与 `listFeatures` 同源），他组节点不计数。
    */
   features?: Array<FeatureRecord & { taskCount: number; stateCounts: Partial<Record<TaskState, number>> }>;
+  /**
+   * **归属（承诺集）只读面 · 列表批量档**（v0.10.1 O7 / C-19；**仅列表分支返回**）——
+   * `featureId → 归属清单`，**一条 SQL** 取全量（照 `stateCounts` 的 B3″ 先例，**不可**逐 Feature 查
+   * ⇒ 列表读的查询数不随 Feature 数增长）。
+   * 键集 = 本次列出的**每一个** Feature（与 {@link FeatureStatusSuccess.features} 逐一对齐）；
+   * **无归属的需求 ⇒ 值为空数组**（不省略键、不报错）。视野判据与 `features` 同源（同一条归属谓词）。
+   */
+  attributionsByFeature?: Record<string, FeatureProjectAttributionItem[]>;
 }
+
+/**
+ * 归属只读面的**单条形状**（v0.10.1 O7 / C-19）。
+ *
+ * 键名与 MCP 写面入参 `projectVersions[]` 的单条对齐（`projectId` + `version`，见
+ * {@link ProjectVersionAdvanceItem}）⇒ **读回即可原样重发**（全量重发是同值幂等的标准动作，C-3 ★R3）。
+ * `version` = 该 project 的 **Project Version**（不是 Group Version；落库侧列名 `project_version`）。
+ * `ownerGroup` / `groupVersion` / `source` / 时间戳**不进本投影** —— 归属表完整行面经 store 读口，
+ * 只读面按「这条需求触达哪些 project、各是什么版本」的用途收窄。
+ */
+export interface FeatureProjectAttributionItem {
+  projectId: string;
+  version: string;
+}
+
+/** 归属行 → 只读面投影（落库侧 `projectVersion` → 面侧 `version`，与写面入参同键名） */
+function toAttributionView(rows: readonly FeatureProjectRecord[]): FeatureProjectAttributionItem[] {
+  return rows.map((row) => ({ projectId: row.projectId, version: row.projectVersion }));
+}
+
 
 /** `listEvents` 的 limit clamp 上限 = 游标续读的单页大小（短页即读到末尾） */
 const ACCEPTANCE_EVENT_PAGE = 1000;
@@ -866,7 +1246,16 @@ export function handleFeatureStatus(
     if (denied !== null) return denied;
     const tasks = listFeatureTasks(feature.featureId, { limit: 1000 }).map(summarizeTask);
     const artifacts = listArtifactsByFeature(feature.featureId, 1000);
-    return { ok: true, feature, tasks, artifacts, acceptance: buildFeatureAcceptance(feature, identity) };
+    return {
+      ok: true,
+      feature,
+      tasks,
+      artifacts,
+      acceptance: buildFeatureAcceptance(feature, identity),
+      // v0.10.1 O7 / C-19：归属按 feature_id 单查（详情路径只有一个 Feature，无 1+N 之虞）；
+      // 可见性已由上面的 ownershipFailure 把关 ⇒ store 读口不必再带组过滤。无归属 ⇒ 空数组。
+      projects: toAttributionView(featureProjectListByFeature(feature.featureId)),
+    };
   }
   // 列表路径：配组 ⇒ 只列本组 Feature（`owner_group = identity`，NULL 无归属被排除 = fail-closed）；
   // 无身份 ⇒ 全量（未配组 / web 运维视图）。
@@ -878,6 +1267,13 @@ export function handleFeatureStatus(
   // `listFeatures` 同源）⇒ 列表读由「1 + N」降为 **O(1)**。`taskCount` 由 `stateCounts` 求和派生，
   // 与改前逐 Feature 的 `listFeatureTasks(...).length` 同值（对照断言见 `test/v090-o2-read-plane.test.ts`）。
   const counts = featureTaskStateCounts(identity === null ? undefined : identity);
+  // v0.10.1 O7 / C-19：归属同样走**一条 SQL**（照上面 B3″ 先例，**不得**逐 Feature 查 ⇒ 查询数
+  // 不随 Feature 数增长）；归属谓词与 `listFeatures` 同源（store 侧复用同一谓词）。
+  const attributionRows = featureProjectListByFeatures(identity === null ? undefined : identity);
+  const attributionsByFeature: Record<string, FeatureProjectAttributionItem[]> = {};
+  for (const f of features) {
+    attributionsByFeature[f.featureId] = toAttributionView(attributionRows.get(f.featureId) ?? []);
+  }
   return {
     ok: true,
     features: features.map((f) => {
@@ -885,6 +1281,7 @@ export function handleFeatureStatus(
       const taskCount = Object.values(stateCounts).reduce((sum, n) => sum + (n ?? 0), 0);
       return { ...f, taskCount, stateCounts };
     }),
+    attributionsByFeature,
   };
 }
 
@@ -924,6 +1321,66 @@ export interface FeatureAdvanceArgs extends RegistrationInput {
    *   不做部分重派，Feature 态不变）。
    */
   retryTaskIds?: string[];
+  /**
+   * **归属（承诺集）写**（v0.10.1 O3 / C-17）：本需求触达哪些 project、各自落哪个 Project Version。
+   *
+   * - **additive**：省略 = 既有行为逐字不变；
+   * - **独立分支**：`projectVersions` **非空**即触发归属写；`to` **等于当前态**时该分支**跳过
+   *   `canTransition`**（照 `retryTaskIds` 先例，转移表零改动、不出现自环）—— 否则「只补归属」的
+   *   调用会落进 `executing → executing` 被判非法；`to` 为合法后继时归属写与主链迁移**同单生效**；
+   * - **不要求同单携带登记字段**、**不入 {@link hasRegistration} 判据**（★R3：塞进去会污染既有登记语义）；
+   * - **全量重发**（C-3 ★R3）：每次带的是该需求的全量承诺集，同值幂等 ⇒ 重发安全；
+   * - 判据不过 ⇒ **整单拒绝在任何写入之前**（★N-8「归属拒 ⇒ 主链零迁移」）；
+   * - 空数组 = **零写 no-op**（不是「清空归属」，撤销承诺是显式删行）。
+   */
+  projectVersions?: ProjectVersionAdvanceItem[];
+}
+
+/**
+ * MCP `a2a_feature_advance` 入参 `projectVersions[]` 的**单条形状**（C-17 写面形态）。
+ *
+ * 与 O2 执法面的 {@link ProjectVersionAttribution} 差一个键名（`version` → `projectVersion`）：
+ * 顶层 `version` 在 `advance` 里**已被 Group Version 登记字段占用**，归属项的版号在入参里叫
+ * `version`、在落库侧叫 `projectVersion`，由本节点做映射（不做双键兼容，避免两个事实源）。
+ *
+ * `groupVersion` / `ownerGroup` **不在入参里** —— 由 Feature 当前记录派生（C-21，见
+ * {@link ProjectVersionAttribution}）。
+ */
+export interface ProjectVersionAdvanceItem {
+  projectId: string;
+  /** 该 project 的 **Project Version**（落 O2 执法时映射为 `projectVersion`） */
+  version: string;
+  /**
+   * **接受即忽略**：归属表无 `repo_id` / `ref` 列（C-16 列面），二者只在**交付快照回读**方向存在
+   * （C-5：由发版意图带入、不回查注册表）⇒ 本入参不持久化、不校验其内容。
+   */
+  repoId?: string;
+  ref?: string;
+}
+
+/** 入参形状 → O2 执法面形状（`repoId` / `ref` 到此为止，不落库） */
+function toAttributionWrites(
+  items: readonly ProjectVersionAdvanceItem[],
+): ProjectVersionAttribution[] {
+  return items.map((item) => ({ projectId: item.projectId, projectVersion: item.version }));
+}
+
+/**
+ * 归属写落笔 + 出参回显（v0.10.1 O3）—— 三条 `advance` 路径共用。
+ *
+ * **校验已在任何写入之前完成**（{@link checkFeatureAttributionWrites} 经
+ * {@link applyFeatureAttributions} 内部再跑一遍，判据唯一、零第二套），本函数只负责
+ * 「全量重发 + 把三档计数挂进出参」。
+ */
+function writeAttribution<T extends FeatureAdvanceSuccess>(
+  success: T,
+  args: AttributionWriteArgs,
+  identity: string | null,
+): T | FeatureToolFailure {
+  const written = applyFeatureAttributions(args, identity);
+  if (written.ok === false) return written;
+  success.attribution = { created: written.created, updated: written.updated, noop: written.noop };
+  return success;
 }
 
 export interface FeatureStateChangeSuccess {
@@ -945,6 +1402,11 @@ export interface FeatureAdvanceSuccess extends FeatureStateChangeSuccess {
   rearmed?: string[];
   /** 本次**实际解冻**（`blocked` → `working`）的节点 id */
   unfrozen?: string[];
+  /**
+   * 本次**归属写**的三档计数（v0.10.1 O3；非该路径不设此字段）。
+   * `noop` = 同值幂等重发的行数（C-3 ★R3「重发安全」的可观测面）。
+   */
+  attribution?: { created: number; updated: number; noop: number };
 }
 
 export function handleFeatureAdvance(
@@ -981,12 +1443,36 @@ export function handleFeatureAdvance(
     reg.patch.approval !== undefined ||
     reg.patch.version !== undefined;
 
+  // ---- 归属独立分支（v0.10.1 O3 / C-17 ★R3）：**先全量校验、零写入** ------------------------------
+  // 位置在所有写入（登记 / Context / 主链 / 归属）**之前** ⇒ ★N-8「归属拒 ⇒ 主链零迁移」的凭据。
+  // 判据唯一来自 O2 的 {@link checkFeatureAttributionWrites}（本节点不另写一套）；`hasRegistration`
+  // **不受影响**（归属不是登记字段语义，折进去会污染既有登记特例）。
+  const attributionArgs: AttributionWriteArgs | null =
+    args.projectVersions !== undefined && args.projectVersions.length > 0
+      ? {
+          featureId: feature.featureId,
+          projectVersions: toAttributionWrites(args.projectVersions),
+          source: "mcp_advance",
+        }
+      : null;
+  if (attributionArgs !== null) {
+    const plan = checkFeatureAttributionWrites(
+      feature,
+      attributionArgs.projectVersions,
+      attributionArgs.source,
+    );
+    if (plan.ok === false) return plan;
+  }
+
   // ---- 重派与解冻（§2.3 / N4）：**显式特例**，不得给 `TRANSITIONS` 加自环 ----------------------
   // `retryTaskIds` 是**派发语义操作**（重派指定失败节点 + 解冻其闭包外下游），不是状态流转
   // ⇒ 跳过 `canTransition`（转移表保持单一事实源、不出现 `executing → executing` 自环）；
   // `to` 必须**显式** `"executing"`，以防借本参数做状态流转。
   if (args.retryTaskIds !== undefined) {
-    return handleRetryResume(feature, { ...args, retryTaskIds: args.retryTaskIds }, reg.patch);
+    const resume = handleRetryResume(feature, { ...args, retryTaskIds: args.retryTaskIds }, reg.patch);
+    if (resume.ok === false || attributionArgs === null) return resume;
+    // 重派校验全过 ⇒ 同单归属写才落笔（归属 + 重派任一不过，都不留半摊）
+    return writeAttribution(resume, attributionArgs, identity);
   }
 
   // ---- 登记字段特例（v0.9.0 B1″）：`to` = 当前态 ∧ 带登记字段 ⇒ **只写登记、不做流转** ------------
@@ -997,14 +1483,30 @@ export function handleFeatureAdvance(
   if (hasRegistration && args.to === feature.state) {
     applyFeatureContext(feature.featureId, args);
     updateFeatureRegistration(feature.featureId, reg.patch);
-    const success: FeatureStateChangeSuccess = {
+    const success: FeatureAdvanceSuccess = {
       ok: true,
       featureId: feature.featureId,
       from: feature.state,
       state: feature.state,
     };
     if (args.note !== undefined) success.note = args.note;
-    return success;
+    if (attributionArgs === null) return success;
+    return writeAttribution(success, attributionArgs, identity);
+  }
+
+  // ---- 归属独立分支的**只补归属**档（C-17 ★R3）：`to` = 当前态 ∧ `projectVersions` 非空 ------------
+  // 不携带登记字段时，`to = 当前态` 在主链上**没有路径**（`canTransition` 会拒）⇒ 本分支替它跳过
+  // 状态机校验；`state` 逐字不变、不发状态事件、不写登记（转移表仍零改动、无自环）。
+  if (attributionArgs !== null && args.to === feature.state) {
+    applyFeatureContext(feature.featureId, args);
+    const success: FeatureAdvanceSuccess = {
+      ok: true,
+      featureId: feature.featureId,
+      from: feature.state,
+      state: feature.state,
+    };
+    if (args.note !== undefined) success.note = args.note;
+    return writeAttribution(success, attributionArgs, identity);
   }
 
   if (!isFeatureState(args.to)) {
@@ -1058,15 +1560,25 @@ export function handleFeatureAdvance(
   // 登记字段与**合法流转同单**写入（v0.9.0）：先落登记，再迁主链 ⇒ 出参回显的 `state` 是迁移后的态
   if (hasRegistration) updateFeatureRegistration(feature.featureId, reg.patch);
 
+  // 归属与**合法流转同单**写入（v0.10.1 O3 / C-17）：位置在主链迁移**之前** ——
+  // 校验早已完成（★N-8），这里只是落笔顺序上让「归属没落成」时主链也不迁移。
+  let attributionCounts: { created: number; updated: number; noop: number } | null = null;
+  if (attributionArgs !== null) {
+    const written = applyFeatureAttributions(attributionArgs, identity);
+    if (written.ok === false) return written;
+    attributionCounts = { created: written.created, updated: written.updated, noop: written.noop };
+  }
+
   const updated = updateFeatureState(feature.featureId, args.to);
   const state = updated === null ? args.to : updated.state;
-  const success: FeatureStateChangeSuccess = {
+  const success: FeatureAdvanceSuccess = {
     ok: true,
     featureId: feature.featureId,
     from: feature.state,
     state,
   };
   if (args.note !== undefined) success.note = args.note;
+  if (attributionCounts !== null) success.attribution = attributionCounts;
   return success;
 }
 

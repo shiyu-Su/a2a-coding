@@ -11,6 +11,7 @@ import type {
   FeatureListItem,
   FeatureTraceView,
   ProjectTasksView,
+  ProjectVersionsField,
   ProjectsView,
 } from "../bridge-client.js";
 import {
@@ -2140,6 +2141,102 @@ ${pool.length === 0 ? `<p class="hint">（无未排期的在途需求 · 终态�
 <button type="button" id="feat-dialog-close">关闭</button>
 <div class="fd-body"></div>
 </dialog>`;
+}
+
+// ---------------------------------------------------------------------------
+// project 级版本区块（v0.10.1 B3 · C-7 三档显示闭集；纯 SSR，零新脚本常量）
+// ---------------------------------------------------------------------------
+
+/** project 档状态徽标（**显示档，另立一族**，C-18②：不得复用 `.draglocked` / `kbadge draglock`）。 */
+const PV_STATUS_BADGE: Readonly<Record<string, { text: string; variant: string; note: string }>> = {
+  open: { text: "open", variant: "topen", note: "project 台账状态（引擎自报值，板不回落、不猜）。" },
+  released: { text: "released", variant: "treleased", note: "project 台账状态（级联置入，仅显示样式，不参与任何判定）。" },
+};
+
+/** 未知 / 缺位状态的徽标档（值域归引擎，板不扩、不映射成 Group 三态）。 */
+const PV_STATUS_UNKNOWN_BADGE: { text: string; variant: string; note: string } = {
+  text: "—",
+  variant: "tunknown",
+  note: "project 台账状态缺位或非字符串 ⇒ 显示 —，板不回落、不猜。",
+};
+
+/**
+ * 「各 project 版本」区块（组织空间排期页 · REQ-2026-10-09-01 C-7）。**纯读投影、三档显示闭集**：
+ * - `live` ⇒ 逐行 `{projectId, version, status, releasable}`（+ 计数 / `reason` / repo / ref）；
+ *   **`releasable === null`（缺键）⇒ 显示 `—`**，未知 ≠ 假否定；
+ * - `empty` ⇒ 「未登记（本版本起生效）」—— **合法事实，不是降级**，且**绝不合成 `notstart` 假行**；
+ * - `absent` ⇒ 降级条 + 根因码（文案单点 = `server.projectVersionDegradationText`，本函数不另写一套）。
+ * **org 切片**由调用方给定（沿用板侧单点切片，`undefined` = 不限组织）⇒ 两组织的同版号互不可见、互不锁。
+ * **不重算 `releasable`、不判 project 闸**（C-4 级联档：project 侧收口判据降为展示字段）；
+ * **容器恒在 `#schedule-board` 之外**（C-18①，接线归 B4），拖拽脚本的入口守卫因此碰不到本区。
+ */
+export function renderProjectVersionsBlock(
+  field: ProjectVersionsField,
+  org?: VersionOrgFilter,
+  degradationText: string | null = null,
+): string {
+  if (field.status === "absent") {
+    const text = degradationText ?? "（未取到降级文案 ⇒ 根因码无从展示，请查投影读取面）";
+    return cardShell(
+      "各 project 版本",
+      "降级",
+      `<p class="b-note">${text}</p>`,
+      "pv-block",
+    );
+  }
+  if (field.status === "empty") {
+    return cardShell(
+      "各 project 版本",
+      "0 行",
+      `<p class="hint">未登记（本版本起生效）—— 本组尚无 project 级版本承诺记录（<b>合法事实，非降级</b>）。</p>`,
+      "pv-block",
+    );
+  }
+  const rows = field.entries
+    .filter((e) => org === undefined || e.org === org)
+    .sort((a, b) => compareVersionOrder(a.version, b.version));
+  const meta = `本组 ${String(rows.length)} 行`;
+  if (rows.length === 0) {
+    return cardShell(
+      "各 project 版本",
+      meta,
+      `<p class="hint">未登记（本版本起生效）—— 投影在场，但<b>本组织</b>无 project 级版本行（他组织的同版号不在此显示，也不互锁）。</p>`,
+      "pv-block",
+    );
+  }
+  const body = rows
+    .map((e) => {
+      const hit = e.status === null ? undefined : PV_STATUS_BADGE[e.status];
+      const badge = hit ?? { ...PV_STATUS_UNKNOWN_BADGE, text: dash(e.status) };
+      const releasable =
+        e.releasable === true
+          ? `<span class="pvbadge tr">是</span>`
+          : e.releasable === false
+            ? `<span class="pvbadge tf">否</span>`
+            : `<span class="pvbadge tu" title="引擎未给 releasable（发版闸未上线的过渡档）⇒ 显示 —，不判定、不作否定档渲染">—</span>`;
+      return (
+        "<tr>" +
+        `<td>${escapeHtml(dash(e.projectId))}</td>` +
+        `<td class="mono">${escapeHtml(dash(e.version))}</td>` +
+        `<td>${escapeHtml(dash(e.repoId))}</td>` +
+        `<td><span class="pvbadge ${badge.variant}" title="${escapeHtml(badge.note)}">${escapeHtml(badge.text)}</span></td>` +
+        `<td>${releasable}</td>` +
+        `<td>${escapeHtml(dash(e.reason))}</td>` +
+        `<td>${[e.openCount, e.completedCount, e.cancelledCount].map((n) => escapeHtml(dash(n))).join(" / ")}</td>` +
+        `<td>${escapeHtml(dash(e.ref))}</td>` +
+        "</tr>"
+      );
+    })
+    .join("");
+  const table = `<table><thead><tr><th>project</th><th>Project Version</th><th>repo</th><th>状态</th><th>可发版</th><th>原因</th><th>开 / 完 / 取（计数）</th><th>交付 ref</th></tr></thead>
+<tbody>${body}</tbody></table>`;
+  return cardShell(
+    "各 project 版本",
+    meta,
+    `<p class="hint">引擎 project 台账的<b>只读投影</b>（按本组切片）：project 级 <code>released</code> <b>只显样式、不参与任何判定</b>，两级计数<b>不横向相加、不互校</b>。</p>
+${table}`,
+    "pv-block",
+  );
 }
 
 // ---------------------------------------------------------------------------

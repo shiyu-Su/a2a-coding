@@ -43,6 +43,14 @@ Launcher 的**入站指挥端点已于 v2.0 退役**（连接模型反转为 pul
 
 四 kind 项目示例的 `repo` 用法与「不需要则整键删除」口径见 `config/config.json.default`（本节点只同步 README，配置样例的补齐归对应节点）。
 
+### 项目 workspace = 代码根（v0.10.1）
+
+`ProjectConfig.workspace` 是该项目 **Agent 执行 / 会话的代码根**：适配器经桥 `--workspace` 下传，ACP 会话的 `cwd` 即取此值（链路 = `types.ts` `ProjectConfig.workspace` → `adapters/types.ts` `LaunchRequest.workspace` → `acp-bridge/acp/session.ts` `AcpSessionRunnerOptions.cwd`）。
+
+- **形态自由**：**可为仓内子目录**（monorepo —— 各子项目各配一个 project、各指自己的子目录），**亦可自成一仓**（polyrepo —— 直接指向该仓根）。machine 侧对这两种形态一视同仁，不区分、不配置化。
+- **与上节 `repo` 的分工**：`repo` 只标注「本项目属于哪个仓库」的**身份**；machine **不从 `workspace` 反推 `repo`**，也不拿 `repo` 去校验目录 —— 配一个不隐含另一个，两者各自独立可选。
+- **校验口径（本版不加码）**：加载期只把 `workspace` 当字符串解析（`config.ts` `parseProject`），**不做任何形态校验 / 归一**（不查 git 仓、不反推仓根、不校验 `repo` 与目录形态是否相符）；唯一判据仍是拉起 Agent 前的**存在性检查**（`launcher/manager.ts` `existsSync`，不存在 ⇒ `AgentStartError`）。
+
 ## 传输层有界重发与启动补结算（v0.8.7，v0.8.8 增续跑与六类值域，v0.8.9 需求2 改续跑资格与总框口径，v0.8.10 续跑 / 重发改**定向取消**）
 
 **① 传输层有界重发（首发早夭自愈，`launcher/runner-exec.ts`）**：dispatch 在**拿到终态之后**（`deliver` 之前）判定 —— 六类值域（PROTOCOL 2.3）下的传输层判据 = `failureKind === "agent"` ∧ `diagnostics.acpErrorKind ∈ {spawn, closed}` ∧ `chunkCount === 0`（即「**载体早夭**」：后端进程起不来 / 中途退出、且一个 chunk 都没吐；`timeout` kind 天然被排除）⇒ **定向取消本轮 → 重新 `ensure` → 重新 `send`**（v0.8.10 · M-N3 起**不再 `host.stop(projectId)`** —— stop 停整桥、连坐同项目其它在飞任务；静默未达成 ⇒ 不 stop、直接结算交宿主），**每节点最多 1 次**（`MAX_TRANSPORT_ATTEMPTS = 1`）。另保留唯一窄场景的内部重投 = **send 相位连接级失败**（此时连终态都拿不到：`entry.a2aTaskId === null` + ECONNREFUSED / ECONNRESET / 桥进程已死）。**两形态由「是否拿到终态」互斥划分、共用同一计数 ⇒ 不会双触发**。**禁止重发**的相位 = **poll 相位**（只能续轮询，`tasks/get` 只读幂等）与**超时 / abort**（请求**可能已送达并在执行**）。硬闸 = 剩余预算 ≥ 60s（`RESEND_MIN_REMAINING_MS`）且不越该次 dispatch 的 `deadline`。留痕 = 日志 + `diagnostics.attempts`（**不落库** —— `retry_count` 是 Feature rearm 语义，不混用）。桥侧**零改动且不可见**：同 taskId、单次终态回传、**不产生第二次账单**。

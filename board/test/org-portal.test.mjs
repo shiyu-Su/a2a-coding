@@ -37,6 +37,8 @@ import {
 import { NEW_REQUIREMENT_DIALOG_SCRIPT } from "../dist/web/layout.js";
 import { createBoardServer } from "../dist/server.js";
 import { engineProjectionAbsentFetcher, engineProjectionFetcher } from "./engine-versions-fixture.mjs";
+// v0.10.1 C2 专用（只增一行导入，上面既有夹具导入与全部既有期望不动）
+import { engineProjectLiveField, engineProjectionOf } from "./engine-versions-fixture.mjs";
 
 function feature(featureId, ownerGroup, version, overrides = {}) {
   return {
@@ -455,6 +457,162 @@ test("N2-⑥e 门户 GET 仍零写（摘要换源不动「纯读面」纪律）"
       ledgerOrgs: [{ org: "甲组" }],
       versions: [],
       engineVersions: engineProjectionFetcher([{ org: "甲组", version: "v9.9.9", status: "released" }]),
+    },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// ⑦ v0.10.1 C2（REQ-2026-10-09-01）—— 门户摘要 × project 面的三条负向钉
+//
+// 口径（改造文档 §2 C-18④⑥ / C-4 双计数 / §4 实现级 board）：
+// **门户摘要 `orgVersionSummaryOf` 不扩 project**；**两级计数不得进同一张表、不得相加、不得互校**；
+// **org 切片不串味**（A 组织的投影不喂 B 组织）。
+// 与 B1/B2/B3/B4 的分工：三档显示闭集与 org 切片档归 T3/T4 的 project 区块用例；
+// 本节点只在**门户面**补「跨三档不变式 + 双计数不相加」两族，且一律走 **live 档**
+// （B2-④b 钉的是 project **缺位**档下的门户零变化 —— 缺位档不携带任何可染色的行，测不出「不扩」）。
+// ---------------------------------------------------------------------------
+
+/** 门户跨档不变式的 Group 基线行（两组织 + released/active 两态都在内）。 */
+const C2_GROUP_ROWS = [
+  { org: "甲组", version: "v0.10.1", status: "active" },
+  { org: "甲组", version: "v0.9.0", status: "released" },
+  { org: "乙组", version: "v0.10.1", status: "released" },
+];
+
+/** project 档 live 行：版号（v8.8.8 / v7.7.7）与计数（0+7+3 / 4+5+6 = 25）都是「一旦串门就可见」的探针。 */
+const C2_PROJECT_ROWS = [
+  { org: "甲组", projectId: "pvorch", version: "v8.8.8", status: "released", releasable: true, openCount: 0, completedCount: 7, cancelledCount: 3 },
+  { org: "乙组", projectId: "pvboard", version: "v7.7.7", status: "open", openCount: 4, completedCount: 5, cancelledCount: 6, reason: "归属未收口" },
+];
+
+const C2_LIVE_FIELD = engineProjectLiveField(C2_PROJECT_ROWS);
+
+/** 门户卡上的全部数字字段（两级计数若被相加，只会露在这里）。 */
+function numericFieldsOf(card) {
+  return [card.scheduled, card.features, card.tasks].filter((v) => typeof v === "number");
+}
+
+test("C2-⑦a 门户摘要不含 project 行：projectionLedgerOf 只取 Group entries（project 版号 / 两态 / 键集一律不混进台账面）", () => {
+  const withProjects = engineProjectionOf(C2_GROUP_ROWS, "", C2_LIVE_FIELD).projection;
+  const withoutProjects = engineProjectionOf(C2_GROUP_ROWS).projection;
+  assert.deepEqual(
+    projectionLedgerOf(withProjects),
+    projectionLedgerOf(withoutProjects),
+    "project 面在场 / 缺位 ⇒ 门户摘要的台账面逐字段恒等（跨档不变式）",
+  );
+  const ledger = projectionLedgerOf(withProjects);
+  assert.deepEqual(
+    ledger.versions.map((r) => `${r.org}@${r.version}@${r.status}`),
+    ["甲组@v0.10.1@active", "甲组@v0.9.0@released", "乙组@v0.10.1@released"],
+    "同序（投影登记序）+ 同状态，且只有 Group 那三行",
+  );
+  assert.equal(
+    ledger.versions.some((r) => r.version === "v8.8.8" || r.version === "v7.7.7"),
+    false,
+    "project 独有版号不得成为台账行（否则门户「已发版 / 进行中」会读到一个 project 版号）",
+  );
+  assert.equal(
+    ledger.versions.some((r) => r.status === "open"),
+    false,
+    "project 档两态（open / released）不得混进 Group 三态（open 既不是 active 也不是 notstart）",
+  );
+  for (const rec of ledger.versions) {
+    assert.deepEqual(
+      Object.keys(rec).sort(),
+      ["createdAt", "note", "org", "status", "updatedAt", "version"],
+      "台账行不带 project 维度键（projectId / releasable / 计数）",
+    );
+  }
+  // 正对照（防上面的负钉空转）：project 版号一旦真被当成 Group 行喂进台账面，摘要就会读出它 —— 探针本身是活的
+  const leaked = projectionLedgerOf({
+    entries: [...C2_GROUP_ROWS.map((r) => ({ ...r })), { org: "甲组", version: "v8.8.8", status: "released" }],
+    capturedAt: "2026-10-09T00:00:00.000Z",
+  });
+  assert.equal(orgVersionSummaryOf(leaked, [], "甲组").lastReleased, "v8.8.8", "同版号若混进 Group 面即成为「已发版」⇒ 上面那条 doesNotMatch 不是空判");
+});
+
+test("C2-⑦b 两级计数不横向相加：门户卡与「无 project 面」基线恒等，project 计数之和不得成为任何字段", () => {
+  const features = [
+    feature("F1", "甲组", "v0.10.1", { taskCount: 2 }),
+    feature("F2", "乙组", "v0.10.1", { taskCount: 3 }),
+  ];
+  const cards = buildOrgPortalCards(
+    ["甲组", "乙组", "板默认"],
+    features,
+    projectionLedgerOf(engineProjectionOf(C2_GROUP_ROWS, "", C2_LIVE_FIELD).projection),
+  );
+  const baseline = buildOrgPortalCards(
+    ["甲组", "乙组", "板默认"],
+    features,
+    projectionLedgerOf(engineProjectionOf(C2_GROUP_ROWS).projection),
+  );
+  assert.deepEqual(cards, baseline, "project 面在场不改任何一张卡（相加 / 互校即破此式）");
+  // project 侧计数探针：甲组行 completedCount = 7、甲组行三计数之和 = 10、乙组行三计数之和 = 15、全表总和 = 25
+  // （Group 侧字段本档取值都在 0–3，任何一枚命中即说明计数被串 / 相加）
+  const projectCounts = [7, 10, 15, 25];
+  for (const card of cards) {
+    for (const v of numericFieldsOf(card)) {
+      assert.equal(projectCounts.includes(v), false, `${card.org} 的数字字段 ${v} 命中 project 侧计数 ⇒ 计数被串了`);
+    }
+    assert.deepEqual(
+      Object.keys(card).sort(),
+      ["active", "activeDerived", "extraActive", "features", "lastReleased", "org", "scheduled", "tasks"],
+      "门户卡字段集 = Group 侧八枚（两级计数不得进同一张表 · C-18⑥）",
+    );
+    assert.equal(card.active.some((v) => v === "v8.8.8" || v === "v7.7.7"), false, "进行中清单不得吞进 project 版号");
+  }
+  assert.deepEqual(
+    cards.map((c) => `${c.org}:${c.tasks}:${c.scheduled}:${c.lastReleased}:${c.active.join("/")}`),
+    ["甲组:2:1:v0.9.0:v0.10.1", "乙组:3:1:v0.10.1:", "板默认:null:0:null:"],
+    "任务数只来自需求列表 taskCount（Group 侧派生），与 project 计数无算术关系；乙组 project 行released 不喂出摘要",
+  );
+});
+
+test("C2-⑦c org 切片不串味：甲组的 Group 行不喂乙组摘要，乙组自己的 project released 行也不喂（A 组织投影 ≠ B 组织凭据）", () => {
+  const ledger = projectionLedgerOf(
+    engineProjectionOf(
+      [
+        { org: "甲组", version: "v0.9.0", status: "released" },
+        { org: "甲组", version: "v0.10.1", status: "active" },
+      ],
+      "",
+      engineProjectLiveField([{ org: "乙组", projectId: "pvorch", version: "v8.8.8", status: "released", releasable: true, completedCount: 9 }]),
+    ).projection,
+  );
+  const yi = orgVersionSummaryOf(ledger, [feature("Z1", "乙组", "v0.10.1", { stage: "需求分析" })], "乙组");
+  assert.deepEqual(
+    yi,
+    { lastReleased: null, active: [], activeDerived: [], extraActive: 0 },
+    "乙组无 Group 行 ⇒ 摘要双空：甲组的 Group 行不串味，乙组自己的 project released 行也不给它「已发版」",
+  );
+  const jia = orgVersionSummaryOf(ledger, [], "甲组");
+  assert.equal(jia.lastReleased, "v0.9.0", "甲组读到自己那两行（切片正确，不是整体为空）");
+  assert.deepEqual(jia.active, ["v0.10.1"]);
+  assert.deepEqual(jia.activeDerived, [], "台账登记的 active 不带派生星");
+});
+
+test("C2-⑦d HTTP：门户在 project live 档下仍只渲 Group 摘要（project 版号 / projectId / 区块 / 根因码一律不出）", async () => {
+  await withPortalServer(
+    async (base) => {
+      const res = await fetch(`${base}/`);
+      assert.equal(res.status, 200);
+      const html = await res.text();
+      assert.match(
+        html,
+        /<p class="kmeta">已发版 v0\.9\.0 · 进行中 v0\.10\.1<\/p>/,
+        "甲组摘要 = Group 档原样（project live 行在场不改摘要行）",
+      );
+      assert.doesNotMatch(html, /v8\.8\.8|v7\.7\.7/, "project 版号不进门户任何行（C-18④ 门户摘要不扩 project）");
+      assert.doesNotMatch(html, /pvorch|pvboard/, "projectId 不进门户");
+      assert.doesNotMatch(html, /各 project 版本|class="[^"]*\bpv-block/, "门户不挂 project 版本区块（区块落点 = 组织空间排期页 · C-18①④）；样式规则 .pv-block 在全站 CSS 里，故钉元素级锚");
+      assert.doesNotMatch(html, /归属未收口|引擎未给 releasable|不横向相加/, "project 侧的原因 / releasable 过渡档文案 / 两级计数说明不进门户");
+      assert.doesNotMatch(html, /project_versions_/, "门户不裸吐 project 根因码");
+    },
+    {
+      features: [feature("F1", "甲组", "v0.10.1", { taskCount: 2 })],
+      ledgerOrgs: [{ org: "甲组" }, { org: "乙组" }],
+      versions: [],
+      engineVersions: engineProjectionFetcher(C2_GROUP_ROWS, "", C2_LIVE_FIELD),
     },
   );
 });

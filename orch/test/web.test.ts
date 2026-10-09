@@ -993,6 +993,7 @@ test("回归：3300 路由枚举含 /api/registry/projects（全部已注册路�
     "/api/projects",
     "/api/features",
     "/api/features-by-version",
+    "/api/project-versions", // v0.10.1 O6（project 级版本只读投影）
     "/api/tasks",
     "/api/events",
     "/api/groups",

@@ -91,6 +91,7 @@ import {
 import { resolveTaskLookup } from "./task-lookup.js";
 import { createRunnerEndpoints, type RunnerEndpointHandle } from "./runner.js";
 import { createVersionsEndpoints } from "./versions-endpoints.js";
+import { createProjectVersionsEndpoints } from "./project-versions-endpoints.js";
 import { activateVersionForFeature } from "./versions-activation.js";
 import {
   FeatureScheduler,
@@ -2222,6 +2223,13 @@ async function startHttpBridge(): Promise<void> {
   const versionsEndpoints = createVersionsEndpoints({
     role: () => runtime.currentRole,
   });
+  /**
+   * Project Version 台账端点（v0.10.1 O5）：与 Group 档同一委托形态、同一端口，**另立处理器实例**
+   * （两档路由前缀不重合 ⇒ 互不认领）。
+   */
+  const projectVersionsEndpoints = createProjectVersionsEndpoints({
+    role: () => runtime.currentRole,
+  });
   const handle = await startHttpTransport({
     core: coreFor(null), // 兜底视图（匿名/全量）；生产请求路径走 coreFor(identity)
     coreFor,
@@ -2235,6 +2243,7 @@ async function startHttpBridge(): Promise<void> {
     onShutdown: shutdown,
     runner: runnerEndpoints,
     versions: versionsEndpoints,
+    projectVersions: projectVersionsEndpoints,
     // O5：/health 出参增加降级快照（只加键，status/role/version 语义不变）
     degraded: () => degradations.snapshot(),
   });

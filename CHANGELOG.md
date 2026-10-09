@@ -2,6 +2,35 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.10.1] - 2026-10-09
+
+> 主题：**版本事实源下沉 project**（每个 project 有自己的版本号；需求过门时登记「触达哪些 project + 各进哪个版本」；**发版一个动作 + 级联**）。主需求 `88026fcd`（20 节点）+ 承接轨 `c6fa6ff4`（5 节点，B5 拆小重建）。
+
+### Added
+
+- **project 版本身份与归属（orch 两张新表）**：`project_versions`（**台账**，键 `(owner_group, project_id, version)`，两态 `open` / `released`）+ `feature_projects`（**归属 / 承诺集**，键 `(owner_group, feature_id, project_id)`，含 `group_version` 列；**不进 prune、不随 Feature 终态级联删**）。
+- **写面**：`/api/project-versions`（POST 建版 / DELETE 删版 / GET 只读；`owner_group` 解析沿既有三源 + 第四源 `project_id`）；`GET /api/versions` **顶层新增 `projectVersions[]`**（+ 可选 `?owner_group=`，缺省全表；**`versions[]` 成员与语义零改动**）；**MCP `a2a_feature_advance` 可选入参 `projectVersions[]`**（**独立分支**、不占用登记字段特例、状态机与转移表零改动、**同单生效**）。
+- **归属写执法五条**：未过门拒 / 向已 `released` 的 `(project, version)` 新增归属或建版拒（**归属写 released 门**）/ 要求版本行**已存在**（**不隐式建版**）/ **不变式继承判据**（同 `(Group Version, project)` 已有承诺 ⇒ 必须继承同号）/ **幂等**（同值 no-op、异值拒）。
+- **板侧读面**：组织空间排期页新增「**各 project 版本**」区块（**三档显示闭集** = 投影在场有行 / 在场无行「未登记（本版本起生效）」/ 读不到「降级条 + 根因码」；按组切片；锁标记**另立样式类**、与排期拖拽闸的 `.draglocked` 逐字分立；**project 面无本地缓存**）。
+- **feature 侧归属只读面**（orch）：`a2a_feature_status` 详情 + 列表（列表走**单条 GROUP BY**，不逐 Feature 查）。
+
+### Changed
+
+- **发版 = 一个动作 + 级联**（用户 2026-10-09 裁定）：标记 Group `released` 时，**同一事务**把其名下**被触达的 project 版本**一并置 `released`（并冻结）；**project 侧判据降为展示字段 `releasable` + 原因**（`total>0 ∧ completed+cancelled===total`，**不含 `completed>0`**），不作发版口、不产拒绝码。⇒ 采纳理由：既消掉「两套标记分别做必然漏标」，也消掉「归属需求全 `cancelled` 的 project 会永久 open、与 Group 互锁即列车死锁」；代价（如实登记）：**「发版闸下沉 project 级」在此档下成为名义上的**。
+- **Group 侧一律不动**：Group 版本台账 / 闸 / 两把锁 / `notstart→active` 自动转换语义与实现**逐字未改**。
+- **`releases.projects[]` 项扩容**：`{repoId, ref}` → **`{projectId, version, repoId, ref}`**（存储形状扩容；**协议保持 2.3**，新增键全可选、既有语义不收紧 ⇒ 纯加法）。
+- **规范落笔（flow）**：`需求流程.md` §2 Step 3 两档限定语（**增补须与主轨同 Group Version**；**跨 Group Version 的补充一律按新需求**）+ §7 新增「两级版本（Group Version / Project Version）」小节（**四条规则**：缺省 = 首版继承当时 Group Version 数值、冲突 ⇒ 409、已归属不可改、**一经 released 即冻结不得复用**；+ 代行档预检 + 术语对齐 + 协议对端桥接 + 双计数不得横向相加 + **无 `package.json` 载体的 project 用规范版本戳**）+ §8（**身份与 tag 按 project、发版记账按 repo**；`{版本}` 指代钉为 Group Version）+ **四戳齐翻 v0.10.1**。
+- **machine 语义定型（零代码）**：`workspace` 在文档/注释层定型为「**代码根**」（可为仓内子目录、亦可自成一仓）；**不动注册载荷、不动协议（2.3）、不 bump 版本号**。
+- **停同升第二次实操**：**orch `0.10.0→0.10.1`**、**board `0.10.0→0.10.1`**（两者本版均有行为变更）、**machine 保持 `0.9.8`**（只有注释/文档改动）、根 `package.json` → `0.10.1`；tag 命名空间 **`orch/v0.10.1`** + **`board/v0.10.1`**（machine 未动 ⇒ 无 tag）。
+
+### 门禁与验收
+
+- **门禁**：orch 全量 **526 / 0 fail / 1 skip**；board 全量 **1449 条**（其中 `BD14-①e` 为**非确定性红**——全量首跑 1 红、次跑全绿，判定**非本版语义引入**，已登记为遗留待核）；承接轨独立验货 = **真产物逐条在、改动既有期望 M=0**；根回归见下。
+- **真机（宿主实测）**：`GET /api/versions` 顶层新增 `projectVersions[]` 且 `versions[]` **13 条逐字未动**；`GET /api/project-versions` 200；**建 4 条 project 版本行**（`orch 0.10.1` / `board 0.10.1` / `machine 0.9.8` / `flow v0.10.1`）+ **写归属**（主 `{created:4}`、承接 `{created:1}` **继承同号未冲突**）+ 重复建版 **409 `orch_project_version_exists`**；板排期页渲染出 **4 行**（board 计数 **2/0/0** = 主 + 承接**并集**）。
+- **可证伪判据（前半成立）**：**同一 Group Version `v0.10.1` 下三个 project 版本号互不相同**（`0.10.1` / `0.9.8` / `v0.10.1`）；后半（发版级联）在标记 `released` 时行使。
+- **验收方式**：用户 2026-10-09 原话授权**宿主代行验收**（「我不是很好验收 你直接验收？」）；引擎 `note` 已如实标注「代行」。
+- **载体切换**：桥重启 pid 61768、板重启 pid 27968（此前板进程自 2026-10-04 起一直跑 v0.9.8 代码 ⇒ **v0.10.0 板侧改动此前从未真机生效**，本版一并切上）；**板本地台账分叉已排除**（本地 10 行 vs 引擎 13 行冲突 0 + `writeFileAtomic` inode Birth==Modify 证明未被写过）。
+
 ## [v0.10.0] - 2026-10-09
 
 > 主题：**版本面单一事实源**（版本成为一等对象 + Release 对象 + 版本聚合读面 + **停同升**）。主需求 `1f937738`（29 节点）+ 三条挂轨：承接重建 `31155242`（board 尾段）、缺陷修复 `97225fb4`（台账 `owner_group` 写口）、规范落笔 `b00472b1`（flow §7 同升纪律）。

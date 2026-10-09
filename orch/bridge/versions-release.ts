@@ -11,8 +11,8 @@
  * 闸判据要读 `features` 聚合（O3 面），搬进事务会把聚合读纳入写锁窗口；故
  * 「**闸在事务前、写在事务内**」，与 `versionLedgerCreate`
  * 的「先 get 再 INSERT」同一套并发口径（SQLite 单写者 + 同进程同步 API 兜窗口）。
- * 「同事务」指的是 **`versions.status` 迁 `released` 与 `releases` 落快照这两写同事务**
- * （缺一必留半成品版本，见 `versionLedgerMarkReleased`），
+ * 「同事务」指的是 **`versions.status` 迁 `released`、`releases` 落快照、以及 project 版本级联置
+ * `released`（v0.10.1 O4 · C-4）这三笔写同事务**（缺一必留半成品版本，见 `versionLedgerMarkReleased`），
  * 不是指把聚合读也圈进来。
  *
  * ## `repoId` 为什么不从注册表取（★ 节点硬约束）
@@ -46,7 +46,8 @@ export interface MarkVersionReleasedInput {
   changelogAnchor?: string | null;
   /**
    * 各仓当期发版引用（**原始 JSON** ⇒ 本层做形状校验）。缺省 = 空数组（单仓未配 `repo` 的现状，
-   * 快照仍落行）。
+   * 快照仍落行）。v0.10.1 O4 起项形状 = `{projectId, version, repoId, ref}`，四键皆
+   * `string | null | 缺省`；前两条是 C-5 新增的可选键（旧形状 `{repoId, ref}` 继续合法）。
    */
   projects?: unknown;
   note?: string | null;
@@ -76,11 +77,15 @@ export type MarkVersionReleasedResult =
 
 /**
  * `projects` 的**边界校验**（入参来自 JSON，形状不可信）：数组 / 每项是普通对象 /
- * `repoId` `ref` ∈ `string | null | 缺省`。
+ * `projectId` `version` `repoId` `ref` ∈ `string | null | 缺省`。
  *
  * **只做形状、不做归一**（§2.1(6)）：不 trim、不折叠大小写、不去重、不排序、不校验 ref 是否为
- * 真 commit/tag —— 引擎不解析 git，校验只会误伤（短 sha / tag 名空间 `<project>/vX.Y.Z` 都归
- * 调用方与根仓库的口径）。
+ * 真 commit/tag、不校验 projectId 是否已注册 —— 引擎不解析 git，校验只会误伤（短 sha / tag 名空间
+ * `<project>/vX.Y.Z` 都归调用方与根仓库的口径）。
+ *
+ * **v0.10.1 O4 · C-5 形状扩**：快照项由 `{repoId, ref}` 扩为 `{projectId, version, repoId, ref}`。
+ * 两个新键**可选**、既有键语义**不收紧** ⇒ 按协议版本判据**不升协议版本**（`PROTOCOL_VERSION`
+ * 保持 `2.3`）。**缺省即不写键**（不填 `null`、不从归属表反查），历史旧形状行读写两端形状不变。
  */
 function validateProjects(
   raw: unknown,
@@ -94,19 +99,26 @@ function validateProjects(
   const projects: ReleaseSnapshotProject[] = [];
   for (const [i, item] of raw.entries()) {
     if (typeof item !== "object" || item === null || Array.isArray(item)) {
-      return { error: `projects[${i}] 期望对象（发版快照项 = {repoId, ref}）` };
+      return { error: `projects[${i}] 期望对象（发版快照项 = {projectId, version, repoId, ref}）` };
     }
     const entry = item as Record<string, unknown>;
-    for (const key of ["repoId", "ref"] as const) {
+    for (const key of ["repoId", "ref", "projectId", "version"] as const) {
       const value = entry[key];
       if (value !== undefined && value !== null && typeof value !== "string") {
         return { error: `projects[${i}].${key} 期望 string | null（收到 ${String(value)}）` };
       }
     }
-    projects.push({
+    const project: ReleaseSnapshotProject = {
       repoId: (entry["repoId"] ?? null) as string | null,
       ref: (entry["ref"] ?? null) as string | null,
-    });
+    };
+    if (entry["projectId"] !== undefined) {
+      project.projectId = (entry["projectId"] ?? null) as string | null;
+    }
+    if (entry["version"] !== undefined) {
+      project.version = (entry["version"] ?? null) as string | null;
+    }
+    projects.push(project);
   }
   return { projects };
 }
@@ -133,7 +145,8 @@ function gateStatus(code: string): number {
  *    §2.1(7)；重复标记的幂等交本口 + store 处理，与 O4 doc「本闸不再判」同口径）；
  * 4. 未 `released` ⇒ 过发版闸（O4 `evaluateReleaseGate`，含收口判据与全 `cancelled` 挡闸）；
  * 5. `projects` 形状校验 ⇒ 否则 400 {@link ERR_RELEASE_PROJECTS}；
- * 6. 进 store 事务：`UPDATE versions.status` + `INSERT releases` + `version.released` 事件同事务。
+ * 6. 进 store 事务：`UPDATE versions.status` + `INSERT releases` + **级联 UPDATE 被触达的
+ *    `project_versions.status`**（C-4，本层不另立第二份级联逻辑）+ `version.released` 事件同事务。
  *
  * **不可变**由 store 侧保证（快照已存在 ⇒ 不覆写任何一列，本次入参被忽略、回读既有快照），
  * 本层不重复判（判据只落一处）。

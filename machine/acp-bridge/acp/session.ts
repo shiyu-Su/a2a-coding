@@ -315,7 +315,7 @@ export interface AcpInjectionConfig {
 
 export interface AcpSessionRunnerOptions {
   client: AcpRequestClient;
-  /** ACP 会话工作目录（项目 workspace） */
+  /** ACP 会话工作目录 = 项目 workspace（**代码根**） */
   cwd: string;
   /** contextId ↔ sessionId 映射（缺省不持久化，每次 `session/new`） */
   sessions?: SessionMap;

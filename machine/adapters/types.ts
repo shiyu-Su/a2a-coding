@@ -16,7 +16,7 @@ import type { AgentKind, RiskLevel } from "../types.js";
 export interface LaunchRequest {
   /** 项目标识（桥的 `--project-id`） */
   projectId: string;
-  /** 项目 workspace（Agent 执行目录，桥的 `--workspace`） */
+  /** 项目 workspace = **代码根**（Agent 执行 / 会话目录，桥的 `--workspace`；可为仓内子目录或自成一仓） */
   workspace: string;
   /** 该项目的 A2A Server 监听端口（桥的 `--port`） */
   a2aPort: number;

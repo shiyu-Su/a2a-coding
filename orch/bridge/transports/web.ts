@@ -25,6 +25,7 @@
  * | `/api/groups` | `loadMachinesConfig(configPath).groups`（每请求现读） | **全组枚举**（v0.9.4 O2）：组结构声明面（`projectGroup` 段），与 `/api/projects`（运行态）语义不同，刻意不合并；配置坏 → 500 `machines_config_error` |
  * | `/api/registry/projects` | `store.listRunners` + `store.listRunnerProjects`（每请求现读，直连） | **注册表全量投影**（REQ-2026-10-03-02）：`runners` 表遍历源，含离线机与其项目，**未经组过滤、无组语义**；与 `/api/projects` 两条读路刻意不交叉复用（C-6） |
  * | `/api/features-by-version?owner_group=&version=` | `store.aggregateFeaturesByVersion(owner_group)`（v0.10.0 O3，直连） | **版本名下卡聚合读面**：`features` 按版号派生「卡清单 + 三桶计数 `{total,completed,cancelled,open}`」，**未登记版号单列一桶不静默丢**；可见性经 `owner_group` 与 `listFeatures` 同源；`version` 给定 ⇒ 收窄到该桶。供板 §2.3「卡派生版号」并集；**非版本台账**（三态归 `/api/versions`），**不做闸判定**（归 O4） |
+ * | `/api/project-versions?owner_group=&project_id=` | `projectVersionsView(owner_group)`（v0.10.1 O6，直连） | **project 级版本只读投影**：`projectVersions[]` 与 8787 的 `GET /api/versions` 顶层键、`GET /api/project-versions` **同一实现**（形状单点 ⇒ 三处不漂移）；`releasable` 判据现算、**仅展示不构成发版口**；**只读**（写意图仍走 8787，本面非 GET ⇒ 405） |
  *
  * ## 硬约束：读事件**绝不移动宿主收件箱游标**
  *
@@ -95,6 +96,8 @@ import { getWarnedConfigTexts, loadMachinesConfig, memberKey } from "../../confi
 import { bridgeLog } from "../bridge-log.js";
 import { handleFeatureTrace } from "../feature-tools.js";
 import type { FeatureTaskSummary } from "../feature-tools.js";
+import { projectVersionsView } from "../versions-endpoints.js";
+import type { ProjectVersionViewEntry } from "../versions-endpoints.js";
 import type { BridgeCore } from "../index.js";
 import { isLoopbackHostOrAddress } from "./http.js";
 
@@ -129,6 +132,12 @@ const REGISTRY_PROJECTS_NOTE =
 const FEATURES_BY_VERSION_SOURCE = "features 表按版号聚合（v0.10.0 O3，零新实体；非版本台账）";
 const FEATURES_BY_VERSION_NOTE =
   "派生面语义：版号 → 名下需求卡清单 + 三桶计数 {total, completed, cancelled, open}；未登记版号（version 为 NULL/空串）单列一桶、不静默丢；可见性 = owner_group 过滤（与 listFeatures 同源）。本面是 features 派生投影，非引擎版本台账（三态 status 见 /api/versions）；闸判定归 O4，本面只出计数";
+
+const PROJECT_VERSIONS_SOURCE =
+  "引擎 project 台账 project_versions 表（每请求现读，直连；本面为读投影，非事实源）" +
+  " + releasable 判据现算（归属表 feature_projects 派生）";
+const PROJECT_VERSIONS_NOTE =
+  "同源口径：projectVersions[] 的单条形状 = 8787 GET /api/versions 顶层 projectVersions[] 与 8787 GET /api/project-versions 的同一实现（projectVersionsView ⇒ 形状单点，三处不漂移）；releasable 是展示字段、不构成发版口（project 侧无独立发版动作）。本面只读：写意图一律走 8787，此处非 GET ⇒ 405";
 
 /** 网页端最小内核依赖（`Pick<BridgeCore, …>`：N4 直接传完整 core，结构性兼容） */
 export type WebCore = Pick<BridgeCore, "projects" | "tasks" | "featureStatus">;
@@ -307,7 +316,7 @@ export async function startWebTransport(
     bridgeLog.error("a2a-bridge", `网页接面错误：${toMessage(err)}`);
   });
   bridgeLog.info("a2a-bridge", `只读网页接面已监听 http://${host}:${boundPort}/`, {
-    api: "/api/projects, /api/features, /api/features-by-version, /api/tasks, /api/events, /api/groups, /api/registry/projects",
+    api: "/api/projects, /api/features, /api/features-by-version, /api/project-versions, /api/tasks, /api/events, /api/groups, /api/registry/projects",
     refreshMs: resolveRefreshMs(options.refreshMs),
   });
 
@@ -391,7 +400,8 @@ type WebRoute =
   | { kind: "events" }
   | { kind: "groups" }
   | { kind: "registryProjects" }
-  | { kind: "featuresByVersion" };
+  | { kind: "featuresByVersion" }
+  | { kind: "projectVersions" };
 
 const FEATURES_PREFIX = "/api/features/";
 const TRACE_SUFFIX = "/trace";
@@ -404,11 +414,20 @@ const REGISTRY_PROJECTS_PATH = "/api/registry/projects";
  * 也与引擎版本台账 `/api/versions`（O2）语义分开 —— 本面是 `features` 派生投影，非台账。
  */
 const FEATURES_BY_VERSION_PATH = "/api/features-by-version";
+/**
+ * project 级版本只读投影路径（v0.10.1 O6）。
+ * **路径名与 8787 的 `PROJECT_VERSIONS_COLLECTION_PATH` 逐字同值**（`/api/project-versions`）——
+ * 3300 只读镜像与 8787 读写面是两个端口上的两个入口，同名不同实例，刻意不复用那个常量符号
+ * （引它会把 8787 的**写端点类**拖进只读接面的依赖面）。同源保证的是**出参形状**
+ * （共用 `projectVersionsView`），不是路由对象。
+ */
+const PROJECT_VERSIONS_PATH = "/api/project-versions";
 
 function matchRoute(path: string): WebRoute | null {
   if (path === "/api/projects") return { kind: "projects" };
   if (path === "/api/features") return { kind: "features", featureId: null };
   if (path === FEATURES_BY_VERSION_PATH) return { kind: "featuresByVersion" };
+  if (path === PROJECT_VERSIONS_PATH) return { kind: "projectVersions" };
   if (path.startsWith(FEATURES_PREFIX)) {
     const raw = path.slice(FEATURES_PREFIX.length);
     if (raw.length > 0 && !raw.includes("/")) return { kind: "features", featureId: raw };
@@ -507,6 +526,9 @@ async function handleRequest(
       return;
     case "featuresByVersion":
       sendFeaturesByVersion(res, url);
+      return;
+    case "projectVersions":
+      sendProjectVersions(res, url);
       return;
   }
 }
@@ -954,6 +976,65 @@ function sendFeaturesByVersion(res: ServerResponse, url: URL): void {
       buckets: buckets.length,
       features: buckets.reduce((sum, b) => sum + b.counts.total, 0),
     },
+  });
+}
+
+/**
+ * `GET /api/project-versions?owner_group=&project_id=`：**project 级版本只读投影**（v0.10.1 O6，
+ * 改造文档 §3 orch 段「3300 project 只读投影」）。
+ *
+ * 存在理由：project 档台账的读面此前只在 **8787**（可写侧）上有两处
+ * （`GET /api/versions` 顶层 `projectVersions[]` 与 `GET /api/project-versions`）—— 运维侧经
+ * **3300** 看版本面时拿不到 project 档。本口把该投影镜像到只读接面，供运维与后续消费方使用。
+ *
+ * - **同源 = 同一实现，不是同一份形状**：出参数组直接透出 {@link projectVersionsView}
+ *   （`bridge/versions-endpoints.ts`，即 8787 两处 `projectVersions[]` 的**唯一**生产者），
+ *   本层**不重挑字段、不重算 `releasable`、不另存一份形状** ⇒ 「三处逐字段一致」由构造保证，
+ *   不依赖纪律（照 `sendFeaturesByVersion` 直接透出 store 聚合面形状的同一理由）。
+ * - **过滤语义照 8787 同档**：`owner_group` 缺省 / 空串 ⇒ **全表**、给定组名 ⇒ 仅本组
+ *   （NULL-safe 比较，匿名档不被染色）；`project_id` 为**可选收窄**（给定 ⇒ 精确匹配、
+ *   不 trim / 不大小写折叠，与 8787 `readFieldSource` 逐字同口径）。
+ * - **无身份参数**：3300 = 运维全量视图、非身份面（§2.7 纪律，照 `sendGroups` /
+ *   `sendRegistryProjects`）；可见性收窄只认显式 `?owner_group=`。
+ * - **只读、零副作用**：`projectVersionsView` 纯读（`project_versions` 表 + 归属表计数现算），
+ *   不建版、不改态、不写事件；写意图只存在于 8787（本口非 GET ⇒ `handleRequest` 统一 405）。
+ * - **project 侧 `releasable` 是展示字段、不构成发版口**（C-4）：本面不判闸、不级联，
+ *   也不因 `releasable=false` 而拒绝出参。
+ * - 读失败 ⇒ 500 `project_version_read_error`（**不 fail-open 成空清单**，与
+ *   `version_aggregate_error` / `registry_read_error` 同口径）。本口**本身就是** project 档，
+ *   故不适用 8787 Group 面的「两档分立、缺键降级」处理（那只适用于合并出参的 `versions[]`）。
+ */
+function sendProjectVersions(res: ServerResponse, url: URL): void {
+  // 观测时刻：内存态（不落库）；先取时刻再取数据 = 「本次观测的时刻」
+  const observedAt = new Date().toISOString();
+  const ownerRaw = url.searchParams.get("owner_group");
+  const ownerGroup = ownerRaw === null || ownerRaw.length === 0 ? undefined : ownerRaw;
+  const projectIdRaw = url.searchParams.get("project_id");
+  const projectId = projectIdRaw === null || projectIdRaw.length === 0 ? undefined : projectIdRaw;
+
+  let entries: ProjectVersionViewEntry[];
+  try {
+    entries = projectVersionsView(ownerGroup);
+  } catch (err) {
+    respondJson(res, 500, {
+      ...failure("project_version_read_error", `project 台账读失败：${toMessage(err)}`),
+      source: PROJECT_VERSIONS_SOURCE,
+      observedAt,
+    });
+    return;
+  }
+
+  const rows =
+    projectId === undefined ? entries : entries.filter((e) => e.project_id === projectId);
+  respondJson(res, 200, {
+    ok: true,
+    source: PROJECT_VERSIONS_SOURCE,
+    observedAt,
+    note: PROJECT_VERSIONS_NOTE,
+    ownerGroup: ownerGroup ?? null,
+    projectId: projectId ?? null,
+    count: rows.length,
+    projectVersions: rows,
   });
 }
 

@@ -608,3 +608,146 @@ test("createBridgeClient.getRegistryProjects: 桥响应无 machines[] ⇒ reject
     (err) => err instanceof BridgeResponseError && err.code === "response_invalid",
   );
 });
+
+// ---------------------------------------------------------------------------
+// v0.10.1 C2（REQ-2026-10-09-01）—— Group 面跨三档不变式（负向钉）
+//
+// 口径（改造文档 §2 C-7 硬约束 / C-18⑥ / §4 实现级 board）：
+// **`projectVersions` 在场 / 缺位都不改 Group `entries`（同序同状态）；`kind` 只由 `versions[]` 决定。**
+// 与 B1 的分工：B1 逐档钉 project 档**自身**的三态与形状（`v0101-engine-project-versions-parse`）；
+// 本节只钉**Group 面对 project 面不变**（基线 × 五变体的恒等式 + Group 条目键闭集），二者不重叠。
+// 本节专用导入（不动上面既有 import 清单 ⇒ 既有期望零改动）。
+// ---------------------------------------------------------------------------
+
+import { parseEngineVersions } from "../dist/bridge-client.js";
+
+const C2_CAPTURED_AT = "2026-10-09T00:00:00.000Z";
+
+/** 「不带 `projectVersions` 键」档（= 老引擎信封；`undefined` 值会造出键，须与缺位区分）。 */
+const C2_NO_KEY = Symbol("no projectVersions key");
+
+/** Group 面基线行：登记序（非版号序）+ 同名跨 org + 缺 status 键（⇒ null）三种形状都在内。 */
+const C2_GROUP_ROWS = [
+  { owner_group: "alpha", version: "0.10.1", status: "active" },
+  { owner_group: "alpha", version: "0.9.0", status: "released" },
+  { owner_group: "beta", version: "0.10.1" },
+];
+
+/** project 面 live 行：刻意与 Group 同名（`alpha` / `0.10.1`）并带两级计数，作为染色 / 相加的探针。 */
+const C2_PROJECT_LIVE_ROWS = [
+  {
+    owner_group: "alpha",
+    project_id: "board",
+    version: "0.10.1",
+    status: "released",
+    releasable: true,
+    open_count: 0,
+    completed_count: 7,
+    cancelled_count: 3,
+    repo_id: "repo-1",
+    ref: "abc123",
+  },
+  { owner_group: "beta", project_id: "orch", version: "9.9.9", status: "open", open_count: 4 },
+];
+
+/** project 面五变体（缺位 / 在场无行 / 在场有行 / 形状不合法 / 在场全非法条目）。 */
+const C2_PROJECT_VARIANTS = [
+  ["缺位（不带 projectVersions 键）", C2_NO_KEY],
+  ["空数组（在场无行 = 合法事实）", []],
+  ["live 带行（同名版号 + 两级计数）", C2_PROJECT_LIVE_ROWS],
+  ["非数组（形状不合法）", { project_id: "board", version: "0.10.1" }],
+  ["全非法条目（缺 project_id / 缺 version / 非对象）", [{}, { version: "9.9.9" }, null, "junk"]],
+];
+
+/** 把 project 面变体并入信封（`C2_NO_KEY` ⇒ 原样返回，绝不造出该键）。 */
+function c2Envelope(body, projectVariant) {
+  return projectVariant === C2_NO_KEY ? body : { ...body, projectVersions: projectVariant };
+}
+
+/**
+ * Group 面的可比快照 = 三档各自的 Group 侧凭据（`kind` / 根因码 / `entries`），**project 档一律剔除**。
+ * absent 档不带 entries ⇒ 收 `null`（「读不到」与「读到 ∧ 零条目」在两档上本就不可混）。
+ */
+function c2GroupFace(json) {
+  const outcome = parseEngineVersions(json, C2_CAPTURED_AT);
+  if (outcome.kind !== "projection") return { kind: outcome.kind, code: outcome.code, entries: null };
+  return { kind: outcome.kind, code: null, entries: outcome.projection.entries };
+}
+
+test("C2-① Group 投影档：projectVersions 五形态下 Group 面与基线逐字段恒等（同序同状态，登记序不被改写）", () => {
+  const baseline = c2GroupFace({ ok: true, versions: C2_GROUP_ROWS });
+  assert.equal(baseline.kind, "projection", "基线本身必须是投影档（否则下面的恒等式空转）");
+  assert.deepEqual(
+    baseline.entries,
+    [
+      { org: "alpha", version: "0.10.1", status: "active" },
+      { org: "alpha", version: "0.9.0", status: "released" },
+      { org: "beta", version: "0.10.1", status: null },
+    ],
+    "同序（登记序）+ 同状态（含缺 status 键 ⇒ null，不猜 notstart）",
+  );
+  for (const [label, variant] of C2_PROJECT_VARIANTS) {
+    assert.deepEqual(
+      c2GroupFace(c2Envelope({ ok: true, versions: C2_GROUP_ROWS }, variant)),
+      baseline,
+      `${label} ⇒ Group 面（kind / 根因码 / entries）必须与「无 project 面」的基线逐字段相同`,
+    );
+  }
+  // 正对照（防恒等式空转）：本快照对 Group 面自身是敏感的 ⇒ 上面五次的「相等」才说明 project 面确实没牵动它
+  assert.notDeepEqual(c2GroupFace({ ok: true, versions: [C2_GROUP_ROWS[0]] }), baseline, "改 versions[] 必须改快照（只留一行 ⇒ 不再相等）");
+});
+
+test("C2-② kind 只由 versions[] 决定：Group 三档 × project 面形态 ⇒ 档位与根因码序列恒定", () => {
+  const tiers = [
+    ["档1 versions[] 是数组", { ok: true, versions: C2_GROUP_ROWS }, ["projection", null]],
+    ["档2 ok:true ∧ 无 versions[]（老桥）", { ok: true }, ["absent", "versions_field_missing"]],
+    ["档3 ok:false（引擎如实报错）", { ok: false, code: "boom", error: "引擎报错" }, ["absent", "boom"]],
+  ];
+  for (const [label, body, expected] of tiers) {
+    const faces = C2_PROJECT_VARIANTS.map(([, variant]) => {
+      const face = c2GroupFace(c2Envelope(body, variant));
+      return [face.kind, face.code];
+    });
+    assert.deepEqual(
+      faces.map(() => expected),
+      faces,
+      `${label}：五形态的 kind + 根因码必须全等于 Group 面自身判出的档位（project 面不得改判）`,
+    );
+  }
+  // 非对象信封（档4）：带 project 面的「伪信封」同样走 absent —— project 面不得把它升成对象档判定
+  assert.equal(parseEngineVersions("junk", C2_CAPTURED_AT).kind, "absent");
+  assert.deepEqual(c2GroupFace(c2Envelope({ projectVersions: C2_PROJECT_LIVE_ROWS }, C2_NO_KEY)), {
+    kind: "absent",
+    code: "unknown",
+    entries: null,
+  }, "信封无 ok:true ∧ 只带 projectVersions ⇒ 仍 absent（project 面在场不解锁投影档）");
+});
+
+test("C2-③ Group 条目键集恒三枚（project 维度与两级计数不挂上 Group 行）；capturedAt 原样透传", () => {
+  const outcome = parseEngineVersions(c2Envelope({ ok: true, versions: C2_GROUP_ROWS }, C2_PROJECT_LIVE_ROWS), C2_CAPTURED_AT);
+  assert.equal(outcome.kind, "projection");
+  assert.equal(outcome.projection.capturedAt, C2_CAPTURED_AT, "捕获时刻由入参给，project 面不改写");
+  for (const entry of outcome.projection.entries) {
+    assert.deepEqual(
+      Object.keys(entry).sort(),
+      ["org", "status", "version"],
+      "Group 条目不带 projectId / releasable / 任何计数字段（两级计数不得进同一张表 · 解析层侧）",
+    );
+  }
+  assert.equal(
+    outcome.projection.entries.some((e) => e.version === "9.9.9"),
+    false,
+    "project 独有版号不得成为 Group 条目",
+  );
+  assert.equal(
+    outcome.projection.entries.filter((e) => e.status === "released").length,
+    1,
+    "Group 侧 released 计数只由 Group 行派生（project 行那条 released 不并入 ⇒ 不染色、不计数）",
+  );
+});
+
+test("C2-④ Group 零版本是合法事实：versions[] 空数组 ∧ project live ⇒ 投影档 + 空 entries（project 行不得替 Group 填条目）", () => {
+  const withLive = c2GroupFace(c2Envelope({ ok: true, versions: [] }, C2_PROJECT_LIVE_ROWS));
+  assert.deepEqual(withLive, { kind: "projection", code: null, entries: [] }, "Group 空面 ≠ 缺位，也不得被 project 行填满");
+  assert.deepEqual(c2GroupFace(c2Envelope({ ok: true, versions: [] }, C2_NO_KEY)), withLive, "与「无 project 面」的零版本档恒等");
+});

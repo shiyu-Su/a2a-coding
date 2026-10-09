@@ -129,7 +129,9 @@ import {
   type EngineVersionsFetcher,
   type EngineVersionsProjection,
   type FeatureListItem,
+  type ProjectVersionsField,
   type ProjectsView,
+  projectVersionsOf,
 } from "./bridge-client.js";
 import { dispositionHttpStatus, terminalTurnRejection, diagnoseOrgsDir, ORGS_DIR_NOT_CONFIGURED, ORG_DISABLED, type BoardHostFace, type TriggerTurnOutcome } from "./host-face.js";
 import {
@@ -294,6 +296,7 @@ import {
   renderOrgSpaceManagePage,
   renderProjects,
   renderDocPage,
+  renderProjectVersionsBlock,
   renderSchedule,
   renderTasks,
   renderTasksPick,
@@ -745,10 +748,20 @@ function orgsStatusOf(host: BoardHostFace | null): OrgsDirStatus {
 
 // ---------------------------------------------------------------------------
 // v0.10.0 B4：已发版锁的引擎读投影（事实源 = 引擎版本台账，板只投影）
+// v0.10.1 B2：同一份投影按**两档分立**消费 —— Group 档（本区：版本列 / 排期锁 / 门户摘要 /
+// 启动日志）语义零变化；project 档（{@link projectVersionTierOf}）只在 project 区块出降级条，
+// **绝不进排期写门**（并档 = 引擎 project 出口上线前整板排期写停摆）。
 // ---------------------------------------------------------------------------
 
 /** 引擎台账投影读不到时的**写口**错误码（fail-closed：挡排期写，不回落本地台账）。 */
 const VERSION_PROJECTION_UNAVAILABLE_CODE = "board_version_projection_unavailable";
+
+/**
+ * v0.10.1 B2：Group 投影**本进程从未读到过**时，project 档降级条的根因码。
+ * 与解析层的 `project_versions_field_missing`（= 引擎 project 面未上线）**分档**：
+ * 前者是「整面读不到」、后者是「混跑期老引擎不带该字段」，两种显示不得混一。
+ */
+const PROJECT_GROUP_READ_NEVER_CODE = "project_versions_group_projection_unreadable";
 
 /** 投影不可达时的统一文案（写口 503 与读面降级提示同源，不各写一套）。 */
 function versionProjectionUnreadableText(reason: string): string {
@@ -816,6 +829,41 @@ async function versionProjectionOf(ctx: Ctx): Promise<EngineVersionsProjection |
 }
 
 /**
+ * **project 档**的取数单点（v0.10.1 B2 · T2；改造文档 §2 C-7 / C-12「投影消费两档分立」）。
+ * 入参 = {@link versionProjectionOf} 的结果 ⇒ 与 Group 面**共用同一次上游读取**
+ * （project 面**没有独立 fetcher**，一次渲染仍只打一次 `/api/versions`、在途共用；
+ * 也不接 `?owner_group=` ⇒ 板照旧全表拉、org 切片留板侧单点，两者都不在本函数）。
+ *
+ * 三档语义（**逐档都不牵动排期写门**，project 面无本地读缓存）：
+ * - 投影在场 ∧ 带合法 `projectVersions[]` ⇒ `live`；
+ * - 投影在场 ∧ 字段在场零条目 ⇒ `empty`（**合法事实**，非降级）；
+ * - 投影在场 ∧ 字段缺位 / 形状不合法 ⇒ `absent`（老引擎档，经 {@link projectVersionsOf} 归一，
+ *   **绝不当成「零条目」的 `empty`**）；
+ * - 投影为 `null`（本进程从未读到过）⇒ 合成 `absent` 带根因码 ⇒ **只有 project 区块出降级条**，
+ *   Group 面（版本列 / 已发版锁 / 门户摘要 / 启动日志）与排期写门各按**自己的档**处理、不受牵连。
+ */
+export function projectVersionTierOf(projection: EngineVersionsProjection | null): ProjectVersionsField {
+  if (projection !== null) return projectVersionsOf(projection);
+  return {
+    status: "absent",
+    code: PROJECT_GROUP_READ_NEVER_CODE,
+    error: "本进程从未读到引擎版本台账投影 ⇒ project 档无从判定（Group 面按各自档降级，project 面单列降级条）",
+  };
+}
+
+/**
+ * project 档**三态显示闭集**里「读不到」那一档的降级条正文单点（v0.10.1 B2 · C-7：
+ * 在场有行 / 在场无行 / 读不到）：`live` 与 `empty` ⇒ `null`（**无降级条** —— `empty` 是
+ * **合法事实**「未登记，本版本起生效」，由 project 区块自己渲文案，不是降级），
+ * `absent` ⇒ 一行含**根因码**的提示。T3 的 project 区块只准经本函数取降级文案（不各写一套）。
+ */
+export function projectVersionDegradationText(field: ProjectVersionsField): string | null {
+  if (field.status !== "absent") return null;
+  return `引擎 project 版本面降级（${field.code} · ${field.error}）—— 仅本区块不可读，` +
+    "**不影响 Group 面**（版本列 / 已发版锁 / 门户摘要照常），也不挡排期写";
+}
+
+/**
  * 门户「版本摘要行」的喂入台账（v0.10.0 尾段 N2 · 摘要换源）：
  * 事实源 = **引擎版本台账投影**（含三态 ⇒ 台账登记的「进行中」不退化成卡派生 `*`）；
  * **只在从未读到过投影时**（{@link versionProjectionOf} 返 `null`）退板本地台账**读缓存** ——
@@ -827,7 +875,12 @@ async function portalSummaryLedgerOf(ctx: Ctx): Promise<VersionsLedger> {
   return projection === null ? ctx.versionsLedger.load().ledger : projectionLedgerOf(projection);
 }
 
-/** 写口的 fail-closed 出口：拿不到投影 ⇒ 结构化 503 拒写（零出网，不触引擎写口）。 */
+/**
+ * 写口的 fail-closed 出口：拿不到投影 ⇒ 结构化 503 拒写（零出网，不触引擎写口）。
+ * **本出口只由 Group 档（`versions[]`）触发**（v0.10.1 B2 · C-12）：project 档缺位 / 形状不合法
+ * 只在 project 区块出降级条（见 {@link projectVersionTierOf} / {@link projectVersionDegradationText}），**不得**并进来 —— 否则引擎
+ * project 出口上线前排期写会被全部挡死（自造停摆）。
+ */
 function respondVersionProjectionClosed(
   res: ServerResponse,
   ctx: Ctx,
@@ -874,6 +927,15 @@ function respondVersionProjectionClosed(
  * org 字段、org 只从路径取，见 {@link handleWriteVersions}），挂在那儿只会把新版本写进**未归属空串桶**
  * ⇒ 门户与各空间页都读不到 = 静默黑洞。故入口随本节点整体迁进空间排期页（全局页头按钮同批撤除；
  * `POST /versions` 全局路由与写闸**零改动**留作纯 HTTP 兜底口，口径同 §9.2「UI 撤、写口留」）。
+ * **project 版本区块接线（v0.10.1 B4 · C-18①）**：区块由 {@link renderProjectVersionsBlock} 渲染，
+ * **串在 {@link renderSchedule} 的整段返回之后** ⇒ 容器恒在 `#schedule-board` 之外（同级 section）。
+ * 落点必须是这里而非看板内部：`DRAG_SCHEDULE_SCRIPT` 的入口守卫只认 `getElementById("schedule-board")`，
+ * 区块若嵌进看板会被既有拖拽脚本当成看板的一部分、在新块上误触发拖拽 POST。**本函数不动 `#schedule-board`
+ * 内部结构、不改排期列渲染逻辑**（`renderSchedule` 签名与列序归渲染侧的口径零改动）。
+ * project 档取数**共用上面同一次 Group 投影**（{@link projectVersionTierOf} 是纯函数，零新增上游读取），
+ * org 切片沿用同一 `org`（`spaceOrg === null` ⇒ `undefined` = 不限组织），降级文案单点
+ * {@link projectVersionDegradationText} —— project 档 `absent` **只出本区块降级条**，
+ * 不牵连版本列 / 已发版锁 / 排期写门（C-12 两档分立）。
  */
 async function renderScheduleBoard(
   ctx: Ctx,
@@ -890,8 +952,12 @@ async function renderScheduleBoard(
   // （降级档，正常档空数组）。并集（∪ 卡派生版号）在视图侧完成，此处不预裁。
   const engineColumnVersions = projectionVersionNames(projection, org);
   const ledgerColumnVersions = projection === null ? ledgerVersionNames(ledger, org) : [];
+  // v0.10.1 B4：project 档与上面 Group 面**共用这份投影**（不另打上游），三态显示归视图单点。
+  const projectVersions = projectVersionTierOf(projection);
   return (
     renderSchedule(groupFeaturesByVersion(features, ledgerColumnVersions, engineColumnVersions), selectRequirementPool(features), lockedVersions, ledger, org) +
+    // v0.10.1 B4（C-18①）：project 版本区块 = `#schedule-board` 的**同级 section**，串在看板整段之后
+    renderProjectVersionsBlock(projectVersions, org, projectVersionDegradationText(projectVersions)) +
     // 提需求弹窗骨架（表单原样复用；orgsDir 三档提示与锁版警示随表单呈现）
     renderNewRequirementDialog(ctx.write.defaultGroup, orgsStatusOf(ctx.host), lockedVersions, spaceOrg) +
     (spaceOrg !== null ? renderNewVersionDialog(spaceOrg) : "")
@@ -2015,6 +2081,8 @@ function detailSpaceOrg(ctx: Ctx, routeOrg: string | null | undefined, ownerGrou
  * **建版本入口归本页（v0.9.6 B4 · 口径 4 / 24）**：页头「＋ 新版本」按钮 + {@link renderNewVersionDialog}
  * 骨架同批在位（骨架由 {@link renderScheduleBoard} 在 `spaceOrg !== null` 档渲染）——台账按
  * `(org, version)` 成域后，本页是**全站唯一**的登记新版本入口（全局 `/schedule` 那份已随 B5a 整页退役）。
+ * **v0.10.1 B4**：「各 project 版本」区块随本页出（喂入点在 {@link renderScheduleBoard}，
+ * 容器在 `#schedule-board` **之外**）—— 本页不另拼区块 HTML、不新增脚本（内联脚本闭集仍七元）。
  */
 async function pageOrgSpaceSchedule(ctx: Ctx, org: string, all: readonly FeatureListItem[], orgNav: PageOrgNav): Promise<Page> {
   const features = featuresOfOrg(all, org);

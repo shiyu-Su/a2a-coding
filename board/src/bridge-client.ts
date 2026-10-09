@@ -291,6 +291,8 @@ export interface TaskStateView {
 /**
  * 引擎版本台账投影的一行（v0.10.0 B4 · 改造文档 §2.1(2) / §2.3(1)）—— 只投影**锁与列并集需要的
  * 键**（`ownerGroup / version / status`），其余列（`date / note / createdAt / updatedAt`）本版不消费。
+ * **本接口是 Group 档（`versions[]`）的成员类型：v0.10.1 硬约束 —— 成员与语义零改动，
+ * project 档不得混入本接口**（负向钉见 `test/v0101-engine-project-versions-parse.test.mjs`）。
  */
 export interface EngineVersionEntry {
   /** 归属组织（引擎 `owner_group`；`null` / 缺键 ⇒ 未归属桶 = 板台账的 `""` 同构语义）。 */
@@ -306,11 +308,61 @@ export interface EngineVersionEntry {
 /**
  * 引擎版本台账投影（**已发版锁的唯一数据源**）。
  * `capturedAt` = 本次成功读取的时刻（板进程内保留「最后一次投影」时用于如实标注新鲜度）。
+ *
+ * `projectVersions`（v0.10.1 B1 · C-7）= project 档的**独立缺位承载**：Group 面投影成立时，
+ * project 面仍可能「未上线」（顶层字段缺位 / 形状不合法）⇒ 两档分立，互不牵连（C-12）。
  */
 export interface EngineVersionsProjection {
   entries: EngineVersionEntry[];
   capturedAt: string;
+  /**
+   * project 档三态（见 {@link ProjectVersionsField}）；**缺位 ≠ 空数组**，两种显示必须可区分。
+   * 解析结果恒带本字段；**夹具的老引擎档 / 历史最后一次投影可能不带** ⇒ 消费侧经
+   * {@link projectVersionsOf} 归一读取（`undefined` ⇒ `absent`，不得当作 empty）。
+   */
+  projectVersions: ProjectVersionsField;
 }
+
+/**
+ * project 级版本台账的一行（v0.10.1 B1 · C-7 最小键集）。
+ * 值域不归一、不校验；**缺键 ⇒ `null` ⇒ 显示 `—`、不猜**（`releasable` 缺位是「引擎闸未上线」
+ * 的过渡档，**不得渲染成「不可发版」**）。
+ */
+export interface EngineProjectVersionEntry {
+  /** 归属组织（引擎 `owner_group`）；缺键 ⇒ 未归属桶 `""`（口径同 {@link EngineVersionEntry.org}）。 */
+  org: string;
+  /** 归属 project（引擎 `project_id`）；缺失 / 空白的条目在解析层整条丢弃。 */
+  projectId: string;
+  /** Project Version；缺失 / 空白的条目在解析层整条丢弃。 */
+  version: string;
+  /** 值域归引擎（`open / released` 等）；非字符串 ⇒ `null`，板不回落、不猜。 */
+  status: string | null;
+  /** 展示字段（C-4 级联档：project 收口判据降为展示，**不是发版口**）；缺键 ⇒ `null` ⇒ `—`。 */
+  releasable: boolean | null;
+  /** 以下计数为引擎自报展示值；缺键 / 非数字 ⇒ `null` ⇒ `—`，板不重算、不与 Group 计数互校（C-18⑥）。 */
+  openCount: number | null;
+  completedCount: number | null;
+  cancelledCount: number | null;
+  /** 不可发版原因（展示用）；缺键 ⇒ `null`。 */
+  reason: string | null;
+  /** 仓库标识（展示用）；缺键 ⇒ `null` ⇒ `—`。 */
+  repoId: string | null;
+  /** 交付引用（展示用）；缺键 ⇒ `null` ⇒ `—`。 */
+  ref: string | null;
+}
+
+/**
+ * project 档的三态（**两档分立**判据的载体，C-7 / C-12）：
+ * - `live` ⇒ 顶层 `projectVersions[]` 在场且**至少一条合法条目**；
+ * - `empty` ⇒ 字段在场但**零合法条目** —— 这是**合法事实**（「未登记，本版本起生效」档），
+ *   与 `absent`（面未上线）**两种显示必须可区分**；
+ * - `absent` ⇒ 顶层字段**缺位 / 非数组** ⇒ project 面单独降级（文案「引擎 project 版本面未上线」），
+ *   **Group 面（版本列 / 锁 / 门户摘要）一切照常**，不牵连排期写门（project 降级**不进** fail-closed）。
+ */
+export type ProjectVersionsField =
+  | { status: "live"; entries: EngineProjectVersionEntry[] }
+  | { status: "empty" }
+  | { status: "absent"; code: string; error: string };
 
 /**
  * `GET /api/versions` 的两种「读到了」的结果（v0.10.0 B4）：
@@ -319,6 +371,11 @@ export interface EngineVersionsProjection {
  *   「拿不到台账投影」处理（**fail-closed 挡排期写**），绝不当成「零个已发版」放行。
  * 二者都不抛：传输层失败 / 非 2xx / 坏 JSON 一律收口为 outcome（宕机不阻断页面渲染，口径同
  * `orgs-view.createOrgGroupsFetcher`）。
+ *
+ * **v0.10.1 B1 两档分立（C-12）**：`kind:"absent"` **只由 Group 面（`versions[]`）决定** ——
+ * project 面的缺位**不新增 kind**，落在 projection 内的 `projectVersions` 独立档上（见
+ * {@link ProjectVersionsField}）。`versions[]` 在场 ∧ `projectVersions[]` 缺位 ⇒ Group 面
+ * **一切照常**（版本列 / 锁 / 门户摘要），仅 project 面降级，**绝不外溢成排期写停摆**。
  */
 export type EngineVersionsOutcome =
   | { kind: "projection"; projection: EngineVersionsProjection }
@@ -682,7 +739,7 @@ export function parseTaskState(json: unknown): TaskStateView {
 }
 
 /**
- * `GET /api/versions` → 引擎版本台账投影（**纯函数**，v0.10.0 B4）。
+ * `GET /api/versions` → 引擎版本台账投影（**纯函数**，v0.10.0 B4；v0.10.1 B1 扩 project 档）。
  *
  * 判定分三档，**只有第一档算「拿到投影」**：
  * 1. 信封 `ok:true` ∧ `versions[]` 是数组 ⇒ 投影（**零条目是合法事实**，不是缺位）；
@@ -692,6 +749,12 @@ export function parseTaskState(json: unknown): TaskStateView {
  * 逐条容错：`version` 缺失 / 空白 ⇒ 丢该条（无版号无从谈锁）；`owner_group` 与 `ownerGroup`
  * 两式键都认（查询参数用 snake_case、写面 body 用 camelCase，读侧不赌单一形态）；缺键 ⇒ 未归属桶
  * `""`；`status` 原样透传（见 {@link EngineVersionEntry.status}）。
+ *
+ * **两档分立（v0.10.1 B1 · C-12）**：上面三档**只判 Group 面**；project 面在同一信封里独立收口
+ * （{@link parseProjectVersionsField}）—— `versions[]` 在场 ∧ `projectVersions[]` 缺位 ⇒
+ * 仍出 projection，Group 面照旧、project 面自持 absent。
+ * **硬约束**：本函数**只认 `versions[]` 里的 Group 行**，project 行混入 `versions[]` 不在此面
+ * （负向钉 = `test/v0101-engine-project-versions-parse.test.mjs`）。
  */
 export function parseEngineVersions(json: unknown, capturedAt: string): EngineVersionsOutcome {
   if (!isRecord(json) || json.ok !== true) {
@@ -707,6 +770,11 @@ export function parseEngineVersions(json: unknown, capturedAt: string): EngineVe
   const entries: EngineVersionEntry[] = [];
   for (const item of json.versions) {
     if (!isRecord(item)) continue;
+    // 负向钉 (a) 的落点：Group 行的形状键永不含 project_id（两档列集不同）⇒ 带非空白
+    // project_id 的行整条不进 Group 投影，因而既不进版本列、也不进锁名单。
+    // 缺键 / null / 空白仍按 Group 行处理（不改 versions[] 既有语义）。
+    const projectId = projectKeyOf(item, "project_id", "projectId");
+    if (projectId !== "") continue;
     const version = (str(item.version) ?? "").trim();
     if (version === "") continue;
     const rawOrg = str(item["owner_group"]) ?? str(item.ownerGroup) ?? "";
@@ -716,7 +784,88 @@ export function parseEngineVersions(json: unknown, capturedAt: string): EngineVe
       status: str(item.status),
     });
   }
-  return { kind: "projection", projection: { entries, capturedAt } };
+  return {
+    kind: "projection",
+    projection: { entries, capturedAt, projectVersions: parseProjectVersionsField(json) },
+  };
+}
+
+/** `project_id` 缺键 / null / 空白的 project 键读取（两式键都认）。 */
+function projectKeyOf(item: Record<string, unknown>, snake: string, camel: string): string {
+  return (str(item[snake]) ?? str(item[camel]) ?? "").trim();
+}
+
+/**
+ * project 档的**归一读取口**（v0.10.1 B1 · 供 T2/T3 消费）：
+ * 解析结果恒带 `projectVersions`，但**夹具的老引擎档与历史最后一次投影可能不带该字段** ⇒
+ * `undefined` 一律按 `absent` 处理（**绝不当成「零条目」的 empty**，口径同 fail-closed：缺面 ≠ 空面）。
+ * 消费侧不得各自手写 `projection.projectVersions.status`（未归一 ⇒ 老档上直接抛）。
+ */
+export function projectVersionsOf(projection: EngineVersionsProjection | null | undefined): ProjectVersionsField {
+  const field = projection?.projectVersions;
+  if (field !== undefined) return field;
+  return {
+    status: "absent",
+    code: "project_versions_field_missing",
+    error: "投影未携带 projectVersions 档（引擎 project 版本面未上线）",
+  };
+}
+
+/**
+ * 顶层 `projectVersions[]` → project 档三态（**纯函数**，v0.10.1 B1 · C-7）。
+ *
+ * - 键**缺位 / 非数组** ⇒ `absent`（面未上线，显示「引擎 project 版本面未上线」）；
+ * - 键在场 ∧ 数组 ∧ **零合法条目** ⇒ `empty`（**合法事实**，与 `absent` 显示必须可区分）；
+ * - 键在场 ∧ 至少一条合法 ⇒ `live`。
+ * 合法 = `project_id` 与 `version` 都非空白；不合格条目整条丢弃（口径同 Group 面「无版号不成条目」）。
+ */
+export function parseProjectVersionsField(body: Record<string, unknown>): ProjectVersionsField {
+  if (!("projectVersions" in body)) {
+    return {
+      status: "absent",
+      code: "project_versions_field_missing",
+      error: "响应无 projectVersions[]（引擎 project 版本面未上线）",
+    };
+  }
+  const raw = body.projectVersions;
+  if (!Array.isArray(raw)) {
+    return {
+      status: "absent",
+      code: "project_versions_field_invalid",
+      error: "projectVersions 存在但不是数组（引擎 project 版本面形状不合法）",
+    };
+  }
+  const entries: EngineProjectVersionEntry[] = [];
+  for (const item of raw) {
+    const e = parseProjectVersionEntry(item);
+    if (e !== null) entries.push(e);
+  }
+  if (entries.length === 0) return { status: "empty" };
+  return { status: "live", entries };
+}
+
+/** project 档逐条解析（snake_case / camelCase 两式键都认，口径同 Group 面）；非法形状 ⇒ `null`（丢该条）。 */
+function parseProjectVersionEntry(item: unknown): EngineProjectVersionEntry | null {
+  if (!isRecord(item)) return null;
+  const projectId = projectKeyOf(item, "project_id", "projectId");
+  if (projectId === "") return null;
+  const version = (str(item.version) ?? "").trim();
+  if (version === "") return null;
+  const rawOrg = str(item["owner_group"]) ?? str(item.ownerGroup) ?? "";
+  const releasable = item["releasable"] === true ? true : item["releasable"] === false ? false : null;
+  return {
+    org: rawOrg.trim(),
+    projectId,
+    version,
+    status: str(item.status),
+    releasable,
+    openCount: num(item["open_count"] ?? item.openCount),
+    completedCount: num(item["completed_count"] ?? item.completedCount),
+    cancelledCount: num(item["cancelled_count"] ?? item.cancelledCount),
+    reason: str(item.reason),
+    repoId: str(item["repo_id"]) ?? str(item.repoId),
+    ref: str(item.ref),
+  };
 }
 
 /**
