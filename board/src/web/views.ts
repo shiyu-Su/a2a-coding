@@ -6,6 +6,7 @@
  */
 import type {
   AcceptanceView,
+  EngineVersionsProjection,
   FeatureDetailView,
   FeatureListItem,
   FeatureTraceView,
@@ -52,7 +53,7 @@ import type {
 import { compareVersionOrder, isUnscheduled, normalizeVersion, sortPoolEntries } from "../version-order.js";
 import { isVersionLocked } from "../version-status.js";
 import { isConfirmedCard } from "../version-transition.js";
-import { findVersionRecord, type VersionLedgerStatus, type VersionOrgFilter, type VersionsLedger } from "../versions-ledger.js";
+import { findVersionRecord, isVersionStatus, type VersionLedgerStatus, type VersionOrgFilter, type VersionsLedger } from "../versions-ledger.js";
 import { VERSION_ACTION_REMOVE } from "../write-guard.js";
 import { emptyRow, escapeHtml } from "./layout.js";
 import type { ErrorOverlayParams } from "./layout.js";
@@ -1699,7 +1700,7 @@ export interface OrgPortalCard {
 
 /**
  * 门户卡的**组织版本摘要**（B6 · 与 {@link buildOrgPortalCards} 同族：显示派生，**不执法**、零写 ——
- * 门户是纯读面，**不跑** `syncAutoVersionTransitions`，未点亮台账的派生档因此带 `*` 出现）。
+ * 门户是纯读面（**不跑任何自动写**），未点亮台账的派生档因此带 `*` 出现）。
  * - 「已发版」= 该组织 `released` 记录按 {@link compareVersionOrder} 取 **semver 最大**（**不用登记序** ——
  *   登记序会把后登记的小版本误当最新）；
  * - 「进行中」= 台账 `active` ∪ 卡派生 active（口径同列头徽标回落：台账无该 `(org, version)` 条目 ∧
@@ -1832,22 +1833,76 @@ export interface ScheduleColumn {
 }
 
 /**
+ * 引擎版本台账投影 → 版号清单（纯读，v0.10.0 尾段 N1 · 版本列换源）：
+ * 事实源 = **引擎版本台账**（板本地台账自 B4 起降为读缓存）⇒ 版本列的台账侧版号取此处。
+ * - `projection === null`（从未读到过投影）⇒ **空清单**（不当作「引擎零版本」，降级档由调用方接读缓存）；
+ * - `org` 切片档同 {@link ledgerVersionNames}：`undefined` = 不限组织，字符串 = 精确匹配该组织；
+ * - 跨组织同名折叠为一、保持登记序、空版号忽略（视图侧再 `normalizeVersion` 归一，此处不重复裁）。
+ * **只取版号、不取状态** —— 状态仍由 `renderSchedule` 的徽标读面按台账条目取（本函数不扩口径）。
+ */
+export function projectionVersionNames(
+  projection: EngineVersionsProjection | null,
+  org?: VersionOrgFilter,
+): string[] {
+  const names: string[] = [];
+  if (projection === null) return names;
+  for (const entry of projection.entries) {
+    if (org !== undefined && entry.org !== org) continue;
+    const v = normalizeVersion(entry.version);
+    if (v === "" || names.includes(v)) continue;
+    names.push(v);
+  }
+  return names;
+}
+
+/**
+ * 引擎版本台账投影 → 台账形状（**全量三态**，v0.10.0 尾段 N2 · 门户摘要 / 启动日志换源）：
+ * 事实源 = 引擎版本台账 ⇒ 纯读面（版本摘要行 / 已发版清单）也改由投影喂入，板本地台账只在
+ * **从未读到过投影**时充当降级读缓存（口径同 N1 的版本列）。
+ * - 与 server 侧 {@link versionProjectionLedgerOf}（**锁档**：只取 `released`）分立的理由是消费面不同 ——
+ *   本函数供 `orgVersionSummaryOf` / {@link releasedVersionLabels}，二者**自身按 status 过滤**，
+ *   故必须保留 `active` / `notstart` 条目，否则「台账登记的进行中版本」会退化成卡派生（带 `*`）；
+ * - `status` 非闭集（含 `null` ⇒ 老桥缺键）⇒ 落 `notstart`：**既不当已发版、也不当进行中**，
+ *   仅占「台账已登记该 `(org, version)`」一位（口径与本地台账的 notstart 条目一致）；
+ * - 时刻字段以本次投影的 `capturedAt` 如实标注（投影不带逐条 createdAt）；`note` 不出投影面 ⇒ `null`。
+ * 纯读、零写。
+ */
+export function projectionLedgerOf(projection: EngineVersionsProjection): VersionsLedger {
+  return {
+    version: 0,
+    versions: projection.entries.map((entry) => ({
+      org: entry.org,
+      version: entry.version,
+      status: isVersionStatus(entry.status) ? entry.status : "notstart",
+      createdAt: projection.capturedAt,
+      updatedAt: projection.capturedAt,
+      note: null,
+    })),
+  };
+}
+
+/**
  * 需求列表 → 版本列（纯函数）：未排期（`trim() === ""` 单一判据，含 null）直接滤除；
  * 列序 = `version-order.ts` 比较器**升序**（semver 数值序、非 `x.y.z` 字典序垫底）；
  * 看板呈现侧按此降序展示（件3：需求池最左 + 版本由大到小，见 {@link renderSchedule}），
  * 本函数不动（版本台账等其它读面仍是升序口径）；
  * 列内保持入参顺序（不做列内二次排序 —— 抖动排序键会让卡片跳位）。
  *
- * **并集（REQ-2026-09-27-05 §2.2 N2）**：列 = **台账条目 ∪ 需求卡派生** ——
- * 台账独有版本（尚无卡的「空列」= 新版本入口的落点）与卡独有版本（台账无登记的**历史脏列**）
- * **都保留显示**；同名去重并作一列（交集）。本函数**纯读、零写**（台账只贡献版本名、不携状态，
- * `notstart → active` 惰性转换在渲染前由 `server.ts` 的 `syncAutoVersionTransitions` 完成）⇒ 读面不突变。
- * **v0.9.6 B3**：`ledgerVersions` 由调用方按组织切片喂入（`ledgerVersionNames(ledger, org)`）——
- * 本函数不认组织，他组织的同版号是否成列取决于调用方给的名字集。
+ * **并集（REQ-2026-09-27-05 §2.2 N2 · v0.10.0 尾段 N1 换源）**：列 = **卡派生 ∪ 台账侧版号** ——
+ * 台账侧独有版本（尚无卡的「空列」= 新版本入口的落点）与卡独有版本（台账无登记的**历史脏列**）
+ * **都保留显示**；同名去重并作一列（交集）。台账侧版号自 v0.10.0 起分两路入参：
+ * `engineVersions` = **引擎版本台账清单**（事实源，见 {@link projectionVersionNames}）、
+ * `ledgerVersions` = 板本地台账（**仅在拿不到投影时**由调用方作降级读缓存喂入，正常档传空数组）——
+ * 两路都是「版号清单」，本函数按同一并集规则消费，不区分来源。
+ * **绝不「只渲染引擎清单」**：引擎无条目 ∧ 卡有 `version` ⇒ 该卡仍须成列（否则卡在整个版本面失去清单读面）。
+ * 本函数**纯读、零写**（台账只贡献版本名、不携状态；不突变入参）⇒ 读面不突变。
+ * **v0.9.6 B3**：两个版号数组均由调用方按组织切片喂入（`projectionVersionNames(projection, org)` /
+ * `ledgerVersionNames(ledger, org)`）—— 本函数不认组织，他组织的同版号是否成列取决于调用方给的名字集。
  */
 export function groupFeaturesByVersion(
   features: readonly FeatureListItem[],
   ledgerVersions: readonly string[] = [],
+  engineVersions: readonly string[] = [],
 ): ScheduleColumn[] {
   const byVersion = new Map<string, FeatureListItem[]>();
   for (const f of features) {
@@ -1857,7 +1912,7 @@ export function groupFeaturesByVersion(
     if (bucket === undefined) byVersion.set(v, [f]);
     else bucket.push(f);
   }
-  for (const raw of ledgerVersions) {
+  for (const raw of [...engineVersions, ...ledgerVersions]) {
     const v = normalizeVersion(raw);
     if (v === "" || byVersion.has(v)) continue; // 空串忽略；交集已在卡派生侧建桶
     byVersion.set(v, []); // 台账独有 ⇒ 空列占位（此版本已建、尚无卡）

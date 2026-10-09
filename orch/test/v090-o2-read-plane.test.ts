@@ -36,6 +36,7 @@ import {
   listEvents,
   listFeatureTasks,
   updateFeatureRegistration,
+  versionLedgerCreate,
 } from "../session/store.js";
 import type { EventRecord, FeatureRecord, TaskState } from "../types.js";
 import type { BridgeCore } from "../bridge/index.js";
@@ -387,26 +388,28 @@ test("B3″ feature.stage：create 不发；advance / approve 真变化各发一
 });
 
 test("B3″ feature.stage：同值重复写 ⇒ 零事件；同单多字段 ⇒ 一条；NULL → 缺省 ⇒ 零事件", () => {
+  // v0.10.0 §7 排期写状态锁：写 `version` 仅当卡处 `需求分析 ∧ 未发起`；存在性亦已执法 ⇒ 先建卡态 + 预登记版号。
+  versionLedgerCreate({ ownerGroup: "gA", version: "v0.9.0" });
   // ① 同值重复写（宿主把同一 stage / 同一 version 再 advance 一次）
-  const a = featureIdOf(coreA.featureCreate({ title: "重复写", stage: "改造方案" }));
-  mustOk(coreA.featureAdvance({ featureId: a, to: "waiting_approval", stage: "改造方案" }));
+  const a = featureIdOf(coreA.featureCreate({ title: "重复写", stage: "需求分析", approval: "未发起" }));
+  mustOk(coreA.featureAdvance({ featureId: a, to: "waiting_approval", stage: "需求分析" }));
   assert.equal(stageEvents(a).length, 0, "stage 同值 ⇒ 零事件");
   mustOk(coreA.featureAdvance({ featureId: a, to: "waiting_approval", version: "v0.9.0" }));
   assert.equal(stageEvents(a).length, 1, "version 真变化 ⇒ 一条");
   mustOk(coreA.featureAdvance({ featureId: a, to: "waiting_approval", version: "v0.9.0" }));
   assert.equal(stageEvents(a).length, 1, "version 重复写 ⇒ 不再加条");
-  mustOk(coreA.featureAdvance({ featureId: a, to: "waiting_approval", approval: "待审批" }));
-  assert.equal(stageEvents(a).length, 1, "approval 写同值（缺省已「待审批」）⇒ 仍零事件");
+  mustOk(coreA.featureAdvance({ featureId: a, to: "waiting_approval", approval: "未发起" }));
+  assert.equal(stageEvents(a).length, 1, "approval 写同值（已「未发起」）⇒ 仍零事件");
 
   // ② 同单多字段变更 ⇒ 恰好一条（一次 advance 是一次事实）
-  const b = featureIdOf(coreA.featureCreate({ title: "同单多字段", stage: "需求分析" }));
+  const b = featureIdOf(coreA.featureCreate({ title: "同单多字段", stage: "需求分析", approval: "未发起" }));
   mustOk(
     coreA.featureAdvance({
       featureId: b,
       to: "waiting_approval",
       stage: "改造方案",
       version: "v0.9.0",
-      approval: "待审批",
+      approval: "未发起",
     }),
   );
   const bEvents = stageEvents(b);

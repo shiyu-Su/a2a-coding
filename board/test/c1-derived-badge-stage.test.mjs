@@ -17,6 +17,7 @@ import { join } from "node:path";
 import { deriveVersionBadgeStatus, groupFeaturesByVersion, renderSchedule } from "../dist/web/views.js";
 import { createVersion, emptyVersionsLedger, serializeVersionsLedger, setVersionStatus } from "../dist/versions-ledger.js";
 import { createBoardServer } from "../dist/server.js";
+import { engineProjectionFetcher } from "./engine-versions-fixture.mjs";
 
 const NOW = "2026-09-28T12:00:00.000Z";
 const IDEA = "需求分析";
@@ -154,12 +155,19 @@ test("C1-⑥（B5a 改版：全局 /schedule 退役 ⇒ 宿主 = 空间排期页
       return { features: cards, stateCounts: null };
     },
   };
-  const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client, versionsLedgerFile: ledgerFile });
+  const handle = await createBoardServer({
+    host: "127.0.0.1",
+    port: 0,
+    client,
+    versionsLedgerFile: ledgerFile,
+    // v0.10.0 尾段 N1：版本列的台账侧版号 = 引擎清单 ⇒ 与本地台账夹具同源同值喂入
+    engineVersionsFetcher: engineProjectionFetcher([{ org: ORG, version: "v0.9.9", status: "notstart" }]),
+  });
   try {
     const text = await (await fetch(`http://127.0.0.1:${handle.port}/org/${ORG}/schedule`)).text();
     assert.match(text, /<h3>v0\.9\.5 <span class="kbadge vbadge notstart"[^>]*>未开始<\/span>/);
     assert.match(text, /<h3>v0\.9\.4 <span class="kbadge vbadge wip"[^>]*>进行中<\/span>/);
-    assert.match(headOf(text, "v0.9.9"), /<span class="kbadge vbadge notstart"[^>]*>未开始<\/span>/, "台账 notstart 空列照旧");
+    assert.match(headOf(text, "v0.9.9"), /<span class="kbadge vbadge notstart"[^>]*>未开始<\/span>/, "notstart 空列照旧（版号来自引擎清单，徽标仍按台账条目取态）");
     assert.match(text, /<h3>需求池 <span class="muted">\(1\)<\/span><\/h3>/, "需求池列无版本徽标");
     const poolAt = text.indexOf("<h3>需求池");
     assert.doesNotMatch(text.slice(poolAt, text.indexOf('<div class="kcol"', poolAt)), /vbadge/, "件3 起池列是最左列 ⇒ 右界取下一枚 kcol（不吞版本列头徽标）");

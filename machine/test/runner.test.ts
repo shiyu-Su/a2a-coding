@@ -125,6 +125,35 @@ test("注册载荷构造：字段齐全、risk 缺省 write、protocolVersion �
   ]);
 });
 
+test("注册载荷 · repo（v0.10.0 · M2）：未配置 ⇒ 不落该键（缺键 ≠ 空串，单仓零感知）", () => {
+  const payload = buildRegisterPayload(MACHINE, SELF_CHECK_OK);
+  for (const project of payload.projects) {
+    assert.ok(!("repo" in project), `${project.projectId} 未配置 repo 不得凭空落键`);
+    assert.equal(project.repo, undefined);
+  }
+});
+
+test("注册载荷 · repo（v0.10.0 · M2）：配置了才带、原样透传（不推断 / 不归一）", () => {
+  const machine: MachineConfig = {
+    ...MACHINE,
+    projects: [
+      { ...MACHINE.projects[0]!, repo: "a2a-coding/machine" },
+      { ...MACHINE.projects[1]! },
+    ],
+  };
+  const payload = buildRegisterPayload(machine, SELF_CHECK_OK);
+  assert.deepEqual(payload.projects, [
+    {
+      projectId: "alpha",
+      agentKind: "opencode",
+      risk: "read",
+      a2aPort: 3010,
+      repo: "a2a-coding/machine",
+    },
+    { projectId: "beta", agentKind: "codex", risk: "write", a2aPort: 3011 },
+  ]);
+});
+
 test("注册请求：POST /runner/register + Bearer 鉴权头 + 载荷入 body", async () => {
   const { calls, fetchFn } = recordingFetch(() =>
     jsonResponse(200, { result: { ok: true }, data: null, error: null }),

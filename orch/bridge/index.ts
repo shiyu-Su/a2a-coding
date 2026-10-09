@@ -90,6 +90,8 @@ import {
  */
 import { resolveTaskLookup } from "./task-lookup.js";
 import { createRunnerEndpoints, type RunnerEndpointHandle } from "./runner.js";
+import { createVersionsEndpoints } from "./versions-endpoints.js";
+import { activateVersionForFeature } from "./versions-activation.js";
 import {
   FeatureScheduler,
   isLocalTerminalTask,
@@ -1330,6 +1332,9 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
     return { ok: false, error: `任务 ${node.taskId} 无 Feature 归属` };
   }
   const feature = getFeature(featureId);
+  // v0.10.0 O2c：首个节点派发 = 版本「notstart → active」自动转换的触发点之一
+  // （引擎内部 · 幂等 · 节流 · 不阻断；`approve` 为另一触发点）。无 Feature / 无版号 ⇒ no-op。
+  if (feature !== null) activateVersionForFeature(feature);
   const message = buildNodeDispatchMessage(node, feature);
   // v0.8.9 O2：渲染结果只写 `dispatchRendered`（本轮下发快照，Runner 领取即用）；
   // `dispatchMessage` 原样回写 = 未渲染 base 保持不变（防「反复派发 ⇒ 外壳叠加」）
@@ -2210,6 +2215,13 @@ async function startHttpBridge(): Promise<void> {
   });
   // O5：看护 owner 门闩接入登记表（follower 停用 ⇒ /health `degraded[]` 增一项）
   setTaskWatcherDegradationSink(degradations);
+  /**
+   * 版本台账端点（v0.10.0 O2a）：仅常驻 http 形态创建，**委托形态照 `/runner/*` 先例**。
+   * `role` 用惰性闭包（同上，角色在 `runtime.start()` 才定）；写路的 owner 门闩由处理器自检。
+   */
+  const versionsEndpoints = createVersionsEndpoints({
+    role: () => runtime.currentRole,
+  });
   const handle = await startHttpTransport({
     core: coreFor(null), // 兜底视图（匿名/全量）；生产请求路径走 coreFor(identity)
     coreFor,
@@ -2222,6 +2234,7 @@ async function startHttpBridge(): Promise<void> {
     version: BRIDGE_VERSION,
     onShutdown: shutdown,
     runner: runnerEndpoints,
+    versions: versionsEndpoints,
     // O5：/health 出参增加降级快照（只加键，status/role/version 语义不变）
     degraded: () => degradations.snapshot(),
   });

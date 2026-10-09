@@ -149,15 +149,15 @@ Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持�
 
 **准入校验链（`/runner/register` 顺序）**：Bearer 形态 → JSON body → `machineId` 非空 → `machineId ∈ machines[]`（403 `runner_not_allowed`）→ token 已配置且匹配（401 `runner_unauthorized`）→ `protocolVersion` 非空（400）→ 主版本 ∈ `SUPPORTED_PEER_PROTOCOL_MAJORS`（403 `protocol_version_mismatch`）→ `projects[]` 结构校验（400）。`/runner/connect` / `/runner/result` 复用前四步，后者再加 `claimToken` 比对（409；**含 v0.8.7 补结算窄口例外**，见错误码族）。
 
-**未知字段忽略**：三个端点请求体一律**宽容解析** —— `capabilities` / `acks` / `selfCheck` 及任何未列字段均不导致 400、不落库、不进入判据；只有**已列入契约的必填字段**参与校验。加可选字段 → minor +1（见版本规则）。
+**未知字段忽略**：三个端点请求体一律**宽容解析** —— `capabilities` / `acks` / `selfCheck` 及任何未列字段均不导致 400、不落库、不进入判据；只有**已列入契约的必填字段**参与校验。
 
-> **v0.8.7 新增的两个可选请求字段**（`failureKind` / `diagnostics`，见 `/runner/result`）：当时**沿用 2.2、未升版**，与版本规则「加可选字段 → minor +1」条文的取舍曾登记待裁（`planlog.md`「跨版本登记项」）。**v0.8.8（2.3）已裁**：**仅新增可忽略的可选字段本身不触发升版**；2.2 → 2.3 的实际触发器是 **`failureKind` 取值集合成员移除**（`infra` / `task` → 六类闭集）—— 属**取值集合变更**且**单向不兼容**，按版本规则须**两侧同升**（见演进记录表 2.3 行）。
+> **v0.8.7 新增的两个可选请求字段**（`failureKind` / `diagnostics`，见 `/runner/result`）：当时**沿用 2.2、未升版**，与版本规则「加可选字段 → minor +1」条文的取舍曾登记待裁（`planlog.md`「跨版本登记项」）。**v0.8.8（2.3）已裁**：**仅新增可忽略的可选字段本身不触发升版**；2.2 → 2.3 的实际触发器是 **`failureKind` 取值集合成员移除**（`infra` / `task` → 六类闭集）—— 属**取值集合变更**且**单向不兼容**，按版本规则须**两侧同升**（见演进记录表 2.3 行）。**本裁定的判据已升为版本规则一般判据**（见「版本规则」第一条：可完全忽略且不影响判定 / 消费语义 ⇒ 不升版）。
 
 > **`diagnostics` 内部加键**（v0.8.8 计量键等）：在「未知字段忽略」伞下，**不单独触发版本变更**；触发 2.3 的只有 `failureKind` 取值集合变更。
 
 ## 版本规则
 
-- **加可选字段**（请求或响应）→ minor +1，主版本不变，旧对端可忽略；
+- **加可选字段**（请求或响应）—— **以判据为准，不默认升版**：字段**可被对端完全忽略且不影响任何判定 / 消费语义** ⇒ **不升版**（主版本、minor 均不变，沿用当前版本）；**引入新可观测行为，或把原本可选 / 无约束项收紧为必填 / 闭集成员** ⇒ **minor +1**（主版本不变，旧对端可忽略未用部分）；
 - **变更必填字段的取值集合**（**新增 / 更名 / 移除成员**，如 `agentKind` 的成员增减或改名、`failureKind` 的合法取值集合更替（2.3：`{infra, task}` → 六类闭集））→ minor +1，主版本不变；旧对端仅在未使用变更取值时兼容；
   - ⚠ **更名与移除是「单向不兼容」**：变更后的取值对未升级对端会被拒，旧取值对已升级对端同样被拒；且拒绝发生在**整包项目级**（`projects[]` 结构校验失败 ⇒ 该 Runner 上报的**全部项目**一起被 `400 bad_request` 拒、该机对桥不可见），**不是只拒那一个项目**。
   - ⇒ 因此**版本号本身不构成兼容窗口**（`/runner/register` 的版本握手只校验**主版本**，枚举取值集合由闭集校验强制）⇒ **更名 / 移除必须由部署侧在同一切换窗口内完成（两侧同升）**，并**在本节下方演进记录表新增一行**登记；**不得跨版本混跑**（旧机与新机同时在线时，必有一侧整包被拒）。
@@ -189,3 +189,4 @@ v0.7.0 发版即**硬切**：连接模型由 push（Bridge → Launcher 入站�
 | 2.1（v0.8.0） | agentKind 取值集合扩展（+qoder）；实际强制来自 agentKind 闭集拒绝，版本握手只校验主版本（SUPPORTED_PEER_PROTOCOL_MAJORS=[2]） | 否（minor） | 使用 qoder 的 Runner 要求 Bridge ≥ 2.1（旧 Bridge 对 qoder 注册以 400 bad_request 拒绝） |
 | 2.2（v0.8.6） | agentKind 取值集合**更名**：`qoder` → `qoder-cn`（**旧值不再合法**）；实际强制来自 agentKind 闭集拒绝，版本握手只校验主版本（SUPPORTED_PEER_PROTOCOL_MAJORS=[2]） | 否（minor，沿 2.1 先例：取值集合变更 + 单向不兼容） | 使用 `qoder-cn` 的 Runner 要求 Bridge ≥ 2.2；**旧值 `qoder` 本版起于两侧均非法**（旧 Bridge 对新值同样 400 拒整包） |
 | 2.3（v0.8.8） | `failureKind` 合法取值 → **六类闭集** `agent` / `transport` / `runner` / `model_queue` / `timeout` / `business`；**旧值 `infra` / `task` 自 2.3 起非法但仍可被接收**（接收端兜底为 `business` 并 warn 留原值，见 `/runner/result`「失败分类」）；`timeout` 必带子键 `diagnostics.timeoutScope`（`acp-prompt` / `runner-deadline`）；`diagnostics` 新增计量键均在「未知字段忽略」伞下、不单独触发版本变更 | 否（minor；但**取值集合成员移除 ⇒ 单方不兼容 ⇒ 两侧须同升**——握手只校验主版本，旧值靠接收端兜底而非握手挡） | Runner ≥ 2.3 上报六类（未升级 2.2 Runner 上报 `infra`/`task` 被兜底为 `business` + warn 留原值，混跑期账面口径见改造文档 §6-9）；Bridge ≥ 2.3 闭集校验 + 兜底落库 |
+| —（沿用 2.3，v0.10.0） | `/runner/register` 注册载荷新增**可选字段 `repo`**（仓库标识，供版本面按仓库拓扑归一 —— 拓扑无关、polyrepo / monorepo 双支持）。该字段**可被对端完全忽略、不进入任何判定 / 消费语义** ⇒ 按版本规则一般判据（第一条）**不升版**（主版本、minor 均不变，沿用 2.3） | 否（新增可忽略的可选字段 ⇒ **不升版**，见版本规则第一条判据） | 无新要求（旧 Runner 不携 `repo` 仍合法，桥按缺省处理；新旧可混跑） |

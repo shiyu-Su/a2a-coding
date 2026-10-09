@@ -2,6 +2,40 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.10.0] - 2026-10-09
+
+> 主题：**版本面单一事实源**（版本成为一等对象 + Release 对象 + 版本聚合读面 + **停同升**）。主需求 `1f937738`（29 节点）+ 三条挂轨：承接重建 `31155242`（board 尾段）、缺陷修复 `97225fb4`（台账 `owner_group` 写口）、规范落笔 `b00472b1`（flow §7 同升纪律）。
+
+### Added
+
+- **版本成为一等对象，事实源落引擎**（orch）：新增 `versions`（**台账，可编辑**，三态 `notstart`/`active`/`released`）+ `releases`（**快照，不可变**）两表，键 `(owner_group, version)`；写端点四路 `GET` / `POST /api/versions` / `PATCH /api/versions/{version}/status` / `DELETE`（统一信封 + 错误码闭集）；**发版闸判据、`released` 锁、排期写状态锁、`notstart→active` 自动转换**（首个节点派发 / `approve` 放行时引擎内部幂等触发，落 `version.activated` 事件）**全部落引擎、在事实源所在进程执法** —— 宿主经 MCP 直写 `version` 同受执法（**后门不豁免**）。
+- **版本聚合只读面**（首刀，**零新实体**）：给定版号 ⇒ 名下需求卡清单 + 触达 project 清单（join `features.version` × `tasks.project_id` 派生）；**未登记版号单列一桶**，不静默丢。
+- **`repo` 仓库标识透传**（machine → orch，为多仓拓扑留位）：`ProjectConfig` 新增**可选** `repo` 键（配置了才解析 / 才播报 / 才随注册载荷 `projects[].repo` 上报，**不做缺省推断**）；orch 消费四处、原值入 Release 快照 `projects[].repoId`（**不归一、不回查注册表**——注册表投影全量替换，拿它当数据源会把「上报缺位」写成「本版不含该仓」= 假事实）；协议保持 **2.3**（可忽略可选字段 ⇒ 不升版），`PROTOCOL.md` 版本规则改写为**判据式**。
+- **一次性迁移**（宿主执行）：板侧 `.data/versions.json` **整表导入为主源**（status 照搬、`released` 不可逆）+ `features.version` **派生补集**（只补缺行、**永不落 `released`**）+ 迁移哨兵事件 `version.ledger_migrated`。实测导入 10 行 + 补集 7 行 ⇒ 台账 `{active:5, notstart:6, released:9}`。
+
+### Changed
+
+- **停「四处 `package.json` + 三处 lock 同升」，改按兼容契约分组**（本版核心，**第一次实操**）：`orch ↔ machine` **仅「协议对端」成组**（协议版本必须一致，**产品版本各自独立**）；`board` **独立**（与编排侧只有只读面、无协议锚）；`flow` 无 `package.json`、不参与同升（其规范版本戳仍随版本走）。⇒ 本版 **orch / board 升 0.10.0，machine 保持 0.9.8**（其改动仅为**可选** `repo` 键、**协议未变**）—— **首次出现各单元版本号不一致**；根 `package.json` 升 0.10.0。
+- **板侧事实源翻转**（board）：本地版本台账由「事实源」降为**读缓存 / 降级投影**（不再是写目标）；建 / 删 / 设状态改为**向引擎发意图**；**删除**渲染期自动转换触发 + 进程内节流表（`versionAutoThrottle` / `applyAutoVersionTransitions`）；版本列 = **引擎 Release 清单 ∪ 卡派生版号**（并集留板）；读投影锁 `isVersionLocked` 改由引擎投影喂入、**fail-closed（锁只紧不松**，拿不到投影即挡排期写）；`orch_*` 错误码走显示映射（**未知码原样展示、不 fail-closed**）。
+- **规范落笔**（flow）：`spec/需求流程.md` §7 新增「**单元版本同升纪律（按兼容契约分组 · v0.10.0 新增）**」四条口径 + 两条引注；§7 新增「**文档 mv 分家**」（`version` 写改道引擎、文档 `mv` 仍由板 / 宿主执行）；§8 发版流程的收口判据 / 标记 `released` / 登记 `stage=发版` 三处按「事实源落引擎」改写；**四戳齐翻 v0.10.0**（需求流程 / 引擎映射 / 文档模板 / README）。
+- **回归套件 7 处旧版本锚修正**（两类成因，均为**既有锚与新纪律/两位 minor 的冲突**，非本版功能回归）：
+  - **停同升类（5 处）**：「单元 `version` 必须与根一致」的旧纪律锚改为「**合法 semver**」—— `test-v0.2.0-features` / `test-v0.2.1-features` / `test-v0.6.2-observability`（三处一致）/ `test-v0.8.10-concurrency`（orch = 根）/ `test-v0.9.0-board`（board = 根）。前两处**必改**（machine 不随升后与根不一致），后三处**同源旧锚一并改**（留着下次单单元发版必红）。
+  - **字符串序比较类（2 处）**：`test-v0.7.1-wait-and-stdio-retire` / `test-v0.7.2-wedge-fix` 的 `version >= '0.7.2'` 走**字面序**比较 —— `'0.10.0' >= '0.7.2'` 为 **false**（`'1' < '7'`）⇒ 改为**数值段比较**。**该缺陷只在首次出现两位 minor 时暴露**，非本版引入。
+  - TC26 文档模板规范戳 pin 随版翻 v0.10.0。
+
+### 门禁与验收
+
+- **根回归 1372/1372**（宿主复跑，`failed:0`；条数较 v0.9.8 的 1378 少 6 = **文档锚按当前版本自动跟随**：v0.9.8 的 9 条 `doc/v0.9.8/` 锚 → v0.10.0 的 3 条 `doc/v0.10.0/` 锚，非用例减少）；orch 全量 **526 / 0 fail / 1 skip**（POSIX 既跳）；board **1382/1382**；machine **567/567**。
+- **板单测 7 条红当场修掉**（`server-schedule-docs-move.test.mjs` 6 条 + `schedule-page.test.mjs` 1 条）：锁源切到**引擎投影**后，这两个文件仍桩**本地台账** ⇒ 真桥把 `v0.9.0–v0.9.8` 报 released、排期写被抢判 **409 `board_version_released`**。**处置 = 改桩**（复用 B4 的 `test/engine-versions-fixture.mjs`，喂「**空引擎投影**」= 读到了 ∧ 零个已发版，属合法事实而非「读不到」档），**断言语义一字未动、零删用例、零放宽**。
+- **验收**：用户 2026-10-09 原话「**我测了 通过**」；宿主实测六项 —— ① 台账读面 ② 迁移后 9 条 `released` 保真 ③ 已发版版排期被拒 ④ 未收口挡闸 `orch_version_not_converged` ⑤ 宿主 MCP 直写受锁 `orch_version_released_locked` ⑥ 新版本首卡自动 `notstart→active`。
+- **载体**：orch 桥与 board 需按新版重启 —— **待用户重启**（本轨按纪律只构建、未自火；重启归用户）；machine **不重启**（本版未发版）。
+
+### Notes
+
+- **未覆盖（显式登记）**：**polyrepo 形态本版只验单仓**（拓扑无关字段 day1 齐、多仓作第二消费者）；⑦「**配了** `repo`」的全链真机路径留待后续触发（当前四个 project 均未配，**缺键路径已自然全链覆盖**）；板 UI 侧复核（排期页版本列 / 「已发版」徽标 / 拖卡到已发版版本被挡）非阻塞。
+- **Step 2 事故登记**：`O1` / `O2a` **假完成**（账面 `completed`、代码零落地，由下游 `O2b` 提供反证链抓出）⇒ 走「**下游吸收**」重定界；用户 2026-10-08 裁定此类处置**此后默认走「另立 Feature 重派」**（池卡 `917514aa`）。承接轨前身 `42cbd9db` 因 board 写档节点反复零产出满窗、依赖边不可改 ⇒ cancel 后按「**拆小节点**」重建为 `31155242`（零方案变动）。
+- **遗留**：`machine/config/config.json` 与样例均**未配 `repo`**（键已就位、值全空）；`machine /health` 补产品版本出口（无消费者，留 v0.10.1+）；`S1` 之后的 §8 显式措辞（可选）。
+
 ## [v0.9.8] - 2026-10-04
 
 > 主题：**推进流程三卡**（心跳自火交人闸 `51208ff1` + 横幅增补 `7feb5b12`；板侧 agent 按项目组生效 `5cd80758` + agentKind 建议下拉增补 `f156f278`；项目组两栏拖拽 `493a3c62` 重建 `c5d17953` + 项目池恒空修复增补 `1ef62596`）。

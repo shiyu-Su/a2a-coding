@@ -27,6 +27,7 @@ import {
   getFeature,
   openStoreDatabase,
   updateFeatureRegistration,
+  versionLedgerCreate,
 } from "../session/store.js";
 import { FEATURE_APPROVALS, FEATURE_STAGES } from "../types.js";
 import {
@@ -77,6 +78,15 @@ function captureConsoleError<T>(run: () => T, sink: string[]): T {
   }
 }
 
+/**
+ * v0.10.0 O1 落表后 `features.version` 写口存在性已执法（未命中 ⇒ `orch_version_unknown`）——
+ * 用例显式把版号登记进引擎台账（`ownerGroup = null` = 无连接身份档），替代旧「任意自由版号」口径。
+ */
+function seedLedger(version: string): void {
+  const outcome = versionLedgerCreate({ ownerGroup: null, version });
+  if (!outcome.ok) throw new Error(`台账建版失败 ${version}：${outcome.code} ${outcome.message}`);
+}
+
 // ---------------------------------------------------------------------------
 // 1 / 2：create 缺省与显式值、闭集校验
 // ---------------------------------------------------------------------------
@@ -104,6 +114,7 @@ test("v0.9.0 B1″：create 不传登记字段 ⇒ 缺省「改造方案 / 待�
 
 test("v0.9.0 B1″：板口径 create 显式传「需求分析 + 未发起」⇒ 回显并落库", () => {
   close();
+  seedLedger("v0.9.0"); // v0.10.0：排期写存在性已执法，先登记版号
   const created = mustOk(
     handleFeatureCreate({
       title: "板建需求",
@@ -204,11 +215,34 @@ test("v0.9.0 B1″：登记特例**无终态守卫** ⇒ completed 后仍可写 
   close();
 });
 
-test("v0.9.0 B1″：登记字段与合法流转同单生效（advance 带 to = 合法后继 + stage / version）", () => {
+test("v0.9.0 B1″：登记字段与合法流转同单生效（advance 带 to = 合法后继 + stage / approval）", () => {
   close();
+  seedLedger("v0.9.0"); // 供下方反向锚使用（存在性先于排期锁）
   const created = mustOk(handleFeatureCreate({ title: "同单" }));
   mustOk(handleFeatureApprove({ featureId: created.featureId }));
+  // v0.10.0 §7 排期写状态锁：`version` 仅 `需求分析 ∧ 未发起` 可写；本卡已过门 ⇒ 同单不携 version
+  // （版本写面覆盖见 v0.10.0 O4/O5 用例），此处锚「登记字段与合法流转同单落库」本身。
   const out = mustOk(
+    handleFeatureAdvance({
+      featureId: created.featureId,
+      to: "integrating",
+      stage: "回归",
+      approval: "已通过",
+    }),
+  );
+  assert.equal(out.state, "integrating", "合法流转照常");
+  const after = getFeature(created.featureId);
+  assert.equal(after?.stage, "回归");
+  assert.equal(after?.approval, "已通过", "同单登记字段一并落库");
+  close();
+});
+
+test("v0.9.0 B1″：过门卡同单写 version ⇒ 排期写状态锁拒（新判定口径，零写入）", () => {
+  close();
+  seedLedger("v0.9.0"); // 存在性先于两把锁 ⇒ 先登记，红点才收敛到状态锁
+  const created = mustOk(handleFeatureCreate({ title: "过门后写 version" }));
+  mustOk(handleFeatureApprove({ featureId: created.featureId }));
+  const blocked = mustFail(
     handleFeatureAdvance({
       featureId: created.featureId,
       to: "integrating",
@@ -216,10 +250,10 @@ test("v0.9.0 B1″：登记字段与合法流转同单生效（advance 带 to = 
       version: "v0.9.0",
     }),
   );
-  assert.equal(out.state, "integrating", "合法流转照常");
+  assert.equal(blocked.code, "board_schedule_state_locked", "过门卡写 version ⇒ 排期写状态锁拒");
   const after = getFeature(created.featureId);
-  assert.equal(after?.stage, "回归");
-  assert.equal(after?.version, "v0.9.0");
+  assert.equal(after?.state, "executing", "拒绝 ⇒ 主链态零变更");
+  assert.equal(after?.version, "", "拒绝 ⇒ version 零写入");
   close();
 });
 
@@ -264,7 +298,11 @@ test("v0.9.0 F2：特例 + note 同传 ⇒ note 真的落库（plan）并回显�
 
 test("v0.9.0 F2：特例 + decisions / contracts 同传 ⇒ 三者一起落库", () => {
   close();
-  const created = mustOk(handleFeatureCreate({ title: "特例带契约" }));
+  seedLedger("v0.9.0"); // 存在性执法：先登记版号
+  // 排期写状态锁（v0.10.0 §7）：写 version 要求卡处 `需求分析 ∧ 未发起` ⇒ 建卡即此态
+  const created = mustOk(
+    handleFeatureCreate({ title: "特例带契约", stage: "需求分析", approval: "未发起" }),
+  );
   mustOk(
     handleFeatureAdvance({
       featureId: created.featureId,

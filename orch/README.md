@@ -30,6 +30,26 @@
 - 要**本组视野**只能走 MCP 端点 `/<组名>/mcp`（见上节），不是在 3300 上切换。
 - 因此数据面侧的可见范围**始终 ⊇** 任一组身份的连接；Board 经 `/api/*` 读数据用于观察与排障，不用于编排。
 
+## 版本面写口执法与错误码闭集（v0.10.0 · REQ-v0.10.0-2026-09-24-01）
+
+版本状态（三态 `notstart/active/released`）与发版闸的事实源**落引擎**（板只投影）。**排期写状态锁 + `released` 锁 + 发版闸**均在引擎侧执法，**含宿主经 MCP 直写 `version` 的路径（后门不豁免 —— 引擎强制，不是板）**：
+
+- **写口执法**：`bridge/feature-tools.ts` 的 `checkVersionWriteLocks`（排期写状态锁 + `released` 锁，挂在 `a2a_feature_create` / `a2a_feature_advance` 写 `version` 之处，fail-fast 零写入）；发版闸 `evaluateReleaseGate`（判据 `total>0 ∧ completed+cancelled===total ∧ completed>0`，`failed` 不计收口、全 `cancelled`/全 `failed` 挡闸；写端点〔O2b〕与 `released` 同事务快照〔O7〕**共用同一判据**）。
+- **发版快照（`released` 同事务写 · O7）**：`bridge/versions-release.ts` 的 `markVersionReleased` = 发版动作的**唯一入口**（O2b 的 `PATCH /api/versions/{version}/status` 在 `released` 分支必须转进它）；判据序 = 台账事实源 → 发版闸（O4）→ `projects` 边界校验 → `session/store.ts` 的 `versionLedgerMarkReleased` 事务。该事务内 `UPDATE versions.status='released'` + `INSERT releases` 快照 + `version.released` 事件**一并成立或一并回滚**（分开写会留下「已锁无事实」或「有事实未锁」的半成品版本，两者都不可事后自动补齐）。快照列 `changelogAnchor` / `projects[].{repoId,ref}` / `note` / `createdAt` **取发版动作带入的原值、引擎不归一**：尤其 `repoId` **不回查 `runner_projects`** —— 那张投影表每次上报被全量替换，机未上报即空，拿它当数据源会把「上报缺位」写成「这一版不含该仓」的**假事实**，而快照不可变、写错即永久错。`releases` 无 `updated_at` 且只 INSERT ⇒ **不可变**（重复标记 = 幂等回读既有快照，入参被忽略，不再过闸，因闸是「进入 released」的准入而非「读回快照」的准入）；迁移主源导入的历史 `released` 行本就无快照 ⇒ 同一入口**补写**（事件标 `backfilled`）。读口 `releaseSnapshotGet` / `releaseSnapshotList`（后者 = 板「版本列 = 引擎 Release 清单 ∪ 卡派生版号」左半）。
+- **台账状态读口**：`session/store.ts` 的 `versionLedgerStatus`（读 `versions.status`，三态闭集见 `types.ts` `VERSION_LEDGER_STATUSES`）；与 O5 `versionLedgerHas` 同族。
+- **中间态禁令（发版闸判据 · 非仅纪律）**：版号不在引擎 `versions` 台账 ⇒ 发版闸 **fail-closed**（`orch_version_unknown`），**即使该版名下卡已全部收口也挡** —— 这就是「不得发布既写本地台账又读引擎的中间态」落到引擎事实源的机器判据（引擎不持有该行 ⇒ 无从证明发版事实）。O1 已把 `versions` 表建入默认 schema ⇒ 存在性执法即时生效，无需再改代码。写口 `released` 锁 / 存在性检查仍保留 `ledgerReady=false`（未迁移历史库）的**放行**兜底（无表 ≠ 已发版/不存在，同 O5 口径），但发版闸在此路径**反向取严**（读不到引擎台账 ⇒ 挡，不放行）。
+
+错误码闭集（MCP 面结构化 `code`；HTTP 面由 O2 端点转 `409 {ok,error:{code,message}}`）。⚠ 这些是**版本面写口码**，与 `PROTOCOL.md` 的 **Runner 线协议错误族**（`failureKind` 等）正交，**不入该表**：
+
+| code | 触发 | 发起面 |
+|---|---|---|
+| `board_schedule_state_locked` | 排期写状态锁：仅 `stage=需求分析 ∧ approval=未发起` 可写 `version`（改版纪律第一档）；已过需求确认门的卡再排期 ⇒ 拒 | **跨单元引用**（板 v0.9.x 起用的码，**字面不变**；v0.10.0 起改由**引擎**返回） |
+| `orch_version_released_locked` | `released` 锁：目标版号在引擎台账已 `released` ⇒ 不可排入 / 不可改排期（create / advance 同挡） | 引擎（新增） |
+| `orch_version_unknown` | 存在性 / 中间态：写 `version` 命中未登记版号；或发版闸要求版号在引擎台账（表未落地或未命中 ⇒ fail-closed） | 引擎（O5 引入 · O4 复用于闸） |
+| `orch_version_not_converged` | 发版闸：版号名下有 `open`（含 `failed`）⇒ 未收口 | 引擎（新增） |
+| `orch_version_all_cancelled` | 发版闸：版号名下全部 `cancelled`（无任何 `completed` 交付）⇒ 挡 | 引擎（新增） |
+| `orch_release_projects_invalid` | 发版快照入参：`projects` 非数组 / 项非对象 / `repoId`\|`ref` 非 `string|null` ⇒ 400（校验在进事务前，挡下即零写入） | 引擎（O7 新增） |
+
 ## Runner 反向注册（pull）
 
 执行机在目标部署形态下**无入口**（无公网 / NAT 后），桥不再向 Launcher 拨号；改由 Runner **主动出站**连桥。

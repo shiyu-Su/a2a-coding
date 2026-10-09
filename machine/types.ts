@@ -10,8 +10,10 @@ import type { AgentKind } from "./agent-kinds.js";
 /**
  * Bridge ⇄ Launcher 线协议版本（单一事实源：仓库根 PROTOCOL.md；orch 侧同名常量见
  * orch/types.ts，修改需两侧同步并由契约测试锁定）。
- * 规则：加可选字段 minor+1；删字段 / 改语义 / 加必填请求体 major+1；
- *      必填字段的取值集合扩展 minor+1。
+ * 规则（判据式，与 PROTOCOL.md「版本规则」一致）：
+ *      加可选字段 **以判据为准、不默认升版** —— 字段**可被对端完全忽略且不影响任何判定 / 消费语义**
+ *      ⇒ **不升版**（主版本、minor 均不变）；**引入新可观测行为，或把原本可选 / 无约束项收紧为必填 / 闭集成员** ⇒ minor+1；
+ *      删字段 / 改语义 / 加必填请求体 major+1；必填字段的取值集合变更（新增 / 更名 / 移除成员）minor+1。
  * v0.7.0：major 由 1.0 升到 2.0（删字段 / 改语义 / 加必填请求体的破坏性变更）。
  * v0.8.0：minor 升到 2.1（`projects[].agentKind` 必填字段取值集合扩展 +qoder，非破坏）。
  * req03 硬切：minor 升到 2.2（`projects[].agentKind` 必填字段取值 `qoder` 更名为 `qoder-cn`）。
@@ -19,6 +21,8 @@ import type { AgentKind } from "./agent-kinds.js";
  *      `infra` / `task` 自 2.3 起非法，但仍可被接收 ⇒ 接收端兜底落 `business` 并 warn 留原值
  *      ⇒ 与上述两次「扩展 / 更名」不同，本次是**单方不兼容**，orch 与 machine **两侧同升**
  *      （混跑期未升级侧上报的旧值只会被兜底归类，不会被拒收）。
+ * v0.10.0：`/runner/register` 载荷新增**可忽略的可选字段 `repo`**（项目仓库标识，观测用、不进任何
+ *      判定 / 消费语义）⇒ 按上述判据式规则第一条**不升版**（沿用 2.3，本常量不动）。
  */
 export const PROTOCOL_VERSION = "2.3";
 
@@ -44,6 +48,13 @@ export interface ProjectConfig {
    * 缺省写入档 `write`（= 执行层适配器内置默认，保证既有项目行为不变）。
    */
   risk?: RiskLevel;
+  /**
+   * 仓库标识（可选，v0.10.0 · M1）：多仓拓扑下标注本项目所属仓库。
+   * machine 侧只「配置了才解析并播报」—— **不做缺省推断 / 归一**：
+   * 未配置 ⇒ 不落该键（单仓零感知、无需迁移）；「缺省 = 宿主仓」的解释权归引擎（orch）。
+   * 线协议面：随注册载荷 `projects[].repo` 上报，属**可忽略的可选字段** ⇒ **不触发升版**（沿用 2.3）。
+   */
+  repo?: string;
   /**
    * 项目 agentConfig（键位口径 = **自消费键顶层平铺**；`agentConfig.<kind>` 段已整体退役，
    * v0.8.5 · M4 起为**唯一**口径）。

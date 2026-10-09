@@ -515,6 +515,10 @@ export class AgentManager {
     // 并发闸上限快照播报（v0.8.10 · M-N5）：两把闸生效上限与出处，「这台机配了多少」进日志
     // （此前该二键无任何回显面，只能靠并发行为反推）。
     console.log(`[launcher] agent ${project.projectId} ${snapshot.gateLimits}`);
+    // 仓库标识快照播报（v0.10.0 · M1）：配置了 repo 才报，未配置省略该键（单仓零感知）。
+    if (snapshot.repo !== undefined) {
+      console.log(`[launcher] agent ${project.projectId} ${snapshot.repo}`);
+    }
     // 后端入口分层解析结果（改造文档 §2.3 · B4）：命中报来源层，失败报逐层清单；
     // 清单入日志、不进 Error message（适配器抛错文案只留摘要 +「详见 launcher.log [backend] 行」）。
     console.log(`[backend] ${snapshot.backend}`);

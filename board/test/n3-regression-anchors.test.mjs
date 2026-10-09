@@ -33,6 +33,7 @@ import {
   SUBMIT_GUARD_SCRIPT,
 } from "../dist/web/layout.js";
 import { createBoardServer } from "../dist/server.js";
+import { engineNoLockFetcher, engineProjectionFetcher } from "./engine-versions-fixture.mjs";
 
 const srcRoot = join(dirname(fileURLToPath(import.meta.url)), "..", "src");
 
@@ -75,7 +76,13 @@ const BROKEN_CLIENT = {
 };
 
 async function withServer(client, run) {
-  const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client });
+  // v0.10.0 B4：读面（详情页 / 空间排期页）也经引擎投影 ⇒ 恒注入「无锁」档，杜绝打开发机的真实引擎。
+  const handle = await createBoardServer({
+    host: "127.0.0.1",
+    port: 0,
+    client,
+    engineVersionsFetcher: engineNoLockFetcher(),
+  });
   try {
     await run(`http://127.0.0.1:${handle.port}`);
   } finally {
@@ -84,7 +91,8 @@ async function withServer(client, run) {
 }
 
 /**
- * 已发版锁夹具（v0.9.4 N3）：锁改读版本台账 ⇒ 预置临时台账文件喂入（`versionsLedgerFile`）。
+ * 已发版锁夹具（v0.9.4 N3 · **v0.10.0 B4 起只喂本地台账**）：锁的**数据源**已换到引擎版本台账投影
+ * （`engineVersionsFetcher`）⇒ 本夹具与投影**同源同值**喂入（钉「板台账只是残留读缓存」）。
  * v0.9.6 B1（扇出点）：条目唯一键 = `(org, version)`、schema 2 ⇒ 夹具**必须带 org**，
  * 缺省 `"alpha"` 与本文件 `feature()` 的 ownerGroup 同值；跨组织场景按档传第二个参数。
  * **v0.9.6 B3（口径 29）**：提需求写口的锁按 `(org, version)` 切 ⇒ 撞锁用例的条目 org 必须等于
@@ -220,6 +228,8 @@ test("N3-④（REQ-04 Q2）POST /requirements 保留断言：端点仍放开 · 
     client,
     defaultGroup: "g",
     versionsLedgerFile: seed.file,
+    // v0.10.0 B4：锁的数据源 = 引擎投影 ⇒ 与台账夹具同源喂入（本用例钉 409 原样执法）。
+    engineVersionsFetcher: engineProjectionFetcher(["v0.9.0"], "g"),
     createRequirementImpl: async (input) => {
       seen.push(input);
       return {

@@ -152,20 +152,40 @@ test("B8-③（E1 改版）虚列拖拽 prompt() 路径已撤除；内联脚本�
 });
 
 // ---------------------------------------------------------------------------
-// ④ 服务端写口零改动：表单档 POST /versions(create) 与隐藏字段载荷逐字兼容
+// ④ v0.10.0 B2：写面改道 ⇒ 表单档 POST /versions(create) 发引擎意图（不再本地落台账）
 // ---------------------------------------------------------------------------
 
-test("B8-④ 表单档提交（action=create + version，urlencoded）⇒ 303 + 台账落 notstart 条目", async () => {
-  // 台账注入临时文件（A3 收口口径：不触碰开发机真实 .data/versions.json）
-  const { mkdtempSync, readFileSync } = await import("node:fs");
+test("B8-④（v0.10.0 B2 改道）表单档提交（action=create + version，urlencoded）⇒ 303 + 引擎收到建版意图", async () => {
+  const { mkdtempSync, existsSync } = await import("node:fs");
   const { tmpdir } = await import("node:os");
   const { join } = await import("node:path");
   const dir = mkdtempSync(join(tmpdir(), "board-b8-"));
+  const versionsFile = join(dir, "data", "versions.json");
+  const calls = [];
+  // 假引擎版本写客户端（B2）：记录意图、返回成功档。
+  const engine = {
+    kind: "versions",
+    client: {
+      async create(input) {
+        calls.push({ kind: "create", input });
+        return { ok: true, httpStatus: 201, version: input.version, status: "notstart" };
+      },
+      async remove(input) {
+        calls.push({ kind: "remove", input });
+        return { ok: true, httpStatus: 200, version: input.version, status: null };
+      },
+      async setStatus(input) {
+        calls.push({ kind: "setStatus", input });
+        return { ok: true, httpStatus: 200, version: input.version, status: input.status };
+      },
+    },
+  };
   const srv = await createBoardServer({
     host: "127.0.0.1",
     port: 0,
     client: fakeClient([]),
-    versionsLedgerFile: join(dir, "data", "versions.json"),
+    versionsLedgerFile: versionsFile,
+    versionsWriteImpl: engine.client,
   });
   try {
     const base = `http://127.0.0.1:${srv.port}`;
@@ -180,9 +200,8 @@ test("B8-④ 表单档提交（action=create + version，urlencoded）⇒ 303 + 
       body: new URLSearchParams({ action: "create", version: "v0.10.0" }).toString(),
     });
     assert.equal(res.status, 303, "成功 = 服务端 303（fetch 跟随后 ok ⇒ wire() 关弹窗刷新）");
-    const ledger = JSON.parse(readFileSync(join(dir, "data", "versions.json"), "utf8"));
-    assert.equal(ledger.versions[0].version, "v0.10.0");
-    assert.equal(ledger.versions[0].status, "notstart", "初态 notstart（写口与闸零改动）");
+    assert.deepEqual(calls, [{ kind: "create", input: { ownerGroup: null, version: "v0.10.0" } }], "建版意图发引擎（全局档 ownerGroup=null）");
+    assert.equal(existsSync(versionsFile), false, "板不再写本地台账（B2：事实源在引擎）");
   } finally {
     await srv.close();
   }

@@ -15,17 +15,28 @@
  *    `GET /org/<名>/schedule`（全局 `/schedule` 已退役 ⇒ 303）；空间落点不再经 navHrefFor 派生
  *    （该函数与 `ORG_SPACE_VIEWS` 同批删除）；**B6 起门户摘顶栏切换器**（`orgSwitcher="none"`，
  *    整页无 org-switch，动线 = 点卡进空间）。
+ * ⑥ **v0.10.0 尾段 N2 —— 摘要换源**：门户版本摘要的台账侧数据 = **引擎版本台账投影**（本地台账降为
+ *    「从未读到过投影」的降级读缓存）；投影 fixture 恒注入（不注入会打真实引擎），absent 档 ⇒ 门户
+ *    照常 200 + 读缓存出摘要；门户仍是纯读面 ⇒ GET 零写。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdirSync, mkdtempSync, writeFileSync } from "node:fs";
+import { mkdirSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { portalOrgNames } from "../dist/orgs-view.js";
-import { buildOrgPortalCards, orgVersionSummaryOf, renderOrgPortal, renderCreateOrgDialog, renderCreateOrgForm } from "../dist/web/views.js";
+import {
+  buildOrgPortalCards,
+  orgVersionSummaryOf,
+  projectionLedgerOf,
+  renderOrgPortal,
+  renderCreateOrgDialog,
+  renderCreateOrgForm,
+} from "../dist/web/views.js";
 import { NEW_REQUIREMENT_DIALOG_SCRIPT } from "../dist/web/layout.js";
 import { createBoardServer } from "../dist/server.js";
+import { engineProjectionAbsentFetcher, engineProjectionFetcher } from "./engine-versions-fixture.mjs";
 
 function feature(featureId, ownerGroup, version, overrides = {}) {
   return {
@@ -213,8 +224,7 @@ test("P-⑤e 折叠「另 N」与双空档仍渲该行（— · —）", () => {
 // ④ HTTP 面 + NAV
 // ---------------------------------------------------------------------------
 
-async function withPortalServer(run, { features, ledgerOrgs, defaultGroup = "板默认", versions } = {}) {
-  const dir = mkdtempSync(join(tmpdir(), "board-n2-portal-"));
+async function withPortalServer(run, { features, ledgerOrgs, defaultGroup = "板默认", versions, engineVersions } = {}) {  const dir = mkdtempSync(join(tmpdir(), "board-n2-portal-"));
   const orgsRoot = join(dir, "orgs");
   mkdirSync(orgsRoot, { recursive: true });
   mkdirSync(join(orgsRoot, "盘遗留组"), { recursive: true });
@@ -241,9 +251,12 @@ async function withPortalServer(run, { features, ledgerOrgs, defaultGroup = "板
     orgsLedgerFile: ledgerFile,
     defaultGroup,
     ...(versionsFile === undefined ? {} : { versionsLedgerFile: versionsFile }),
+    // **N2 起摘要的事实源 = 引擎投影 ⇒ 恒注入假投影**（同 `engine-versions-fixture` 纪律：不注入会打
+    // 开发机的真实引擎，摘要随本机台账漂移）。缺省喂「零条目投影」= 读到了 ∧ 引擎无版本。
+    engineVersionsFetcher: engineVersions ?? engineProjectionFetcher(versions ?? []),
   });
   try {
-    await run(`http://127.0.0.1:${handle.port}`, client);
+    await run(`http://127.0.0.1:${handle.port}`, client, dir);
   } finally {
     await handle.close();
   }
@@ -329,3 +342,120 @@ test("P-④（B5a + 件1 改版 + 件A 改名）GET / = 项目组门户（高亮
 
 // P-④b（NAV「首页」不进组织空间映射 · navHrefFor 空间派生）整枚退役：v0.9.6 B5a 起 NAV 恒三枚全局
 // href、`navHrefFor`/`ORG_SPACE_VIEWS` 已删 ⇒ 本锚无对象可钉；闭集逐字节钉在 orgs-page N6-⑫ / web.test。
+
+// ---------------------------------------------------------------------------
+// ⑥ v0.10.0 尾段 N2 —— 门户版本摘要**换源引擎投影**（本地台账降为「从未读到过投影」的读缓存）
+// ---------------------------------------------------------------------------
+
+/** 引擎投影夹具（`EngineVersionsProjection` 形态，同 `bridge-client.parseEngineVersions` 出参）。 */
+function projectionOf(entries, capturedAt = "2026-10-08T00:00:00.000Z") {
+  return { entries, capturedAt };
+}
+
+test("N2-⑥a projectionLedgerOf：三态全保（released / active 各自归位）；非闭集状态落 notstart", () => {
+  const ledger = projectionLedgerOf(
+    projectionOf([
+      { org: "甲组", version: "v0.9.0", status: "released" },
+      { org: "甲组", version: "v0.9.1", status: "active" },
+      { org: "甲组", version: "v0.9.2", status: "notstart" },
+      { org: "甲组", version: "v0.9.3", status: null },
+    ]),
+  );
+  assert.deepEqual(
+    ledger.versions.map((r) => [r.org, r.version, r.status]),
+    [
+      ["甲组", "v0.9.0", "released"],
+      ["甲组", "v0.9.1", "active"],
+      ["甲组", "v0.9.2", "notstart"],
+      ["甲组", "v0.9.3", "notstart"],
+    ],
+    "缺状态（老桥）⇒ 既不当已发版、也不当进行中，仅占「台账已登记」一位",
+  );
+  assert.equal(ledger.versions[0].createdAt, "2026-10-08T00:00:00.000Z", "时刻如实标注为投影捕获时刻");
+  assert.equal(ledger.versions[0].note, null, "投影不带 note ⇒ null（不编造留痕）");
+});
+
+test("N2-⑥b 摘要判据经投影仍成立：released 取 semver 最大 · active 台账态不派生星 · notstart 不进进行中", () => {
+  const ledger = projectionLedgerOf(
+    projectionOf([
+      { org: "甲组", version: "v0.9.0", status: "released" },
+      { org: "甲组", version: "v0.10.0", status: "released" },
+      { org: "甲组", version: "v0.9.4", status: "active" },
+      { org: "甲组", version: "v0.9.2", status: "notstart" },
+      { org: "乙组", version: "v9.9.9", status: "released" },
+    ]),
+  );
+  const s = orgVersionSummaryOf(ledger, [feature("X1", "甲组", "v0.9.3")], "甲组");
+  assert.equal(s.lastReleased, "v0.10.0", "已发版 = 投影 released 里 semver 最大");
+  assert.deepEqual(s.active, ["v0.9.3", "v0.9.4"], "台账 active ∪ 卡派生；notstart 不入");
+  assert.deepEqual(s.activeDerived, ["v0.9.3"], "投影已登记 v0.9.4 ⇒ 无星；v0.9.3 无条目才派生");
+});
+
+test("N2-⑥c HTTP：摘要读投影（引擎值与本地台账**不同值** ⇒ 以投影为准；台账登记的 active 不带星）", async () => {
+  await withPortalServer(
+    async (base) => {
+      const html = await (await fetch(`${base}/`)).text();
+      assert.match(
+        html,
+        /<p class="kmeta">已发版 v9\.9\.9 · 进行中 v0\.9\.4<\/p>/,
+        "甲组摘要 = 引擎投影（released v9.9.9 / active v0.9.4 无星），本地台账的 v0.9.0 不露出",
+      );
+    },
+    {
+      features: [feature("F1", "甲组", "v0.9.4")],
+      ledgerOrgs: [{ org: "甲组" }],
+      // 本地台账（读缓存档）故意与引擎**反着写**：released v0.9.0 / v0.9.4 未登记
+      versions: [{ org: "甲组", version: "v0.9.0", status: "released", createdAt: "2026-09-27T00:00:00.000Z", updatedAt: "2026-09-27T00:00:00.000Z", note: null }],
+      engineVersions: engineProjectionFetcher([
+        { org: "甲组", version: "v9.9.9", status: "released" },
+        { org: "甲组", version: "v0.9.4", status: "active" },
+      ]),
+    },
+  );
+});
+
+test("N2-⑥d HTTP 降级档：投影从未读到（absent）⇒ 本地台账读缓存照常出摘要，门户不 500（读面不挡）", async () => {
+  await withPortalServer(
+    async (base) => {
+      const res = await fetch(`${base}/`);
+      assert.equal(res.status, 200, "拿不到投影不得把门户页打崩");
+      const html = await res.text();
+      assert.match(
+        html,
+        /<p class="kmeta">已发版 v0\.9\.0 · 进行中 —<\/p>/,
+        "甲组 = 降级读缓存的 released 直读（台账有该条目、名下无卡 ⇒ 进行中 —）",
+      );
+      assert.match(
+        html,
+        /<p class="kmeta" title="带 \* = 台账未登记该版[^"]*">已发版 — · 进行中 v0\.9\.4\*<\/p>/,
+        "乙组 = 台账无该条目 ⇒ 照旧卡派生带星",
+      );
+    },
+    {
+      features: [feature("F1", "乙组", "v0.9.4")],
+      ledgerOrgs: [{ org: "甲组" }, { org: "乙组" }],
+      versions: [{ org: "甲组", version: "v0.9.0", status: "released", createdAt: "2026-09-27T00:00:00.000Z", updatedAt: "2026-09-27T00:00:00.000Z", note: null }],
+      engineVersions: engineProjectionAbsentFetcher(),
+    },
+  );
+});
+
+test("N2-⑥e 门户 GET 仍零写（摘要换源不动「纯读面」纪律）", async () => {
+  await withPortalServer(
+    async (base, client, dir) => {
+      const versionsFile = join(dir, "versions.json");
+      const before = readFileSync(versionsFile, "utf8");
+      await (await fetch(`${base}/`)).text();
+      assert.equal(before.includes("v9.9.9"), false, "夹具本地台账本就无引擎那条 released（换源前提）");
+      assert.equal(readFileSync(versionsFile, "utf8"), before, "门户为纯读面：读投影不得回写本地台账、不点亮任何档");
+      void client;
+    },
+    {
+      features: [feature("F1", "甲组", "v0.9.4")],
+      ledgerOrgs: [{ org: "甲组" }],
+      versions: [],
+      engineVersions: engineProjectionFetcher([{ org: "甲组", version: "v9.9.9", status: "released" }]),
+    },
+  );
+});
+

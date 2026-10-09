@@ -1,13 +1,16 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { spawnSync } from "node:child_process";
 import { existsSync, mkdirSync, mkdtempSync, readFileSync, readdirSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
-import { join } from "node:path";
+import { dirname, join, resolve } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   VERSIONS_LEDGER_VERSION,
   VERSION_STATUSES,
   defaultVersionsLedgerFile,
+  defaultVersionsSentinelFile,
   emptyVersionsLedger,
   parseVersionRecord,
   parseVersionsLedger,
@@ -21,10 +24,15 @@ import {
   setVersionStatus,
   migrateReleasedVersions,
   migrateLedgerOrgs,
+  exportVersionsLedger,
+  serializeVersionsExport,
+  VERSIONS_EXPORT_SCHEMA,
   VersionsLedgerStore,
 } from "../dist/versions-ledger.js";
 
 const NOW = "2026-09-27T12:00:00.000Z";
+/** 板根（出源 CLI 用 `dist/` 编译产物，须先 `npm run build`；口径同其余走 dist 的测试）。 */
+const boardRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 
 // ---------------------------------------------------------------------------
 // N1 纯函数：容错解析 / 序列化 / 建删设
@@ -171,9 +179,23 @@ test("N1-store 坏文件：load 如实回报 corrupt=true（不静默当「没�
 
 // ---------------------------------------------------------------------------
 // N1 一次性迁移：config releasedVersions → 台账 released（fail-fast / 残留键 warn / 不双读）
+// v0.10.0 B1：边界判据 = **独立哨兵**（不再是台账文件 exists()）
 // ---------------------------------------------------------------------------
 
-test("N1-迁移成功：台账不存在 ⇒ releasedVersions 四条全部灌入 status=released，回执 migrated=四条", () => {
+test("N1-defaultVersionsSentinelFile：哨兵缺省落点 = <cwd>/.data/versions.migrated.json（与台账同目录不同名）", () => {
+  const p = defaultVersionsSentinelFile("/tmp/board-x");
+  assert.ok(p.endsWith(join(".data", "versions.migrated.json")), p);
+  assert.notEqual(p, defaultVersionsLedgerFile("/tmp/board-x"), "哨兵不得与台账同路径");
+});
+
+test("B1-旧迁移开关已删（钉「不复用」）：store 不再暴露 exists()，边界只剩 migrationDone()", () => {
+  const { file } = tmpLedger();
+  const store = new VersionsLedgerStore(file);
+  assert.equal("exists" in store, false, "exists() 若还在，后续节点可能又把它当迁移边界接回去（假绿根源）");
+  assert.equal(typeof store.migrationDone, "function", "唯一边界判据 = 哨兵 migrationDone()");
+});
+
+test("N1-迁移成功：哨兵未立 ⇒ releasedVersions 四条全部灌入 status=released，回执 migrated=四条", () => {
   const { file } = tmpLedger();
   const store = new VersionsLedgerStore(file);
   const out = migrateReleasedVersions({
@@ -190,7 +212,7 @@ test("N1-迁移成功：台账不存在 ⇒ releasedVersions 四条全部灌入 
   assert.equal(findVersionRecord(ledger, "v0.9.1").note, "migrated:config-releasedVersions");
 });
 
-test("N1-迁移空配置：releasedVersions 为空 ⇒ 空操作、不建文件、无 warn", () => {
+test("B1-迁移空配置：releasedVersions 为空 ⇒ 空操作、不建文件、无 warn", () => {
   const { file } = tmpLedger();
   const store = new VersionsLedgerStore(file);
   const out = migrateReleasedVersions({ releasedVersions: [], store, now: NOW });
@@ -198,10 +220,11 @@ test("N1-迁移空配置：releasedVersions 为空 ⇒ 空操作、不建文件�
   assert.equal(existsSync(file), false, "空配置不落台账文件");
 });
 
-test("N1-迁移失败 ⇒ 向上抛出（拒起板）：seedReleased 写失败即 fail-fast", () => {
+test("B1-迁移失败 ⇒ 向上抛出（拒起板）：seedReleased 写失败即 fail-fast", () => {
   const boom = new Error("disk boom");
   const fake = {
-    exists: () => false,
+    migrationDone: () => false,
+    markMigrationDone: () => {},
     load: () => ({ ledger: emptyVersionsLedger(), corrupt: false }),
     seedReleased: () => {
       throw boom;
@@ -214,10 +237,11 @@ test("N1-迁移失败 ⇒ 向上抛出（拒起板）：seedReleased 写失败�
   );
 });
 
-test("N1-残留键 warn / 不双读：台账已存在 ⇒ 忽略 config 键（residual + warning），台账逐字节不动", () => {
-  const { file } = tmpLedger();
-  const store = new VersionsLedgerStore(file);
+test("B1-残留键 warn / 不双读：**哨兵已立** ⇒ 忽略 config 键（residual + warning），台账逐字节不动", () => {
+  const { dir, file } = tmpLedger();
+  const store = new VersionsLedgerStore(file, join(dir, ".data", "versions.migrated.json"));
   store.create("v0.10.0", NOW);
+  store.markMigrationDone("migrated=0 residual=0 orgBucketed=0");
   const before = readFileSync(file, "utf8");
   const out = migrateReleasedVersions({
     releasedVersions: ["v0.9.0", "v0.9.1"],
@@ -226,9 +250,217 @@ test("N1-残留键 warn / 不双读：台账已存在 ⇒ 忽略 config 键（re
   });
   assert.deepEqual(out.migrated, [], "不双读：不再重复灌入");
   assert.deepEqual(out.residual, ["v0.9.0", "v0.9.1"]);
-  assert.match(out.warning, /残留键/, "一次性 warn 文案");
+  assert.match(out.warning, /残留键/, "warn 文案");
+  assert.match(out.warning, /哨兵已立/, "边界判据 = 哨兵（文案须说明事实源，不再说「台账已存在」）");
   assert.equal(readFileSync(file, "utf8"), before, "残留键不得改动台账文件");
   assert.deepEqual(findVersionRecord(store.load().ledger, "v0.9.0"), null, "残留键值不进台账");
+});
+
+test("B1-假绿钉：台账文件**已存在但为空**（无哨兵）⇒ 不得当成「已迁移」，照灌 releasedVersions", () => {
+  const { file } = tmpLedger();
+  const store = new VersionsLedgerStore(file);
+  store.save(emptyVersionsLedger());
+  assert.equal(existsSync(file), true, "前置：台账文件存在（旧判据「台账是否存在」会在此假绿）");
+  assert.equal(store.migrationDone(), false, "前置：哨兵未立");
+  const out = migrateReleasedVersions({ releasedVersions: ["v0.9.0"], store, now: NOW });
+  assert.deepEqual(out.migrated, ["v0.9.0"], "空台账 + 无哨兵 ⇒ 迁移视同未发生，不得静默丢弃锁数据");
+  assert.deepEqual(out.residual, []);
+});
+
+test("B1-哨兵落点：注入自定义台账路径 ⇒ 哨兵由台账**同目录派生**（不落到 cwd/.data 生产目录）", () => {
+  const { dir, file } = tmpLedger();
+  const custom = join(dir, "elsewhere", "v.json");
+  const store = new VersionsLedgerStore(custom);
+  assert.equal(store.sentinelFile, join(dir, "elsewhere", "versions.migrated.json"), store.sentinelFile);
+  const plain = new VersionsLedgerStore(file);
+  assert.equal(plain.sentinelFile, defaultVersionsSentinelFile(dir), "台账走缺省落点时哨兵与缺省哨兵同路径");
+});
+
+test("B1-哨兵落盘：markMigrationDone 建文件（含 doneAt/note）、migrationDone 转真；哨兵与台账两判据正交", () => {
+  const { dir, file } = tmpLedger();
+  const sentinel = join(dir, ".data", "versions.migrated.json");
+  const store = new VersionsLedgerStore(file, sentinel);
+  assert.equal(store.migrationDone(), false);
+  store.markMigrationDone("migrated=4");
+  assert.equal(store.migrationDone(), true);
+  assert.equal(existsSync(sentinel), true);
+  const body = JSON.parse(readFileSync(sentinel, "utf8"));
+  assert.equal(body.kind, "board-versions-migration-sentinel");
+  assert.equal(body.note, "migrated=4");
+  assert.ok(typeof body.doneAt === "string" && body.doneAt.endsWith("Z"), "doneAt = ISO 时刻");
+  assert.equal(existsSync(file), false, "**哨兵不得创建台账**（两判据正交）");
+  assert.deepEqual(readdirSync(join(dir, ".data")).sort(), ["versions.migrated.json"], "哨兵写入不留 .tmp 残留");
+});
+
+test("B1-升级路径：哨兵缺失 + 台账已有数据 ⇒ 已存在版号**不覆盖不复制**、缺失版号补入；回执只报本次新增", () => {
+  const { file } = tmpLedger();
+  const store = new VersionsLedgerStore(file);
+  let l = createVersion(emptyVersionsLedger(), "v0.9.3", NOW, "a2a").ledger;
+  l = setVersionStatus(l, "v0.9.3", "active", NOW, "manual:keep").ledger;
+  store.save(l);
+  const out = migrateReleasedVersions({ releasedVersions: ["v0.9.3", "v0.9.0"], store, now: NOW });
+  assert.deepEqual(out.migrated, ["v0.9.0"], "v0.9.3 已在台账（active）⇒ 幂等跳过，不进「已灌入」回执");
+  const after = store.load().ledger;
+  assert.equal(after.versions.length, 2, "已存在版号不得复制出空串桶副本");
+  assert.equal(findVersionRecord(after, "v0.9.3", "a2a").status, "active", "既有行状态不被迁移覆盖");
+  assert.equal(findVersionRecord(after, "v0.9.3", "a2a").note, "manual:keep", "既有 note 留痕不被改写");
+  assert.equal(isVersionReleased(after, "v0.9.0"), true, "台账缺失的已发版版号补入为 released（锁不静默消失）");
+});
+
+test("B1-升级路径幂等：重跑迁移（哨兵仍未立）⇒ 零新增、台账逐字节不动", () => {
+  const { file } = tmpLedger();
+  const store = new VersionsLedgerStore(file);
+  migrateReleasedVersions({ releasedVersions: ["v0.9.0", "v0.9.1"], store, now: NOW });
+  const before = readFileSync(file, "utf8");
+  const again = migrateReleasedVersions({ releasedVersions: ["v0.9.0", "v0.9.1"], store, now: "2026-10-09T00:00:00.000Z" });
+  assert.deepEqual(again.migrated, [], "已灌入的版号第二次不再算新增");
+  assert.equal(readFileSync(file, "utf8"), before, "重跑不得改动台账（updatedAt/note 不动）");
+});
+
+// ---------------------------------------------------------------------------
+// v0.10.0 B1 出源：台账整表 → 引擎导入载荷（全字段、纯读、确定性、坏文件拒导）
+// ---------------------------------------------------------------------------
+
+test("B1-出源全字段：org/version/status/note/createdAt/updatedAt 逐值透传（含未归属空串桶），date 恒 null 空位", () => {
+  const { file } = tmpLedger();
+  const store = new VersionsLedgerStore(file);
+  let l = createVersion(emptyVersionsLedger(), "v0.9.0", "2026-09-20T00:00:00.000Z", "a2a").ledger;
+  l = setVersionStatus(l, "v0.9.0", "released", "2026-09-21T00:00:00.000Z", "manual:ship", "a2a").ledger;
+  l = createVersion(l, "v0.9.8", "2026-10-04T00:00:00.000Z", "a2a").ledger;
+  l = createVersion(l, "v1.0.0", "2026-10-05T00:00:00.000Z", "").ledger;
+  store.save(l);
+  const payload = exportVersionsLedger(store);
+  assert.equal(payload.schema, VERSIONS_EXPORT_SCHEMA);
+  assert.equal(payload.count, 3);
+  assert.deepEqual(payload.versions, [
+    {
+      org: "a2a",
+      version: "v0.9.0",
+      status: "released",
+      date: null,
+      note: "manual:ship",
+      createdAt: "2026-09-20T00:00:00.000Z",
+      updatedAt: "2026-09-21T00:00:00.000Z",
+    },
+    {
+      org: "a2a",
+      version: "v0.9.8",
+      status: "notstart",
+      date: null,
+      note: null,
+      createdAt: "2026-10-04T00:00:00.000Z",
+      updatedAt: "2026-10-04T00:00:00.000Z",
+    },
+    {
+      org: "",
+      version: "v1.0.0",
+      status: "notstart",
+      date: null,
+      note: null,
+      createdAt: "2026-10-05T00:00:00.000Z",
+      updatedAt: "2026-10-05T00:00:00.000Z",
+    },
+  ]);
+  assert.deepEqual(payload.versions.map((v) => v.org), ["a2a", "a2a", ""], "未归属桶如实带出，不出源侧过滤");
+});
+
+test("B1-出源确定性 + 纯读：两次导出逐字节相同、台账与哨兵文件零改动", () => {
+  const { file } = tmpLedger();
+  const store = new VersionsLedgerStore(file);
+  store.create("v0.9.0", NOW, "a2a");
+  store.create("v0.9.1", NOW, "a2a");
+  const before = readFileSync(file, "utf8");
+  const a = serializeVersionsExport(exportVersionsLedger(store));
+  const b = serializeVersionsExport(exportVersionsLedger(store));
+  assert.equal(a, b, "确定性：载荷不含生成时刻 ⇒ 可 diff、可重复导");
+  assert.ok(!a.includes("generatedAt"), "不得混入易变字段");
+  assert.equal(readFileSync(file, "utf8"), before, "出源是纯读，不改台账");
+  assert.equal(store.migrationDone(), false, "出源不立哨兵（哨兵只属迁移链路）");
+});
+
+test("B1-出源坏文件 ⇒ 抛出拒导（不按空台账出货，防 released 历史静默导出为零）", () => {
+  const { dir, file } = tmpLedger();
+  mkdirSync(join(dir, ".data"));
+  writeFileSync(file, "{ 这不是 JSON", "utf8");
+  const store = new VersionsLedgerStore(file);
+  assert.throws(() => exportVersionsLedger(store), /损坏/, "坏文件必须拒导");
+});
+
+test("B1-出源缺文件 ⇒ 诚实的空（count=0，不抛）", () => {
+  const { file } = tmpLedger();
+  const store = new VersionsLedgerStore(file);
+  assert.deepEqual(exportVersionsLedger(store).versions, []);
+});
+
+// ---------------------------------------------------------------------------
+// v0.10.0 B1 出源 CLI：scripts/export-versions-ledger.mjs（只读、退出码 {0,1,2}）
+// ---------------------------------------------------------------------------
+
+function runExportCli(args, cwd) {
+  return spawnSync(process.execPath, [join(boardRoot, "scripts", "export-versions-ledger.mjs"), ...args], {
+    encoding: "utf8",
+    cwd,
+  });
+}
+
+test("B1-CLI：--stdout 打全字段载荷；exit 0；台账文件逐字节不动（纯读）", () => {
+  const { dir, file } = tmpLedger();
+  const store = new VersionsLedgerStore(file);
+  let l = createVersion(emptyVersionsLedger(), "v0.9.0", NOW, "a2a").ledger;
+  l = setVersionStatus(l, "v0.9.0", "released", "2026-09-28T00:00:00.000Z", "manual:ship", "a2a").ledger;
+  store.save(l);
+  const before = readFileSync(file, "utf8");
+  const r = runExportCli(["--in", file, "--stdout"], dir);
+  assert.equal(r.status, 0, r.stderr);
+  const payload = JSON.parse(r.stdout);
+  assert.equal(payload.schema, VERSIONS_EXPORT_SCHEMA);
+  assert.equal(payload.count, 1);
+  assert.deepEqual(payload.versions, [
+    {
+      org: "a2a",
+      version: "v0.9.0",
+      status: "released",
+      date: null,
+      note: "manual:ship",
+      createdAt: NOW,
+      updatedAt: "2026-09-28T00:00:00.000Z",
+    },
+  ]);
+  assert.equal(readFileSync(file, "utf8"), before, "CLI 不得改动台账");
+  assert.equal(existsSync(join(dir, ".data", "versions.migrated.json")), false, "CLI 不立哨兵");
+});
+
+test("B1-CLI：--out 落文件；缺省落点 = 台账同目录 versions-export.json", () => {
+  const { dir, file } = tmpLedger();
+  const store = new VersionsLedgerStore(file);
+  store.create("v0.9.0", NOW, "a2a");
+  const outPath = join(dir, "engine-import", "versions.json");
+  const r1 = runExportCli(["--in", file, "--out", outPath], dir);
+  assert.equal(r1.status, 0, r1.stderr);
+  assert.equal(JSON.parse(readFileSync(outPath, "utf8")).count, 1);
+  const r2 = runExportCli(["--in", file], dir);
+  assert.equal(r2.status, 0, r2.stderr);
+  assert.equal(existsSync(join(dir, ".data", "versions-export.json")), true, "缺省导出落台账同目录");
+});
+
+test("B1-CLI：台账损坏 ⇒ exit 2 且**不产载荷**（不按空台账出货）", () => {
+  const { dir, file } = tmpLedger();
+  mkdirSync(join(dir, ".data"));
+  writeFileSync(file, "{ 这不是 JSON", "utf8");
+  const outPath = join(dir, "out.json");
+  const r = runExportCli(["--in", file, "--out", outPath], dir);
+  assert.equal(r.status, 2, r.stdout + r.stderr);
+  assert.equal(existsSync(outPath), false, "拒导不得留下半截导出文件");
+});
+
+test("B1-CLI：缺文件 ⇒ exit 0 + count 0（诚实的空）；未知参数 ⇒ exit 1", () => {
+  const { dir, file } = tmpLedger();
+  const ok = runExportCli(["--in", file, "--stdout"], dir);
+  assert.equal(ok.status, 0, ok.stderr);
+  assert.equal(JSON.parse(ok.stdout).count, 0);
+  const bad = runExportCli(["--nope"], dir);
+  assert.equal(bad.status, 1);
+  assert.match(bad.stderr, /未知参数/);
 });
 
 // ---------------------------------------------------------------------------

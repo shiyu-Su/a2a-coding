@@ -24,6 +24,7 @@
  * | `/api/events?since=&limit=&featureId=` | `store.listEvents({ since, limit, featureId })` | **直连 store**；游标由前端传参；`featureId` = 按需求收窄（v0.9.0 B3″，仍纯读） |
  * | `/api/groups` | `loadMachinesConfig(configPath).groups`（每请求现读） | **全组枚举**（v0.9.4 O2）：组结构声明面（`projectGroup` 段），与 `/api/projects`（运行态）语义不同，刻意不合并；配置坏 → 500 `machines_config_error` |
  * | `/api/registry/projects` | `store.listRunners` + `store.listRunnerProjects`（每请求现读，直连） | **注册表全量投影**（REQ-2026-10-03-02）：`runners` 表遍历源，含离线机与其项目，**未经组过滤、无组语义**；与 `/api/projects` 两条读路刻意不交叉复用（C-6） |
+ * | `/api/features-by-version?owner_group=&version=` | `store.aggregateFeaturesByVersion(owner_group)`（v0.10.0 O3，直连） | **版本名下卡聚合读面**：`features` 按版号派生「卡清单 + 三桶计数 `{total,completed,cancelled,open}`」，**未登记版号单列一桶不静默丢**；可见性经 `owner_group` 与 `listFeatures` 同源；`version` 给定 ⇒ 收窄到该桶。供板 §2.3「卡派生版号」并集；**非版本台账**（三态归 `/api/versions`），**不做闸判定**（归 O4） |
  *
  * ## 硬约束：读事件**绝不移动宿主收件箱游标**
  *
@@ -68,12 +69,20 @@
  */
 import { createServer as createHttpServer } from "node:http";
 import type { IncomingMessage, Server, ServerResponse } from "node:http";
-import { getQueuedTask, listEvents, listRunnerProjects, listRunners } from "../../session/store.js";
+import {
+  aggregateFeaturesByVersion,
+  getQueuedTask,
+  listEvents,
+  listRunnerProjects,
+  listRunners,
+} from "../../session/store.js";
 import type {
   QueueState,
   QueuedTaskRecord,
   RunnerProjectRecord,
   RunnerState,
+  VersionCardAggregate,
+  VersionFeaturesBucket,
 } from "../../session/store.js";
 import type {
   EventRecord,
@@ -116,6 +125,10 @@ const GROUPS_SOURCE = "config.json `projectGroup` 段（每请求现读，热改
 const REGISTRY_PROJECTS_SOURCE = "桥注册表（Runner 上报全量投影，未经组过滤）";
 const REGISTRY_PROJECTS_NOTE =
   "全量投影语义：遍历源 = runners 注册表（含离线机及其项目、含零项目机），未经组过滤、不认识组；非实时在线探测，项目陈旧性以 lastReportedAt（最后一次 Runner 上报时刻）表达";
+
+const FEATURES_BY_VERSION_SOURCE = "features 表按版号聚合（v0.10.0 O3，零新实体；非版本台账）";
+const FEATURES_BY_VERSION_NOTE =
+  "派生面语义：版号 → 名下需求卡清单 + 三桶计数 {total, completed, cancelled, open}；未登记版号（version 为 NULL/空串）单列一桶、不静默丢；可见性 = owner_group 过滤（与 listFeatures 同源）。本面是 features 派生投影，非引擎版本台账（三态 status 见 /api/versions）；闸判定归 O4，本面只出计数";
 
 /** 网页端最小内核依赖（`Pick<BridgeCore, …>`：N4 直接传完整 core，结构性兼容） */
 export type WebCore = Pick<BridgeCore, "projects" | "tasks" | "featureStatus">;
@@ -294,7 +307,7 @@ export async function startWebTransport(
     bridgeLog.error("a2a-bridge", `网页接面错误：${toMessage(err)}`);
   });
   bridgeLog.info("a2a-bridge", `只读网页接面已监听 http://${host}:${boundPort}/`, {
-    api: "/api/projects, /api/features, /api/tasks, /api/events, /api/groups, /api/registry/projects",
+    api: "/api/projects, /api/features, /api/features-by-version, /api/tasks, /api/events, /api/groups, /api/registry/projects",
     refreshMs: resolveRefreshMs(options.refreshMs),
   });
 
@@ -377,17 +390,25 @@ type WebRoute =
   | { kind: "tasks"; taskId: string | null }
   | { kind: "events" }
   | { kind: "groups" }
-  | { kind: "registryProjects" };
+  | { kind: "registryProjects" }
+  | { kind: "featuresByVersion" };
 
 const FEATURES_PREFIX = "/api/features/";
 const TRACE_SUFFIX = "/trace";
 const TASKS_PREFIX = "/api/tasks/";
 /** 注册表全量投影路径（REQ-2026-10-03-02 C-1…C-6；无查询参数、无身份参数） */
 const REGISTRY_PROJECTS_PATH = "/api/registry/projects";
+/**
+ * 版本名下卡聚合读面路径（v0.10.0 O3）。
+ * 刻意用 `/api/features-by-version`（非 `/api/features/…`）：不与 `FEATURES_PREFIX` 前缀分支相撞，
+ * 也与引擎版本台账 `/api/versions`（O2）语义分开 —— 本面是 `features` 派生投影，非台账。
+ */
+const FEATURES_BY_VERSION_PATH = "/api/features-by-version";
 
 function matchRoute(path: string): WebRoute | null {
   if (path === "/api/projects") return { kind: "projects" };
   if (path === "/api/features") return { kind: "features", featureId: null };
+  if (path === FEATURES_BY_VERSION_PATH) return { kind: "featuresByVersion" };
   if (path.startsWith(FEATURES_PREFIX)) {
     const raw = path.slice(FEATURES_PREFIX.length);
     if (raw.length > 0 && !raw.includes("/")) return { kind: "features", featureId: raw };
@@ -483,6 +504,9 @@ async function handleRequest(
       return;
     case "registryProjects":
       sendRegistryProjects(res);
+      return;
+    case "featuresByVersion":
+      sendFeaturesByVersion(res, url);
       return;
   }
 }
@@ -867,6 +891,70 @@ function toRegistryProjectView(project: RunnerProjectRecord): RegistryProjectVie
     startedAt: project.startedAt,
     lastReportedAt: project.updatedAt,
   };
+}
+
+/**
+ * `GET /api/features-by-version?owner_group=&version=`：**版本名下卡聚合读面**（v0.10.0 O3，
+ * 改造文档 §2.1(5)「只读聚合面 · 首刀 · 零新实体」）。
+ *
+ * 存在理由：把「版号 → 名下需求卡清单 + 三桶计数 `{total, completed, cancelled, open}`」从
+ * `features` 一处派生，供 **板 §2.3「引擎 Release 清单 ∪ 卡派生版号」并集的右半**
+ * （卡派生版号 = 本面 `versions` 全集）。
+ *
+ * - **可见性同源**：`owner_group` 直接透给 `aggregateFeaturesByVersion`（其内复用
+ *   {@link featureOwnershipPredicate} = 与 `listFeatures` 同一判据，不另写）；缺省 / 空 ⇒ 全量
+ *   （3300 运维视图，与本文件其它面 `identity=null` 口径一致）；给定组名 ⇒ 仅本组
+ *   （NULL 无归属被排除 = fail-closed）。
+ * - **`version` 可选收窄**：给定 ⇒ `buckets` 只留该版号桶（**空串 ⇒ 未登记桶**）；缺省 ⇒ 全部桶。
+ *   `versions` / `unregisteredCount` 恒为**全量口径**（收窄只动 `buckets`，不改派生版号全集）。
+ * - **未登记版号不静默丢**：`version=null` 的桶恒在 `buckets` 末位（若存在未登记卡），计数另见
+ *   `unregisteredCount`。
+ * - **只读、零副作用、不判闸**：闸判定归 O4；本面只出计数与清单。聚合读失败 ⇒ 500
+ *   `version_aggregate_error`（**不 fail-open 成空**，与 `registry_read_error` 同口径）。
+ *
+ * 出参直接透出 store 聚合面形状（{@link VersionCardAggregate} / {@link VersionFeaturesBucket}）——
+ * 该形状在 store 侧已收窄（不带 `requirement`/`plan`/`decisions` 长文本），此处不再二次白名单，
+ * **避免两份形状漂移**。
+ */
+function sendFeaturesByVersion(res: ServerResponse, url: URL): void {
+  const observedAt = new Date().toISOString();
+  const ownerRaw = url.searchParams.get("owner_group");
+  const ownerGroup = ownerRaw === null || ownerRaw.length === 0 ? undefined : ownerRaw;
+  const versionParam = url.searchParams.get("version"); // null=不给（全量）；""=显式未登记桶
+
+  let aggregate: VersionCardAggregate;
+  try {
+    aggregate = aggregateFeaturesByVersion(ownerGroup);
+  } catch (err) {
+    respondJson(res, 500, {
+      ...failure("version_aggregate_error", `版本名下卡聚合读失败：${toMessage(err)}`),
+      source: FEATURES_BY_VERSION_SOURCE,
+      observedAt,
+    });
+    return;
+  }
+
+  const buckets: VersionFeaturesBucket[] =
+    versionParam === null
+      ? aggregate.buckets
+      : aggregate.buckets.filter((b) => (b.version ?? "") === versionParam);
+
+  respondJson(res, 200, {
+    ok: true,
+    source: FEATURES_BY_VERSION_SOURCE,
+    observedAt,
+    note: FEATURES_BY_VERSION_NOTE,
+    ownerGroup: ownerGroup ?? null,
+    version: versionParam,
+    versions: aggregate.versions,
+    unregisteredCount: aggregate.unregisteredCount,
+    buckets,
+    counts: {
+      versions: aggregate.versions.length,
+      buckets: buckets.length,
+      features: buckets.reduce((sum, b) => sum + b.counts.total, 0),
+    },
+  });
 }
 
 // ---------------------------------------------------------------------------

@@ -121,10 +121,13 @@ import { mkdirSync, readFileSync } from "node:fs";
 import { join } from "node:path";
 import {
   createBridgeClient,
+  createEngineVersionsFetcher,
   DEFAULT_BRIDGE_BASE_URL,
   type AcceptanceView,
   type BridgeClient,
   type BridgeClientOptions,
+  type EngineVersionsFetcher,
+  type EngineVersionsProjection,
   type FeatureListItem,
   type ProjectsView,
 } from "./bridge-client.js";
@@ -197,17 +200,13 @@ import {
   type GroupMemberWriteOptions,
 } from "./group-admin.js";
 import { OrgsLedgerStore, defaultOrgsLedgerFile, enabledOrgNames, findOrgRecord, ledgerOrgNames, disabledOrgNames, isOrgDisabled } from "./orgs-ledger.js";
-import { VersionsLedgerStore, defaultVersionsLedgerFile, findVersionRecord, ledgerVersionNames, releasedVersionNames, type VersionOrgFilter, type VersionsLedger } from "./versions-ledger.js";
+import { VersionsLedgerStore, defaultVersionsLedgerFile, ledgerVersionNames, releasedVersionNames, type VersionsLedger } from "./versions-ledger.js";
+import { createVersionsWriteClient, describeVersionWriteError, type VersionsWriteClient } from "./versions-write.js";
 import { SuspendLedgerStore, defaultSuspendLedgerFile, type SuspendedEntry } from "./suspend-ledger.js";
-import {
-  applyAutoVersionTransitions,
-  decideVersionTransition,
-  isConfirmedCard,
-} from "./version-transition.js";
 import { statDirKind } from "./host-runtime.js";
 import { readVersion } from "./version.js";
 import { isVersionLocked } from "./version-status.js";
-import { normalizeVersion, parseVersion } from "./version-order.js";
+import { normalizeVersion } from "./version-order.js";
 import { defaultRepoRoot, readDoc, type DocsSource } from "./docs-read.js";
 import { docsMoveRegistrations, executeDocsMove, planDocsMove, type DocsMoveResult } from "./docs-move.js";
 import { defaultStaticRoot, findVendoredAsset, VENDORED_ASSETS, MERMAID_ASSET, mermaidAssetScriptTag, mermaidRenderScript, vendoredAssetExists } from "./docs-render.js";
@@ -277,6 +276,8 @@ import {
   buildOrgPortalCards,
   errorFamilyLabel,
   groupFeaturesByVersion,
+  projectionLedgerOf,
+  projectionVersionNames,
   renderAcceptanceSection,
   renderActionArea,
   renderAgentsPage,
@@ -367,6 +368,20 @@ export interface CreateBoardServerOptions {
     input: { groupName: string },
     options: GroupMemberWriteOptions,
   ) => Promise<GroupMemberWriteOutcome>;
+  /**
+   * **版本台账写口注入**（v0.10.0 B2 · 改造文档 §2.1(2) / §2.3(2)）。缺省用 `versions-write.js` 的
+   * {@link createVersionsWriteClient}（打 `mcpBaseUrl` = 引擎可写面 `/api/versions*`）。
+   * 三处写面（建 / 删 / 设状态）**只经本客户端向引擎发意图**；板**无本地下沉兜底写** ——
+   * 引擎不可达即硬失败，注入点不可省略、也不可回落。
+   */
+  versionsWriteImpl?: VersionsWriteClient;
+  /**
+   * **版本台账读投影注入**（v0.10.0 B4 · 改造文档 §2.3(1)）：已发版锁的**唯一数据源**。
+   * 缺省 = 按 `mcpBaseUrl`（引擎可写面）打 `GET /api/versions`；测试注入假端点。
+   * 读不到投影 ⇒ 写口 **fail-closed 挡排期写**（503），**不回落本地台账、绝不当作「零个已发版」**；
+   * 读面（版本列 / 详情页锁样式）用**本进程最后一次成功投影**（锁只紧不松）。
+   */
+  engineVersionsFetcher?: EngineVersionsFetcher;
   /**
    * **宿主面**（BD8）：触发一轮 / 桥状态 / 停桥的唯一入口，缺省 `null` ⇒ 宿主面不可用
    * （`GET /host` 如实显示「未装配」，写端点结构化 503 `host_face_disabled`，**不假数据**）。
@@ -540,6 +555,11 @@ interface Ctx extends PageCtx {
     groupMemberWrite: NonNullable<CreateBoardServerOptions["groupMemberWriteImpl"]>;
     /** 停用释放成员写（§9.4-①）：`group.remove` 唯一通路，停用 handler 专享（不经成员表单）。 */
     releaseOrgGroup: NonNullable<CreateBoardServerOptions["releaseOrgGroupImpl"]>;
+    /**
+     * 版本台账写口（v0.10.0 B2）：建 / 删 / 设状态三支的**唯一出口**，打引擎 `/api/versions*`；
+     * 板不判闸、不本地兜底（引擎不可达 ⇒ 硬失败）。
+     */
+    versions: VersionsWriteClient;
   };
   /** BD8 宿主面（`null` ⇒ 未装配，写端点结构化 503、状态页如实显示）。 */
   host: BoardHostFace | null;
@@ -557,8 +577,20 @@ interface Ctx extends PageCtx {
   bridgeIdentity: BridgeIdentityFetcher | null;
   /** v0.9.4 A1：板侧组织台账存取（`.data/orgs.json`；建组织写口的唯一落点，单进程单写手）。 */
   orgsLedger: OrgsLedgerStore;
-  /** v0.9.4 N1：板侧版本台账存取（`.data/versions.json`；`POST /versions` 写口唯一落点，亦为版本锁唯一事实源）。 */
+  /**
+   * v0.9.4 N1：板侧版本台账存取（`.data/versions.json`）。
+   * **v0.10.0 起角色翻转**（B2 写面改道引擎 / B4 锁改读引擎投影）：本文件**不再是版本锁事实源**，
+   * 降为读缓存/降级投影 + 列并集的派生版号读面（B5）。
+   */
   versionsLedger: VersionsLedgerStore;
+  /** v0.10.0 B4：引擎版本台账读面（`GET /api/versions`，已发版锁的唯一数据源）。 */
+  engineVersions: EngineVersionsFetcher;
+  /** v0.10.0 B4：本进程**最后一次成功**的引擎台账投影（桥不可达时读面按它显示；写面不回落）。 */
+  engineVersionsLastGood: EngineVersionsProjection | null;
+  /** v0.10.0 B4：最近一次读不到的根因文案（`null` = 最近一次读到了）；写口 503 文案的事实源。 */
+  engineVersionsFailure: string | null;
+  /** v0.10.0 B4：在途读取（页面一次渲染只打一次 `/api/versions`，多个读面共用同一份结果）。 */
+  engineVersionsInFlight: Promise<EngineVersionsProjection | null> | null;
   /**
    * v0.9.5 C7 · T7：板侧 **suspended 台账**（内存为事实源；`.data/suspended.json` 仅供崩溃取证、启动清空重写）。
    * 挂起口写、停链口清；心跳监视（C8）读本实例。
@@ -568,12 +600,6 @@ interface Ctx extends PageCtx {
    * v0.9.5 C10：组织种子化配置（`null` ⇒ 不种子化）。建组织链与启动回填共用同一份解析结果。
    */
   orgSeed: ResolvedOrgSeedOptions | null;
-  /**
-   * v0.9.4 W3：自动转换（`notstart → active`）的**进程内节流表**——
-   * 键 = `versionKey(org, version)` 复合串（v0.9.6 B2 · 口径 31：同一版本在不同组织各自计量），
-   * 值 = 上次尝试时刻 ms；跨请求复用，板进程内单实例（护栏③）。
-   */
-  versionAutoThrottle: Map<string, number>;
 }
 
 interface Page {
@@ -717,42 +743,122 @@ function orgsStatusOf(host: BoardHostFace | null): OrgsDirStatus {
   return { tier: "ready", orgsDir: configured };
 }
 
+// ---------------------------------------------------------------------------
+// v0.10.0 B4：已发版锁的引擎读投影（事实源 = 引擎版本台账，板只投影）
+// ---------------------------------------------------------------------------
+
+/** 引擎台账投影读不到时的**写口**错误码（fail-closed：挡排期写，不回落本地台账）。 */
+const VERSION_PROJECTION_UNAVAILABLE_CODE = "board_version_projection_unavailable";
+
+/** 投影不可达时的统一文案（写口 503 与读面降级提示同源，不各写一套）。 */
+function versionProjectionUnreadableText(reason: string): string {
+  return `引擎版本台账投影不可读（${reason}）`;
+}
+
 /**
- * 排期看板正文单点（全局页 ∩ D 档组织空间页共用）：数据源由调用方给定
- * （全局 = `getFeatures()` 原样；空间 = 先过 {@link featuresOfOrg} 按 ownerGroup 过滤）。
- * 弹窗表单的组织上下文（BD8）：`spaceOrg` 非空 ⇒ 免选形态（只读展示 + hidden 值必发 + action 带前缀）。
+ * 投影 → 台账形状：**只取 `status = released` 的条目**并落 `released`（其余两态 `notstart`/`active`
+ * 不入锁 —— 把「进行中的版本」当已发版锁住是反语义）。**锁的 org 切片与去重继续走
+ * {@link releasedVersionNames} 单点**，本模块不再立第二套「已发版集」判据。
+ * `null` ⇒ 空集（只用于读面「无锁可显示」档；写面不得用此档放行，见 {@link versionProjectionOf}）。
  */
+function versionProjectionLedgerOf(
+  projection: EngineVersionsProjection | null,
+): VersionsLedger {
+  if (projection === null) return { version: 0, versions: [] };
+  return {
+    version: 0,
+    versions: projection.entries
+      .filter((entry) => entry.status === "released")
+      .map((entry) => ({
+        org: entry.org,
+        version: entry.version,
+        status: "released" as const,
+        createdAt: projection.capturedAt,
+        updatedAt: projection.capturedAt,
+        note: null,
+      })),
+  };
+}
+
 /**
- * 渲染前**惰性自动转换**（W3 · 改造文档 §2.3）：唯一一处 `notstart → active` 触发点。
- * 比对「台账 notstart 条目 × 该条目所属组织的该版本名下存在已确认卡（stage ≠ 需求分析）」；
- * 三护栏由 {@link applyAutoVersionTransitions} 承担（幂等 / 写失败不阻断渲染 / 进程内节流），
- * 此处仅做 warn 留痕（写失败 ⇒ 该条目回落派生态、渲染照常）。
- * **候选逐组织判定**（v0.9.6 B2 · 口径 31）：`cards` 喂**全局**列表（自动转换要看得到每张卡的
- * 归属），落点按 `(ownerGroup, version)` 判定 —— 台账已按 `(org, version)` 成域，他组织的
- * 已确认卡不点亮本组织的同版号条目。
+ * 取引擎版本台账投影（**一次渲染只打一次** `/api/versions`：同请求内的多个消费点共用同一在途结果）。
+ * 口径（改造文档 §2.3(1)）：
+ * - 读到 ⇒ 刷新进程内「最后一次投影」并返回；
+ * - 读不到 ⇒ 返回**最后一次投影**（读面「锁只紧不松」）；进程内从未读到过 ⇒ `null`
+ *   —— 由写面按 **fail-closed 挡排期写**、读面按「无锁可显示」降级，两侧都**绝不**把
+ *   「拿不到台账」当成「零个已发版」放行。读不到的根因留在 {@link Ctx.engineVersionsFailure}
+ *   供写口如实点出。
  */
-function syncAutoVersionTransitions(ctx: Ctx, features: readonly FeatureListItem[]): VersionsLedger {
-  const { ledger } = ctx.versionsLedger.load();
-  const outcome = applyAutoVersionTransitions({
-    ledger,
-    cards: features,
-    store: ctx.versionsLedger,
-    throttle: ctx.versionAutoThrottle,
-    nowMs: ctx.now(),
-  });
-  for (const t of outcome.failed) {
-    process.stderr.write(
-      `警告：版本 ${t.version}（${t.org === "" ? "未归属组织" : t.org}）首卡过确认门自动转 active 写失败（不阻断渲染，回落派生态）\n`,
-    );
+async function versionProjectionOf(ctx: Ctx): Promise<EngineVersionsProjection | null> {
+  if (ctx.engineVersionsInFlight !== null) return ctx.engineVersionsInFlight;
+  const pending = (async (): Promise<EngineVersionsProjection | null> => {
+    try {
+      const outcome = await ctx.engineVersions();
+      if (outcome.kind === "projection") {
+        ctx.engineVersionsLastGood = outcome.projection;
+        ctx.engineVersionsFailure = null;
+        return outcome.projection;
+      }
+      ctx.engineVersionsFailure = versionProjectionUnreadableText(`${outcome.code} · ${outcome.error}`);
+      return ctx.engineVersionsLastGood;
+    } catch (err) {
+      // 注入面按契约不抛；本兜底同样不放开写口（根因进文案，不静默）。
+      ctx.engineVersionsFailure = versionProjectionUnreadableText(errText(err));
+      return ctx.engineVersionsLastGood;
+    }
+  })();
+  ctx.engineVersionsInFlight = pending;
+  try {
+    return await pending;
+  } finally {
+    ctx.engineVersionsInFlight = null;
   }
-  return outcome.ledger;
+}
+
+/**
+ * 门户「版本摘要行」的喂入台账（v0.10.0 尾段 N2 · 摘要换源）：
+ * 事实源 = **引擎版本台账投影**（含三态 ⇒ 台账登记的「进行中」不退化成卡派生 `*`）；
+ * **只在从未读到过投影时**（{@link versionProjectionOf} 返 `null`）退板本地台账**读缓存** ——
+ * 与 N1 版本列的降级档同一口径（读面不挡；写口的 fail-closed 不经此路径，见
+ * {@link respondVersionProjectionClosed}）。纯读、零写。
+ */
+async function portalSummaryLedgerOf(ctx: Ctx): Promise<VersionsLedger> {
+  const projection = await versionProjectionOf(ctx);
+  return projection === null ? ctx.versionsLedger.load().ledger : projectionLedgerOf(projection);
+}
+
+/** 写口的 fail-closed 出口：拿不到投影 ⇒ 结构化 503 拒写（零出网，不触引擎写口）。 */
+function respondVersionProjectionClosed(
+  res: ServerResponse,
+  ctx: Ctx,
+  accept: string | undefined,
+  fields: readonly ErrorOverlayField[],
+  active: NavKey = "features",
+): void {
+  respondError(
+    res,
+    accept,
+    503,
+    VERSION_PROJECTION_UNAVAILABLE_CODE,
+    `${ctx.engineVersionsFailure ?? versionProjectionUnreadableText("原因未知")} ⇒ 已发版锁无法判定，本板拒绝排期写` +
+      `（**fail-closed**：拿不到引擎版本台账投影时绝不当作「零个已发版」放行）。请稍后重试；` +
+      `锁的判定恢复 = 引擎版本台账读端点可达。`,
+    undefined,
+    fields,
+    active,
+  );
 }
 
 /**
  * 排期看板正文单点（v0.9.6 B5a 起唯一调用方 = D 档组织空间排期页；全局 `/schedule` 页已退役）：
  * 数据源由调用方给定（空间 = 先过 {@link featuresOfOrg} 按 ownerGroup 过滤）。
  * 弹窗表单的组织上下文（BD8）：`spaceOrg` 非空 ⇒ 免选形态（只读展示 + hidden 值必发 + action 带前缀）。
- * `ledger` = 调用方已过 {@link syncAutoVersionTransitions} 的回落渲染台账（版本列 = 台账 ∪ 卡派生并集）。
+ * **v0.10.0 B4 数据源分家**：`lockedVersions` = **引擎投影喂入**的已发版名单（调用方经
+ * {@link versionProjectionOf} 取，按 `spaceOrg` 切片）；`ledger` = 本地台账，**不再参与锁判定**。
+ * **版本列并集（v0.10.0 尾段 N1）**：列源 = **引擎版本台账清单 ∪ 卡派生版号**（并集留板，见
+ * {@link projectionVersionNames} / {@link groupFeaturesByVersion}）—— **绝不只渲染引擎清单**
+ * （引擎无条目 ∧ 卡有 `version` ⇒ 该卡仍须成列，否则它在版本面失去清单读面）；本地台账只在
+ * **投影从未读到过**的降级档贡献版号，正常档不喂（事实源在引擎）。
  * **增补八 §9.3**：全局页（`spaceOrg` 为 null）另挂「＋ 新版本」弹窗骨架（入口按钮只在全局页头）。
  * **版本切片读面（v0.9.6 B3 · 口径 3 / 29）**：台账唯一键 = `(org, version)` ⇒ 本页的三张读面
  * （已发版锁名单 / 版本列并集 / 列头徽标与删除 ×）全部按 `spaceOrg` 切片 —— 空间页他组织的同版号
@@ -769,16 +875,23 @@ function syncAutoVersionTransitions(ctx: Ctx, features: readonly FeatureListItem
  * ⇒ 门户与各空间页都读不到 = 静默黑洞。故入口随本节点整体迁进空间排期页（全局页头按钮同批撤除；
  * `POST /versions` 全局路由与写闸**零改动**留作纯 HTTP 兜底口，口径同 §9.2「UI 撤、写口留」）。
  */
-function renderScheduleBoard(
+async function renderScheduleBoard(
   ctx: Ctx,
   features: readonly FeatureListItem[],
   ledger: VersionsLedger,
   spaceOrg: string | null,
-): string {
+): Promise<string> {
   const org = spaceOrg === null ? undefined : spaceOrg.trim();
-  const lockedVersions = releasedVersionNames(ledger, org);
+  // B4：已发版锁名单改由引擎投影喂入（判据 `isVersionLocked` 零改动）；投影不可达 ⇒ 退到
+  // 最后一次投影（读面只紧不松），仍拿不到 ⇒ 空名单 = 不显示锁样式（执法在写口 fail-closed）。
+  const projection = await versionProjectionOf(ctx);
+  const lockedVersions = releasedVersionNames(versionProjectionLedgerOf(projection), org);
+  // N1：版本列的台账侧版号 = 引擎清单（事实源）；投影从未读到过 ⇒ 退到本地台账读缓存
+  // （降级档，正常档空数组）。并集（∪ 卡派生版号）在视图侧完成，此处不预裁。
+  const engineColumnVersions = projectionVersionNames(projection, org);
+  const ledgerColumnVersions = projection === null ? ledgerVersionNames(ledger, org) : [];
   return (
-    renderSchedule(groupFeaturesByVersion(features, ledgerVersionNames(ledger, org)), selectRequirementPool(features), lockedVersions, ledger, org) +
+    renderSchedule(groupFeaturesByVersion(features, ledgerColumnVersions, engineColumnVersions), selectRequirementPool(features), lockedVersions, ledger, org) +
     // 提需求弹窗骨架（表单原样复用；orgsDir 三档提示与锁版警示随表单呈现）
     renderNewRequirementDialog(ctx.write.defaultGroup, orgsStatusOf(ctx.host), lockedVersions, spaceOrg) +
     (spaceOrg !== null ? renderNewVersionDialog(spaceOrg) : "")
@@ -820,7 +933,7 @@ function schedulePageScripts(ctx: Ctx): string {
  * （`/schedule` 页头，全站唯一入口）—— 本页不再渲染该按钮（弹窗脚本内的 `wireNewVersion` 因无此 id 空转）。
  * **不注入**排期看板的浮层 / 拖拽 / mermaid 三枚脚本（它们随 `/schedule` 走）。
  * **B6**：门户不另挂组清单（件1 起全站唯一处 = 侧栏二级菜单）；卡增「已发版 / 进行中」版本摘要行
- * （台账只读喂入，纯读面不做自动点亮，派生档带 `*`）。
+ * （**v0.10.0 尾段 N2 起 = 引擎版本台账投影只读喂入**，纯读面不做自动点亮，派生档带 `*`）。
  * 内联脚本闭集保持**七元**（N3-⑦/⑧ 纪律锚；门户新增的这点脚本是既有第五枚内的泛化，非新枚）。
  * **件B（REQ-2026-10-02-02）**：门户不收全站口径说明（页底 `ul.notes`）—— 经 `noNotes` 单点开关摘除
  * （`VIEW_NOTES` 常量与数据源不动，其余 `sendPage` 调用点照旧渲染；增补三 件B 起排期页同挂本开关）。
@@ -828,6 +941,10 @@ function schedulePageScripts(ctx: Ctx): string {
 async function pageOrgPortal(ctx: Ctx): Promise<Page> {
   const view = await ctx.client.getFeatures();
   const orgNav = orgNavOf(ctx, undefined, featureOrgGroups(view.features));
+  // B6（N2 换源）：版本摘要行的台账侧数据 = **引擎版本台账投影**（门户为纯读面 —— 显示派生不执法、零写）。
+  // 降级档沿用 B4 / N1 同一套投影失败语义：读不到 ⇒ 退本进程最后一次投影；从未读到过 ⇒ 退板本地台账
+  // **读缓存**（读面不挡；写口的 fail-closed 不经此路径）。
+  const summaryLedger = await portalSummaryLedgerOf(ctx);
   return {
     title: "项目组门户",
     active: "home",
@@ -835,11 +952,7 @@ async function pageOrgPortal(ctx: Ctx): Promise<Page> {
     // B6 的「顶栏切换器摘除」随件1 外壳退役：全站只有一处侧栏项目组菜单，门户页不再单独摘挂。
     // orgNav 装配照旧保留 —— 门户卡数据源就是 orgNav.orgs。
     headerActions: '<button type="button" id="new-org-open" class="header-actions" hidden>＋ 建项目组</button>',
-    // B6：版本台账只读喂入（门户纯读面，**不跑** syncAutoVersionTransitions —— 显示派生不执法、零写）。
-    bodyHtml: renderOrgPortal(
-      buildOrgPortalCards(orgNav.orgs, view.features, ctx.versionsLedger.load().ledger),
-      orgsStatusOf(ctx.host),
-    ),
+    bodyHtml: renderOrgPortal(buildOrgPortalCards(orgNav.orgs, view.features, summaryLedger), orgsStatusOf(ctx.host)),
     extraScripts: NEW_REQUIREMENT_DIALOG_SCRIPT,
     noNotes: true,
   };
@@ -919,7 +1032,12 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string, spaceOrg: string |
       : "";
   // 版本切片读面（v0.9.6 B3）：详情页的排期锁 = **该卡归属组织**的 released 切片
   // （归属缺失 ⇒ 空串桶 `""`，与 `migrateLedgerOrgs` 的未归属桶同构）—— 他组织的同版号不锁本卡。
-  const lockedVersions = releasedVersionNames(ctx.versionsLedger.load().ledger, (f.ownerGroup ?? "").trim());
+  // **v0.10.0 B4**：切片的数据源由本地台账换成**引擎版本台账投影**（锁判据 `isVersionLocked` 零改动）。
+  const detailProjection = await versionProjectionOf(ctx);
+  const lockedVersions = releasedVersionNames(
+    versionProjectionLedgerOf(detailProjection),
+    (f.ownerGroup ?? "").trim(),
+  );
   // 件2：空间 tab 行（详情页**无激活态**，作空间上下文与返回口）；归属不可得 ⇒ 空串不渲。
   const spaceOrgOfCard = detailSpaceOrg(ctx, spaceOrg, f.ownerGroup);
   const spaceNavHtml = spaceOrgOfCard === null ? "" : renderSpaceNav(spaceOrgOfCard, null);
@@ -1302,6 +1420,8 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
       scheduleFeature: options.scheduleFeatureImpl ?? scheduleFeature,
       groupMemberWrite: options.groupMemberWriteImpl ?? writeGroupMembersWithRetry,
       releaseOrgGroup: options.releaseOrgGroupImpl ?? releaseOrgGroup,
+      // v0.10.0 B2：版本写面改道引擎（`/api/versions*`，同 `mcpBaseUrl` = 可写面 8787）；无本地兜底。
+      versions: options.versionsWriteImpl ?? createVersionsWriteClient({ baseUrl: options.mcpBaseUrl ?? DEFAULT_MCP_BASE_URL }),
     },
     host: options.hostFace ?? null,
     shutdown: options.onShutdown ?? null,
@@ -1330,11 +1450,17 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
         : options.bridgeIdentityFetcher,
     orgsLedger: new OrgsLedgerStore(options.orgsLedgerFile ?? defaultOrgsLedgerFile()),
     versionsLedger: new VersionsLedgerStore(options.versionsLedgerFile ?? defaultVersionsLedgerFile()),
+    // v0.10.0 B4：已发版锁的数据源 = 引擎版本台账投影（与写面同端 8787）；本地台账降为读缓存。
+    engineVersions:
+      options.engineVersionsFetcher ??
+      createEngineVersionsFetcher({ baseUrl: options.mcpBaseUrl ?? DEFAULT_MCP_BASE_URL }),
+    engineVersionsLastGood: null,
+    engineVersionsFailure: null,
+    engineVersionsInFlight: null,
     suspendLedger: options.suspendLedgerStore ?? new SuspendLedgerStore(options.suspendLedgerFile ?? defaultSuspendLedgerFile()),
     orgSeed: options.orgSeed === undefined || options.orgSeed === null
       ? null
       : resolveOrgSeedOptions(options.orgSeed, { repoRoot: options.docs?.repoRoot }),
-    versionAutoThrottle: new Map<string, number>(),
   };
   // v0.9.5 C10：启动幂等回填 —— **listen 前** best-effort（只补缺不覆盖、逐组织 fail-open、
   // 跳过已停用组织）。任何异常都不得阻断板启动；`orgSeed === null` ⇒ 整段跳过（既有行为不变）。
@@ -1892,8 +2018,7 @@ function detailSpaceOrg(ctx: Ctx, routeOrg: string | null | undefined, ownerGrou
  */
 async function pageOrgSpaceSchedule(ctx: Ctx, org: string, all: readonly FeatureListItem[], orgNav: PageOrgNav): Promise<Page> {
   const features = featuresOfOrg(all, org);
-  // 自动转换喂**全局**列表（要看得到每张卡的归属，落点按 (org, version) 判定，口径 31）；渲染用本空间过滤集。
-  const ledger = syncAutoVersionTransitions(ctx, all);
+  const ledger = ctx.versionsLedger.load().ledger;
   return {
     title: `空间 · ${org} · 排期`,
     active: "schedule",
@@ -1903,7 +2028,7 @@ async function pageOrgSpaceSchedule(ctx: Ctx, org: string, all: readonly Feature
       '<button type="button" id="new-req-open" class="header-actions">＋ 新增需求</button>' +
       '<button type="button" id="new-version-open" class="header-actions" hidden>＋ 新版本</button>',
     // B5b ⑤：看板页头 `<h2>` 由本页给出（`renderSchedule` 不再自带）
-    bodyHtml: `${renderSpaceNav(org, "schedule")}<h2>排期看板</h2>${renderScheduleBoard(ctx, features, ledger, org)}`,
+    bodyHtml: `${renderSpaceNav(org, "schedule")}<h2>排期看板</h2>${await renderScheduleBoard(ctx, features, ledger, org)}`,
     // 增补三 件B（REQ-2026-10-02-03）：排期页不收全站口径说明（复用增补二 `noNotes` 单点开关）
     noNotes: true,
     extraScripts: schedulePageScripts(ctx),
@@ -2092,23 +2217,34 @@ async function handleWriteRequirement(
       return;
     }
   }
-  // ③ 已发版锁（REQ-v0.9.2 增补 ⑤ N2 / v0.9.4 N3 锁读台账）：目标版本 ∈ 版本台账 released ⇒ 409 零出网。
-  //    锁判据唯一走 `isVersionLocked`（trim 后精确串匹配，禁前缀）；空 version = 未排期 ⇒ 恒不锁、放行。
+  // ③ 已发版锁（REQ-v0.9.2 增补 ⑤ N2 / v0.9.4 N3 锁读台账 / **v0.10.0 B4 锁读引擎投影**）：
+  //    目标版本 ∈ 引擎版本台账 released ⇒ 409 零出网。
+  //    锁判据唯一走 `isVersionLocked`（trim 后精确串匹配，禁前缀，**本版零改动**）；
+  //    空 version = 未排期 ⇒ 恒不锁、放行（未排期不进锁判定，也就不需投影在场）。
+  //    **fail-closed**：已排版本 ∧ 拿不到引擎台账投影 ⇒ 503 拒写（§2.3(1)「锁只紧不松」），
+  //    **不回落本地台账、绝不当作「零个已发版」放行**。
   //    **锁的 org 维**（v0.9.6 B3 · 口径 29）= 三段回退 `spaceOrg ?? form.group ?? ctx.write.defaultGroup`
   //    （`form.group` 已由 `parseRequirementForm` 做过「表单 > 板级默认」回落 ⇒ 与下方 ③b
   //    `isOrgDisabled` 的归属解析同源，不新立一套）；台账唯一键 `(org, version)` ⇒ 他组织同版号不锁本条。
   const lockOrg = (spaceOrg ?? form.group ?? ctx.write.defaultGroup ?? "").trim();
-  if (isVersionLocked(form.version, releasedVersionNames(ctx.versionsLedger.load().ledger, lockOrg))) {
-    respondError(
-      res,
-      headers.accept,
-      409,
-      "board_version_released",
-      `版本 ${form.version} 已发版 ⇒ 已发版版本不可排入新需求。请排入后续版本（本板只锁前台写口；在版本台账把该版标记 released / 重开为进行中即实时生效）。`,
-      undefined,
-      requirementBackfillFields(body, spaceOrg),
-    );
-    return;
+  if (normalizeVersion(form.version) !== "") {
+    const projection = await versionProjectionOf(ctx);
+    if (projection === null) {
+      respondVersionProjectionClosed(res, ctx, headers.accept, requirementBackfillFields(body, spaceOrg));
+      return;
+    }
+    if (isVersionLocked(form.version, releasedVersionNames(versionProjectionLedgerOf(projection), lockOrg))) {
+      respondError(
+        res,
+        headers.accept,
+        409,
+        "board_version_released",
+        `版本 ${form.version} 已发版 ⇒ 已发版版本不可排入新需求。请排入后续版本（锁的事实源 = 引擎版本台账；在引擎把该版标记 released / 重开为进行中即实时生效）。`,
+        undefined,
+        requirementBackfillFields(body, spaceOrg),
+      );
+      return;
+    }
   }
   // ③b 停用组织不可提新需求（v0.9.4 A4 · BD3）：目标组织在板台账被标记停用 ⇒ 409 拒绝（零出网）。
   //    判据单一纯函数 = `orgs-ledger.isOrgDisabled`（与 D 档归属 mismatch 校验同落点，可共享）。
@@ -2539,20 +2675,13 @@ async function handleSetOrgHostAgent(
 // v0.9.4 N1 写面：POST /versions（REQ-2026-09-27-05 —— 版本台账，`action` 三值闭集分流）
 // ---------------------------------------------------------------------------
 
-/** 建版本撞同名 ⇒ 结构化错误码（409）。 */
-const VERSION_EXISTS_CODE = "board_version_exists";
-/** 目标版本不在台账 ⇒ 结构化错误码（404）。 */
-const VERSION_NOT_FOUND_CODE = "board_version_not_found";
-/** released 不可删 ⇒ 结构化错误码（409）。 */
-const VERSION_REMOVE_RELEASED_CODE = "board_version_remove_released";
 /**
- * 名下有**已确认卡** ⇒ 结构化错误码（409）。
- * **增补十一 E2 口径变更**：可删判据由「名下无任何卡（含想法卡）」改为「名下无已确认卡」——
- * 想法卡不拦删除，删除时自动清空其 `version` 回需求池。
+ * **写面改道引擎（v0.10.0 B2 · 改造文档 §2.3(2)/(3)）**：建 / 删 / 设状态三支不再有板侧事实源
+ * 写口（原 `board_version_exists` / `board_version_not_found` / `board_version_remove_released` /
+ * `board_version_remove_confirmed_cards` / `board_version_remove_pool_back_failed` 五个本地码随
+ * 本地台账写口一并退役）。板**不判闸**：错误码一律来自引擎（`orch_*` …），经
+ * {@link describeVersionWriteError} 决定展示文案（未知码原样展示、不 fail-closed）。
  */
-const VERSION_REMOVE_CONFIRMED_CODE = "board_version_remove_confirmed_cards";
-/** 想法卡回池写失败 ⇒ 结构化错误码（502；版本不删，fail-closed）。 */
-const VERSION_REMOVE_POOL_BACK_CODE = "board_version_remove_pool_back_failed";
 
 /** 版本写表单失败回填（口径同 {@link orgBackfillFields}：只回显非空提交值）。 */
 function versionBackfillFields(body: string): ErrorOverlayField[] {
@@ -2570,28 +2699,22 @@ function versionBackfillFields(body: string): ErrorOverlayField[] {
 }
 
 /**
- * 版本台账写（v0.9.4 N1 · REQ-2026-09-27-05）。一条 `POST /versions` 靠表单 `action` 分三支：
- * - **create**：`version` 非空 ∧ `x.y.z`（复用 `parseVersion`，零新增 regex）⇒ 台账落
- *   `status = notstart`（三态初态；`notstart → active` 由 W3 渲染前惰性自动转换）；**同组织同版号** ⇒ 409。
- * - **remove**：闸 = 台账存在 ∧ `status ∈ {notstart, active}` ∧ **名下无已确认卡**
- *   （增补十一 E2 口径变更：原「名下无卡（含想法卡）」作废）；`released` 不可删（409）；
- *   名下有已确认卡 ⇒ 409 `board_version_remove_confirmed_cards`；桥读不动 ⇒ 502 fail-closed（不删）。
- *   删除时名下**想法卡自动回需求池**（逐张清空 `version`）；任一张回池失败 ⇒ 502 且不删台账条目。
- * - **setStatus**：台账存在 ⇒ **迁移矩阵五条边执法**（W3 · `version-transition.ts`；需事实的两条边
- *     读桥、不可达 ⇒ 502 fail-closed）；非法迁移 ⇒ 409；条目不存在 ⇒ 404。
+ * 版本台账写（v0.10.0 B2 起：**写面改道引擎**）。一条 `POST /versions` 靠表单 `action` 分三支
+ * （`create` / `remove` / `setStatus`），三支**都只向引擎发一次意图**（`ctx.write.versions`），
+ * 板**不判闸**（不复核形状 / 重复 / released / 名下卡 / 迁移矩阵）：引擎的错误码**原样展示**
+ * （经 {@link describeVersionWriteError} 决定文案，未知码原样、不 fail-closed），HTTP 状态用引擎回执；
+ * 引擎不可达 ⇒ **502 `bridge_unreachable` 硬失败**（**无本地下沉兜底写**，`.data/versions.json`
+ * 不再被本写面写入）。
  *
  * CSRF / body 上限 / 回填 / 错误浮层与其余写口**同规格**；**不写状态机、不动任何配置**。
  * 回显：JSON ⇒ 结构化载荷（create 201 / remove 200 / setStatus 200）；表单档 ⇒ **303 回排期看板**
  * （PRG，版本列就在该页；刷新不重复写）。
  *
- * **组织作用域（v0.9.6 B4 · 口径 4 / 5 / 30）**：台账唯一键 = `(org, version)` ⇒ 本 handler 的 org
- * **只从服务端路径上下文取**（`spaceOrg` = 归一层剥 `/org/<名>` 前缀后的路径组织；建版本表单**不带
- * org 字段**，客户端不提交、也不可提交）。
- * - `spaceOrg` 非空 ⇒ 建 / 删 / 设状态三处均按 `(spaceOrg, version)` 精确落条目，两处数卡闸
- *   （删除的「名下无已确认卡」、发版的「名下全收口」）**只数该组织名下的卡**，303 回**本空间排期页**；
- * - `spaceOrg` 为 null（全局 `POST /versions` 直投 —— 全局页头入口已随本节点撤除，路由留到
- *   B5a 退役）⇒ create 落**未归属空串桶**、删 / 设状态按「不限组织」取首个命中、303 回 `/schedule`，
- *   即 B4 之前的既有形态（切片只在空间档生效，全局档不做第二套猜测）。
+ * **组织作用域（口径 4 / 5 / 30）**：本 handler 的 org **只从服务端路径上下文取**
+ * （`spaceOrg` = 归一层剥 `/org/<名>` 前缀后的路径组织；建版本表单**不带 org 字段**）。
+ * - `spaceOrg` 非空 ⇒ 以该组织为 `ownerGroup` 发引擎，303 回**本空间排期页**；
+ * - `spaceOrg` 为 null（全局 `POST /versions` 直投 —— 全局页头入口已撤除，路由留到 B5a 退役）
+ *   ⇒ `ownerGroup = null`（引擎匿名档），303 回 `/schedule`。
  */
 async function handleWriteVersions(
   req: IncomingMessage,
@@ -2620,64 +2743,22 @@ async function handleWriteVersions(
     respondError(res, headers.accept, form.status, form.code, form.error, undefined, versionBackfillFields(body));
     return;
   }
-  const nowIso = (): string => new Date(ctx.now()).toISOString();
   /**
-   * 本请求的组织档（口径 4 / 30：org **只**由服务端路径上下文决定，表单零 org 字段）。
-   * - `writeOrg` = create 的落点桶（全局直投 ⇒ 空串 = 未归属桶，与 `migrateLedgerOrgs` 的缺桶同构）；
-   * - `orgFilter` = 取条目与两处数卡闸的切片档（全局档 `undefined` = 不限组织 = B4 之前的既有形态）；
-   * - `backTo` = 三支共用的 303 落点（空间档回**本空间排期页**，全局档仍 `/schedule`，口径 5）。
+   * 组织档（口径 4 / 30：org **只**由服务端路径上下文决定，表单零 org 字段）：`null` = 全局直投
+   * （引擎匿名档 NULL）；否则 = 本组织名。`backTo` = 三支共用的 303 落点（空间档回**本空间排期页**，
+   * 全局档仍 `/schedule`，口径 5）。
    */
-  const writeOrg = spaceOrg === null ? "" : spaceOrg.trim();
-  const orgFilter: VersionOrgFilter = spaceOrg === null ? undefined : spaceOrg.trim();
+  const engineOwner = spaceOrg === null || spaceOrg.trim() === "" ? null : spaceOrg.trim();
   const backTo = spaceOrg === null ? "/schedule" : orgSpaceLink(spaceOrg, "schedule");
-  const orgLabel = writeOrg === "" ? "未归属组织" : writeOrg;
-  /**
-   * 名下卡集合 = 两处数卡闸（删除的「名下无已确认卡」/ 发版的「名下全收口」）唯一数据源。
-   * **空间档再加一层 `ownerGroup` 过滤**：他组织的同版号卡既不挡本组织删版，也不计入本组织的收口判据
-   * （口径 30「该组织的该版本名下全收口」）；`orgFilter` 为 `undefined` ⇒ 不过滤（全局并集形态）。
-   */
-  const cardsUnderKey = (all: readonly FeatureListItem[]): readonly FeatureListItem[] =>
-    all.filter(
-      (f) =>
-        normalizeVersion(f.version) === form.version &&
-        (orgFilter === undefined || (f.ownerGroup ?? "").trim() === orgFilter),
-    );
 
   if (form.action === VERSION_ACTION_CREATE) {
-    // semver 收口（§2.5 方向）：复用 parseVersion，非 x.y.z ⇒ 拒新写（读面存量脏值保留）。
-    if (parseVersion(form.version) === null) {
-      respondError(
-        res,
-        headers.accept,
-        400,
-        VERSION_FORM_INVALID_CODE,
-        `版本号 ${form.version} 不是 x.y.z 形式（可带 v 前缀）⇒ 不建列（读面存量脏值保留，只拦新写）`,
-        undefined,
-        versionBackfillFields(body),
-      );
-      return;
-    }
-    const created = ctx.versionsLedger.create(form.version, nowIso(), writeOrg);
-    if (!created.added) {
-      respondError(
-        res,
-        headers.accept,
-        409,
-        VERSION_EXISTS_CODE,
-        `版本 ${form.version} 已在组织 ${orgLabel} 的台账中 ⇒ 不重复创建` +
-          `（唯一键 = (组织, 版本)，本闸只挡**同组织同版号**；他组织各有其版本序列，互不冲突）。`,
-        undefined,
-        versionBackfillFields(body),
-      );
+    const out = await ctx.write.versions.create({ ownerGroup: engineOwner, version: form.version });
+    if (!out.ok) {
+      respondError(res, headers.accept, out.httpStatus, out.code, describeVersionWriteError(out.code, out.message), undefined, versionBackfillFields(body));
       return;
     }
     if ((headers.accept ?? "").includes("application/json")) {
-      respondJson(res, 201, {
-        ok: true,
-        version: form.version,
-        status: "notstart",
-        ledgerFile: ctx.versionsLedger.file,
-      });
+      respondJson(res, 201, { ok: true, version: out.version ?? form.version, status: out.status ?? "notstart" });
       return;
     }
     res.writeHead(303, { location: backTo, "cache-control": "no-store" });
@@ -2686,101 +2767,13 @@ async function handleWriteVersions(
   }
 
   if (form.action === VERSION_ACTION_REMOVE) {
-    const rec = findVersionRecord(ctx.versionsLedger.load().ledger, form.version, orgFilter);
-    if (rec === null) {
-      respondError(res, headers.accept, 404, VERSION_NOT_FOUND_CODE, `版本 ${form.version} 不在台账中 ⇒ 无可删`, undefined, versionBackfillFields(body));
+    const out = await ctx.write.versions.remove({ ownerGroup: engineOwner, version: form.version });
+    if (!out.ok) {
+      respondError(res, headers.accept, out.httpStatus, out.code, describeVersionWriteError(out.code, out.message), undefined, versionBackfillFields(body));
       return;
     }
-    // 闸一：released 不可删
-    if (rec.status === "released") {
-      respondError(
-        res,
-        headers.accept,
-        409,
-        VERSION_REMOVE_RELEASED_CODE,
-        `版本 ${form.version} 已发版（released）⇒ 不可删除`,
-        undefined,
-        versionBackfillFields(body),
-      );
-      return;
-    }
-    // 闸二（增补十一 E2 · 口径变更）：名下无**已确认卡**即可删 —— 判据与列头「未开始」徽标同源
-    //   （`stage ≠ 需求分析` = 已过 Step 0 确认门）。想法卡不拦删除，删除后自动回需求池（见下）。
-    //   读桥 feature 列表按 trim 归一后的 version 精确比对；桥不可达 ⇒ 502 fail-closed（不删）。
-    let mine: readonly FeatureListItem[];
-    try {
-      const view = await ctx.client.getFeatures();
-      mine = cardsUnderKey(view.features);
-    } catch (err) {
-      respondError(
-        res,
-        headers.accept,
-        502,
-        BRIDGE_UNREACHABLE_CODE,
-        `删除版本需核对名下卡片 ⇒ 桥读不到即不删（fail-closed）：${errText(err)}`,
-        undefined,
-        versionBackfillFields(body),
-      );
-      return;
-    }
-    const confirmedCount = mine.filter((f) => isConfirmedCard(f.stage)).length;
-    if (confirmedCount > 0) {
-      respondError(
-        res,
-        headers.accept,
-        409,
-        VERSION_REMOVE_CONFIRMED_CODE,
-        `该版本下还有已确认需求（${String(confirmedCount)} 条）⇒ 请先移出后再删`,
-        undefined,
-        versionBackfillFields(body),
-      );
-      return;
-    }
-    // 想法卡自动回需求池：逐张把 `version` 清空（复用既有排期写封装，仅 `version` 一字段）。
-    // 任一失败 ⇒ 不删台账条目（fail-closed：留下「版还在、卡已回池」的可重试中间态，如实回执）。
-    const backToPool: string[] = [];
-    const poolFailures: string[] = [];
-    for (const f of mine.filter((x) => !isConfirmedCard(x.stage))) {
-      const group = (f.ownerGroup ?? "").trim();
-      if (group === "") {
-        poolFailures.push(`${f.featureId}（无归属组织，不猜组）`);
-        continue;
-      }
-      let outcome: ScheduleOutcome;
-      try {
-        outcome = await ctx.write.scheduleFeature(
-          { featureId: f.featureId, to: f.state, version: "" },
-          { group, baseUrl: ctx.write.mcpBaseUrl },
-        );
-      } catch (err) {
-        poolFailures.push(`${f.featureId}（${errText(err)}）`);
-        continue;
-      }
-      if (outcome.ok) backToPool.push(f.featureId);
-      else poolFailures.push(`${f.featureId}（${outcome.code}：${outcome.error}）`);
-    }
-    if (poolFailures.length > 0) {
-      respondError(
-        res,
-        headers.accept,
-        502,
-        VERSION_REMOVE_POOL_BACK_CODE,
-        `版本 ${form.version} 名下 ${String(poolFailures.length)} 张想法卡未能回需求池（${poolFailures.join("；")}）` +
-          `⇒ 本次不删该版本（已回池 ${String(backToPool.length)} 张不会重复处理），请刷新核对后重试`,
-        undefined,
-        versionBackfillFields(body),
-      );
-      return;
-    }
-    const removed = ctx.versionsLedger.remove(form.version, orgFilter);
     if ((headers.accept ?? "").includes("application/json")) {
-      respondJson(res, 200, {
-        ok: true,
-        version: form.version,
-        removed: removed.removed,
-        backToPool,
-        ledgerFile: ctx.versionsLedger.file,
-      });
+      respondJson(res, 200, { ok: true, version: form.version, removed: true });
       return;
     }
     res.writeHead(303, { location: backTo, "cache-control": "no-store" });
@@ -2788,75 +2781,20 @@ async function handleWriteVersions(
     return;
   }
 
-  // setStatus（parser 保证 form.status 非 null）：迁移矩阵五条边执法（W3 · §2.3 / 确认单 v5）
+  // setStatus（parser 保证 form.status 非 null）：目标态原样发引擎，迁移矩阵 / 发版闸执法归引擎
   if (form.action === VERSION_ACTION_SET_STATUS) {
     const target = form.status;
     if (target === null) {
       respondError(res, headers.accept, 400, VERSION_FORM_INVALID_CODE, "目标状态缺失（setStatus 必带 status）", undefined, versionBackfillFields(body));
       return;
     }
-    const rec = findVersionRecord(ctx.versionsLedger.load().ledger, form.version, orgFilter);
-    if (rec === null) {
-      respondError(res, headers.accept, 404, VERSION_NOT_FOUND_CODE, `版本 ${form.version} 不在台账中 ⇒ 无法设状态`, undefined, versionBackfillFields(body));
-      return;
-    }
-    if (rec.status !== target) {
-      // 只有需要事实的两条边（active → notstart / active → released）才读桥；桥不可达 ⇒ 502 fail-closed（不猜、不写）。
-      let hasConfirmedCard = false;
-      let total = 0;
-      let completed = 0;
-      let cancelled = 0;
-      let failed = 0;
-      if (rec.status === "active" && (target === "notstart" || target === "released")) {
-        let mine: readonly FeatureListItem[];
-        try {
-          const view = await ctx.client.getFeatures();
-          mine = cardsUnderKey(view.features);
-        } catch (err) {
-          respondError(
-            res,
-            headers.accept,
-            502,
-            BRIDGE_UNREACHABLE_CODE,
-            `版本状态迁移（${rec.status} → ${target}）需核对名下卡片 ⇒ 桥读不到即不写（fail-closed）：${errText(err)}`,
-            undefined,
-            versionBackfillFields(body),
-          );
-          return;
-        }
-        hasConfirmedCard = mine.some((f) => isConfirmedCard(f.stage));
-        total = mine.length;
-        // raw 三桶计数：完成集合 = completed + cancelled（由 decideVersionTransition 合成），failed 不入。
-        completed = mine.filter((f) => f.state === "completed").length;
-        cancelled = mine.filter((f) => f.state === "cancelled").length;
-        failed = mine.filter((f) => f.state === "failed").length;
-      }
-      const decision = decideVersionTransition(rec.status, target, {
-        version: form.version,
-        hasConfirmedCard,
-        total,
-        completed,
-        cancelled,
-        failed,
-      });
-      if (!decision.ok) {
-        respondError(res, headers.accept, 409, decision.code, decision.error, undefined, versionBackfillFields(body));
-        return;
-      }
-    }
-    const set = ctx.versionsLedger.setStatus(form.version, target, nowIso(), undefined, orgFilter);
-    if (!set.found) {
-      respondError(res, headers.accept, 404, VERSION_NOT_FOUND_CODE, `版本 ${form.version} 不在台账中 ⇒ 无法设状态`, undefined, versionBackfillFields(body));
+    const out = await ctx.write.versions.setStatus({ ownerGroup: engineOwner, version: form.version, status: target });
+    if (!out.ok) {
+      respondError(res, headers.accept, out.httpStatus, out.code, describeVersionWriteError(out.code, out.message), undefined, versionBackfillFields(body));
       return;
     }
     if ((headers.accept ?? "").includes("application/json")) {
-      respondJson(res, 200, {
-        ok: true,
-        version: form.version,
-        status: target,
-        changed: set.changed,
-        ledgerFile: ctx.versionsLedger.file,
-      });
+      respondJson(res, 200, { ok: true, version: form.version, status: out.status ?? target });
       return;
     }
     res.writeHead(303, { location: backTo, "cache-control": "no-store" });
@@ -3441,9 +3379,11 @@ function scheduleLockBackfill(targetVersion: string, currentVersion: string | nu
  * - 表单 `version` **必须显式传**（键缺失 ⇒ 编程错误，经全局兜底落 500，不做缺键语义）；
  *   空串 = 删除排期；服务端发送前一律 `trim()`；
  * - `to` = 先 `getFeature` 取当前态原样回填（advance「`to` = 当前态」登记字段特例，不迁移状态机）；
- * - **已发版锁（增补 ⑤ N3）**：`getFeature` 之后、出网之前做三分判（现版本 × 目标版本）——
+ * - **已发版锁（增补 ⑤ N3 / v0.10.0 B4 改读引擎投影）**：`getFeature` 之后、出网之前做三分判（现版本 × 目标版本）——
  *   入锁（现 ∉ 锁版 ∧ 目标 ∈ 锁版）⇒ 409；出锁（现 ∈ 锁版 ∧ 目标 ≠ 现版本，含清空回池）⇒ 409；
  *   同锁版无变化 ⇒ 幂等放行；未排期 ↔ 未锁版间的一切变动照常（错误码同提需求面 `board_version_released`）；
+ *   **锁集的数据源 = 引擎版本台账投影**（本地 `.data/versions.json` 不再参与判定）；投影不可读 ⇒
+ *   **503 fail-closed 挡排期写**（§2.3(1)「锁只紧不松」，不回落本地台账）；
  * - 身份 = 该 Feature 的 `ownerGroup`，**null ⇒ 结构化 503，绝不回落板级默认组**
  *   （排期改的是既有需求归属，拿板级组名出网会把写打到别的组织目录）；
  * - 读-写窗口内态漂移被桥拒（非法流转）⇒ 如实弹错误浮层 + N1 字段回填，**不自动重试**；
@@ -3527,10 +3467,17 @@ async function handleWriteSchedule(
     );
     return;
   }
-  // ③b 已发版锁（REQ-v0.9.2 增补 ⑤ N3 / v0.9.4 N3 锁读台账）：现版本（getFeature）× 目标版本（表单）三分判，零出网。
-  //    同锁版无变化 ⇒ 幂等放行（不报错）；锁判据唯一走 `isVersionLocked`（trim 后精确匹配）；
+  // ③b 已发版锁（REQ-v0.9.2 增补 ⑤ N3 / v0.9.4 N3 锁读台账 / **v0.10.0 B4 锁读引擎投影**）：
+  //    现版本（getFeature）× 目标版本（表单）三分判，零出网。
+  //    同锁版无变化 ⇒ 幂等放行（不报错）；锁判据唯一走 `isVersionLocked`（trim 后精确匹配，**本版零改动**）；
   //    清空回池 = 目标归一后空串 ⇒ 若现 ∈ 锁版即"出锁"被拒。回填带上现版本值（用户看到从哪被锁）。
-  const released = releasedVersionNames(ctx.versionsLedger.load().ledger);
+  //    **fail-closed**：拿不到引擎版本台账投影 ⇒ 503 拒写（不回落本地台账、绝不当作「零个已发版」放行）。
+  const scheduleProjection = await versionProjectionOf(ctx);
+  if (scheduleProjection === null) {
+    respondVersionProjectionClosed(res, ctx, headers.accept, backfill, "schedule");
+    return;
+  }
+  const released = releasedVersionNames(versionProjectionLedgerOf(scheduleProjection));
   const targetLocked = isVersionLocked(form.version, released);
   const currentLocked = isVersionLocked(currentVersion, released);
   // 入锁判据：`v0.9.1-probe` 相对锁版 `v0.9.1` 算「改到别的版」⇒ 出锁拒（同版判据见 ③a′ 精确等串）。
@@ -3540,7 +3487,7 @@ async function handleWriteSchedule(
       headers.accept,
       409,
       "board_version_released",
-      `版本 ${form.version} 已发版 ⇒ 该版本已发版，不可将需求排入（本板只锁前台写口；在版本台账把该版标记 released / 重开为进行中即实时生效）。`,
+      `版本 ${form.version} 已发版 ⇒ 该版本已发版，不可将需求排入（事实源 = 引擎版本台账；在引擎把该版标记 released / 重开为进行中即实时生效）。`,
       undefined,
       scheduleLockBackfill(form.version, currentVersion),
     );
@@ -3552,7 +3499,7 @@ async function handleWriteSchedule(
       headers.accept,
       409,
       "board_version_released",
-      `该需求现排期版本 ${normalizeVersion(currentVersion)} 已发版 ⇒ 已发版版本的需求不可移出或取消排期（本板只锁前台写口；在版本台账把该版标记 released / 重开为进行中即实时生效）。`,
+      `该需求现排期版本 ${normalizeVersion(currentVersion)} 已发版 ⇒ 已发版版本的需求不可移出或取消排期（事实源 = 引擎版本台账；在引擎把该版标记 released / 重开为进行中即实时生效）。`,
       undefined,
       scheduleLockBackfill(form.version, currentVersion),
     );

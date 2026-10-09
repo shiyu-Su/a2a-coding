@@ -28,6 +28,7 @@ import {
   renderPage,
 } from "../dist/web/layout.js";
 import { createBoardServer } from "../dist/server.js";
+import { engineNoLockFetcher } from "./engine-versions-fixture.mjs";
 
 function feature(featureId, version, overrides = {}) {
   return {
@@ -840,11 +841,20 @@ test("增补① 锁定说明归属：409 服务端文案完整保留（卡面降
       };
     },
   });
-  // 空版本台账注入：本用例断的是「排期状态锁」，不得被本机真实台账的已发版锁抢判
+  // 锁夹具两档恒注入（v0.10.0 B4：已发版锁的**事实源 = 引擎版本台账投影**，本地台账不再参与锁判）：
+  // 本用例断的是「排期状态锁」，两把锁叠加时**版本锁先判**（见 server-schedule-write G-⑥）⇒ 除空本地
+  // 台账外，还须喂**空引擎投影**（「读到了 ∧ 零个已发版」的合法事实），否则开发机真实引擎把 v0.9.2
+  // 标 released 会抢判成 409 board_version_released，状态锁的文案永远断不到。
   const lockFree = mkdtempSync(join(tmpdir(), "board-locked-"));
   const lockFreeFile = join(lockFree, "versions.json");
   writeFileSync(lockFreeFile, JSON.stringify({ version: 1, versions: [] }, null, 2) + "\n", "utf8");
-  const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client, versionsLedgerFile: lockFreeFile });
+  const handle = await createBoardServer({
+    host: "127.0.0.1",
+    port: 0,
+    client,
+    versionsLedgerFile: lockFreeFile,
+    engineVersionsFetcher: engineNoLockFetcher(),
+  });
   try {
     const base = `http://127.0.0.1:${handle.port}`;
     const cardText = await (await fetch(`${base}/org/alpha/schedule`)).text();

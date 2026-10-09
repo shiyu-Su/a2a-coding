@@ -16,6 +16,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { createBoardServer } from "../dist/server.js";
+import { engineProjectionFetcher } from "./engine-versions-fixture.mjs";
 
 const NOW = Date.parse("2026-09-27T12:00:00Z");
 const WRITE_HEADERS = { "x-board-write": "1", accept: "application/json" };
@@ -131,6 +132,10 @@ async function withSpaceServer(envOptions, run, serverOverrides = {}) {
       : releasedVersions === undefined
         ? null
         : versionsLedgerFixture(releasedVersions.map((raw) => ({ org: releasedOrg ?? "", version: raw })));
+  // v0.10.0 B4：已发版锁的数据源 = **引擎版本台账投影** ⇒ 与本地台账夹具同源恒注入
+  // （不声明锁版的用例喂空投影：既不打开发机的真实引擎，也不因引擎不可达被 fail-closed 挡写）。
+  const projectionFeed =
+    ledgerRecords !== undefined ? ledgerRecords : (releasedVersions ?? []).map((raw) => ({ org: releasedOrg ?? "", version: raw }));
   const handle = await createBoardServer({
     host: "127.0.0.1",
     port: 0,
@@ -140,6 +145,7 @@ async function withSpaceServer(envOptions, run, serverOverrides = {}) {
     orgsLedgerFile: env.ledgerFile,
     ...overrides,
     ...(seed === null ? {} : { versionsLedgerFile: seed.file }),
+    engineVersionsFetcher: overrides.engineVersionsFetcher ?? engineProjectionFetcher(projectionFeed),
   });
   try {
     await run(`http://127.0.0.1:${handle.port}`, env);

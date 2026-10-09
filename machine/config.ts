@@ -143,6 +143,11 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
     // 任务风险档位：缺省不写（由 launcher 取 write），写了必须是三值之一
     project.risk = asRiskLevel(risk, `projects[${idx}].risk`);
   }
+  const repo = o["repo"];
+  if (repo !== undefined) {
+    // 仓库标识（v0.10.0 · M1）：缺省不写（单仓零感知，「宿主仓」解释权归引擎）；写了必须是非空字符串
+    project.repo = asString(repo, `projects[${idx}].repo`);
+  }
   return project;
 }
 

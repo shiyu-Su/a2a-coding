@@ -4,7 +4,9 @@
  * 硬约束：
  * - **仅 GET**：本模块只提供 GET 路径，不封装任何写操作；
  * - **不碰事件游标**：桥 `/api/events` 的游标语义一律不触碰（事件读取口径由后续节点专门处理）；
- * - 数据源 = 桥既有只读接面（`/api/features` / `/api/features/:id` / `/api/features/:id/trace`）。
+ * - 数据源 = 桥既有只读接面（`/api/features` / `/api/features/:id` / `/api/features/:id/trace`）
+ *   + 引擎版本台账读端点（v0.10.0 B4：`GET <引擎可写面>/api/versions`，与版本写面同端、**仍是 GET**，
+ *   见 {@link createEngineVersionsFetcher}）。
  *
  * 解析逻辑与网络调用**分离**：`parse*` 是纯函数（输入已解析 JSON，输出归一视图），
  * 便于不依赖桥在跑即单测；`get*` 负责 fetch + JSON.parse 后委派给对应 `parse*`。
@@ -21,6 +23,16 @@ export interface BridgeClientOptions {
   /** 单次请求超时（ms），缺省 10_000 */
   timeoutMs?: number;
 }
+
+/**
+ * 版本台账读面基址：与**引擎版本写面同端**（`versions-write.ts` 的
+ * `DEFAULT_ENGINE_BASE_URL` = 可写面 8787）。本客户端缺省仍走 3300 只读面，
+ * 故版本台账读单独注入该基址（板不直连 machine、也不另立第三个面）。
+ */
+export const DEFAULT_ENGINE_VERSIONS_BASE_URL = "http://127.0.0.1:8787";
+
+/** 引擎版本台账读端点（改造文档 §2.1(2)：板读投影唯一来源）。 */
+export const ENGINE_VERSIONS_QUERY_PATH = "/api/versions";
 
 export interface BridgeClient {
   readonly baseUrl: string;
@@ -275,6 +287,42 @@ export interface TaskStateView {
   taskId: string | null;
   state: string;
 }
+
+/**
+ * 引擎版本台账投影的一行（v0.10.0 B4 · 改造文档 §2.1(2) / §2.3(1)）—— 只投影**锁与列并集需要的
+ * 键**（`ownerGroup / version / status`），其余列（`date / note / createdAt / updatedAt`）本版不消费。
+ */
+export interface EngineVersionEntry {
+  /** 归属组织（引擎 `owner_group`；`null` / 缺键 ⇒ 未归属桶 = 板台账的 `""` 同构语义）。 */
+  org: string;
+  version: string;
+  /**
+   * 版本状态（三态 `notstart / active / released`）。值域**不归一、不校验、不回落** —— 非字符串 ⇒
+   * `null`，由消费侧按「非 `released`」处理（缺状态绝不当作已发版）。
+   */
+  status: string | null;
+}
+
+/**
+ * 引擎版本台账投影（**已发版锁的唯一数据源**）。
+ * `capturedAt` = 本次成功读取的时刻（板进程内保留「最后一次投影」时用于如实标注新鲜度）。
+ */
+export interface EngineVersionsProjection {
+  entries: EngineVersionEntry[];
+  capturedAt: string;
+}
+
+/**
+ * `GET /api/versions` 的两种「读到了」的结果（v0.10.0 B4）：
+ * - **projection** ⇒ 引擎台账在场（空台账 = 合法零条目，锁集为空是真事实）；
+ * - **absent** ⇒ 响应合法但**没有 `versions[]` 面**（老桥 / 该端点未上线的引擎）⇒ 调用方按
+ *   「拿不到台账投影」处理（**fail-closed 挡排期写**），绝不当成「零个已发版」放行。
+ * 二者都不抛：传输层失败 / 非 2xx / 坏 JSON 一律收口为 outcome（宕机不阻断页面渲染，口径同
+ * `orgs-view.createOrgGroupsFetcher`）。
+ */
+export type EngineVersionsOutcome =
+  | { kind: "projection"; projection: EngineVersionsProjection }
+  | { kind: "absent"; code: string; error: string };
 
 export interface TraceProjectBusy {
   busy: boolean;
@@ -631,6 +679,100 @@ export function parseTaskState(json: unknown): TaskStateView {
   const body = expectOk(json, "子任务详情");
   const task = isRecord(body.task) ? body.task : {};
   return { taskId: str(task.taskId), state: str(task.state) ?? "unknown" };
+}
+
+/**
+ * `GET /api/versions` → 引擎版本台账投影（**纯函数**，v0.10.0 B4）。
+ *
+ * 判定分三档，**只有第一档算「拿到投影」**：
+ * 1. 信封 `ok:true` ∧ `versions[]` 是数组 ⇒ 投影（**零条目是合法事实**，不是缺位）；
+ * 2. 信封 `ok:true` 但**无 `versions[]`** ⇒ `kind:"absent"`（老桥缺该字段）；
+ * 3. 信封 `ok:false` / 非对象 ⇒ `kind:"absent"`（引擎如实报错，同样按「拿不到投影」收口）。
+ *
+ * 逐条容错：`version` 缺失 / 空白 ⇒ 丢该条（无版号无从谈锁）；`owner_group` 与 `ownerGroup`
+ * 两式键都认（查询参数用 snake_case、写面 body 用 camelCase，读侧不赌单一形态）；缺键 ⇒ 未归属桶
+ * `""`；`status` 原样透传（见 {@link EngineVersionEntry.status}）。
+ */
+export function parseEngineVersions(json: unknown, capturedAt: string): EngineVersionsOutcome {
+  if (!isRecord(json) || json.ok !== true) {
+    const code = isRecord(json) ? (str(json.code) ?? "unknown") : "response_invalid";
+    const error = isRecord(json)
+      ? (str(json.error) ?? "响应缺少 ok:true")
+      : "版本台账响应不是 JSON 对象";
+    return { kind: "absent", code, error };
+  }
+  if (!Array.isArray(json.versions)) {
+    return { kind: "absent", code: "versions_field_missing", error: "响应 ok:true 但缺 versions[]（老桥无版本台账面）" };
+  }
+  const entries: EngineVersionEntry[] = [];
+  for (const item of json.versions) {
+    if (!isRecord(item)) continue;
+    const version = (str(item.version) ?? "").trim();
+    if (version === "") continue;
+    const rawOrg = str(item["owner_group"]) ?? str(item.ownerGroup) ?? "";
+    entries.push({
+      org: rawOrg.trim(),
+      version,
+      status: str(item.status),
+    });
+  }
+  return { kind: "projection", projection: { entries, capturedAt } };
+}
+
+/**
+ * 引擎版本台账**一次性读取器**（v0.10.0 B4 · §2.1(2) / §2.3(1)）—— 已发版锁的唯一喂入源。
+ * 一律**不抛**：拿到投影 ⇒ `projection`；其余（不可达 / 超时 / 非 2xx / 坏 JSON / 老桥无
+ * `versions[]`）⇒ `absent` 并带**根因码与文案**，供写口在 fail-closed 拒写时如实点出为什么挡。
+ */
+export type EngineVersionsFetcher = () => Promise<EngineVersionsOutcome>;
+
+export interface EngineVersionsFetcherOptions {
+  /** 引擎可写面基址（与 `versions-write.ts` 同端），缺省 {@link DEFAULT_ENGINE_VERSIONS_BASE_URL}。 */
+  baseUrl?: string;
+  fetchImpl?: typeof fetch;
+  /** 单次请求超时（ms），缺省 10_000。 */
+  timeoutMs?: number;
+  /** 投影捕获时刻（ISO 字符串生成器，测试注入固定时钟）。 */
+  nowIso?: () => string;
+}
+
+function engineVersionsAbsent(code: string, error: string): EngineVersionsOutcome {
+  return { kind: "absent", code, error };
+}
+
+export function createEngineVersionsFetcher(
+  options: EngineVersionsFetcherOptions = {},
+): EngineVersionsFetcher {
+  const base = (options.baseUrl ?? DEFAULT_ENGINE_VERSIONS_BASE_URL).replace(/\/+$/, "");
+  const timeoutMs = options.timeoutMs ?? 10_000;
+  const nowIso = options.nowIso ?? (() => new Date().toISOString());
+  return async (): Promise<EngineVersionsOutcome> => {
+    const fetchImpl = options.fetchImpl ?? globalThis.fetch;
+    if (typeof fetchImpl !== "function") {
+      return engineVersionsAbsent("no_fetch", "运行环境无 fetch 实现 ⇒ 无法触达引擎版本台账读端点");
+    }
+    let res: Response;
+    try {
+      res = await fetchImpl(`${base}${ENGINE_VERSIONS_QUERY_PATH}`, {
+        method: "GET",
+        signal: AbortSignal.timeout(timeoutMs),
+        headers: { accept: "application/json" },
+      });
+    } catch (err: unknown) {
+      return engineVersionsAbsent("versions_unreachable", `引擎不可达（GET ${ENGINE_VERSIONS_QUERY_PATH}）：${err instanceof Error ? err.message : String(err)}`);
+    }
+    const text = await res.text().catch(() => "");
+    if (!res.ok) {
+      return engineVersionsAbsent(`http_${res.status}`, `引擎返回 HTTP ${res.status}：${text.slice(0, 200)}`);
+    }
+    let parsed: unknown;
+    try {
+      parsed = JSON.parse(text) as unknown;
+    } catch {
+      return engineVersionsAbsent("response_invalid", `版本台账响应不是合法 JSON：${text.slice(0, 200)}`);
+    }
+    return parseEngineVersions(parsed, nowIso());
+  };
 }
 
 // ---------------------------------------------------------------------------

@@ -25,6 +25,7 @@ import {
   executeDocsMove,
   planDocsMove,
 } from "../dist/docs-move.js";
+import { engineNoLockFetcher } from "./engine-versions-fixture.mjs";
 
 const NOW = Date.parse("2026-09-26T12:00:00Z");
 const FORM_HEADERS = { "content-type": "application/x-www-form-urlencoded" };
@@ -106,7 +107,10 @@ async function withDocsServer(
   scheduleFeatureImpl,
   run,
 ) {
-  // 空版本台账恒注入：缺省会读开发机真实 `.data/versions.json`，排期写锁随本机状态漂移
+  // 锁夹具两档恒注入（v0.10.0 B4：已发版锁的**事实源 = 引擎版本台账投影**，本地台账不再参与锁判）：
+  // ① 空引擎投影 ⇒ 「读到了 ∧ 零个已发版」（合法事实，非「读不到」档），版本锁不抢判，本文件的
+  //    断言面回到 mv 本身；缺省会打开发机真实引擎（本机台账常把 v0.9.x 标 released ⇒ 排期写集体 409）。
+  // ② 空本地台账 ⇒ 只喂非锁面（版本列/台账读面），同样不得随本机状态漂移。
   const ledgerDir = mkdtempSync(join(tmpdir(), "board-locked-"));
   const ledgerFile = join(ledgerDir, "versions.json");
   writeFileSync(ledgerFile, JSON.stringify({ version: 1, versions: [] }, null, 2) + "\n", "utf8");
@@ -119,6 +123,7 @@ async function withDocsServer(
     docs: { repoRoot, orgsDir: null },
     scheduleFeatureImpl,
     versionsLedgerFile: ledgerFile,
+    engineVersionsFetcher: engineNoLockFetcher(),
   });
   try {
     await run(`http://127.0.0.1:${handle.port}`);

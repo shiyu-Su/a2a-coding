@@ -13,7 +13,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
-import { groupFeaturesByVersion, renderSchedule } from "../dist/web/views.js";
+import { groupFeaturesByVersion, projectionVersionNames, renderSchedule } from "../dist/web/views.js";
 import {
   createVersion,
   emptyVersionsLedger,
@@ -21,6 +21,7 @@ import {
   setVersionStatus,
 } from "../dist/versions-ledger.js";
 import { createBoardServer } from "../dist/server.js";
+import { engineProjectionAbsentFetcher, engineProjectionFetcher } from "./engine-versions-fixture.mjs";
 
 const NOW = "2026-09-27T12:00:00.000Z";
 /**
@@ -151,7 +152,18 @@ test("N2-⑤（B5a 改版）HTTP：空间排期页台账独有列现形 + 三态
         return { features: [feature("F1", "v0.9.4")], stateCounts: null };
       },
     };
-    const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client, versionsLedgerFile: ledgerFile });
+    const handle = await createBoardServer({
+      host: "127.0.0.1",
+      port: 0,
+      client,
+      versionsLedgerFile: ledgerFile,
+      // v0.10.0 尾段 N1：版本列的台账侧版号事实源 = 引擎清单 ⇒ 与本地台账夹具**同源同值**恒注入
+      // （不注入会打开发机的真实引擎：列随本机台账漂移，且降级档（读缓存）永不被测到）。
+      engineVersionsFetcher: engineProjectionFetcher([
+        { org: ORG, version: "v0.9.3", status: "released" },
+        { org: ORG, version: "v0.9.5", status: "notstart" },
+      ]),
+    });
     try {
       const text = await (await fetch(`http://127.0.0.1:${handle.port}/org/${ORG}/schedule`)).text();
       assert.match(
@@ -165,6 +177,111 @@ test("N2-⑤（B5a 改版）HTTP：空间排期页台账独有列现形 + 三态
       await handle.close();
     }
     assert.equal(readFileSync(ledgerFile, "utf8"), before, "GET 排期页不得改写台账（并集/徽标为纯读）");
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// v0.10.0 尾段 N1 —— 版本列并集换源：**引擎 Release 清单 ∪ 卡派生版号**（并集留板）
+//   ① 引擎清单是台账侧版号的事实源（板本地台账降为「从未读到过投影」的降级读缓存）；
+//   ② 绝不「只渲染引擎清单」：引擎无 Release 条目 ∧ 卡有 `version` ⇒ 该版仍须成列
+//      （否则该卡在版本面失去清单读面）。
+// ---------------------------------------------------------------------------
+
+/** 引擎投影（`EngineVersionsProjection` 形态，同 `bridge-client.parseEngineVersions` 出参）。 */
+function projectionOf(entries) {
+  return { entries, capturedAt: NOW };
+}
+
+test("N1-① projectionVersionNames：null ⇒ 空清单；条目按登记序去重；空版号忽略；org 切片档同 ledgerVersionNames", () => {
+  assert.deepEqual(projectionVersionNames(null), [], "从未读到过投影 ⇒ 空清单（不当作「引擎零版本」）");
+  assert.deepEqual(projectionVersionNames(projectionOf([])), [], "空台账 = 合法零条目");
+  const p = projectionOf([
+    { org: "alpha", version: "v0.9.9", status: "notstart" },
+    { org: "beta", version: "v0.9.8", status: "released" },
+    { org: "alpha", version: "v0.9.9", status: "active" },
+    { org: "", version: "v1.0.0", status: "active" },
+    { org: "alpha", version: "   ", status: null },
+  ]);
+  assert.deepEqual(projectionVersionNames(p), ["v0.9.9", "v0.9.8", "v1.0.0"], "不限组织：跨组织同名折叠为一、保持登记序、空版号丢");
+  assert.deepEqual(projectionVersionNames(p, "alpha"), ["v0.9.9"], "切片档 = 只取本组织条目");
+  assert.deepEqual(projectionVersionNames(p, ""), ["v1.0.0"], "空串 = 未归属桶精确档");
+  assert.deepEqual(projectionVersionNames(p, "gamma"), [], "该组织无条目 ⇒ 空清单");
+});
+
+test("N1-② 并集（定向核心）：引擎清单空 ∧ 卡有 version ⇒ 该版仍成列；引擎独有条目 ⇒ 空列；交集并作一列；两路版号不重复出列", () => {
+  assert.deepEqual(
+    groupFeaturesByVersion([feature("F1", "v0.9.4"), feature("F9", "dirty-old")], [], []).map((c) => c.version),
+    ["v0.9.4", "dirty-old"],
+    "引擎无 Release 条目 ⇒ 卡派生版号照旧成列（含历史脏列）",
+  );
+  const cols = groupFeaturesByVersion([feature("F1", "v0.9.4")], [], ["v0.9.5", "v0.9.4"]);
+  assert.deepEqual(cols.map((c) => c.version), ["v0.9.4", "v0.9.5"], "引擎独有 v0.9.5 成空列；交集 v0.9.4 并作一列");
+  assert.deepEqual(cols[1].features, [], "引擎独有能力 ⇒ 空列（尚无卡）");
+  const both = groupFeaturesByVersion([feature("F2", "v0.9.4")], ["v0.9.3"], ["v0.9.5", "v0.9.3"]);
+  assert.deepEqual(both.map((c) => c.version), ["v0.9.3", "v0.9.4", "v0.9.5"], "两路台账版号同给 ⇒ 并集不重复出列");
+});
+
+test("N1-③ HTTP：引擎清单独有版本（本地台账零条目）⇒ 空间排期页出空列；卡派生版号同时在列（并集留板）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "board-n1-"));
+  try {
+    const ledgerFile = join(dir, "versions.json");
+    writeFileSync(ledgerFile, serializeVersionsLedger(emptyVersionsLedger()), "utf8");
+    const client = {
+      baseUrl: "http://fake",
+      async getFeatures() {
+        return { features: [feature("F1", "v0.9.4")], stateCounts: null };
+      },
+    };
+    const handle = await createBoardServer({
+      host: "127.0.0.1",
+      port: 0,
+      client,
+      versionsLedgerFile: ledgerFile,
+      engineVersionsFetcher: engineProjectionFetcher([{ org: ORG, version: "v2.0.0", status: "notstart" }]),
+    });
+    try {
+      const text = await (await fetch(`http://127.0.0.1:${handle.port}/org/${ORG}/schedule`)).text();
+      assert.match(
+        text,
+        /<h3>v2\.0\.0 <span class="kbadge vbadge notstart"[^>]*>未开始<\/span> <span class="muted">\(0\)<\/span>/,
+        "引擎清单独有版本 ⇒ 空列现形（本地台账无该条目）",
+      );
+      assert.match(text, /<h3>v0\.9\.4 <span class="kbadge vbadge wip"/, "卡派生版号仍在列（并集不因引擎清单在场而收缩）");
+    } finally {
+      await handle.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("N1-④ HTTP 降级档：投影从未读到（absent）⇒ 本地台账读缓存照常成列（读面不挡）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "board-n1d-"));
+  try {
+    const ledgerFile = join(dir, "versions.json");
+    writeFileSync(ledgerFile, serializeVersionsLedger(ledgerWith([["v0.9.5", "notstart"]])), "utf8");
+    const client = {
+      baseUrl: "http://fake",
+      async getFeatures() {
+        return { features: [feature("F1", "v0.9.4")], stateCounts: null };
+      },
+    };
+    const handle = await createBoardServer({
+      host: "127.0.0.1",
+      port: 0,
+      client,
+      versionsLedgerFile: ledgerFile,
+      engineVersionsFetcher: engineProjectionAbsentFetcher(),
+    });
+    try {
+      const text = await (await fetch(`http://127.0.0.1:${handle.port}/org/${ORG}/schedule`)).text();
+      assert.match(text, /<h3>v0\.9\.5 /, "拿不到投影 ⇒ 台账读缓存仍贡献版号（不退化成只渲染卡派生）");
+      assert.match(text, /<h3>v0\.9\.4 /, "卡派生版号不受影响");
+    } finally {
+      await handle.close();
+    }
   } finally {
     rmSync(dir, { recursive: true, force: true });
   }

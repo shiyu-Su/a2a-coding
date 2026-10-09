@@ -172,6 +172,26 @@ export function isFeatureApproval(v: unknown): v is FeatureApproval {
   return typeof v === "string" && (FEATURE_APPROVALS as readonly string[]).includes(v);
 }
 
+/**
+ * **版本台账状态**值域（v0.10.0 O4 · 改造文档 §2.1(1)/(3)，落 `versions.status`）—— 三态、**事实源在引擎**。
+ *
+ * - `notstart`：台账已建版号、尚未派发任何节点；
+ * - `active`：首个节点派发 / `approve` 放行时引擎内部幂等转换（`notstart→active`，非板写口）；
+ * - `released`：**已发版锁**的事实源 —— 排期写与 MCP 直写 `version` 一律不得写入 `released` 版号；
+ *   标记 `released` 须经发版闸（判据见 `bridge/feature-tools.ts` 的 `evaluateReleaseGate`）。
+ *
+ * ⚠ 这是**版本**的状态，与 Feature 的 `stage`（观测登记字段）/ `state`（引擎态）三维正交、不得互推。
+ */
+export const VERSION_LEDGER_STATUSES = ["notstart", "active", "released"] as const;
+
+/** 版本台账状态（由 `VERSION_LEDGER_STATUSES` 派生；勿另立第二份清单） */
+export type VersionLedgerStatus = (typeof VERSION_LEDGER_STATUSES)[number];
+
+/** 收窄：unknown → VersionLedgerStatus（台账读口对 `status` 列取值的唯一闭集判据） */
+export function isVersionLedgerStatus(v: unknown): v is VersionLedgerStatus {
+  return typeof v === "string" && (VERSION_LEDGER_STATUSES as readonly string[]).includes(v);
+}
+
 /** Feature 记录（落 SQLite `features` 表） */
 export interface FeatureRecord {
   featureId: string;

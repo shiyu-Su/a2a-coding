@@ -501,7 +501,11 @@ export interface RunnerTaskDiagnostics {
   cancelUnsupported?: boolean;
 }
 
-/** 任务结果（M4 落盘 `.a2a/outbox/<taskId>.json` 的载荷形状） */
+/**
+ * 任务结果（M4 落盘 `.a2a/outbox/<taskId>.json` 的载荷形状）。
+ * v0.10.0 版本面：`/runner/result` 载荷**不含 `repo` 键**（仓库标识只走注册载荷
+ * `projects[].repo`），本形状零改动 ⇒ 不受「可忽略可选字段不升版」判据影响（沿用 2.3）。
+ */
 export interface RunnerTaskResult {
   taskId: string;
   machineId: string;

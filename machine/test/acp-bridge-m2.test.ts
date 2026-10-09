@@ -74,8 +74,16 @@ class MemoryFs implements SessionMapFs {
   }
 }
 
+/**
+ * 固定时钟（对齐 test/acp-session-map.test.ts 的 `FIXED` 口径）：SessionMap 的 `load()` 会按
+ * TTL（缺省 7 天，以 `updatedAt` 计）淘汰条目，走真实墙钟时本文件的旧条目 fixture
+ * （`updatedAt = 2026-09-19`）会在 2026-09-26 之后被剪掉 ⇒ 断言随日期过期而必红。
+ * 取 2026-09-20 = fixture 之后 1 天：条目仍是「旧格式条目」，但永不在 TTL 之外。
+ */
+const FIXED_NOW = (): Date => new Date("2026-09-20T00:00:00.000Z");
+
 function makeMap(fs: MemoryFs): SessionMap {
-  return new SessionMap({ projectId: "p1", baseDir: "/m", fs });
+  return new SessionMap({ projectId: "p1", baseDir: "/m", fs, now: FIXED_NOW });
 }
 
 /** SessionMap 的落盘路径（与实现同口径：join(baseDir, .a2a, acp-sessions, <projectId>.json)）。 */

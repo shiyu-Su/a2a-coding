@@ -14,14 +14,22 @@
  *
  * **一次性迁移**（改造文档 §2.1）：启动前置、fail-fast —— `config/config.json` 的
  * `releasedVersions` 四条灌入 → `status=released`；灌入失败 ⇒ 拒起板（防已发版锁静默消失）。
- * 迁移边界 = **台账文件是否存在**：文件已存在 ⇒ 该键为**残留键**，一次性 warn、**不双读**
- * （不重复灌入、不改台账）。台账读面（`isVersionLocked` 切换）归 N3，本节点只建台账 + 写口。
+ * **v0.10.0 B1 起迁移边界 = 独立哨兵文件**（`.data/versions.migrated.json`，见 {@link defaultVersionsSentinelFile}）：
+ * 旧判据「台账文件是否存在」（`store.exists()`）**已删除** —— 台账「存在」≠「非空」，
+ * 空台账 / 坏文件 load 按空台账起 ⇒ 残留键会被再次灌入（假绿）。哨兵缺失 ⇒ 一次性迁移视同未发生，
+ * `releasedVersions` 照灌，且 `seedReleased` **非破坏性**（已存在版号幂等跳过，不覆盖 status/note、不复制空串桶副本），
+ * 故 v0.9.4 既有部署升级日（哨兵晚于台账诞生）首启补立哨兵，不丢历史也不重复灌。
+ * 台账读面（`isVersionLocked` 切换）归后续节点，本节点只出源 + 换边界。
+ *
+ * **出源（v0.10.0 B1，§2.1-⑦ / §2.3-4）**：{@link exportVersionsLedger} 把本地台账整表导出为
+ * 引擎导入载荷（全字段 `org/version/status/date/note/createdAt/updatedAt`；读-only、不改台账），
+ * CLI 入口 = `scripts/export-versions-ledger.mjs`（一次性运维，供引擎侧迁移脚本消费）。
  *
  * 原子写复用 `host-bridge-ledger.ts` 的 {@link writeFileAtomic}（tmp + rename + 建父目录）；
  * 板是单进程单写手，与其余台账同口径**不加文件锁**。
  */
 import { existsSync, readFileSync } from "node:fs";
-import { join, resolve } from "node:path";
+import { join, resolve, dirname } from "node:path";
 import { writeFileAtomic } from "./host-bridge-ledger.js";
 
 /** 台账 schema 版本（未来加字段时用于迁移判定；v0.9.6 B1 记录扩 `org` ⇒ 1 → 2）。 */
@@ -30,6 +38,14 @@ export const VERSIONS_LEDGER_VERSION = 2;
 /** 缺省台账落点：`<board>/.data/versions.json`（`.data/` 已在 `.gitignore`）。 */
 export function defaultVersionsLedgerFile(cwd: string = process.cwd()): string {
   return join(resolve(cwd), ".data", "versions.json");
+}
+
+/**
+ * 缺省**迁移哨兵**落点（v0.10.0 B1）：`<board>/.data/versions.migrated.json`。
+ * 与台账文件**同目录不同名** ⇒ `.data/` 整体删除时两者同灭（哨兵不比台账更长寿，语义一致）。
+ */
+export function defaultVersionsSentinelFile(cwd: string = process.cwd()): string {
+  return join(resolve(cwd), ".data", "versions.migrated.json");
 }
 
 /** 版本状态闭集（三态，用户裁定）：未开始 / 进行中 / 已发版。 */
@@ -175,7 +191,7 @@ export function isVersionReleased(ledger: VersionsLedger, version: string, org?:
 /**
  * 建版本（**纯函数**）：同键 `(org, version)` 已存在 ⇒ 原样返回 + `added: false`（幂等，**不覆盖**既有状态）；
  * 不同组织的同版号是**两条独立条目**（口径 1）。org 省略 ⇒ 落空串桶（未切片调用面的既有形态）。
- * 新条目初态 `status = notstart`（用户裁定：`notstart → active` 由首卡过确认门自动触发，见 `version-transition.ts`）。
+ * 新条目初态 `status = notstart`（`notstart → active` 仅经人工写口，自动转换已迁引擎 · v0.10.0 C-1；板侧迁移矩阵见 `version-transition.ts`）。
  */
 export function createVersion(
   ledger: VersionsLedger,
@@ -229,28 +245,35 @@ export function setVersionStatus(
 // 一次性迁移（config `releasedVersions` → 台账 released）
 // ---------------------------------------------------------------------------
 export interface ReleasedMigrationResult {
-  /** 本次实际灌入台账的版本号（首次迁移；非空 ⇒ 应打印迁移回执）。 */
+  /** 本次实际**新增**为 released 的版本号（首次迁移；非空 ⇒ 应打印迁移回执。已存在而幂等跳过的版号不入回执）。 */
   migrated: string[];
-  /** 台账已存在时被忽略的**残留键**值（一次性 warn、不双读；空 = 无残留）。 */
+  /** 哨兵已立时被忽略的**残留键**值（warn、不双读；空 = 无残留）。 */
   residual: string[];
-  /** 残留键 warn 文案（null = 无）；调用方负责打印一次。 */
+  /** 残留键 warn 文案（null = 无）；调用方负责打印。 */
   warning: string | null;
 }
 
 /** 迁移所需的台账存取面（最小接口，便于单测注入假 store 钉「写失败 ⇒ 抛出」）。 */
 export interface MigrationStore {
-  /** 台账文件是否已存在（迁移边界：存在 ⇒ 一次性迁移已发生过）。 */
-  exists(): boolean;
+  /**
+   * **迁移哨兵**是否已立 = 一次性迁移边界的唯一判据（v0.10.0 B1）。
+   * 旧判据「台账文件是否存在」已删除：台账「存在」≠「非空」，空台账 / 坏文件 load 按空台账起 ⇒ 假绿。
+   */
+  migrationDone(): boolean;
+  /** 一次性迁移链路收尾时落哨兵（含空操作档）。 */
+  markMigrationDone(note: string | null): void;
   load(): { ledger: VersionsLedger; corrupt: boolean };
-  /** 把给定版本号以 `status=released` 灌入并落盘（写失败**抛出** ⇒ fail-fast）。 */
+  /** 把给定版本号以 `status=released` 灌入并落盘（**非破坏性**：已在任一组织存在的版号跳过；写失败**抛出** ⇒ fail-fast）。 */
   seedReleased(versions: readonly string[], now: string): VersionsLedger;
 }
 
 /**
- * 一次性迁移（改造文档 §2.1）：`releasedVersions` 灌入台账 `status=released`。
- * - `releasedVersions` 为空（未配置 / 空数组）⇒ 空操作，无 warn；
- * - 台账**不存在** ⇒ 迁移：全部灌入 + 落盘（`save` 抛出即向上抛 ⇒ **拒起板**）；
- * - 台账**已存在** ⇒ 该键为**残留键**：一次性 warn 文案，**不双读**（不灌入、不改台账）。
+ * 一次性迁移（改造文档 §2.1；v0.10.0 B1 起边界 = **独立哨兵**）：`releasedVersions` 灌入台账 `status=released`。
+ * - `releasedVersions` 为空（未配置 / 空数组）⇒ 空操作，无 warn（哨兵由调用方补立）；
+ * - 哨兵**未立** ⇒ 迁移：逐个灌入 + 落盘（`save` 抛出即向上抛 ⇒ **拒起板**）。
+ *   台账文件此时**已存在且有数据**（v0.9.4 起已迁移过、哨兵机制晚生）⇒ `seedReleased` 对已存在版号
+ *   **幂等跳过**（不复制空串桶副本、不覆盖既有 status/note），只补台账里缺失的版号；
+ * - 哨兵**已立** ⇒ 该键为**残留键**：warn 文案，**不双读**（不灌入、不改台账）。
  */
 export function migrateReleasedVersions(input: {
   releasedVersions: readonly string[];
@@ -263,17 +286,19 @@ export function migrateReleasedVersions(input: {
     if (v !== "" && !wanted.includes(v)) wanted.push(v);
   }
   if (wanted.length === 0) return { migrated: [], residual: [], warning: null };
-  if (input.store.exists()) {
+  if (input.store.migrationDone()) {
     return {
       migrated: [],
       residual: wanted,
       warning:
-        `config.json 的 releasedVersions 为残留键（版本台账已存在）⇒ 已按单一事实源忽略该键、不再读取：` +
+        `config.json 的 releasedVersions 为残留键（版本台账一次性迁移已完成，哨兵已立）⇒ 已按单一事实源忽略该键、不再读取：` +
         `${wanted.join(" · ")}。请从 config.json 整键删除（版本状态改在板上维护）。`,
     };
   }
+  const before = new Set(releasedVersionNames(input.store.load().ledger));
   const ledger = input.store.seedReleased(wanted, input.now);
-  return { migrated: releasedVersionNames(ledger), residual: [], warning: null };
+  // 回执 = 本次**新增**的 released（升级日哨兵未立但台账已有数据 ⇒ seedReleased 幂等跳过已存在版号，不得谎报「已灌入」）。
+  return { migrated: releasedVersionNames(ledger).filter((v) => !before.has(v)), residual: [], warning: null };
 }
 
 // ---------------------------------------------------------------------------
@@ -331,12 +356,28 @@ export function migrateLedgerOrgs(
  */
 export class VersionsLedgerStore implements MigrationStore {
   readonly file: string;
-  constructor(file: string = defaultVersionsLedgerFile()) {
+  /** 迁移哨兵文件（v0.10.0 B1；**缺省由台账路径同目录派生** ⇒ 注入自定义台账时哨兵不串目录）。 */
+  readonly sentinelFile: string;
+  constructor(file: string = defaultVersionsLedgerFile(), sentinelFile: string = join(dirname(file), "versions.migrated.json")) {
     this.file = file;
+    this.sentinelFile = sentinelFile;
   }
 
-  exists(): boolean {
-    return existsSync(this.file);
+  /**
+   * 迁移哨兵是否已立 = 一次性迁移的**唯一边界判据**（v0.10.0 B1）。
+   * 旧判据「台账文件是否存在」已**删除**（`exists()` 无生产调用点，留 API 只会被人接回去）：
+   * 台账「存在」≠「非空」——空台账 / 坏文件 load 按空台账起 ⇒ 残留键会被再次灌入（假绿）。
+   */
+  migrationDone(): boolean {
+    return existsSync(this.sentinelFile);
+  }
+
+  /** 落迁移哨兵（tmp + rename 原子写；写失败**抛出** ⇒ 与其它一次性迁移同口径 fail-fast）。 */
+  markMigrationDone(note: string | null): void {
+    writeFileAtomic(
+      this.sentinelFile,
+      JSON.stringify({ kind: "board-versions-migration-sentinel", doneAt: new Date().toISOString(), note }, null, 2) + "\n",
+    );
   }
 
   load(): { ledger: VersionsLedger; corrupt: boolean } {
@@ -387,17 +428,87 @@ export class VersionsLedgerStore implements MigrationStore {
     return next;
   }
 
-  /** 一次性迁移灌入（**写失败抛出** ⇒ 由调用方 fail-fast 拒起板）。与现存条目合并、不覆盖。 */
+  /**
+   * 一次性迁移灌入（**写失败抛出** ⇒ 由调用方 fail-fast 拒起板）。
+   * v0.10.0 B1 哨兵口径下本函数可能跑在**已有数据的台账**上（升级日哨兵尚未立），故为**非破坏性**：
+   * 版号已在任一组织存在 ⇒ 不新建空串桶副本、不覆盖既有 status/note（发版事实已在 ⇒ 幂等跳过）；
+   * 仅对台账完全缺失的版号建 `notstart` 行并置 `released`。
+   */
   seedReleased(versions: readonly string[], now: string): VersionsLedger {
     const { ledger } = this.load();
     let next = ledger;
-    for (const v of versions) next = createVersion(next, v, now).ledger;
-    let released = next;
+    const seeded: string[] = [];
     for (const v of versions) {
-      // 迁移语义 = 全部置 released（createVersion 只建 notstart；此处补状态）。
-      released = setVersionStatus(released, v, "released", now, "migrated:config-releasedVersions").ledger;
+      if (findVersionRecord(next, v) !== null) continue;
+      next = createVersion(next, v, now).ledger;
+      seeded.push(v);
     }
-    this.save(released);
-    return released;
+    for (const v of seeded) {
+      // 迁移语义 = 新建行置 released（createVersion 只建 notstart；此处补状态）。
+      next = setVersionStatus(next, v, "released", now, "migrated:config-releasedVersions").ledger;
+    }
+    this.save(next);
+    return next;
   }
+}
+
+// ---------------------------------------------------------------------------
+// 出源（v0.10.0 B1 · §2.1-⑦ / §2.3-4）：台账整表导出为引擎导入载荷
+// ---------------------------------------------------------------------------
+
+/** 导出 schema 版本（引擎导入侧按此键分流；台账文件 schema（`VERSIONS_LEDGER_VERSION`）是另一回事，二者独立演进）。 */
+export const VERSIONS_EXPORT_SCHEMA = 1;
+
+/** 导出的一行（= 台账记录全字段逐值透传 + `date` 空位；**不改写、不归一、不排序**）。 */
+export interface VersionExportRecord {
+  /** 组织名（板 `org` 原值；引擎落键 `owner_group`，映射在导入侧）。`""` = 未归属桶，如实带出。 */
+  org: string;
+  version: string;
+  status: VersionLedgerStatus;
+  /**
+   * 发版日期（引擎 `versions.date` 列）。板台账**无 date 存储**（v0.9.4 建台账至今无该字段）
+   * ⇒ 导出恒为 `null` 空位，**不造假值**；发版事实如需日期由引擎侧从别处补齐（偏离项已在回执登记）。
+   */
+  date: string | null;
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** 导出载荷（引擎一次性迁移脚本的**主源**输入，见 §2.1-⑦）。 */
+export interface VersionsExportPayload {
+  schema: number;
+  /** 导出源文件路径（追溯用）。 */
+  source: string;
+  count: number;
+  versions: VersionExportRecord[];
+}
+
+/**
+ * 台账 → 引擎导入载荷（**纯读**，不改任何文件）。
+ * - 全字段透传（`org/version/status/note/createdAt/updatedAt` 逐值不动，含未归属空串桶）；
+ * - **输出确定性**：不含生成时刻、保持登记序 ⇒ 同一文件两次导出逐字节相同（可重复导、可 diff）；
+ * - `corrupt`（坏文件）⇒ **抛出拒导** —— 导出主源若按空台账出货会把 `released` 历史静默导出为零，
+ *   与迁移 fail-fast 同口径（`load()` 的容错形态适用于运行时，不适用于出源）。
+ */
+export function exportVersionsLedger(store: VersionsLedgerStore): VersionsExportPayload {
+  const { ledger, corrupt } = store.load();
+  if (corrupt) {
+    throw new Error(`版本台账文件损坏（${store.file}）⇒ 拒绝导出：出源按空台账出货会静默丢 released 历史，请先修复文件`);
+  }
+  const versions: VersionExportRecord[] = ledger.versions.map((rec) => ({
+    org: rec.org,
+    version: rec.version,
+    status: rec.status,
+    date: null,
+    note: rec.note,
+    createdAt: rec.createdAt,
+    updatedAt: rec.updatedAt,
+  }));
+  return { schema: VERSIONS_EXPORT_SCHEMA, source: store.file, count: versions.length, versions };
+}
+
+/** 序列化导出载荷（固定缩进 2 + 行尾换行，口径同台账本体）。 */
+export function serializeVersionsExport(payload: VersionsExportPayload): string {
+  return JSON.stringify(payload, null, 2) + "\n";
 }

@@ -992,6 +992,7 @@ test("回归：3300 路由枚举含 /api/registry/projects（全部已注册路�
   const registered = [
     "/api/projects",
     "/api/features",
+    "/api/features-by-version",
     "/api/tasks",
     "/api/events",
     "/api/groups",
@@ -1062,4 +1063,77 @@ test("close() 可停机：keep-alive 空闲连接不挂起（closeIdleConnection
     req.end();
   });
   assert.equal(refused, true, "close() 后端口应不再接受连接");
+});
+
+// ---------------------------------------------------------------------------
+// v0.10.0 O3：GET /api/features-by-version（版本名下卡聚合读面，直连 store）
+// ---------------------------------------------------------------------------
+
+interface VersionFeaturesBody {
+  ok: boolean;
+  source: string;
+  observedAt: string;
+  note: string;
+  ownerGroup: string | null;
+  version: string | null;
+  versions: string[];
+  unregisteredCount: number;
+  buckets: Array<{
+    version: string | null;
+    counts: { total: number; completed: number; cancelled: number; open: number };
+    features: Array<{ featureId: string; state: string; title: string }>;
+  }>;
+  counts: { versions: number; buckets: number; features: number };
+}
+
+test("GET /api/features-by-version → 版本名下卡聚合：owner_group 收窄可见性 + version 可选 + 未登记桶末位 + 非 GET 405（v0.10.0 O3）", async () => {
+  const g = "gweb-fbv";
+  createFeature({ featureId: "fbv-a", title: "FBV A", version: "1.2.3", state: "completed", ownerGroup: g });
+  createFeature({ featureId: "fbv-b", title: "FBV B", version: "1.2.3", state: "executing", ownerGroup: g });
+  createFeature({ featureId: "fbv-c", title: "FBV C", ownerGroup: g }); // 未登记（NULL 版号）
+
+  // 本面直连 store，不经 core —— 桩令 core 三方法皆抛，命中即证明未复用 core 读路
+  const handle = await startWeb(
+    fakeCore({
+      projects: async () => {
+        throw new Error("features-by-version 不应经 core.projects");
+      },
+    }),
+  );
+
+  const res = await get(handle.port, `/api/features-by-version?owner_group=${g}`);
+  assert.equal(res.status, 200);
+  const body = json<VersionFeaturesBody>(res);
+  assert.equal(body.ok, true);
+  assert.equal(body.ownerGroup, g);
+  assert.match(body.source, /features 表按版号聚合/);
+  assert.match(body.observedAt, /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}/);
+  assert.deepEqual(body.versions, ["1.2.3"]);
+  assert.equal(body.unregisteredCount, 1, "未登记卡不静默丢");
+  assert.equal(body.buckets[body.buckets.length - 1]!.version, null, "未登记桶恒末位");
+  const v = body.buckets.find((b) => b.version === "1.2.3")!;
+  assert.deepEqual(v.counts, { total: 2, completed: 1, cancelled: 0, open: 1 });
+  assert.deepEqual(v.features.map((f) => f.featureId).sort(), ["fbv-a", "fbv-b"]);
+  assert.equal(body.counts.features, 3, "counts.features = 全部桶 total 之和");
+
+  // version 收窄：只动 buckets；versions / unregisteredCount 仍全量口径
+  const one = json<VersionFeaturesBody>(
+    await get(handle.port, `/api/features-by-version?owner_group=${g}&version=1.2.3`),
+  );
+  assert.equal(one.buckets.length, 1, "收窄只留该桶");
+  assert.equal(one.buckets[0]!.version, "1.2.3");
+  assert.deepEqual(one.versions, ["1.2.3"], "versions 不随收窄变化");
+  assert.equal(one.counts.buckets, 1);
+
+  // version= 空串 ⇒ 命中未登记桶
+  const un = json<VersionFeaturesBody>(
+    await get(handle.port, `/api/features-by-version?owner_group=${g}&version=`),
+  );
+  assert.equal(un.buckets.length, 1);
+  assert.equal(un.buckets[0]!.version, null);
+
+  // 已注册路径非 GET ⇒ 405
+  const notGet = await get(handle.port, "/api/features-by-version", "POST");
+  assert.equal(notGet.status, 405);
+  assert.equal(json<ErrorBody>(notGet).code, "method_not_allowed");
 });

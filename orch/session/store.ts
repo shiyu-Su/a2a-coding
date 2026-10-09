@@ -31,6 +31,7 @@ import type {
   TaskLane,
   TaskRecord,
   TaskState,
+  VersionLedgerStatus,
 } from "../types.js";
 import {
   AGENT_KINDS,
@@ -41,6 +42,7 @@ import {
   FEATURE_STAGES,
   isFeatureApproval,
   isFeatureStage,
+  isVersionLedgerStatus,
   ORPHAN_FAILURE_KIND,
   TASK_LANES,
 } from "../types.js";
@@ -152,6 +154,54 @@ export const EVENT_FEATURE_STATE = "feature.state";
  */
 export const EVENT_FEATURE_STAGE = "feature.stage";
 /**
+ * 事件 kind：**版本台账建行**（v0.10.0 O1/O2a · 改造文档 §2.1(1)(2)）。
+ *
+ * 由 {@link SessionStore.versionLedgerCreate} 在 INSERT 同事务后发出；`feature_id` / `task_id`
+ * 均 `NULL`（版本台账不属于任何 Feature）⇒ 按案 B 归属谓词只有**未限定作用域**的读面可见，
+ * 与 `store.list_truncated` 同一处置口径（运维留痕，不进板上清单）。
+ */
+export const EVENT_VERSION_LEDGER_CREATED = "version.ledger_created";
+/** 事件 kind：**版本台账删行**（v0.10.0 O2a；与 `DELETE /api/versions/{version}` 一对一） */
+export const EVENT_VERSION_LEDGER_DELETED = "version.ledger_deleted";
+/**
+ * 事件 kind：**版本自动转 `active`**（v0.10.0 O2c · 改造文档 §2.1(2)）—— 由
+ * {@link SessionStore.versionLedgerActivate} 在「`versions.status` 由 `notstart` 迁 `active`」的
+ * **同一事务内**发出（`feature_id` / `task_id` 均 `NULL`：版本台账不属任何 Feature）。
+ *
+ * 触发方 = **引擎内部**（首个节点派发 / `approve` 放行），**不开放板写口** —— 板只读结果。
+ * `payload.from = "notstart"` / `payload.to = "active"`；幂等（非 `notstart` ⇒ 零写入、零事件）。
+ */
+export const EVENT_VERSION_ACTIVATED = "version.activated";
+/**
+ * 事件 kind：**版本手动设状态**（v0.10.0 O2c）—— 由
+ * {@link SessionStore.versionLedgerSetStatus} 在非发版状态间改 `status` 时发出
+ * （`notstart ↔ active` 的人工写口；发版仍走 {@link EVENT_VERSION_RELEASED}）。
+ * 同值重写（幂等）**零事件**；`released` 为终态，本事件**永不出现在 `from = released`** 的迁移里。
+ */
+export const EVENT_VERSION_STATUS_CHANGED = "version.status_changed";
+/**
+ * 事件 kind：**版本发版**（v0.10.0 O7 · 改造文档 §2.1(1)）—— 由
+ * {@link SessionStore.versionLedgerMarkReleased} 在「`versions.status` 迁 `released` +
+ * `releases` 落快照」的**同一事务内**发出 ⇒ 事件与两行写同时成立或同时不成立。
+ *
+ * `payload.backfilled = true` ⇒ 台账行原本已是 `released`、本次只补写缺失的快照
+ * （迁移主源导入的历史 `released` 行无快照，见 `需求流程.md` §8 标记 `released` 条），
+ * 读账时据此区分「发版那一刻」与「事后补登」。
+ */
+export const EVENT_VERSION_RELEASED = "version.released";
+/**
+ * 事件 kind：**迁移哨兵**（v0.10.0 O1 · 改造文档 §2.1(7)）。
+ *
+ * 一次性迁移脚本（`scripts/migrate-versions-ledger.mjs`）在 `--apply` 成功后落**一条**，
+ * 作为「本库已迁移」的判据 —— **不复用 `exists()`**（台账里有行 ≠ 迁移跑过：建单端点同样会
+ * 造出行，拿台账判据会把「手工建单」误当成「已导入板台账」而漏掉未导入的行）。
+ * 迁移判据 = 哨兵行存在 ⇒ 跳过；不存在 ⇒ 执行。幂等由「哨兵 + `INSERT` 走 get-then-insert」两重兜住。
+ *
+ * 哨兵的**读写都在脚本内**（离线一次性工具，直接开 SQLite）；本常量存在的意义 =
+ * **把 kind 字面量钉在引擎侧单一事实源**，脚本与任何后续读面对齐同一串，不各写各的。
+ */
+export const EVENT_VERSION_LEDGER_MIGRATED = "version.ledger_migrated";
+/**
  * 事件 kind：列表查询**触顶截断**告警（v0.6.1 REQ-05 §2.5 白捡 / C12）。
  *
  * `listFeatures` / `listFeatureTasks` 返回行数触顶（`=== limit`）时记**事件 + 日志各一条**，
@@ -251,6 +301,8 @@ export interface RunnerProjectInput {
   endpoint?: string | null;
   /** 项目 Agent 启动时刻（可空） */
   startedAt?: string | null;
+  /** 所属仓库标识（可空 = 老桥未上报 / 缺省宿主仓，由引擎解释层承担） */
+  repo?: string | null;
 }
 
 /** Runner 项目记录（落 `runner_projects`；`updated_at` 由每次全量替换统一盖章） */
@@ -264,6 +316,8 @@ export interface RunnerProjectRecord {
   status: RunnerProjectStatus;
   endpoint: string | null;
   startedAt: string | null;
+  /** 所属仓库标识（可空 = 未上报） */
+  repo: string | null;
   updatedAt: string;
 }
 
@@ -371,7 +425,7 @@ export interface ListFeatureTasksOptions {
   limit?: number;
 }
 
-/** `listFeatures` 入参：可选状态过滤 / 条数上限 / 归属组过滤 */
+/** `listFeatures` 入参：可选状态 / 版号 / 条数上限 / 归属组过滤 */
 export interface ListFeaturesOptions {
   state?: FeatureState;
   limit?: number;
@@ -381,7 +435,229 @@ export interface ListFeaturesOptions {
    * （未配组环境的匿名入口 / web 运维视图）。
    */
   ownerGroup?: string;
+  /**
+   * 版号过滤（v0.10.0 O5b）：与 {@link SessionStore.aggregateFeaturesByVersion} 的**未登记桶口径同源**
+   * （{@link featureVersionCondition} 单点承载，`listFeatures` 的 WHERE / 参数 / 去重键三处共用）。
+   *
+   * - **非空串** ⇒ 精确匹配该版号（trim 归一，与写口 `bridge/feature-tools.ts` 的
+   *   `parseRegistration` 同口径）；
+   * - **空串 / 纯空白** ⇒ 只返**未登记**卡（`version IS NULL OR version = ''`，含存量 NULL 行）；
+   * - **`undefined`** ⇒ 不筛版号（全量）。
+   */
+  version?: string;
 }
+
+/**
+ * `aggregateFeaturesByVersion` 出参：单张需求卡（渲染层收窄视图，**不带 `requirement`/`plan`/
+ * `decisions` 长文本** —— 聚合面面向「列出版 + 计数」，全文归 `listFeatures` / `feature_status`）。
+ */
+export interface VersionFeatureCard {
+  featureId: string;
+  state: FeatureState;
+  title: string;
+  stage: FeatureStage;
+  approval: FeatureApproval;
+  parentFeatureId: string | null;
+  updatedAt: string;
+}
+
+/** 版号名下单桶：三桶计数 + 名下需求卡清单（`version = null` ⇒ 未登记版号桶） */
+export interface VersionFeaturesBucket {
+  /** 版号；`null` = 未登记桶（`features.version` 为 NULL / 空串） */
+  version: string | null;
+  counts: { total: number; completed: number; cancelled: number; open: number };
+  features: VersionFeatureCard[];
+}
+
+/** 版本名下卡聚合读面全量（v0.10.0 O3；见 {@link SessionStore.aggregateFeaturesByVersion}） */
+export interface VersionCardAggregate {
+  /** 每版号一桶：已登记版号字典序在前，未登记桶（`version=null`）恒最后 */
+  buckets: VersionFeaturesBucket[];
+  /** 已登记版号全集（升序，不含未登记哨兵）= 板 §2.3「卡派生版号」并集的左料 */
+  versions: string[];
+  /** 未登记（无版号）卡张数（不静默丢；`0` = 无未登记卡） */
+  unregisteredCount: number;
+}
+
+/**
+ * 版本台账三态（v0.10.0 O1 · 改造文档 §2.1(1)）—— **清单与收窄判据的事实源在 `types.ts`**
+ * （`VERSION_LEDGER_STATUSES` / `VersionLedgerStatus` / `isVersionLedgerStatus`，O4 已落），
+ * 本表只引用、**不另立第二份清单**（防两处漂移）。语义：
+ *
+ * - `notstart` —— 台账有此行、尚无节点派发；
+ * - `active` —— 已有派发 / 过审（`notstart → active` 的自动转换归 O2c，板无写口）；
+ * - `released` —— **终态、不可回退**（写入经 O4 发版闸 + O7 同事务快照）。
+ */
+
+/**
+ * 版号 **semver 形状**（v0.10.0 O1 起为台账侧权威判据；与 O5 在 `bridge/feature-tools.ts` 内的
+ * 私有副本 `VERSION_SHAPE_RE` 逐字同形）：**可选 `v` 前缀** + `X.Y.Z` 三段（不做前导零宽松）
+ * + 可选 `-prerelease` + 可选 `+build`。
+ *
+ * ⚠ 两份副本并存 = 判据漂移风险，收敛项已随本节点回执登记（本节点不改 O5 文件）。
+ */
+const VERSION_SHAPE_RE =
+  /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+export function isVersionShapeValid(version: string): boolean {
+  return VERSION_SHAPE_RE.test(version);
+}
+
+/** 版本台账行（`versions` 表；**可编辑** —— 排期锁与 `released` 锁的事实源） */
+export interface VersionLedgerRecord {
+  /** 归属组 = `projectGroup` 组名；`null` = 无归属（未配组的匿名档，与 `features.owner_group` 同口径） */
+  ownerGroup: string | null;
+  version: string;
+  status: VersionLedgerStatus;
+  /** 发版日期（自由文本，板侧展示用；引擎不解析、不参与判定） */
+  date: string | null;
+  note: string | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+/** `releases.projects_json` 单项（**原值入快照、不归一**，改造文档 §2.1(6)） */
+export interface ReleaseSnapshotProject {
+  repoId: string | null;
+  ref: string | null;
+}
+
+/**
+ * 发版快照行（`releases` 表；**不可变**）。表与类型由 O1 落，**写入路径 = O7**
+ * （标记 `released` 时与 `versions.status` 同事务，见 {@link SessionStore.versionLedgerMarkReleased}）。
+ */
+export interface ReleaseSnapshotRecord {
+  ownerGroup: string | null;
+  version: string;
+  changelogAnchor: string | null;
+  projects: ReleaseSnapshotProject[];
+  note: string | null;
+  createdAt: string;
+}
+
+/**
+ * 标记 `released` 的快照入参（v0.10.0 O7 · 改造文档 §2.1(1)(6)）。
+ *
+ * **全部字段取调用方原值、引擎不归一**（§2.1(6)）：
+ * - `projects[].repoId` —— 由**发版动作**（板/宿主的发版意图）带入，引擎**不回查 `runner_projects`
+ *   投影表**：该表每次上报**全量替换**（{@link SessionStore.runnerProjectsReplace}），机未上报即空 ⇒
+ *   拿它当快照数据源会把「上报缺位」写成「该版无仓库」，是**假事实**；
+ * - `projects[].ref` —— 发版动作产生的 commit / tag（引擎不解析、不校验形状，同 §2.1(6) 口径）；
+ * - `changelogAnchor` —— CHANGELOG 锚点（同上：引擎不解析文档）。
+ *
+ * `projects` 缺省 = 空数组（单仓未配 `repo` 的现状 ⇒ 快照仍落行，`projects_json = "[]"`，
+ * 与「非 released 阶段无快照行」的判据不冲突）。
+ */
+export interface ReleaseSnapshotInput {
+  /** 归属组 = 台账键的一部分；`null` = 匿名档 */
+  ownerGroup: string | null;
+  version: string;
+  changelogAnchor?: string | null;
+  projects?: ReleaseSnapshotProject[];
+  note?: string | null;
+}
+
+/**
+ * 快照写口出参（v0.10.0 O7）—— 两个布尔把「幂等」拆成可读的两半，供 HTTP 面 / 回执留痕：
+ * - `statusMigrated` = 本次**真的**把台账 `status` 迁入 `released`（`false` = 原本已 `released`）；
+ * - `snapshotWritten` = 本次**真的**落了快照行（`false` = 快照已存在 ⇒ 不可变，不覆写）。
+ *   两者同 `false` ⇒ 纯幂等读回，零写入、零事件。
+ */
+export type ReleaseSnapshotWriteResult =
+  | {
+      ok: true;
+      snapshot: ReleaseSnapshotRecord;
+      ledger: VersionLedgerRecord;
+      statusMigrated: boolean;
+      snapshotWritten: boolean;
+    }
+  | { ok: false; code: string; message: string; status: number };
+
+/** `versionLedgerCreate` 入参（`ownerGroup` 必填语义：`null` = 匿名档，不是「未提供」） */
+export interface VersionLedgerCreateInput {
+  ownerGroup: string | null;
+  version: string;
+  /** 缺省 `notstart`；**不接受 `released`**（发版只能经 O2c 的设状态端点 + O4 闸） */
+  status?: VersionLedgerStatus;
+  date?: string | null;
+  note?: string | null;
+}
+
+/**
+ * `versionLedgerSetStatus` 入参（v0.10.0 O2c）—— `PATCH /api/versions/{version}/status` 的**手动**写口。
+ *
+ * 只承载 `notstart ↔ active` 的人工改态；**`released` 不经此口**（发版必须走
+ * {@link SessionStore.versionLedgerMarkReleased} 的闸 + 快照同事务）。
+ */
+export interface VersionLedgerSetStatusInput {
+  ownerGroup: string | null;
+  version: string;
+  status: VersionLedgerStatus;
+  note?: string | null;
+}
+
+/**
+ * `versionLedgerActivate` 出参（v0.10.0 O2c）—— 三护栏的**幂等**判据面：
+ * - `activated = true` ⇒ 本次真的把 `notstart` 迁成 `active`（且发了一条 {@link EVENT_VERSION_ACTIVATED}）；
+ * - `activated = false` ⇒ 无需动作（非 `notstart` / 行不存在 / 台账未就绪）。
+ */
+export interface VersionActivationResult {
+  /** 本次是否真的完成 `notstart → active`（幂等：重复触发恒为 `false`）。 */
+  activated: boolean;
+  /** 事务后该行 `status`（行不存在 / 台账未就绪 ⇒ `null`）。 */
+  status: VersionLedgerStatus | null;
+  /** 台账是否就绪（`false` = O1 `versions` 表未落地 ⇒ 过渡态，调用方应静默跳过）。 */
+  ledgerReady: boolean;
+}
+
+/**
+ * 台账写口出参（HTTP 面据此直接映射状态码与信封，见 `bridge/versions-endpoints.ts`）：
+ * 失败分支的 `code` 是 **`orch_*` 闭集**（板按错误码显示映射表呈现，未知码原样展示）。
+ */
+export type VersionLedgerWriteResult =
+  | { ok: true; record: VersionLedgerRecord }
+  | { ok: false; code: string; message: string; status: number };
+
+/** 版号名下卡的收口计数（`DELETE` 判据用；三桶口径与 O3 聚合面逐字一致） */
+export interface VersionCardCounts {
+  total: number;
+  completed: number;
+  cancelled: number;
+  /** 未收口 = 其余全部态（含 `failed` —— `failed` 不算收口，见 `需求流程.md` §8） */
+  open: number;
+}
+
+/**
+ * `versions` 表的**列清单单一串**（读口共用；SELECT 列序 = {@link rowToVersionLedger} 的取值键序）。
+ * 抽成常量：新增列时只需改 DDL + 这一串，避免各读口 SQL 分散漏改。
+ */
+const VERSION_LEDGER_COLUMNS =
+  "owner_group, version, status, date, note, created_at, updated_at";
+
+/**
+ * `releases` 表的**列清单单一串**（v0.10.0 O7；同 {@link VERSION_LEDGER_COLUMNS} 的抽常理由）。
+ * 无 `updated_at` —— 快照不可变，列面本身就不提供改写目标。
+ */
+const RELEASE_COLUMNS =
+  "owner_group, version, changelog_anchor, projects_json, note, created_at";
+
+/**
+ * 版本台账写口的 **`orch_*` 错误码闭集**（v0.10.0 O2a）。
+ *
+ * 命名沿用既有 `orch_*` 前缀（板按「错误码显示映射表」翻译成人话，**未知码原样展示、不 fail-closed**）。
+ * 码值即契约：HTTP 信封 `error.code` 与 MCP 面共用，不得随意改名。
+ */
+export const ERR_VERSION_SHAPE = "orch_version_invalid_shape";
+export const ERR_VERSION_STATUS = "orch_version_status_invalid";
+export const ERR_VERSION_EXISTS = "orch_version_exists";
+export const ERR_VERSION_UNKNOWN = "orch_version_unknown";
+export const ERR_VERSION_RELEASED_LOCKED = "orch_version_released_locked";
+export const ERR_VERSION_OPEN_CARDS = "orch_version_open_cards";
+/**
+ * 发版快照的 `projects` 入参形状非法（v0.10.0 O7）。
+ * 校验落**边界**（HTTP / MCP 入参是 JSON，形状不可信），见 `bridge/versions-release.ts`。
+ */
+export const ERR_RELEASE_PROJECTS = "orch_release_projects_invalid";
 
 /** `pruneTasks` 入参：保留策略阈值覆盖（缺省用环境变量 / 内置默认） */
 export interface PruneTasksOptions {
@@ -922,24 +1198,50 @@ function featureOwnershipCondition(
   return { clause: "owner_group = ?", params: [ownerGroup] };
 }
 
-/** `listFeatures` 的 WHERE 片段（状态过滤 ∧ 归属谓词；含尾空格，可直接接 `ORDER BY`） */
-function featureListWhere(opts: { state?: FeatureState; ownerGroup?: string }): string {
-  const clauses: string[] = [];
-  if (opts.state !== undefined) clauses.push("state = ?");
-  clauses.push(featureOwnershipCondition(opts.ownerGroup).clause);
-  const kept = clauses.filter((c) => c.length > 0);
+/**
+ * 版号谓词的**裸条件**（v0.10.0 O5b，不含 `WHERE` / `AND` 前缀）= `listFeatures` 版号过滤的
+ * **唯一事实源**。三档口径与 {@link SessionStore.aggregateFeaturesByVersion} 的**未登记桶**同源：
+ *
+ * - `undefined` ⇒ 空片段（不筛版号 = 全量）；
+ * - trim 后**空串** ⇒ `(version IS NULL OR version = '')` = 只返未登记卡（**零绑定参数**；
+ *   存量行落 NULL、撤排期行落 `''`，两者同属未登记桶，不得只认其一）；
+ * - trim 后**非空** ⇒ `version = ?`（精确匹配，绑定 trim 后值 —— 与写口 trim 归一同口径）。
+ */
+function featureVersionCondition(
+  version: string | undefined,
+): { clause: string; params: string[] } {
+  if (version === undefined) return { clause: "", params: [] };
+  const trimmed = version.trim();
+  if (trimmed === "") return { clause: "(version IS NULL OR version = '')", params: [] };
+  return { clause: "version = ?", params: [trimmed] };
+}
+
+/**
+ * `listFeatures` 的**过滤条件清单** = {@link featureListWhere} 与 {@link featureListParams} 的
+ * **共同事实源**（拼接序与绑参序由同一份数组派生，不可能各写一份而串位到错误的列）。
+ * 顺序固定 **state → version → owner**。
+ */
+function featureListConditions(
+  opts: ListFeaturesOptions,
+): Array<{ clause: string; params: string[] }> {
+  const conditions: Array<{ clause: string; params: string[] }> = [];
+  if (opts.state !== undefined) conditions.push({ clause: "state = ?", params: [opts.state] });
+  conditions.push(featureVersionCondition(opts.version));
+  conditions.push(featureOwnershipCondition(opts.ownerGroup));
+  return conditions;
+}
+
+/** `listFeatures` 的 WHERE 片段（状态 ∧ 版号 ∧ 归属谓词；含尾空格，可直接接 `ORDER BY`） */
+function featureListWhere(opts: ListFeaturesOptions): string {
+  const kept = featureListConditions(opts)
+    .filter((c) => c.clause.length > 0)
+    .map((c) => c.clause);
   return kept.length > 0 ? `WHERE ${kept.join(" AND ")} ` : "";
 }
 
-/** `listFeatures` 的绑定参数（顺序 = {@link featureListWhere} 的片段顺序：state → owner） */
-function featureListParams(opts: {
-  state?: FeatureState;
-  ownerGroup?: string;
-}): Array<string | number> {
-  const params: Array<string | number> = [];
-  if (opts.state !== undefined) params.push(opts.state);
-  params.push(...featureOwnershipCondition(opts.ownerGroup).params);
-  return params;
+/** `listFeatures` 的绑定参数（顺序 = {@link featureListWhere} 的片段顺序：state → version → owner） */
+function featureListParams(opts: ListFeaturesOptions): Array<string | number> {
+  return featureListConditions(opts).flatMap((c) => c.params);
 }
 
 function rowToArtifact(row: Record<string, unknown>): ArtifactRecord {
@@ -1050,7 +1352,80 @@ function rowToRunnerProject(row: Record<string, unknown>): RunnerProjectRecord {
     status,
     endpoint: readNullableString(row, "endpoint"),
     startedAt: readNullableString(row, "started_at"),
+    repo: readNullableString(row, "repo"),
     updatedAt: readString(row, "updated_at"),
+  };
+}
+
+/**
+ * `versions` 行 → 台账记录。
+ *
+ * `status` 脏值 ⇒ **fail-fast**（照 `rowToRunner` / `rowToRunnerProject` 口径，本表只由引擎写口
+ * 与一次性迁移脚本写，脏值 = 库被手工改过 ⇒ 必须可见，不得静默兜成缺省态）。
+ */
+function rowToVersionLedger(row: Record<string, unknown>): VersionLedgerRecord {
+  const status = readString(row, "status");
+  if (!isVersionLedgerStatus(status)) {
+    throw new Error(`[session-store] 列 status 数据损坏：非法版本台账态 ${status}`);
+  }
+  return {
+    ownerGroup: readNullableString(row, "owner_group"),
+    version: readString(row, "version"),
+    status,
+    date: readNullableString(row, "date"),
+    note: readNullableString(row, "note"),
+    createdAt: readString(row, "created_at"),
+    updatedAt: readString(row, "updated_at"),
+  };
+}
+
+/**
+ * 解析 `releases.projects_json` 列（`ReleaseSnapshotProject[]` JSON 字符串）。
+ *
+ * 快照列**原值入、不归一**（改造文档 §2.1(6)）⇒ 这里**只做形状校验**（数组 / 元素是对象 /
+ * `repoId` `ref` 是 `string | null`），**不做** trim、大小写折叠、去重、排序 —— 脏值 = 库被手工
+ * 改过 ⇒ fail-fast（与 {@link rowToVersionLedger} 同一口径，快照是发版事实、不得静默兜缺省）。
+ */
+function readReleaseProjects(row: Record<string, unknown>): ReleaseSnapshotProject[] {
+  const raw = readNullableString(row, "projects_json");
+  if (raw === null) return [];
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(raw);
+  } catch {
+    throw new Error(`[session-store] 列 projects_json 数据损坏：非法 JSON`);
+  }
+  if (!Array.isArray(parsed)) {
+    throw new Error(`[session-store] 列 projects_json 数据损坏：期望 JSON 数组`);
+  }
+  const projects: ReleaseSnapshotProject[] = [];
+  for (const v of parsed) {
+    if (typeof v !== "object" || v === null || Array.isArray(v)) {
+      throw new Error(`[session-store] 列 projects_json 数据损坏：数组元素非对象`);
+    }
+    const item = v as Record<string, unknown>;
+    for (const key of ["repoId", "ref"] as const) {
+      const value = item[key];
+      if (value !== null && value !== undefined && typeof value !== "string") {
+        throw new Error(`[session-store] 列 projects_json 数据损坏：${key} 非 string | null`);
+      }
+    }
+    projects.push({
+      repoId: (item["repoId"] ?? null) as string | null,
+      ref: (item["ref"] ?? null) as string | null,
+    });
+  }
+  return projects;
+}
+
+function rowToReleaseSnapshot(row: Record<string, unknown>): ReleaseSnapshotRecord {
+  return {
+    ownerGroup: readNullableString(row, "owner_group"),
+    version: readString(row, "version"),
+    changelogAnchor: readNullableString(row, "changelog_anchor"),
+    projects: readReleaseProjects(row),
+    note: readNullableString(row, "note"),
+    createdAt: readString(row, "created_at"),
   };
 }
 
@@ -1156,9 +1531,54 @@ CREATE TABLE IF NOT EXISTS runner_projects (
   status      TEXT NOT NULL,
   endpoint    TEXT,
   started_at  TEXT,
+  repo        TEXT,
   updated_at  TEXT NOT NULL,
   PRIMARY KEY (runner_id, project_id)
 )`;
+
+/**
+ * **版本台账表**（v0.10.0 O1 · 改造文档 §2.1(1)）—— **可编辑**，排期锁与 `released` 锁的事实源。
+ *
+ * 键 = `(owner_group, version)` ⇒ 列车号**组内唯一**（同名版号可分属两组）。
+ * `owner_group` 可空（NULL = 未配组的匿名档）⇒ 目标定位一律用 **NULL-safe `IS`**
+ * （`owner_group = ?` 对 NULL 恒不成立；且 SQLite 的 PK/UNIQUE 把 NULL 视为互不相等，
+ * 故「重复 ⇒ 409」不得依赖 `ON CONFLICT`，见 {@link SessionStore.versionLedgerGet}）。
+ *
+ * 形状与 O5 单测的代打 fixture（`test/v0100-o5-version-validation.test.ts`）**逐字一致**
+ * ⇒ 该 fixture 在本表落地后原样退役（`IF NOT EXISTS` 空转，不产生第二份表）。
+ */
+const VERSIONS_DDL = `
+CREATE TABLE IF NOT EXISTS versions (
+  owner_group TEXT,
+  version     TEXT,
+  status      TEXT NOT NULL DEFAULT 'notstart',
+  date        TEXT,
+  note        TEXT,
+  created_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  updated_at  TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (owner_group, version)
+)`;
+
+/**
+ * **发版快照表**（v0.10.0 O1 · 改造文档 §2.1(1)）—— **不可变**，仅在标记 `released`
+ * 那一刻与 `versions.status` **同事务**写入（写入路径 = O7
+ * {@link SessionStore.versionLedgerMarkReleased}，唯一 INSERT 点）。
+ *
+ * **无 `updated_at`**（快照不改写 = 不可变的 schema 表达）；`projects_json` =
+ * `ReleaseSnapshotProject[]` 原文（`repoId` 不归一，§2.1(6)）。
+ * **不加 `status` 列**（三态归台账，C-3 裁定：两表分工，快照不重复承载状态）。
+ */
+const RELEASES_DDL = `
+CREATE TABLE IF NOT EXISTS releases (
+  owner_group      TEXT,
+  version          TEXT,
+  changelog_anchor TEXT,
+  projects_json    TEXT,
+  note             TEXT,
+  created_at       TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+  PRIMARY KEY (owner_group, version)
+)`;
+
 
 /**
  * SQLite 会话/任务存储。
@@ -1425,6 +1845,19 @@ export class SessionStore {
     // 段 2 / 段 3：注册表两张（运行态投影；IF NOT EXISTS = 幂等）
     this.db.exec(RUNNERS_DDL);
     this.db.exec(RUNNER_PROJECTS_DDL);
+    // v0.10.0 迁移：runner_projects 加 repo 列（可选透传，缺省 = NULL；老库表已存在时新列靠此 ALTER 补上，列已存在时忽略）
+    // 纪律照既有：只加列、必可空、不复用既有列、读侧 `readNullableString`、**只在 ctor try-ALTER**。
+    try {
+      this.db.exec("ALTER TABLE runner_projects ADD COLUMN repo TEXT");
+    } catch {
+      // 列已存在（幂等）
+    }
+    // 段 2″ / 段 3：版本面两表（v0.10.0 O1 · 改造文档 §2.1(1)）。
+    // `versions` = 可编辑台账（排期锁 / `released` 锁的事实源）；`releases` = 不可变快照（写入归 O7）。
+    // 两者都是**新建表**（非既有表加列）⇒ `IF NOT EXISTS` 幂等，无需 try-ALTER；
+    // 存量数据由一次性迁移脚本 `scripts/migrate-versions-ledger.mjs` 导入（运行时不读板文件）。
+    this.db.exec(VERSIONS_DDL);
+    this.db.exec(RELEASES_DDL);
     // 段 4：索引 —— 队列候选（claim 热路径）/ claim_token 唯一 / 项目投影按 Runner
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_state, queued_at)");
     // claim_token 唯一：SQLite 唯一索引允许多个 NULL ⇒ 未领取行不受限，领取行令牌唯一。
@@ -1443,6 +1876,9 @@ export class SessionStore {
     );
     // v0.8.6 §2.3：Feature 列表 / 事件收件箱案 B 过滤（`owner_group = ?`）的热路径索引
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_features_owner ON features(owner_group)");
+    // v0.10.0 O5（§2.1(4)）：`features.version` 索引 —— 支撑按版本聚合读面 / 排期锁查表的热路径。
+    // 老库若已有脏自由文本值也一并索引（读侧透传、不改写存量，见 §2.1(4) 脏值归一条）。
+    this.db.exec("CREATE INDEX IF NOT EXISTS idx_features_version ON features(version)");
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS idx_tasks_feature ON tasks(feature_id, updated_at DESC)",
     );
@@ -2125,8 +2561,8 @@ export class SessionStore {
     const now = nowIso();
     const insert = this.db.prepare(
       `INSERT INTO runner_projects
-         (runner_id, project_id, workspace, agent_kind, a2a_port, risk, status, endpoint, started_at, updated_at)
-       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
+         (runner_id, project_id, workspace, agent_kind, a2a_port, risk, status, endpoint, started_at, repo, updated_at)
+       VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)`,
     );
     this.db.exec("BEGIN IMMEDIATE");
     try {
@@ -2142,6 +2578,7 @@ export class SessionStore {
           p.status,
           p.endpoint ?? null,
           p.startedAt ?? null,
+          p.repo ?? null,
           now,
         );
       }
@@ -2791,7 +3228,630 @@ export class SessionStore {
     return stored;
   }
 
-  /** 列出 Feature（updated_at 倒序；可选状态 / 归属组过滤；limit 默认 100，clamp 到 [1,1000]） */
+  /**
+   * **版本台账存在性读口**（v0.10.0 O5 · 改造文档 §2.1(4)）：给定 `(owner_group, version)` 判断是否
+   * 命中 O1 版本台账（`versions` 表 PK）。
+   *
+   * - `exists = true` ⇒ 该 `(owner_group, version)` 已在台账内（排期锁与 `released` 锁由 O4 在此读口
+   *   之上执法，本节点不做）；
+   * - `exists = false` ∧ `ledgerReady = true` ⇒ 台账已建表但无此版号（存在性校验 ⇒ 拒）；
+   - `ledgerReady = false` ⇒ 台账表**尚未由 O1 建立**（过渡态）。此时**不能**把「无表」误判成
+   *   「版号不存在」—— 那会把写侧的**所有** version 一刀切挡死，与「O1 未落地 ⇒ 校验未开」的意图相反。
+   *   调用方（feature-tools 写口）**在此路径下跳过存在性检查**（**shape 校验仍生效**）；O1 落表后
+   *   本读口自动切换到执法路径，无需再改本节点代码。
+   *
+   * **owner_group 语义**（照 `featureOwnershipPredicate` 口径）：
+   - 非空 ⇒ 精确匹配 `owner_group = ?`；
+   - `null` / `undefined` ⇒ 匹配 `owner_group IS NULL`（**不放开为「任意组」**，避免跨组串台账）。
+   *
+   * **不做 normalize**：trim 由调用方负责（写口在 parseRegistration 已 trim）；本读口按字面串查，
+   * 与 §2.1(4)「不做脏值归一」口径一致 —— **不改写存量行**。
+   */
+  versionLedgerHas(
+    ownerGroup: string | null | undefined,
+    version: string,
+  ): { exists: boolean; ledgerReady: boolean } {
+    try {
+      const row =
+        ownerGroup === null || ownerGroup === undefined
+          ? this.db
+              .prepare("SELECT 1 AS hit FROM versions WHERE owner_group IS NULL AND version = ? LIMIT 1")
+              .get(version)
+          : this.db
+              .prepare("SELECT 1 AS hit FROM versions WHERE owner_group = ? AND version = ? LIMIT 1")
+              .get(ownerGroup, version);
+      return { exists: row !== undefined, ledgerReady: true };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("no such table")) return { exists: false, ledgerReady: false };
+      throw err;
+    }
+  }
+
+  /**
+   * **台账单行读**（v0.10.0 O1 · 改造文档 §2.1(1)）。
+   *
+   * `ownerGroup` 是**键的一部分**、不是过滤器 ⇒ 这里**不接受 `undefined`**：
+   * `null` = 匿名档（未配组），`"g1"` = g1 组。定位用 **NULL-safe `IS`**，
+   * 因为 `owner_group = ?` 对 NULL 行恒不成立（会把匿名档读成「不存在」）。
+   */
+  versionLedgerGet(ownerGroup: string | null, version: string): VersionLedgerRecord | null {
+    const row = this.db
+      .prepare(`SELECT ${VERSION_LEDGER_COLUMNS} FROM versions WHERE owner_group IS ? AND version = ?`)
+      .get(ownerGroup, version) as Record<string, unknown> | undefined;
+    return row === undefined ? null : rowToVersionLedger(row);
+  }
+
+  /**
+   * **台账列表读**（v0.10.0 O1）—— `GET /api/versions` 的**板读投影唯一来源**（§2.1(2) / §2.3(1)）。
+   *
+   * 过滤语义与 {@link SessionStore.listFeatures} 的 `ownerGroup` 逐字对齐：
+   * - `undefined` ⇒ **全量**（未配组环境的匿名入口 / 3300 运维全量视图）；
+   * - 组名字符串 ⇒ **仅本组**；
+   * - `null` ⇒ **仅匿名档**（`owner_group IS NULL` 行）—— 板按组读取时用不到此档，
+   *   给一次性迁移脚本与运维查数留口。
+   *
+   * 排序 = `(owner_group, version)` 字典序（**不按 updatedAt**：读投影要做「集合可比对」，
+   * 顺序必须只由键决定，否则同一次改版会把行挤出列表中段）。
+   */
+  versionLedgerList(ownerGroup?: string | null): VersionLedgerRecord[] {
+    const clause =
+      ownerGroup === undefined
+        ? ""
+        : ownerGroup === null
+          ? "WHERE owner_group IS NULL"
+          : "WHERE owner_group = ?";
+    const rows = this.db
+      .prepare(
+        `SELECT ${VERSION_LEDGER_COLUMNS} FROM versions ${clause} ORDER BY owner_group, version`,
+      )
+      .all(...(ownerGroup === undefined || ownerGroup === null ? [] : [ownerGroup])) as Array<
+      Record<string, unknown>
+    >;
+    return rows.map(rowToVersionLedger);
+  }
+
+  /**
+   * **建版（台账建行）**（v0.10.0 O2a · 改造文档 §2.1(2)）—— `POST /api/versions` 的写口。
+   *
+   * 判据（全部在写口内做完，**任一不过 ⇒ 零写入**，返回结构化失败供 HTTP 面直接映射状态码）：
+   * 1. **shape**：`version` trim 后必须命中 semver 形状（{@link isVersionShapeValid}）⇒ 否则 400；
+   * 2. **status 可建集**：只接受 `notstart`（缺省）/ `active`；**`released` 不可建**
+   *    —— 发版是「过闸后的结果」，不是建版参数；直建 `released` 会绕过 O4 发版闸与 O7 快照；
+   * 3. **重复 ⇒ 409**：同 `(owner_group, version)` 已存在即拒（**幂等**：二次 POST 不产生第二行、
+   *    不改第一行任何列、不写第二条事件）。
+   *
+   * ⚠ 重复判定**不得依赖 `ON CONFLICT` / `INSERT OR REPLACE`**：本表 PK 含可空列
+   * `owner_group`，而 SQLite 的唯一约束把 NULL 视为互不相等 ⇒ 匿名档会**静默插出第二行**。
+   * 故先 {@link versionLedgerGet} 定位、再插；并发窗口由 SQLite 单写者 + 同进程同步 API 兜住。
+   *
+   * **不做脏值归一**（§2.1(4) 同口径）：入参原样落，`version` 只 trim。
+   */
+  versionLedgerCreate(input: VersionLedgerCreateInput): VersionLedgerWriteResult {
+    const version = input.version.trim();
+    if (version.length === 0) {
+      return {
+        ok: false,
+        code: ERR_VERSION_SHAPE,
+        message: "version 不得为空串（撤排期不进台账，属 features.version 语义）",
+        status: 400,
+      };
+    }
+    if (!isVersionShapeValid(version)) {
+      return {
+        ok: false,
+        code: ERR_VERSION_SHAPE,
+        message: `非法 version "${input.version}"：期望 semver 形状 vX.Y.Z（可省 v、可带 -prerelease/+build）`,
+        status: 400,
+      };
+    }
+    const status = input.status ?? "notstart";
+    if (status === "released" || !isVersionLedgerStatus(status)) {
+      return {
+        ok: false,
+        code: ERR_VERSION_STATUS,
+        message: `非法 status "${String(status)}"（建版可集：notstart / active；released 只能经设状态端点过 O4 闸）`,
+        status: 400,
+      };
+    }
+    if (this.versionLedgerGet(input.ownerGroup, version) !== null) {
+      return {
+        ok: false,
+        code: ERR_VERSION_EXISTS,
+        message: `版本已存在（owner_group=${input.ownerGroup === null ? "NULL" : `"${input.ownerGroup}"`} · version=${version}）`,
+        status: 409,
+      };
+    }
+    const at = nowIso();
+    const record: VersionLedgerRecord = {
+      ownerGroup: input.ownerGroup,
+      version,
+      status,
+      date: input.date ?? null,
+      note: input.note ?? null,
+      createdAt: at,
+      updatedAt: at,
+    };
+    this.db
+      .prepare(
+        `INSERT INTO versions (owner_group, version, status, date, note, created_at, updated_at)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        record.ownerGroup,
+        record.version,
+        record.status,
+        record.date,
+        record.note,
+        record.createdAt,
+        record.updatedAt,
+      );
+    this.appendEvent({
+      featureId: null,
+      taskId: null,
+      kind: EVENT_VERSION_LEDGER_CREATED,
+      state: null,
+      payload: JSON.stringify({
+        ownerGroup: record.ownerGroup,
+        version: record.version,
+        status: record.status,
+      }),
+    });
+    return { ok: true, record };
+  }
+
+  /**
+   * **删版（台账删行）**（v0.10.0 O2a）—— `DELETE /api/versions/{version}` 的写口。
+   *
+   * 三道判据，**任一命中 ⇒ 不删**（结构化失败，零副作用）：
+   * 1. 台账无此行 ⇒ 404 {@link ERR_VERSION_UNKNOWN}；
+   * 2. `status = released` ⇒ 409 {@link ERR_VERSION_RELEASED_LOCKED} —— **发版事实不可撤销**
+   *    （`released` 锁的事实在台账行本身，删了就没有「已发版」的读投影，板 §2.3(1) 的
+   *    「锁只紧不松」失去依据）；
+   * 3. 名下有未收口卡 ⇒ 409 {@link ERR_VERSION_OPEN_CARDS} —— 删台账会把在飞需求变成
+   *    「排期指向不存在的版号」。收口口径 = `completed` / `cancelled`（与 O3 三桶、
+   *    `需求流程.md` §8 发版收口集合逐字一致；`failed` **不算收口**）。
+   *
+   * **只删 `versions` 行，不碰 `releases`**：快照只在标记 released 时产生，而 released 已在
+   * 判据 2 挡住 ⇒ 可达此处的行必然无快照，无需级联。
+   */
+  versionLedgerDelete(ownerGroup: string | null, version: string): VersionLedgerWriteResult {
+    const row = this.versionLedgerGet(ownerGroup, version);
+    if (row === null) {
+      return {
+        ok: false,
+        code: ERR_VERSION_UNKNOWN,
+        message: `台账无此行（owner_group=${ownerGroup === null ? "NULL" : `"${ownerGroup}"`} · version=${version}）`,
+        status: 404,
+      };
+    }
+    if (row.status === "released") {
+      return {
+        ok: false,
+        code: ERR_VERSION_RELEASED_LOCKED,
+        message: `已发版版本不可删除（version=${version} 处于 released 终态；发版事实归 releases 快照与 git tag）`,
+        status: 409,
+      };
+    }
+    const counts = this.countVersionCards(ownerGroup, version);
+    if (counts.open > 0) {
+      return {
+        ok: false,
+        code: ERR_VERSION_OPEN_CARDS,
+        message: `名下有 ${counts.open} 张未收口卡（total=${counts.total} completed=${counts.completed} cancelled=${counts.cancelled}），须先收口再删版`,
+        status: 409,
+      };
+    }
+    this.db
+      .prepare("DELETE FROM versions WHERE owner_group IS ? AND version = ?")
+      .run(ownerGroup, version);
+    this.appendEvent({
+      featureId: null,
+      taskId: null,
+      kind: EVENT_VERSION_LEDGER_DELETED,
+      state: null,
+      payload: JSON.stringify({ ownerGroup, version, status: row.status }),
+    });
+    return { ok: true, record: row };
+  }
+
+  /**
+   * **手动设状态**（v0.10.0 O2c · 改造文档 §2.1(2)）—— `PATCH /api/versions/{version}/status` 的
+   * **非发版分支**写口（`notstart ↔ active`）。
+   *
+   * 判据（任一不过 ⇒ 零写入，结构化失败供 HTTP 面映射）：
+   * 1. 台账无此行 ⇒ 404 {@link ERR_VERSION_UNKNOWN}（设状态只能对已登记版号发生）；
+   * 2. **`released` 为终态、不可回退** ⇒ 现态 `released` 时改态一律 409
+   *    {@link ERR_VERSION_RELEASED_LOCKED}（发版事实不可撤销）；
+   * 3. **目标 `released` 不经本口** ⇒ 400 {@link ERR_VERSION_STATUS}（发版必须走
+   *    {@link SessionStore.versionLedgerMarkReleased} 的闸 + 快照同事务）；
+   * 4. 同态同 note ⇒ **幂等**（`changed: false` 语义，零事件、零改 `updated_at`）。
+   *
+   * 非发版状态切换落一条 {@link EVENT_VERSION_STATUS_CHANGED}（审计留痕，与自动转换的
+   * {@link EVENT_VERSION_ACTIVATED} 区分：前者人工、后者引擎内部）。
+   */
+  versionLedgerSetStatus(input: VersionLedgerSetStatusInput): VersionLedgerWriteResult {
+    const version = input.version.trim();
+    if (version.length === 0) {
+      return {
+        ok: false,
+        code: ERR_VERSION_SHAPE,
+        message: "version 不得为空串（设状态必须指名版号）",
+        status: 400,
+      };
+    }
+    const row = this.versionLedgerGet(input.ownerGroup, version);
+    if (row === null) {
+      return {
+        ok: false,
+        code: ERR_VERSION_UNKNOWN,
+        message: `台账无此行（owner_group=${input.ownerGroup === null ? "NULL" : `"${input.ownerGroup}"`} · version=${version}）`,
+        status: 404,
+      };
+    }
+    if (row.status === "released") {
+      return {
+        ok: false,
+        code: ERR_VERSION_RELEASED_LOCKED,
+        message: `已发版版本不可回退（version=${version} 处于 released 终态；发版事实归 releases 快照与 git tag，不可撤销）`,
+        status: 409,
+      };
+    }
+    if (input.status === "released") {
+      return {
+        ok: false,
+        code: ERR_VERSION_STATUS,
+        message: "状态 released 只能经发版分支（发版闸 + 快照同事务）落定，不经手动设状态口",
+        status: 400,
+      };
+    }
+    if (!isVersionLedgerStatus(input.status)) {
+      return {
+        ok: false,
+        code: ERR_VERSION_STATUS,
+        message: `非法 status "${String(input.status)}"（手动设状态可集：notstart / active）`,
+        status: 400,
+      };
+    }
+    const note =
+      input.note === undefined
+        ? row.note
+        : input.note === null || input.note.trim() === ""
+          ? null
+          : input.note.trim();
+    if (row.status === input.status && row.note === note) {
+      return { ok: true, record: row }; // 幂等：同值重写零写入、零事件
+    }
+    const at = nowIso();
+    this.db
+      .prepare(
+        "UPDATE versions SET status = ?, note = ?, updated_at = ? WHERE owner_group IS ? AND version = ?",
+      )
+      .run(input.status, note, at, input.ownerGroup, version);
+    const updated = this.versionLedgerGet(input.ownerGroup, version);
+    const record: VersionLedgerRecord = updated ?? { ...row, status: input.status, note, updatedAt: at };
+    this.appendEvent({
+      featureId: null,
+      taskId: null,
+      kind: EVENT_VERSION_STATUS_CHANGED,
+      state: null,
+      payload: JSON.stringify({
+        ownerGroup: input.ownerGroup,
+        version,
+        from: row.status,
+        to: input.status,
+      }),
+    });
+    return { ok: true, record };
+  }
+
+  /**
+   * **自动转 `active`（引擎内部 · 幂等）**（v0.10.0 O2c · 改造文档 §2.1(2)）——
+   * 「首个节点派发 / `approve` 放行」触发的 `notstart → active`，**不开放板写口**。
+   *
+   * 语义（三护栏的**幂等**落点）：
+   * - 行不存在 / 台账未就绪 ⇒ **不建行**、`activated = false`（自动转换只翻**已登记**版号，
+   *   建版归 O2a；缺失行由写口的存在性校验在排期时挡）；
+   * - 现态非 `notstart`（`active` / `released`）⇒ 零写入、零事件 ⇒ `activated = false`；
+   * - 现态 `notstart` ⇒ 同事务 `UPDATE status='active'` + 一条 {@link EVENT_VERSION_ACTIVATED}
+   *   ⇒ `activated = true`（**失败不吞**：抛给调用方的护栏兜，见 `bridge/versions-activation.ts`）。
+   *
+   * 并发：`BEGIN IMMEDIATE` 内**重读**再判（与 {@link SessionStore.versionLedgerMarkReleased}
+   * 同口径）⇒ 同进程并发触发也不会出现双事件 / 双写。
+   */
+  versionLedgerActivate(ownerGroup: string | null, version: string): VersionActivationResult {
+    const v = version.trim();
+    if (v.length === 0) return { activated: false, status: null, ledgerReady: true };
+    const probe = this.versionLedgerStatus(ownerGroup, v);
+    if (!probe.ledgerReady) return { activated: false, status: null, ledgerReady: false };
+    if (probe.status !== "notstart") return { activated: false, status: probe.status, ledgerReady: true };
+    const at = nowIso();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const current = this.versionLedgerGet(ownerGroup, v);
+      if (current === null || current.status !== "notstart") {
+        this.db.exec("COMMIT");
+        return { activated: false, status: current === null ? null : current.status, ledgerReady: true };
+      }
+      this.db
+        .prepare("UPDATE versions SET status = 'active', updated_at = ? WHERE owner_group IS ? AND version = ?")
+        .run(at, ownerGroup, v);
+      this.appendEvent({
+        featureId: null,
+        taskId: null,
+        kind: EVENT_VERSION_ACTIVATED,
+        state: null,
+        payload: JSON.stringify({ ownerGroup, version: v, from: "notstart", to: "active" }),
+      });
+      this.db.exec("COMMIT");
+      return { activated: true, status: "active", ledgerReady: true };
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // 事务已不在活动态：保留原始错误，不掩盖
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * 版号名下卡的收口计数（{@link versionLedgerDelete} 判据 3 专用）。
+   *
+   * **刻意不复用 {@link SessionStore.aggregateFeaturesByVersion}**：聚合面的 `ownerGroup`
+   * 语义是「`undefined` ⇒ 全量」，而本判据要的是**台账键的精确一档**（`null` ⇒ 仅匿名档）。
+   * 拿全量计数当精确档会把**别组的同名版号卡**算进来 ⇒ 误挡删版（fail-closed 方向，
+   * 但会把合法操作挡死）。归属匹配用 NULL-safe `IS`，与 {@link versionLedgerGet} 同键口径。
+   * 三桶判据本身与 O3 一致（completed / cancelled = 收口，其余含 failed = open）。
+   */
+  private countVersionCards(ownerGroup: string | null, version: string): VersionCardCounts {
+    const rows = this.db
+      .prepare("SELECT state FROM features WHERE owner_group IS ? AND version = ?")
+      .all(ownerGroup, version) as Array<Record<string, unknown>>;
+    const counts: VersionCardCounts = { total: rows.length, completed: 0, cancelled: 0, open: 0 };
+    for (const row of rows) {
+      const state = readString(row, "state");
+      if (state === "completed") counts.completed += 1;
+      else if (state === "cancelled") counts.cancelled += 1;
+      else counts.open += 1;
+    }
+    return counts;
+  }
+
+  // ------------------------------------------------------------------
+  // v0.10.0 O7：发版快照（`releases` 表 · 与 `versions.status` 同事务写入 · 不可变）
+  // ------------------------------------------------------------------
+
+  /**
+   * **发版快照单行读**（v0.10.0 O7 · 改造文档 §2.1(1)）—— 键定位口径与
+   * {@link SessionStore.versionLedgerGet} 逐字一致（NULL-safe `IS`，`ownerGroup` 是键的一部分）。
+   *
+   * 判据用途：{@link SessionStore.versionLedgerMarkReleased} 的事务内「快照是否已存在」检查
+   * （不可变 ⇒ 存在即不覆写）。
+   */
+  releaseSnapshotGet(ownerGroup: string | null, version: string): ReleaseSnapshotRecord | null {
+    const row = this.db
+      .prepare(`SELECT ${RELEASE_COLUMNS} FROM releases WHERE owner_group IS ? AND version = ?`)
+      .get(ownerGroup, version) as Record<string, unknown> | undefined;
+    return row === undefined ? null : rowToReleaseSnapshot(row);
+  }
+
+  /**
+   * **发版快照列表读**（v0.10.0 O7）—— 板 §2.3(3)「版本列 = **引擎 Release 清单** ∪ 卡派生版号」
+   * 左半的数据源（右半 = O3 {@link SessionStore.aggregateFeaturesByVersion}）。
+   *
+   * 过滤与排序口径与 {@link SessionStore.versionLedgerList} 逐字对齐（`undefined` ⇒ 全量 /
+   * 组名 ⇒ 本组 / `null` ⇒ 仅匿名档；排序只由键决定，顺序可比对）。
+   *
+   * **不含未发版版本**：`releases` 只在标记 `released` 那一刻落行 ⇒ 本清单天然等于「已发版集合」，
+   * 不需要（也不得）再按 status 过滤。
+   */
+  releaseSnapshotList(ownerGroup?: string | null): ReleaseSnapshotRecord[] {
+    const clause =
+      ownerGroup === undefined
+        ? ""
+        : ownerGroup === null
+          ? "WHERE owner_group IS NULL"
+          : "WHERE owner_group = ?";
+    const rows = this.db
+      .prepare(
+        `SELECT ${RELEASE_COLUMNS} FROM releases ${clause} ORDER BY owner_group, version`,
+      )
+      .all(...(ownerGroup === undefined || ownerGroup === null ? [] : [ownerGroup])) as Array<
+      Record<string, unknown>
+    >;
+    return rows.map(rowToReleaseSnapshot);
+  }
+
+  /**
+   * **标记 `released` + 落快照（同事务）**（v0.10.0 O7 · 改造文档 §2.1(1)）——
+   * 发版动作（O2b 的 `PATCH /api/versions/{version}/status` 的 `released` 分支）的唯一写口。
+   *
+   * **为什么必须同事务**：`versions.status = released` 是**排期锁**的事实源，`releases` 行是
+   * **发版事实**（哪些仓、哪个 ref、CHANGELOG 锚点）的唯一承载。两者分开写 ⇒ 任一步崩在半路都会
+   * 留下「已锁但无事实」或「有事实但未锁」的半成品版本，而两者都不可事后自动补齐（前者板会放行
+   * 排期、后者发版闸拿不到清单）。故一个事务内做完：UPDATE 台账 + INSERT 快照 + 事件留痕。
+   *
+   * **本写口不判发版闸**（判据在 O4 `evaluateReleaseGate`，由调用方在进事务**之前**评）——
+   * 闸要读 `features` 聚合（O3 面），搬进事务会把「聚合读」纳入写锁窗口；SQLite 单写者 +
+   * 同进程同步 API ⇒ 「闸后写」的并发窗口与 {@link SessionStore.versionLedgerCreate}
+   * 的「先 get 再 INSERT」同一口径（同一套护栏，不另立）。
+   *
+   * 语义（四种入参落点，全部**只写 `releases` 的 INSERT、绝不 UPDATE/DELETE**）：
+   * 1. 台账未 `released` ∧ 无快照 ⇒ **正常发版**：UPDATE status + INSERT 快照 + 事件
+   *    （`backfilled = false`），两写同事务；
+   * 2. 台账已 `released` ∧ 无快照 ⇒ **补写**（迁移主源导入的历史 `released` 行本就无快照，
+   *    §2.1(7)）：只 INSERT 快照 + 事件（`backfilled = true`），status 不动 ⇒ 幂等；
+   * 3. 已 `released` ∧ 快照已存在 ⇒ **纯幂等**：零写入、零事件，原样回读既有快照
+   *    （不可变 = 第二次标记**不得**改写任何一列，入参被忽略）；
+   * 4. 台账无此行 ⇒ 404 {@link ERR_VERSION_UNKNOWN}，零写入（发版只能对着已登记的版号发生；
+   *    建版归 O2a，本口不代发）。
+   *
+   * `projects` / `changelogAnchor` / `ref` **原值入快照、不归一**（§2.1(6)）—— 尤其 `repoId`
+   * **不查 `runner_projects` 投影**：见 {@link ReleaseSnapshotInput}。
+   *
+   * ⚠ 版号形状（{@link isVersionShapeValid}）在此**不复核**：台账行已存在即键已成立，
+   *   历史导入行的版号可能早于形状校验（O5）落地，复核会把补写路径（判据 2）整体挡死。
+   *   空串仍挡（它不是任何行的键）。
+   */
+  versionLedgerMarkReleased(input: ReleaseSnapshotInput): ReleaseSnapshotWriteResult {
+    const version = input.version.trim();
+    if (version.length === 0) {
+      return {
+        ok: false,
+        code: ERR_VERSION_SHAPE,
+        message: "version 不得为空串（标记 released 必须指名版号）",
+        status: 400,
+      };
+    }
+    const ownerGroup = input.ownerGroup;
+    const at = nowIso();
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const ledger = this.versionLedgerGet(ownerGroup, version);
+      if (ledger === null) {
+        this.db.exec("ROLLBACK");
+        return {
+          ok: false,
+          code: ERR_VERSION_UNKNOWN,
+          message: `台账无此行（owner_group=${ownerGroup === null ? "NULL" : `"${ownerGroup}"`} · version=${version}），不得对未登记版号发版`,
+          status: 404,
+        };
+      }
+      const existing = this.releaseSnapshotGet(ownerGroup, version);
+      const snapshotWritten = existing === null;
+      let snapshot = existing;
+      if (snapshot === null) {
+        this.db
+          .prepare(
+            `INSERT INTO releases (owner_group, version, changelog_anchor, projects_json, note, created_at)
+             VALUES (?, ?, ?, ?, ?, ?)`,
+          )
+          .run(
+            ownerGroup,
+            version,
+            input.changelogAnchor ?? null,
+            JSON.stringify(input.projects ?? []),
+            input.note ?? null,
+            at,
+          );
+        const written = this.releaseSnapshotGet(ownerGroup, version);
+        if (written === null) {
+          throw new Error(
+            `[session-store] versionLedgerMarkReleased 落快照后未能读回：version=${version}`,
+          );
+        }
+        snapshot = written;
+      }
+      const statusMigrated = ledger.status !== "released";
+      if (statusMigrated) {
+        this.db
+          .prepare(
+            "UPDATE versions SET status = 'released', updated_at = ? WHERE owner_group IS ? AND version = ?",
+          )
+          .run(at, ownerGroup, version);
+      }
+      if (snapshotWritten || statusMigrated) {
+        this.appendEvent({
+          featureId: null,
+          taskId: null,
+          kind: EVENT_VERSION_RELEASED,
+          state: null,
+          payload: JSON.stringify({
+            ownerGroup,
+            version,
+            from: ledger.status,
+            to: "released",
+            backfilled: !statusMigrated,
+            changelogAnchor: snapshot.changelogAnchor,
+            projects: snapshot.projects.length,
+          }),
+        });
+      }
+      this.db.exec("COMMIT");
+      const stored = this.versionLedgerGet(ownerGroup, version);
+      if (stored === null) {
+        throw new Error(
+          `[session-store] versionLedgerMarkReleased 提交后未能读回台账行：version=${version}`,
+        );
+      }
+      return { ok: true, snapshot, ledger: stored, statusMigrated, snapshotWritten };
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // 事务已不在活动态：保留原始错误，不掩盖
+      }
+      throw err;
+    }
+  }
+
+  /**
+   * **迁移哨兵存在性读**（v0.10.0 O1 · 改造文档 §2.1(7)）。
+   *
+   * 判据 = `events` 里是否存在 kind = {@link EVENT_VERSION_LEDGER_MIGRATED} 的行。
+   * **刻意不以台账行数 / `exists()` 充当判据**：建版端点（O2a）自己也会造出台账行 ⇒
+   * 「台账非空」推不出「板台账已整表导入过」；拿台账当判据会把未迁移库误判成已迁移，
+   * 从此**永久漏掉**只能从 `versions.json` 拿到的行（含 `released` 态与原始时间戳）。
+   * 哨兵是**独立的一次性痕迹**，与台账行正交。
+   *
+   * 表缺失（极端：`events` 不存在）⇒ 返回 `false`（= 未迁移），让调用方走「待迁移」分支，
+   * 而不是静默跳过。
+   */
+  versionsLedgerMigrationDone(): boolean {
+    try {
+      const row = this.db
+        .prepare("SELECT 1 AS hit FROM events WHERE kind = ? LIMIT 1")
+        .get(EVENT_VERSION_LEDGER_MIGRATED);
+      return row !== undefined;
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("no such table")) return false;
+      throw err;
+    }
+  }
+
+  /**
+   * **版本台账状态读口**（v0.10.0 O4 · 改造文档 §2.1(3)）：给定 `(owner_group, version)` 读引擎
+   * 版本台账（O1 `versions` 表的 `status` 列，三态 {@link VersionLedgerStatus}），供 **`released` 锁**
+   * 与**发版闸**执法。与 {@link versionLedgerHas} 同族（同一张表、同一 `owner_group` 语义、同过渡兜底）。
+   *
+   * 分流：
+   * - `status = "released"` ⇒ 该版**已发版**：排期写 / 宿主 MCP 直写 `version` 一律挡（`released` 锁）；
+   * - `status = "notstart" | "active"` ⇒ 未发版：排期写放行（仍受排期写状态锁）；
+   * - `status = null` ∧ `ledgerReady = true` ⇒ 台账已建表但无此版号（存在性另由 {@link versionLedgerHas}
+   *   挡门；本读口只回状态、不重复挡存在性）；
+   * - `ledgerReady = false` ⇒ 台账表**尚未由 O1 建立**（过渡态）。
+   *   **排期写**路径在此跳过 `released` 锁（无表 ≠ 已发版，不得一刀切挡所有版号 —— 同 O5 存在性检查）；
+   *   **发版闸**路径在此 **fail-closed**（见 `evaluateReleaseGate`：引擎尚未持有台账 ⇒ 不得发布
+   *   「既写本地台账又读引擎」的中间态）。O1 落表后本读口自动切执法路径，**无需再改代码**。
+   *
+   * **不做 normalize**：trim 由调用方负责（写口已在 `parseRegistration` trim）；本读口按字面串查、不改写存量。
+   */
+  versionLedgerStatus(
+    ownerGroup: string | null | undefined,
+    version: string,
+  ): { status: VersionLedgerStatus | null; ledgerReady: boolean } {
+    try {
+      const row =
+        ownerGroup === null || ownerGroup === undefined
+          ? this.db
+              .prepare("SELECT status FROM versions WHERE owner_group IS NULL AND version = ? LIMIT 1")
+              .get(version)
+          : this.db
+              .prepare("SELECT status FROM versions WHERE owner_group = ? AND version = ? LIMIT 1")
+              .get(ownerGroup, version);
+      if (row === undefined) return { status: null, ledgerReady: true };
+      const raw = (row as Record<string, unknown>)["status"];
+      return { status: isVersionLedgerStatus(raw) ? raw : null, ledgerReady: true };
+    } catch (err) {
+      const msg = err instanceof Error ? err.message : String(err);
+      if (msg.includes("no such table")) return { status: null, ledgerReady: false };
+      throw err;
+    }
+  }
+
+  /** 列出 Feature（updated_at 倒序；可选状态 / 版号 / 归属组过滤；limit 默认 100，clamp 到 [1,1000]） */
   listFeatures(opts: ListFeaturesOptions = {}): FeatureRecord[] {
     const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
     const where = featureListWhere(opts);
@@ -2804,10 +3864,15 @@ export class SessionStore {
       )
       .all(...params) as Array<Record<string, unknown>>;
     // v0.6.1 REQ-05 §2.5 白捡（C12）：触顶 ⇒ 事件 + 日志各一条（total 校验）
+    // v0.10.0 O5b **去重键补 `version`**：旧键 `(state, owner, limit)` 不含版号 ⇒ 不同版号过滤
+    // 共用一个 key，第一个版号触顶后**其余版号的触顶被静默吞**（`truncationWarned` 一次性）。
+    // 口径变更：版号段取**归一后**值（与 {@link featureVersionCondition} 同三档：`undefined` ⇒ `*`、
+    // 空/纯空白 ⇒ `""` = 未登记桶、非空 ⇒ trim 后版号）⇒ 同一版号的重复触顶仍只告一次。
     const stateFilter = opts.state;
     const ownerFilter = opts.ownerGroup;
+    const versionFilter = opts.version === undefined ? "*" : opts.version.trim();
     this.warnIfListTruncated(
-      `listFeatures:${stateFilter ?? "*"}:${ownerFilter ?? "*"}:${limit}`,
+      `listFeatures:${stateFilter ?? "*"}:${ownerFilter ?? "*"}:${versionFilter}:${limit}`,
       "listFeatures",
       null,
       rows.length,
@@ -2858,6 +3923,92 @@ export class SessionStore {
       out.set(featureId, bucket);
     }
     return out;
+  }
+
+  /**
+   * **版本名下卡聚合读面**（v0.10.0 O3，改造文档 §2.1(5)「只读聚合面（首刀，零新实体）」）：
+   * 「版号 → 名下需求卡清单 + 三桶计数 `{total, completed, cancelled, open}`」。
+   *
+   * 两处消费（本节点**不做闸判定**，闸归 O4）：
+   * - **O4 发版闸**：取某版号桶的 `counts` 判「`total>0 ∧ completed+cancelled===total ∧ completed>0`」；
+   *   三桶口径已在此固化 —— `completed` = 引擎态 `completed`，`cancelled` = 引擎态 `cancelled`，
+   *   `open` = 其余全部态（含 `failed`，收口口径不计入 completed/cancelled，见 `需求流程.md` §8）；
+   * - **板 §2.3 版本列并集**：「卡派生版号」= `versions` 全集（含未登记卡经 `unregisteredCount` 表达）。
+   *
+   * ★ **可见性与 {@link listFeatures} 同源**：归属过滤复用 {@link featureOwnershipPredicate}
+   *   （同 {@link featureTaskStateCounts} 口径），**不得另写一份归属条件** —— 另写 = 两处判据漂移，
+   *   聚合侧会把不可见 Feature 算进计数 ⇒ 闸判静默放宽视野。`ownerGroup` 语义与 `listFeatures` 逐字一致：
+   *   给定组名 ⇒ 仅本组（`owner_group = ?`，NULL 无归属行被排除 = fail-closed）；`undefined` ⇒ 全量
+   *   （未配组环境匿名入口 / 3300 运维视图）。
+   *
+   * ★ **截断处理 = 显式全量扫（不加 `LIMIT`）**：版号名下卡数 = 需求量的函数、天然有界（远小于 per-feature
+   *   的 `tasks` 表），一次归属过滤全扫即可同时得**卡清单与计数** ⇒ **不存在截断**（若未来加 `LIMIT`，
+   *   必须经 {@link warnIfListTruncated} 留痕，且计数不得由截断后的清单派生 —— 会让 O4 闸静默误判）。
+   *   计数与卡清单**同源同集**（同一批行 JS 分组），不会打架。
+   *
+   * ★ **未登记版号单列一桶，不静默丢**：`features.version` 为 NULL / 空串（{@link rowToFeature} 已归一
+   *   `''`）⇒ 归入未登记桶（`version: null`），**照样进 `features` 清单、照样计数**；板据此把无版本卡
+   *   显示为「未排期 / 未登记」列，而非当作不存在。
+   *
+   * 排序：`buckets` 按已登记版号字典序、未登记桶恒最后；桶内卡按 `updated_at` 倒序（与 {@link listFeatures}
+   *   同「新者在前」）。
+   */
+  aggregateFeaturesByVersion(ownerGroup?: string): VersionCardAggregate {
+    const owner = featureOwnershipPredicate(ownerGroup, true);
+    const rows = this.db
+      .prepare(
+        `SELECT ${FEATURE_COLUMNS}
+         FROM features${owner.clause}
+         ORDER BY version ASC, updated_at DESC`,
+      )
+      .all(...owner.params) as Array<Record<string, unknown>>;
+
+    // Map 插入序 = SQL 序（version 升序，NULL/'' 在 SQLite ASC 最前）；未登记桶恒挪到最后
+    const byVersion = new Map<string | null, VersionFeaturesBucket>();
+    const versions: string[] = [];
+    for (const row of rows.map(rowToFeature)) {
+      const version = row.version === "" ? null : row.version; // '' = 未登记（NULL 或空串）
+      let bucket = byVersion.get(version);
+      if (bucket === undefined) {
+        bucket = {
+          version,
+          counts: { total: 0, completed: 0, cancelled: 0, open: 0 },
+          features: [],
+        };
+        byVersion.set(version, bucket);
+        if (version !== null) versions.push(version);
+      }
+      const c = bucket.counts;
+      c.total += 1;
+      // 态闭集外的脏值只进 total（保守，不虚报 completed/cancelled）；open 末尾派生
+      if (row.state === "completed") c.completed += 1;
+      else if (row.state === "cancelled") c.cancelled += 1;
+      bucket.features.push({
+        featureId: row.featureId,
+        state: row.state,
+        title: row.title,
+        stage: row.stage,
+        approval: row.approval,
+        parentFeatureId: row.parentFeatureId,
+        updatedAt: row.updatedAt,
+      });
+    }
+
+    const buckets: VersionFeaturesBucket[] = [];
+    let unregisteredCount = 0;
+    for (const [version, bucket] of byVersion) {
+      bucket.counts.open = bucket.counts.total - bucket.counts.completed - bucket.counts.cancelled;
+      if (version === null) {
+        unregisteredCount = bucket.counts.total;
+        continue; // 未登记桶先摘出，最后再压回（保证恒在末尾）
+      }
+      buckets.push(bucket);
+    }
+    const unregistered = byVersion.get(null);
+    if (unregistered !== undefined) buckets.push(unregistered);
+    versions.sort();
+
+    return { buckets, versions, unregisteredCount };
   }
 
   // ------------------------------------------------------------------
@@ -3310,6 +4461,143 @@ export function featureTaskStateCounts(
   ownerGroup?: string,
 ): Map<string, Partial<Record<TaskState, number>>> {
   return getDefaultStore().featureTaskStateCounts(ownerGroup);
+}
+
+/**
+ * 版本名下卡聚合读面（默认存储；v0.10.0 O3）—— 见
+ * {@link SessionStore.aggregateFeaturesByVersion}（**归属谓词与 `listFeatures` 同源**；
+ * 未登记版号单列一桶、不静默丢；不加 `LIMIT` ⇒ 无截断）。
+ */
+export function aggregateFeaturesByVersion(ownerGroup?: string): VersionCardAggregate {
+  return getDefaultStore().aggregateFeaturesByVersion(ownerGroup);
+}
+
+/**
+ * 版本台账存在性读口（默认存储；v0.10.0 O5）—— 见
+ * {@link SessionStore.versionLedgerHas}（`ledgerReady = false` 语义 = O1 表尚未落地，调用方
+ * 在此路径跳过存在性检查、**shape 校验仍生效**；不改写存量）。
+ */
+export function versionLedgerHas(
+  ownerGroup: string | null | undefined,
+  version: string,
+): { exists: boolean; ledgerReady: boolean } {
+  return getDefaultStore().versionLedgerHas(ownerGroup, version);
+}
+
+/**
+ * 版本台账状态读口（默认存储；v0.10.0 O4）—— 见
+ * {@link SessionStore.versionLedgerStatus}（三态 `notstart/active/released`；`ledgerReady = false`
+ * 语义 = O1 表尚未落地：排期写跳 `released` 锁、发版闸 fail-closed）。
+ */
+export function versionLedgerStatus(
+  ownerGroup: string | null | undefined,
+  version: string,
+): { status: VersionLedgerStatus | null; ledgerReady: boolean } {
+  return getDefaultStore().versionLedgerStatus(ownerGroup, version);
+}
+
+/**
+ * 版本台账**单行读**（默认存储；v0.10.0 O1）—— 见 {@link SessionStore.versionLedgerGet}。
+ * `ownerGroup` 是键的一部分：`null` = 匿名档（不接受 `undefined`）。
+ */
+export function versionLedgerGet(
+  ownerGroup: string | null,
+  version: string,
+): VersionLedgerRecord | null {
+  return getDefaultStore().versionLedgerGet(ownerGroup, version);
+}
+
+/**
+ * 版本台账**列表读**（默认存储；v0.10.0 O1）—— 见 {@link SessionStore.versionLedgerList}。
+ * `undefined` ⇒ 全量 / 字符串 ⇒ 本组 / `null` ⇒ 仅匿名档。
+ */
+export function versionLedgerList(ownerGroup?: string | null): VersionLedgerRecord[] {
+  return getDefaultStore().versionLedgerList(ownerGroup);
+}
+
+/**
+ * 版本台账**建版**（默认存储；v0.10.0 O2a）—— 见 {@link SessionStore.versionLedgerCreate}。
+ * 出参直接映射 HTTP 状态码与信封（`POST /api/versions`）。
+ */
+export function versionLedgerCreate(input: VersionLedgerCreateInput): VersionLedgerWriteResult {
+  return getDefaultStore().versionLedgerCreate(input);
+}
+
+/**
+ * 版本台账**删版**（默认存储；v0.10.0 O2a）—— 见 {@link SessionStore.versionLedgerDelete}。
+ * 出参直接映射 HTTP 状态码与信封（`DELETE /api/versions/{version}`）。
+ */
+export function versionLedgerDelete(
+  ownerGroup: string | null,
+  version: string,
+): VersionLedgerWriteResult {
+  return getDefaultStore().versionLedgerDelete(ownerGroup, version);
+}
+
+/**
+ * 版本台账**手动设状态**（默认存储；v0.10.0 O2c）—— 见
+ * {@link SessionStore.versionLedgerSetStatus}。`notstart ↔ active` 人工写口；
+ * `released` 为终态不可回退，发版另走 {@link versionLedgerMarkReleased}。
+ */
+export function versionLedgerSetStatus(
+  input: VersionLedgerSetStatusInput,
+): VersionLedgerWriteResult {
+  return getDefaultStore().versionLedgerSetStatus(input);
+}
+
+/**
+ * 版本台账**自动转 active**（默认存储；v0.10.0 O2c）—— 见
+ * {@link SessionStore.versionLedgerActivate}。引擎内部触发（首个节点派发 / `approve` 放行），
+ * 幂等；调用方的节流 / 不阻断护栏见 `bridge/versions-activation.ts`。
+ */
+export function versionLedgerActivate(
+  ownerGroup: string | null,
+  version: string,
+): VersionActivationResult {
+  return getDefaultStore().versionLedgerActivate(ownerGroup, version);
+}
+
+/**
+ * 发版快照**单行读**（默认存储；v0.10.0 O7）—— 见 {@link SessionStore.releaseSnapshotGet}。
+ * `ownerGroup` 是键的一部分：`null` = 匿名档（不接受 `undefined`）。
+ */
+export function releaseSnapshotGet(
+  ownerGroup: string | null,
+  version: string,
+): ReleaseSnapshotRecord | null {
+  return getDefaultStore().releaseSnapshotGet(ownerGroup, version);
+}
+
+/**
+ * 发版快照**列表读**（默认存储；v0.10.0 O7）—— 见 {@link SessionStore.releaseSnapshotList}
+ * （= 板 §2.3(3)「引擎 Release 清单」左半）。
+ */
+export function releaseSnapshotList(ownerGroup?: string | null): ReleaseSnapshotRecord[] {
+  return getDefaultStore().releaseSnapshotList(ownerGroup);
+}
+
+/**
+ * 版本台账**标记 released + 落快照（同事务）**（默认存储；v0.10.0 O7）——
+ * 见 {@link SessionStore.versionLedgerMarkReleased}。
+ *
+ * ⚠ 出参的 `snapshotWritten = false` **不等于**「本次没发版」：快照已存在 ⇒ 幂等回读、
+ * 不覆写（不可变判据）。发版闸判据（O4）由调用方在进本口之前评。
+ */
+export function versionLedgerMarkReleased(
+  input: ReleaseSnapshotInput,
+): ReleaseSnapshotWriteResult {
+  return getDefaultStore().versionLedgerMarkReleased(input);
+}
+
+/**
+ * 迁移哨兵**存在性读**（默认存储；v0.10.0 O1 · 改造文档 §2.1(7)）—— 见
+ * {@link SessionStore.versionsLedgerMigrationDone}（判据 = 哨兵事件行存在；
+ * **不以台账行数充当**，那会把「手工建单」误判成「已导入板台账」）。
+ * 哨兵的**写入**由离线一次性脚本 `scripts/migrate-versions-ledger.mjs` 直接落 `events`
+ * （脚本不经桥进程 ⇒ kind 字面量与 {@link EVENT_VERSION_LEDGER_MIGRATED} 逐字同值）。
+ */
+export function versionsLedgerMigrationDone(): boolean {
+  return getDefaultStore().versionsLedgerMigrationDone();
 }
 
 /** 清理保留策略（默认存储） */

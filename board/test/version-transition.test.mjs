@@ -1,5 +1,5 @@
 /**
- * REQ-2026-09-27-05 §2.3 W3 —— 状态转换执法（单件）：迁移矩阵五条边 + 自动转换三护栏。
+ * REQ-2026-09-27-05 §2.3 W3 —— 状态转换执法（单件）：迁移矩阵五条边（人工写面）。
  *
  * 判据（改造文档 §2.3 / 需求确认单 v5）：
  * - 手动写面闸（五条边）：`notstart → active`（正例）· `active → notstart`（有已确认卡 ⇒ 拒）·
@@ -7,10 +7,8 @@
  *   **完成集合 = completed + cancelled**（cancelled 轨已终止、无遗留待办 ⇒ 计入），`failed` 不计入
  *   ⇒ 含 failed 反例必须拒；**全 cancelled（无任何交付）同样必须拒**）·
  *   `released → active`（重开）· `notstart → released`（状态机拒）；
- * - 自动转换唯一一处 = 渲染前惰性比对「台账 notstart 条目 × 该组织该版本名下存在 stage ≠ 需求分析 的卡」
- *   （v0.9.6 B2 · 口径 31：候选键 = `(org, version)`，他组织的卡不点亮本组织条目），
- *   三护栏：幂等 / 写失败不阻断渲染（回落派生态） / 进程内节流（≥30s，按条目计量）；
- * - 自动写留 `note='auto:first-card-confirmed'`。
+ * - **自动转换（`notstart → active`）已迁引擎（v0.10.0 · C-1 / O2b）** —— 板侧不再有任何自动写路径，
+ *   本文件不再覆盖自动转换（原节流 / 幂等 / 复合键、GET 渲染前自动转换用例整段退役）。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -18,21 +16,7 @@ import { mkdirSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "nod
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 
-import {
-  AUTO_NOTE,
-  AUTO_THROTTLE_MS,
-  IDEA_CARD_STAGE,
-  applyAutoVersionTransitions,
-  decideVersionTransition,
-  deriveAutoActiveVersions,
-  isConfirmedCard,
-} from "../dist/version-transition.js";
-import {
-  createVersion,
-  emptyVersionsLedger,
-  findVersionRecord,
-  setVersionStatus,
-} from "../dist/versions-ledger.js";
+import { IDEA_CARD_STAGE, decideVersionTransition, isConfirmedCard } from "../dist/version-transition.js";
 import { createBoardServer } from "../dist/server.js";
 
 const NOW = "2026-09-27T12:00:00.000Z";
@@ -124,162 +108,8 @@ test("W3-⑥ released → active 重开放行；notstart → released 与 releas
 });
 
 // ---------------------------------------------------------------------------
-// 自动转换引擎（注入假 store）：判据 + 三护栏
+// HTTP 接线：手动写面闸（经引擎）
 // ---------------------------------------------------------------------------
-
-/** 假存储：可注入 `fail`（全抛）/ `failOrg`（该组织的写抛错）以验证护栏②；记录全部写入尝试。 */
-function fakeStore(ledger, opts = {}) {
-  let current = ledger;
-  const writes = [];
-  return {
-    writes,
-    get ledger() {
-      return current;
-    },
-    setStatus(version, status, now, note, org) {
-      writes.push({ version, status, now, note, org });
-      if (opts.fail || (opts.failOrg !== undefined && org === opts.failOrg)) throw new Error("disk boom（用例注入）");
-      current = setVersionStatus(current, version, status, now, note, org).ledger;
-      return { ledger: current };
-    },
-  };
-}
-
-function twoVersionLedger(org = "alpha") {
-  let l = createVersion(emptyVersionsLedger(), "v0.9.4", NOW, org).ledger;
-  return createVersion(l, "v0.9.5", NOW, org).ledger;
-}
-
-/** 两条同版号、分属两组织的 notstart 台账（口径 31 的隔离面）。 */
-function sameVersionTwoOrgs() {
-  let l = createVersion(emptyVersionsLedger(), "v0.9.4", NOW, "alpha").ledger;
-  return createVersion(l, "v0.9.4", NOW, "beta").ledger;
-}
-
-test("W3-⑦ 自动转换判据：仅「notstart ∧ 该组织该版本名下已确认卡」命中；想法卡不触发；幂等（护栏①：一跳后不再写）", () => {
-  const ledger = twoVersionLedger();
-  const cards = [
-    { ownerGroup: "alpha", version: "v0.9.4", stage: "改造方案" }, // 已确认
-    { ownerGroup: "alpha", version: "v0.9.5", stage: IDEA_CARD_STAGE }, // 想法卡 ⇒ 不触发
-  ];
-  assert.deepEqual(deriveAutoActiveVersions(ledger, cards), [{ org: "alpha", version: "v0.9.4" }], "仅已确认卡命中；想法卡不触发");
-
-  const store = fakeStore(ledger);
-  const throttle = new Map();
-  const first = applyAutoVersionTransitions({ ledger, cards, store, throttle, nowMs: NOW_MS });
-  assert.deepEqual(first.written, [{ org: "alpha", version: "v0.9.4" }]);
-  assert.deepEqual(first.failed, []);
-  assert.deepEqual(first.throttled, []);
-  assert.equal(store.writes.length, 1);
-  assert.equal(store.writes[0].note, AUTO_NOTE, "自动写留 note");
-  assert.equal(store.writes[0].org, "alpha", "写入按 (org, version) 精确落点");
-  assert.equal(findVersionRecord(first.ledger, "v0.9.4", "alpha").status, "active");
-  assert.equal(findVersionRecord(first.ledger, "v0.9.4", "alpha").note, AUTO_NOTE);
-  assert.equal(findVersionRecord(first.ledger, "v0.9.5", "alpha").status, "notstart", "想法卡版本停在 notstart");
-
-  // 护栏① 幂等：以回落台账再跑一次 ⇒ 已 active，候选为空 ⇒ 零写。
-  const second = applyAutoVersionTransitions({
-    ledger: first.ledger,
-    cards,
-    store,
-    throttle,
-    nowMs: NOW_MS,
-  });
-  assert.deepEqual(second.written, []);
-  assert.equal(store.writes.length, 1, "命中一跳不再写");
-});
-
-test("W3-⑦b 自动转换逐 org（口径 31）：候选键 = (org, version) ⇒ 他组织的已确认卡不点亮本组织同版号，节流亦按条目计量", () => {
-  const ledger = sameVersionTwoOrgs();
-  const cards = [{ ownerGroup: "alpha", version: "v0.9.4", stage: "改造方案" }];
-  assert.deepEqual(deriveAutoActiveVersions(ledger, cards), [{ org: "alpha", version: "v0.9.4" }], "beta 的同版号条目不入候选");
-
-  const store = fakeStore(ledger);
-  const throttle = new Map();
-  const out = applyAutoVersionTransitions({ ledger, cards, store, throttle, nowMs: NOW_MS });
-  assert.deepEqual(out.written, [{ org: "alpha", version: "v0.9.4" }]);
-  assert.equal(findVersionRecord(out.ledger, "v0.9.4", "alpha").status, "active");
-  assert.equal(findVersionRecord(out.ledger, "v0.9.4", "beta").status, "notstart", "他组织的同版号条目不受影响");
-
-  // 节流按 (org, version) 计量：beta 同版号不被 alpha 刚才那次尝试挡住（同刻即可写）
-  const out2 = applyAutoVersionTransitions({
-    ledger: out.ledger,
-    cards: [{ ownerGroup: "beta", version: "v0.9.4", stage: "改造方案" }],
-    store,
-    throttle,
-    nowMs: NOW_MS,
-  });
-  assert.deepEqual(out2.throttled, [], "节流键是复合串，不是光版本串");
-  assert.deepEqual(out2.written, [{ org: "beta", version: "v0.9.4" }]);
-
-  // 未归属桶（口径 32 的迁移层遗留）：无归属的卡只点亮 org = "" 的同版号条目，不认领带组织的条目
-  const three = createVersion(sameVersionTwoOrgs(), "v0.9.4", NOW, "").ledger;
-  const orphanCards = [{ ownerGroup: null, version: "v0.9.4", stage: "改造方案" }];
-  assert.deepEqual(deriveAutoActiveVersions(three, orphanCards), [{ org: "", version: "v0.9.4" }], "org 精确匹配，空串桶不是通配档");
-});
-
-test("W3-⑧ 护栏③ 进程内节流：同 (org, version) 条目 ≥30s 至多尝试一次", () => {
-  const ledger = createVersion(emptyVersionsLedger(), "v0.9.4", NOW, "alpha").ledger;
-  const cards = [{ ownerGroup: "alpha", version: "v0.9.4", stage: "改造方案" }];
-  const store = fakeStore(ledger, { fail: true }); // 写失败 ⇒ 条目仍 notstart ⇒ 下次仍命中候选
-  const throttle = new Map();
-  const hit = [{ org: "alpha", version: "v0.9.4" }];
-
-  const a = applyAutoVersionTransitions({ ledger, cards, store, throttle, nowMs: NOW_MS });
-  assert.deepEqual(a.failed, hit);
-  assert.equal(store.writes.length, 1);
-
-  const b = applyAutoVersionTransitions({ ledger, cards, store, throttle, nowMs: NOW_MS + 10_000 });
-  assert.deepEqual(b.throttled, hit);
-  assert.equal(store.writes.length, 1, "30s 内不再尝试");
-
-  const c = applyAutoVersionTransitions({
-    ledger,
-    cards,
-    store,
-    throttle,
-    nowMs: NOW_MS + AUTO_THROTTLE_MS,
-  });
-  assert.deepEqual(c.failed, hit);
-  assert.equal(store.writes.length, 2, "越过窗口后再尝试");
-});
-
-test("W3-⑨ 护栏② 写失败不阻断：failed 回报 + 回落台账按 (org, version) 剔除失败条目（不误导为「未开始」、不误剔他组织同版号）、入参无副作用", () => {
-  const ledger = sameVersionTwoOrgs();
-  const cards = [
-    { ownerGroup: "alpha", version: "v0.9.4", stage: "改造方案" },
-    { ownerGroup: "beta", version: "v0.9.4", stage: "改造方案" },
-  ];
-  const store = fakeStore(ledger, { failOrg: "alpha" }); // 只有 alpha 那次写失败
-  const out = applyAutoVersionTransitions({ ledger, cards, store, throttle: new Map(), nowMs: NOW_MS });
-  assert.deepEqual(out.failed, [{ org: "alpha", version: "v0.9.4" }]);
-  assert.deepEqual(out.written, [{ org: "beta", version: "v0.9.4" }]);
-  assert.equal(findVersionRecord(out.ledger, "v0.9.4", "alpha"), null, "失败条目剔除 ⇒ 徽标回落派生态");
-  assert.equal(findVersionRecord(out.ledger, "v0.9.4", "beta").status, "active", "不误剔他组织的同版号条目");
-  assert.equal(findVersionRecord(ledger, "v0.9.4", "alpha").status, "notstart", "入参台账不得被改动");
-});
-
-// ---------------------------------------------------------------------------
-// HTTP 接线：手动写面闸 + GET 自动转换
-// ---------------------------------------------------------------------------
-
-function feature(id, version, overrides = {}) {
-  return {
-    featureId: id,
-    state: "executing",
-    title: `需求 ${id}`,
-    requirement: null,
-    taskCount: 1,
-    ownerGroup: "alpha",
-    stage: "改造方案",
-    version,
-    approval: "已通过",
-    createdAt: "c",
-    updatedAt: "u",
-    stateCounts: null,
-    ...overrides,
-  };
-}
 
 function tmpEnv() {
   const dir = mkdtempSync(join(tmpdir(), "board-w3-"));
@@ -291,7 +121,7 @@ function seedLedger(file, entries) {
   writeFileSync(file, JSON.stringify({ version: 1, versions: entries }, null, 2) + "\n", "utf8");
 }
 
-/** 台账条目夹具：`org` 缺省 = `feature()` 夹具的归属组织（口径 31 后自动转换按 (org, version) 命中）。 */
+/** 台账条目夹具：`org` 缺省 = `alpha`。 */
 function rec(version, status, org = "alpha") {
   return { org, version, status, createdAt: NOW, updatedAt: NOW, note: null };
 }
@@ -300,9 +130,28 @@ function readLedger(file) {
   return JSON.parse(readFileSync(file, "utf8")).versions;
 }
 
-async function withServer(run, { features = [], seed = [] } = {}) {
+/** v0.10.0 B2：假引擎版本写客户端（记录意图，缺省成功档）——写面改道后覆盖 setStatus 直投。 */
+function fakeEngine(impl = {}) {
+  const calls = [];
+  const make = (kind) => async (input) => {
+    calls.push({ kind, input });
+    const r = impl[kind];
+    if (typeof r === "function") return r(input);
+    if (r !== undefined) return r;
+    return {
+      ok: true,
+      httpStatus: kind === "create" ? 201 : 200,
+      version: input.version,
+      status: kind === "remove" ? null : (input.status ?? "notstart"),
+    };
+  };
+  return { calls, client: { create: make("create"), remove: make("remove"), setStatus: make("setStatus") } };
+}
+
+async function withServer(run, { features = [], seed = [], engineImpl = {} } = {}) {
   const env = tmpEnv();
   if (seed.length > 0) seedLedger(env.versionsFile, seed);
+  const engine = fakeEngine(engineImpl);
   const client = {
     baseUrl: "http://fake",
     async getFeatures() {
@@ -327,9 +176,10 @@ async function withServer(run, { features = [], seed = [] } = {}) {
     client,
     now: () => NOW_MS,
     versionsLedgerFile: env.versionsFile,
+    versionsWriteImpl: engine.client,
   });
   try {
-    await run(`http://127.0.0.1:${handle.port}`, env);
+    await run(`http://127.0.0.1:${handle.port}`, env, engine);
   } finally {
     await handle.close();
     rmSync(env.dir, { recursive: true, force: true });
@@ -345,159 +195,119 @@ function postVersions(base, fields) {
   });
 }
 
-test("W3-⑩ HTTP active → notstart：有已确认卡 ⇒ 409；仅想法卡 ⇒ 200 退回", async () => {
+test("W3-⑩（v0.10.0 B2 改道）HTTP setStatus 经引擎：引擎放行 ⇒ 200；unknown ⇒ 404 原样码；本地台账零写", async () => {
   await withServer(
-    async (base, env) => {
+    async (base, env, engine) => {
       const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "notstart" });
-      assert.equal(res.status, 409);
-      assert.equal((await res.json()).code, "board_version_transition_confirmed_cards");
-      assert.equal(readLedger(env.versionsFile)[0].status, "active", "拒绝即零写");
+      assert.equal(res.status, 200, "引擎放行 ⇒ 板 200（引擎 setStatus 只锁 released 终态）");
+      assert.equal((await res.json()).status, "notstart", "回显引擎 record.status");
+      assert.deepEqual(engine.calls, [
+        { kind: "setStatus", input: { ownerGroup: null, version: "v0.9.4", status: "notstart" } },
+      ]);
+      assert.equal(readLedger(env.versionsFile)[0].status, "active", "本地台账零写（投影只读）");
     },
-    { seed: [rec("v0.9.4", "active")], features: [feature("F1", "v0.9.4")] },
+    { seed: [rec("v0.9.4", "active")] },
   );
   await withServer(
-    async (base, env) => {
-      const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "notstart" });
+    async (base) => {
+      const res = await postVersions(base, { action: "setStatus", version: "v9.9.9", status: "active" });
+      assert.equal(res.status, 404);
+      assert.equal((await res.json()).code, "orch_version_unknown", "引擎码原样");
+    },
+    { engineImpl: { setStatus: { ok: false, httpStatus: 404, code: "orch_version_unknown", message: "unknown" } } },
+  );
+});
+
+test("W3-⑪（v0.10.0 B2 改道）HTTP setStatus active → released 经引擎（发版闸归引擎，板原样展示）", async () => {
+  await withServer(
+    async (base, env, engine) => {
+      const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "released" });
       assert.equal(res.status, 200);
-      assert.equal((await res.json()).status, "notstart");
-      assert.equal(readLedger(env.versionsFile)[0].status, "notstart");
+      assert.equal((await res.json()).status, "released");
+      assert.deepEqual(engine.calls, [
+        { kind: "setStatus", input: { ownerGroup: null, version: "v0.9.4", status: "released" } },
+      ]);
+      assert.equal(readLedger(env.versionsFile)[0].status, "active", "本地台账零写");
     },
-    { seed: [rec("v0.9.4", "active")], features: [feature("F1", "v0.9.4", { stage: IDEA_CARD_STAGE })] },
-  );
-});
-
-test("W3-⑪ HTTP active → released：全 completed ⇒ 200；完成集合缩影（16 completed + 3 cancelled）⇒ 200；含 failed ⇒ 409", async () => {
-  await withServer(
-    async (base, env) => {
-      const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "released" });
-      assert.equal(res.status, 200);
-      assert.equal(readLedger(env.versionsFile)[0].status, "released");
-    },
-    {
-      seed: [rec("v0.9.4", "active")],
-      features: [feature("F1", "v0.9.4", { state: "completed" }), feature("F2", "v0.9.4", { state: "completed" })],
-    },
-  );
-  // 正向缩影（v0.9.4 名下 16 completed + 3 cancelled = 19 全收尾）⇒ 放行
-  await withServer(
-    async (base, env) => {
-      const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "released" });
-      assert.equal(res.status, 200, "completed + cancelled === total ∧ completed > 0 ⇒ 放行");
-      assert.equal(readLedger(env.versionsFile)[0].status, "released");
-    },
-    {
-      seed: [rec("v0.9.4", "active")],
-      features: [
-        ...Array.from({ length: 16 }, (_, i) => feature(`C${i}`, "v0.9.4", { state: "completed" })),
-        ...Array.from({ length: 3 }, (_, i) => feature(`X${i}`, "v0.9.4", { state: "cancelled" })),
-      ],
-    },
+    { seed: [rec("v0.9.4", "active")] },
   );
   await withServer(
-    async (base, env) => {
+    async (base) => {
       const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "released" });
       assert.equal(res.status, 409);
-      assert.equal((await res.json()).code, "board_version_transition_release_incomplete");
-      assert.equal(readLedger(env.versionsFile)[0].status, "active", "拒绝即零写");
+      assert.equal((await res.json()).code, "orch_version_not_converged", "引擎发版闸码原样");
     },
     {
       seed: [rec("v0.9.4", "active")],
-      features: [
-        feature("F1", "v0.9.4", { state: "completed" }),
-        feature("F2", "v0.9.4", { state: "failed" }),
-        feature("F3", "v0.9.4", { state: "cancelled" }),
-      ],
+      engineImpl: { setStatus: { ok: false, httpStatus: 409, code: "orch_version_not_converged", message: "gate" } },
     },
   );
 });
 
-test("W3-⑪b HTTP active → released 负锚：全 cancelled ⇒ 409（零交付版不得发版）；非终态在途 ⇒ 409", async () => {
+test("W3-⑪b（v0.10.0 B2 改道）HTTP active → released 负锚：零交付 / 非终态在途均由引擎拒", async () => {
   await withServer(
-    async (base, env) => {
+    async (base) => {
       const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "released" });
-      assert.equal(res.status, 409, "completed = 0 ⇒ 拒（用户裁决 A）");
-      assert.equal((await res.json()).code, "board_version_transition_release_incomplete");
-      assert.equal(readLedger(env.versionsFile)[0].status, "active", "拒绝即零写");
+      assert.equal(res.status, 409, "completed = 0 ⇒ 引擎发版闸拒");
+      assert.equal((await res.json()).code, "orch_version_not_converged");
     },
     {
       seed: [rec("v0.9.4", "active")],
-      features: [
-        feature("F1", "v0.9.4", { state: "cancelled" }),
-        feature("F2", "v0.9.4", { state: "cancelled" }),
-      ],
+      engineImpl: { setStatus: { ok: false, httpStatus: 409, code: "orch_version_not_converged", message: "zero-delivery" } },
     },
   );
   await withServer(
     async (base) => {
       const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "released" });
-      assert.equal(res.status, 409, "名下仍有 executing 在途 ⇒ 未收口");
-      assert.equal((await res.json()).code, "board_version_transition_release_incomplete");
+      assert.equal(res.status, 409, "名下仍有 executing 在途 ⇒ 引擎未收口拒");
+      assert.equal((await res.json()).code, "orch_version_not_converged");
     },
     {
       seed: [rec("v0.9.4", "active")],
-      features: [
-        feature("F1", "v0.9.4", { state: "completed" }),
-        feature("F2", "v0.9.4", { state: "completed" }),
-        feature("F3", "v0.9.4", { state: "executing" }),
-      ],
+      engineImpl: { setStatus: { ok: false, httpStatus: 409, code: "orch_version_not_converged", message: "inflight" } },
     },
   );
 });
 
-test("W3-⑫ HTTP notstart → released / released → notstart ⇒ 409 forbidden（状态机拒绝）", async () => {
-  await withServer(
-    async (base) => {
-      const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "released" });
-      assert.equal(res.status, 409);
-      assert.equal((await res.json()).code, "board_version_transition_forbidden");
-    },
-    { seed: [rec("v0.9.4", "notstart")] },
-  );
+test("W3-⑫（v0.10.0 B2 改道）HTTP released 终态：改态被引擎拒（orch_version_released_locked 原样）", async () => {
   await withServer(
     async (base) => {
       const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "notstart" });
       assert.equal(res.status, 409);
-      assert.equal((await res.json()).code, "board_version_transition_forbidden");
+      assert.equal((await res.json()).code, "orch_version_released_locked");
     },
-    { seed: [rec("v0.9.4", "released")] },
+    {
+      seed: [rec("v0.9.4", "released")],
+      engineImpl: { setStatus: { ok: false, httpStatus: 409, code: "orch_version_released_locked", message: "locked" } },
+    },
   );
-});
-
-test("W3-⑬ HTTP released → active 重开放行（200）", async () => {
   await withServer(
-    async (base, env) => {
+    async (base) => {
       const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "active" });
-      assert.equal(res.status, 200);
-      assert.equal((await res.json()).status, "active");
-      assert.equal(readLedger(env.versionsFile)[0].status, "active");
+      assert.equal(res.status, 409, "released 不可回退（引擎终态锁）");
+      assert.equal((await res.json()).code, "orch_version_released_locked");
     },
-    { seed: [rec("v0.9.4", "released")] },
+    {
+      seed: [rec("v0.9.4", "released")],
+      engineImpl: { setStatus: { ok: false, httpStatus: 409, code: "orch_version_released_locked", message: "locked" } },
+    },
   );
 });
 
-test("W3-⑭（B5a 改版：全局 /schedule 退役 ⇒ 看板宿主 = 空间排期页）HTTP GET /org/alpha/schedule 自动转换：notstart + 已确认卡 ⇒ 落盘 active + note；再 GET 幂等不再写", async () => {
+test("W3-⑬（v0.10.0 B2 改道）HTTP released → active：引擎拒（终态不可回退），板原样展示、本地零写", async () => {
   await withServer(
-    async (base, env) => {
-      const res = await fetch(`${base}/org/alpha/schedule`);
-      assert.equal(res.status, 200);
-      const html = await res.text();
-      const first = readLedger(env.versionsFile)[0];
-      assert.equal(first.status, "active", "首卡已确认 ⇒ 渲染前自动转 active");
-      assert.equal(first.note, AUTO_NOTE);
-      assert.match(html, /<h3>v0\.9\.4 <span class="kbadge vbadge wip"[^>]*>进行中<\/span>/, "徽标 = 台账 active");
-
-      const snapshot = readFileSync(env.versionsFile, "utf8");
-      await (await fetch(`${base}/org/alpha/schedule`)).text();
-      assert.equal(readFileSync(env.versionsFile, "utf8"), snapshot, "幂等：已 active ⇒ 不再写");
+    async (base, env, engine) => {
+      const res = await postVersions(base, { action: "setStatus", version: "v0.9.4", status: "active" });
+      assert.equal(res.status, 409);
+      assert.equal((await res.json()).code, "orch_version_released_locked");
+      assert.deepEqual(engine.calls, [
+        { kind: "setStatus", input: { ownerGroup: null, version: "v0.9.4", status: "active" } },
+      ]);
+      assert.equal(readLedger(env.versionsFile)[0].status, "released", "本地台账零写（原 released 不变）");
     },
-    { seed: [rec("v0.9.4", "notstart")], features: [feature("F1", "v0.9.4")] },
-  );
-  // 想法卡不触发：GET 后仍 notstart
-  await withServer(
-    async (base, env) => {
-      await (await fetch(`${base}/org/alpha/schedule`)).text();
-      assert.equal(readLedger(env.versionsFile)[0].status, "notstart", "仅想法卡 ⇒ 不触发自动转换");
+    {
+      seed: [rec("v0.9.4", "released")],
+      engineImpl: { setStatus: { ok: false, httpStatus: 409, code: "orch_version_released_locked", message: "locked" } },
     },
-    { seed: [rec("v0.9.4", "notstart")], features: [feature("F1", "v0.9.4", { stage: IDEA_CARD_STAGE })] },
   );
 });

@@ -244,6 +244,11 @@ export interface AgentConfigSnapshot {
    */
   gateLimits: string;
   /**
+   * 仓库标识（v0.10.0 · M1）：项目配置 `repo` 生效时播报 `repo=<值>（agentConfig）`；
+   * **未配置 ⇒ 省略该键**（`undefined`）—— 缺省 = 宿主仓的解释权归引擎，machine 只「配置了才上报」。
+   */
+  repo?: string;
+  /**
    * 后端入口 `[backend]` 日志行正文（不含 `[backend]` 前缀，manager 打印时加）。
    * 命中：`<projectId> kind=<kind> <层名> hit <绝对路径>`；
    * 未命中：`<projectId> 解析失败，逐层清单：L0-explicit=miss(..) | ..`（清单入日志，不进 Error message）。
@@ -326,6 +331,7 @@ export function describeAgentConfig(
     sessionRetention: describeSessionRetention(project),
     sessionWindow: describeSessionWindow(project, cancelQuiesceMs),
     gateLimits: describeGateLimits(project),
+    ...(project.repo !== undefined ? { repo: `repo=${project.repo}（agentConfig）` } : {}),
     backend: describeBackend(project, deps),
   };
 }

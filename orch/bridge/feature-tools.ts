@@ -29,6 +29,7 @@
 import { randomUUID } from "node:crypto";
 import {
   appendEvent,
+  aggregateFeaturesByVersion,
   countQueuedBefore,
   createFeature,
   EVENT_FEATURE_STATE,
@@ -47,8 +48,11 @@ import {
   updateFeatureRegistration,
   updateFeatureState,
   updateTaskState,
+  versionLedgerHas,
+  versionLedgerStatus,
 } from "../session/store.js";
 import { EVENT_FAILURE_REPORT, planResume } from "./scheduler.js";
+import { activateVersionForFeature } from "./versions-activation.js";
 import type {
   FeatureContextPatch,
   FeatureRegistrationPatch,
@@ -399,10 +403,32 @@ interface RegistrationInput {
  * - 只回传**已提供**的字段（undefined = 本次不写该列，交 `updateFeatureRegistration` 保留原值）；
  * - 非法值 ⇒ 结构化拒绝（`feature_invalid_stage` / `feature_invalid_approval`），**零写入**；
  * - **不校验序、不校验回退**（B5″：`stage` 序校验 / 回退限制都不做）。
+ *
+ * **v0.10.0 O5 · `version` 写口格式校验（改造文档 §2.1(4)）**：
+ * - **不校验** `undefined`（未提供 = 不写，保留原值）；
+ * - **不校验** 空串（= 撤排期回「未登记」桶、非版号；见 {@link SessionStore.aggregateFeaturesByVersion} 未登记桶口径）；
+ * - **trim** 后非空 ⇒ 必须命中 **semver 形状**（可选 `v` 前缀 + `MAJOR.MINOR.PATCH` + 可选 prerelease/build）；
+ *   不合形状 ⇒ `feature_invalid_version_shape`，零写入；
+ * - **不做脏值归一** —— 存量自由文本行**不被改写**、也不参与 shape 判定（此校验只作用于**写口**，
+ *   与读侧 `readNullableString(...) ?? ""` 归一并存）；
+ * - **存在性校验**（∈ O1 台账）由调用方（`handleFeatureCreate` / `handleFeatureAdvance`）在 shape
+ *   过关后就近做 —— 需要 Feature 的 `owner_group`（advance 时）或连接身份（create 时），本函数不持有该上下文。
  */
 type RegistrationParse =
   | { ok: true; patch: FeatureRegistrationPatch }
   | { ok: false; code: string; error: string };
+
+/**
+ * semver 形状（v0.10.0 O5）：**可选 `v` 前缀**（历史上板/宿主两种写法并存，宽松兼容）
+ * + `X.Y.Z` 三段（不做前导零宽松）+ 可选 `-prerelease` + 可选 `+build`。
+ * **不做** `~`/`^`/range 语法（那些是消费侧匹配符，不是登记值）。
+ */
+const VERSION_SHAPE_RE =
+  /^v?(0|[1-9]\d*)\.(0|[1-9]\d*)\.(0|[1-9]\d*)(?:-[0-9A-Za-z.-]+)?(?:\+[0-9A-Za-z.-]+)?$/;
+
+function isVersionShapeValid(v: string): boolean {
+  return VERSION_SHAPE_RE.test(v);
+}
 
 function parseRegistration(input: RegistrationInput): RegistrationParse {
   const patch: FeatureRegistrationPatch = {};
@@ -426,9 +452,179 @@ function parseRegistration(input: RegistrationInput): RegistrationParse {
     }
     patch.approval = input.approval;
   }
-  // `version` 是自由文本（无闭集、不校验）
-  if (input.version !== undefined) patch.version = input.version;
+  // v0.10.0 O5：`version` 写口 shape 校验（undefined / 空串 ⇒ 放行；trim 后非空 ⇒ 必须命中 semver）
+  if (input.version !== undefined) {
+    const trimmed = input.version.trim();
+    if (trimmed !== "" && !isVersionShapeValid(trimmed)) {
+      return {
+        ok: false,
+        code: "feature_invalid_version_shape",
+        error:
+          `非法 version "${input.version}"：期望 semver 形状 vX.Y.Z（可省 v、可带 -prerelease/+build）；` +
+          `空串表示撤排期（回未登记桶）`,
+      };
+    }
+    // 归一为 trim 后值落库，避免 `" v0.10.0 "` 与 `"v0.10.0"` 在台账 PK 上分裂
+    patch.version = trimmed;
+  }
   return { ok: true, patch };
+}
+
+/**
+ * **版本台账存在性检查**（v0.10.0 O5 · 改造文档 §2.1(4)）：shape 过关后就近做，
+ * 由调用方传入当前上下文里 Feature 将落的 `owner_group`（create = 连接身份 / advance = 已有归属）。
+ *
+ * 分流：
+ * - **未写 version**（`undefined`）⇒ 放行（本次不动 version 列）；
+ * - **空串**（撤排期 ⇒ 回未登记桶）⇒ 放行（不必 ∈ 台账；见 {@link aggregateFeaturesByVersion} 未登记桶）；
+ * - **非空** ∧ **`ledgerReady = true`** ∧ **不在台账** ⇒ 拒（`orch_version_unknown`，409 语义 —— HTTP 面错误码由 O2 端点转；本处是 MCP 面）；
+ * - **非空** ∧ **`ledgerReady = false`**（O1 版本台账尚未落地 ⇒ 过渡态）⇒ **放行**（shape 校验仍生效）；
+ *   台账一建，本检查自动切执法路径，无需再改代码。
+ */
+function checkVersionLedger(
+  ownerGroup: string | null | undefined,
+  version: string | undefined,
+): FeatureToolFailure | null {
+  if (version === undefined || version === "") return null;
+  const { exists, ledgerReady } = versionLedgerHas(ownerGroup, version);
+  if (!ledgerReady) return null; // O1 未落表 ⇒ 跳过存在性检查（shape 已在前一步把关）
+  if (exists) return null;
+  return {
+    ok: false,
+    code: "orch_version_unknown",
+    error:
+      `version "${version}" 不在引擎版本台账（owner_group=${ownerGroup === null || ownerGroup === undefined ? "NULL" : `"${ownerGroup}"`}）` +
+      `：先经板/宿主建版号或选已存在的版号；空串 = 撤排期（回未登记桶）不经本检`,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// O4 · 版本写口执法（发版闸 + 两把锁 · 改造文档 §2.1(3)）
+// ---------------------------------------------------------------------------
+
+/**
+ * **排期写执法**（v0.10.0 O4）—— 任意**写 `features.version`**（= 把需求排入某版）经此门，
+ * **fail-fast、零写入**。宿主经 MCP 直写 `version` 同受执法（**后门不豁免 —— 引擎侧强制、非板**）。
+ * 两把锁（改造文档 §2.1(3) / `需求流程.md` §7）：
+ *
+ * 1. **排期写状态锁** —— 仅 `stage = 需求分析 ∧ approval = 未发起` 的卡可写版号（= §7 改版纪律
+ *    第一档「想法挪版」，零善后）。已过需求确认门（`stage ≠ 需求分析` ∨ `approval ≠ 未发起`）⇒ 拒
+ *    `board_schedule_state_locked`（**跨单元引用码，字面不变**：原由板侧发起，v0.10.0 起改由引擎返回）。
+ *    ⚠ 本锁**只作用于 advance 的再排期路径**（对既有卡挪版 / 改期）；**create 不施本锁** —— create
+ *    确立卡的初始态、无「先前态」可锁，且板「需求提出即入板」恒以 `需求分析 / 未发起` 建卡、天然满足。
+ *    「有产出物的改版」（§7 第二档，卡已过门）不在此锁放行面 —— 由宿主善后轨处理，不在本节点范围。
+ * 2. **`released` 锁** —— 目标版号在引擎版本台账为 `released` ⇒ 不可排入 / 不可改排期，拒
+ *    `orch_version_released_locked`。trim 全等匹配（`parseRegistration` 已 trim）、**禁前缀**（按台账 PK 字面查）。
+ *    台账未落地（`ledgerReady = false`）⇒ 过渡放行（同 O5 存在性检查：无表 ≠ 已发版，不得一刀切挡所有版号）。
+ *    create 与 advance 同施本锁。
+ *
+ * 未写 version（`undefined`）/ 空串（撤排期 ⇒ 回未登记桶）⇒ 整门跳过（不针对某已存在版号排期）。
+ */
+function checkVersionWriteLocks(
+  current: { stage: FeatureStage; approval: FeatureApproval },
+  ownerGroup: string | null | undefined,
+  version: string | undefined,
+  opts: { applyStateLock: boolean },
+): FeatureToolFailure | null {
+  if (version === undefined || version === "") return null;
+  // 1) 排期写状态锁（仅 advance 再排期路径执法；create 无先前态 ⇒ 由 applyStateLock=false 跳过）
+  if (opts.applyStateLock && (current.stage !== "需求分析" || current.approval !== "未发起")) {
+    return {
+      ok: false,
+      code: "board_schedule_state_locked",
+      error:
+        `排期写状态锁：version "${version}" 仅当 stage=需求分析 ∧ approval=未发起 时可写；` +
+        `当前 stage=${current.stage} / approval=${current.approval}（已过需求确认门 ⇒ 不可挪版/改期；` +
+        `有产出物的改版走 §7 第二档善后轨，不在本锁放行面）`,
+    };
+  }
+  // 2) released 锁（create / advance 同施）
+  const { status, ledgerReady } = versionLedgerStatus(ownerGroup, version);
+  if (ledgerReady && status === "released") {
+    return {
+      ok: false,
+      code: "orch_version_released_locked",
+      error:
+        `已发版锁：version "${version}" 在引擎版本台账为 released（owner_group=` +
+        `${ownerGroup === null || ownerGroup === undefined ? "NULL" : `"${ownerGroup}"`}），不可排入 / 不可改排期`,
+    };
+  }
+  return null;
+}
+
+/** 发版闸入参（O2b 设状态端点 / O7 标记 released 同事务前调用） */
+export interface ReleaseGateInput {
+  ownerGroup: string | null | undefined;
+  /** 已 trim 的目标版号 */
+  version: string;
+}
+
+/** 发版闸 verdict（成功回该版号名下三桶计数，供调用方留痕 / 快照） */
+export type ReleaseGateResult =
+  | {
+      ok: true;
+      counts: { total: number; completed: number; cancelled: number; open: number };
+    }
+  | FeatureToolFailure;
+
+/**
+ * **发版闸**（v0.10.0 O4 · 改造文档 §2.1(3) / `需求流程.md` §8）—— 「标记 released」的准入判据，
+ * **执法落引擎**；写端点（O2b `PATCH /api/versions/{version}/status`）与快照同事务（O7）**共用本判据**。
+ *
+ * 判据**不变**（`需求流程.md` §8 收口口径，本节点不改语义）：
+ *   `total > 0 ∧ completed + cancelled === total ∧ completed > 0`
+ *   - `failed` **不计入收口**（`open` 含 `failed`，与 O3 三桶口径同源）⇒ 名下有 `open`（含 `failed`）⇒ 未收口；
+ *   - **全 `cancelled`**（`total>0 ∧ completed=0`）⇒ 无任何交付 ⇒ 挡闸；
+ *   - **全 `failed`**（未收口）⇒ 须先经 `cancel` 归档再判 ⇒ 挡闸。
+ *
+ * **中间态禁令作发版闸判据**（★R2 加严，非仅纪律）：发版事实源必须在引擎 —— 台账未落地
+ * （`ledgerReady = false`）或版号不在引擎台账 ⇒ **fail-closed** 拒 `orch_version_unknown`
+ * （不得发布「既写本地台账又读引擎」的中间态版本）。
+ *
+ * 已 `released` 的重复标记交调用方（O2a 幂等）处理，本闸不再判（`status` 在此只作读、不挡同版重复标记）。
+ * ⚠ `owner_group` 为 NULL（未配组 / 匿名）时聚合走**全量**（{@link aggregateFeaturesByVersion} 无「IS NULL」
+ *   过滤档）；带组环境按组精确计数，与本闸判据一致。
+ */
+export function evaluateReleaseGate(input: ReleaseGateInput): ReleaseGateResult {
+  const ownerGroup = input.ownerGroup;
+  const version = input.version;
+  // 事实源在引擎 / 中间态禁令：版号须已在引擎台账登记（表就绪 ∧ 命中），否则 fail-closed
+  const { exists, ledgerReady } = versionLedgerHas(ownerGroup, version);
+  if (!ledgerReady || !exists) {
+    return {
+      ok: false,
+      code: "orch_version_unknown",
+      error:
+        `发版闸：version "${version}" 不在引擎版本台账（owner_group=` +
+        `${ownerGroup === null || ownerGroup === undefined ? "NULL" : `"${ownerGroup}"`}）` +
+        `${ledgerReady ? "" : "（台账尚未落地 ⇒ 既写本地台账又读引擎的中间态，fail-closed 不得发布）"}；` +
+        `发版事实源须在引擎，先经引擎建版号`,
+    };
+  }
+  // 收口判据：取该版号名下卡三桶计数（可见性同源，与板 / 聚合面同口径）
+  const agg = aggregateFeaturesByVersion(ownerGroup ?? undefined);
+  const bucket = agg.buckets.find((b) => b.version === version);
+  const counts = bucket?.counts ?? { total: 0, completed: 0, cancelled: 0, open: 0 };
+  if (counts.total === 0 || counts.completed + counts.cancelled !== counts.total) {
+    return {
+      ok: false,
+      code: "orch_version_not_converged",
+      error:
+        `发版闸：version "${version}" 未收口（total=${counts.total} completed=${counts.completed} ` +
+        `cancelled=${counts.cancelled} open=${counts.open}）；` +
+        `须 total>0 ∧ completed+cancelled===total（open 含 failed，failed 不计收口、须先 cancel 归档）`,
+    };
+  }
+  if (counts.completed === 0) {
+    return {
+      ok: false,
+      code: "orch_version_all_cancelled",
+      error:
+        `发版闸：version "${version}" 名下 ${counts.total} 张卡全部 cancelled（无任何 completed 交付）；` +
+        `全取消版本不得标记 released`,
+    };
+  }
+  return { ok: true, counts };
 }
 
 // ---------------------------------------------------------------------------
@@ -476,6 +672,17 @@ export function handleFeatureCreate(
   // ⇒ **不传三参数的既有调用行为逐字不变**（缺省恰为「改造方案 + 待审批」= 既有语义）
   const reg = parseRegistration(args);
   if (reg.ok === false) return reg;
+  // v0.10.0 O5：shape 过关后做**存在性校验**（∈ O1 台账；台账未落地 ⇒ 过渡放行，见 {@link checkVersionLedger}）
+  const ledgerFailure = checkVersionLedger(identity, reg.patch.version);
+  if (ledgerFailure !== null) return ledgerFailure;
+  // v0.10.0 O4：create 只施 `released` 锁（无「先前态」可挡排期 ⇒ 不施排期写状态锁，见 {@link checkVersionWriteLocks}）
+  const writeLockFailure = checkVersionWriteLocks(
+    { stage: reg.patch.stage ?? DEFAULT_FEATURE_STAGE, approval: reg.patch.approval ?? DEFAULT_FEATURE_APPROVAL },
+    identity,
+    reg.patch.version,
+    { applyStateLock: false },
+  );
+  if (writeLockFailure !== null) return writeLockFailure;
   // 父需求校验（v0.9.3 O1，零写入前）：存在性 + 可见性走带身份过滤读口
   // （`ownershipFailure` 同源判据，禁止第二套）⇒ 不存在与他组不可见**同一拒绝码**
   // `feature_not_found`（不泄漏他组 Feature 的存在性，fail-closed）。只存不解析：不递归、不判环。
@@ -504,8 +711,9 @@ export function handleFeatureCreate(
     // 前段讨论 / 方案（Step 0/1）不走引擎；`waiting_approval → executing` 只能经 `a2a_feature_approve`
     state: "waiting_approval",
     // v0.9.0 登记字段：`version` 未传 ⇒ NULL（读回归一为空串，不落 "null" 字面量）
+    // v0.10.0 O5：经 parseRegistration trim 后取（既有非空原样、脏值走 shape 挡门；NULL ⇒ 未登记）
     stage: reg.patch.stage ?? DEFAULT_FEATURE_STAGE,
-    version: args.version ?? null,
+    version: reg.patch.version ?? null,
     approval: reg.patch.approval ?? DEFAULT_FEATURE_APPROVAL,
   });
   const success: FeatureCreateSuccess = {
@@ -754,6 +962,20 @@ export function handleFeatureAdvance(
   // 登记字段：**先解析校验**（非法 ⇒ 任何写入之前拒绝，Feature 态与登记值零变更）
   const reg = parseRegistration(args);
   if (reg.ok === false) return reg;
+  // v0.10.0 O5：shape 过关后做**存在性校验**（∈ O1 台账；台账未落地 ⇒ 过渡放行，见 {@link checkVersionLedger}）
+  // ⚠ 归属取**当前 Feature 的 ownerGroup**（谁建谁见 ⇒ 与 identity 一致已由 `ownershipFailure` 把关）；
+  // 台账 PK 用 `(owner_group, version)`，故按 Feature 归属查、不按连接身份查（后者可能为 null 但 Feature 非空）。
+  const ledgerFailure = checkVersionLedger(feature.ownerGroup, reg.patch.version);
+  if (ledgerFailure !== null) return ledgerFailure;
+  // v0.10.0 O4：shape + 存在性过关后做**排期写执法**（两把锁；宿主 MCP 直写同受、后门不豁免）。
+  // 位置在存在性检查**之后** ⇒ 保留 O5「未登记版号 ⇒ orch_version_unknown」的判据优先序。
+  const writeLockFailure = checkVersionWriteLocks(
+    { stage: feature.stage, approval: feature.approval },
+    feature.ownerGroup,
+    reg.patch.version,
+    { applyStateLock: true },
+  );
+  if (writeLockFailure !== null) return writeLockFailure;
   const hasRegistration =
     reg.patch.stage !== undefined ||
     reg.patch.approval !== undefined ||
@@ -1023,6 +1245,10 @@ export function handleFeatureApprove(
   const updated = updateFeatureState(feature.featureId, "executing");
   // 过审即把门状态落定（**单向、无回边**）：同一张单不得被重复过审解释
   updateFeatureRegistration(feature.featureId, { approval: "已通过" });
+  // v0.10.0 O2c：`approve` 放行 = 版本「notstart → active」自动转换的触发点之一
+  // （引擎内部 · 幂等 · 不阻断；事件 `version.activated` 由 store 写口同事务落）。
+  // 版本面故障绝不拖垮过审：`activateVersionForFeature` 自带 try/catch 护栏（见 versions-activation.ts）。
+  activateVersionForFeature(feature);
   return {
     ok: true,
     featureId: feature.featureId,

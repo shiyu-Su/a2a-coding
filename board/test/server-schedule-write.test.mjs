@@ -6,6 +6,7 @@ import { join } from "node:path";
 
 import { createBoardServer } from "../dist/server.js";
 import { scheduleFeature } from "../dist/feature-schedule.js";
+import { engineProjectionFetcher } from "./engine-versions-fixture.mjs";
 
 const NOW = Date.parse("2026-09-25T12:00:00Z");
 
@@ -57,9 +58,10 @@ function fakeClient(featureOver = {}) {
 }
 
 /**
- * 已发版锁夹具（v0.9.4 N3）：`releasedVersions` 已退役出服务端配置（运行时锁改读版本台账）
- * ⇒ 测试把「这些版本已发版」预置为临时台账文件喂入（`versionsLedgerFile`）。
- * **恒注入**（未声明锁版时喂空台账）：否则缺省会读开发机真实 `.data/versions.json`，锁随本机状态漂移。
+ * 已发版锁夹具（v0.9.4 N3 · **v0.10.0 B4 起只喂本地台账**）：锁的**数据源**已换到引擎版本台账投影
+ * （`engineVersionsFetcher`，见 `engine-versions-fixture.mjs`）⇒ 本夹具与投影**同源同值**恒注入
+ * （未声明锁版时喂空台账 + 空投影）。否则缺省会读开发机真实 `.data/versions.json`、
+ * 或打开发机的真实引擎（写口 fail-closed ⇒ 引擎一宕集体 503），锁随本机状态漂移。
  */
 function releasedLedgerFixture(versions = []) {
   const dir = mkdtempSync(join(tmpdir(), "board-locked-"));
@@ -85,6 +87,8 @@ async function withServer(run, serverOptions = {}, client) {
     now: () => NOW,
     ...rest,
     versionsLedgerFile: seed.file,
+    // v0.10.0 B4：锁读引擎投影 ⇒ 与台账夹具同源恒注入（用例可显式覆盖本键走 fail-closed 档）。
+    engineVersionsFetcher: rest.engineVersionsFetcher ?? engineProjectionFetcher(releasedVersions ?? []),
   });
   try {
     await run(`http://127.0.0.1:${handle.port}`);

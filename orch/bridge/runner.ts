@@ -1482,6 +1482,7 @@ function parseProjects(value: unknown): ProjectsOutcome {
       workspace: asNonEmptyString(item["workspace"]),
       endpoint: asNonEmptyString(item["endpoint"]),
       startedAt: asNonEmptyString(item["startedAt"]),
+      repo: asNonEmptyString(item["repo"]),
     });
   }
   return { ok: true, projects };

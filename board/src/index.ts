@@ -32,7 +32,13 @@ import {
 } from "./host-bridge.js";
 import { HostTurnManager, createHostBridgeGateway } from "./host-turn.js";
 import { createHostFace, orgBridgeConfig, type BoardHostFace } from "./host-face.js";
-import { createBridgeClient } from "./bridge-client.js";
+import {
+  createBridgeClient,
+  createEngineVersionsFetcher,
+  type EngineVersionsFetcher,
+  type EngineVersionsOutcome,
+} from "./bridge-client.js";
+import { projectionLedgerOf } from "./web/views.js";
 import type { ChainStateSnapshot } from "./derive.js";
 import type { EngineStateProbe, HostRelay } from "./host-relay.js";
 import { SuspendLedgerStore, defaultSuspendLedgerFile } from "./suspend-ledger.js";
@@ -41,9 +47,11 @@ import { OrgsLedgerStore, defaultOrgsLedgerFile, findOrgRecord, isOrgDisabled as
 import {
   VersionsLedgerStore,
   defaultVersionsLedgerFile,
+  defaultVersionsSentinelFile,
   migrateLedgerOrgs,
   migrateReleasedVersions,
   releasedVersionLabels,
+  type VersionsLedger,
 } from "./versions-ledger.js";
 import { readVersion } from "./version.js";
 import { patchStreamTimestamp } from "./log.js";
@@ -118,6 +126,53 @@ export function composeChainSnapshot(
   }
   if (entry === null && sources.heartbeat?.isAutoArmed(id) !== true) return null;
   return { chainState: "monitoring", reason: null, source: null, pendingCount: pendingCount ?? 0 };
+}
+
+/** 启动日志「已发版锁定」一行的产出（v0.10.0 尾段 N2）。 */
+export interface StartupReleasedVersions {
+  /** 「版本（组织）」标签清单 —— `(org, version)` 是唯一键，光版号会跨组织混淆（口径 32）。 */
+  labels: string[];
+  /** 数据源的如实标注（写进日志括注，读者须知道清单来自哪一档）。 */
+  sourceNote: string;
+  /** 非 `null` ⇒ 启动期没读到引擎投影，本串作为 warn 原样输出（**不阻断启动**）。 */
+  degraded: string | null;
+}
+
+/**
+ * 启动日志的已发版清单读取（v0.10.0 尾段 N2 · 换源）：事实源 = **引擎版本台账**，
+ * 一次性打 `GET <mcpBaseUrl>/api/versions`；**启动期桥不可达不得让启动崩** ——
+ * 读不到 ⇒ 清单退板本地台账**读缓存**并如实标出（口径同 N1 版本列 / B4 门户的降级档）。
+ *
+ * 本函数**只出日志**，不判锁：已发版锁的**执法**仍在写口按 fail-closed 走（拿不到投影 ⇒ 挡排期写、
+ * **锁只紧不松**，见 `server.ts` 的 `versionProjectionOf`），故此处降级不会放松任何锁。
+ */
+export async function readStartupReleasedVersions(input: {
+  engineVersions: EngineVersionsFetcher;
+  localLedger: () => VersionsLedger;
+  localLedgerFile: string;
+}): Promise<StartupReleasedVersions> {
+  let outcome: EngineVersionsOutcome;
+  try {
+    outcome = await input.engineVersions();
+  } catch (err) {
+    // 注入面按契约不抛（`createEngineVersionsFetcher` 全档收口为 outcome）；本兜底只为
+    // 「启动不许崩」这条硬约束兜住第三方注入的读取器，根因照样如实点出。
+    outcome = { kind: "absent", code: "versions_fetch_threw", error: err instanceof Error ? err.message : String(err) };
+  }
+  if (outcome.kind === "projection") {
+    return {
+      labels: releasedVersionLabels(projectionLedgerOf(outcome.projection)),
+      sourceNote: "引擎版本台账 GET /api/versions 的 released 条目（v0.10.0 起事实源在引擎）",
+      degraded: null,
+    };
+  }
+  return {
+    labels: releasedVersionLabels(input.localLedger()),
+    sourceNote: `**降级读缓存** = 板本地版本台账 ${input.localLedgerFile}（启动期未读到引擎投影）`,
+    degraded:
+      `引擎版本台账投影启动期不可读（${outcome.code} · ${outcome.error}）⇒ 「已发版锁定」清单退到板本地台账读缓存。` +
+      "锁的**执法**仍按 fail-closed 判（写口拿不到投影 ⇒ 挡排期写，锁只紧不松），本档不影响启动",
+  };
 }
 
 /**
@@ -199,12 +254,15 @@ async function main(): Promise<void> {
   const orgsLedgerFile = defaultOrgsLedgerFile();
   const orgsLedger = new OrgsLedgerStore(orgsLedgerFile);
   // 板版本台账（v0.9.4 N1）：一次性迁移 config `releasedVersions` → 台账 released（启动前置、fail-fast）。
-  // 灌入失败 ⇒ 抛出 ⇒ failStartup 拒起板（防已发版锁静默消失）；台账已存在 ⇒ 残留键一次性 warn、不双读。
+  // 灌入失败 ⇒ 抛出 ⇒ failStartup 拒起板（防已发版锁静默消失）。
+  // v0.10.0 B1：迁移边界 = **独立哨兵**（`.data/versions.migrated.json`），**不复用台账 `exists()`**
+  // —— 台账「存在」≠「非空」（空台账 / 坏文件 load 按空台账起 ⇒ 残留键会被再次灌入 = 假绿）。
+  // 哨兵缺失 ⇒ 视同未迁移（v0.9.4 既有部署升级日即此形态，首启完成迁移后补立）；残留键档每次启动 warn（事实提醒，直至整键删除）。
   // v0.9.4 N3：`releasedVersions` 已从 BoardConfig 退役（运行时锁改读台账）⇒ 迁移输入经 `readLegacyReleasedVersions`
   // 直接从配置文件读历史键（唯一读取点）。
   fatal.setPhase("版本台账迁移");
   const versionsLedgerFile = defaultVersionsLedgerFile();
-  const versionsLedger = new VersionsLedgerStore(versionsLedgerFile);
+  const versionsLedger = new VersionsLedgerStore(versionsLedgerFile, defaultVersionsSentinelFile());
   const versionMigration = migrateReleasedVersions({
     releasedVersions: readLegacyReleasedVersions(cfg.sourcePath),
     store: versionsLedger,
@@ -221,6 +279,7 @@ async function main(): Promise<void> {
   // v0.9.6 B1（口径 32）：台账组织维度一次性迁移 —— 串接在 releasedVersions 灌入之后，
   // 判据 = 条目缺 `org` 键 ⇒ stamp 为 config 的 group；未配 group ⇒ 一次性 warn + 留空串桶（**不 fail-fast**）。
   // 无缺 org 条目 ⇒ 幂等空操作（不落盘，重启不重复 stamp）。
+  let orgBucketedCount = 0;
   {
     const before = versionsLedger.load();
     const orgMigration = migrateLedgerOrgs(before.ledger, group, new Date().toISOString());
@@ -230,9 +289,17 @@ async function main(): Promise<void> {
         `版本台账一次性迁移：${orgMigration.stamped.length} 条缺组织维度的条目已 stamp 为默认组织（${orgMigration.stamped.join(" · ")}），落 ${versionsLedgerFile}\n`,
       );
     }
+    orgBucketedCount = orgMigration.bucketed.length;
     if (orgMigration.warning !== null) {
       process.stderr.write(`警告：${orgMigration.warning}\n`);
     }
+  }
+  // 哨兵收尾：本轮迁移链路**成功走完**（含空操作档）⇒ 落哨兵（一次性迁移此后不再重跑）。
+  // seedReleased 写失败已在上方抛出拒起板 ⇒ 走到这里落哨兵不会把失败记成完成；写失败同样抛出（fail-fast）。
+  if (!versionsLedger.migrationDone()) {
+    versionsLedger.markMigrationDone(
+      `migrated=${versionMigration.migrated.length} residual=${versionMigration.residual.length} orgBucketed=${orgBucketedCount}`,
+    );
   }
   fatal.setPhase("宿主面装配");
   // v0.9.5 C3：只读引擎态探针 = 读面 BridgeClient 的一跳 getFeature（GET-only 硬约束不动）。
@@ -326,10 +393,19 @@ async function main(): Promise<void> {
     `生效值：port = ${cfg.port} · host = ${cfg.host} · 读面桥 = ${cfg.bridgeUrl} · MCP 基址 = ${cfg.mcpBaseUrl} · hostKind = ${cfg.hostKind} · machineDist = ${cfg.machineDist} · turnTimeoutMs = ${cfg.turnTimeoutMs ?? "未配置（下游缺省 10 min）"}\n`,
   );
   // v0.9.6 B1（口径 32）：启动日志的已发版清单**带组织维度**（`(org, version)` 是唯一键，光版号会跨组织混淆）。
-  const releasedNow = releasedVersionLabels(versionsLedger.load().ledger);
-  if (releasedNow.length > 0) {
+  // v0.10.0 尾段 N2：清单的**数据源换到引擎版本台账**（一次性只读）；启动期桥不可达 ⇒ 退本地台账读缓存
+  // + 如实 warn，**不阻断启动**（锁的执法仍在写口 fail-closed，本处只出日志）。
+  const startupReleased = await readStartupReleasedVersions({
+    engineVersions: createEngineVersionsFetcher({ baseUrl: cfg.mcpBaseUrl }),
+    localLedger: () => versionsLedger.load().ledger,
+    localLedgerFile: versionsLedgerFile,
+  });
+  if (startupReleased.degraded !== null) {
+    process.stderr.write(`警告：${startupReleased.degraded}\n`);
+  }
+  if (startupReleased.labels.length > 0) {
     process.stdout.write(
-      `已发版锁定：${releasedNow.join(" · ")}（版本台账 ${versionsLedgerFile} 的 released 条目）⇒ 提需求排入这些版本、以及排期写改入 / 改出（含清空）这些版本一律 409 board_version_released 拒绝（同锁版重提放行）；后台 POST /versions setStatus 直投标记 released / 重开为进行中实时生效（前台已撤该入口 · 增补十一 E3）\n`,
+      `已发版锁定：${startupReleased.labels.join(" · ")}（${startupReleased.sourceNote}）⇒ 提需求排入这些版本、以及排期写改入 / 改出（含清空）这些版本一律 409 board_version_released 拒绝（同锁版重提放行）；后台 POST /versions setStatus 直投标记 released / 重开为进行中实时生效（前台已撤该入口 · 增补十一 E3）\n`,
     );
   }
   if (group === null) {

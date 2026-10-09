@@ -5,25 +5,25 @@
   "mcp": {
     "a2a": {
       "type": "remote",
-      "url": "http://127.0.0.1:8787/mcp",
+      "url": "http://127.0.0.1:8787/a2a-coding/mcp",
       "enabled": true
     }
   },
   "permission": {
     "edit": {
-      "orch/**": "deny",
-      "machine/**": "deny",
-      "flow/**": "deny"
+      "orch/**": "allow",
+      "machine/**": "allow",
+      "flow/**": "allow"
     },
     "read": {
-      "orch/**": "deny",
-      "machine/**": "deny",
-      "flow/**": "deny"
+      "orch/**": "allow",
+      "machine/**": "allow",
+      "flow/**": "allow"
     },
     "grep": {
-      "orch/**": "deny",
-      "machine/**": "deny",
-      "flow/**": "deny"
+      "orch/**": "allow",
+      "machine/**": "allow",
+      "flow/**": "allow"
     }
   }
 }

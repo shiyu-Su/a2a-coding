@@ -1292,6 +1292,117 @@ test("listFeatures owner_group 过滤：给定组名只见本组（NULL 被排�
   }
 });
 
+// ---------------------------------------------------------------------------
+// v0.10.0 O3：版本名下卡聚合读面 aggregateFeaturesByVersion（聚合 / 可见性 / 截断 / 未登记桶）
+// ---------------------------------------------------------------------------
+
+test("aggregateFeaturesByVersion：版号分桶 + 三桶计数 + 卡清单（open 含非终态与 failed）", () => {
+  const store = newStore();
+  try {
+    store.createFeature({ featureId: "a", title: "A", version: "0.10.0", state: "completed" });
+    store.createFeature({ featureId: "b", title: "B", version: "0.10.0", state: "completed" });
+    store.createFeature({ featureId: "c", title: "C", version: "0.10.0", state: "cancelled" });
+    store.createFeature({ featureId: "d", title: "D", version: "0.10.0", state: "executing" });
+    store.createFeature({ featureId: "e", title: "E", version: "0.10.0", state: "failed" });
+    store.createFeature({ featureId: "f", title: "F", version: "0.11.0", state: "waiting_approval" });
+
+    const agg = store.aggregateFeaturesByVersion();
+    const v10 = agg.buckets.find((b) => b.version === "0.10.0");
+    assert.ok(v10 !== undefined, "0.10.0 桶应存在");
+    assert.deepEqual(v10!.counts, { total: 5, completed: 2, cancelled: 1, open: 2 });
+    assert.deepEqual(
+      v10!.features.map((x) => x.featureId).sort(),
+      ["a", "b", "c", "d", "e"],
+      "卡清单含名下全部卡",
+    );
+    // 渲染层收窄：卡不带长文本（requirement/plan/decisions 一律不出口）
+    assert.deepEqual(
+      Object.keys(v10!.features[0]!).sort(),
+      ["approval", "featureId", "parentFeatureId", "stage", "state", "title", "updatedAt"],
+    );
+
+    const v11 = agg.buckets.find((b) => b.version === "0.11.0");
+    assert.deepEqual(v11!.counts, { total: 1, completed: 0, cancelled: 0, open: 1 });
+
+    assert.deepEqual(agg.versions, ["0.10.0", "0.11.0"], "已登记版号升序全集");
+    assert.equal(agg.unregisteredCount, 0);
+  } finally {
+    store.close();
+  }
+});
+
+test("aggregateFeaturesByVersion：未登记版号单列一桶、不静默丢（NULL 与空串同归一桶、恒末位）", () => {
+  const store = newStore();
+  try {
+    store.createFeature({ featureId: "reg", title: "R", version: "0.10.0", state: "completed" });
+    store.createFeature({ featureId: "nullver", title: "N", state: "executing" }); // 省略 ⇒ NULL
+    store.createFeature({ featureId: "emptyver", title: "E", version: "", state: "completed" }); // 空串
+
+    const agg = store.aggregateFeaturesByVersion();
+    assert.equal(agg.unregisteredCount, 2, "NULL + 空串两张都进未登记桶");
+    const unreg = agg.buckets[agg.buckets.length - 1]!;
+    assert.equal(unreg.version, null, "未登记桶恒在末位");
+    assert.deepEqual(unreg.counts, { total: 2, completed: 1, cancelled: 0, open: 1 });
+    assert.deepEqual(unreg.features.map((x) => x.featureId).sort(), ["emptyver", "nullver"]);
+    assert.deepEqual(agg.versions, ["0.10.0"], "未登记不进 versions 全集");
+  } finally {
+    store.close();
+  }
+});
+
+test("aggregateFeaturesByVersion：可见性与 listFeatures 同源（owner_group 过滤、NULL 无归属 fail-closed）", () => {
+  const store = newStore();
+  try {
+    store.createFeature({ featureId: "a1", title: "A1", version: "0.10.0", state: "completed", ownerGroup: "g1" });
+    store.createFeature({ featureId: "a2", title: "A2", version: "0.10.0", state: "completed", ownerGroup: "g1" });
+    store.createFeature({ featureId: "b1", title: "B1", version: "0.10.0", state: "executing", ownerGroup: "g2" });
+    store.createFeature({ featureId: "orphan", title: "O", version: "0.10.0", state: "completed" }); // NULL 无归属
+
+    const g1 = store.aggregateFeaturesByVersion("g1");
+    const g1v = g1.buckets.find((b) => b.version === "0.10.0")!;
+    assert.deepEqual(
+      g1v.counts,
+      { total: 2, completed: 2, cancelled: 0, open: 0 },
+      "g1 视野只数自己的 a1/a2；他组 b1 与无归属 orphan 都不计入",
+    );
+    assert.deepEqual(g1v.features.map((x) => x.featureId).sort(), ["a1", "a2"]);
+
+    // 同源校验：聚合各桶 total 之和 + 未登记 = listFeatures 同视野条数
+    const aggTotal = g1.buckets.reduce((s, b) => s + b.counts.total, 0);
+    assert.equal(aggTotal, store.listFeatures({ ownerGroup: "g1" }).length);
+
+    const all = store.aggregateFeaturesByVersion();
+    assert.equal(all.buckets.find((b) => b.version === "0.10.0")!.counts.total, 4, "缺省全量含 4 张");
+  } finally {
+    store.close();
+  }
+});
+
+test("aggregateFeaturesByVersion：截断显式排除（不加 LIMIT ⇒ counts.total === 清单长度、三桶闭合）", () => {
+  const store = newStore();
+  try {
+    for (let i = 0; i < 120; i++) {
+      store.createFeature({
+        featureId: `f${i}`,
+        title: `F${i}`,
+        version: "0.10.0",
+        state: i % 5 === 0 ? "completed" : i % 5 === 1 ? "cancelled" : "executing",
+      });
+    }
+    const agg = store.aggregateFeaturesByVersion();
+    const v = agg.buckets.find((b) => b.version === "0.10.0")!;
+    assert.equal(v.features.length, 120, "120 张全进清单（超 listFeatures 缺省 limit=100 也不截断）");
+    assert.equal(v.counts.total, v.features.length, "计数与清单同集、不打架");
+    assert.equal(
+      v.counts.completed + v.counts.cancelled + v.counts.open,
+      v.counts.total,
+      "三桶闭合 = total",
+    );
+  } finally {
+    store.close();
+  }
+});
+
 test("owner_group 列幂等迁移：老库（无该列）以新代码打开后自动补列，重启不报错", () => {
   const dbPath = join(tmpdir(), `orch-owner-mig-${process.pid}-${Math.random().toString(36).slice(2)}.sqlite`);
   try {

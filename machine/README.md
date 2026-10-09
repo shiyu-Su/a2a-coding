@@ -22,7 +22,7 @@ Launcher 的**入站指挥端点已于 v2.0 退役**（连接模型反转为 pul
 
 **出站循环**（启动自检通过后才进入，注册载荷因此携带真实自检结论）：
 
-1. `POST {bridge.url}/runner/register` —— 携 `machineId` / `projects[]`（`projectId` / `agentKind` / `risk` / `a2aPort`）/ `capabilities` / `selfCheck` / `protocolVersion` / `version`（本单元软件版本，取 `machine/package.json` 的 `version`，读取失败回落 `"0.0.0"`；**观测用、非握手判据**，PROTOCOL 2.0 起即有）；注册载荷顶层字段**不扩**（红线）—— 本机降级面（`/health` 的 `degraded` 段）**不随载荷外传**，与 orch 侧 `degraded[]` 互不相通（见上节）；
+1. `POST {bridge.url}/runner/register` —— 携 `machineId` / `projects[]`（`projectId` / `agentKind` / `risk` / `a2aPort` / **可选** `repo`〔v0.10.0 · M2：项目配置了才带、原样透传，未配置 ⇒ 不落该键（缺键 ≠ 报空串）；「缺省 = 宿主仓」解释权归 orch；**additive 字段 · 老桥不认 ⇒ 忽略未知字段、零回归 ⇒ 不升 `protocolVersion`**，语义见下节「项目仓库标识 `repo`」〕）/ `capabilities` / `selfCheck` / `protocolVersion` / `version`（本单元软件版本，取 `machine/package.json` 的 `version`，读取失败回落 `"0.0.0"`；**观测用、非握手判据**，PROTOCOL 2.0 起即有）；注册载荷顶层字段**不扩**（红线）—— `repo` 挂在 **`projects[]` 逐项**（非载荷顶层），不破该红线；本机降级面（`/health` 的 `degraded` 段）**不随载荷外传**，与 orch 侧 `degraded[]` 互不相通（见上节）；
 2. `POST {bridge.url}/runner/connect` —— **长轮询**（桥端 hold ~25s）：空响应 = 心跳；非空 = 命令。命令族三类：
    - `dispatch` → 本地 `ensure`（幂等复用）→ 本地 A2A `message/send` → 轮询至终态 → 组装结果；
    - `stop` → 该**项目**有在飞任务即拒收（回执 `error:"in-flight"`；v0.8.10 · M-N1 起判据按项目、非全机），否则停项目 → 回执；
@@ -32,6 +32,16 @@ Launcher 的**入站指挥端点已于 v2.0 退役**（连接模型反转为 pul
 **鉴权**：per-machine 静态 Bearer token（machine 侧 `launcher.bridge.token` ↔ orch 侧 `machines[].token`）；401/403 结构化进退避，**绝不崩进程**。
 
 **运行态落盘**：`.a2a/runner-state.json`（原子写；`scripts/reaper.mjs` 判活 Runner 的事实源）。新鲜度窗口 `N = max(2 × 30s, 90s) = 90s`（时钟回拨视为新鲜）；子进程账本 `.a2a/children/<pid>.json` 不变。
+
+### 项目仓库标识 `repo`（v0.10.0 · M1 配置键 + M2 载荷字段）
+
+多仓拓扑（polyrepo）下标注「本项目属于哪个仓库」的**可选身份串**（如 `a2a-coding/machine`）。machine 侧**只配置了才解析并播报，不做任何缺省推断 / 归一** —— 单仓零感知、无需迁移，「缺省 = 宿主仓」的**解释权归引擎（orch）**。该标识**贯穿三处、口径一致**：
+
+- **配置侧（`ProjectConfig.repo` · `config.ts` `parseProject`）**：**顶层可选键**（与 `risk` 同族，是项目对象自身的键、**不是** `agentConfig` 平铺自消费键）。校验照 `risk` 的**条件写入**先例：**未写 ⇒ 不落该键**（加载成功、无报错）；**一旦写了必须是非空字符串**（空串 / 非串 ⇒ `loadMachineConfig` 加载期 fail-fast，报错文案指名 `.repo`）。
+- **载荷侧（`RunnerProjectPayload.repo` · `launcher/runner.ts` `buildRegisterPayload`）**：**仅项目配置了才随注册载荷 `projects[]` 逐项下发**、原样透传（照 `readOnly` 保守缺省先例、只认显式值）；未配置 ⇒ **不落该键**（**缺键 ≠ 报空串**）。老桥不认该键 ⇒ 忽略未知字段、零回归，属 **additive** 变更，**不升 `protocolVersion`**（当前 `2.3`，bump 与否由协议节点单独决定，本节点不动协议常量）；挂在 `projects[]` 逐项、非载荷顶层，不破「注册载荷顶层字段不扩」红线。
+- **播报侧（`AgentConfigSnapshot.repo` · `launcher/config-snapshot.ts` `describeAgentConfig`）**：配置了才随启动快照打一行 `[launcher] agent <projectId> repo=<值>（agentConfig）`（每次拉起都打）；**未配置 ⇒ 省略该键**（`undefined`，缺键 ≠ 报空）。**落点 = 同 `gateLimits` 一族的 launcher 本机日志面**（`.a2a/logs/launcher.log`）：不经桥、不进 orch `/health`（与「两面不通」同族）⇒ 「这台机这一项配了什么仓」只能查本机。
+
+四 kind 项目示例的 `repo` 用法与「不需要则整键删除」口径见 `config/config.json.default`（本节点只同步 README，配置样例的补齐归对应节点）。
 
 ## 传输层有界重发与启动补结算（v0.8.7，v0.8.8 增续跑与六类值域，v0.8.9 需求2 改续跑资格与总框口径，v0.8.10 续跑 / 重发改**定向取消**）
 

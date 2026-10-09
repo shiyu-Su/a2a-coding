@@ -83,6 +83,13 @@ export interface RunnerProjectPayload {
   /** 解析后的有效风险档位（缺省 `write`，与 manager 的权限映射同口径） */
   risk: RiskLevel;
   a2aPort: number;
+  /**
+   * 仓库标识（v0.10.0 · M2）：**仅项目配置了才随载荷下发** —— machine 侧不做缺省推断 /
+   * 归一（照 `readOnly` 保守缺省先例，只认显式值）；未配置 ⇒ **不落该键**（≠ 报空串），
+   * 「缺省 = 宿主仓」的解释权归引擎（orch）。老桥不认该键 ⇒ 忽略未知字段，零回归。
+   * 版本面：该键**可被对端完全忽略、不进入任何判定 / 消费语义** ⇒ 按版本规则判据**不升版**（沿用 2.3）。
+   */
+  repo?: string;
 }
 
 /** 注册载荷中的自检结论（部分项目失败 `ok=true` 仍注册；仅**全部项目不可用**才不注册） */
@@ -91,7 +98,9 @@ export interface RunnerSelfCheckPayload {
   failures: SelfCheckFailure[];
 }
 
-/** `POST /runner/register` 载荷 */
+/**
+ * `POST /runner/register` 载荷（v0.10.0：`projects[].repo` = 可忽略可选字段，**不触发升版**，沿用 2.3）
+ */
 export interface RunnerRegisterPayload {
   machineId: string;
   projects: RunnerProjectPayload[];
@@ -315,6 +324,8 @@ export function buildRegisterPayload(
       // 缺省 write（与 manager.ts 权限映射同口径），保证桥看到的即实际执行档位
       risk: project.risk ?? "write",
       a2aPort: project.a2aPort,
+      // 仓库标识：配置了才带（缺键 ≠ 空串），不推断 / 不归一，见 RunnerProjectPayload.repo
+      ...(project.repo !== undefined ? { repo: project.repo } : {}),
     })),
     capabilities: { ...capabilities },
     selfCheck: { ok: selfCheck.ok, failures: selfCheck.failures },

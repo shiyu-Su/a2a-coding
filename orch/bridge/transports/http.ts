@@ -20,6 +20,9 @@
  * - `/runner/*`（v0.7.0 A3）：**委托** `options.runner`（`bridge/runner.ts`）处理，本层不做
  *   任何鉴权 / 判断 —— 该处理器的 `handle()` 自行完成「非 owner 503」门闩与路由匹配；
  *   未接 runner 时 `/runner/*` 自然落 404（兜底）。
+ * - `/api/versions*`（v0.10.0 O2a + O2c）：**同款委托** `options.versions`
+ *   （`bridge/versions-endpoints.ts`）—— 版本台账读投影 + 建 / 删 / **设状态**写口。
+ *   本层同样不做判断；未注入时落 404（兜底）。
  *
  * 实现边界：HTTP 层用 `node:http`（SDK 的 express 助手依赖 express，而 orch 未声明该依赖，
  * 「不得新增第三方依赖」故不用）；绑定默认 loopback，非 loopback 地址打 warn（跨机鉴权待 v0.7.0）。
@@ -33,6 +36,7 @@ import { bridgeLog } from "../bridge-log.js";
 import type { BridgeCore, DegradedItem } from "../index.js";
 import { createServer } from "../register-tools.js";
 import type { RunnerEndpointHandle } from "../runner.js";
+import type { VersionsEndpointHandle } from "../versions-endpoints.js";
 
 /**
  * HTTP 接入面关闭兜底预算（ms）：`server.close()` 等待在飞请求自然收尾的上限；
@@ -109,6 +113,16 @@ export interface HttpTransportOptions {
    * 缺省（未注入）时 `/runner/*` 走 404（兜底）。
    */
   runner?: RunnerEndpointHandle;
+  /**
+   * 版本台账端点处理器（v0.10.0 O2a；可选）：`/api/versions`（GET / POST）与
+   * `/api/versions/{version}`（DELETE）。由 `bridge/index.ts` 常驻 http 启动时经
+   * `createVersionsEndpoints` 注入；缺省时这些路径自然落 404（兜底）。
+   *
+   * **为什么落本端口（8787）而不是 3300**：3300 = `transports/web.ts` 的**只读**运维面
+   * （非 GET 一律 405，且「不做第二编排入口」是它的既有契约）；8787 是**可写面**，
+   * 委托形态照 `/runner/*` 先例（本层不做判断，处理器自检路由 / owner / 方法）。
+   */
+  versions?: VersionsEndpointHandle;
 }
 
 export interface HttpTransportHandle {
@@ -281,6 +295,12 @@ async function handleRequest(
   // Runner 入站分支（v0.7.0 A3）：仅在注入处理器时生效；`handle()` 自检形态 / owner 门闩 / 路由匹配
   if (options.runner !== undefined) {
     if (await options.runner.handle(req, res, path)) return;
+  }
+  // 版本台账分支（v0.10.0 O2a + O2c）：同上，`handle()` 自检路由 / 方法 / owner 门闩
+  // （O2a：GET / POST 集合、DELETE 单行；O2c：PATCH `…/{version}/status` 设状态）；
+  // 不认领的路径 ⇒ 继续往下落 404
+  if (options.versions !== undefined) {
+    if (await options.versions.handle(req, res, path)) return;
   }
   respondJson(res, 404, { ok: false, error: "not_found" });
 }

@@ -36,6 +36,7 @@ import { dirname, join } from "node:path";
 import { groupFeaturesByVersion, renderSchedule } from "../dist/web/views.js";
 import { createVersion, emptyVersionsLedger, serializeVersionsLedger, setVersionStatus } from "../dist/versions-ledger.js";
 import { createBoardServer } from "../dist/server.js";
+import { engineProjectionFetcher } from "./engine-versions-fixture.mjs";
 
 const NOW = "2026-09-28T12:00:00.000Z";
 /**
@@ -213,16 +214,22 @@ test("A2-⑥ 零脚本（内联闭集七元不扩）+ 闸文案由框头 title/a
 // ③ HTTP 接线：入口 → 服务端既有闸
 // ---------------------------------------------------------------------------
 
-async function withBoard(run, features, ledger, serverOverrides = {}) {
+async function withBoard(run, features, ledger, serverOverrides = {}, engineImpl = {}) {
   const dir = mkdtempSync(join(tmpdir(), "board-a2-"));
   const file = join(dir, "data", "versions.json");
   mkdirSync(dirname(file), { recursive: true });
   writeFileSync(file, serializeVersionsLedger(ledger), "utf8");
+  const engine = fakeEngine(engineImpl);
   const handle = await createBoardServer({
     host: "127.0.0.1",
     port: 0,
     now: () => Date.parse(NOW),
     versionsLedgerFile: file,
+    // v0.10.0 B2：版本写面改道引擎（注入假引擎，离线自证「只发意图」）。
+    versionsWriteImpl: engine.client,
+    // v0.10.0 尾段 N1：版本列的台账侧版号事实源 = 引擎清单 ⇒ 与本地台账夹具**同源同值**恒注入
+    // （不注入会打开发机的真实引擎 ⇒ 空列随本机台账漂移）。
+    engineVersionsFetcher: engineProjectionFetcher(ledger.versions.map((r) => ({ org: r.org, version: r.version, status: r.status }))),
     ...serverOverrides,
     client: {
       baseUrl: "http://fake",
@@ -244,11 +251,29 @@ async function withBoard(run, features, ledger, serverOverrides = {}) {
     },
   });
   try {
-    await run(`http://127.0.0.1:${handle.port}`, file);
+    await run(`http://127.0.0.1:${handle.port}`, file, engine);
   } finally {
     await handle.close();
     rmSync(dir, { recursive: true, force: true });
   }
+}
+
+/** 假引擎版本写客户端（v0.10.0 B2）：记录逐次 `{kind, input}`，缺省成功档。 */
+function fakeEngine(impl = {}) {
+  const calls = [];
+  const make = (kind) => async (input) => {
+    calls.push({ kind, input });
+    const r = impl[kind];
+    if (typeof r === "function") return r(input);
+    if (r !== undefined) return r;
+    return {
+      ok: true,
+      httpStatus: kind === "create" ? 201 : 200,
+      version: input.version,
+      status: kind === "remove" ? null : (input.status ?? "notstart"),
+    };
+  };
+  return { calls, client: { create: make("create"), remove: make("remove"), setStatus: make("setStatus") } };
 }
 
 function postVersions(base, body) {
@@ -260,61 +285,67 @@ function postVersions(base, body) {
   });
 }
 
-test("A2-⑦ HTTP 接线：既有闸逐条落位 —— 有已确认卡删⇒409 业务文案 / 未全 completed 发版⇒409 / 后台直投重开⇒303 + 台账真变", async () => {
+test("A2-⑦（v0.10.0 B2 改道）HTTP 接线：三写面只发引擎意图、错误码原样展示、本地台账零写", async () => {
   const ledger = ledgerWith([["v0.9.6", "active"], ["v0.9.3", "released"]]);
   await withBoard(
-    async (base, file) => {
-      // 删除：名下有已确认卡 ⇒ 服务端闸拒（口径变更 E2；文案业务化，浮层可呈）
+    async (base, file, engine) => {
+      // 删除：名下未收口 ⇒ 引擎 409（板不再自判「已确认卡」，闸归引擎）
       const del = await postVersions(base, { action: "remove", version: "v0.9.6" });
-      assert.equal(del.status, 409, "有已确认需求 ⇒ 不可删（闸在服务端，入口只是接线）");
+      assert.equal(del.status, 409);
       const delText = await del.text();
-      assert.match(delText, /board_version_remove_confirmed_cards/, "新错误码原样");
-      assert.match(delText, /该版本下还有已确认需求（1 条）⇒ 请先移出后再删/, "业务化文案（不透传内部细节）");
-      assert.match(delText, /class="err-ov-card"/, "错误卡族在 ⇒ data-ov=1 的 fetch 档可抽出来做浮层");
+      assert.match(delText, /orch_version_open_cards/, "引擎码原样（板本地码已退役）");
+      assert.match(delText, /未收口/, "走显示映射表给业务化文案");
+      assert.match(delText, /class="err-ov-card"/, "错误卡族在 ⇒ data-ov 档可抽出做浮层");
 
-      // 后台直投发版（active → released）：名下未全部 completed ⇒ 既有闸拒（E3 只撤入口、不撤闸）
+      // 后台直投发版（active → released）：闸归引擎
       const rel = await postVersions(base, { action: "setStatus", version: "v0.9.6", status: "released" });
       assert.equal(rel.status, 409);
-      assert.match(await rel.text(), /board_version_transition_release_incomplete/, "发版闸文案（completed 0 / total 1）");
+      assert.match(await rel.text(), /orch_version_not_converged/, "引擎发版闸码原样");
 
-      // 重开（**后台入口**：前台已无按钮，此表单直投即数据订正通道）：released → active
+      // 重开（released → active）：引擎放行 ⇒ 板 PRG 303
       const reopen = await postVersions(base, { action: "setStatus", version: "v0.9.3", status: "active" });
       assert.equal(reopen.status, 303);
       assert.equal(reopen.headers.get("location"), "/schedule");
-      const after = readFileSync(file, "utf8");
-      assert.match(after, /"version": "v0\.9\.3",\s*"status": "active"/, "重开确实落台账（入口 → 写口 → 台账连通）");
-      assert.match(after, /"version": "v0\.9\.6",\s*"status": "active"/, "被拒的两笔零写入");
+
+      assert.deepEqual(
+        engine.calls.map((c) => [c.kind, c.input.version, c.input.status ?? null]),
+        [
+          ["remove", "v0.9.6", null],
+          ["setStatus", "v0.9.6", "released"],
+          ["setStatus", "v0.9.3", "active"],
+        ],
+        "三笔意图均发引擎（板零本地台账写）",
+      );
+      assert.equal(readFileSync(file, "utf8"), serializeVersionsLedger(ledger), "本地台账逐字节不动");
     },
     [feature("F1", "v0.9.6")],
     ledger,
+    {},
+    {
+      remove: { ok: false, httpStatus: 409, code: "orch_version_open_cards", message: "open" },
+      setStatus: (input) =>
+        input.version === "v0.9.6"
+          ? { ok: false, httpStatus: 409, code: "orch_version_not_converged", message: "gate" }
+          : { ok: true, httpStatus: 200, version: input.version, status: input.status },
+    },
   );
 });
 
-test("E2-⑦b HTTP 接线：× 删「仅想法卡」的版本 ⇒ 200 + 卡自动回池（version 清空）+ 台账摘除", async () => {
-  const seen = [];
+test("E2-⑦b（v0.10.0 B2 改道）HTTP 接线：× 删只发引擎删意图（回池语义随本地写口退役），本地台账零写", async () => {
   const ledger = ledgerWith([["v0.9.7", "notstart"]]);
   await withBoard(
-    async (base, file) => {
+    async (base, file, engine) => {
       const res = await postVersions(base, { action: "remove", version: "v0.9.7" });
       assert.equal(res.status, 303, "表单档 = PRG 回 /schedule（无 JS 亦可用）");
       assert.deepEqual(
-        seen.map((s) => [s.input.featureId, s.input.version]),
-        [["F1", ""], ["F2", ""]],
-        "两张想法卡各发一次排期写清空 version（不丢卡）",
+        engine.calls,
+        [{ kind: "remove", input: { ownerGroup: null, version: "v0.9.7" } }],
+        "只发删意图：不再逐张回池（闸与删语义归引擎）",
       );
-      assert.equal(readFileSync(file, "utf8").includes("v0.9.7"), false, "台账条目摘除");
+      assert.equal(readFileSync(file, "utf8"), serializeVersionsLedger(ledger), "本地台账零写");
     },
-    [
-      feature("F1", "v0.9.7", { stage: "需求分析", approval: "未发起" }),
-      feature("F2", "v0.9.7", { stage: "需求分析", approval: "未发起" }),
-    ],
+    [feature("F1", "v0.9.7", { stage: "需求分析", approval: "未发起" })],
     ledger,
-    {
-      scheduleFeatureImpl: async (input) => {
-        seen.push({ input });
-        return { ok: true, featureId: input.featureId, state: input.to, version: input.version };
-      },
-    },
   );
 });
 
@@ -368,32 +399,38 @@ test("D1-⑨ 同屏三态：notstart 只有框头 ×、active 与 released 全�
   assert.match(colHtml(html, "v0.9.3"), /vbadge locked/, "徽标未被连带删掉");
 });
 
-test("D1-⑩ 服务端零改动：前台无重开入口，后台 setStatus 直投仍 released → active（数据纠错通道在位）", async () => {
+test("D1-⑩（v0.10.0 B2 改道）前台无重开，后台 setStatus 直投经引擎（released → active）", async () => {
   const ledger = ledgerWith([["v0.9.3", "released"]]);
   await withBoard(
-    async (base, file) => {
+    async (base, file, engine) => {
       const text = await (await fetch(`${base}/org/${ORG}/schedule`)).text();
       assert.doesNotMatch(text, /value="active"/, "前台页面上没有任何指向 status=active 的表单");
       assert.doesNotMatch(text, /name="action" value="setStatus"/, "E3：前台页面上没有任何 setStatus 表单");
       const res = await postVersions(base, { action: "setStatus", version: "v0.9.3", status: "active" });
-      assert.equal(res.status, 303, "setStatus 写口与闸语义不变（released → active 无闸）");
-      assert.match(readFileSync(file, "utf8"), /"version": "v0\.9\.3",\s*"status": "active"/, "后台直投确实落台账");
+      assert.equal(res.status, 303, "引擎放行 ⇒ 板 PRG 303");
+      assert.deepEqual(engine.calls, [
+        { kind: "setStatus", input: { ownerGroup: null, version: "v0.9.3", status: "active" } },
+      ]);
+      assert.equal(readFileSync(file, "utf8"), serializeVersionsLedger(ledger), "本地台账零写");
     },
     [],
     ledger,
   );
 });
 
-test("E3-⑪ 前台撤「标记已发版」后，后台 setStatus 正向仍通（active → released，名下全收尾且有交付）", async () => {
+test("E3-⑪（v0.10.0 B2 改道）后台 setStatus 正向 active → released 经引擎（闸归引擎）", async () => {
   const ledger = ledgerWith([["v0.9.6", "active"]]);
   await withBoard(
-    async (base, file) => {
+    async (base, file, engine) => {
       const text = await (await fetch(`${base}/org/${ORG}/schedule`)).text();
       assert.doesNotMatch(text, /name="status" value="released"|标记已发版<\/button>/, "负向锚：前台无 status=released 表单");
       const res = await postVersions(base, { action: "setStatus", version: "v0.9.6", status: "released" });
-      assert.equal(res.status, 303, "后台入口在位：active → released 直投放行（闸 = 名下全部收尾〔completed+cancelled〕∧ completed > 0，本例满足）");
+      assert.equal(res.status, 303, "引擎放行 ⇒ 板 PRG 303");
       assert.equal(res.headers.get("location"), "/schedule");
-      assert.match(readFileSync(file, "utf8"), /"version": "v0\.9\.6",\s*"status": "released"/, "直投落台账（发版锁随之生效）");
+      assert.deepEqual(engine.calls, [
+        { kind: "setStatus", input: { ownerGroup: null, version: "v0.9.6", status: "released" } },
+      ]);
+      assert.equal(readFileSync(file, "utf8"), serializeVersionsLedger(ledger), "本地台账零写");
     },
     [feature("F1", "v0.9.6", { state: "completed" })],
     ledger,
