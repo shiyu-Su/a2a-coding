@@ -13,7 +13,7 @@ machine/.a2a/
 **/.a2a/
 machine/agents/
 
-# 单元实际配置（不入库；模板见 config.json.default）
+# 单元实际配置（不入库；模板见各单元 config/config.json.default 与 config.json.example —— 后者随配置模板拆分 REQ-2026-10-10-01 新增，含示例值、随包分发）
 machine/config/config.json
 orch/config/config.json
 board/config/config.json

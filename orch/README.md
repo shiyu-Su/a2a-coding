@@ -117,6 +117,19 @@ npm run bridge:logs      # 输出日志全文（支持 --lines N / --follow）
   - `holdMs` = `/runner/connect` 长轮询挂起上限（空超时即心跳）；`heartbeatTimeoutMs` = 注册心跳判死阈值（超期只降在线态、不触发 stop）。两者均为正整数毫秒，非法解析期 fail-fast。
   - **`orphanTimeoutMs`（v0.8.7 新增 · 孤儿墙钟出口）** = 在飞任务的**墙钟判死**阈值：`queue_state ∈ {claimed, running}` 且 `claimed_at` 早于 `now - orphanTimeoutMs` ⇒ 桥把该任务置 `failed` + `queue_state='settled'` + `failure_kind='runner'`（v0.8.8 O1：六类闭集的「不可续跑」子类，取代二分时代的 `infra`），并发 **`task.orphaned`** 事件（payload 含 `machineId` / `projectId` / `featureId` / `claimedAt` / `elapsedMs` / `timeoutMs`）⇒ Feature 静止收敛发失败账单 ⇒ 宿主 `advance(retryTaskIds)` 重派。**与心跳清算分工不同**：心跳管「**机器死没死**」⇒ 回 `queued`（可复活）；墙钟管「**任务自己超没超**」⇒ `failed` 记账交宿主。二者挂同一 `sweepIntervalMs` timer、**同 tick 先 `sweepStale` 后墙钟**（心跳先命中者走 requeue，墙钟只收残量 ⇒ 两路竞争天然消解）。**跨单元不变量：`orphanTimeoutMs` > 机器侧最坏总框（三段构成 = 窗上限 600s + 结构余量 300s + `min(续跑余量, 窗)` ≤ 600s ⇒ 1500s）** —— 缺省 30 min 对 machine 侧 10 min 窗上限恒有 300s 边际 ⇒ **orch 不读 machine 配置**（避免跨单元配置耦合）。
 - 顶层可选 `projectGroup`：**组数组** `[{ name, members[] }]`，形状与语义见「连接身份与可见性」；缺省（不写该键）= 无组 = 全量接纳。
+- **两份模板文件的分工**：`config/config.json.default` = schema 缺省值 + 必填形状骨架（只放值，说明文字不进模板）；`config/config.json.example` = **完整可运行示例**（首次部署照抄它最省事 —— 键齐 + 值安全：`machines[]` 一律字面量哑值，不含真实 machineId / 真实 token / 本机路径，也不含 `projectGroup`，故可随文档外发）。**两份都不参与加载** —— 桥只读 `MACHINES_CONFIG` 所指文件（缺省 `config/config.json`），无自动复制回退。
+- **`projectGroup` 的数组形态与配置期执法**（形状 = **组数组** `[{ name, members: [{ machineId, projectId }] }]`；连接身份与可见性语义见「连接身份与可见性」）：
+  - **段缺省 = 全量接纳**：不写 `projectGroup` 键 ⇒ 全部已配置机器 / 项目照常列出与派发，旧配置零改动可用（`.example` 即此形态）。
+  - **段存在时必须是组数组**，每个元素是一个组对象；`members` 必须是**非空**数组 —— 空数组视为配置错误（要么删掉该段、要么列出成员）。
+  - **组名 `name` 必填**（身份 = 连接 URL 路径首段，无名组不可被寻址）：字符集 `[A-Za-z0-9_-]+`，且不得与保留首段 `health` / `shutdown` / `runner` 或 `transport.http.path` 的首段冲突（撞段 ⇒ 启动 fail-fast）。
+  - **配组后连接必须带组名首段**：`http://127.0.0.1:8787/<组名>/mcp`（如组名 `team-a` ⇒ `http://127.0.0.1:8787/team-a/mcp`）；不带组名的裸 `/mcp` ⇒ **403 `group_identity_required`**（fail-closed，**不**回退成全量接纳）。
+  - **组间成员互斥 ⇒ 配置期 fail-fast**：同一 `(machineId, projectId)` 出现在两个组 ⇒ 桥拒绝启动、不 bind；**组内重复项**由集合去重、不算冲突。
+  - **成员机器名拼错的代价是全局的**：成员 `machineId` 不在 `machines[]` ⇒ 桥整体拒绝派发（`machines_config_error`），且该段解析失败会让 transport 读取一并 fail-fast（桥拒绝启动、不 bind）；`web` 各键仍回落自身缺省。改完配置先验 JSON 合法性，再起桥看日志。
+  - **推荐入组机器保持 `launcher.idleStopMs > 0`（machine 侧配置，缺省 300000）**：把项目移出组成员后，靠 Launcher 空闲回收把已拉起的 agent 自动收回；配 0（显式禁用回收）时该 agent 可能长期驻留，需人工停单个项目。
+- **`machines[]` 逐键口径**：
+  - `launcherUrl` —— **已作废（deprecated，v0.7.0）**：入站指挥通道随 Runner 反向注册退役；解析已放宽为**可选**（缺省 / 非法仅告警，不 fail-fast、不回退全量接纳），出站路径退役前仍兼容保留（可继续填旧值，也可省略）。
+  - `token` —— per-machine Runner 鉴权 token（可选）：桥按 `machineId` 校验 Runner 注册 / 领任务 / 回传携带的静态 Bearer，**须与 machine 侧 `launcher.bridge.token` 一致**；声明时须为非空字符串，该机未配置 token 一律拒绝（绝不 fail-open）。
+- **不同 Agent 的配置方式**：本单元**无 Agent 配置项**（配置面不含 `agentKind` / `agentConfig`；机器侧 Agent 配置由 machine 自持、桥不下发、且在项目投影白名单中被显式剔除）。orch 仅对**来自 machine 上报**的 `agentKind` 做**闭集校验**（闭集源 = 仓库根 `PROTOCOL.md` 的 `agent-kinds` 锚点；执法三处 = 注册载荷 400 整包拒 / 投影写口拒写 / 读回脏值守卫）；合法值仅作**透传 / 投影**出现。
 
 ## 启停与就绪语义（统一口径锚点）
 

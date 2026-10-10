@@ -16,6 +16,9 @@
  */
 import { randomUUID } from "node:crypto";
 import type { MachineConfig, ProjectConfig } from "../types.js";
+import type { TaskType } from "../task-types.js";
+import { TASK_TYPES } from "../task-types.js";
+import { agentRolesErrors, effectiveRiskOf, roleSummaryLines, rolesOf } from "../agent-roles.js";
 import {
   A2A_TERMINAL_STATES,
   postJsonRpc,
@@ -34,6 +37,48 @@ export const DEFAULT_STARTUP_CHECK_PROMPT = "Reply with exactly: OK";
 
 /** 任务态轮询间隔 */
 const POLL_INTERVAL_MS = 1_000;
+
+/**
+ * 自检**真跑**那一条任务出场的职责位（v0.10.2 · M-4）：恒为 `unit_agent`。
+ *
+ * 职责位映射（`agentConfig.roles`）落地后，自检**不**按职责位逐条真跑 —— 四个位各跑一条会把
+ * 自检墙钟乘以职责位数，且其余三位没有「必须真跑」的判据。本版的口径：
+ * - **真跑 1 条** = 缺省职责位 `unit_agent`（发送体**不注入** `metadata` ⇒ 载荷逐字现状，
+ *   对端落 `unit_agent` 缺省语义，见 F-C2 / F-C6）；
+ * - **其它职责位只做配置级校验**（{@link rolesConfigCheck}，纯本地、零派发、零拉起）。
+ */
+export const SELF_CHECK_TASK_TYPE: TaskType = "unit_agent";
+
+/** 职责位配置级校验结果（不真跑；错误文案 = `agent-roles.ts` 加载期同一判据） */
+export interface RolesConfigCheck {
+  /** `agentConfig.roles` 是否配了（未配 ⇒ 逐字现状，本项直接通过） */
+  configured: boolean;
+  /** 已配置的职责位（按 `TASK_TYPES` 闭集序） */
+  roles: TaskType[];
+  /** 校验失败文案（空数组 ⇒ 通过） */
+  errors: string[];
+}
+
+/**
+ * 启动自检的**配置级**职责位校验（v0.10.2 · M-4）：读本机 `agentConfig.roles` + 本机生效 risk，
+ * 经 `agent-roles.ts` 的**同一判据**复核四个旋钮（角色名 / rank 上限 / 未知键 / 未配 ⇒ 现状）。
+ *
+ * 为什么自检还要复核一遍（加载期已 fail-fast）：自检是**运行面**——配置经别的通道进来
+ * （测试注入 / 未来非 `loadMachineConfig` 路径）时，这里是第二道可见口；两处共用
+ * `agentRolesErrors` ⇒ **不会长出两套判据**。**只读、不派发、不拉起**，故墙钟与职责位数无关。
+ */
+export function rolesConfigCheck(project: ProjectConfig): RolesConfigCheck {
+  const risk = effectiveRiskOf(project);
+  const errors = agentRolesErrors(project.agentConfig, risk, "agentConfig.roles");
+  const roles = rolesOf(project.agentConfig);
+  const configured: TaskType[] = [];
+  if (roles !== undefined) {
+    for (const taskType of TASK_TYPES) {
+      if (roles[taskType] !== undefined) configured.push(taskType);
+    }
+  }
+  return { configured: roles !== undefined, roles: configured, errors };
+}
 
 /**
  * 自检任务在本机在飞台账中的 taskId 前缀（M5·MC1）：自检经 `manager.inFlight` 登记，
@@ -115,7 +160,11 @@ export function classifySelfCheckCause(reason: string): SelfCheckCause | undefin
   if (/模型|\bmodel\b|-32602|invalid (request )?param/i.test(reason)) return "model";
   // 端口 / 进程级故障（EADDRINUSE、包装器提前退出等）：非项目根因，交 ensure 文案（机器级判据已收敛为「全部项目不可用」，cause 不再参与）
   if (/EADDRINUSE|端口|包装器进程提前退出|spawn/i.test(reason)) return undefined;
-  if (/auth|api[ _-]?key|token|认证|登录|login|unauthorized|forbidden|credential|401|403/i.test(reason)) {
+  if (
+    /auth|api[ _-]?key|token|认证|登录|login|unauthorized|forbidden|credential|401|403/i.test(
+      reason,
+    )
+  ) {
     return "auth";
   }
   return undefined;
@@ -321,9 +370,31 @@ async function checkProject(
 }
 
 /**
+ * 职责位配置级校验的**日志产出**（v0.10.2 · M-4 · 验收判据⑦「其它职责位配置级校验有产出」）：
+ * 逐位一行（配了 / 没配、配了什么），纯本地、零派发。
+ * 校验不过 ⇒ 只**报**不判负（加载期 `config.ts` 已 fail-fast 拦下同样的错误，走到这里
+ * 说明是别的通道进来的配置；机器级判据仍只看「至少一项可服务」）。
+ */
+function logRolesConfigCheck(project: ProjectConfig): void {
+  const check = rolesConfigCheck(project);
+  if (check.errors.length > 0) {
+    console.error(
+      `[self-check] ${project.projectId} 职责位配置校验不过（配置级、未真跑）：${check.errors.join("；")}`,
+    );
+  }
+  for (const line of roleSummaryLines(project.agentConfig, effectiveRiskOf(project))) {
+    console.log(`[self-check] ${project.projectId} ${line}`);
+  }
+}
+
+/**
  * 启动自检入口：对本机全部项目顺序执行，返回汇总结果（不抛出、不退出）。
  * **粒度口径（§2.4-⑤）**：`ok = 至少一项可服务`（无项目亦视为 ok）；单项失败**不再判负全机**，
  * 而是进 `unavailable` 集，由入口 `launcher/index.ts` 逐项登记不可用、仅在机器级故障时 fail-fast 退出。
+ *
+ * **职责位口径（v0.10.2 · M-4）**：每项目**恒真跑 1 条**（{@link SELF_CHECK_TASK_TYPE}
+ * = `unit_agent`），其余职责位只走 {@link rolesConfigCheck}（配置级、零派发）
+ * ⇒ **自检墙钟与配置了几个职责位无关**（项目数仍是唯一乘数）。
  */
 export async function runStartupSelfCheck(
   manager: AgentManager,
@@ -337,6 +408,8 @@ export async function runStartupSelfCheck(
     `[self-check] 开始：${machine.projects.length} 个项目，prompt="${prompt}"，每项目超时 ${timeoutMs}ms`,
   );
   for (const project of machine.projects) {
+    // 职责位配置级校验先出（纯本地、零派发）：其余三位**不真跑**（见 SELF_CHECK_TASK_TYPE 注释）。
+    logRolesConfigCheck(project);
     console.log(`[self-check] ${project.projectId}（${project.agentKind}）自检中…`);
     const outcome = await checkProject(manager, project, prompt, timeoutMs);
     if ("stage" in outcome) {

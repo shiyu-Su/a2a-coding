@@ -1,0 +1,63 @@
+{
+  "machineId": "machine-01",
+  "launcher": {
+    "port": 3100,
+    "bridge": {
+      "url": "http://127.0.0.1:8787",
+      "token": "runner-token-placeholder"
+    }
+  },
+  "projects": [
+    {
+      "projectId": "demo-opencode",
+      "workspace": "C:/demo/machine-ws/opencode",
+      "agentKind": "opencode",
+      "a2aPort": 3010,
+      "risk": "write",
+      "repo": "demo-repo",
+      "agentConfig": {
+        "backendCmd": "C:/opt/acp/opencode/bin/opencode.exe",
+        "model": "opencode-go/glm-5.3-flash",
+        "sessionTimeoutMs": 600000,
+        "continueMarginMs": 300000,
+        "sessionRetentionDays": 14,
+        "sessionRetentionMax": 300,
+        "maxConcurrentWrites": 1,
+        "maxConcurrentReads": 2
+      }
+    },
+    {
+      "projectId": "demo-codex",
+      "workspace": "C:/demo/machine-ws/codex",
+      "agentKind": "codex",
+      "a2aPort": 3011,
+      "risk": "write",
+      "agentConfig": {
+        "backendCmd": "C:/opt/acp/codex-acp/node_modules/@agentclientprotocol/codex-acp/dist/index.js",
+        "model": "deepseek-v4-pro"
+      }
+    },
+    {
+      "projectId": "demo-claude",
+      "workspace": "C:/demo/machine-ws/claude",
+      "agentKind": "claude",
+      "a2aPort": 3012,
+      "risk": "write",
+      "agentConfig": {
+        "backendCmd": "C:/opt/acp/claude-agent-acp/node_modules/@agentclientprotocol/claude-agent-acp/dist/index.js",
+        "model": "default"
+      }
+    },
+    {
+      "projectId": "demo-qoder-cn",
+      "workspace": "C:/demo/machine-ws/qoder-cn",
+      "agentKind": "qoder-cn",
+      "a2aPort": 3013,
+      "risk": "write",
+      "agentConfig": {
+        "backendCmd": "C:/opt/acp/qoderclicn/bin/qoderclicn.exe",
+        "model": "qfmodel"
+      }
+    }
+  ]
+}

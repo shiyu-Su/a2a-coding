@@ -98,7 +98,7 @@ test("件5-③（管理页 · 正常态）：成员表卡 + 双表单卡 + 末�
     },
   });
   assert.match(html, /<div class="b-forms">[\s\S]*?加成员[\s\S]*?删成员/, "加 / 减成员双表单卡并列");
-  assert.match(html, /该组声明成员 1 项 · 观测时刻 2026-10-02T01:00:00\.000Z/, "成员表卡带计数与读取时间");
+  assert.doesNotMatch(html, /成员（声明态/, "REQ-2026-10-10-03 N2：逐组声明态成员清单卡退役 ⇒ 管理页不再出现该区块（计数与观测时刻改由核对卡 / 池卡承载，见 :108）");
   assert.match(
     html,
     new RegExp(`<p class="b-note danger"><b>末位成员不可删</b>[\\s\\S]*?${LAST_MEMBER_REMOVE_CODE}`),

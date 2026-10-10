@@ -32,6 +32,7 @@ import {
 } from "../dist/orgs-view.js";
 import { createBoardServer } from "../dist/server.js";
 import { renderPage } from "../dist/web/layout.js";
+import { renderOrgSpaceManagePage } from "../dist/web/views.js";
 
 function feature(featureId, ownerGroup, overrides = {}) {
   return {
@@ -251,7 +252,7 @@ test("N3-①（§9-c 新锚）GET /org/<名>/manage: 成员区（声明态清单
     assert.equal(res.status, 200);
     assert.match(res.text, /管理 · alpha/, "页标题 = 空间内管理");
     // 成员清单 = 3300 全组枚举的该组投影（本用例 groupsFetcher 未装配 ⇒ 如实「未查询」，见 N3-③）
-    assert.match(res.text, /成员（声明态 · <code>GET \/api\/groups<\/code> 该组投影）/);
+    assert.doesNotMatch(res.text, /成员（声明态/, "REQ-2026-10-10-03 N2：逐组声明态成员清单卡退役 ⇒ 整页不得再出现该区块（声明面健康度改由配置核对卡首行承载，见 N6-⑧）");
     // 表单 action **不带空间前缀**：归一层不扩写路由，成员写仍是那一条全局 `POST /orgs/{org}/members`
     assert.match(res.text, /<form method="post" action="\/orgs\/alpha\/members"[^>]*data-submit="已提交，加成员中…" data-ov="1">/);
     assert.match(res.text, /<input type="hidden" name="action" value="add">/);
@@ -300,7 +301,7 @@ test("N6-⑧（§9-c 翻向到 manage）项目面不可达降级: 「不可达�
     assert.match(res.text, /transport_error/);
     assert.match(res.text, /连不上（假）/);
     assert.match(res.text, /F3/, "本组需求表不受项目面失败影响");
-    assert.match(res.text, /成员（声明态/, "成员区照常呈现");
+    assert.match(res.text, /声明面成员（3300 <code>GET \/api\/groups<\/code>）/, "声明面健康度仍由核对卡首行承载");
   }, {
     fetcher: async (org) =>
       org === "beta"
@@ -589,12 +590,10 @@ test("BD5-③（§9-c 翻向）manage 页消费声明面: 该组成员清单 + �
   await withOrgsServer(async (base) => {
     const res = await get(base, "/org/alpha/manage");
     assert.equal(res.status, 200);
-    assert.match(res.text, /成员（声明态 · <code>GET \/api\/groups<\/code> 该组投影）/, "声明面区块上板");
-    assert.match(res.text, /该组声明成员 2 项/);
-    assert.match(res.text, /<td>win-a<\/td><td>board<\/td>/, "成员项逐行（machineId / projectId 两列）");
+    assert.doesNotMatch(res.text, /成员（声明态/, "REQ-2026-10-10-03 N2：退役清单卡的负向钉（本 fixture 版独立钉，与 N3-① 各自成条、条数不折）");
+    // 原「本组成员计数 / 本组完整清单 / observedAt 上页」三条锚随该卡退役迁出 ⇒ 落 org-pool-two-column 池-⑲（N3 迁入位）
     assert.match(res.text, /组 gamma 缺成员，已忽略/, "warnings 如实呈现");
     assert.match(res.text, /不参与任何判定/, "warnings 口径钉死为纯呈现");
-    assert.match(res.text, /观测时刻 2026-09-27T02:00:00.000Z/, "observedAt 上板（声明是快照不是实时）");
     assert.doesNotMatch(res.text, /gamma-only/, "别组的声明条目不渗进本组空间（不扩呈现面）");
   }, {
     fetcher: async () => ({ ok: true, projects: [] }),
@@ -614,6 +613,7 @@ test("BD5-③b（§9-c 新锚）声明面无该组 ⇒「未声明」如实呈�
   await withOrgsServer(async (base) => {
     const res = await get(base, "/org/beta/manage");
     assert.equal(res.status, 200);
+    // 承载已迁至池卡三出口（REQ-2026-10-10-03 N2 §2.2：「未查询」/「不可用」/ 右栏空态同渲一枚 note）
     assert.match(res.text, /<b>未声明<\/b>/);
     assert.match(res.text, /首次写入即建组带首成员/);
   }, {
@@ -631,7 +631,7 @@ test("BD5-④（§9-c 翻向）3300 宕机降级: 成员区整块灰显「组数
   await withOrgsServer(async (base) => {
     const res = await get(base, "/org/alpha/manage");
     assert.equal(res.status, 200, "3300 挂了不炸页");
-    assert.match(res.text, /组数据不可用/);
+    assert.match(res.text, /<span class="b-badge danger">读不到<\/span>/, "声明面不可达的结论档 = 配置核对卡 sourceRow 的 danger 徽标（原「组数据不可用」区块字面随卡退役换新）");
     assert.match(res.text, /groups_unreachable/);
     assert.match(res.text, /ECONNREFUSED/, "错误原文如实带出");
     assert.match(res.text, /p-alpha/, "运行态项目面（a2a_projects）不受声明面故障影响");
@@ -660,7 +660,69 @@ test("BD5-⑤（§9-c 翻向）全组枚举降级鲁棒 + 未装配: 查询器�
   await withOrgsServer(async (base) => {
     const res = await get(base, "/org/alpha/manage");
     assert.equal(res.status, 200);
-    assert.match(res.text, /全组枚举查询器未装配/);
-    assert.match(res.text, /不编造「无成员」/, "未装配 ⇒ 不臆造空清单");
+    assert.match(res.text, /<span class="b-badge mute">未装配<\/span>/, "未装配 ⇒ 核对卡首行如实标「未装配」（不伪装成有读数）");
+    assert.match(res.text, /本区不查询（不编造「齐备」也不编造「缺失」）/, "未装配 ⇒ 不臆造任何一侧结论（原「不编造无成员」语义等价、字面换新）");
   }, { fetcher: async () => ({ ok: true, projects: [] }), groupsFetcher: null });
+});
+
+// ---------------------------------------------------------------------------
+// REQ-2026-10-10-03 N4 · 管理页项目表置顶的新增锚（N-1 首卡 / N-2 相对序 / N-3 删卡负锚新锚位）
+// 局部夹具 = 直调 `renderOrgSpaceManagePage`（本文件的 harness 不装配池 ⇒ `id="member-pool"`
+// 只在这次直调里存在；不改既有 `withOrgsServer` 夹具结构）。
+// ---------------------------------------------------------------------------
+
+const PIN_PROJECTS_OK = {
+  ok: true,
+  projects: [{ machineId: "m1", projectId: "p-a1", agentKind: "claude", a2aPort: 3017, status: "online", startedAt: null, machineError: null }],
+};
+const PIN_GROUPS_DECLARED = {
+  ok: true,
+  observedAt: "2026-10-10T00:00:00.000Z",
+  warnings: [],
+  groups: [{ name: "alpha", memberCount: 1, members: [{ machineId: "m1", projectId: "p-a1" }] }],
+};
+const PIN_POOL_OK = { ok: true, rows: [{ machineId: "m9", projectId: "p-free", lastReportedAt: null }], observedAt: null };
+
+const pinHtml = renderOrgSpaceManagePage({
+  org: "alpha",
+  features: [],
+  projectsOutcome: PIN_PROJECTS_OK,
+  groupsOutcome: PIN_GROUPS_DECLARED,
+  poolOutcome: PIN_POOL_OK,
+  poolSourceCount: 2,
+});
+
+/** 卡头起点（`b-card-h` 内层标题的字面）—— N-2 的六个比较对象就是其余六块。 */
+const cardHeadAt = (label) => pinHtml.indexOf(`b-card-h">${label}`);
+
+test("置顶-①（N-1 · REQ-2026-10-10-03）项目卡 = 整页第一张 b-card（防「首卡错」）", () => {
+  const i = pinHtml.indexOf('<div class="b-card"');
+  assert.ok(i >= 0, "夹具页至少渲出一张 b-card（切片起点在位）");
+  // 窗口取 80 而非 60：needle 自卡起点偏移 21（`<div class="b-card">` + 换行）起、长 48 ⇒ 60 会截断 needle 本身。
+  assert.ok(
+    pinHtml.slice(i, i + 80).includes('<p class="b-card-h">项目<span class="b-card-meta">'),
+    "第一张卡的卡头逐字为「项目 + b-card-meta」⇒ 项目表置顶成立",
+  );
+});
+
+test("置顶-②（N-2 · REQ-2026-10-10-03）项目卡先于池卡与其余六块（防「相对序错」，与置顶-① 分工不同）", () => {
+  const projectIdx = cardHeadAt("项目");
+  assert.ok(projectIdx >= 0, "项目卡卡头在位");
+  assert.ok(projectIdx < pinHtml.indexOf('id="member-pool"'), "项目卡先于两栏池容器（置顶后第一块 = 项目）");
+  for (const label of [
+    "加 / 删项目（两栏拖拽）",
+    "成员（项目组台账）",
+    "本组织 agent 配置",
+    "停用本组织",
+    "配置核对",
+    "需求",
+  ]) {
+    const at = cardHeadAt(label);
+    assert.ok(at >= 0, `其余块「${label}」仍在页上（缺席不得当成「排在后面」）`);
+    assert.ok(projectIdx < at, `项目卡必须先于「${label}」`);
+  }
+});
+
+test("置顶-③（N-3 · REQ-2026-10-10-03 新锚位）退役卡不复活：整页不出现「成员（声明态」（与 N3-① / BD5-③ 各自成条）", () => {
+  assert.doesNotMatch(pinHtml, /成员（声明态/, "本夹具（项目面可读 + 声明面已装配 + 池已装配）下同样不得渲出退役的逐组声明态成员清单卡");
 });

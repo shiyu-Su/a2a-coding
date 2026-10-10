@@ -14,6 +14,7 @@ import type {
   ProjectVersionsField,
   ProjectsView,
 } from "../bridge-client.js";
+import { projectVersionsOf } from "../bridge-client.js";
 import {
   AGENT_VIEW_CALIBRATION_NOTE,
   B13_CALIBRATION_NOTES,
@@ -673,6 +674,34 @@ function renderFeatureMetaCard(f: FeatureDetailView["feature"]): string {
   return `<h2>需求信息</h2>\n<dl class="b-meta">${body}</dl>`;
 }
 
+/**
+ * 归属卡（② · REQ-2026-10-10-02）：这条需求在各 project 落哪个 Project Version。
+ *
+ * 数据源 = 详情出参顶层 `projects[]`（**与落点① 的 `projectVersions[]` 是两个数据源、两个切片**）：
+ * 只读该两键，**不 join 状态、不加状态列**（归属一经引用其版号不可改，状态由版本面自己答）。
+ *
+ * 三态渲染（缺面 ≠ 空面）：
+ * - `null` / `undefined` ⇒ **整卡不渲**（C2 空区块短路；调用方手搭的 detail 无该键也走此分支）；
+ * - `[]` ⇒ 零行 + 中性文案（「未归属」是合法事实，不是降级）；
+ * - 有行 ⇒ 逐行，**行数 == `projects.length`，行序 = 引擎原序（不排序** —— 排序会把归属集
+ *   伪装成版本列车序，而引擎侧无序承诺）。
+ *
+ * 卡体 = `dl.b-meta` 两列（照 {@link renderFeatureMetaCard} 先例），左列取 `projectId`、右列取
+ * `version`（键名逐字，不译写）；**不用 `<table>`**（侧栏 320px + 浮层内会挤破）。
+ * **不按 org 切片**（数据源已是单需求维度，再切会在 `ownerGroup ≠ 页面 org` 时清零合法行）。
+ */
+export function renderFeatureOwnershipCard(projects: FeatureDetailView["projects"] | undefined): string {
+  if (projects === null || projects === undefined) return "";
+  const head = `<h2>归属（project 版本）</h2>`;
+  if (projects.length === 0) {
+    return `${head}\n<p class="hint muted">（暂无 project 归属记录）</p>`;
+  }
+  const body = projects
+    .map((p) => `<div class="b-meta-row"><dt>${escapeHtml(p.projectId)}</dt><dd>${escapeHtml(p.version)}</dd></div>`)
+    .join("");
+  return `${head}\n<dl class="b-meta">${body}</dl>`;
+}
+
 export function renderFeatureDetail(
   detail: FeatureDetailView,
   trace: FeatureTraceView | null,
@@ -764,7 +793,7 @@ ${foldCalibration(
   const actionCard = featCard(terminal ? "" : `${extras.actionAreaHtml ?? ""}${extras.answerFormHtml ?? ""}`, "feat-action");
   const turnCard = featCard(extras.turnTraceHtml ?? "", "feat-turn");
   const folds = `${foldSection("需求原文", renderRequirementOrigin(f.requirement))}${execution}${foldSection("验收轨迹", extras.acceptanceHtml ?? "")}`;
-  const side = `${featCard(renderFeatureMetaCard(f), "feat-meta")}${featCard(stageOutputsSection, "feat-outputs")}${graphCard}${featCard(scheduleForm, "feat-schedule")}`;
+  const side = `${featCard(renderFeatureMetaCard(f), "feat-meta")}${featCard(renderFeatureOwnershipCard(detail.projects), "feat-ownership")}${featCard(stageOutputsSection, "feat-outputs")}${graphCard}${featCard(scheduleForm, "feat-schedule")}`;
   return `${extras.spaceNavHtml ?? ""}
 ${head}
 <div class="feat-cols">
@@ -1142,8 +1171,8 @@ export interface OrgSpaceManageInput {
   projectsOutcome: OrgProjectsOutcome | null;
   /**
    * 全组枚举结论（3300 只读 `GET <3300>/api/groups`，组结构**声明面** = 本组成员清单的事实源）。
-   * `null` = 查询器未装配 ⇒ 标「未查询」；`ok=false` = 3300 宕机 / 配置坏 ⇒ 成员区**灰化**，
-   * **本页其余照常渲染**（宕机不得阻断管理页）。与逐组 `a2a_projects`（运行态）**并存、不替代**。
+   * `null` = 查询器未装配 ⇒ 池右栏与核对卡首行标「未查询」；`ok=false` = 3300 宕机 / 配置坏 ⇒
+   * 二者**灰化**，**本页其余照常渲染**（宕机不得阻断管理页）。与逐组 `a2a_projects`（运行态）**并存、不替代**。
    */
   groupsOutcome: OrgGroupsOutcome | null;
   /**
@@ -1170,6 +1199,20 @@ export interface OrgSpaceManageInput {
     globalKind: string | null;
     globalModel: string | null;
   };
+  /**
+   * **引擎版本台账投影（project 档）**核对源（v0.10.2 · REQ-2026-10-10-02 N2）：配置核对卡的
+   * **第三行**，与项目卡「已发布的最新版本号」列**共用同一次** `GET /api/versions` 读取。
+   * **省略 = 未注入 ⇒ 该源不参评**（行不出现，也不参与「配置齐备」闸 —— 不注入即零行为变化）。
+   * 三输入即三档判据的原料：`projection = null` ⇒ 本进程**从未读到过**投影；`failure` 非 `null`
+   * ⇒ 本次读失败、值取最后一次投影（**stale**）；project 档 `absent` ⇒ 老引擎档。
+   * `degradationText` = `absent` 两档的**降级文案单点**（`server.projectVersionDegradationText`
+   * 的产出，含根因码）⇒ 视图不另写一套根因码。
+   */
+  versionProjection?: {
+    projection: EngineVersionsProjection | null;
+    failure: string | null;
+    degradationText: string | null;
+  };
 }
 
 function renderOrgFeaturesTable(features: readonly FeatureListItem[]): string {
@@ -1194,7 +1237,26 @@ function renderOrgFeaturesTable(features: readonly FeatureListItem[]): string {
   );
 }
 
-function renderOrgProjectsTable(org: string, outcome: OrgProjectsOutcome | null): string {
+/**
+ * 组织项目卡（运行态 `a2a_projects`，一行 = 一 `(machineId, projectId)`）。
+ *
+ * 「已发布的最新版本号」列（v0.10.2 · REQ-2026-10-10-02 落点①）取数口径：
+ * - 源 = **宿主本次渲染已取到的那份投影**（`versionProjection`，与配置核对卡共用同一次
+ *   `GET /api/versions`）⇒ 本函数**不再打上游**；
+ * - 值 = 按 `(org, projectId)` 从 project 档取 `status === "released"` 的 **semver 最大**
+ *   （照门户摘要 {@link orgVersionSummaryOf} 的写法，用既有 `compareVersionOrder` / `normalizeVersion`，
+ *   **不引入第二套比较器**）；`status = open` 的行**不进该列**；
+ * - 无已发布版 / 投影为 `null` / project 档 `absent`·`empty` / 未注入 ⇒ 一律 `—`：**「无已发布」与
+ *   「读不到」同显 `—`、不加提示、不加 `title`**（诚实通道唯一在配置核对卡，裁定④）；
+ * - 联键 = `entry.projectId` trim 后精确相等 ∧ `entry.org === org`（他 org 的同版号不得染色）；
+ * - 同 project 多机 ⇒ 同版号在**多行重复出现**，**不按 `projectId` 去重**（正常形态，不是缺陷）。
+ * 三个早退分支（未查询 / 不可达）不带表 ⇒「空态 8 列」只作用于正常分支。
+ */
+function renderOrgProjectsTable(
+  org: string,
+  outcome: OrgProjectsOutcome | null,
+  versionProjection?: OrgSpaceManageInput["versionProjection"],
+): string {
   if (outcome === null) {
     return cardShell(
       "项目",
@@ -1209,11 +1271,28 @@ function renderOrgProjectsTable(org: string, outcome: OrgProjectsOutcome | null)
       `<p class="hint warn">不可达（<code>${escapeHtml(outcome.code)}</code>）：${escapeHtml(outcome.error)} —— 项目清单未知（灰化不炸页；刷新本页重查）。</p>`,
     );
   }
+  const releasedVersionByProject = new Map<string, string>();
+  if (versionProjection !== undefined) {
+    const field: ProjectVersionsField = projectVersionsOf(versionProjection.projection);
+    if (field.status === "live") {
+      for (const entry of field.entries) {
+        if (entry.org !== org || entry.status !== "released") continue;
+        const projectId = entry.projectId.trim();
+        const version = normalizeVersion(entry.version);
+        if (projectId === "" || version === "") continue;
+        const held = releasedVersionByProject.get(projectId);
+        if (held === undefined || compareVersionOrder(version, held) > 0) {
+          releasedVersionByProject.set(projectId, version);
+        }
+      }
+    }
+  }
   const rows = outcome.projects.map((p) => {
     return (
       "<tr" + (p.machineError !== null ? ' class="warn"' : "") + ">" +
       `<td>${escapeHtml(p.machineId)}</td>` +
       `<td><a class="fl" href="${escapeHtml(orgSpaceLink(org, "tasks"))}?project=${encodeURIComponent(p.projectId)}">${escapeHtml(p.projectId)}</a></td>` +
+      `<td>${escapeHtml(dash(releasedVersionByProject.get(p.projectId.trim())))}</td>` +
       `<td>${escapeHtml(p.agentKind ?? "—")}</td>` +
       `<td>${p.a2aPort === null ? "—" : String(p.a2aPort)}</td>` +
       `<td>${escapeHtml(p.status ?? "—")}</td>` +
@@ -1225,8 +1304,8 @@ function renderOrgProjectsTable(org: string, outcome: OrgProjectsOutcome | null)
   return cardShell(
     "项目",
     `运行态 ${String(outcome.projects.length)} 项`,
-    `<table><thead><tr><th>machineId</th><th>projectId</th><th>agentKind</th><th>a2aPort</th><th>status</th><th>startedAt</th><th>机器 error</th></tr></thead>
-<tbody>${rows.length === 0 ? emptyRow(7, "（该组织快照中无项目）") : rows.join("")}</tbody></table>`,
+    `<table><thead><tr><th>machineId</th><th>projectId</th><th>已发布的最新版本号</th><th>agentKind</th><th>a2aPort</th><th>status</th><th>startedAt</th><th>机器 error</th></tr></thead>
+<tbody>${rows.length === 0 ? emptyRow(8, "（该组织快照中无项目）") : rows.join("")}</tbody></table>`,
   );
 }
 
@@ -1385,9 +1464,11 @@ function memberDragRow(
  * **两栏拖拽区**（v0.9.8 · REQ-2026-10-03-02 · SSR 直出，拖拽仅作增强）：
  * 左「项目池」= 全量机器项目 − **全组（含本组）声明面**（{@link poolProjects} 的集合差，
  * 故别组成员在池里**完全不显示** —— 显示层过滤，不是写入闸门）；右「本组项目」= 声明面 members
- * （与上方「成员（声明态）」区同源，两栏同源不另立事实）。
- * 降级照「成员（声明态）」区四档先例：快照未装配 ⇒「未查询」；读失败 / 声明面不可达 ⇒「不可用」整块灰化
+ * （两栏同取 3300 全组枚举的该组投影，不另立事实源）。
+ * 降级多档先例：快照未装配 ⇒「未查询」；读失败 / 声明面不可达 ⇒「不可用」整块灰化
  * （**不给拖拽载荷** ⇒ 不给假池编造归属）；两种降级下**下方手填表单照常可用**（回路面不劣化）。
+ * **退役卡的承接位（v0.10.2 · REQ-2026-10-10-03 N2）**：逐组「成员清单」卡撤销后，「未声明」档由本卡
+ * **三出口**同渲同一枚 note —— 「未查询」/「不可用」/ 右栏空态 ⇒ 诚实通道不因删卡失承载。
  * `#member-pool` + `data-org` = {@link MEMBER_DRAG_SCRIPT} 的入口锚与提交目标（页隔离锚点，N3-⑦/⑧）。
  * `sourceCount` = **左集规模**（差集被减之前的桥注册表全集投影行数），只服务空态两分支的字面（B-3）：
  * 左集本身零行 ⇒「机器注册表暂无项目记录」；左集有行但全被减 ⇒「已全部归属某个项目组」。二者不串台。
@@ -1400,22 +1481,25 @@ function renderMemberPoolColumns(
   sourceCount: number | null = null,
 ): string {
   const title = `加 / 删项目（两栏拖拽）`;
+  const declared = groupsOutcome !== null && groupsOutcome.ok;
+  const ownRow = declared ? groupsOutcome.groups.find((g) => g.name === org) : undefined;
+  const undeclared = declared && ownRow === undefined;
+  const undeclaredNote = `<p class="hint muted"><b>未声明</b>：orch 的 <code>projectGroup</code> 段尚无名为 <code>${escapeHtml(org)}</code> 的组（盘目录 / 板台账 / 需求归属可先于组存在，不是错误）—— 首次写入即建组带首成员（左栏拖入或下方手填，一次写入）。</p>`;
   if (pool === null) {
     return cardShell(
       title,
       "未查询",
-      `<p class="hint muted"><b>未查询</b>：全量机器项目快照未装配 ⇒ 本区不呈现池与本组清单（不编造「无项目」）；下方两枚手填表单照常可用。</p>`,
+      `<p class="hint muted"><b>未查询</b>：全量机器项目快照未装配 ⇒ 本区不呈现池与本组清单（不编造「无项目」）；下方两枚手填表单照常可用。</p>${undeclared ? undeclaredNote : ""}`,
     );
   }
   if (!pool.ok) {
     return cardShell(
       title,
       "不可用",
-      `<p class="hint warn muted"><b>池数据不可用</b>（<code>${escapeHtml(pool.code)}</code>）：${escapeHtml(pool.error)} —— 项目归属未知 ⇒ 本区整块灰化、<b>不给拖拽</b>（刷新本页重查；下方两枚手填表单照常可用）。</p>`,
+      `<p class="hint warn muted"><b>池数据不可用</b>（<code>${escapeHtml(pool.code)}</code>）：${escapeHtml(pool.error)} —— 项目归属未知 ⇒ 本区整块灰化、<b>不给拖拽</b>（刷新本页重查；下方两枚手填表单照常可用）。</p>${undeclared ? undeclaredNote : ""}`,
     );
   }
-  const declared = groupsOutcome !== null && groupsOutcome.ok;
-  const own = declared ? (groupsOutcome.groups.find((g) => g.name === org)?.members ?? []) : [];
+  const own = ownRow?.members ?? [];
   const canRemove = own.length > 1;
   const poolBody =
     pool.rows.length === 0
@@ -1425,9 +1509,11 @@ function renderMemberPoolColumns(
       : pool.rows.map((r) => memberDragRow(r.machineId, r.projectId, true, r.lastReportedAt)).join("\n");
   const ownBody = !declared
     ? `<p class="hint muted">（声明面不可用 ⇒ 本组清单未知，不编造「无项目」）</p>`
-    : own.length === 0
-      ? `<p class="hint muted">（本组暂无项目：左栏拖入即建组带首成员）</p>`
-      : own.map((r) => memberDragRow(r.machineId, r.projectId, canRemove)).join("\n");
+    : undeclared
+      ? undeclaredNote
+      : own.length === 0
+        ? `<p class="hint muted">（本组暂无项目：该组已在 orch 声明、成员清单为空 —— 左栏拖入即加入本组）</p>`
+        : own.map((r) => memberDragRow(r.machineId, r.projectId, canRemove)).join("\n");
   const ownMeta = own.length === 1 ? `${String(own.length)} 项 · 末位不可移出` : `${String(own.length)} 项`;
   return cardShell(
     title,
@@ -1442,7 +1528,7 @@ ${poolBody}
 ${ownBody}
 </div>
 </div>
-<p class="hint">两栏与上方「成员（声明态）」<b>同源</b>（3300 全组枚举），左栏另加一次全量项目快照；<b>三个数据源各有自己的观测时刻</b> ⇒ 刚移出的项目在本栏的归属可能瞬时滞后。<b>落点以服务端投影与 409 为准</b>：撞别组 ⇒ 409 <code>${escapeHtml(MEMBER_GROUP_CONFLICT_CODE)}</code>（浮层点名所属组），末位不可删 ⇒ 409 <code>${escapeHtml(LAST_MEMBER_REMOVE_CODE)}</code>。拖拽只做增强 —— 无 JS 时两栏退化为静态清单，下方手填表单照常提交。</p>`,
+<p class="hint">两栏<b>同源</b> = 3300 全组枚举的该组投影，左栏另加一次全量项目快照；<b>三个数据源各有自己的观测时刻</b> ⇒ 刚移出的项目在本栏的归属可能瞬时滞后。<b>落点以服务端投影与 409 为准</b>：撞别组 ⇒ 409 <code>${escapeHtml(MEMBER_GROUP_CONFLICT_CODE)}</code>（浮层点名所属组），末位不可删 ⇒ 409 <code>${escapeHtml(LAST_MEMBER_REMOVE_CODE)}</code>。拖拽只做增强 —— 无 JS 时两栏退化为静态清单，下方手填表单照常提交。</p>`,
   );
 }
 
@@ -1491,85 +1577,88 @@ ${input.action === "add" ? `<p class="b-note">${escapeHtml(MEMBER_ADD_RESIDENCY_
 }
 
 /**
- * 本组的**声明态成员清单**（v0.9.4 C 档/BD5 数据 + §9-c 承接位 · REQ-2026-09-30-04 件5 卡化）：
- * 取自 3300 全组枚举 `GET <3300>/api/groups` 的只读投影（**声明面** = orch `config.json` 的 `projectGroup` 段，
- * 与运行态逐组 `a2a_projects` 语义不同、刻意并存不替代）。
- * 四档如实降级：查询器未装配 ⇒「未查询」；3300 宕机 / 配置坏 ⇒「组数据不可用」整块灰化
- * （**不阻断本页其余渲染**）；声明面无该组 ⇒「未声明」（盘 / 台账 / 需求归属源可先于 orch 组存在，不是错误）；
- * `warnings[]` **移出本卡**、归入下方「配置核对」卡的警示条（件5），仍只作小字呈现、**不参与任何判定逻辑**。
- */
-function renderOrgMemberSection(org: string, outcome: OrgGroupsOutcome | null): string {
-  const title = `成员（声明态 · <code>GET /api/groups</code> 该组投影）`;
-  if (outcome === null) {
-    return cardShell(
-      title,
-      "未查询",
-      `<p class="hint muted">全组枚举查询器未装配 ⇒ 本区不呈现声明数据（不编造「无成员」）。</p>`,
-    );
-  }
-  if (!outcome.ok) {
-    return cardShell(
-      title,
-      "不可用",
-      `<p class="hint warn muted"><b>组数据不可用</b>（<code>${escapeHtml(outcome.code)}</code>）：${escapeHtml(outcome.error)} —— 3300 聚合面查询失败 ⇒ 本区整块灰化，<b>本页其余部分照常渲染</b>（刷新本页重查）。</p>`,
-    );
-  }
-  const row = outcome.groups.find((g) => g.name === org);
-  if (row === undefined) {
-    return cardShell(
-      title,
-      "未声明",
-      `<p class="hint muted"><b>未声明</b>：orch 的 <code>projectGroup</code> 段尚无名为 <code>${escapeHtml(org)}</code> 的组 —— 盘目录 / 板台账 / 需求归属可以先于组存在，不是错误；下方「加成员」首次写入即建组带首成员（一次写入）。</p>`,
-    );
-  }
-  const rows = row.members.map((m) => {
-    return (
-      "<tr>" +
-      `<td>${escapeHtml(m.machineId)}</td>` +
-      `<td>${escapeHtml(m.projectId)}</td>` +
-      "</tr>"
-    );
-  });
-  const meta =
-    outcome.observedAt === null
-      ? `该组声明成员 ${String(row.memberCount)} 项`
-      : `该组声明成员 ${String(row.memberCount)} 项 · 观测时刻 ${escapeHtml(outcome.observedAt)}`;
-  return cardShell(
-    title,
-    meta,
-    `<table><thead><tr><th>machineId</th><th>projectId</th></tr></thead>
-<tbody>${rows.length === 0 ? emptyRow(2, "（无成员：该组已声明但成员清单为空）") : rows.join("")}</tbody></table>`,
-  );
-}
-
-/**
- * **配置核对卡**（REQ-2026-09-30-04 件5 · 原型 v2.3 样张⑤）：本页**已读到的两张只读投影**
- * （声明面 3300 `GET /api/groups` · 运行态逐组 `a2a_projects`）逐源给一行核对结论，
+ * **配置核对卡**（REQ-2026-09-30-04 件5 · 原型 v2.3 样张⑤；v0.10.2 N2 加第三行）：本页**已读到的
+ * 只读投影**逐源给一行核对结论 —— **① 声明面** 3300 `GET /api/groups` · **② 运行态** 逐组
+ * `a2a_projects` · **③ 引擎版本台账投影（project 档）**（`GET /api/versions`，未注入 ⇒ 不参评），
  * 外加桥 `warnings[]` 的**缺文件 / 配置瑕疵警示条**。
- * **零新触面**：不查盘、不新增只读端点 —— 核对的就是上面两区那次读取的健康度，
+ * **零新触面**：不查盘、不新增只读端点 —— 核对的是本页各读面那次读取的健康度，
  * 因此「上次核对时间」= 声明面那次读取的 `observedAt`（缺 ⇒ 不谎报时间）。
- * 全部源可读 ∧ 无 warn ⇒ 正常态一行「配置齐备 · 上次核对时间 …」。
+ * 全部**已注入**源可读 ∧ 无 warn ⇒ 正常态一行「配置齐备 · 上次核对时间 …」。
+ *
+ * **第三行的三态闭集**（互斥 + 穷尽，改造文档 §2.1 落点④）—— **判据序 ①→②→③ 不可颠倒**：
+   1. `projection === null` ⇒ **本进程从未读到过**（「读不到」+ 根因码
+      `project_versions_group_projection_unreadable`，经降级文案单点带出）；
+   2. `projection !== null` ∧ `failure !== null` ⇒ **stale** = 本次读失败、值取 `engineVersionsLastGood`
+      （「本次读不到 · 值取最后一次投影」+ `failure` 根因）；
+   3. `projection !== null` ∧ `failure === null` ∧ project 档 `absent` ⇒ **老引擎档**（「读不到」+
+      `project_versions_field_missing` / `_invalid`）；
+   余下（`live` / `empty`）⇒ **「可读」** —— `empty` 是**合法事实**「未登记，本版本起生效」，
+   **不得报读不到**。
+ * 颠倒 ①/② 的后果：`versionProjectionOf` 读失败时返回的正是最后一次投影，**从未读到**（投影为
+ * `null`）同时满足 ② ⇒ 颠倒会渲出**两条根因**。本行也是「投影读不到」的**唯一诚实通道**
+ * （项目卡新列刻意不带 stale 提示，裁定④）。
  */
 function renderOrgConfigCheckCard(
   groupsOutcome: OrgGroupsOutcome | null,
   projectsOutcome: OrgProjectsOutcome | null,
+  versionProjection?: OrgSpaceManageInput["versionProjection"],
 ): string {
-  const sourceRow = (nameHtml: string, outcome: { ok: boolean; code?: string; error?: string } | null): string => {
+  const sourceRow = (
+    nameHtml: string,
+    outcome: { ok: boolean; code?: string; error?: string } | null,
+    danger?: { badge: string; note: string },
+  ): string => {
     if (outcome === null) {
       return `<tr><td>${nameHtml}</td><td><span class="b-badge mute">未装配</span></td><td class="muted">本区不查询（不编造「齐备」也不编造「缺失」）</td></tr>`;
     }
     if (!outcome.ok) {
-      return `<tr class="warn"><td>${nameHtml}</td><td><span class="b-badge danger">读不到</span></td><td><code>${escapeHtml(outcome.code ?? "unknown")}</code> ${escapeHtml(outcome.error ?? "")}</td></tr>`;
+      const note =
+        danger !== undefined
+          ? escapeHtml(danger.note)
+          : `<code>${escapeHtml(outcome.code ?? "unknown")}</code> ${escapeHtml(outcome.error ?? "")}`;
+      return `<tr class="warn"><td>${nameHtml}</td><td><span class="b-badge danger">${escapeHtml(danger?.badge ?? "读不到")}</span></td><td>${note}</td></tr>`;
     }
     return `<tr><td>${nameHtml}</td><td><span class="b-badge ok">可读</span></td><td class="muted">本次读取正常收敛</td></tr>`;
   };
+  /**
+   * 第三行（版本台账投影 project 档）：`readable` = 是否计入「全部源可读」闸。
+   * **不造「未装配」档** —— 投影读取器恒在（`ctx.engineVersions`），`sourceRow` 的 null 分支对本源不可达。
+   */
+  const versionProjectionSource = (
+    v: NonNullable<OrgSpaceManageInput["versionProjection"]>,
+  ): { html: string; readable: boolean } => {
+    const nameHtml = "引擎版本台账投影（project 档 · <code>GET /api/versions</code>）";
+    if (v.projection === null) {
+      return {
+        html: sourceRow(nameHtml, { ok: false }, { badge: "读不到", note: v.degradationText ?? "（未取到降级文案 ⇒ 根因码无从展示，请查投影读取面）" }),
+        readable: false,
+      };
+    }
+    if (v.failure !== null) {
+      return {
+        html: sourceRow(nameHtml, { ok: false }, { badge: "本次读不到", note: `值取最后一次投影 · ${v.failure}` }),
+        readable: false,
+      };
+    }
+    const field: ProjectVersionsField = projectVersionsOf(v.projection);
+    if (field.status === "absent") {
+      return {
+        html: sourceRow(nameHtml, { ok: false }, { badge: "读不到", note: v.degradationText ?? `${field.code} · ${field.error}` }),
+        readable: false,
+      };
+    }
+    return { html: sourceRow(nameHtml, { ok: true }), readable: true };
+  };
+  const versionSource = versionProjection === undefined ? null : versionProjectionSource(versionProjection);
   const warnings = groupsOutcome !== null && groupsOutcome.ok ? groupsOutcome.warnings : [];
   const bothAssembled = groupsOutcome !== null && projectsOutcome !== null;
   const allReadable =
     groupsOutcome !== null &&
     projectsOutcome !== null &&
     groupsOutcome.ok &&
-    projectsOutcome.ok;
+    projectsOutcome.ok &&
+    // 未注入 ⇒ 不参评（true：第三源缺席时不得挡「配置齐备」）
+    (versionSource === null || versionSource.readable);
   const checkedAt =
     groupsOutcome !== null && groupsOutcome.ok ? groupsOutcome.observedAt : null;
   const summary = allReadable
@@ -1585,11 +1674,16 @@ function renderOrgConfigCheckCard(
           .join("")}</ul>`;
   return cardShell(
     "配置核对",
-    bothAssembled ? "本页两源的读取健康度" : "部分源未查询",
+    bothAssembled
+      ? versionSource === null
+        ? "本页两源的读取健康度"
+        : "本页三源的读取健康度"
+      : "部分源未查询",
     `<table><thead><tr><th>核对源</th><th>结论</th><th>说明</th></tr></thead>
 <tbody>
 ${sourceRow("声明面成员（3300 <code>GET /api/groups</code>）", groupsOutcome)}
 ${sourceRow("运行态项目（逐组 <code>a2a_projects</code>）", projectsOutcome)}
+${versionSource === null ? "" : versionSource.html}
 </tbody></table>
 ${warnBar}
 ${summary}`,
@@ -1653,27 +1747,28 @@ function renderOrgHostAgentCard(
  * `GET /org/<名>/manage` **空间内管理页**（v0.9.4 §9-c · REQ-2026-09-27-06 N3）：
  * `/orgs` 组织管理页退役后，逐组织的管理职能落到该组织空间内（复用归一层上下文：
  * 组织不存在 404 / **已停用 410** 同 `org-space.resolveOrgSpaceRoute` 口径，本页只在「在用」组织上渲染）。
- * 页内六块（REQ-2026-09-30-04 件5 卡化，**全部复用既有写口，服务端零改动**）：
- * **成员区**（声明态清单，取自 3300 全组枚举）→ **加 / 减成员双表单卡**
- * → `POST /orgs/{org}/members`（隐藏 `action`）；**停用卡** → `POST /orgs`（隐藏 `action=disable`，
- * 同写口分流；台账标记不物理删目录，恢复 = 同名重建）；**配置核对卡**（本页两源读取健康度 + warnings）；
- * **需求卡** = 归一层已持有的该组需求投影（零新触桥面）；**项目卡** = 逐组只读 `a2a_projects`
- *   （运行态，与声明态成员并存）；项目深链落**空间任务页**
- *   `/org/<名>/tasks?project=…`（v0.9.6 C3：manage 页内 org 已知，不再指全局 `/tasks`）。
- * **两栏拖拽（v0.9.8 · REQ-2026-10-03-02）**：成员区之下插 {@link renderMemberPoolColumns}（左池 / 右本组），
- * 手填表单由 {@link renderMemberFormsFold} 折叠收纳（**DOM 原样保留**，无 JS 即常态可见）；
+ * 页内七块（REQ-2026-09-30-04 件5 卡化，**全部复用既有写口，服务端零改动**），渲出序 =
+ * **项目卡**（置顶第一块）= 逐组只读 `a2a_projects`（运行态）；项目深链落**空间任务页**
+ *   `/org/<名>/tasks?project=…`（v0.9.6 C3：manage 页内 org 已知，不再指全局 `/tasks`）；
+ * **两栏拖拽池** {@link renderMemberPoolColumns}（左池 / 右本组，v0.9.8 · REQ-2026-10-03-02）
+ * → **加 / 减成员双表单卡**（{@link renderMemberFormsFold} 折叠收纳，**DOM 原样保留**，无 JS 即常态可见）
+ *   → `POST /orgs/{org}/members`（隐藏 `action`）；**本组织 agent 配置卡**；**停用卡** → `POST /orgs`
+ *   （隐藏 `action=disable`，同写口分流；台账标记不物理删目录，恢复 = 同名重建）；**配置核对卡**
+ *   （本页**已注入**源的读取健康度 + warnings；第三源 = 引擎版本台账投影 project 档，随
+ *   {@link OrgSpaceManageInput.versionProjection} 注入才参评）；**需求卡** = 归一层已持有的该组需求投影（零新触桥面）。
+ * **v0.10.2 · REQ-2026-10-10-03 N2**：逐组「成员清单」卡（3300 全组枚举的该组投影）撤销 ⇒ 声明面那一次
+ * 读取的健康度仍由核对卡首行承载，「未声明」档由 {@link renderMemberPoolColumns} 的三出口承接；
  * 本页是全站**唯一**注入第七枚内联脚本 {@link MEMBER_DRAG_SCRIPT} 的页（`Page.extraScripts` 页隔离）。
  */
 export function renderOrgSpaceManagePage(input: OrgSpaceManageInput): string {
   return `<h2>管理 · ${escapeHtml(input.org)}</h2>
-${renderOrgMemberSection(input.org, input.groupsOutcome)}
+${renderOrgProjectsTable(input.org, input.projectsOutcome, input.versionProjection)}
 ${renderMemberPoolColumns(input.org, input.poolOutcome ?? null, input.groupsOutcome, input.poolSourceCount ?? null)}
 ${renderMemberFormsFold(input.org)}
 ${renderOrgHostAgentCard(input.org, input.hostAgent ?? { orgKind: null, orgModel: null, globalKind: null, globalModel: null })}
 ${renderDisableOrgCard(input.org)}
-${renderOrgConfigCheckCard(input.groupsOutcome, input.projectsOutcome)}
-${renderOrgFeaturesTable(input.features)}
-${renderOrgProjectsTable(input.org, input.projectsOutcome)}`;
+${renderOrgConfigCheckCard(input.groupsOutcome, input.projectsOutcome, input.versionProjection)}
+${renderOrgFeaturesTable(input.features)}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -2141,102 +2236,6 @@ ${pool.length === 0 ? `<p class="hint">（无未排期的在途需求 · 终态�
 <button type="button" id="feat-dialog-close">关闭</button>
 <div class="fd-body"></div>
 </dialog>`;
-}
-
-// ---------------------------------------------------------------------------
-// project 级版本区块（v0.10.1 B3 · C-7 三档显示闭集；纯 SSR，零新脚本常量）
-// ---------------------------------------------------------------------------
-
-/** project 档状态徽标（**显示档，另立一族**，C-18②：不得复用 `.draglocked` / `kbadge draglock`）。 */
-const PV_STATUS_BADGE: Readonly<Record<string, { text: string; variant: string; note: string }>> = {
-  open: { text: "open", variant: "topen", note: "project 台账状态（引擎自报值，板不回落、不猜）。" },
-  released: { text: "released", variant: "treleased", note: "project 台账状态（级联置入，仅显示样式，不参与任何判定）。" },
-};
-
-/** 未知 / 缺位状态的徽标档（值域归引擎，板不扩、不映射成 Group 三态）。 */
-const PV_STATUS_UNKNOWN_BADGE: { text: string; variant: string; note: string } = {
-  text: "—",
-  variant: "tunknown",
-  note: "project 台账状态缺位或非字符串 ⇒ 显示 —，板不回落、不猜。",
-};
-
-/**
- * 「各 project 版本」区块（组织空间排期页 · REQ-2026-10-09-01 C-7）。**纯读投影、三档显示闭集**：
- * - `live` ⇒ 逐行 `{projectId, version, status, releasable}`（+ 计数 / `reason` / repo / ref）；
- *   **`releasable === null`（缺键）⇒ 显示 `—`**，未知 ≠ 假否定；
- * - `empty` ⇒ 「未登记（本版本起生效）」—— **合法事实，不是降级**，且**绝不合成 `notstart` 假行**；
- * - `absent` ⇒ 降级条 + 根因码（文案单点 = `server.projectVersionDegradationText`，本函数不另写一套）。
- * **org 切片**由调用方给定（沿用板侧单点切片，`undefined` = 不限组织）⇒ 两组织的同版号互不可见、互不锁。
- * **不重算 `releasable`、不判 project 闸**（C-4 级联档：project 侧收口判据降为展示字段）；
- * **容器恒在 `#schedule-board` 之外**（C-18①，接线归 B4），拖拽脚本的入口守卫因此碰不到本区。
- */
-export function renderProjectVersionsBlock(
-  field: ProjectVersionsField,
-  org?: VersionOrgFilter,
-  degradationText: string | null = null,
-): string {
-  if (field.status === "absent") {
-    const text = degradationText ?? "（未取到降级文案 ⇒ 根因码无从展示，请查投影读取面）";
-    return cardShell(
-      "各 project 版本",
-      "降级",
-      `<p class="b-note">${text}</p>`,
-      "pv-block",
-    );
-  }
-  if (field.status === "empty") {
-    return cardShell(
-      "各 project 版本",
-      "0 行",
-      `<p class="hint">未登记（本版本起生效）—— 本组尚无 project 级版本承诺记录（<b>合法事实，非降级</b>）。</p>`,
-      "pv-block",
-    );
-  }
-  const rows = field.entries
-    .filter((e) => org === undefined || e.org === org)
-    .sort((a, b) => compareVersionOrder(a.version, b.version));
-  const meta = `本组 ${String(rows.length)} 行`;
-  if (rows.length === 0) {
-    return cardShell(
-      "各 project 版本",
-      meta,
-      `<p class="hint">未登记（本版本起生效）—— 投影在场，但<b>本组织</b>无 project 级版本行（他组织的同版号不在此显示，也不互锁）。</p>`,
-      "pv-block",
-    );
-  }
-  const body = rows
-    .map((e) => {
-      const hit = e.status === null ? undefined : PV_STATUS_BADGE[e.status];
-      const badge = hit ?? { ...PV_STATUS_UNKNOWN_BADGE, text: dash(e.status) };
-      const releasable =
-        e.releasable === true
-          ? `<span class="pvbadge tr">是</span>`
-          : e.releasable === false
-            ? `<span class="pvbadge tf">否</span>`
-            : `<span class="pvbadge tu" title="引擎未给 releasable（发版闸未上线的过渡档）⇒ 显示 —，不判定、不作否定档渲染">—</span>`;
-      return (
-        "<tr>" +
-        `<td>${escapeHtml(dash(e.projectId))}</td>` +
-        `<td class="mono">${escapeHtml(dash(e.version))}</td>` +
-        `<td>${escapeHtml(dash(e.repoId))}</td>` +
-        `<td><span class="pvbadge ${badge.variant}" title="${escapeHtml(badge.note)}">${escapeHtml(badge.text)}</span></td>` +
-        `<td>${releasable}</td>` +
-        `<td>${escapeHtml(dash(e.reason))}</td>` +
-        `<td>${[e.openCount, e.completedCount, e.cancelledCount].map((n) => escapeHtml(dash(n))).join(" / ")}</td>` +
-        `<td>${escapeHtml(dash(e.ref))}</td>` +
-        "</tr>"
-      );
-    })
-    .join("");
-  const table = `<table><thead><tr><th>project</th><th>Project Version</th><th>repo</th><th>状态</th><th>可发版</th><th>原因</th><th>开 / 完 / 取（计数）</th><th>交付 ref</th></tr></thead>
-<tbody>${body}</tbody></table>`;
-  return cardShell(
-    "各 project 版本",
-    meta,
-    `<p class="hint">引擎 project 台账的<b>只读投影</b>（按本组切片）：project 级 <code>released</code> <b>只显样式、不参与任何判定</b>，两级计数<b>不横向相加、不互校</b>。</p>
-${table}`,
-    "pv-block",
-  );
 }
 
 // ---------------------------------------------------------------------------

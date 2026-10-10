@@ -43,6 +43,15 @@ import { LAST_MEMBER_REMOVE_CODE, MEMBER_GROUP_CONFLICT_CODE } from "../dist/gro
 import { createBoardServer } from "../dist/server.js";
 
 // ---------------------------------------------------------------------------
+// 切片 helper（必须在任何顶层求值之前定义 —— `twoColumnHtml` 在模块顶层渲染，
+// helper 定义在其后时仍处于 TDZ，各测试便只能内联重复切片式）
+// 界只用两枚稳定 DOM 锚（`data-side` / `member-forms-fold`），样式类锚不作切片界（见文末负向钉）。
+// ---------------------------------------------------------------------------
+
+const poolColumn = (html) => html.slice(html.indexOf('data-side="pool"'), html.indexOf('data-side="own"'));
+const ownColumn = (html) => html.slice(html.indexOf('data-side="own"'), html.indexOf("member-forms-fold"));
+
+// ---------------------------------------------------------------------------
 // 夹具
 // ---------------------------------------------------------------------------
 
@@ -220,8 +229,8 @@ test("池-⑦ 两栏 SSR：左池右本组 · 行带 draggable 与载荷属性 �
     /<div class="mrow" draggable="true" data-machine="m3" data-project="p-c1">/,
     "池行 draggable 由**服务端判据**渲染 + data-machine/data-project 作拖拽载荷来源",
   );
-  const poolSide = twoColumnHtml.slice(twoColumnHtml.indexOf('data-side="pool"'), twoColumnHtml.indexOf('data-side="own"'));
-  const ownSide = twoColumnHtml.slice(twoColumnHtml.indexOf('data-side="own"'), twoColumnHtml.indexOf("member-forms-fold"));
+  const poolSide = poolColumn(twoColumnHtml);
+  const ownSide = ownColumn(twoColumnHtml);
   assert.ok(poolSide.includes('data-machine="m3"'), "未归属项来自**注册表投影**（换源前左集构造性恒空 ⇒ 这一行根本进不了池栏）；m3 是**离线机**，仍照常列出（C-1）");
   assert.ok(!poolSide.includes("p-b1") && !poolSide.includes("p-a1"), "别组声明项目与本组项目都**不出现**在左栏（不显示 ≠ 写不进，执法见 hint）");
   assert.ok(ownSide.includes("p-a1") && ownSide.includes("p-a2") && !ownSide.includes("p-c1"), "右栏 = 本组声明面 members，不混入池行");
@@ -243,7 +252,7 @@ test("池-⑨ 末位成员行不给 draggable（同写前闸判据，拖不动�
     groupsOutcome: groupsOutcome(own),
     poolOutcome: computeProjectPool(pool([{ machineId: "m1", projectId: "p-a1" }, { machineId: "m3", projectId: "p-c1" }]), groupsOutcome(own)),
   });
-  const ownSide = html.slice(html.indexOf('data-side="own"'), html.indexOf('class="hint"'));
+  const ownSide = ownColumn(html);
   assert.match(ownSide, /<div class="mrow"><span class="mono">m1<\/span> \/ <span class="mono">p-a1<\/span><\/div>/, "末位行**无 draggable**（服务端判据先行）");
   assert.match(html, /本组 1 项 · 末位不可移出/, "卡头如实标注不可移出");
   assert.match(html, /<div class="mrow" draggable="true" data-machine="m3" data-project="p-c1">/, "池行照旧可拖（末位闸只管右栏）");
@@ -347,9 +356,9 @@ test("池-⑫ 管理页池源 = getRegistryProjects()：注册表全量投影落
       assert.match(text, /<div class="mrow" draggable="true" data-machine="m1" data-project="p-free">/, "未被任何组声明的项目落到池栏，可拖");
       assert.match(text, /<div class="mrow" draggable="true" data-machine="m3" data-project="p-c1">/, "**离线机 m3 的项目照常进池**（换源前：旧面对离线机发机级 error ⇒ 一行都投影不出）");
       assert.match(text, /最后上报于 2026-09-20T23:59:59\.000Z（非实时探测）/, "弱提示随 HTTP 装配面上页（B-4）");
-      const poolSide = text.slice(text.indexOf('data-side="pool"'), text.indexOf('data-side="own"'));
+      const poolSide = poolColumn(text);
       assert.equal(poolSide.includes("p-b1"), false, "别组（beta）声明的项目在池里完全不显示");
-      const ownSide = text.slice(text.indexOf('data-side="own"'), text.indexOf("member-forms-fold"));
+      const ownSide = ownColumn(text);
       assert.match(ownSide, /data-machine="m1" data-project="p-a1">/, "本组两项（非末位）落右栏且可拖回池栏");
       assert.match(ownSide, /data-machine="m1" data-project="p-a2">/);
       assert.equal(ownSide.includes("p-b1"), false, "右栏只呈现本组声明面");
@@ -375,7 +384,7 @@ test("池-⑬ 快照读失败不炸页：池区降级「不可用」+ 透传码�
       assert.equal(res.status, 200, "快照读失败 ⇒ 只降级池区，不整页 502");
       assert.match(text, /<span class="b-card-meta">不可用<\/span>/, "池区档名如实「不可用」");
       assert.match(text, /snapshot_unreachable[\s\S]*?快照面爆炸（假）/, "结构化码 + 根因原文呈现，不静默");
-      assert.match(text, /成员（声明态/, "成员区照常呈现");
+      assert.match(text, /<tr[^>]*><td>声明面成员/, "成员区照常呈现（替身锚 = 配置核对卡首行 <tr><td>，不依赖成员区文案）");
       assert.match(text, /<form method="post" action="\/orgs\/alpha\/members"/, "手填表单在失败档仍是主通路（照常可用）");
     },
   );
@@ -428,9 +437,6 @@ test("池-⑭ 读面缺席 / 缺方法（同步抛错）收口为降级 ⇒ 页�
 // ---------------------------------------------------------------------------
 // ④ v0.9.8「项目池恒空修复」新增三枚：正锚（B-4 字面）/ 负锚（C-2·C-5 禁字）/ 装配锚（C-6 单点）
 // ---------------------------------------------------------------------------
-
-const poolColumn = (html) => html.slice(html.indexOf('data-side="pool"'), html.indexOf('data-side="own"'));
-const ownColumn = (html) => html.slice(html.indexOf('data-side="own"'), html.indexOf("member-forms-fold"));
 
 test("池-⑮（正锚 · B-4）池行弱提示逐字「最后上报于 {ISO 时刻}（非实时探测）」· 缺值不渲 · 右栏行不带该位", () => {
   const html = renderOrgSpaceManagePage({
@@ -507,4 +513,109 @@ test("池-⑰（装配锚 · C-6）src/server.ts 池源**仅一处**经 getRegis
   assert.equal((body.match(/client\.getProjects\(\)/g) ?? []).length, 0, "旧面 `getProjects()` 在池装配路径**零残留**（它仍是别的页的读路，故只锚本函数体）");
   assert.equal((body.match(/poolSourceCount:/g) ?? []).length, 1, "左集规模单点随池装配 = 空态两分支的唯一事实源（B-3）");
   assert.equal((body.match(/poolOutcome,/g) ?? []).length, 1, "池结论单点入视图（差集在板、只装配一次）");
+});
+
+test("池-⑱（切片负向钉 · REQ-2026-10-10-03 N1）样式类锚不得再充当任何切片界 · 切片式只许写在两枚 helper 定义处", () => {
+  const selfSource = readFileSync(fileURLToPath(import.meta.url), "utf8");
+  // needle 用字符类拆开书写（inde[x]Of / [c]lass），本文件里因此不存在「样式类当界」的那串字面量本身。
+  const styleBound = /inde[x]Of\s*\(\s*['"]?[^)'"]*[c]lass=/;
+  assert.equal(styleBound.test(selfSource), false, "切片界只用两枚 DOM 锚（data-side / member-forms-fold）；样式类随重构漂移 ⇒ 拿它当界会静默切成空片段，锚看似在跑实则不验任何东西");
+  const sliceSites = selfSource.split("\n").filter((line) => /\.slice\([^{]*inde[x]Of/.test(line));
+  assert.equal(sliceSites.length, 2, "全文件只有两枚 helper 的定义行取界，测试体内不得再各写一份内联切片式");
+  assert.ok(sliceSites.every((line) => /^const (pool|own)Column = /.test(line)), "取界的两行就是 poolColumn / ownColumn 的定义行");
+});
+
+/**
+ * 池-⑲（迁入锚 · REQ-2026-10-10-03 N3）—— 逐组声明态成员清单卡退役（N2）后，
+ * 原挂在该卡上的三条锚迁入本文件（本文件的夹具已装配池，`orgs-page` 的 harness 不装配 ⇒ 承接位只能落这里）：
+ *  - 卡头「本组成员计数」（原 `orgs-page:593`「该组声明成员 2 项」）；
+ *  - 「本组完整清单不减」（原 `orgs-page:594` 成员行 `<td>win-a</td><td>board</td>`）；
+ *  - `observedAt` 上页（原 `orgs-page:597`，摘出 warn 夹具 ⇒ 本用例 warnings 为空，走正常档 summary）。
+ */
+test("池-⑲（迁入锚 · REQ-2026-10-10-03 N3）本组成员计数 + 本组完整清单 + 观测时刻上页（退役卡三条锚的承接位）", () => {
+  const groups = {
+    ok: true,
+    warnings: [],
+    observedAt: "2026-09-27T02:00:00.000Z",
+    groups: [{ name: "alpha", memberCount: 2, members: [{ machineId: "win-a", projectId: "board" }, { machineId: "win-a", projectId: "orch" }] }],
+  };
+  const html = renderOrgSpaceManagePage({
+    org: "alpha",
+    features: [],
+    projectsOutcome: { ok: true, projects: [] },
+    groupsOutcome: groups,
+    poolOutcome: computeProjectPool(
+      snapFromRegistry([{ machineId: "win-a", projects: [{ projectId: "board" }, { projectId: "orch" }, { projectId: "free-1" }, { projectId: "free-2" }] }]),
+      groups,
+    ),
+  });
+  assert.match(html, /池 2 项 · 本组 2 项/, "卡头计数承载「本组成员计数」（声明面两项不因退役卡而少报一项）");
+  assert.match(
+    ownColumn(html),
+    /<div class="mrow" draggable="true" data-machine="win-a" data-project="board"><span class="mono">win-a<\/span> \/ <span class="mono">board<\/span>/,
+    "本组完整清单不减（两项成员行逐条落右栏；两项 ⇒ 非末位 ⇒ 行带 draggable，与末位闸同判据）",
+  );
+  assert.match(html, /<p class="b-note ok">配置齐备 · 上次核对时间 2026-09-27T02:00:00\.000Z<\/p>/, "observedAt 上页（声明是快照不是实时）—— 无 warn 夹具的正常档一行");
+});
+
+// ---------------------------------------------------------------------------
+// ⑤ REQ-2026-10-10-03 N4 · 退役卡承接位的两档互斥钉（N-4 / N-5 / N-4b）
+// 「组未声明」与「已声明但成员清单为空」是**两个不同的事实**，不得塌成同一句；
+// 「未声明」档由池卡**三出口**同渲同一枚 note（未查询 / 不可用 / 右栏空态）。
+// ---------------------------------------------------------------------------
+
+/** 声明面可读但**不含 alpha**（= 组未声明）。 */
+const UNDECLARED_GROUPS = groupsOutcome(BETA_ONE);
+/** 声明面可读且 alpha 已声明、成员清单为空（= 已声明无成员）。 */
+const DECLARED_EMPTY_ALPHA = { name: "alpha", memberCount: 0, members: [] };
+
+test("池-⑳（N-4 · REQ-2026-10-10-03 N4）两档互斥钉：组未声明 ⇒ 渲「未声明」，且不得渲成「已声明、成员清单为空」", () => {
+  const html = renderOrgSpaceManagePage({
+    org: "alpha",
+    features: [],
+    projectsOutcome: null,
+    groupsOutcome: UNDECLARED_GROUPS,
+    poolOutcome: computeProjectPool(pool([prow("m1", "p-a1"), prow("m9", "p-free")]), UNDECLARED_GROUPS),
+  });
+  assert.match(html, /<b>未声明<\/b>/, "退役卡的「未声明」档由池卡承接（诚实通道不因删卡失承载）");
+  assert.doesNotMatch(
+    html,
+    /（本组暂无项目：该组已在 orch 声明、成员清单为空/,
+    "「组未声明」≠「已声明但成员为空」：两档字面不得互塌（塌成同句即本锚红）",
+  );
+});
+
+test("池-㉑（N-4b · REQ-2026-10-10-03 N4）三出口的另两个早退出口同样承接「未声明」（快照未装配 / 池不可用）", () => {
+  const unassembled = renderOrgSpaceManagePage({
+    org: "alpha",
+    features: [],
+    projectsOutcome: null,
+    groupsOutcome: UNDECLARED_GROUPS,
+    poolOutcome: null,
+  });
+  assert.match(unassembled, /<b>未声明<\/b>/, "出口一「未查询」档：右栏空态渲不出，仍由早退分支带出未声明 note");
+  const unavailable = renderOrgSpaceManagePage({
+    org: "alpha",
+    features: [],
+    projectsOutcome: null,
+    groupsOutcome: UNDECLARED_GROUPS,
+    poolOutcome: { ok: false, code: "snapshot_unreachable", error: "快照面爆炸（假）" },
+  });
+  assert.match(unavailable, /<b>未声明<\/b>/, "出口二「不可用」档：整块灰化也不得丢掉未声明结论");
+});
+
+test("池-㉒（N-5 · REQ-2026-10-10-03 N4）右栏空态正锚：已声明 ∧ members 为空 ⇒ 渲「本组暂无项目…」且不与「建组」引导混写", () => {
+  const html = renderOrgSpaceManagePage({
+    org: "alpha",
+    features: [],
+    projectsOutcome: null,
+    groupsOutcome: groupsOutcome(DECLARED_EMPTY_ALPHA, BETA_ONE),
+    poolOutcome: computeProjectPool(pool([prow("m9", "p-free")]), groupsOutcome(DECLARED_EMPTY_ALPHA, BETA_ONE)),
+  });
+  assert.match(
+    ownColumn(html),
+    /（本组暂无项目：该组已在 orch 声明、成员清单为空 —— 左栏拖入即加入本组/,
+    "已声明空组的右栏空态逐字在位（与池-⑳ 是一对互斥钉的两半）",
+  );
+  assert.doesNotMatch(ownColumn(html), /建组/, "该档不得冒充「未声明」的建组引导（组已在声明面存在）");
 });

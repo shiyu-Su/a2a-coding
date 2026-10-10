@@ -6,6 +6,7 @@
  *   orch 侧同名类型见 `orch/types.ts`，修改时需两侧同步。
  */
 import type { AgentKind } from "./agent-kinds.js";
+import type { TaskType } from "./task-types.js";
 
 /**
  * Bridge ⇄ Launcher 线协议版本（单一事实源：仓库根 PROTOCOL.md；orch 侧同名常量见
@@ -31,6 +32,14 @@ export const PROTOCOL_VERSION = "2.3";
  * 取值集合单一事实源 = `./agent-kinds.js`（本模块仅 re-export，既有 import 站点不变）。
  */
 export type { AgentKind };
+
+/**
+ * 职责位（`taskType`）取值集合（v0.10.2 · M-1）。
+ * 取值集合单一事实源 = `./task-types.js`（本模块仅 re-export，既有 import 站点不变）。
+ * 消费点：`launcher/runner-exec.ts`（派发 + `roles` 映射读点）、`agent-roles.ts`（加载期校验，
+ * v0.10.2 · M-4）、`launcher/self-check.ts`（自检真跑那条的出场身份）。
+ */
+export type { TaskType };
 
 /** 任务风险档位：由适配器映射为各 CLI 的权限 / 沙箱参数 */
 export type RiskLevel = "read" | "write" | "full";
@@ -75,11 +84,18 @@ export interface ProjectConfig {
    * - `model` —— 非必填，适配器读出后经 `--model` 透传给 ACP 桥（协议面 set，不校验、不映射）；
    * - `systemPrompt` / `systemPromptMode` —— 非必填，自定义注入经 `--system-prompt` /
    *   `--system-prompt-mode` 透传（缺省 `append`）。
+   * - `roles` —— **职责位映射**（v0.10.2 · M-4 · F-C2，per project 一处）：
+   *   `roles = { <taskType>: { model?, systemPrompt?, systemPromptMode?, risk? } }`，
+   *   角色名 = `./task-types.js` 的 `TASK_TYPES` 闭集，形状与校验见 `./agent-roles.js`。
+   *   **`agentConfig` 首个嵌套校验**：`roles` **子对象**四条 fail-closed（撞保留键 / `risk`
+   *   rank 高于项目生效值 / 子对象未知键 / 未配 ⇒ 逐字现状）；**顶层平铺保持现状**
+   *   （未知顶层键静默忽略）⇒ 两套语义并存，是收窄的结果不是缺陷。
    *
    * **段键（`<kind>` 段）已退役**：段内键不再被任何人消费（写了无效、也不再告警）—— 其读者
    * （`writeAgentConfig` / `agents/` 产物 / `--config-file` / `--config-segment`）随段一并删除。
    * **「保留」≠ 提供读点**：命名空间保留键清单见 `./agent-kinds.ts` 的
-   * `RESERVED_AGENT_CONFIG_FLAT_KEYS`（保留只占命名空间，不等于该键已有平铺读点）。
+   * `RESERVED_AGENT_CONFIG_FLAT_KEYS`（保留只占命名空间，不等于该键已有平铺读点；
+   * v0.10.2 · M-4 起该清单有**运行期消费者** = `agentRolesErrors()` 校验①）。
    */
   agentConfig?: Record<string, unknown>;
 }

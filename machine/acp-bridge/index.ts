@@ -54,12 +54,23 @@
  * `session/set_config_option {configId:"model"}` 下发；缺省 / 空串 ⇒ 不发该请求（与旧版逐字一致）。
  * 走 CLI 而非 `--config-file` 白名单扩展：后者只覆盖 opencode，qoder 不接该通道。
  *
+ * v0.10.2 · 节点 M-2（角色化，改造文档 §2.3 F-M2）：**会话级 per-request 覆盖通道**。
+ * 本文件的 CLI（`--model` / `--mode` / `--collaboration-mode` / `--system-prompt[-mode]` / `--risk`）
+ * 语义抬为**进程级回落源**：派发可在 `message/send` 的 **A2A `message.metadata`** 里逐键带覆盖值，
+ * 生效序 = **override 优先、无则回落此处装配的构造器值**（解析点 = `a2a-server.parseRoleIntent`，
+ * 合并点 = `acp/session.ts` 的 `AcpSessionRunner.resolveTurnKnobs`）。
+ * **无新增 CLI flag**（覆盖不走命令行）；不带 `metadata` ⇒ 全部走回落 = 逐字现状。
+ * 覆盖**只在同 `agentKind` / 同后端进程内**生效（跨 kind / 跨 `backendCmd` = 本版边界外，F-C4 `M2-b`）。
+ * `--risk` 的回落接线由 **M-3** 补齐（M-2 落笔时 `permission.ts` 未接 ⇒ risk override 静默无效，
+ * 即 F-M2 登记的漏点）：`session/request_permission` params 带 `sessionId` ⇒ 处理器经进程内共享的
+ * {@link SessionRiskRegistry} 按会话取档，未登记回落此处 `args.risk`。
+ *
  * 不 import `launcher/**` / `orch/**`；无第三方依赖（仅 node:*）。
  */
 import { pathToFileURL } from "node:url";
 import { createAcpA2AServer, type AcpA2AServer } from "./a2a-server.js";
 import { AcpClient, createNodeAcpSpawn } from "./acp/client.js";
-import { createPermissionHandler } from "./acp/permission.js";
+import { createPermissionHandler, SessionRiskRegistry } from "./acp/permission.js";
 import {
   AcpSessionRunner,
   DEFAULT_SESSION_TIMEOUT_MS,
@@ -372,7 +383,10 @@ export async function startBridge(args: BridgeArgs, deps: StartBridgeDeps = {}):
     logger,
   });
   await client.initialize();
-  client.setRequestHandler(createPermissionHandler(args.risk, logger));
+  // v0.10.2 · M-3：会话级 risk 路由表 = 处理器与 runner 之间的**进程内共享对象**
+  // （注册点在本侧、读取点在处理器；无 per-request 登记 ⇒ 逐字回落 args.risk）。
+  const sessionRisks = new SessionRiskRegistry();
+  client.setRequestHandler(createPermissionHandler(args.risk, logger, sessionRisks));
 
   // 自定义注入（v0.8.5 · M4）：段与 `--config-file` 通道退役 ⇒ 直接来自桥 flag。
   const injection: AcpInjectionConfig = {
@@ -387,6 +401,10 @@ export async function startBridge(args: BridgeArgs, deps: StartBridgeDeps = {}):
     ...(args.sessionRetentionDays !== undefined ? { retentionDays: args.sessionRetentionDays } : {}),
     ...(args.sessionRetentionMax !== undefined ? { retentionMax: args.sessionRetentionMax } : {}),
   });
+  // v0.10.2 · M-2：以下四旋钮的 flag 取值 = **进程级回落源**（`AcpSessionRunner.resolveTurnKnobs` 的
+  // 「无 override 时」一侧）；per-request 覆盖自本版经 `message/send` 的 A2A `metadata` 进来
+  // （解析点 = `a2a-server.parseRoleIntent`），**逐键**优先于此处装配的值。
+  // ⇒ 本装配**不得删**：删掉即失去回落语义（未带 override 的派发会零配置下发）。
   const runner = new AcpSessionRunner({
     client,
     cwd: args.workspace,
@@ -398,6 +416,8 @@ export async function startBridge(args: BridgeArgs, deps: StartBridgeDeps = {}):
     ...(args.collaborationMode !== undefined ? { collaborationMode: args.collaborationMode } : {}),
     ...(args.sessionMeta !== undefined ? { sessionMeta: args.sessionMeta } : {}),
     ...(args.mcpServers !== undefined ? { mcpServers: args.mcpServers } : {}),
+    // v0.10.2 · M-3：risk 的 per-request 通道（与上面装配点同一登记表实例）。
+    sessionRisks,
     logger,
   });
   const server = createAcpA2AServer({ executor: runner, logger });

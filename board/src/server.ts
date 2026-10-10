@@ -296,7 +296,6 @@ import {
   renderOrgSpaceManagePage,
   renderProjects,
   renderDocPage,
-  renderProjectVersionsBlock,
   renderSchedule,
   renderTasks,
   renderTasksPick,
@@ -417,7 +416,7 @@ export interface CreateBoardServerOptions {
   /**
    * **组织空间管理页的全组枚举查询器**（v0.9.4 C 档 · BD5）：只读 `GET <3300>/api/groups`
    * （orch 组结构**声明面** = manage 页成员清单的事实源）。缺省 = 按读面桥基址（config
-   * `bridgeUrl`）真查；测试注入假端点。`null` ⇒ 不查询，成员区如实显示「未查询」。
+   * `bridgeUrl`）真查；测试注入假端点。`null` ⇒ 不查询，池右栏与核对卡首行如实显示「未查询」。
    */
   orgGroupsFetcher?: OrgGroupsFetcher | null;
   /**
@@ -749,7 +748,7 @@ function orgsStatusOf(host: BoardHostFace | null): OrgsDirStatus {
 // ---------------------------------------------------------------------------
 // v0.10.0 B4：已发版锁的引擎读投影（事实源 = 引擎版本台账，板只投影）
 // v0.10.1 B2：同一份投影按**两档分立**消费 —— Group 档（本区：版本列 / 排期锁 / 门户摘要 /
-// 启动日志）语义零变化；project 档（{@link projectVersionTierOf}）只在 project 区块出降级条，
+// 启动日志）语义零变化；降级条只归 project 档（{@link projectVersionTierOf}）出，
 // **绝不进排期写门**（并档 = 引擎 project 出口上线前整板排期写停摆）。
 // ---------------------------------------------------------------------------
 
@@ -839,7 +838,7 @@ async function versionProjectionOf(ctx: Ctx): Promise<EngineVersionsProjection |
  * - 投影在场 ∧ 字段在场零条目 ⇒ `empty`（**合法事实**，非降级）；
  * - 投影在场 ∧ 字段缺位 / 形状不合法 ⇒ `absent`（老引擎档，经 {@link projectVersionsOf} 归一，
  *   **绝不当成「零条目」的 `empty`**）；
- * - 投影为 `null`（本进程从未读到过）⇒ 合成 `absent` 带根因码 ⇒ **只有 project 区块出降级条**，
+ * - 投影为 `null`（本进程从未读到过）⇒ 合成 `absent` 带根因码 ⇒ **只有 project 档出降级条**，
  *   Group 面（版本列 / 已发版锁 / 门户摘要 / 启动日志）与排期写门各按**自己的档**处理、不受牵连。
  */
 export function projectVersionTierOf(projection: EngineVersionsProjection | null): ProjectVersionsField {
@@ -854,12 +853,13 @@ export function projectVersionTierOf(projection: EngineVersionsProjection | null
 /**
  * project 档**三态显示闭集**里「读不到」那一档的降级条正文单点（v0.10.1 B2 · C-7：
  * 在场有行 / 在场无行 / 读不到）：`live` 与 `empty` ⇒ `null`（**无降级条** —— `empty` 是
- * **合法事实**「未登记，本版本起生效」，由 project 区块自己渲文案，不是降级），
- * `absent` ⇒ 一行含**根因码**的提示。T3 的 project 区块只准经本函数取降级文案（不各写一套）。
+ * **合法事实**「未登记，本版本起生效」，由 project 档自己渲文案，不是降级），
+ * `absent` ⇒ 一行含**根因码**的提示。**唯一消费面 = 管理页「配置核对」卡第三行**（v0.10.2 落点④）——
+ * 其它读面不得各写一套降级文案。
  */
 export function projectVersionDegradationText(field: ProjectVersionsField): string | null {
   if (field.status !== "absent") return null;
-  return `引擎 project 版本面降级（${field.code} · ${field.error}）—— 仅本区块不可读，` +
+  return `引擎 project 版本面降级（${field.code} · ${field.error}）—— 仅 project 档不可读，` +
     "**不影响 Group 面**（版本列 / 已发版锁 / 门户摘要照常），也不挡排期写";
 }
 
@@ -878,7 +878,7 @@ async function portalSummaryLedgerOf(ctx: Ctx): Promise<VersionsLedger> {
 /**
  * 写口的 fail-closed 出口：拿不到投影 ⇒ 结构化 503 拒写（零出网，不触引擎写口）。
  * **本出口只由 Group 档（`versions[]`）触发**（v0.10.1 B2 · C-12）：project 档缺位 / 形状不合法
- * 只在 project 区块出降级条（见 {@link projectVersionTierOf} / {@link projectVersionDegradationText}），**不得**并进来 —— 否则引擎
+ * 只在 project 档出降级条（见 {@link projectVersionTierOf} / {@link projectVersionDegradationText}），**不得**并进来 —— 否则引擎
  * project 出口上线前排期写会被全部挡死（自造停摆）。
  */
 function respondVersionProjectionClosed(
@@ -927,15 +927,6 @@ function respondVersionProjectionClosed(
  * org 字段、org 只从路径取，见 {@link handleWriteVersions}），挂在那儿只会把新版本写进**未归属空串桶**
  * ⇒ 门户与各空间页都读不到 = 静默黑洞。故入口随本节点整体迁进空间排期页（全局页头按钮同批撤除；
  * `POST /versions` 全局路由与写闸**零改动**留作纯 HTTP 兜底口，口径同 §9.2「UI 撤、写口留」）。
- * **project 版本区块接线（v0.10.1 B4 · C-18①）**：区块由 {@link renderProjectVersionsBlock} 渲染，
- * **串在 {@link renderSchedule} 的整段返回之后** ⇒ 容器恒在 `#schedule-board` 之外（同级 section）。
- * 落点必须是这里而非看板内部：`DRAG_SCHEDULE_SCRIPT` 的入口守卫只认 `getElementById("schedule-board")`，
- * 区块若嵌进看板会被既有拖拽脚本当成看板的一部分、在新块上误触发拖拽 POST。**本函数不动 `#schedule-board`
- * 内部结构、不改排期列渲染逻辑**（`renderSchedule` 签名与列序归渲染侧的口径零改动）。
- * project 档取数**共用上面同一次 Group 投影**（{@link projectVersionTierOf} 是纯函数，零新增上游读取），
- * org 切片沿用同一 `org`（`spaceOrg === null` ⇒ `undefined` = 不限组织），降级文案单点
- * {@link projectVersionDegradationText} —— project 档 `absent` **只出本区块降级条**，
- * 不牵连版本列 / 已发版锁 / 排期写门（C-12 两档分立）。
  */
 async function renderScheduleBoard(
   ctx: Ctx,
@@ -952,12 +943,8 @@ async function renderScheduleBoard(
   // （降级档，正常档空数组）。并集（∪ 卡派生版号）在视图侧完成，此处不预裁。
   const engineColumnVersions = projectionVersionNames(projection, org);
   const ledgerColumnVersions = projection === null ? ledgerVersionNames(ledger, org) : [];
-  // v0.10.1 B4：project 档与上面 Group 面**共用这份投影**（不另打上游），三态显示归视图单点。
-  const projectVersions = projectVersionTierOf(projection);
   return (
     renderSchedule(groupFeaturesByVersion(features, ledgerColumnVersions, engineColumnVersions), selectRequirementPool(features), lockedVersions, ledger, org) +
-    // v0.10.1 B4（C-18①）：project 版本区块 = `#schedule-board` 的**同级 section**，串在看板整段之后
-    renderProjectVersionsBlock(projectVersions, org, projectVersionDegradationText(projectVersions)) +
     // 提需求弹窗骨架（表单原样复用；orgsDir 三档提示与锁版警示随表单呈现）
     renderNewRequirementDialog(ctx.write.defaultGroup, orgsStatusOf(ctx.host), lockedVersions, spaceOrg) +
     (spaceOrg !== null ? renderNewVersionDialog(spaceOrg) : "")
@@ -2081,8 +2068,6 @@ function detailSpaceOrg(ctx: Ctx, routeOrg: string | null | undefined, ownerGrou
  * **建版本入口归本页（v0.9.6 B4 · 口径 4 / 24）**：页头「＋ 新版本」按钮 + {@link renderNewVersionDialog}
  * 骨架同批在位（骨架由 {@link renderScheduleBoard} 在 `spaceOrg !== null` 档渲染）——台账按
  * `(org, version)` 成域后，本页是**全站唯一**的登记新版本入口（全局 `/schedule` 那份已随 B5a 整页退役）。
- * **v0.10.1 B4**：「各 project 版本」区块随本页出（喂入点在 {@link renderScheduleBoard}，
- * 容器在 `#schedule-board` **之外**）—— 本页不另拼区块 HTML、不新增脚本（内联脚本闭集仍七元）。
  */
 async function pageOrgSpaceSchedule(ctx: Ctx, org: string, all: readonly FeatureListItem[], orgNav: PageOrgNav): Promise<Page> {
   const features = featuresOfOrg(all, org);
@@ -2109,11 +2094,15 @@ const SPACE_ACTIVE: NavKey = "schedule";
 /**
  * `GET /org/<名>/manage`（v0.9.4 §9-c · REQ-2026-09-27-06 N3）：**空间内管理页** ——
  * `/orgs` 组织管理页退役后，成员管理与停用操作在本组织空间内承接：
- * - **成员区** = 该组声明态成员清单（3300 `GET /api/groups` 投影）+ 增 / 删表单
- *   （action 复用既有全局写口 `POST /orgs/{org}/members`，服务端零改动）；
+ * - **声明面读面** = 3300 `GET /api/groups` 的该组投影 + 增 / 删表单
+ *   （action 复用既有全局写口 `POST /orgs/{org}/members`，服务端零改动）；**v0.10.2 N2 撤销原「成员清单」卡**
+ *   ⇒ 该次读取的健康度改由配置核对卡首行承载，「未声明」档由项目池卡的三出口承接；
  * - **停用操作** = `POST /orgs`（隐藏 `action=disable`，同写口分流）；成功 303 回 `/` 即门户；
- * - **项目区** = 本组运行态项目（只读 `a2a_projects`，组身份 = 组织名；与声明态成员清单并存、不替代）；
+ * - **项目区** = 本组运行态项目（只读 `a2a_projects`，组身份 = 组织名；**置顶第一块**，与 3300 声明面读面并存、不替代）；
  * - 需求简表 = 归一层已持有的该组需求投影（`resolved.features`，**零新增触桥面**）。
+ * **v0.10.2 N2（④）**：本页另取**引擎版本台账投影**单点 = {@link versionProjectionOf}（并行四路之一，
+ * 在途共用 ⇒ **一次渲染恰一次** `GET /api/versions`；8787 上第二条 HTTP 读路，**不新增上游主机**），
+ * 供配置核对卡第三行按 project 档三态如实核对（该源**读不到不进**项目卡的 `!outcome.ok` 分支 —— 两条通路）。
  * 停用组织进本路由已由归一层挡下（410 `board_org_space_gone`，同空间口径）。
  */
 async function pageOrgSpaceManage(ctx: Ctx, org: string, all: readonly FeatureListItem[], orgNav: PageOrgNav): Promise<Page> {
@@ -2150,8 +2139,17 @@ async function pageOrgSpaceManage(ctx: Ctx, org: string, all: readonly FeatureLi
       return { ok: false, code: "snapshot_unreachable", error: errText(err) };
     }
   })();
-  const [groups, projects, snapshot] = await Promise.all([groupsOutcome, projectsOutcome, snapshotOutcome]);
+  const [groups, projects, snapshot, projection] = await Promise.all([
+    groupsOutcome,
+    projectsOutcome,
+    snapshotOutcome,
+    // v0.10.2 N2（④ 配置核对卡第三行）：第 4 路**并行**读取，与项目卡新列（N3）共用同一在途结果
+    // ⇒ 一次渲染**恰一次** `GET /api/versions`（8787 上第二条 HTTP 读路，**不新增上游主机**）。
+    versionProjectionOf(ctx),
+  ]);
   const poolOutcome = computeProjectPool(snapshot, groups);
+  // ④ 第三行的三档原料：project 档归一 + 降级文案单点（两者都不落库、不留缓存，纯本次渲染派生）。
+  const versionField = projectVersionTierOf(projection);
   // v0.9.8 按项目组配 agent：配置卡数据源 = 本次已读台账记录 + configView（零新读面；宿主面未装配 ⇒ 全局两键 null）
   const orgRec = findOrgRecord(ctx.orgsLedger.load().ledger, org);
   const faceConfig = ctx.host === null ? null : ctx.host.configView();
@@ -2179,6 +2177,13 @@ async function pageOrgSpaceManage(ctx: Ctx, org: string, all: readonly FeatureLi
           orgModel: orgRec?.agentModel ?? null,
           globalKind: faceConfig?.kind ?? null,
           globalModel: faceConfig?.hostModel ?? null,
+        },
+        // 配置核对卡第三行（④）：三档判据的原料一次给全 —— 投影本体（null = 从未读到）、
+        // 本次读失败根因（非 null = stale，值取最后一次投影）、`absent` 档降级文案单点。
+        versionProjection: {
+          projection,
+          failure: ctx.engineVersionsFailure,
+          degradationText: projectVersionDegradationText(versionField),
         },
       }),
   };

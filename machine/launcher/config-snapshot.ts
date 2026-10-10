@@ -3,7 +3,8 @@
  *
  * 每次拉起 Agent（manager.start，含自检触发的启动）向 Launcher 日志报告：
  * 1. 配置获取层级：项目 agentConfig（**平铺键**）+ 各 kind 的用户级配置层；
- * 2. endpoint 与模型 id（配置面解析，值标注来源）。
+ * 2. endpoint 与模型 id（配置面解析，值标注来源）；
+ * 3. v0.10.2 · M-4 起：`agentConfig.roles`（职责位映射）的**生效值**（F-C7 取证面）。
  *
  * v0.8.5 语义级重写（REQ-v0.8.5-2026-09-21-01 · M6，随 `agentConfig.<kind>` 段与
  * wrapper 配置通道退役）：
@@ -39,6 +40,8 @@ import {
   DEFAULT_SESSION_RETENTION_MAX,
 } from "../acp-bridge/session-map.js";
 import { DEFAULT_SESSION_TIMEOUT_MS } from "../acp-bridge/acp/session.js";
+import { describeRoleConfig, effectiveRiskOf, rolesOf } from "../agent-roles.js";
+import { TASK_TYPES } from "../task-types.js";
 
 /** 读取 JSON 文件；不存在或解析失败返回 null（快照尽力而为，不抛出） */
 function readJsonIfExists(path: string): Record<string, unknown> | null {
@@ -221,6 +224,30 @@ function describeGateLimits(project: ProjectConfig): string {
   return `并发闸：写上限=${writeText} 读上限=${readText}`;
 }
 
+/**
+ * 职责位映射（`agentConfig.roles`）生效值播报（v0.10.2 · M-4 · F-C7 取证面）：
+ * 逐角色列出该机该项目**配了什么**（`systemPrompt` 只报字符数、不落正文）。
+ *
+ * - **未配 `roles` ⇒ 省略该键**（照 `repo` 先例：缺键 ≠ 报空，老配置日志形状不变）；
+ * - 上限取**本机生效 risk**（`project.risk ?? write`），与加载期校验②、自检面**同一读点**
+ *   （`effectiveRiskOf`），口径不分叉；不读 orch 注册投影。
+ * - 「配了的角色」按 `TASK_TYPES` 闭集序列出，**未配的角色不进播报正文**（回落平铺 / 构造器，
+ *   逐位全清单在自检行里 —— 那边是「配没配都要看得见」，这里是「只报生效的覆盖」）。
+ */
+function describeRoles(project: ProjectConfig): string | undefined {
+  const roles = rolesOf(project.agentConfig);
+  if (roles === undefined) return undefined;
+  const configured: string[] = [];
+  for (const taskType of TASK_TYPES) {
+    const role = roles[taskType];
+    if (role === undefined) continue;
+    configured.push(`${taskType}{${describeRoleConfig(role)}}`);
+  }
+  const body =
+    configured.length > 0 ? configured.join(" ") : "无（配了空对象 ⇒ 全部回落平铺 / 构造器）";
+  return `职责位 roles：上限 risk=${effectiveRiskOf(project)}｜${body}`;
+}
+
 /** 单次 Agent 启动的配置快照：配置层级 + endpoint / 模型 id + 后端入口分层解析结果 */
 export interface AgentConfigSnapshot {
   hierarchy: string;
@@ -248,6 +275,12 @@ export interface AgentConfigSnapshot {
    * **未配置 ⇒ 省略该键**（`undefined`）—— 缺省 = 宿主仓的解释权归引擎，machine 只「配置了才上报」。
    */
   repo?: string;
+  /**
+   * 职责位映射生效值（v0.10.2 · M-4 · F-C7 取证面）：
+   * `职责位 roles：上限 risk=…｜<taskType>{…} …`；
+   * **未配 `roles` ⇒ 省略该键**（照 `repo` 先例，老配置日志形状不变）。
+   */
+  roles?: string;
   /**
    * 后端入口 `[backend]` 日志行正文（不含 `[backend]` 前缀，manager 打印时加）。
    * 命中：`<projectId> kind=<kind> <层名> hit <绝对路径>`；
@@ -293,10 +326,7 @@ function userConfigLayer(project: ProjectConfig): string {
  * 命中（有 `command`）只报命中层；未命中则把解析器已扫的**全层清单**渲染进日志
  * （清单入日志、不进 Error message，规避 `singleLine()` 300 字符截断）。
  */
-function describeBackend(
-  project: ProjectConfig,
-  deps?: BackendEntryDeps,
-): string {
+function describeBackend(project: ProjectConfig, deps?: BackendEntryDeps): string {
   const { command, probes } = resolveBackendEntry(project.agentKind, project.agentConfig, deps);
   if (command !== undefined) {
     const hit = probes.find((p) => p.status === "hit");
@@ -315,6 +345,7 @@ function describeBackend(
  * + 模型 / endpoint（claude 的用户级层按文件存在性直读判定）。
  * v0.8.6 · B4：追加 `backend` 段（后端入口分层解析结果，供 `[backend]` 日志行）。
  * v0.8.10 · M-N5：追加 `gateLimits` 段（两把并发闸的生效上限与出处）。
+ * v0.10.2 · M-4：追加 `roles` 段（职责位映射生效值；未配 ⇒ 省略该键）。
  * `deps` 仅供注入式单测造「命中 / 全 miss」两例；运行期缺省走真机 fs。
  * `cancelQuiesceMs`（v0.8.10 · M-N4）= 该机该项目的取消往返耗时（本机 `tasks/cancel` →
  * `tasks/get` 到桥台账转终态，来自停事件账）；**不反映后端是否真的停止计算**。
@@ -325,6 +356,7 @@ export function describeAgentConfig(
   deps?: BackendEntryDeps,
   cancelQuiesceMs?: number,
 ): AgentConfigSnapshot {
+  const rolesLine = describeRoles(project);
   return {
     hierarchy: `项目 agentConfig（平铺键）+ ${userConfigLayer(project)}`,
     ...resolveModelEndpoint(project),
@@ -332,6 +364,7 @@ export function describeAgentConfig(
     sessionWindow: describeSessionWindow(project, cancelQuiesceMs),
     gateLimits: describeGateLimits(project),
     ...(project.repo !== undefined ? { repo: `repo=${project.repo}（agentConfig）` } : {}),
+    ...(rolesLine !== undefined ? { roles: rolesLine } : {}),
     backend: describeBackend(project, deps),
   };
 }

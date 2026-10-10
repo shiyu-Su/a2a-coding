@@ -414,6 +414,69 @@ test("parseFeatureDetail: acceptance 容错（空对象 / 非数组 / 未知态 
   assert.equal(retired.acceptance.failures[0].payload, "{坏 JSON");
 });
 
+test("parseFeatureDetail: projects[] 三态（v0.10.2 N6 归属读面）—— 真样例 3 行 ⇒ 3 条", () => {
+  // 一手样例（2026-10-10 实测 GET http://127.0.0.1:3300/api/features/25aa4b44 顶层 projects[]）
+  const view = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "25aa4b44", state: "executing" },
+    tasks: [],
+    projects: [
+      { projectId: "board", version: "0.10.2" },
+      { projectId: "machine", version: "0.10.2" },
+      { projectId: "orch", version: "0.10.2" },
+    ],
+  });
+  assert.deepEqual(view.projects, [
+    { projectId: "board", version: "0.10.2" },
+    { projectId: "machine", version: "0.10.2" },
+    { projectId: "orch", version: "0.10.2" },
+  ]);
+});
+
+test("parseFeatureDetail: projects[] = [] ⇒ 空数组（合法「未归属」，不得吞成 null）", () => {
+  const view = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [],
+    projects: [],
+  });
+  assert.deepEqual(view.projects, []);
+  assert.notEqual(view.projects, null, "空面 ≠ 缺面");
+});
+
+test("parseFeatureDetail: 无 projects 键 / 非数组 ⇒ null（缺面 ≠ 空面；真机不可触，以单测代）", () => {
+  const missing = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [],
+  });
+  assert.equal(missing.projects, null);
+  const wrongShape = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [],
+    projects: { projectId: "board", version: "0.10.2" },
+  });
+  assert.equal(wrongShape.projects, null, "非数组 ⇒ null，不抛");
+});
+
+test("parseFeatureDetail: projects[] 逐条严格取 camelCase 两键，非法条目整条丢弃（不抛、不认 snake_case）", () => {
+  const view = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [],
+    projects: [
+      { projectId: "board", version: "0.10.2" },
+      { project_id: "machine", version: "0.10.2" },
+      { projectId: "orch" },
+      { projectId: "flow", version: "" },
+      "x",
+      null,
+    ],
+  });
+  assert.deepEqual(view.projects, [{ projectId: "board", version: "0.10.2" }]);
+});
+
 test("parseProjects: machines/projects/runners 归一 + 缺字段容错", () => {
   const view = parseProjects({
     ok: true,

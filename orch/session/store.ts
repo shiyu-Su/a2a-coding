@@ -31,6 +31,7 @@ import type {
   TaskLane,
   TaskRecord,
   TaskState,
+  TaskType,
   VersionLedgerStatus,
 } from "../types.js";
 import {
@@ -45,6 +46,7 @@ import {
   isVersionLedgerStatus,
   ORPHAN_FAILURE_KIND,
   TASK_LANES,
+  TASK_TYPES,
 } from "../types.js";
 
 /**
@@ -416,6 +418,15 @@ export interface TaskCreateInput {
    * 任何一次未带 `lane` 的 upsert（重派 / 补登记）都会静默改档。要显式改档必须**显式传值**。
    */
   lane?: TaskLane | null;
+  /**
+   * **职责位**（v0.10.2 O-1，落 `tasks.task_type`；缺省 `undefined` = 落库 NULL ⇒ 读侧按 `unit_agent`
+   * 解释 = 本字段引入前的唯一行为）。
+   *
+   * ⚠️ **ON CONFLICT 走 `COALESCE(excluded.task_type, task_type)`**（保留首次声明）：与 `lane` 同一条
+   * 理由 —— 本字段**缺省不是 `unit_agent` 而是 NULL**，正是为了「**不带职责位的重登记不会把
+   * `dev_manager` 降成 `unit_agent`**」（重派 / 补登记都走同一条 upsert）。要显式改档必须**显式传值**。
+   */
+  taskType?: TaskType | null;
 }
 
 /** `listTasks` 入参：按项目（可选状态）取最近任务 */
@@ -951,6 +962,10 @@ function isTaskLane(v: string): v is TaskLane {
   return (TASK_LANES as readonly string[]).includes(v);
 }
 
+function isTaskType(v: string): v is TaskType {
+  return (TASK_TYPES as readonly string[]).includes(v);
+}
+
 /**
  * **写档 SQL 片段**（v0.8.10 O-N1；忙集谓词与 `claimTask` 写优先排序**共用同一片段**）。
  *
@@ -1186,9 +1201,11 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
  *
  * v0.8.10 O-N1：加 `lane`（并发档）。**列只加在迁移段、不进 `TASKS_DDL`**（照 v0.6.1 起既有纪律：
  * `dispatch_guard` / `diagnostics_json` / `dispatch_rendered` 三列同此），老库升级路径不变。
+ *
+ * v0.10.2 O-1：加 `task_type`（职责位）。**同一条纪律：列只加在迁移段、不进 `TASKS_DDL`**。
  */
 const TASK_COLUMNS =
-  "task_id, project_id, context_id, state, lane, artifacts_json, text, prompt, " +
+  "task_id, project_id, context_id, state, lane, task_type, artifacts_json, text, prompt, " +
   "feature_id, dependencies, input_artifacts, remote_task_id, dispatch_guard, dispatch_message, dispatch_rendered, updated_at, " +
   "retry_count, failure_kind, diagnostics_json, " +
   "created_at, started_at, finished_at";
@@ -1255,6 +1272,7 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     contextId: readString(row, "context_id"),
     state,
     lane: readLane(row),
+    taskType: readTaskType(row),
     artifactsJson: readNullableString(row, "artifacts_json"),
     text: readNullableString(row, "text"),
     prompt: readNullableString(row, "prompt"),
@@ -1455,6 +1473,24 @@ function readLane(row: Record<string, unknown>): TaskLane {
   if (raw === null) return "write";
   if (!isTaskLane(raw)) {
     throw new Error(`[session-store] 列 lane 数据损坏：非法值 ${raw}`);
+  }
+  return raw;
+}
+
+/**
+ * 解析 `task_type` 列（v0.10.2 O-1）：**NULL 归一为 `unit_agent`**（缺省职责位 = 本列引入前的
+ * 唯一行为，存量行与未带职责位的建行路径均落此档）；
+ * 非 NULL 但闭集外的值 = 数据损坏（fail-fast，与其余列同纪律；**不兜底归一**）。
+ *
+ * 与 `readLane` 的**同一形状、相反的兜底禁忌**：`lane` 若把 NULL 当只读 = 静默放宽串行门；
+ * 本列若把 NULL 当非 `unit_agent` = 给存量行凭空赋新语义（触发 `roles` 路由）。
+ * 两侧 SQL 都**不谓词化**本列（O-1 无按职责位筛选的查询），归一只在此一处。
+ */
+function readTaskType(row: Record<string, unknown>): TaskType {
+  const raw = readNullableString(row, "task_type");
+  if (raw === null) return "unit_agent";
+  if (!isTaskType(raw)) {
+    throw new Error(`[session-store] 列 task_type 数据损坏：非法值 ${raw}`);
   }
   return raw;
 }
@@ -2070,6 +2106,7 @@ export class SessionStore {
     // 零副作用（连续两跑库状态一致）；**注册表不启动清空**（不清 `runners` / `runner_projects`，
     // 重启后投影仍在）。段落划分（顺序固定）：
     //   段 1：`tasks` 队列五列；段 1b：`tasks.lane`（v0.8.10 O-N1，含存量归一）；
+    //   段 1c：`tasks.task_type`（v0.10.2 O-1，存量**不回填**）；
     //   段 2：`runners` 表；段 3：`runner_projects` 表；段 4：队列 / 注册表索引。
     // 段 1：`tasks` 队列列。老行一律留 NULL（`queue_state` NULL ⇒ 读侧视为 `settled`，**不回填**）。
     for (const column of [
@@ -2102,6 +2139,22 @@ export class SessionStore {
       // 列已存在（幂等）
     }
     this.db.exec("UPDATE tasks SET lane = 'write' WHERE lane IS NULL");
+    // 段 1c（v0.10.2 O-1 · REQ-2026-10-09-01 §2.3 F-C1 / §3.2）：`tasks.task_type` 职责位列。
+    // 口径 = **缺省 `unit_agent`**（本列引入前的唯一行为：不读该列时与 v0.10.1 逐字一致）。
+    //
+    // ⚠️ **与段 1b 相反**：本段**不做**存量 `UPDATE` 归一 —— `lane` 必须回填是因为 SQL 侧两处谓词
+    // 直接读该列（NULL 漏归 = 静默放宽串行门）；`task_type` 在 O-1 **没有任何 SQL 谓词消费**，
+    // 归一唯一落点 = 读侧 `readTaskType`（NULL ⇒ `unit_agent`）。存量行留 NULL 是**正确语义**
+    // （= 未声明），回填 `'unit_agent'` 反而会把「未声明」与「显式声明 unit_agent」两种事实压平，
+    // 后续按职责位筛选的节点将无法区分。
+    //
+    // 纪律照既有：只加列、必可空、不复用既有列、读侧 `readTaskType`、**只在 ctor try-ALTER**
+    // （`ALTER` 不改 `updated_at`、不写事件 —— 迁移非运行期状态变更）。
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN task_type TEXT");
+    } catch {
+      // 列已存在（幂等）
+    }
     // 段 2 / 段 3：注册表两张（运行态投影；IF NOT EXISTS = 幂等）
     this.db.exec(RUNNERS_DDL);
     this.db.exec(RUNNER_PROJECTS_DDL);
@@ -2237,15 +2290,16 @@ export class SessionStore {
     this.db
       .prepare(
         `INSERT INTO tasks
-           (task_id, project_id, context_id, state, lane, artifacts_json, text, prompt,
+           (task_id, project_id, context_id, state, lane, task_type, artifacts_json, text, prompt,
             feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, dispatch_rendered, updated_at,
             created_at, started_at, finished_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(task_id) DO UPDATE SET
            project_id = excluded.project_id,
            context_id = excluded.context_id,
            state = excluded.state,
            lane = COALESCE(excluded.lane, lane),
+           task_type = COALESCE(excluded.task_type, task_type),
            artifacts_json = excluded.artifacts_json,
            text = excluded.text,
            prompt = excluded.prompt,
@@ -2265,6 +2319,7 @@ export class SessionStore {
         rec.contextId,
         rec.state,
         rec.lane ?? null,
+        rec.taskType ?? null,
         rec.artifactsJson ?? null,
         rec.text ?? null,
         prompt,

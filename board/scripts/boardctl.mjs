@@ -676,7 +676,7 @@ function printUsage() {
 
 配置（BD12″ 口径）：
   本脚本**不解析配置内容** —— 只把 env BOARD_CONFIG（配置文件**路径**）原样透传给板进程；
-  缺省配置文件 = <board>/config/config.json（模板 config.json.default）。
+  缺省配置文件 = <board>/config/config.json（默认值参照 config.json.default · 可运行示例 config.json.example）。
   pidfile  ${PIDFILE_PATH}（板自己写，本脚本只读）
   日志     ${LOG_PATH}
   致命日志 ${FATAL_LOG_PATH}（板死在 logger 之前时唯一的取证面；start 失败会连它一起打尾部）

@@ -17,8 +17,9 @@
  *   确实落到传给后端桥的起桥参数（缺省时连 `agentConfig` 键都不出现）；
  * - **R4 解析进 BoardConfig 端到端**：`loadConfig` 同场携带未知键与 `_` 注释键 ⇒ 忽略且不影响其它键；
  *   空串 / 纯空白 ⇒ null（同 T1 的 validateConfig 断言，此处走真实文件读入）；
- * - **R5 C4 模板锚**：`config/config.json.default` 含 `hostModel` + `_hostModelComment`，
- *   且落在 `hostKind` 邻位（R1 建议项）。
+ * - **R5 C4 模板锚（配置模板拆分 S2 起 = 模板两文件口径）**：`hostModel` 键落 `config/config.json.example`
+ *   的 `hostKind` 邻位，其**说明**（不透传 / 不校验）落 `README.md` 的 `hostModel` bullet ——
+ *   模板不再承载 `_` 注释键，说明位 = README。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -34,8 +35,19 @@ import { buildHostFace } from "../dist/index.js";
 
 const MODEL = "opencode-go/deepseek-v4.1-flash";
 
-/** 配置模板绝对路径（从本测试文件位置反推，与 cwd 无关）。 */
-const TEMPLATE_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "..", "config", "config.json.default");
+/** 可运行起点模板绝对路径（配置模板拆分 S2 起，`hostModel` 等 opt-in 键落这里）。 */
+const TEMPLATE_EXAMPLE_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "..", "config", "config.json.example");
+/** 单元 README 绝对路径（配置模板拆分 S2 起，说明位 = README，不在模板）。 */
+const README_PATH = resolve(dirname(fileURLToPath(import.meta.url)), "..", "README.md");
+
+/** README 里承载 `hostModel` 语义的那枚逐键 bullet（恰好一枚，多枚 = 口径分叉）。 */
+function readmeHostModelBullet() {
+  const hits = readFileSync(README_PATH, "utf8")
+    .split(/\r?\n/)
+    .filter((line) => /^-\s+\*\*`hostModel`/.test(line));
+  assert.equal(hits.length, 1, "README 须恰有一枚 hostModel 逐键 bullet");
+  return hits[0];
+}
 
 /** 假适配器：只记录板传进来的 request（真适配器的 argv 板无权也无需拼）。 */
 function fakeAdapter(kind = "opencode") {
@@ -222,22 +234,23 @@ test("T2-R4（解析进 BoardConfig 端到端）loadConfig：未知键 / _ 注�
 });
 
 // ---------------------------------------------------------------------------
-// R5 · C4 模板锚：hostModel + _hostModelComment 落 hostKind 邻位
+// R5 · C4 模板锚（模板两文件）：hostModel 落 .example 的 hostKind 邻位，说明落 README bullet
 // ---------------------------------------------------------------------------
 
-test("T2-R5（C4 模板锚）config.json.default 含 hostModel 键 + _hostModelComment，且落 hostKind 邻位", () => {
-  const text = readFileSync(TEMPLATE_PATH, "utf8");
+test("T2-R5（C4 模板锚 · 模板两文件）.example 含 hostModel 键且落 hostKind 邻位；说明（不透传 / 不校验）落 README", () => {
+  const text = readFileSync(TEMPLATE_EXAMPLE_PATH, "utf8");
   const parsed = JSON.parse(text);
 
-  assert.ok(Object.prototype.hasOwnProperty.call(parsed, "hostModel"), "模板须声明 hostModel 键");
-  assert.equal(typeof parsed._hostModelComment, "string", "须带 _hostModelComment 注释键");
-  assert.match(parsed._hostModelComment, /不透传/, "注释须写明缺省 = 不透传");
-  assert.match(parsed._hostModelComment, /不校验/, "注释须写明板不校验取值");
+  assert.ok(Object.prototype.hasOwnProperty.call(parsed, "hostModel"), ".example 须声明 hostModel 键");
+  const bullet = readmeHostModelBullet();
+  assert.equal(typeof bullet, "string", "hostModel 说明须由 README 承载（模板不留 `_` 注释键）");
+  assert.match(bullet, /不透传/, "README 的 hostModel bullet 须写明缺省 = 不透传");
+  assert.match(bullet, /不校验/, "README 的 hostModel bullet 须写明板不校验取值");
 
   const iKind = text.indexOf('"hostKind"');
   const iModel = text.indexOf('"hostModel"');
   const iBridge = text.indexOf('"bridgeUrl"');
-  assert.ok(iKind >= 0, "模板须有 hostKind 键");
+  assert.ok(iKind >= 0, ".example 须有 hostKind 键");
   assert.ok(iModel > iKind, "hostModel 应排在 hostKind 之后（邻位）");
   assert.ok(iModel < iBridge, "hostModel 应排在 bridgeUrl 之前（hostKind 邻位）");
 });

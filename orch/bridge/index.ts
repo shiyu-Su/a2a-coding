@@ -46,6 +46,7 @@ import {
   type TaskListItem,
   type TaskRecord,
   type TaskState as DomainTaskState,
+  type TaskType,
   type TransportConfig,
   type TransportMode,
   type WebConfig,
@@ -696,8 +697,10 @@ export interface DispatchTaskInput {
   /**
    * 独立任务（inquiry）建行参数：**全部前置断言通过后**才落库 ⇒ 成员错 / 定位失败**不留脏行**。
    * Feature 节点行已存在（`registerFeatureNode` 已建）⇒ 传 `null`，不重复落库。
+   * `taskType`（v0.10.2 增补三 E-1）= 职责位**声明原样透传**（缺省 undefined = 落库 NULL ⇒
+   * 读侧归一 `unit_agent`）；**与 `lane` 正交** —— inquiry 建行仍恒 `lane='read'`。
    */
-  newTask: { prompt: string; dispatchMessage: string } | null;
+  newTask: { prompt: string; dispatchMessage: string; taskType?: TaskType | null } | null;
   /**
    * 连接身份（v0.8.6 §2.2；`null` / 缺省 = 无身份 ⇒ 全组聚合视图）。
    * - **inquiry 路径**（`handleCall`）：由 `coreFor(identity)` 绑定注入 = 调用方连接身份；
@@ -938,6 +941,9 @@ export async function dispatchTask(input: DispatchTaskInput): Promise<DispatchOu
       // v0.8.10 O-N4：散活（inquiry）本就是只读语义 ⇒ 恒落只读档。
       // 不显式标则按缺省 = 写档 ⇒ 撞 machine 写闸 ⇒ 散活排到 Feature 写节点后面。
       lane: "read",
+      // v0.10.2 增补三 E-1：职责位原样透传声明（缺省 undefined = 落库 NULL ⇒ 读侧归一
+      // unit_agent）；与 `lane` 正交，本行**不改**上面「恒 read」的读档语义。
+      taskType: input.newTask.taskType,
       prompt: truncatePrompt(input.newTask.prompt),
       dispatchMessage: input.newTask.dispatchMessage,
     });
@@ -990,6 +996,10 @@ export async function dispatchTask(input: DispatchTaskInput): Promise<DispatchOu
  *
  * v0.7.0 A4：经队列派发 —— 前置通过后落独立任务行 → 入队 + wake → 同步预算内等终态；
  * 拿到终态回真实结果，否则回 `working` + `taskId`（**对外契约不变**）。
+ *
+ * v0.10.2 增补三 E-1：`taskType` = 职责位声明（可选，形制同 `registerFeatureNode` 的同名入参）
+ * —— 建行时原样落 `tasks.task_type`（缺省 = NULL ⇒ 读侧归一 `unit_agent`）。
+ * **派发形态与并发档不变**：仍恒 `lane='read'`，仍经同一队列与 `toDispatchCommand` 带顶层键。
  */
 async function handleCall(
   projectId: string,
@@ -997,6 +1007,7 @@ async function handleCall(
   contextIdInput: string | undefined,
   wait: boolean,
   mode: "inquiry" = "inquiry",
+  taskType?: TaskType | undefined,
   identity: string | null = null,
 ): Promise<CallOutcome> {
   void mode; // 类型级契约：运行时无需分支（非 inquiry 无法通过编译）
@@ -1008,7 +1019,7 @@ async function handleCall(
     projectId,
     contextId,
     wait,
-    newTask: { prompt: text, dispatchMessage: text },
+    newTask: { prompt: text, dispatchMessage: text, taskType },
     identity,
   });
   if (!sent.ok) {
@@ -1193,10 +1204,16 @@ function renderFeatureContext(feature: FeatureRecord): string | null {
  * v0.8.9 O2：`base` 只读**未渲染的原始消息**（`dispatch_message` 经本节点起不再被渲染结果
  * 回写，恒为干净 base；`?? prompt` 为历史行兜底）⇒ 渲染只发生在本函数返回值，
  * 由调用方落 `dispatch_rendered` 快照列，反复派发不叠加外壳。
+ *
+ * v0.10.2 O-3（F-C6）：**职责位进外壳一行**，且**仅非缺省注入** —— `unit_agent`（含存量 NULL
+ * 归一档）**不注入**，故缺省节点的派发消息**逐字不变**。该行是**面向人 / 后端 agent 的外壳**，
+ * 机器判据仍以派发命令顶层键 `taskType` 为准（machine 侧禁解析正文取该值）；随其余外壳一并
+ * **只进 `dispatch_rendered` 快照**，**绝不回写 `base`**（反复派发不叠加）。
  */
 function buildNodeDispatchMessage(node: TaskRecord, feature: FeatureRecord | null): string {
   const base = node.dispatchMessage ?? node.prompt ?? "";
   const blocks: string[] = [];
+  if (node.taskType !== "unit_agent") blocks.push(`职责位 taskType=${node.taskType}`);
   if (feature !== null) {
     const context = renderFeatureContext(feature);
     if (context !== null) blocks.push(context);
@@ -1214,7 +1231,9 @@ function buildNodeDispatchMessage(node: TaskRecord, feature: FeatureRecord | nul
  * `executing` / `waiting_approval`；`analyzing`（分析扇出）已随主链收敛**有意撤销**；
  * 登记 ≠ 派发 —— `tick` 只看 `executing`。变更该常量即自动更新文案，经 `join` 取用）；
  * `dependencies` 引用同 Feature 内的本地 taskId；`inputs` 声明本节点引用的上游产物；
- * `readOnly`（v0.8.10 O-N4）声明本节点并发档：仅显式 `true` ⇒ `lane='read'`，否则 `'write'`。
+ * `readOnly`（v0.8.10 O-N4）声明本节点并发档：仅显式 `true` ⇒ `lane='read'`，否则 `'write'`；
+ * `taskType`（v0.10.2 O-2）声明本节点职责位：仅显式带值才落 `tasks.task_type`，
+ * **缺省（undefined）= 落库 NULL = 未声明** ⇒ 读侧归一 `unit_agent`（**不在此处兜底写值**）。
  */
 function registerFeatureNode(
   projectId: string,
@@ -1225,6 +1244,7 @@ function registerFeatureNode(
   inputs?: readonly InputArtifactRef[] | undefined,
   identity: string | null = null,
   readOnly?: boolean | undefined,
+  taskType?: TaskType | undefined,
 ): CallOutcome {
   const contextId =
     contextIdInput !== undefined && contextIdInput.length > 0 ? contextIdInput : randomUUID();
@@ -1283,6 +1303,10 @@ function registerFeatureNode(
     // v0.8.10 O-N4：并发档显式写入（不依赖 NULL 缺省）—— readOnly 仅显式 true 才是只读档，
     // 缺省 / false 一律按写档（保守）。
     lane: readOnly === true ? "read" : "write",
+    // v0.10.2 O-2：职责位**原样透传声明**（不做 `?? "unit_agent"` 兜底）—— 缺省 = undefined =
+    // 落库 NULL = 「未声明」，读侧归一 unit_agent；显式归一会把「未声明」压平成「声明了 unit_agent」，
+    // 并让 COALESCE 失去「后续声明可抬档」的能力。
+    taskType,
     // prompt 保留截断片段用于辨识；dispatchMessage 存全文供调度器派发
     prompt: message,
     featureId,
@@ -1707,6 +1731,10 @@ async function handleTasks(
     taskId: record.taskId,
     contextId: record.contextId,
     state: record.state,
+    // v0.10.2 O-3：本面此前连 `lane` 都没有 ⇒ 与 `a2a_feature_status` / `a2a_feature_trace`
+    // 长期不一致，一并补齐。两字段都**恒有值**（读侧 NULL 已归一 write / unit_agent），**不得省略**。
+    lane: record.lane,
+    taskType: record.taskType,
     prompt: record.prompt,
     text: record.text ?? textFromArchivedArtifacts(record.artifactsJson),
     artifacts: parseArchivedArtifacts(record.artifactsJson),
@@ -1909,6 +1937,12 @@ export interface BridgeCore {
      * （`mode="execute"`）必带 `featureId`，走 `registerFeatureNode`（登记 DAG，由调度器派发）。
      */
     mode?: "inquiry",
+    /**
+     * **职责位**（v0.10.2 增补三 E-1）：可选，**缺省 = 未声明**（落库 NULL ⇒ 读侧 `unit_agent`）。
+     * inquiry 的**读档语义不变**（恒 `lane='read'`），本参数与 `lane` 正交。
+     * 非法值在 `register-tools.ts` 的 schema / 准入层已被结构化拒绝，不得到达本口。
+     */
+    taskType?: TaskType | undefined,
   ): Promise<CallOutcome>;
   registerFeatureNode(
     projectId: string,
@@ -1918,6 +1952,11 @@ export interface BridgeCore {
     dependencies: readonly string[],
     inputs?: readonly InputArtifactRef[] | undefined,
     readOnly?: boolean | undefined,
+    /**
+     * **职责位**（v0.10.2 O-2）：可选，**缺省 = 未声明**（落库 NULL ⇒ 读侧 `unit_agent`）。
+     * 非法值在 `register-tools.ts` 的 schema / 准入层已被结构化拒绝，不得到达本口。
+     */
+    taskType?: TaskType | undefined,
   ): CallOutcome;
   taskStatus(taskId: string): Promise<TaskStatusOutcome>;
   cancel(taskId: string): Promise<CancelOutcome>;
@@ -1959,10 +1998,10 @@ export function createCore(identity: string | null = null): BridgeCore {
     projects: (): Promise<MachinesView | Failure> => handleProjects(identity),
     tasks: (projectId, state, limit): Promise<TasksView | Failure> =>
       handleTasks(projectId, state, limit, identity),
-    call: (projectId, text, contextId, wait, mode): Promise<CallOutcome> =>
-      handleCall(projectId, text, contextId, wait, mode, identity),
-    registerFeatureNode: (projectId, message, contextId, featureId, dependencies, inputs, readOnly): CallOutcome =>
-      registerFeatureNode(projectId, message, contextId, featureId, dependencies, inputs, identity, readOnly),
+    call: (projectId, text, contextId, wait, mode, taskType): Promise<CallOutcome> =>
+      handleCall(projectId, text, contextId, wait, mode, taskType, identity),
+    registerFeatureNode: (projectId, message, contextId, featureId, dependencies, inputs, readOnly, taskType): CallOutcome =>
+      registerFeatureNode(projectId, message, contextId, featureId, dependencies, inputs, identity, readOnly, taskType),
     taskStatus: (taskId): Promise<TaskStatusOutcome> => handleTaskStatus(taskId, identity),
     cancel: (taskId): Promise<CancelOutcome> => handleCancel(taskId, identity),
     events: (since): EventsOutcome | Failure => handleEvents(identity, since),

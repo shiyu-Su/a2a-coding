@@ -94,6 +94,7 @@ import type {
   MachinesConfig,
   RiskLevel,
   TaskState,
+  TaskType,
 } from "../types.js";
 import {
   AGENT_KINDS,
@@ -308,6 +309,13 @@ export interface RunnerDispatchCommand {
    * 故 `PROTOCOL_VERSION` 保持 2.3 不升。⚠️ 只挂在命令顶层，**不进 `payload`**。
    */
   readOnly?: true;
+  /**
+   * **职责位声明**（v0.10.2 O-2，来源 `tasks.task_type`）：**仅非缺省**（≠ `unit_agent`）时带；
+   * 缺省（undefined）= 未声明 ⇒ 对端按 `unit_agent` 处理（= 本字段引入前的唯一行为）。
+   * **逐字照 `readOnly?: true` 形制**：只挂在命令顶层、**不进 `payload`**；缺省**不带键**。
+   * 可选 ∧ 缺省即现状 ⇒ `PROTOCOL_VERSION` 保持 2.3 不升（同 `readOnly` 判据）。
+   */
+  taskType?: TaskType;
 }
 
 export interface RunnerStopCommand {
@@ -1306,6 +1314,21 @@ class RunnerEndpoints implements RunnerEndpointHandle {
         featureId: rec.featureId,
       }),
     });
+    /**
+     * **混跑留痕**（v0.10.2 O-2，F-C1「未消费 warn 留痕带原值」）：
+     * 派发命令带 `taskType` = 非缺省职责位；machine 侧的结果回传面（F-C7 冻结裁定）**不带**
+     * `taskType` 消费回执 ⇒ orch 无法正向确认「对端真的按该职责位起了会话」。
+     * 照 v0.8.8 `failure_kind_fallback=<原值>` 形制：**每次派发带非缺省 `taskType` ⇒ warn 一次**，
+     * 键 `task_type_unconsumed=<原值>`；缺省档（`unit_agent`）**不 warn**（避免噪音）。
+     * 该 warn 是**留痕**（audit trail）不是拒绝：混跑结束、machine 侧回执面若补上，删除本 warn。
+     */
+    if (rec.taskType !== "unit_agent") {
+      bridgeLog.warn(
+        "a2a-runner",
+        `派发命令带非缺省 taskType ⇒ 对端无消费回执，混跑期无法正向确认「按该职责位起会话」` +
+          `（task_type_unconsumed=${rec.taskType}）：machineId=${machineId} taskId=${rec.taskId}`,
+      );
+    }
   }
 
   /**
@@ -1554,7 +1577,14 @@ async function readJsonBody(req: IncomingMessage): Promise<BodyOutcome> {
   return { ok: true, body };
 }
 
-function toDispatchCommand(rec: QueuedTaskRecord): RunnerDispatchCommand {
+/**
+ * `QueuedTaskRecord` → `RunnerDispatchCommand`（**导出供单测直接断言顶层键位**，
+ * 与 `resolveReportedFailureKind` 等纯函数同形制）。
+ *
+ * v0.8.10 `readOnly` 与 v0.10.2 `taskType` 都遵循**同一形制**：仅**非缺省**显式带键，
+ * 缺省 ⇒ **键不出现**（= `undefined` = 对端按缺省档解释）。键位**只在命令顶层、不进 `payload`**。
+ */
+export function toDispatchCommand(rec: QueuedTaskRecord): RunnerDispatchCommand {
   return {
     command: "dispatch",
     taskId: rec.taskId,
@@ -1570,6 +1600,9 @@ function toDispatchCommand(rec: QueuedTaskRecord): RunnerDispatchCommand {
     inputs: rec.inputArtifacts,
     // v0.8.10 O-N4：lane → readOnly（仅只读档显式带键；写档不带 = undefined = 对端按写）
     ...(rec.lane === "read" ? { readOnly: true as const } : {}),
+    // v0.10.2 O-2：task_type → taskType（照 readOnly 形制：仅非缺省显式带键；
+    // 缺省 `unit_agent` 不带 = undefined = 对端按 unit_agent = 本字段引入前的唯一行为）
+    ...(rec.taskType !== "unit_agent" ? { taskType: rec.taskType } : {}),
   };
 }
 

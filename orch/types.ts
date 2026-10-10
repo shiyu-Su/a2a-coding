@@ -46,6 +46,23 @@ export const AGENT_KINDS = ["opencode", "codex", "claude", "qoder-cn"] as const;
 export type AgentKind = (typeof AGENT_KINDS)[number];
 
 /**
+ * 职责位（任务类型）取值集合（**v0.10.2 O-1 引入；orch 单元内唯一枚举源**）。
+ *
+ * 取值集合的规范源 = 仓库根 `PROTOCOL.md` 的机器可解析 `task-types` 锚点；
+ * orch（本常量）与 machine 侧对应模块**各自派生常量、不共享代码**（两单元自包含），
+ * 两侧一致性由回归断言「本地清单 == 锚点」锁定（同 `AGENT_KINDS` 先例）。
+ *
+ * ⚠️ **缺省档 = `unit_agent`**（v0.8.10 `TASK_LANES` 的同形纪律）：本清单是**协议镜像**，
+ * orch 不主动扩展 —— 成员变更（增 / 更名 / 移除）必须先改 `PROTOCOL.md` 再同步到这里。
+ * 落库列 `tasks.task_type` 的 **NULL 一律归一为 `unit_agent`**（读侧 `readTaskType`）——
+ * 反向（NULL 当其它档）等于给存量行凭空赋新语义。
+ */
+export const TASK_TYPES = ["unit_agent", "product_manager", "project_manager", "dev_manager"] as const;
+
+/** 职责位（由 `TASK_TYPES` 派生；勿另立第二份清单） */
+export type TaskType = (typeof TASK_TYPES)[number];
+
+/**
  * A2A 任务态。
  * `blocked` 为 **orch 本地专属**（v0.4.0 失败传播：上游失败 → 下游置 blocked），
  * **不映射 A2A**（A2A 无此态；派发/查询一律按 `working` 语义处理）。
@@ -503,6 +520,17 @@ export interface TaskRecord {
    *    同 project 的读写节点都等（本版**不**放开「写挡读」）。
    */
   lane: TaskLane;
+  /**
+   * **职责位**（v0.10.2 O-1，落 `tasks.task_type`；取值见 {@link TASK_TYPES}）。
+   *
+   * 声明形态（与 `lane` 同一条链，O-1 只落「值域 + 落库」两段）：入参 `taskType` → 落库本列 →
+   * 透传 machine（`DispatchCommand.taskType?`）。
+   *
+   * **读侧不存在 NULL**：列里的 NULL 一律归一为缺省档 `unit_agent`（= 本字段引入前的唯一行为）。
+   * 落库侧 NULL 承载的是「**未声明**」这一事实 ⇒ 迁移**不回填**、写侧 `COALESCE` 保留首次声明
+   * （与 `lane` 的「NULL 归保守档 + COALESCE 保首次档」同形，兜底方向按各自缺省档取）。
+   */
+  taskType: TaskType;
   artifactsJson: string | null;
   /** 任务结果纯文本（成功 = artifacts 文本；失败 = status.message 错误原因）；旧记录可能为 null */
   text: string | null;
@@ -678,6 +706,17 @@ export interface TaskListItem {
   taskId: string;
   contextId: string;
   state: TaskState;
+  /**
+   * **并发档**（v0.10.2 O-3 补齐；与 `a2a_feature_status` / `a2a_feature_trace` 同字段同语义）。
+   *
+   * 本面此前**连 `lane` 都没有** —— 三读出参长期不一致，一并补齐（读侧 NULL 已归一 `write`，恒有值）。
+   */
+  lane: TaskLane;
+  /**
+   * **职责位**（v0.10.2 O-3；与 `lane` 同一条声明链的两个读出面）：
+   * 读侧不存在 NULL（列里的 NULL 已归一缺省档 `unit_agent`）⇒ **恒有值、不得省略字段**。
+   */
+  taskType: TaskType;
   /** 派发时的原始 prompt 片段（截断），用于辨识任务 */
   prompt: string | null;
   /** 结果文本（本地 text，缺省回退归档 artifacts 文本） */

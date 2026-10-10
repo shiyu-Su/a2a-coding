@@ -1,13 +1,15 @@
 /**
  * BD12″ 板配置化用例（config.ts 加载器 + index.ts 装配 + 真进程钉子）。
  *
- * 七组：① 完整配置逐键生效（含 `_comment` 族被忽略）② 缺 config.json ⇒ 明确错误文案（不裸崩）
+ * 八组：① 完整配置逐键生效（含 `_comment` 族被忽略）② 缺 config.json ⇒ 明确错误文案（不裸崩）
  * ③ 坏 JSON ⇒ `[config]` 前缀错误 ④ 非法值 ⇒ 结构化 fail-fast ⑤ 未知键 ⇒ 忽略不影响解析
- * ⑥ orgsDir 留空 ⇒ 宿主面不装配 ⑦ env 只覆盖路径；argv 传配置内容一律不生效（真进程）。
+ * ⑥ orgsDir 留空 ⇒ 宿主面不装配 ⑦ env 只覆盖路径；argv 传配置内容一律不生效（真进程）
+ * ⑧ 拆分不变量（REQ-2026-10-10-01 配置模板拆分）：模板两文件无 `_` 键 / 缺省常量键值 == 常量
+ *    / 叶子值无尖括号 / 键集 ⊆ 内联白名单。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { dirname, join } from "node:path";
 import { fileURLToPath } from "node:url";
@@ -23,7 +25,11 @@ import {
   resolveConfigPath,
   validateConfig,
 } from "../dist/config.js";
+import { DEFAULT_BRIDGE_BASE_URL } from "../dist/bridge-client.js";
 import { buildHostFace } from "../dist/index.js";
+import { DEFAULT_HOST_AGENT_KIND } from "../dist/host-bridge.js";
+import { DEFAULT_TURN_TIMEOUT_MS } from "../dist/host-turn.js";
+import { DEFAULT_MCP_BASE_URL } from "../dist/requirement.js";
 import { defaultPidfilePath, readPidfile } from "../dist/lifecycle.js";
 import { resolveMachineDistDir } from "../dist/host-runtime.js";
 
@@ -263,5 +269,71 @@ test("⑦b（真进程钉子）argv 传配置内容一律不生效：--port / --
     const record = readPidfile(pidPath);
     if (record !== null && record.pid === child.pid) rmSync(pidPath, { force: true });
     rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+// ---------------------------------------------------------------------------
+// ⑧ 拆分不变量（REQ-2026-10-10-01 · 配置模板拆分 S2 · board b2）
+// ---------------------------------------------------------------------------
+
+/** 板可配键白名单（本用例内联 = 唯一落点；新增 / 改名配置键须同轮改这里 + README）。 */
+const TEMPLATE_KEYS = [
+  "port",
+  "host",
+  "orgsDir",
+  "group",
+  "hostKind",
+  "hostModel",
+  "bridgeUrl",
+  "mcpBaseUrl",
+  "machineDist",
+  "repoRoot",
+  "turnTimeoutMs",
+];
+
+/** `.default` 里「有代码缺省常量」的键 → 常量本身（按常量比对，用例内零字面量；板例外集 = 空）。 */
+const CODE_DEFAULTS = {
+  port: DEFAULT_PORT,
+  host: DEFAULT_HOST,
+  hostKind: DEFAULT_HOST_AGENT_KIND,
+  bridgeUrl: DEFAULT_BRIDGE_BASE_URL,
+  mcpBaseUrl: DEFAULT_MCP_BASE_URL,
+  turnTimeoutMs: DEFAULT_TURN_TIMEOUT_MS,
+};
+
+/** 递归收集 [键路径, 值]（含中间层，板模板现为扁平）。 */
+function keyEntries(node, prefix = "", out = []) {
+  if (node === null || typeof node !== "object") return out;
+  for (const [key, value] of Object.entries(node)) {
+    const path = prefix === "" ? key : `${prefix}.${key}`;
+    out.push([path, value]);
+    keyEntries(value, path, out);
+  }
+  return out;
+}
+
+test("⑧拆分不变量：两模板无 `_` 前缀键 · 缺省常量键值逐等于常量 · 递归叶子值无尖括号 · 键集 ⊆ 白名单", () => {
+  const files = ["config.json.default", "config.json.example"].map((name) => [
+    name,
+    JSON.parse(readFileSync(join(boardRoot, "config", name), "utf8")),
+  ]);
+  for (const [name, parsed] of files) {
+    for (const [path] of keyEntries(parsed)) {
+      assert.ok(
+        path.split(".").every((segment) => !segment.startsWith("_")),
+        `${name}：不得出现 _ 前缀键（说明位 = README）⇒ ${path}`,
+      );
+      assert.ok(TEMPLATE_KEYS.includes(path.split(".").pop()), `${name}：键 ${path} 不在可配键白名单内`);
+    }
+    const angled = keyEntries(parsed)
+      .filter(([, v]) => typeof v === "string" && /[<>]/.test(v))
+      .map(([p]) => p);
+    assert.deepEqual(angled, [], `${name}：递归叶子值不得含 < > 形态占位`);
+  }
+
+  const defaults = files[0][1];
+  for (const [key, constant] of Object.entries(CODE_DEFAULTS)) {
+    assert.ok(key in defaults, `.default 须留缺省常量键 ${key}`);
+    assert.equal(defaults[key], constant, `.default 的 ${key} 须逐等于代码缺省常量（板例外集 = 空）`);
   }
 });

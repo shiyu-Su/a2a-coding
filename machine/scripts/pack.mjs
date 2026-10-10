@@ -48,6 +48,8 @@ const EXCLUDE_SUFFIXES = [".zip", ".log", ".tsbuildinfo"];
  * 特定相对路径不打入（本机实例配置，永不外发）：
  * config/config.json 含 bridge token 明文 + 本机绝对路径，属本机资产（被工作区根 .gitignore 排除）；
  * 部署包只带 config/config.json.default 模板，目标机自行生成实例配置。
+ * ⚠ 硬纪律：config/config.json.example 不在本排除表内 ⇒ 它是**会被外发**的文件，
+ * 其 token 与任何路径**永不得写真实值**（写真实值 = 随部署包泄漏）。
  */
 const EXCLUDE_RELATIVE_PATHS = new Set(["config/config.json"]);
 /** 缺件哨兵：这些不在包里即判目录结构异常，fail-fast 而非静默出残包 */
@@ -56,6 +58,7 @@ const REQUIRED_ENTRIES = [
   "launcher/index.ts",
   "acp-bridge/index.ts",
   "config/config.json.default",
+  "config/config.json.example",
   "scripts/launcherctl.mjs",
 ];
 /** 禁入哨兵：一旦出现在待打包列表即 fail-fast（本机敏感文件，误外发代价 > 打包失败代价） */

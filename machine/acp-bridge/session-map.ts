@@ -50,6 +50,12 @@ export interface SessionMapEntry {
   lastMessageIds: string[];
   /** 首轮注入完成时刻（UTC ISO 8601；缺省 = 未注入） */
   injectedAt?: string;
+  /**
+   * 该会话上一轮出场的职责位（v0.10.2 增补五 · M1；缺省 = 未知）。
+   * 仅供「同 ctx 续接换职责位」的 warn 守卫对照，不参与任何判定、不 gate 派发。
+   * **老条目缺该键 ⇒ 前角色未知 ⇒ 不 warn**（渐进生效）；旧版本 `load` 只认白名单键、忽略此键 ⇒ 可回滚。
+   */
+  taskType?: string;
 }
 
 /** 可注入文件系统（缺省 `createNodeSessionMapFs()`）。 */
@@ -188,10 +194,23 @@ export class SessionMap {
   }
 
   /**
+   * 记录「本轮以哪个职责位出场」并落盘（v0.10.2 增补五 · M1，与 {@link markInjected} 同形）：
+   * 无该键则不动（映射已作废 ⇒ 无从谈职责位）。**每次覆盖为最新值**（不像 `injectedAt` 保最早），
+   * 因为下一轮的 warn 判据要看「上一条真跑过的职责位」。仅供对照，不参与任何判定。
+   */
+  markTaskType(contextId: string, taskType: string): void {
+    const entry = this.entries.get(contextId);
+    if (entry === undefined) return;
+    entry.taskType = taskType;
+    entry.updatedAt = this.now().toISOString();
+    this.persist();
+  }
+
+  /**
    * 写入映射并原子落盘。
    *
    * **合并式写入（v0.8.9 · M1）**：仅换 `sessionId` + 刷新 `updatedAt`，**保留**该 contextId
-   * 已有的 `prompted` / `injectedAt` / `turn` / `lastMessageIds`（覆盖式写入会把已跑轮次清零，
+   * 已有的 `prompted` / `injectedAt` / `taskType` / `turn` / `lastMessageIds`（覆盖式写入会把已跑轮次清零，
    * 使注入判定与重放判定失忆）。会话确已作废时由调用方先 {@link delete} 再 `set`。
    */
   set(contextId: string, sessionId: string): void {
@@ -204,6 +223,7 @@ export class SessionMap {
       lastMessageIds: prev?.lastMessageIds ?? [],
     };
     if (prev?.injectedAt !== undefined) entry.injectedAt = prev.injectedAt;
+    if (prev?.taskType !== undefined) entry.taskType = prev.taskType;
     this.entries.set(contextId, entry);
     this.persist();
   }
@@ -331,6 +351,7 @@ export class SessionMap {
       // 旧条目兼容：缺键 / 类型不符 ⇒ 取缺省值（不报错、不写入缺省值干扰旧格式语义）
       if (value["prompted"] === true) entry.prompted = true;
       if (typeof value["injectedAt"] === "string") entry.injectedAt = value["injectedAt"];
+      if (typeof value["taskType"] === "string") entry.taskType = value["taskType"];
       const turn = value["turn"];
       if (typeof turn === "number" && Number.isFinite(turn)) entry.turn = turn;
       const lastMessageIds = value["lastMessageIds"];

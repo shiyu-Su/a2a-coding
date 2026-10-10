@@ -12,10 +12,14 @@
  *
  * 就绪语义：`listen()` resolve = 端口已 listening（Launcher 的 `waitForPort` 为 TCP 探测，
  * listen 即就绪，不依赖 `/health`）。
+ *
+ * v0.10.2 · 节点 M-2：本模块是 **`message.metadata`（角色意图载体）的唯一解析点**（{@link parseRoleIntent}）
+ * —— 解析产物以 typed 字段挂在 `MessageSendParams` 上透给执行器，桥内其它模块不得再读 `metadata`。
+ * **不传 ⇒ 两个键都不落 ⇒ 派发链逐字现状**。
  */
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { TaskRegistry, type MessageSendParams } from "./task-registry.js";
-import type { A2ATask, Clock, TaskExecutor, TextPart } from "./types.js";
+import type { A2ATask, Clock, SessionOverrides, TaskExecutor, TextPart } from "./types.js";
 
 /** 唯一业务路径（与 `a2a-client.ts` 的 `${endpoint}/a2a/jsonrpc` 一致）。 */
 export const A2A_JSONRPC_PATH = "/a2a/jsonrpc";
@@ -92,6 +96,47 @@ function parseTextParts(raw: unknown): TextPart[] {
   return parts;
 }
 
+/**
+ * `metadata` 中被桥**认领**的原样字符串键（v0.10.2 · M-2）。
+ * 未列出的键 ⇒ **忽略**（桥不猜后端方言，也不据未知键报错：launcher 侧 `roles` 已有 fail-closed
+ * 校验，本侧只是第二道读点，宽容读、不另立判据）。
+ */
+const OVERRIDE_TEXT_KEYS = ["model", "mode", "collaborationMode", "risk", "systemPrompt"] as const;
+
+/**
+ * `message/send` 的**角色意图解析结果**（v0.10.2 · M-2）。
+ * 形状与 `TaskExecutionInput` 同位（本对象即透传体，不再另设一层）。
+ */
+export interface RoleIntent {
+  taskType?: string;
+  overrides?: SessionOverrides;
+}
+
+/**
+ * **`message.metadata` 的唯一解析点**（v0.10.2 · M-2 · F-M2 / F-C6）：
+ * machine → 后端 agent 段的角色意图自本版经 A2A `metadata` 承载（**新载体，仓内此前零命中**），
+ * 桥侧只在此处读一次 —— 其余模块（registry / session / index）一律接**已解析的 typed 字段**，
+ * 不得再自行解析 `metadata`（「双通道以 metadata 为准」的另一半 = metadata 也只有一个消费点）。
+ *
+ * 取值纪律：**逐键宽容**（非串 / 空串 / 非法枚举 ⇒ 该键不落 ⇒ 该旋钮回落构造器），
+ * 全部键都落空 ⇒ `overrides` 不落（= 无覆盖，逐字现状）。
+ */
+export function parseRoleIntent(metadata: unknown): RoleIntent {
+  if (!isRecord(metadata)) return {};
+  const taskType = metadata["taskType"];
+  const overrides: SessionOverrides = {};
+  for (const key of OVERRIDE_TEXT_KEYS) {
+    const value = metadata[key];
+    if (typeof value === "string" && value.length > 0) overrides[key] = value;
+  }
+  const mode = metadata["systemPromptMode"];
+  if (mode === "append" || mode === "replace") overrides.systemPromptMode = mode;
+  return {
+    ...(typeof taskType === "string" && taskType.length > 0 ? { taskType } : {}),
+    ...(Object.keys(overrides).length > 0 ? { overrides } : {}),
+  };
+}
+
 /** 解析 `message/send` 参数；非法返回 `null`。 */
 function parseMessageSendParams(params: unknown): MessageSendParams | null {
   if (!isRecord(params)) return null;
@@ -109,6 +154,10 @@ function parseMessageSendParams(params: unknown): MessageSendParams | null {
       ...(typeof contextId === "string" ? { contextId } : {}),
     },
   };
+  // v0.10.2 · M-2：`metadata` 缺键 ⇒ `parseRoleIntent` 出空对象 ⇒ 两个键都不落（逐字现状）
+  const intent = parseRoleIntent(message["metadata"]);
+  if (intent.taskType !== undefined) parsed.taskType = intent.taskType;
+  if (intent.overrides !== undefined) parsed.overrides = intent.overrides;
   const configuration = params["configuration"];
   if (isRecord(configuration) && configuration["blocking"] === true) {
     parsed.configuration = { blocking: true };

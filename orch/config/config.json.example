@@ -1,0 +1,27 @@
+{
+  "transport": {
+    "mode": "http",
+    "http": {
+      "host": "127.0.0.1",
+      "port": 8787,
+      "path": "/mcp"
+    }
+  },
+  "web": {
+    "enabled": true,
+    "host": "127.0.0.1",
+    "port": 3300
+  },
+  "runner": {
+    "holdMs": 25000,
+    "heartbeatTimeoutMs": 60000,
+    "orphanTimeoutMs": 1800000
+  },
+  "machines": [
+    {
+      "machineId": "machine-01",
+      "launcherUrl": "http://127.0.0.1:3100",
+      "token": "runner-token-placeholder"
+    }
+  ]
+}

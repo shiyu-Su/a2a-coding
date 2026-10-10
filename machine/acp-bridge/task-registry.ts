@@ -16,6 +16,7 @@ import type {
   A2AMessage,
   A2ATask,
   Clock,
+  SessionOverrides,
   TaskExecutionResult,
   TaskExecutor,
   TextPart,
@@ -40,6 +41,13 @@ interface TaskRecord {
 export interface MessageSendParams {
   message: A2AMessage;
   configuration?: { blocking?: boolean };
+  /**
+   * 职责位原值（v0.10.2 · M-2）：由 `a2a-server.parseRoleIntent` 从 `message.metadata` 解出后挂在此处
+   * （**本模块不解析 `metadata`**，只把 typed 字段透给执行器）。缺省 ⇒ 不落键。
+   */
+  taskType?: string;
+  /** 会话级 per-request 覆盖包（v0.10.2 · M-2；同上，缺省 ⇒ 全回落构造器）。 */
+  overrides?: SessionOverrides;
 }
 
 export interface TaskRegistryOptions {
@@ -67,11 +75,14 @@ export class TaskRegistry {
   /**
    * 处理 `message/send`。非 blocking 时**立即**返回 `working` 句柄；
    * blocking 时等待执行器终态后返回同一（已更新）任务对象。
+   *
+   * v0.10.2 · M-2：`params` 上的 `taskType` / `overrides`（已由 `a2a-server` 从 `metadata` 解出）
+   * 原样透传给执行器，台账与 A2A Task 形状**不承载**这两个键。
    */
   async send(params: MessageSendParams): Promise<A2ATask> {
     const taskId = this.idFactory();
     const task: A2ATask = { id: taskId, status: { state: "working" }, artifacts: [] };
-    const pending = this.run(taskId, textFromParts(params.message.parts), params.message);
+    const pending = this.run(taskId, textFromParts(params.message.parts), params);
     this.records.set(taskId, {
       task,
       pending,
@@ -130,14 +141,20 @@ export class TaskRegistry {
     return record.task;
   }
 
-  /** 后台执行并回写终态。 */
-  private async run(taskId: string, text: string, message: A2AMessage): Promise<void> {
+  /**
+   * 后台执行并回写终态。
+   * v0.10.2 · M-2：`taskType` / `overrides` 经 `params` 透传至执行器（**不落 A2A Task 形状** ⇒
+   * launcher 读面与 `result` schema 零改动）；缺省 ⇒ 不传该键 = 无覆盖（**逐字现状**）。
+   */
+  private async run(taskId: string, text: string, params: MessageSendParams): Promise<void> {
     try {
       const result = await this.executor.execute({
         taskId,
         text,
-        contextId: message.contextId ?? "",
-        messageId: message.messageId,
+        contextId: params.message.contextId ?? "",
+        messageId: params.message.messageId,
+        ...(params.taskType !== undefined ? { taskType: params.taskType } : {}),
+        ...(params.overrides !== undefined ? { overrides: params.overrides } : {}),
       });
       // 放弃标记须在终态回写**之前**落：`applyResult` 之后这条 record 即进入「终态支路」的判定窗口。
       if (result.abandoned === true) {

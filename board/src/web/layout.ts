@@ -1218,18 +1218,6 @@ export function renderPage(params: PageParams): string {
      —— E3 撤除列头操作行（.vops / form.vop）后，版本列头仅剩本一处写入口 */
   .kcol > h3 form.vdel { position: absolute; top: -2px; right: 0; margin: 0; }
   .kcol > h3 form.vdel button { font-size: 12px; line-height: 1; padding: 0 5px; color: #a33; background: transparent; border: 1px solid #a336; border-radius: 4px; }
-  /* v0.10.1 B3（REQ-2026-10-09-01 C-18②）：project 级版本区块的显示族 —— 另立一类，
-     与排期拖拽闸的 .draglocked / kbadge draglock 逐字分立（两套显示语言不得互用：
-     前者 = 「project 台账已发版」的事实展示，不执法；后者 = 「拖不动」的闸锁语义）。
-     .pvbadge.tu（可发版缺键 = —）刻意取中性灰，不得取警告色 —— 未知 ≠ 否定。 */
-  .pv-block { margin: 0 0 var(--b-sp-16); }
-  .pvbadge { display: inline-block; padding: 0 var(--b-sp-6); border: 1px solid var(--b-line); border-radius: var(--b-r-3); background: var(--b-surface-2); color: var(--b-text-2); font-size: var(--b-fs-11); white-space: nowrap; }
-  .pvbadge.treleased { border-color: var(--b-ok-line); background: var(--b-ok-bg); color: var(--b-ok); }
-  .pvbadge.topen { border-color: var(--b-brand-line); background: var(--b-brand-soft); color: var(--b-brand-ink); }
-  .pvbadge.tunknown { color: var(--b-text-4); }
-  .pvbadge.tr { border-color: var(--b-ok-line); background: var(--b-ok-bg); color: var(--b-ok); }
-  .pvbadge.tf { border-color: var(--b-danger-line); background: var(--b-danger-bg); color: var(--b-danger); }
-  .pvbadge.tu { color: var(--b-text-4); }
   .kmeta { margin: 4px 0 0; color: #667; font-size: 11px; }
   .tpoints { margin: 4px 0 0; padding-left: 16px; color: #667; font-size: 11px; }
   .tpoints li { margin: 1px 0; }

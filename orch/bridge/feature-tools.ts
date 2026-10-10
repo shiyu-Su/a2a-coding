@@ -80,7 +80,7 @@ import type {
   QueueState,
   QueuedTaskRecord,
 } from "../session/store.js";
-import type { TaskLane } from "../types.js";
+import type { TaskLane, TaskType } from "../types.js";
 import {
   allowedTransitions,
   canTransition,
@@ -144,6 +144,15 @@ export interface FeatureTaskSummary {
    * 存量行 / 未带档登记 = `write`（NULL 已在读侧归一，**不存在第三个值**）。
    */
   lane: TaskLane;
+  /**
+   * **职责位**（v0.10.2 O-3 additive；来源 `tasks.task_type`，取值见 {@link TASK_TYPES}）：
+   * 与 `lane` 同一条声明链，**读侧不存在 NULL** —— 列里的 NULL 已在读侧归一为缺省档
+   * `unit_agent`（= 本列引入前的唯一行为），故本字段**恒有值、不得省略**。
+   *
+   * 读账口径：非 `unit_agent` ⇒ 该节点以其它职责位（产品经理 / 项目经理 / 研发经理）出场，
+   * machine 侧按本机 `agentConfig.roles` 路由该次会话的四个旋钮。
+   */
+  taskType: TaskType;
   prompt: string | null;
   remoteTaskId: string | null;
   dependencies: string[] | null;
@@ -348,6 +357,8 @@ function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
     state: rec.state,
     // 并发档恒有值（读侧 NULL 已归一 write）：**不得省略字段**
     lane: rec.lane,
+    // 职责位恒有值（读侧 NULL 已归一 unit_agent）：**不得省略字段**（v0.10.2 O-3）
+    taskType: rec.taskType,
     prompt: rec.prompt,
     remoteTaskId: rec.remoteTaskId,
     dependencies: rec.dependencies,
@@ -1919,6 +1930,7 @@ export function handleFeatureTrace(
       projectId: n.projectId,
       state: n.state,
       lane: n.lane,
+      taskType: n.taskType,
       queueState,
       waitReason: waitReasonOf(
         feature,
@@ -2008,6 +2020,11 @@ export interface FeatureTraceNode {
   state: TaskRecord["state"];
   /** **并发档**（v0.8.10 O-N3 additive；`read` = 只读档，不参与写忙集） */
   lane: TaskLane;
+  /**
+   * **职责位**（v0.10.2 O-3 additive；来源 `tasks.task_type`）：与 `lane` 同款**恒有值**
+   * （读侧 NULL 已归一 `unit_agent`）⇒ **不得省略字段**。
+   */
+  taskType: TaskType;
   /** 队列态；null = 不在队（未入队 / 重排后待再派 / input-required） */
   queueState: QueueState | null;
   waitReason: FeatureWaitReason;

@@ -315,8 +315,7 @@ export class AgentManager {
     this.idle = new IdleReaper({
       idleStopMs: this.effectiveIdleStopMs(),
       // v0.8.10 · M-N1：按项目在飞计数（旧台账无 `countFor` ⇒ 回落全机 `size`，行为同旧版）
-      inFlightCount: (projectId) =>
-        this.inFlight.countFor?.(projectId) ?? this.inFlight.size,
+      inFlightCount: (projectId) => this.inFlight.countFor?.(projectId) ?? this.inFlight.size,
       onIdle: (projectId) => {
         // 停因 = `idle-reap`（v0.8.10 · M-N4）：连坐到的在飞任务据此在账面上指认回收方
         void this.stop(projectId, { cause: "idle-reap" }).catch((err: unknown) => {
@@ -518,6 +517,11 @@ export class AgentManager {
     // 仓库标识快照播报（v0.10.0 · M1）：配置了 repo 才报，未配置省略该键（单仓零感知）。
     if (snapshot.repo !== undefined) {
       console.log(`[launcher] agent ${project.projectId} ${snapshot.repo}`);
+    }
+    // 职责位映射快照播报（v0.10.2 · M-4 · F-C7 取证面）：配了 roles 才报，未配省略该键
+    // （照 repo 先例，老配置日志形状不变）。
+    if (snapshot.roles !== undefined) {
+      console.log(`[launcher] agent ${project.projectId} ${snapshot.roles}`);
     }
     // 后端入口分层解析结果（改造文档 §2.3 · B4）：命中报来源层，失败报逐层清单；
     // 清单入日志、不进 Error message（适配器抛错文案只留摘要 +「详见 launcher.log [backend] 行」）。

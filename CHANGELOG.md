@@ -2,6 +2,28 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.10.2] - 2026-10-10
+
+> 主题：**角色化（project 级四职责位）+ 配置模板拆分 + 板读面分流**。主需求 `4d7cf009`（角色化，12 节点，含五条增补轨）+ `25aa4b44`（配置模板拆分，9 节点）+ `f2dcb141`（排期展示分流，9 节点）+ 增补 `39248358`（管理页项目表置顶，6 节点）。**machine 首次抬号 0.9.8 → 0.10.2**（PjM 结论：roles 配置 / 模板拆分 / 守卫触达）。
+
+### Added
+
+- **角色化（project 级四职责位）**：`taskType` 闭集 = `unit_agent`（缺省）/ `product_manager` / `project_manager` / `dev_manager`（`pjm` 更名 `project_manager`）；四条 fail-closed 校验；`agentConfig.roles.<taskType>` 可按职责位覆盖 `model` / `systemPrompt` / `systemPromptMode` / `risk`（machine 侧守卫 + warn）。**工序 → 职责位对照表**与**会话复用纪律**（Step 0→1 换角色另起 ctx / Step 1→2 生成任务复用同线 / 执行节点全新）落 `flow/spec/需求流程.md` §0.5（增补五/六：宿主自办三条语义 + 纪律语义下沉 flow，`AGENTS.md` 改回指）。
+- **配置模板拆分（`config.default` / `config.example`）**：三单元 `.default` 只放 schema 默认（orch 28 行 / machine 42 行 / board 9 行，说明键归零）、新增 `.example`（完整可运行示例，随包分发：machine `pack.mjs` 哨兵）；**说明文字全进各单元 README**（含「不同 Agent 的配置方式」）；machine `.default:25` 存量真实路径泄露一并修复。**根回归换源 28 条**（A 类：orch 组数组口径 → README / machine bridge·backendCmd·model 样例与口径 → `.example` + README / 两把闸键 → `.example`）+ **失效锚重指向 8 条 + 空转真加固 1 条**（B 类：v0.10.2 M-2 三私有方法签名加 per-request 第二参数 ⇒ `applyModel` / `applyMode` 锚随签名与日志字面漂移；其中体提取一条为空转真，改显式窗口 + 体非空前置 + 剥注释）。
+- **板读面分流（排期展示分流 + 增补）**：管理页项目卡新增「**已发布的最新版本号**」列（复用投影单点，一次渲染恰一次 `/api/versions`）；需求详情 / 浮层新增「**归属（project 版本）**」卡（`projects[]` 三态解析：缺面整卡不渲 / 空数组中性文案非降级 / 有行按引擎原序）；**排期页摘除 `.pv-block`**（对 v0.10.1 交付的回退，锚处置 A/B/C：退役 1 文件 + 整页零处四件闭集 + N3-⑪ 半保留半退役 + B4-② 守门钉保留）；管理页「配置核对」卡加第三行（投影健康度，`empty` 不报读不到）；**增补：项目表置顶 + 去掉「成员（声明态）」表**（池卡三出口「未声明」承接位 + 切片加固）。
+- **发版门修复（宿主 S3/B 类，随本版）**：根回归 12 个配置相关文件 36 失败 → **全量 1378 / 1378 全绿**；`.gitignore` 注记补 `.example`。
+
+### Changed
+
+- **停同升分组第三次实操**：`orch` / `board` / **`machine`** 三单元同升 **0.10.2**（machine 首次自 0.9.8 抬号）；`flow` 无 package.json（三份 spec 戳已在增补五/六翻 v0.10.2）；协议保持 2.3。
+- **根回归版本 pin 随版翻**：machine 4 条（`test-v0.8.4` / `test-v0.8.5`）+ flow 文档模板戳 1 条。
+
+### 固定口径（登记）
+
+- 组级 agent 形态（`edca37b1`，v0.10.3 候选）：组级两职责正名 + 会话切分矩阵落 flow；**「orch agent 一个还是多个角色」待推进时再裁**。
+- 板读面免手刷（`858e9e46`）与板卡片呈现（`68afbc73`）已立卡待排期（甲先定稿、乙后做）。
+- 验收期登记：整页负向判据「不得出现『成员（声明态』」在真板不可达（命中需求卡自身标题）⇒ 4 处锚建议收窄为卡头形态（后续小项）。
+
 ## [v0.10.1] - 2026-10-09
 
 > 主题：**版本事实源下沉 project**（每个 project 有自己的版本号；需求过门时登记「触达哪些 project + 各进哪个版本」；**发版一个动作 + 级联**）。主需求 `88026fcd`（20 节点）+ 承接轨 `c6fa6ff4`（5 节点，B5 拆小重建）。

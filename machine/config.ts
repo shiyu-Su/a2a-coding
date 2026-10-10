@@ -1,9 +1,7 @@
 import { readFileSync } from "node:fs";
 import { AGENT_KINDS } from "./agent-kinds.js";
-import {
-  effectiveSessionTimeoutMs,
-  SESSION_TIMEOUT_MS_CAP,
-} from "./launcher/agent-config.js";
+import { agentRolesErrors, effectiveRiskOf } from "./agent-roles.js";
+import { effectiveSessionTimeoutMs, SESSION_TIMEOUT_MS_CAP } from "./launcher/agent-config.js";
 import type { AgentKind, BridgeConfig, MachineConfig, ProjectConfig, RiskLevel } from "./types.js";
 
 function fail(msg: string): never {
@@ -105,9 +103,7 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
         !Number.isInteger(continueMarginMs) ||
         continueMarginMs < 0
       ) {
-        fail(
-          `projects[${idx}].agentConfig.continueMarginMs 必须是非负整数（毫秒，0 = 关闭续跑）`,
-        );
+        fail(`projects[${idx}].agentConfig.continueMarginMs 必须是非负整数（毫秒，0 = 关闭续跑）`);
       }
       const windowMs = effectiveSessionTimeoutMs(project.agentConfig);
       const windowSource =
@@ -147,6 +143,20 @@ function parseProject(v: unknown, idx: number): ProjectConfig {
   if (repo !== undefined) {
     // 仓库标识（v0.10.0 · M1）：缺省不写（单仓零感知，「宿主仓」解释权归引擎）；写了必须是非空字符串
     project.repo = asString(repo, `projects[${idx}].repo`);
+  }
+  // v0.10.2 · M-4 · F-C2：`agentConfig.roles`（职责位 → 旋钮映射）的四条 fail-closed 校验。
+  // 判据的**唯一实现点**在 `agent-roles.ts`（自检面共用同一函数），此处只做 fail-fast 转换；
+  // risk 上限取**本机生效值**（`project.risk ?? write`），不读 orch 注册投影。
+  // ⚠ **范围收窄（两套语义并存，勿当不一致来「修」**）：fail-closed 只作用于 `roles` 子对象；
+  //   上方 `agentConfig` 顶层平铺键**保持现状**（未知顶层键静默忽略，既不拒也不 strip）——
+  //   把顶层一并收紧会让存量 `config.json*` 直接起不来。
+  const rolesCtx = `projects[${idx}].agentConfig.roles`;
+  for (const roleError of agentRolesErrors(
+    project.agentConfig,
+    effectiveRiskOf(project),
+    rolesCtx,
+  )) {
+    fail(roleError);
   }
   return project;
 }

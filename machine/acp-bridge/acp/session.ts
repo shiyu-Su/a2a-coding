@@ -44,6 +44,15 @@
  * `session/new` / `load` / `resume` **三路统一携带 `_meta`**（否则复用会话拿不到 ⇒ full 档静默降级）。
  * 桥只收 adapter 的原样值，**不做 kind→mode 映射**。
  *
+ * **per-request 覆盖（v0.10.2 · M-2，角色化）**：`model` / `mode` / `collaboration_mode` / `systemPrompt`
+ * 四处消费点改读**本轮生效值** {@link TurnKnobs} —— 由 {@link AcpSessionRunner.resolveTurnKnobs} 按
+ * 「**override（`TaskExecutionInput.overrides`，源自 A2A `message.metadata`）优先、无则回落构造器**」
+ * 逐键解析一次。下发**时机 / 请求体形状 / fail-fast 口径 / 零请求条件**全部不变；
+ * `overrides` 缺省 ⇒ 生效值 == 构造器值 ⇒ **逐字现状**。`contextId → sessionId` 阶梯与首轮注入判据
+ * （{@link isFirstTurn}）**不改**，M-N2 捕获窗簿记不动。`risk` 不在此路（生效点 = `acp/permission.ts` 的
+ * **会话级路由**，v0.10.2 · M-3：`execute` 在会话建立后把 `overrides.risk` 登记进
+ * {@link SessionRiskRegistry}，权限处理器按 `sessionId` 取档、未登记回落进程级 `--risk`）。
+ *
  * **失败诊断留痕（v0.8.7 · M4 → v0.8.8 · M1 扩）**：三处失败出口（① 会话建立失败 ② prompt 失败
  * ③ prompt 超时）各在 `TaskExecutionResult.artifacts` 追加一条 `name="machine-diagnostics"`（text = JSON）
  * ⇒ **零类型 / 零 wire 变更**；launcher `buildResult` 按名摘除 + 解析（见 {@link DIAGNOSTICS_ARTIFACT_NAME}）。
@@ -126,7 +135,12 @@
  */
 import { AcpError, wideJson } from "./client.js";
 import { buildArtifacts } from "../artifacts.js";
-import type { TaskExecutionInput, TaskExecutionResult } from "../types.js";
+import { normalizeRisk, SessionRiskRegistry } from "./permission.js";
+import type {
+  SessionOverrides,
+  TaskExecutionInput,
+  TaskExecutionResult,
+} from "../types.js";
 import { countValidOutcomeBlocks, parseOutcome } from "../outcome.js";
 import { A2A_OUTCOME_CONVENTION } from "../outcome.js";
 import { MAX_LAST_MESSAGE_IDS, type SessionMap } from "../session-map.js";
@@ -344,6 +358,12 @@ export interface AcpSessionRunnerOptions {
    * 缺省 ⇒ 三路均不带该键。
    */
   sessionMeta?: Record<string, unknown>;
+  /**
+   * 会话级 risk 登记表（v0.10.2 · M-3，**进程内共享对象**）：与 `createPermissionHandler` 的
+   * 第三参是同一实例 —— 本侧登记（`execute` 会话建立后），处理器侧按 `sessionId` 读取。
+   * 缺省 ⇒ runner 自建（权限侧拿不到同一对象时等效于纯进程级回落）。
+   */
+  sessionRisks?: SessionRiskRegistry;
   logger?: (message: string) => void;
 }
 
@@ -433,6 +453,25 @@ function countChunks(win: CaptureWindow): number {
 }
 
 /**
+ * 一轮会话建立期**实际生效**的旋钮取值（v0.10.2 · M-2 · F-C4「`M2-a` 档」= 同 `agentKind` /
+ * 同后端进程内的 per-request 覆盖）。
+ *
+ * 唯一产出点 = {@link AcpSessionRunner.resolveTurnKnobs}（**override 优先、无则回落构造器**）；
+ * 四处消费点（注入 / model / mode / collaboration_mode）**只读本结构**，不再直读构造器字段
+ * ⇒ 覆盖与回落不可能走成两套判据。
+ * `risk` **不在本结构**：它的生效点是权限路由（`acp/permission.ts`），不属会话建立期 ——
+ * v0.10.2 · M-3 经 `execute` 把 `overrides.risk` 登记进 {@link SessionRiskRegistry}（会话级路由），
+ * 不经本轮旋钮。
+ */
+interface TurnKnobs {
+  model?: string;
+  mode?: string;
+  collaborationMode?: string;
+  systemPrompt?: string;
+  systemPromptMode?: "append" | "replace";
+}
+
+/**
  * 会话执行器：实现 B1 的 `TaskExecutor` 语义（execute / cancel）。
  * 任务执行 = 保证会话（load|resume|new）→ prompt（注入 outcome 约定）→ 累积至终态 → 文本。
  */
@@ -442,15 +481,28 @@ export class AcpSessionRunner {
   private readonly sessions: SessionMap | null;
   private readonly timeoutMs: number;
   private readonly mcpServers: readonly unknown[];
+  /**
+   * 自定义注入的**回落源**（进程级缺省，来自 `BridgeArgs` → `startBridge` 装配）。
+   * v0.10.2 · M-2：消费点 {@link buildInjection} 改读本轮 {@link TurnKnobs}，本字段只在
+   * per-request `overrides` 未给 `systemPrompt` / `systemPromptMode` 时被取用。
+   */
   private readonly injection: AcpInjectionConfig;
-  /** 归一化后的 model：非空字符串才保留（空串 / 非字符串 ⇒ `undefined` ⇒ 永不 set） */
+  /**
+   * 归一化后的 model：非空字符串才保留（空串 / 非字符串 ⇒ `undefined` ⇒ 永不 set）。
+   * v0.10.2 · M-2 起语义 = **回落源**（见 {@link injection} 同条口径）。
+   */
   private readonly model: string | undefined;
-  /** 归一化后的 mode：非空字符串才保留（空串 / 非字符串 ⇒ `undefined` ⇒ 永不下发）。 */
+  /** 归一化后的 mode：非空字符串才保留（空串 / 非字符串 ⇒ `undefined` ⇒ 永不下发）。回落源口径同 {@link model}。 */
   private readonly mode: string | undefined;
-  /** 归一化后的 collaboration_mode：同 mode。 */
+  /** 归一化后的 collaboration_mode：同 mode。回落源口径同 {@link model}。 */
   private readonly collaborationMode: string | undefined;
   /** 会话建立期 `_meta`（`undefined` ⇒ 三路均不携带）。 */
   private readonly sessionMeta: Record<string, unknown> | undefined;
+  /**
+   * 会话级 risk 登记表（v0.10.2 · M-3）：与权限处理器共享的**同一实例**（装配点 `startBridge`），
+   * 登记点 = {@link execute}（会话建立后、prompt 写出前）。
+   */
+  private readonly sessionRisks: SessionRiskRegistry;
   private readonly logger: (message: string) => void;
   /**
    * **taskId → 本轮捕获窗**（v0.8.10 · M-N2 换键，此前是 `sessionId → 窗`）：**开窗即存在、收窗即删**
@@ -512,18 +564,65 @@ export class AcpSessionRunner {
         ? options.collaborationMode
         : undefined;
     this.sessionMeta = options.sessionMeta;
+    this.sessionRisks = options.sessionRisks ?? new SessionRiskRegistry();
     this.logger = options.logger ?? ((): void => undefined);
     this.client.onNotification((method, params) => this.onNotification(method, params));
   }
 
   /**
-   * 首轮注入文本 = 缺省 a2a-outcome 约定 + config 段 `systemPrompt`
-   * （`append` = 追加在缺省约定之后；`replace` = 替换缺省约定；无 config 时仅缺省约定）。
+   * 本轮生效值解析（v0.10.2 · M-2，**唯一解析点**）：
+   * **逐键**判定「per-request override 有效 ⇒ 覆盖；否则回落构造器」——
+   * 有效 = 非空字符串（`systemPromptMode` = `append` / `replace` 二值之一），与构造器字段的
+   * 归一化口径**逐字同形**（空串 / 非串 ⇒ 视为未给，不覆盖）。
+   * ⇒ `overrides` 缺省 / 空对象 ⇒ 全键落回构造器 = **未引入本通路时逐字一致**（验收判据②）。
+   *
+   * 留痕：任一覆盖键生效时打一条日志（键名列出），排查「这次会话用的哪个 model」不必反推配置。
    */
-  private buildInjection(): string {
-    const custom = this.injection.systemPrompt;
+  private resolveTurnKnobs(overrides: SessionOverrides | undefined): TurnKnobs {
+    const given = overrides ?? {};
+    const textOf = (value: string | undefined): string | undefined =>
+      typeof value === "string" && value.length > 0 ? value : undefined;
+    const model = textOf(given.model) ?? this.model;
+    const mode = textOf(given.mode) ?? this.mode;
+    const collaborationMode = textOf(given.collaborationMode) ?? this.collaborationMode;
+    const systemPrompt = textOf(given.systemPrompt) ?? this.injection.systemPrompt;
+    const systemPromptMode = given.systemPromptMode ?? this.injection.systemPromptMode;
+    const applied = (
+      [
+        ["model", textOf(given.model)],
+        ["mode", textOf(given.mode)],
+        ["collaboration_mode", textOf(given.collaborationMode)],
+        ["systemPrompt", textOf(given.systemPrompt)],
+        ["systemPromptMode", given.systemPromptMode],
+      ] as const
+    )
+      .filter(([, value]) => value !== undefined)
+      .map(([key]) => key);
+    if (applied.length > 0) {
+      this.logger(`[acp-session] per-request 覆盖生效（键=${applied.join(",")}）`);
+    }
+    return {
+      ...(model !== undefined ? { model } : {}),
+      ...(mode !== undefined ? { mode } : {}),
+      ...(collaborationMode !== undefined ? { collaborationMode } : {}),
+      ...(systemPrompt !== undefined ? { systemPrompt } : {}),
+      ...(systemPromptMode !== undefined ? { systemPromptMode } : {}),
+    };
+  }
+
+  /**
+   * 首轮注入文本 = 缺省 a2a-outcome 约定 + `systemPrompt`
+   * （`append` = 追加在缺省约定之后；`replace` = 替换缺省约定；无自定义段时仅缺省约定）。
+   *
+   * v0.10.2 · M-2：取值源改为**本轮生效值** {@link TurnKnobs} —— `systemPrompt` / `systemPromptMode`
+   * 可被 per-request override 覆盖，未覆盖时即构造器 `injection` 的现值（**逐字现状**）。
+   * ⚠ **注入判据（首轮与否）不改**：本方法只换「文本内容从哪来」，「什么时候注入」仍由
+   * {@link isFirstTurn}（`contextId` → `injectedAt`）决定。
+   */
+  private buildInjection(knobs: TurnKnobs): string {
+    const custom = knobs.systemPrompt;
     if (custom === undefined || custom.length === 0) return A2A_OUTCOME_CONVENTION;
-    if (this.injection.systemPromptMode === "replace") return custom;
+    if (knobs.systemPromptMode === "replace") return custom;
     return `${A2A_OUTCOME_CONVENTION}\n\n${custom}`;
   }
 
@@ -576,6 +675,14 @@ export class AcpSessionRunner {
   private bumpTurn(contextId: string): void {
     if (this.sessions !== null) this.sessions.bumpTurn(contextId);
     else this.turnsInMemory.set(contextId, this.completedTurns(contextId) + 1);
+  }
+
+  /**
+   * 记账「本轮以哪个职责位出场」（v0.10.2 增补五 · M1）：写穿时机与其它 mutator 一致（prompt 成功出口）。
+   * 无 `SessionMap` ⇒ 不落（warn 守卫依赖 `sessionResumed`，而后者只在有映射时才可能为真 ⇒ 无需进程内表）。
+   */
+  private recordTaskType(contextId: string, taskType: string): void {
+    this.sessions?.markTaskType(contextId, taskType);
   }
 
   /**
@@ -671,9 +778,20 @@ export class AcpSessionRunner {
   async execute(input: TaskExecutionInput): Promise<TaskExecutionResult> {
     const ensureStartedAt = Date.now();
     const continueTurn = input.text.includes(CONTINUE_TURN_PROMPT_MARKER);
+    // v0.10.2 · M-2：本轮生效值（override 优先、无则回落构造器）在此**一次**解析，
+    // 之后四处消费点（注入 / model / mode / collaboration_mode）只读它。
+    const knobs = this.resolveTurnKnobs(input.overrides);
+    // 职责位留痕（v0.10.2 · M-2）：桥**不校验**取值、也不据它判定任何事（闭集执法在 launcher intake），
+    // 只把「这一轮是以哪个职责位跑的」打进日志，供真机自检与排查对照。
+    if (input.taskType !== undefined) {
+      this.logger(`[acp-session] 本轮职责位 taskType=${input.taskType}（taskId=${input.taskId}）`);
+    }
+    // v0.10.2 增补五 · M1：同 ctx 续接换职责位的 warn 守卫 —— 前角色快照**必须在 ensureSession 之前**取
+    // （回落 new 会 `sessions.delete` 旧条目，见 session.ts:1215，之后再取就没了）。
+    const prevRole = this.sessions?.getEntry(input.contextId)?.taskType;
     let session: EstablishedSession;
     try {
-      session = await this.ensureSession(input.contextId);
+      session = await this.ensureSession(input.contextId, knobs);
     } catch (err) {
       // 建立失败：捕获窗未开 ⇒ 三项计数记 0，`sessionResumed` / `sessionReused` / `firstChunkElapsedMs`
       // **不报**（无事实不编造，报 0 会被下游当成「有推进但零字符」）。
@@ -695,14 +813,30 @@ export class AcpSessionRunner {
       });
     }
     const { sessionId, sessionResumed, sessionReused } = session;
+    // v0.10.2 增补五 · M1：**只在真续接（sessionResumed）且前角色已知并变了**时 warn 一行 ——
+    // 回落 new 那轮本就全新注入、角色变化正常，不 gate 会假阳性。只出声、不拒、不改任何行为。
+    if (sessionResumed && prevRole !== undefined && prevRole !== input.taskType) {
+      this.logger(
+        `[acp-session] warn：同会话换职责位：prev=${prevRole} → now=${String(input.taskType)}` +
+          `（contextId=${input.contextId}）`,
+      );
+    }
     const bridgeEnsureElapsedMs = Math.max(0, Date.now() - ensureStartedAt);
     this.taskSessions.set(input.taskId, sessionId);
+    // v0.10.2 · M-3：per-request risk 的生效键 = ACP `sessionId`（非 contextId —— 后端
+    // `session/request_permission` params 带的就是它）。归一化后即「合法档才登记」，
+    // 非法 / 缺省 ⇒ 不登记 ⇒ 权限处理器回落进程级 `--risk`（逐字现状）。登记须在 prompt 前。
+    const riskOverride = normalizeRisk(input.overrides?.risk);
+    if (riskOverride !== undefined) {
+      this.sessionRisks.register(sessionId, riskOverride);
+      this.logger(`[acp-session] 会话级 risk=${riskOverride} 已登记（sessionId=${sessionId}）`);
+    }
     // 轮次序号**在会话建立之后**取：load/resume 双失败回落 new 会 delete 旧条目（其 turn 已作废），
     // 建立前取会把死会话的轮次算进新会话的第一轮。
     const turn = this.completedTurns(input.contextId) + 1;
 
     const firstTurn = this.isFirstTurn(input.contextId);
-    const injection = firstTurn ? `${this.buildInjection()}\n\n---\n\n` : "";
+    const injection = firstTurn ? `${this.buildInjection(knobs)}\n\n---\n\n` : "";
     const promptText = `${injection}${input.text}`;
 
     let promptResult: unknown;
@@ -797,6 +931,7 @@ export class AcpSessionRunner {
 
     const win = this.closeCapture(input.contextId, sessionId, input.taskId);
     this.bumpTurn(input.contextId);
+    if (input.taskType !== undefined) this.recordTaskType(input.contextId, input.taskType);
     const text = win === null ? "" : groupTexts(win).join("");
     const blockCount = countValidOutcomeBlocks(text);
     const diag: BridgeDiag = {
@@ -1072,8 +1207,11 @@ export class AcpSessionRunner {
    *
    * **回标 `sessionResumed`（v0.8.8 · M1）**：`load` / `resume` 任一真成功 ⇒ true；两级都失败回落
    * `session/new` ⇒ false = **续跑退化成重跑**（本机制最大隐性风险，日志 + 诊断双留痕）。
+   *
+   * v0.10.2 · M-2：本方法接 {@link TurnKnobs} —— 阶梯与首轮注入判据**零改动**，变的只是
+   * 「三个 apply 用的值从构造器字段换成 per-request 解析后的生效值」。
    */
-  private async ensureSession(contextId: string): Promise<EstablishedSession> {
+  private async ensureSession(contextId: string, knobs: TurnKnobs): Promise<EstablishedSession> {
     const cached = this.sessions?.get(contextId) ?? null;
     let sessionId: string | null = null;
     let sessionResumed = false;
@@ -1102,9 +1240,9 @@ export class AcpSessionRunner {
     this.logger(
       `[acp-session] 会话建立完成（contextId=${contextId} sessionId=${sessionId} sessionResumed=${String(sessionResumed)}）`,
     );
-    await this.applyModel(sessionId);
-    await this.applyMode(sessionId);
-    await this.applyCollaborationMode(sessionId);
+    await this.applyModel(sessionId, knobs.model);
+    await this.applyMode(sessionId, knobs.mode);
+    await this.applyCollaborationMode(sessionId, knobs.collaborationMode);
     return {
       sessionId,
       sessionResumed,
@@ -1119,24 +1257,27 @@ export class AcpSessionRunner {
    * 否则发 `session/set_config_option {configId:"model", value:<原样>}`，**不校验**值合法性。
    * 失败（含后端 `-32602` 一类的取值错误）⇒ **fail-fast**：日志（含配置原值 + 原因）后抛错，
    * 由 `ensureSession` 冒泡使会话建立失败，任务以 `failed` 收场（不回退后端默认、不继续 prompt）。
+   *
+   * v0.10.2 · M-2：取值改**入参**（= {@link TurnKnobs} 解析后的生效值，per-request 优先、否则构造器）
+   * —— 下发时机、请求体形状、fail-fast 口径**全部不变**。
    */
-  private async applyModel(sessionId: string): Promise<void> {
-    if (this.model === undefined) return;
+  private async applyModel(sessionId: string, model: string | undefined): Promise<void> {
+    if (model === undefined) return;
     let result: unknown;
     try {
       result = await this.requestWithTimeout("session/set_config_option", {
         sessionId,
         configId: "model",
-        value: this.model,
+        value: model,
       });
     } catch (err) {
       const reason = reasonOf(err);
-      this.logger(`[acp-session] model=${this.model} 设置失败（${reason}）`);
-      throw new Error(`model=${this.model} 设置失败：${reason}`);
+      this.logger(`[acp-session] model=${model} 设置失败（${reason}）`);
+      throw new Error(`model=${model} 设置失败：${reason}`);
     }
     const current = configCurrentValue(result, "model");
     this.logger(
-      `[acp-session] model=${this.model} 已设置（currentValue=${current === undefined ? "n/a" : String(current)}）`,
+      `[acp-session] model=${model} 已设置（currentValue=${current === undefined ? "n/a" : String(current)}）`,
     );
   }
 
@@ -1146,9 +1287,9 @@ export class AcpSessionRunner {
    * 才回落 `session/set_config_option {configId:"mode"}`；**其余错误一律 fail-fast**
    * （日志含配置原值 + 原因后抛错 ⇒ 会话建立失败、任务 `failed`，不静默回落）。
    * 成功日志回显方式同 {@link applyModel}（`configCurrentValue(result, "mode")`，取不到呈现 `n/a`）。
+   * 取值入参口径同 {@link applyModel}（v0.10.2 · M-2）。
    */
-  private async applyMode(sessionId: string): Promise<void> {
-    const mode = this.mode;
+  private async applyMode(sessionId: string, mode: string | undefined): Promise<void> {
     if (mode === undefined) return;
     let result: unknown = undefined;
     try {
@@ -1183,9 +1324,13 @@ export class AcpSessionRunner {
    * `collaboration_mode` **不在 `modes` 集合内** ⇒ **只走**
    * `session/set_config_option {configId:"collaboration_mode"}`，无 `session/set_mode` 优先路径、也不回落；
    * 失败 ⇒ fail-fast（同 applyModel：日志 + 抛错）。
+   * 取值入参口径同 {@link applyModel}（v0.10.2 · M-2）。
    */
-  private async applyCollaborationMode(sessionId: string): Promise<void> {
-    const value = this.collaborationMode;
+  private async applyCollaborationMode(
+    sessionId: string,
+    collaborationMode: string | undefined,
+  ): Promise<void> {
+    const value = collaborationMode;
     if (value === undefined) return;
     let result: unknown = undefined;
     try {

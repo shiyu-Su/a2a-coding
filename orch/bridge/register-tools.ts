@@ -15,7 +15,8 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { BRIDGE_VERSION } from "../version.js";
 import type { BridgeCore } from "./index.js";
-import type { FeatureState } from "../types.js";
+import type { FeatureState, TaskType } from "../types.js";
+import { TASK_TYPES } from "../types.js";
 import { CONFIG_WRITE_GROUP_OPS } from "./config-write.js";
 
 function toMessage(err: unknown): string {
@@ -122,7 +123,29 @@ export const a2aCallSchema = {
     .describe(
       'true = 声明本节点为**只读**（落 `tasks.lane=read`，machine 按只读档放行）；缺省 / false = 按写档（保守）',
     ),
+  taskType: z
+    .enum(TASK_TYPES, {
+      error: `职责位非法：taskType 取值必须是 ${TASK_TYPES.join(" / ")} 之一（缺省 = 未声明 ⇒ 按 \`unit_agent\`）`,
+    })
+    .optional()
+    .describe(
+      `**职责位**（可选，v0.10.2 O-2，形制同 \`readOnly\`）：声明本节点以哪个职责位出场，取值 ∈ ${TASK_TYPES.join(" / ")}；**缺省 = 未声明 ⇒ \`unit_agent\`**（缺省只对「未声明」成立）。落 \`tasks.task_type\` 并经派发命令顶层 \`taskType?\` 透传 machine。**两种 mode 均可携带**（v0.10.2 增补三 E-1：\`inquiry\` 开放携带，用于 Step 0 职责位出场；\`inquiry\` 的读档语义不变）`,
+    ),
 };
+
+/**
+ * `a2a_call` 入参的**对象级 schema**（= {@link a2aCallSchema} raw shape，v0.10.2 O-2）。
+ *
+ * **为什么保留这一层**：`taskType` 的**值域拒**必须在**落库之前**的 schema 层表达（两种驱动口
+ * ——MCP / 网页 ——共用同一判据），由 {@link taskTypeFieldIssues} 解析后归一为结构化拒绝。
+ *
+ * **v0.10.2 增补三 E-1**：原先挂在 `superRefine` 上的跨字段拒（`inquiry` 携带 `taskType` ⇒ 拒，
+ * 码 `task_type_not_allowed_for_inquiry`）**已下线** —— `lane` 与 `task_type` 是正交两列，
+ * `inquiry` 也允许声明职责位（读档不变），故本层不再需要跨字段判定。
+ *
+ * ⚠️ 对端 JSON Schema（`tools/list`）**不携带**跨字段约束，值域由单字段 `z.enum(TASK_TYPES)` 表达。
+ */
+export const a2aCallArgsSchema = z.object(a2aCallSchema);
 
 /**
  * `a2a_config_write_group` 入参形状（导出以便单测直接断言 schema：op 闭集收窄、
@@ -159,12 +182,18 @@ export type CallAdmission = { ok: true } | { ok: false; code: string; error: str
  * - `mode="inquiry"` ⇒ **不得带 `featureId`**（禁止用"询问"往 DAG 塞执行节点；码
  *   `feature_not_allowed_for_inquiry`）。
  *
- * `mode` 的"必填 + 枚举收窄"由 {@link a2aCallSchema} 在 schema 层强制（缺参 / 非法值在 MCP 层即被拒，
- * 见 `test/register-tools.test.ts`）。
+ * **职责位与本判据正交**（v0.10.2 增补三 E-1）：`taskType` **两种 mode 均可携带** ——
+ * 原「`inquiry` 不得带 `taskType`」的拒（码 `task_type_not_allowed_for_inquiry`）**已下线**
+ * （`lane` 与 `task_type` 是正交两列，`inquiry` 的读档语义不因此改变）。
+ * `taskType` 的**值域**校验由 {@link validateCallTaskType} / {@link a2aCallArgsSchema} 负责。
+ *
+ * `mode` / `taskType` 的「可选 + 枚举收窄」由 {@link a2aCallSchema} 在 schema 层强制
+ * （缺参 / 非法值在 MCP 层即被拒，见 `test/register-tools.test.ts`）。
  */
 export function validateCallMode(args: {
   mode: A2aCallMode;
   featureId?: string | undefined;
+  taskType?: string | undefined;
 }): CallAdmission {
   const hasFeatureId = args.featureId !== undefined && args.featureId.length > 0;
   if (args.mode === "execute" && !hasFeatureId) {
@@ -186,6 +215,44 @@ export function validateCallMode(args: {
     };
   }
   return { ok: true };
+}
+
+/**
+ * `taskType` **非法值结构化拒绝**（v0.10.2 O-2，纯函数、可单测）：
+ * **不兜底归一** —— 「未声明」（`undefined` / 空串）才缺省 `unit_agent`，声明了闭集外的值
+ * 一律响亮拒绝（码 `task_type_invalid`，文案含四值值域）。
+ *
+ * 与 machine 侧的分工：本口是**声明面**的第一道（宿主经 MCP / 网页直调也过这里）；
+ * machine launcher intake 的硬拒（`unknown_task_type=<原值>`）是第二道兜底（F-C1）。
+ */
+export function validateCallTaskType(taskType: string | undefined): CallAdmission {
+  if (taskType === undefined || taskType.length === 0) return { ok: true };
+  if (!(TASK_TYPES as readonly string[]).includes(taskType)) {
+    return {
+      ok: false,
+      code: "task_type_invalid",
+      error:
+        `taskType 非法：${taskType}；取值必须是 ${TASK_TYPES.join(" / ")} 之一。` +
+        "缺省（不带该键）= 未声明 ⇒ 按 unit_agent，不得用其它写法表达缺省。",
+    };
+  }
+  return { ok: true };
+}
+
+/**
+ * 经 {@link a2aCallArgsSchema} 解析 `a2a_call` 入参，把 `taskType` 相关 issue 归一为**结构化拒绝**
+ * （码 `task_type_invalid`）；非 `taskType` 的解析问题 ⇒ `{ ok: true }`
+ * （交由 SDK 的 `mode` 必填等既有判定与文案负责）。
+ *
+ * v0.10.2 增补三 E-1 起，本口**只剩值域一码** —— 原第二码
+ * `task_type_not_allowed_for_inquiry`（跨字段拒）随 `inquiry` 开放携带而下线。
+ */
+export function taskTypeFieldIssues(args: unknown): CallAdmission {
+  const parsed = a2aCallArgsSchema.safeParse(args);
+  if (parsed.success) return { ok: true };
+  const issues = parsed.error.issues.filter((issue) => issue.path.join(".") === "taskType");
+  if (issues.length === 0) return { ok: true };
+  return { ok: false, code: "task_type_invalid", error: issues.map((issue) => issue.message).join("；") };
 }
 
 /**
@@ -253,11 +320,16 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
         `**mode 必填（无缺省）**：mode="execute" = 执行型派发，**必带 featureId**，任务作为 Feature DAG 节点登记（不立即派发），由调度器按 dependencies 串行自动派发（可挂载态 = ${MOUNTABLE_FEATURE_STATES.join(" / ")}）；mode="inquiry" = 只读询问 / 核实（Step 0/1 用），**不得带 featureId**，经队列立即下发。` +
         "**即时性说明**：任务入队后桥经 `/runner/connect` 的 wake 信号**尽力立即下发**；目标机 Runner 未连接时，照常入队（**不拒绝**），最长等其下一轮轮询周期（约 `runner.holdMs`，默认 25s）被领取。" +
         "**只读声明**：`readOnly=true` 标记节点为只读档（machine 侧只读闸内放行、不占写忙集）；缺省 / false = 按写档（保守）。inquiry 恒为只读档，无需声明。" +
+        "**职责位声明**：`taskType` 声明节点以哪个职责位出场（取值 ∈ " +
+        `${TASK_TYPES.join(" / ")}；缺省 = 未声明 ⇒ unit_agent），经派发命令顶层 taskType? 透传 machine；` +
+        "非法值 ⇒ 结构化拒绝（task_type_invalid）。**两种 mode 均可携带**（v0.10.2 增补三：`inquiry` 开放声明职责位，其读档语义不变）。" +
         "**仅项目组成员可派发**：非成员 ⇒ 返回 `project_not_a_member`（零出站请求即失败）。",
       inputSchema: a2aCallSchema,
     },
     async (args) => {
       try {
+        const declared = taskTypeFieldIssues(args);
+        if (!declared.ok) return errorResult(declared);
         const admission = validateCallMode(args);
         if (!admission.ok) return errorResult(admission);
         if (args.mode === "execute") {
@@ -278,6 +350,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
             args.dependencies ?? [],
             args.inputs,
             args.readOnly,
+            args.taskType,
           );
           return outcome.ok ? textResult(outcome) : errorResult(outcome);
         }
@@ -286,6 +359,9 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           args.message,
           args.contextId,
           args.wait ?? true,
+          "inquiry",
+          // v0.10.2 增补三 E-1：inquiry 也可声明职责位（读档不变）
+          args.taskType,
         );
         return outcome.ok ? textResult(outcome) : errorResult(outcome);
       } catch (err) {

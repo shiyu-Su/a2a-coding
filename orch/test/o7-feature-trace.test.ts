@@ -285,6 +285,8 @@ const NODE_KEYS = [
   "projectId",
   "state",
   "lane",
+  // v0.10.2 O-3 additive：职责位（与 `lane` 同形制，NULL 老数据归一 unit_agent）
+  "taskType",
   "queueState",
   "waitReason",
   "blockedOn",

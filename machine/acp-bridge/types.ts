@@ -34,6 +34,32 @@ export interface A2AMessage {
   parts: TextPart[];
   messageId: string;
   contextId?: string;
+  /**
+   * A2A 消息元信息（**v0.10.2 · M-2 起桥侧接这根线**）：machine → 后端 agent 段的角色意图载体
+   * （launcher 从 dispatch 顶层 `taskType` + 本机 `agentConfig.roles` 映射后写入）。
+   * 本模块只标**形态**（宽对象），**不校验**；解析的唯一落点 = `a2a-server.ts` 的
+   * `parseRoleIntent`（其它地方不得再解析 `metadata`）。
+   */
+  metadata?: Record<string, unknown>;
+}
+
+/**
+ * 会话级 **per-request 覆盖包**（v0.10.2 · M-2 · F-C4 `M2-a` 档）。
+ *
+ * 语义 = 「**override 优先、无则回落构造器**」：每个键**单独**判定 —— 有效值覆盖构造器同名字段，
+ * 缺省 / 空串 ⇒ 落 `BridgeArgs` → `startBridge` 装配的**进程级缺省**（未配 ⇒ 逐字现状）。
+ * 覆盖**只在同 `agentKind` / 同后端进程内**生效（`M2-b` 跨 kind / 跨 `backendCmd` 属边界外，本版不做）。
+ *
+ * `risk` 只标形态：取值 = `index.ts` 的 `BridgeRisk` 闭集（`read` / `write` / `full`），
+ * 本模块是零依赖叶、不 import 该类型，**校验与消费归 `acp/permission.ts` 的 `sessionId→risk` 路由节点**。
+ */
+export interface SessionOverrides {
+  model?: string;
+  systemPrompt?: string;
+  systemPromptMode?: "append" | "replace";
+  mode?: string;
+  collaborationMode?: string;
+  risk?: string;
 }
 
 /** v0.3 artifact（最小集：文本 parts）。 */
@@ -63,6 +89,16 @@ export interface TaskExecutionInput {
   contextId: string;
   /** 原始 A2A messageId */
   messageId: string;
+  /**
+   * 职责位原值（v0.10.2 · M-2）：由 `message.metadata.taskType` 解出，**桥只透传 / 留痕，不校验**
+   * （闭集执法在 launcher intake，见 `launcher/runner-exec.ts`）。缺省 ⇒ 不落该键 = 未声明。
+   */
+  taskType?: string;
+  /**
+   * 会话级 per-request 覆盖包（v0.10.2 · M-2）：由 `message.metadata` 解出的**有效键**，
+   * 逐键「override 优先、无则回落构造器」。缺省 / 空对象 ⇒ 全回落（逐字现状）。
+   */
+  overrides?: SessionOverrides;
 }
 
 /** 执行器终态结果（由 B2/B3 的 ACP 会话执行器产出）。 */

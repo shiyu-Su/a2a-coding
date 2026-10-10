@@ -67,13 +67,18 @@ Runner 长轮询（**poll 即心跳**）：携带 `machineId`，可携带本轮�
 
 | 判别字段 | 载荷 | 语义 |
 |----------|------|------|
-| `"dispatch"` | `{ command, taskId, projectId, contextId, commandId, message, claimToken, featureId, dependencies, inputs }` | 派发一条任务：Runner 本地 `ensure`（幂等复用）→ 本地 A2A `message/send` → 轮询至终态 |
+| `"dispatch"` | `{ command, taskId, projectId, contextId, commandId, message, claimToken, featureId, dependencies, inputs, taskType? }` | 派发一条任务：Runner 本地 `ensure`（幂等复用）→ 本地 A2A `message/send` → 轮询至终态 |
 | `"stop"` | `{ command: "stop", projectId, commandId }` | 停止**本机单个项目** Agent（`projectId` = **该 stop 目标项目**；**不是停全部**）：Runner 以本机在飞台账自决 —— `in-flight > 0` 拒收，回执 `error: "in-flight"` |
 | `"cancel-task"` | `{ command: "cancel-task", taskId, projectId, commandId }` | 取消某在飞任务（Runner 经台账按 `taskId` 定位项目 → 本地 A2A `tasks/cancel`；台账无此 taskId ⇒ 回执 `error: "unknown-task"`，本地句柄未取得 ⇒ `error: "not-started"`） |
 
 **命令公共字段（必填）**：三类载荷一律必携 **`commandId`**（string）—— 桥侧 `uuid` 生成的命令标识；`stop` / `cancel-task` 的 machine 回执 `{ commandId, error? }` 以它**原样带回**（见「命令回执」），`dispatch` 的 `commandId` 供观测 / 对账（其结果走 `/runner/result`，不走回执）。`stop` / `cancel-task` 另必携 **`projectId`**：`stop` 由桥侧显式指定目标项目；`cancel-task` 由桥侧任务记录解析补入（machine 侧按 `taskId` 定位台账，不消费该字段）。
 
-`dispatch` 字段：`taskId` = 桥侧任务 id（**回传幂等键的一半**）；`contextId` = A2A 会话上下文；`message` = 派发消息全文；`claimToken` = **本次领取令牌**（回传结果时必须原样带回）；`featureId` = 所属 Feature（可为 `null`）；`dependencies` / `inputs` = 上游依赖与产物引用（Runner 仅展示，顺序由桥保证）。
+`dispatch` 字段：`taskId` = 桥侧任务 id（**回传幂等键的一半**）；`contextId` = A2A 会话上下文；`message` = 派发消息全文；`claimToken` = **本次领取令牌**（回传结果时必须原样带回）；`featureId` = 所属 Feature（可为 `null`）；`dependencies` / `inputs` = 上游依赖与产物引用（Runner 仅展示，顺序由桥保证）；**`taskType`（可选，v0.10.2 引入）= 职责位**，取值 ∈ 下方 `task-types` 锚点闭集，**缺省 `unit_agent`**（键缺省 = 未声明 ⇒ 按 `unit_agent` 处理）。
+<!-- task-types: unit_agent,product_manager,project_manager,dev_manager -->
+
+> **`taskType` 取值集合规范源**：上行为 `taskType` 取值集合的**机器可解析规范源锚点**（供回归断言以正则捕获）。orch（`orch/types.ts` 的 `TASK_TYPES`）与 machine 侧对应模块**各自派生常量、不共享代码**（两单元自包含），两侧一致性由回归断言「本地清单 == 锚点」锁定（与上文 `agent-kinds` 锚点同一捕获形制）。
+>
+> **为何 `PROTOCOL_VERSION` 保持 `2.3` 不升（v0.10.2 判据）**：`taskType` 是**可选键**、**缺省值 = `unit_agent` = 该字段引入前的唯一行为**，且**不下发即现状** —— 未升版 Runner 按「未知字段忽略」伞整键丢弃本键，其判定与消费语义与 2.3 逐字一致，不存在单向不兼容变更。按 `需求流程.md` §7 协议版本规则（「可被对端完全忽略且不影响任何判定 / 消费语义的新增字段 ⇒ 不升版」），本次**不 minor bump**。（消费侧对本键的非法值处置属 machine 侧 intake 语义，不改变本判据。）
 
 **优先级**：控制命令（stop / cancel-task）**先于** claim 评估 —— 已就绪的控制命令总是优先下发，避免「先 claim 再发现该下发 stop」而丢任务；多条按入队时刻（同刻按入队序）取最早就绪者。
 

@@ -66,6 +66,8 @@ function task(
     state,
     // v0.8.10 O-N1：并发档；纯函数构造取缺省档（写 = 参与串行门），需要只读经 `over` 覆盖
     lane: "write",
+    // v0.10.2 O-1：职责位；纯函数构造取缺省档（unit_agent）
+    taskType: "unit_agent",
     artifactsJson: null,
     text: null,
     prompt: null,

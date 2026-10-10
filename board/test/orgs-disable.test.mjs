@@ -181,7 +181,7 @@ async function withBd3Server(env, run, opts = {}) {
     // §9.4-①：停用 handler 会调 O1 group.remove —— 离线用例一律注入假实现（不真打桥）。
     releaseOrgGroupImpl: release.impl,
     orgProjectsFetcher: opts.fetcher ?? (async () => ({ ok: true, projects: [] })),
-    // §9-c：管理页成员区会查 3300 声明面 ⇒ BD3 用例统一不装配（离线确定性；成员清单区显示「未查询」）
+    // §9-c：管理页会查 3300 声明面（项目池右栏 + 配置核对卡首行）⇒ BD3 用例统一不装配（离线确定性；两处如实显示「未查询」）
     orgGroupsFetcher: null,
   });
   try {

@@ -186,6 +186,12 @@ export interface FeatureDetailView {
   tasks: FeatureTaskItem[];
   /** 详情出参顶层 `acceptance` 块；老桥 / 缺键 / 非对象 ⇒ null（现行为） */
   acceptance: AcceptanceView | null;
+  /**
+   * 详情出参顶层 `projects[]`（归属 / 承诺集读面，v0.10.2 N6）：
+   * 数组 ⇒ 逐条 camelCase 两键；**键缺位 / 非数组 ⇒ null**（缺面 ≠ 空面，口径同 {@link projectVersionsOf}）；
+   * `[]` ⇒ 空数组 = 合法事实「该需求未归属任何 project」（与 null 的「面不可读」必须可区分）。
+   */
+  projects: { projectId: string; version: string }[] | null;
 }
 
 /** `GET /api/projects` 归一视图（快照语义：`observedAt` + note，非实时在线） */
@@ -325,8 +331,13 @@ export interface EngineVersionsProjection {
 
 /**
  * project 级版本台账的一行（v0.10.1 B1 · C-7 最小键集）。
- * 值域不归一、不校验；**缺键 ⇒ `null` ⇒ 显示 `—`、不猜**（`releasable` 缺位是「引擎闸未上线」
- * 的过渡档，**不得渲染成「不可发版」**）。
+ * 值域不归一、不校验；**缺键 ⇒ `null`、不猜**（`—` 一类的缺省显示归消费侧，解析层不替引擎补默认）。
+ *
+ * **v0.10.2 消费面现状**（原排期页 project 版本区块已摘 ⇒ 下列字段不再有板侧显示面，但**仍如实解析、
+ * 不裁字段**）：板当前只消费 `org` / `projectId` / `status`（管理页「已发布的最新版本号」列）；
+ * `releasable` / 三枚计数 / `reason` / `repoId` / `ref` = **暂无消费面**（引擎自报值，留作读面恢复时的
+ * 数据源）。若将来再渲 `releasable`：其缺位是「引擎闸未上线」的过渡档，**不得渲染成「不可发版」**
+ * （未知 ≠ 假否定）。
  */
 export interface EngineProjectVersionEntry {
   /** 归属组织（引擎 `owner_group`）；缺键 ⇒ 未归属桶 `""`（口径同 {@link EngineVersionEntry.org}）。 */
@@ -337,17 +348,17 @@ export interface EngineProjectVersionEntry {
   version: string;
   /** 值域归引擎（`open / released` 等）；非字符串 ⇒ `null`，板不回落、不猜。 */
   status: string | null;
-  /** 展示字段（C-4 级联档：project 收口判据降为展示，**不是发版口**）；缺键 ⇒ `null` ⇒ `—`。 */
+  /** 展示字段（C-4 级联档：project 收口判据降为展示，**不是发版口**）；缺键 ⇒ `null`（板不重算、不判 project 闸）。 */
   releasable: boolean | null;
-  /** 以下计数为引擎自报展示值；缺键 / 非数字 ⇒ `null` ⇒ `—`，板不重算、不与 Group 计数互校（C-18⑥）。 */
+  /** 以下计数为引擎自报展示值；缺键 / 非数字 ⇒ `null`，板不重算、不与 Group 计数互校（C-18⑥）。 */
   openCount: number | null;
   completedCount: number | null;
   cancelledCount: number | null;
-  /** 不可发版原因（展示用）；缺键 ⇒ `null`。 */
+  /** 不可发版原因（展示字段，板侧暂无消费面）；缺键 ⇒ `null`。 */
   reason: string | null;
-  /** 仓库标识（展示用）；缺键 ⇒ `null` ⇒ `—`。 */
+  /** 仓库标识（展示字段，板侧暂无消费面）；缺键 ⇒ `null`。 */
   repoId: string | null;
-  /** 交付引用（展示用）；缺键 ⇒ `null` ⇒ `—`。 */
+  /** 交付引用（展示字段，板侧暂无消费面；交付快照本身板不显示 ★R3）；缺键 ⇒ `null`。 */
   ref: string | null;
 }
 
@@ -356,7 +367,9 @@ export interface EngineProjectVersionEntry {
  * - `live` ⇒ 顶层 `projectVersions[]` 在场且**至少一条合法条目**；
  * - `empty` ⇒ 字段在场但**零合法条目** —— 这是**合法事实**（「未登记，本版本起生效」档），
  *   与 `absent`（面未上线）**两种显示必须可区分**；
- * - `absent` ⇒ 顶层字段**缺位 / 非数组** ⇒ project 面单独降级（文案「引擎 project 版本面未上线」），
+ * - `absent` ⇒ 顶层字段**缺位 / 非数组** ⇒ project 面单独降级（`error` 文案含「引擎 project 版本面
+ *   未上线」；v0.10.2 起**唯一显示面** = 管理页「配置核对」卡第三行，`empty` / `absent` 的可区分性
+ *   就落在这一行 ⇒ 项目卡新列对二者同显 `—`，裁定④），
  *   **Group 面（版本列 / 锁 / 门户摘要）一切照常**，不牵连排期写门（project 降级**不进** fail-closed）。
  */
 export type ProjectVersionsField =
@@ -553,7 +566,29 @@ export function parseFeatureDetail(json: unknown): FeatureDetailView {
     },
     tasks,
     acceptance: parseAcceptance(body.acceptance),
+    projects: parseFeatureProjects(body.projects),
   };
+}
+
+/**
+ * 顶层 `projects[]`（归属 / 承诺集，v0.10.2 N6）三态解析：
+ *
+ * - 键**缺位 / 非数组** ⇒ `null`（归属面不可读；**缺面 ≠ 空面**，口径同 {@link projectVersionsOf}）；
+ * - 数组 ⇒ 逐条**严格取 camelCase 两键**（一手核实桥出参为 camelCase，不做 snake_case 双形容错）；
+ * - `[]` ⇒ 空数组（合法的「未归属」事实，不得吞成 null）。
+ * 条目缺任一非空白字符串键 ⇒ 整条丢弃（口径同 project 档「无版号不成条目」），不抛。
+ */
+function parseFeatureProjects(v: unknown): FeatureDetailView["projects"] {
+  if (!Array.isArray(v)) return null;
+  const out: { projectId: string; version: string }[] = [];
+  for (const item of v) {
+    if (!isRecord(item)) continue;
+    const projectId = str(item.projectId)?.trim();
+    const version = str(item.version)?.trim();
+    if (!projectId || !version) continue;
+    out.push({ projectId, version });
+  }
+  return out;
 }
 
 /**
@@ -814,7 +849,7 @@ export function projectVersionsOf(projection: EngineVersionsProjection | null | 
 /**
  * 顶层 `projectVersions[]` → project 档三态（**纯函数**，v0.10.1 B1 · C-7）。
  *
- * - 键**缺位 / 非数组** ⇒ `absent`（面未上线，显示「引擎 project 版本面未上线」）；
+ * - 键**缺位 / 非数组** ⇒ `absent`（面未上线，根因码 + `error` 文案随档带出，供核对卡第三行展示）；
  * - 键在场 ∧ 数组 ∧ **零合法条目** ⇒ `empty`（**合法事实**，与 `absent` 显示必须可区分）；
  * - 键在场 ∧ 至少一条合法 ⇒ `live`。
  * 合法 = `project_id` 与 `version` 都非空白；不合格条目整条丢弃（口径同 Group 面「无版号不成条目」）。

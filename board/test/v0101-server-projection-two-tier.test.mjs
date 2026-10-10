@@ -285,7 +285,7 @@ test("B2-④ 一次渲染只打一次 /api/versions：project 档共用 Group �
       const html = await (await fetch(`${base}/org/${ORG}/schedule`)).text();
       assert.equal(fetcher.calls, before + 1, "排期页一次渲染 = 一次上游读取（版本列 + 锁 + project 档共用）");
       assert.match(html, /<h3>v1\.0\.0/, "Group 版本列照常现形（project 档在场不影响列并集）");
-      assert.doesNotMatch(html, /project_versions_/, "读面不裸吐根因码 —— project 区块的降级条归 T3 渲染");
+      assert.doesNotMatch(html, /project_versions_/, "读面不裸吐根因码（★v0.10.2 落点③ 摘块后本锚升为**整页**范围 —— 根因码唯一合法落点 = 管理页「配置核对」卡第三行）");
     },
     { engineVersionsFetcher: fetcher },
   );
@@ -298,12 +298,10 @@ test("B2-④b project 缺位档：门户与排期页各自只打一次，Group �
       const schedule = await (await fetch(`${base}/org/${ORG}/schedule`)).text();
       assert.match(schedule, /🔒 已发版/, "Group 已发版锁样式照常");
       assert.match(schedule, /<h3>v9\.9\.9/, "Group 版本列照常");
-      // B4 接线后 project 区块在场 ⇒ project 根因码的**唯一**落点 = 区块体内那条降级条
-      // （本锚原为整页 doesNotMatch，其口径本就写着「降级条归 T3 渲染」，随接线落位收窄成分档面）；
-      // Group 面的停摆码仍**整页不得出现**（两档分立不破）。
-      const blockStart = schedule.indexOf('<div class="b-card pv-block">');
-      assert.notEqual(blockStart, -1, "B4 接线后排期页必须渲出 project 区块（降级档）");
-      assert.doesNotMatch(schedule.slice(0, blockStart), /project_versions_/, "区块之前的 Group 面不裸吐 project 根因码");
+      // ★v0.10.2 落点③ 改判：`.pv-block` 区块已摘 ⇒ 原「blockStart 之前 = Group 面」的分档面收窄**作废**，
+      // 本锚恢复为**整页**负向钉（与同文件 B2-④ 同范围）。范围仍是「排期页 + 门户」两页 ——
+      // 管理页「配置核对」卡第三行**合法**出现该根因码（锚 = v0102-config-check-third-row），故不写成全站。
+      assert.doesNotMatch(schedule, /project_versions_/, "project 缺位档：排期页整页不裸吐 project 根因码（区块摘除后无降级条落点）");
       assert.doesNotMatch(schedule, /board_version_projection_unavailable|已发版锁无法判定/, "project 缺位不外溢成排期页停摆文案");
 
       const portal = await (await fetch(`${base}/`)).text();

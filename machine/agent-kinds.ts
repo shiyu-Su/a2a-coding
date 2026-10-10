@@ -21,6 +21,12 @@ export type AgentKind = (typeof AGENT_KINDS)[number];
  * `backendCmd` / `model`（自消费键）与 `systemPrompt` / `systemPromptMode`
  * （v0.8.5 · M4：段退役后自定义注入的平铺键，见 `launcher/agent-config.ts`）；
  * 其余为既有顶层键（观测键）的占位登记。
+ *
+ * `roles`（v0.10.2 · M-4 · F-C2）：`agentConfig.roles` 职责位映射 = 顶层平铺键 ⇒ 占用命名空间。
+ *
+ * **运行期消费者（v0.10.2 · M-4 起）**：此前本常量**只被测试锚引用**（=「有定义、无消费者」）；
+ * 今天的消费者是 `agent-roles.ts` 的 `agentRolesErrors()` 校验① —— 逐角色名对照本清单，
+ * 撞名 ⇒ 加载期 fail-fast。新增保留键只改这一处，校验器不硬编码成员。
  */
 export const RESERVED_AGENT_CONFIG_FLAT_KEYS = [
   "backendCmd",
@@ -31,4 +37,5 @@ export const RESERVED_AGENT_CONFIG_FLAT_KEYS = [
   "agentCard",
   "events",
   "mcp",
+  "roles",
 ] as const;

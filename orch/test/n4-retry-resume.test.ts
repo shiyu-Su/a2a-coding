@@ -64,6 +64,8 @@ function node(
     state,
     // v0.8.10 O-N1：并发档；纯函数构造取缺省档（write = 参与串行门）
     lane: "write",
+    // v0.10.2 O-1：职责位；纯函数构造取缺省档（unit_agent = 本字段引入前的唯一行为）
+    taskType: "unit_agent",
     artifactsJson: null,
     text: null,
     prompt: null,

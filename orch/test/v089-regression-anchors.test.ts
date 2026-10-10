@@ -444,6 +444,8 @@ const ROW_KEYS = [
   "diagnostics",
   // v0.8.10 O-N3 additive：读写分道档位（`read` / `write`，NULL 老数据归一 write）
   "lane",
+  // v0.10.2 O-3 additive：职责位（`unit_agent` / …，NULL 老数据归一 unit_agent；与 `lane` 同形制）
+  "taskType",
 ] as const;
 
 /** ② 透传 diagnostics 的键闭集与类型期望（§2.3 键表逐字对齐；machine 全报 ⇒ 全透传） */

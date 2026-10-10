@@ -17,9 +17,11 @@
  *    v0.9.3 B-T5 起增「排期拖拽」`DRAG_SCHEDULE_SCRIPT`（当时六枚，与弹窗常量分立、不可共置）；
  *    **v0.9.8 REQ-2026-10-03-02 起 = 七元**（新增「成员两栏拖拽」`MEMBER_DRAG_SCRIPT`，
  *    与排期拖拽常量分立、不可共置 —— 那枚的入口守卫 `#schedule-board` 不因其扩）。
- * ④ **v0.10.1 C3 · project 版本面带来的纪律面（N3-⑩～⑬）**：区块容器恒在 `#schedule-board` 之外且
- *    **恰一处**（C-18①）；内联闭集**字面枚数恒七**、区块零脚本；`WRITE_ROUTES` **恒 11 条**（C-18③）；
- *    板本地台账源码**无 project 维键**（板不落库、project 面无本地缓存）。
+ * ④ **v0.10.1 C3 · project 版本面带来的纪律面（N3-⑩～⑬）**：★v0.10.2 落点③ 摘块后 ⑩ / ⑩b **改判为
+ *    负向「零处」钉** —— 排期页**整页零 pv 元素**（四件闭集 `.pv-block` / `.pvbadge` / 标题字面
+ *    「各 project 版本」/ 根因码前缀 `project_versions_`，**范围限排期页**，根因码在管理页「配置核对」卡
+ *    **合法出现** ⇒ 不得写成全站零出现）；内联闭集**字面枚数恒七**（摘块是纯删，不动脚本面）；
+ *    `WRITE_ROUTES` **恒 11 条**（C-18③）；板本地台账源码**无 project 维键**（板不落库、project 面无本地缓存）。
  *    本组是**回归面的结构 / 计数钉**（防后续版本顺手扩），不重抄 B1/B3/B4 各单元档的行为级断言。
  */
 import { test } from "node:test";
@@ -641,13 +643,26 @@ test("N3-⑨（增补三 · 负向锚）全站可执行内联脚本零 `form.act
 
 // ---------------------------------------------------------------------------
 // ④ v0.10.1 C3 · project 版本面的结构 / 计数纪律钉（改造文档 §2 C-18）
+//     ★v0.10.2 落点③ 摘块：⑩ / ⑩b 由「正向恰一处」翻成「整页零处」负向钉，⑪ 半退役
+//     （`INLINE_SCRIPT_ALLOWLIST == 7` 两条留、区块体内零脚本两条随区块退役），⑫⑬ 零改动。
 //     本组只钉「结构位置 + 恒等计数」，行为级断言归 B1/B3/B4 各单元档，此处不重抄。
 // ---------------------------------------------------------------------------
 
-const BOARD_OPEN_TAG = '<div class="kanban" id="schedule-board">';
-const PV_BLOCK_OPEN = '<div class="b-card pv-block">';
+/**
+ * 排期页「整页零 pv 元素」**四件闭集**（★v0.10.2 落点③ 改判 · 改造文档 §2.3 B-3）。
+ * **范围只钉排期页**：第 4 件（根因码前缀）在管理页「配置核对」卡第三行**合法出现**
+ * （正向对照见 N3-⑩b 末段）⇒ 本闭集**不得**扩成全站负向钉。
+ */
+const PV_ZERO_ON_SCHEDULE = ["pv-block", "pvbadge", "各 project 版本", "project_versions_"];
 
-/** project 区块三档夹具（live / empty / absent ⇒ 三档都必须渲出**同一枚**容器）。 */
+/** 整页零处钉：四件闭集逐件断言（件缺一份 = 锚退化成弱锚，故用闭集数组而非正则）。 */
+function assertZeroPvElements(html, label) {
+  for (const needle of PV_ZERO_ON_SCHEDULE) {
+    assert.ok(!html.includes(needle), `${label}：整页不得出现「${needle}」（.pv-block 区块已于 v0.10.2 摘除）`);
+  }
+}
+
+/** project 档三态夹具（live / empty / absent ⇒ ★v0.10.2 起三档在排期页一律**零处**渲出）。 */
 function projectFixture() {
   return engineProjectionWithProjectsFetcher(
     [{ org: "alpha", version: "v0.10.1", status: "active" }],
@@ -679,39 +694,15 @@ async function withProjectServer(fetcher, run) {
   }
 }
 
-/**
- * 按 div 嵌套深度摘出 `openTag` 元素的区间 `[start, end)`（end = 闭合 `</div>` 之后一位）。
- * **必须**用深度扫描而不是「切到下一个兄弟标记」：区块一旦嵌进看板，下一个同级标记会掩盖嵌位 ⇒
- * 「不在看板内」这条判据只能靠**闭合位置**来判（可证伪性所在）。
- */
-function elementRange(html, openTag, label) {
-  const start = html.indexOf(openTag);
-  assert.notEqual(start, -1, `${label} 必须渲出（缺位 = 锚失效，不许静默放行）`);
-  const scanner = /<div\b[^>]*>|<\/div>/g;
-  scanner.lastIndex = start;
-  let depth = 0;
-  for (let m = scanner.exec(html); m !== null; m = scanner.exec(html)) {
-    depth += m[0] === "</div>" ? -1 : 1;
-    if (depth === 0) return { start, end: scanner.lastIndex };
-  }
-  return assert.fail(`${label} 未闭合 ⇒ 结构锚失效`);
-}
-
-const countOf = (haystack, needle) => haystack.split(needle).length - 1;
-
-test("N3-⑩（C-18① 结构锚）project 版本区块 `pv-block` **恰一处**且**在看板闭合之后**（同级 section；把区块挪进看板内 ⇒ 本锚必红）", async () => {
+test("N3-⑩（★v0.10.2 改判 · C-18① 翻负向）排期页**整页零 pv 元素**四件闭集（live 档：引擎有 project 行也不渲区块）", async () => {
   await withProjectServer(projectFixture(), async (base) => {
     const html = await (await fetch(`${base}/org/alpha/schedule`)).text();
-    assert.equal(countOf(html, PV_BLOCK_OPEN), 1, "区块容器恰一处（多渲 = 两档并置 / 重复接线）");
-    const board = elementRange(html, BOARD_OPEN_TAG, "看板容器");
-    const pv = elementRange(html, PV_BLOCK_OPEN, "project 区块");
-    assert.ok(pv.start > board.end, "区块起点必须落在 #schedule-board 的闭合之后（嵌进看板 = 拖拽脚本入口守卫会误触 POST）");
-    assert.ok(!html.slice(board.start, board.end).includes("pv-block"), "看板区间内不得出现区块容器类");
-    assert.ok(!html.slice(board.start, board.end).includes("各 project 版本"), "看板区间内不得出现区块标题");
+    assertZeroPvElements(html, "live 档排期页");
+    assert.match(html, /<div class="kanban" id="schedule-board">/, "摘块不动看板容器（Group 面照常）");
   });
 });
 
-test("N3-⑩b（C-18① 三档恒在）live / empty / absent 三档各自「恰一处 + 看板之外」；门户 `/` 零处（不扩摘要）", async () => {
+test("N3-⑩b（★v0.10.2 改判 · 三档一律零处）live / empty / absent 三档各自「排期页整页零 pv 元素」；absent 档的根因码**只准落管理页**", async () => {
   const tiers = [
     ["live", projectFixture()],
     ["empty", engineProjectionFetcher([], "", engineProjectEmptyField())],
@@ -720,29 +711,25 @@ test("N3-⑩b（C-18① 三档恒在）live / empty / absent 三档各自「恰�
   for (const [label, fetcher] of tiers) {
     await withProjectServer(fetcher, async (base) => {
       const html = await (await fetch(`${base}/org/alpha/schedule`)).text();
-      assert.equal(countOf(html, PV_BLOCK_OPEN), 1, `${label} 档：区块必须渲出且恰一处（absent 档出降级条、不出容器 = 降级不可见）`);
-      const board = elementRange(html, BOARD_OPEN_TAG, `${label} 档看板`);
-      const pv = elementRange(html, PV_BLOCK_OPEN, `${label} 档区块`);
-      assert.ok(pv.start > board.end, `${label} 档：区块恒在看板闭合之后`);
-      const portal = await (await fetch(`${base}/`)).text();
-      assert.equal(countOf(portal, PV_BLOCK_OPEN), 0, `${label} 档：门户不挂区块（C-18④ 摘要不扩 project）`);
+      assertZeroPvElements(html, `${label} 档排期页`);
     });
   }
+  // ★范围限定的**正向对照**（改造文档 §2.3 B-3：负向钉只钉排期页，不得写成全站）：
+  // 同一 absent 夹具下，根因码在管理页「配置核对」卡第三行**必须**可读 ⇒ 证明上面钉的是「排期页零处」，
+  // 不是「全站零处」。门户零处由 `test/org-portal.test.mjs` 的既有负向锚存续覆盖（原 ⑩b 的门户断言与之重复，已并）。
+  await withProjectServer(engineProjectionWithProjectAbsentFetcher([]), async (base) => {
+    const manage = await (await fetch(`${base}/org/alpha/manage`)).text();
+    assert.match(manage, /project_versions_/, "根因码的合法落点 = 管理页配置核对卡（排期页负向钉因此必须限范围）");
+  });
 });
 
-test("N3-⑪（C-18 零新增脚本）project 区块 = 纯 SSR：闭集仍**七元**、区块体内零 `<script`、无常量外泄", async () => {
+test("N3-⑪（C-18 零新增脚本 · ★v0.10.2 **半退役**）内联闭集仍**七元**；「区块体内零 `<script`」两条随 `.pv-block` 摘除退役", () => {
+  // 保留的两条 = **全站**内联闭集纪律锚（与本项目区块无关，摘块不动它）。
   assert.equal(INLINE_SCRIPT_ALLOWLIST.length, 7, "内联闭集枚数恒七（v0.9.8 起；project 面不得扩第八枚）");
   const blocks = collectInlineScriptBlocks();
   assert.equal(blocks.length, 7, `src/** 可执行内联字面量仍七处（实际 ${blocks.length}）`);
-  await withProjectServer(projectFixture(), async (base) => {
-    const html = await (await fetch(`${base}/org/alpha/schedule`)).text();
-    const pv = elementRange(html, PV_BLOCK_OPEN, "project 区块");
-    const block = html.slice(pv.start, pv.end);
-    assert.ok(!block.includes("<script"), "区块体内不得有任何脚本（纯读投影，无自有交互面）");
-    for (const marker of INLINE_SCRIPT_ALLOWLIST) {
-      assert.ok(!block.includes(marker.runtime ?? marker.marker), `区块体内不得内联「${marker.key}」常量正文（单点常量只在注入点出现一次）`);
-    }
-  });
+  // ★退役的两条（原「区块体内零 `<script`」+「区块体内不得内联常量正文」）：判据主语 = 已不存在的区块体，
+  //   其防的「区块自带交互面」随 v0.10.2 落点③ 摘块一并消失；「零新增脚本」由上面两条全站闭集锚继续把门。
 });
 
 test("N3-⑫（C-18③ 计数锚）`WRITE_ROUTES` 恒 11 条 · 全 POST · 零 project 维写路径（project 面不落库 ⇒ 无写口）", () => {

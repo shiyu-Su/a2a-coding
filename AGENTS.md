@@ -6,12 +6,15 @@
 
 本项目的需求流程规范由 `flow/` 包提供（单一事实源），ZCode 宿主经本文件加载：
 
-- @flow/spec/需求流程.md —— Step 0–3 骨架 / 每步判据 / 产出物 / planlog 与发版纪律
-- @flow/spec/引擎映射.md —— 步骤 ↔ Feature 状态 ↔ 驱动方、两道确认门、工具面
+- @flow/spec/需求流程.md —— Step 0–3 骨架 / 每步判据 / 产出物 / 职责位与会话复用纪律 / 版本与发版纪律
+- @flow/spec/引擎映射.md —— 步骤 ↔ Feature 状态 ↔ 驱动方、两道确认门、工具面、并发语义矩阵
+- @flow/spec/文档模板.md —— 需求确认单 / 改造文档 / 派发消息的模板（**§2 判据强制「使用同目录模板」，故必须一并加载**）
 
-若上面的 `@` 引用未被宿主展开为文件内容，进入需求工作前先 Read 这两份文件（守卫 hook 对这两个路径放行只读）。
+若上面的 `@` 引用未被宿主展开为文件内容，进入需求工作前先 Read 这三份文件（守卫 hook 对这三个路径放行只读）。
 
 ## 编排等待纪律（派发后必须用脚本阻塞等待）
+
+> **语义归 flow**（`flow/spec/引擎映射.md` §7：宿主「不自己轮询、不催办」，等待由运行底座承担）—— 本节只写**本仓的等待手段**。
 
 - **派发 Feature 后**：`node scripts/watch-feature.mjs <featureId>`（`a2a_feature_approve` 之后即调用）；按退出码分流 `0/10/11/12/13/20/1`。
 - **派发常规 `a2a_call` 任务后**（v0.8.2 起）：`node scripts/watch-task.mjs <taskId...>` —— 只读等待到目标 id 全部达成退出判据（`completed` / `failed` / `blocked` / `input-required`）或窗口耗尽；**入参必须是 `a2a_call` 返回的 taskId（本地 id）**（传 Feature 节点的 `remoteTaskId` 会 404）。
@@ -83,13 +86,32 @@ v0.8.9 起 `contextId` 是**节点级**会话标识：宿主选择沿用还是�
 
 | 场合 | 说明 |
 |---|---|
-| 新增业务节点 | `a2a_call(mode="execute", featureId=…)` 登记的每一个新节点都是新任务 ⇒ 新 `contextId` |
+| 新增业务节点 | `a2a_call(mode="execute", featureId=…)` 登记的每一个新节点都是新任务 ⇒ 新 `contextId`。**⚠ v0.10.2 收窄**：若该节点属「**同一（需求, step〔职责位〕, project）**」的**续轮**（多轮对话），则**续用同一 `contextId`** —— 见下方「3.1 职责位会话复用」 |
 | 任务语义切换 / 上下文已污染 | 同一目标下改换做法，或前一轮结论已污染需要干净起点时，主动换新 |
 | 跨 Feature / 跨需求 | **一律不共享 `contextId`** |
 
 **3. 一句话原则**
 
 同一逻辑任务的多次触达复用同一 `contextId`；**每个新任务节点开新 `contextId`**。
+
+**3.1 职责位会话复用（v0.10.2）**
+
+**正式文本在 `flow/spec/需求流程.md` §0.5「会话复用纪律」**（复用范围上界 = **默认另起 + 显式登记的跨 step 例外**；例外**仅「Step 1 → Step 2 生成具体任务」一处**、且**硬性要求同角色**；三条转换表；不变量）—— **本文件不再存副本**。
+
+- **不变量（宿主必守）**：同一 `contextId` 上**任意时刻至多一个在飞轮次** ⇒ **并行节点不得共享**同一 ctx（同 ctx 并发会让 machine 侧 `markCaptureDead` **冻结前一轮**）。
+- **不改** `retryTaskIds` / `answer` / 超时续跑（场景 C）的既有**同节点**续接语义（三者不构成「同键新派发」）。
+- **⚠ 落点纪律（用户 2026-10-10 口径）**：**纪律语义归 `flow/`**（它是**可整体复制到任意项目**的单一事实源，也是**板轮 agent 唯一可达**的纪律落点）；**本文件只保留「宿主接入层」** —— 端点 / 守卫 / 脚本名 / 本仓特有约定。旧口径「本纪律的正式文本在本文件、不在 flow 包」**已作废**。
+
+## 职责位派发纪律（v0.10.2）
+
+**`taskType` = 职责位标签**，闭集四值：`unit_agent`（**缺省**）· `product_manager` · `project_manager` · `dev_manager`。
+
+- **「哪个工序标哪个」的正式文本在 `flow/spec/需求流程.md` §0.5**（「工序 → 职责位」对照表 + **Step 0 标注限定语** + **会话复用纪律**）—— **本文件不再存第二份**（旧表已删，一律回指）。
+- **不传 `taskType` ⇒ 落 `unit_agent`**（缺省归一，**不是非法**）—— **所以「漏标」是静默的**；**非法值会被结构化拒绝**（`unknown_task_type=<原值>`）。
+- **⚠ 别拿「工具面没有这个入参」当理由**（实测坐实）：宿主会话若建于桥重启**之前**，本会话手上的 `a2a_call` **不声明** `taskType`；**但未声明的额外参数会原样透传** —— 实测经常规 MCP 工具多传 `taskType=dev_manager` ⇒ 台账如实落 `dev_manager`（`lane=read`）⇒ **照传即可，不需要绕行**。仅批量派发 / 命令串受限时才走 HTTP 直调（`POST http://127.0.0.1:8787/<组名>/mcp`；请求体写临时文件后 `curl -d @file`，避开单元路径守卫）。
+- **`roles` 覆盖的生效条件**（machine 本机事实）：`agentConfig.roles.<taskType>` **配了的键才生效**（`model` / `systemPrompt` / `systemPromptMode` / `risk`）；**未配 ⇒ 逐字现状**（回落项目平铺值）。**同一 `agentKind` 内**才能换 model / 提示词 / 档位（跨后端 CLI 本版不做）。
+- **同 ctx 换角色的静默错配**（machine 事实）：`model`/`mode` 逐轮重下发，但 **`systemPrompt` 只在会话首轮注入** ⇒ 跨角色复用同一 `contextId` = 「新模型 + 旧人格」。**machine 侧已加 warn 守卫**（增补五 M1）：同 ctx 续接 ∧ `taskType` 变化 ⇒ 出声（**不拒**）。
+- **本仓自己的开发需求也走同一张表**（v0.10.2 ⑧ 用户裁定 = 接管）。
 
 **4. 澄清：Feature 级 `context_id` ≠ 节点级会话**
 
@@ -99,27 +121,16 @@ v0.8.9 起 `contextId` 是**节点级**会话标识：宿主选择沿用还是�
 
 `machine/agent-outcome.ts` 的 outcome 约定文案把解析落点写成 `@a2a-wrapper/core` 的 `resolveOutcome` —— 属过时表述（包装器族已于 v0.8.5 退役）。今天的解析器是 `machine/acp-bridge/outcome.ts`。本项只是口径登记，**不构成改动授权**。
 
+## 宿主自办项纪律（v0.10.2）
+
+**三条语义的正式文本已下沉 `flow/spec/需求流程.md` §2「载体升级」条的子条**（① 归属写明由宿主执行的 ⇒ **宿主当轮做完并回填证据、不得转述「待用户」**；② **载体升级须清点全部载体**；③ **判旧码用行为探针**）—— **本文件只留本仓手段**：
+
+- **构造 / 重启手段**：`build`；桥 = `node orch/scripts/bridgectl.mjs restart`；Launcher = `node scripts/_launcher-ctl.mjs restart`（**根级一次性脚本 = 绕过单元路径守卫的宿主通道**）。
+- `machine/config/config.json` 之类配置**只在启动读一次** ⇒ 改配置同款要重启 Launcher。
+- **本仓探针实例**：拿 `taskType=project_manager` 打一发，被 `unknown_task_type` 拒 = 载体还是旧码。**本仓实操中桥与 Launcher 各漏升过一次**（Launcher 那次直接导致 **PjM 工序在运行态打不通**）。
+
 ## 并发语义与派发纪律（v0.8.10）
 
-v0.8.10 把「同 project 串行」拆成「**写串行 + 读不挡人**」。派活前先看这六条，**别把刻意设计当缺陷**（规范全文见 `flow/spec/引擎映射.md` §4.1 补充「并发语义矩阵」）。
+**规范全文在 `flow/spec/引擎映射.md` §4.1 补充「并发语义矩阵」** —— 串行单位 / 四边矩阵 / 两把闸 / 只读声明 / 同批只认领一个，**一律以该处为准**（本文件不再存删节副本，避免与 flow 分叉）。
 
-**1. 串行单位 = project（不是 Feature）**：同 project 串行、**跨 project 真并行**；「Feature 间 / Feature 内串行」都只是同 project 串行的特例。
-
-**2. 四边矩阵（同 project 内）**
-
-| 组合 | 可否并行 | 依据 |
-|---|---|---|
-| 读 × 写 | ✅ **读不挡写** | 只读档退出写忙集 |
-| 写 × 读 | ❌ **写挡读 —— 刻意，本版不放开** | 写档在飞 ⇒ 项目忙 ⇒ 读写节点一律等 |
-| 读 × 读 | ✅ 门径可并行；受 machine 读闸限（**缺省 1 ⇒ 实际仍串行**，配 `maxConcurrentReads ≥ 2` 才有真并行） | 只读档不入忙集 |
-| 写 × 写 | ❌ 互斥 | 写档入忙集 |
-
-**⇒ 派活时的等待预期**：往**有写在飞**的 project 派只读任务，**它会等**（`waitReason=project_busy`）；往**只有读在飞**的 project 派写或读，照常进。
-
-**3. 两把闸（machine 侧、按 project、缺省 1/1）**：`agentConfig.maxConcurrentWrites` / `maxConcurrentReads`（FIFO 排队；**派发预算从放行时刻起算**，不吃排队时长）。**⚠ 闸上限没有日志回显** ⇒ 查「这台机配了多少」只能看配置或反推并发行为。
-
-**4. 判「在排队还是真在跑」用 `a2a_feature_trace(featureId)`**：看 `waitReason`（八值闭集）/ `position` / `waitedSince` / `projectBusy{taskId,machineId}` / `readOccupants[]`。**两个时钟不得相加**（orch 领取队列的等待 ≠ machine 本机闸内等待）；**闸内排队 orch 看不见** ⇒ 「`/health inFlightCount` 已到 3 而只有 2 个在跑」是正常形态。
-
-**5. 只读是「声明」不是「强制」**：`a2a_call(readOnly=true)` 落 `lane='read'`（缺省 / 非 `true` ⇒ 按写），inquiry 恒为 read 档；引擎**看不见任务动哪些文件** ⇒ 声明失真只能事后核对（工作树指纹）。
-
-**6. 同批只认领一个（避免误判为卡住）**：同一拍（tick）内同 project **至多认领一个**节点（批次布尔刻意不改）⇒ 两个只读即使都就绪，第二个也要等下一拍（约 30s 或事件触发）才被领。
+**宿主排障手段（本仓事实）**：判「在排队还是真在跑」用 `a2a_feature_trace(featureId)` 看 `waitReason`（八值闭集）/ `position` / `waitedSince` / `projectBusy{taskId,machineId}` / `readOccupants[]`；**两个时钟不得相加**（orch 领取队列的等待 ≠ machine 本机闸内等待）；**闸上限没有日志回显**（只能看配置或反推并发行为）；`/health inFlightCount` 已到 3 而只有 2 个在跑属正常形态。

@@ -21,8 +21,11 @@
  * 去重不改解析语义（结果一致、合法配置仍零告警）；`resetWarnOnceCache` 提供用例级隔离。
  * 覆盖（v0.8.3 O2）：`callback` 段与 `machines[].pushCallback` 退役 ⇒ 旧配置宽容解析（不抛错、
  * 返回对象无 `callback` 键）+ 两条退役 warn 各恰一次（文案级 once-per-process）。
- * 覆盖（v0.8.6 FIX-2 R-2）：模板 `config/config.json.default` 的 `_projectGroupExample`（组数组样例）
- * 原样喂给 `parseProjectGroups` 正向接受（防样例与 schema 二次漂移）。
+ * 覆盖（v0.8.6 FIX-2 R-2 · 配置模板拆分 S2 改写）：组数组样例**内联**喂 `parseProjectGroups`
+ * 正向接受（防样例与 schema 二次漂移；样例不再落 `config.json.default` 模板）。
+ * 覆盖（配置模板拆分 S2 拆分不变量）：两份入库模板 `config.json.default` / `config.json.example`
+ * ① 无 `_` 前缀键 ② 有代码缺省常量的段（transport/web/runner）值逐等于该常量（machines[] 骨架占位豁免）
+ * ③ 递归叶子标量值无尖括号 ④ 顶层键 ⊆ 白名单 {transport, web, runner, machines, projectGroup}。
  *
  * 运行：`npm test`（先 `tsc` 构建，再 `node --test dist/test/`）。
  */
@@ -709,30 +712,100 @@ test("defaultProjectGroup：唯一「全量接纳」默认构造（段缺省态�
 
 // ── v0.7.0 A1：协议常量 + launcherUrl/token + runner 段 ─────────────────────────
 
-// ★ 模板样例 ↔ schema 防漂移（v0.8.6 FIX-2 R-2）：把 config/config.json.default 的
-// `_projectGroupExample` 原样喂给 parseProjectGroups 断言被接受 —— 样例回退单组对象、
-// 组名非法、成员不在模板 machines[]、跨组重复等任一回归都会让本用例变红。
-test("config.json.default 的 _projectGroupExample 组数组被 parseProjectGroups 接受（machineId 取模板自身 machines[]）", () => {
-  const tplPath = join(appRootFromModule(import.meta.url), "config", "config.json.default");
-  const tpl = JSON.parse(readFileSync(tplPath, "utf8")) as {
-    _comment: string;
-    machines: { machineId: string }[];
-    _projectGroupExample: unknown;
-  };
-  assert.ok(tpl._comment.includes("组数组"), "_comment 必须是组数组口径（不得回退「单组」）");
-  assert.ok(
-    tpl._comment.includes("group_identity_required"),
-    "_comment 须含「配组后连接带组名首段」口径",
-  );
-  assert.ok(Array.isArray(tpl._projectGroupExample), "_projectGroupExample 必须是组数组");
-  assert.ok(tpl._projectGroupExample.length >= 2, "样例至少演示两个组");
-  const machineIds = new Set(tpl.machines.map((m) => m.machineId));
-  const groups = parseProjectGroups(tpl._projectGroupExample, machineIds);
-  assert.equal(groups.length, tpl._projectGroupExample.length);
+// ★ 组数组样例 ↔ schema 防漂移（原 v0.8.6 FIX-2 R-2 曾由 `config.json.default` 的
+// `_projectGroupExample` 承载；配置模板拆分 S2 后模板不再内嵌样例，改由本用例**内联**一份
+// 组数组喂 parseProjectGroups —— 「样例 ↔ schema 漂移」语义不变：样例回退单组对象、组名非法、
+// 成员不在 machines[]、跨组重复等任一回归都会让本用例变红。
+test("组数组样例被 parseProjectGroups 接受（内联样例，防样例与 schema 二次漂移）", () => {
+  const sample = [
+    { name: "team-a", members: [{ machineId: "m1", projectId: "p-a" }] },
+    { name: "team-b", members: [{ machineId: "m2", projectId: "p-b" }] },
+  ];
+  const machineIds = new Set(["m1", "m2"]);
+  assert.ok(sample.length >= 2, "样例至少演示两个组");
+  const groups = parseProjectGroups(sample, machineIds);
+  assert.equal(groups.length, sample.length);
   assert.ok(
     groups.every((g) => g.selective),
     "配了组 ⇒ 每组恒 selective=true",
   );
+});
+
+// ── 配置模板拆分（S2）：两份入库模板的拆分不变量 ─────────────────────────────
+// 模板分工：`config.json.default` = 骨架占位（值取字面量哑值）；`config.json.example` = 可照抄样例。
+// 说明文档已搬进 README（S1），两份模板只承载「结构 + 缺省值」，不再夹带 `_comment` 与尖括号占位。
+const CONFIG_TEMPLATE_FILES = ["config.json.default", "config.json.example"];
+
+/** 读入库模板（相对 orch 单元根 `config/`），返回解析后的 JSON */
+function readConfigTemplate(fileName: string): Record<string, unknown> {
+  const path = join(appRootFromModule(import.meta.url), "config", fileName);
+  return JSON.parse(readFileSync(path, "utf8")) as Record<string, unknown>;
+}
+
+/** 递归收集全部对象键名（数组元素一并下钻） */
+function collectKeys(node: unknown, out: string[] = []): string[] {
+  if (Array.isArray(node)) {
+    for (const item of node) collectKeys(item, out);
+  } else if (node && typeof node === "object") {
+    for (const [k, v] of Object.entries(node)) {
+      out.push(k);
+      collectKeys(v, out);
+    }
+  }
+  return out;
+}
+
+/** 递归收集全部叶子标量值（字符串 / 数字 / 布尔） */
+function collectLeafValues(node: unknown, out: unknown[] = []): unknown[] {
+  if (Array.isArray(node)) {
+    for (const item of node) collectLeafValues(item, out);
+  } else if (node && typeof node === "object") {
+    for (const v of Object.values(node)) collectLeafValues(v, out);
+  } else if (
+    typeof node === "string" ||
+    typeof node === "number" ||
+    typeof node === "boolean"
+  ) {
+    out.push(node);
+  }
+  return out;
+}
+
+test("拆分不变量①：两份入库模板无任何 `_` 前缀键", () => {
+  for (const f of CONFIG_TEMPLATE_FILES) {
+    const underscoreKeys = collectKeys(readConfigTemplate(f)).filter((k) => k.startsWith("_"));
+    assert.deepEqual(underscoreKeys, [], `${f} 不得含 _ 前缀键（说明文档归 README）`);
+  }
+});
+
+test("拆分不变量②：模板有代码缺省常量的段（transport/web/runner）值逐等于该常量", () => {
+  // 不可 import 私有 defaultTransport/parseWeb ⇒ 用公开 API 从最小配置（不含三段）解析出缺省常量比对。
+  // machines[] 属「骨架占位、无常量」⇒ 豁免本条。
+  const def = withConfig(minimalConfig(), loadMachinesConfig);
+  for (const f of CONFIG_TEMPLATE_FILES) {
+    const tpl = readConfigTemplate(f);
+    assert.deepEqual(tpl.transport, def.transport, `${f}.transport 须逐等于代码缺省`);
+    assert.deepEqual(tpl.web, def.web, `${f}.web 须逐等于代码缺省`);
+    assert.deepEqual(tpl.runner, def.runner, `${f}.runner 须逐等于代码缺省`);
+  }
+});
+
+test("拆分不变量③：两份模板递归叶子值无尖括号（占位不用 <…> 形态）", () => {
+  for (const f of CONFIG_TEMPLATE_FILES) {
+    const offenders = collectLeafValues(readConfigTemplate(f)).filter(
+      (v) => typeof v === "string" && (v.includes("<") || v.includes(">")),
+    );
+    assert.deepEqual(offenders, [], `${f} 叶子字符串值不得含尖括号 < >`);
+  }
+});
+
+test("拆分不变量④：两份模板顶层键 ⊆ 白名单 {transport, web, runner, machines, projectGroup}", () => {
+  const whitelist = new Set(["transport", "web", "runner", "machines", "projectGroup"]);
+  for (const f of CONFIG_TEMPLATE_FILES) {
+    for (const k of Object.keys(readConfigTemplate(f))) {
+      assert.ok(whitelist.has(k), `${f} 顶层键 "${k}" 不在白名单`);
+    }
+  }
 });
 
 /** 捕获解析期 `console.warn`（断言「缺省/非法告警」与「合法不告警」） */

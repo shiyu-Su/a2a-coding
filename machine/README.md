@@ -41,7 +41,7 @@ Launcher 的**入站指挥端点已于 v2.0 退役**（连接模型反转为 pul
 - **载荷侧（`RunnerProjectPayload.repo` · `launcher/runner.ts` `buildRegisterPayload`）**：**仅项目配置了才随注册载荷 `projects[]` 逐项下发**、原样透传（照 `readOnly` 保守缺省先例、只认显式值）；未配置 ⇒ **不落该键**（**缺键 ≠ 报空串**）。老桥不认该键 ⇒ 忽略未知字段、零回归，属 **additive** 变更，**不升 `protocolVersion`**（当前 `2.3`，bump 与否由协议节点单独决定，本节点不动协议常量）；挂在 `projects[]` 逐项、非载荷顶层，不破「注册载荷顶层字段不扩」红线。
 - **播报侧（`AgentConfigSnapshot.repo` · `launcher/config-snapshot.ts` `describeAgentConfig`）**：配置了才随启动快照打一行 `[launcher] agent <projectId> repo=<值>（agentConfig）`（每次拉起都打）；**未配置 ⇒ 省略该键**（`undefined`，缺键 ≠ 报空）。**落点 = 同 `gateLimits` 一族的 launcher 本机日志面**（`.a2a/logs/launcher.log`）：不经桥、不进 orch `/health`（与「两面不通」同族）⇒ 「这台机这一项配了什么仓」只能查本机。
 
-四 kind 项目示例的 `repo` 用法与「不需要则整键删除」口径见 `config/config.json.default`（本节点只同步 README，配置样例的补齐归对应节点）。
+四 kind 项目示例的 `repo` 用法与「不需要则整键删除」口径见 `config/config.json.example`（◄ v0.10.2 配置模板拆分：完整可运行的四 kind 骨架示例的唯一落点；`config/config.json.default` 瘦身后只留默认值与骨架、不再承载说明与示例）。
 
 ### 项目 workspace = 代码根（v0.10.1）
 
@@ -149,6 +149,20 @@ npm run logs      # 输出日志全文（支持 --lines N / --follow）
   - `status === "starting"` ⇒ **本服务启动中（已在运行但未就绪）** —— 缺省 / `--no-wait` 即返 `0`，`--wait-ready` 续等至 `ok`。
 - **退出码恒 `{0,1}`**：`0` = 已发起 / 已就绪 / 已在运行；`1` = 超时 / 被非本服务占用 / spawn 失败。
 
+## 启动自检与 `/shutdown` 的两个 `launcher` 级键（v0.10.2 · 配置模板拆分补写）
+
+> 键位口径：这两键都在**顶层 `launcher` 段**（机器级），**不是** `projects[].agentConfig` 的平铺自消费键，也**不是** `launcher.bridge` 的段内键。逐键的「键位 / 缺省 / 生效面 / 非法值后果」：
+
+| 键位 | 缺省（不写时） | 生效面 | 非法值后果 |
+|---|---|---|---|
+| `launcher.startupCheckPrompt` | 落代码缺省 `launcher/self-check.ts` 的 `DEFAULT_STARTUP_CHECK_PROMPT` = `Reply with exactly: OK`（**刻意极短**，最小化一次真实模型调用的 token 消耗） | 启动自检**每项目真跑的那 1 条任务**所用的 prompt —— 全机共用一条、逐项目不变（出场身份恒 `unit_agent`，其余职责位只做配置级校验、不真跑，见「键位口径与自定义注入」节）。与 `launcher.startupCheck`（`false` = 跳过自检，`/health degraded.selfCheckSkipped` 直报「跳过」而非伪装通过）· `launcher.startupCheckTimeoutMs`（缺省 `120000`，单项目覆盖 ensure + 发送 + 轮询全程）同族 | 非字符串 / **空串** ⇒ `loadMachineConfig` **加载期 fail-fast**（文案 `launcher.startupCheckPrompt 必须是非空字符串`，配置解析期抛错、进程退出） |
+| `launcher.shutdownToken` | 不写 ⇒ **不做 Bearer 校验**（`launcher/index.ts` 条件展开：未配即不传；`launcher/server.ts` 判 `token !== undefined`） | 仅当 `launcher.shutdownEndpoint === true`（缺省 `false` ⇒ 该路由根本不注册）注册了 `POST /shutdown` 才生效：**配了** ⇒ 请求头须逐字等于 `Authorization: Bearer <token>`，否则 401 `未认证`；**未配** ⇒ 任何 loopback 来源都能停。判序 = **loopback 校验在前、Bearer 在后**；反代转发后源地址仍是 loopback ⇒ 反代必须 deny `/shutdown` | 写了必须是非空字符串，空串 / 非串 ⇒ 加载期 fail-fast（文案 `launcher.shutdownToken 必须是非空字符串`）；**空串不等于「无 token」**，它是被拒的非法值 |
+
+**这两键刻意不进 `config/config.json.default`**（`.default` 只留「默认值与骨架」，说明位 = 本 README）：
+
+- `startupCheckPrompt` —— 缺省的**单一源是 `launcher/self-check.ts`**，把它抄进模板等于**造第二事实源**（代码抬缺省时模板会静默滞后）；且模板里写任何具体 prompt 都会**覆盖代码缺省、改变自检行为**，与「`.default` 每键值 == 代码缺省常量」的判据相互拉扯。
+- `shutdownToken` —— 它是**凭据**，入库模板永不得含真实值（泄露面）；而模板里想表达「没有 token」只能写空串，**空串会撞上面的非空串校验 fail-fast** ⇒ `cp .default` 出来的配置直接起不来。**唯一正确形态 = 整键省略**（不需要 `/shutdown` 时连 `shutdownEndpoint` 一起省略）。
+
 ## 空闲回收（idleStopMs，v0.7.0 新口径，v0.8.10 · M-N1 改**按项目**计数）
 
 项目 Agent 的本地回收判据 = **该项目无在飞任务（`inFlightLedger.countFor(projectId) == 0`）且静默 ≥ `idleStopMs`**：
@@ -181,7 +195,34 @@ v0.8.5 起四条 kind **同构**：适配器 `protocol` 恒为 `"acp"`，`buildL
 
 - 桥 CLI 另有一个 **v0.9.0 · M2a 新增（M2c 收紧校验）、launcher 今天不装配** 的 flag：`--mcp-servers-json <JSON 对象数组>` = ACP `session/new` / `session/load` 的 `mcpServers` 取值来源（由板 / 手工起桥时直接传入）；缺省 / 空串 ⇒ 该槽位仍为 `[]`（既有行为零变化）。每个元素须为对象、带非空 `name`、带 ACP 判别键 `type` ∈ {`http`, `sse`, `acp`}，且该 `type` 要求的必填键非空（`http`/`sse` ⇒ `url`；`acp` ⇒ `command`）；非法 JSON / 非数组 / 上述形态不合规 ⇒ 启动即抛（M2b 实测：缺 `type` 的 payload 在 M2a 口径下能过启动期、直到运行期 `session/new` 才被后端拒 `-32602`）。
 
+### 不同 Agent 的配置方式（四 kind × 键矩阵）
+
+> 本节是**总览**，四张细目表留在原位、各自回指本节：后端命令与自动解析 = 「后端命令」节 · risk → 会话模式 = 「权限：risk 三档 → 会话模式」节 · 模型取值 = 「model 通路」节 · 两把并发闸 = 「并发语义」节②。
+>
+> **kind 值域不在本节重抄** —— `agentKind` 取值集合的清单源 = 仓库根 `PROTOCOL.md` 的 `agent-kinds` 锚点（机器可解析规范源，orch / machine 两侧各自派生常量、由根回归断言「本地清单 == 锚点」）；machine 侧派生点 = `agent-kinds.ts` 的 `AGENT_KINDS`。下表按该锚点当前成员逐 kind 成行。
+
+**逐 kind 相同的部分（故不占表的列宽）**：
+
+- `projects[]` 的**必填四键**四 kind 一致 = `projectId` / `workspace` / `agentKind` / `a2aPort`；与 kind 无关的可选两键 = `risk`（缺省 `write`）· `repo`。
+- `agentConfig` 的**可选覆盖键**是同一套 11 枚顶层平铺自消费键（`backendCmd` · `model` · `systemPrompt` · `systemPromptMode` · `sessionTimeoutMs` · `continueMarginMs` · `sessionRetentionDays` · `sessionRetentionMax` · `maxConcurrentWrites` · `maxConcurrentReads` · `roles`），**逐 kind 通用、不另立键名**；「不写 = 走缺省」，不需要时**整键删除**、勿原样拷贝。
+- **最小可用片段 = 只写必填四键**：`backendCmd` 缺省走四层自动解析 · `model` 未配 ⇒ 不下发旗标、**后端用自身默认** · `risk` 缺省 `write` · 两把闸缺省 1/1 ⇒ 片段**可直接跑**。前提 = 该 kind 的适配器已外部安装（未装 ⇒ 四层解析落空、该项目自检判不可用，见「后端命令」失败语义）。
+
+| kind | 必填键 | 该 kind 常被覆盖的键 | 特有取值约束（细目回指各节） | 最小可用片段（可直接跑、零注释键） |
+|---|---|---|---|---|
+| `opencode` | `projectId` · `workspace` · `agentKind` · `a2aPort` | `model` · `backendCmd` | 后端 = `opencode` CLI 自带 ACP 入口，桥 `--backend-args` 缺省 `["acp"]`（**子命令**，非 `--acp` 旗标）；显式 `backendCmd` 须 **`.exe` 真身绝对路径**（npm 裸 PATH 只有 `.cmd` / `.ps1` 壳 ⇒ 桥 `shell:false` 直调 ENOENT / EINVAL）；`model` 形态 = `providerID/modelID`，provider 须先在该 CLI 侧配置里定义才出现在清单；无效 `model` ⇒ `session/set_config_option` **即时硬报错 `-32602`**、不回落、整会话不可用；risk 三档直传 `--risk`；凭据 = `opencode` CLI 用户级登录态 | `{"projectId":"demo-opencode","workspace":"C:/demo/machine-ws/opencode","agentKind":"opencode","a2aPort":3010}` |
+| `codex` | 同上（四键，语义与取值范围一致） | `model` · `backendCmd` | 后端 = `@agentclientprotocol/codex-acp`（npm 包，`bin` → `dist/index.js`）；`backendCmd` **推荐填该脚本入口绝对路径** ⇒ 适配器自动组 `node <入口>`（可执行体 ⇒ `--backend-args []`、脚本入口 ⇒ `[<入口路径>]`）；risk 三档经 `--mode`，`read` 档 = `read-only` **另加** `--collaboration-mode plan`（可读不可写，终态仍是 `end_turn`）；`model` 取 `model-catalog.json` 的 `codex` 段（协议面 modelId）；默认跑适配器自带的 `@openai/codex`，钉版本 / 指向外部 codex **只认 env `CODEX_PATH`**（PATH 上的裸 `codex` 无此效果）；凭据 = `OPENAI_API_KEY` 或 `~/.codex/auth.json` + `~/.codex/config.toml` | `{"projectId":"demo-codex","workspace":"C:/demo/machine-ws/codex","agentKind":"codex","a2aPort":3011}` |
+| `claude` | 同上 | `model` · `backendCmd` · `systemPrompt` | 后端 = `@agentclientprotocol/claude-agent-acp`，同 codex 走**脚本入口归一**；risk 三档经 `--mode` = `plan` / `acceptEdits` / `bypassPermissions`，`full` 档另带 `--session-meta-json`（会话 `_meta` 的 `allowDangerouslySkipPermissions`，缺省即 `true`）；`model` 可填值 = default / opus / fable / sonnet / haiku（真机报文证 `configOptions{id:"model"}`）；外部二进制经 env `CLAUDE_CODE_EXECUTABLE` 转出；平台二进制在 SDK 的 `optionalDependencies` ⇒ `--omit=optional` 可省 ≈222.8 MiB；凭据 = `~/.claude/settings.json` 用户级配置 | `{"projectId":"demo-claude","workspace":"C:/demo/machine-ws/claude","agentKind":"claude","a2aPort":3012}` |
+| `qoder-cn` | 同上 | `model` · `backendCmd` | **无 npm 包** ⇒ 自动解析走 `pathCommand="qoderclicn"` + `knownPaths` 白名单（win `~/.qoder-cn/bin/qoderclicn/qoderclicn.exe` · mac/linux `~/.local/bin/qoderclicn`）+ PATH（命令名 `qoderclicn` **≠ kind 名**）；`backendCmd` 可填 `.exe` 绝对路径**或可补全为 `.exe` 的裸名**（指向非标准位置安装）；`--backend-args` 走桥缺省 `["--acp"]`；`model` 形态 = **纯 modelId**（`model-catalog.json` 的 `qoder-cn` 段 14 值，示例 `qfmodel` = Qwen3.8-Flash），**显示名不是合法值**；无效 `model` ⇒ 当下不报错、**延迟到 `session/new` 才报 `-32000`**（对照 `--print` 形态静默回落 `using "auto"`）；risk 经桥 `--risk` 透传；凭据优先 `~/.qoder-cn/.auth`、备选 env `QODERCN_PERSONAL_ACCESS_TOKEN`（不支持 per-project env） | `{"projectId":"demo-qoder-cn","workspace":"C:/demo/machine-ws/qoder-cn","agentKind":"qoder-cn","a2aPort":3013}` |
+
+> 完整可运行示例（四 kind 各一条、含 `backendCmd` 覆盖写法与逐 kind 的真实示例值）= `config/config.json.example`；示例里的 `backendCmd` 是**占位样例**，实跑须换本机真身路径或整键删除（见下节使用前置）。
+
 ### 后端命令：外部安装 + `backendCmd` 可选覆盖（四层自动解析）
+
+> **回指**：本节的细目（四层链 / kind × 入口表 / `[backend]` 分层日志）在「不同 Agent 的配置方式（四 kind × 键矩阵）」里有一行一枚的**总览**；两处口径同源，本节为详。
+>
+> **使用前置（配置样例 → 本机真身）**：`config/config.json.example` 的 `backendCmd` 为**占位样例**（结构对称所需、路径不是本机事实），实跑须按下面**四层链**换成本机真身路径，或**整键删除**走自动解析 —— 留着占位值不改 = L0 显式层直接判该项目不可用（写了就必须存在且是文件，不静默回落）。
+>
+> **适配器外部安装（四 kind，全局或项目本地任选）**：`opencode` → `npm i -g opencode-ai`（ACP 入口 = 子命令 `acp`，适配器内置为 `--backend-args ["acp"]`；Windows 填 `opencode.exe` 绝对路径）· `qoder-cn` → 安装 `qodercn` CLI（ACP 入口 `--acp`，走桥缺省 `--backend-args`，无 npm 包）· `codex` → `npm i -g @agentclientprotocol/codex-acp`（自带 `@openai/codex`）· `claude` → `npm i -g @agentclientprotocol/claude-agent-acp`。machine 不内联任何后端、`package.json` 零新增依赖。
 
 machine **不内联任何后端**（`package.json` 零新增依赖）：ACP 后端由**适配器包各自外部安装**。v0.8.6 起 `agentConfig.backendCmd` 对四个 kind 一律为**可选覆盖**：缺省时机器按**四层链**自动解析适配器入口（`KIND → 入口` 表唯一事实源 = `adapters/backend-entry.ts` 的 `BACKEND_LOOKUP_BY_KIND`）；写了显式值则**以显式值为准**（含指向非标准位置安装的自建适配器）——显式值的契约 = **入口文件路径，必须存在且是文件**，不满足 ⇒ 该项目明确不可用、**不静默回落下层**（想按命令名走 PATH 的正确表达 = 删键，见 L0 行）。
 
@@ -232,9 +273,11 @@ machine **不内联任何后端**（`package.json` 零新增依赖）：ACP 后�
 
 ### 权限：risk 三档 → 会话模式（映射唯一落点 = 适配器）
 
+> **回指**：本节的三档 × 三 kind 映射表是**细目**；逐 kind 的档位取值约束（codex `read` 另加 `--collaboration-mode plan`、claude `full` 另带 `--session-meta-json` 等）在「不同 Agent 的配置方式（四 kind × 键矩阵）」表里各占一格。职责位可经 `agentConfig.roles.<taskType>.risk` 覆盖本轮档位（上限 = 项目生效 risk，见「键位口径与自定义注入」节）。
+
 risk 恒经 `permission(risk)` **单一出口**下发（桥对 kind 无知、只收原样值）：
 
-**`risk` 是可选键；项目不写该键 ⇒ 缺省 `write`**（三处同口径：`launcher/manager.ts:411` 与 `launcher/runner.ts:265` 均为 `project.risk ?? "write"`；`acp-bridge/index.ts:122` 桥侧 `--risk` 解析亦缺省 `"write"`）。配置侧（`config.ts:80-84`）：**不写即缺省；一旦写了必须是 `read` / `write` / `full` 三值之一**（否则解析期报错）。
+**`risk` 是可选键；项目不写该键 ⇒ 缺省 `write`**（三处同口径：`launcher/manager.ts` 的 `project.risk ?? "write"`（`start()` 内）、`launcher/runner.ts` 的 `project.risk ?? "write"`（注册载荷装配处）、`acp-bridge/index.ts` 桥侧 `--risk` 解析亦缺省 `"write"`；校验侧的同一缺省档 = `agent-roles.ts` 的 `DEFAULT_RISK_LEVEL`，v0.10.2 · M-4 起被「角色 risk 不得高于项目**生效** risk」那条校验经 `effectiveRiskOf()` 消费。桥是零仓内依赖的叶模块，**不引该常量**、自持字面缺省）。配置侧（`config.ts` `parseProject`）：**不写即缺省；一旦写了必须是 `read` / `write` / `full` 三值之一**（否则解析期报错）。
 
 | kind | `read` | `write` | `full` |
 |---|---|---|---|
@@ -254,23 +297,71 @@ risk 恒经 `permission(risk)` **单一出口**下发（桥对 kind 无知、只
 
 **四 kind 统一读顶层平铺 `agentConfig.model`** ⇒ 适配器原样透传 `--model` ⇒ 桥在**每次会话建立后**（`session/new` / `load` / `resume` 三路）发一次 ACP `session/set_config_option {configId:"model", value:<原样>}`（set 是 per-session，恢复路径不假设后端保持模型）。值**不校验、不映射**（`-m` 吃显示名、协议面吃 modelId ⇒ 统一只走协议面，后端 argv 不再拼 `-m`）；未配 / 空串 ⇒ 桥完全不发该请求。**可填值清单见 `config/model-catalog.json`**（含四 kind 全清单与枚举方式）。
 
+> **回指**：逐 kind 的 model 形态差异在「不同 Agent 的配置方式（四 kind × 键矩阵）」表里各占一格；本节是**判据详**（◄ v0.10.2 配置模板拆分：以下八条原写在 `config/config.json.default` 的 `_modelComment` 注释键里，随该键撤销改由本节承载）。
+
+1. **machine 侧不校验、不做 name↔modelId 映射**：本键经适配器原样下发桥 `--model`，取值对错全交后端；缺键 / 空串 / 非字符串 ⇒ 不下发旗标 ⇒ **后端用自身默认**。
+2. **值必须是后端自己的 modelId**（形态逐 kind 不同）：`opencode` = `providerID/modelID`（示例值 `opencode-go/glm-5.3-flash`，非占位、可被 catalog 解析）· `qoder-cn` = 纯 modelId（示例值 `qfmodel` = Qwen3.8-Flash）· `claude` = default / opus / fable / sonnet / haiku（真机报文证其 `configOptions{id:"model"}`）· `codex` = 见 catalog `codex` 段。
+3. **provider 侧前置**：opencode 的 provider 须先在其 `opencode.json` 的 `provider.<id>.options` 里定义才会出现在清单 ⇒ **自定义端点 / 代理走这里**；qoder-cn 的端点与可见模型由 `~/.qoder-cn` 登录态决定、无可文件声明的 provider 块 ⇒ 只能填 `model-catalog.json` 的 `qoder-cn` 段列出的 14 个 modelId 之一，**显示名（如 `Qwen3.8-Flash`）不是合法值**（`~/.qoder-cn/settings.json` 存显示名、ACP 面用 modelId，两处不可混用）。
+4. **枚举方式（三种，各给不同一侧）**：`opencode models`（只给 `providerID/modelID`、无显示名）· `qoderclicn --list-models`（只给显示名、无 modelId ⇒ **不能直接当配置值**）· 或开一次 ACP 会话读 `session/new` 响应 `configOptions[]` 中 `id=="model"` 的 `options[]`（id↔name 同现）；对照表 = 同目录 `config/model-catalog.json`。
+5. **无效值行为（实测，三处不一致 ⇒ 没有统一的「报错」可指望）**：`opencode` ACP ⇒ `session/set_config_option` **即时硬报错 `-32602`**、不回落，可见但代价是整会话不可用；`qoder-cn` ACP ⇒ 当下**不报错**、**延迟到 `session/new` 才报 `-32000`**（后端进程活着，失败点后移）；`qoder-cn` `--print` 形态 ⇒ **静默回落**（stderr 打 `using "auto" instead`，「看起来成功其实换了模型」是真风险）。⇒ **写前请核对 id**。
+6. **配置面只做 `model`**（v0.8.2 定档）：`effort` / `reasoning_effort` / `mode` 同在 `configOptions` 面上但**明确不做**，配置面无对应键（`mode` 走 `--mode` / 会话 `set_mode`，见「权限：risk 三档 → 会话模式」节，不是模型键的替代品）。
+7. **生效链路 ≠ 启动日志**：`launcher/config-snapshot.ts` 启动日志播报的 `model=…` 出自 `resolveModelEndpoint`，是**观测日志**，与「会话内是否真 set 成功」不同源 ⇒ 勿据日志推断生效。
+8. **段内遗留写法不再被消费**：`agentConfig.opencode.model` / `agentConfig.qoder-cn.model` 这类**段内**写法自 v0.8.5 起**不生效**（段与告警分支一并退役：写了无效、也不再告警）⇒ 四 kind 一律写顶层平铺 `agentConfig.model`；「保留」只占命名空间、不等于提供读点（见下节）。
+
 ### 键位口径与自定义注入
 
 - **`agentConfig.<kind>` 段与配置通道整体退役**（v0.8.5）：`--config-file` / `--config-segment` / `writeAgentConfig` / `agents/` 产物全部退役 ⇒ 段内键（wrapper 族契约键、ACP 族段内 `model` 等）**不再被任何人消费**，写了无效、也不再告警。
 - 键位口径 = **自消费键顶层平铺**：`backendCmd`（**可选覆盖**，缺省走四层自动解析，见「后端命令」）· `model` · `systemPrompt` / `systemPromptMode`（自定义注入 ⇒ 桥 `--system-prompt` / `--system-prompt-mode`，缺省 `append`）· `sessionTimeoutMs`（v0.8.7 · 桥会话窗 ⇒ `--session-timeout <ms>`，缺省不写 = 桥落自身缺省值 600000；上限护栏见下条）· **`continueMarginMs`（v0.8.9 需求2 · M1 · 场景 C 续跑余量）**：顶层平铺自消费键，**缺省 0 = 不续跑**（缺省关闭的策略键、显式 opt-in），合法值 = **非负整数**，**上限 = 本项目生效会话窗**（`effectiveSessionTimeoutMs` = 显式 `sessionTimeoutMs` ?? 桥缺省 600000，故封顶 ≤ 600000）；超限 / 非法 ⇒ `loadMachineConfig` 加载期 fail-fast（报错文案带生效窗实际数值与出处）；生效值经 `config-snapshot` 与 `sessionTimeoutMs` 同行播报（`sessionTimeoutMs=… continueMarginMs=…`）· `sessionRetentionDays` / `sessionRetentionMax`（v0.8.9 · M5 · SessionMap 保留边界 ⇒ 桥 `--session-retention-days` / `--session-retention-max`，缺省不写 = 桥落自身缺省 7 天 / 500 条）· **`maxConcurrentWrites` / `maxConcurrentReads`（v0.8.10 · M-N5 · 同项目两把并发闸的上限）**：平铺自消费键，**缺省 1 / 1**，launcher 侧消费、**不透传桥**。
+- **`roles`（v0.10.2 · M-4 · 职责位映射）**：**`agentConfig` 首个嵌套校验**，形状 = `roles = { <taskType>: { model?, systemPrompt?, systemPromptMode?, risk? } }`（角色名闭集见 `task-types.ts` 的 `TASK_TYPES`；per project 一处，仍是顶层平铺自消费键）。四条 fail-closed（唯一实现点 = `agent-roles.ts` 的 `agentRolesErrors()`，加载期 `config.ts` 与启动自检 `launcher/self-check.ts` **共用同一判据**、不长出两套）：① 角色名须在闭集内**且不撞** `RESERVED_AGENT_CONFIG_FLAT_KEYS`（该常量 v0.10.2 起有**运行期消费者**，不再是纯测试锚；`roles` 自身已登记进去）；② `role.risk` 经**显式 rank 映射** `RISK_RANK`（`read < write < full`）判「**不得高于项目生效 risk**」，生效值 = `project.risk ?? "write"`（**只读本机值、不读 orch 注册投影**）—— ⚠ **禁字面序比较**：字典序给的是 `full < read < write`，用它判这条会把最宽的 `full` 判成最小、校验反向失效；③ `roles` 子对象内**未知键即拒**（防 `modle` 之类拼错静默失效）；④ **未配 `roles` ⇒ 逐字现状**（缺省回落平铺 / 构造器值，老配置零迁移）。
+- **两套 agent 配置面并述（v0.10.2 · 配置模板拆分 G3）** —— 同一项目上并存、各自记账，不是同一套键的两种写法：
+
+| 面 | 项目级 `agentConfig` **平铺键** | 职责位 `agentConfig.roles.<taskType>` |
+|---|---|---|
+| 作用域 | 该 project 的**缺省生效值**（任何职责位未覆盖某旋钮时都归它） | 只覆盖**被点名的那一个职责位**本轮的取值 |
+| 键集 | 11 枚顶层平铺自消费键（见上条口径） | 四旋钮 = `model` / `systemPrompt` / `systemPromptMode` / `risk` |
+| 校验语义 | 逐键类型 / 上限 fail-fast；**未知顶层键静默忽略**（既不拒也不 strip） | 四条 fail-closed（见上条，不在此复制）；**子对象未知键即拒** |
+| 未配行为 | 落构造器 / 桥缺省 | 逐字现状 = 整位回落同名平铺键（老配置零迁移） |
+| 可见面 | `config-snapshot` 每次拉起逐键播报「值 + 出处（agentConfig / 缺省）」 | 同一快照的 `职责位 roles：…` 一行（未配 ⇒ 省略该键；`systemPrompt` 只报字符数、不落正文） |
+
+- **回落链（单一方向、逐旋钮各自判定，非整位切换）** = `agentConfig.roles.<taskType>.<旋钮>` 命中 ⇒ 用该值 → 未命中 ⇒ 回落 `agentConfig.<同名平铺键>` → 仍未配 ⇒ 回落**构造器 / 桥缺省**。⇒ 某个职责位只覆盖 `model` 时，该位的 `systemPrompt` 仍走平铺键；平铺键改了也仍被该位的 `model` 遮蔽。查「这一轮到底用了什么」= launcher 本机日志的 `config-snapshot` 行（两个面都在同一行报，不经桥、不进 orch `/health`）。
+- ⚠ 回落链与「同 ctx 换职责位」相乘的**静默错配**：`model` / `mode` 逐轮重下发，但 `systemPrompt` **只在会话首轮注入** ⇒ 同一 `contextId` 跨职责位续用 = 「新模型 + 旧人格」（machine 侧出声 warn、不拒）。
+
+- **⚠ 两套语义并存（v0.10.2 · F-C2 范围收窄，勿当不一致来「统一」）**：fail-closed **只作用于 `roles` 子对象**；`agentConfig` **顶层平铺键保持现状**（未知顶层键静默忽略，既不拒也不 strip）—— 把顶层一并收紧会让存量 `config.json*` 直接起不来。存量兼容由 `test/config-roles.test.ts` 的「全部 `config/config.json*` 原样过校验」断言钉住。
+- **职责位生效值的可见面（v0.10.2 · F-C7）**：`config-snapshot` 随每次拉起播报一行 `职责位 roles：上限 risk=…｜<taskType>{…} …`（**未配 ⇒ 省略该键**，照 `repo` 先例；`systemPrompt` 只报字符数、不落正文）。**启动自检恒真跑 1 条 / 项目**，出场身份 = `unit_agent`（`SELF_CHECK_TASK_TYPE`；发送体不注入 `metadata` ⇒ 载荷逐字现状、对端落缺省职责位），其余职责位**只做配置级校验**（纯本地、零派发、零拉起）⇒ **自检墙钟与配置了几个职责位无关**（项目数仍是唯一乘数）。
 - **`maxConcurrentWrites` / `maxConcurrentReads`（v0.8.10 · M-N5）**：同一 **project** 的**两把独立计数闸**上限 —— 写档 / 读档各算各的（读不占写位、写不占读位）。**缺省 1 / 1**（单一源 `launcher/agent-config.ts` 的 `DEFAULT_MAX_CONCURRENT_WRITES` / `DEFAULT_MAX_CONCURRENT_READS`，经 `effectiveGateLimits(agentConfig)` 落）⇒ **不配任何键 = 同项目同档串行 = v0.8.9 行为**；要真并行只读须**显式**配 `maxConcurrentReads ≥ 2`。合法值 = **正整数**，非正整数 / 非整数 ⇒ `loadMachineConfig` **加载期 fail-fast**（0 或负数会让闸「永远排不到」、计数语义失真）。**作用域 = 按 project 计、与项目组正交**（不是组级、不是机器级；跨项目全局闸本版不做）；超限**排队（FIFO）不丢弃不超时**，派发预算从**放行时刻**起算。完整语义见「并发语义」节②；**生效值与出处的查表面 = 同节「并发闸上限播报」**（`config-snapshot` → launcher.log）。
 - **`sessionRetentionDays` / `sessionRetentionMax`（v0.8.9 · M5）**：会话映射（`contextId ↔ sessionId`）的 TTL 天数与单项目条数上限（LRU）。合法值 = **正整数**（**无上限语义**），非法 ⇒ `loadMachineConfig` 加载期 fail-fast；生效值随 `config-snapshot` 启动播报落 launcher.log（`sessionRetentionDays=… sessionRetentionMax=…`，值标注出处 agentConfig / 缺省）。**与 `sessionTimeoutMs` 语义完全独立、互不派生**（一个管映射留存、一个管会话执行窗）。
 - **`sessionTimeoutMs` 上限护栏（v0.8.7 · M2，v0.8.9 需求2 起 15 min → 10 min）**：合法值 = 正整数且 **≤ 600000（10 min）**，超限 / 非法 ⇒ `loadMachineConfig` 加载期 fail-fast。上限的**单一源** = `launcher/agent-config.ts` 的 `SESSION_TIMEOUT_MS_CAP`（桥是零仓内依赖的叶模块，只宽松校验「整数 > 0」，不重复定义上限）。**降到 10 min 的理由**：最坏总框 = 600s（窗）+ 300s（结构余量）+ 600s（续跑余量按窗封顶）= **1500s（25 min）** ≤ 安全线、且 **< orch 孤儿墙钟 30 min（1800s）** ⇒ launcher 与 orch 两层超时**无需组合校验**（orch 侧零代码改动、`orphanTimeoutMs` 缺省不动）；与 launcher 派发总框的关系见下条三段公式，且**无机器级全局 flag**（一个慢项目不应拉长全部项目的台账寿命）。**⚠ 升级说明：若曾把 `sessionTimeoutMs` 配到 > 600000，须先改配再升级** —— 否则 Launcher 加载期 fail-fast（窗上限已从 900000 降到 600000）。
 - **launcher 侧派生（v0.8.7 · M3，v0.8.9 需求2 起改三段式）**：Runner `dispatch` 的等待预算**按项目**取，纯函数**三段公式** `dispatchBudgetMs(生效窗, 续跑余量) = 生效窗 + 结构余量(DISPATCH_MARGIN_MS=300s) + min(续跑余量, 生效窗)` ⇒ 桥窗一改，deadline 同值派生（不存在「只配桥侧、launcher 仍按缺省掐断」的静默无效）；**未配窗** ⇒ 生效窗落桥缺省 600_000，总框 = `600_000 + 300_000 + em`（`em = min(continueMarginMs, 生效窗)`，缺省 em=0 ⇒ **900_000**）—— **未配窗项目的总框也统一走本公式**；**能否续跑只看 `continueMarginMs > 0`，与配没配窗无关**（资格是策略键、不是窗配置的结构性副产品）。结果附**机器可读字段**：`failureKind`（**PROTOCOL 2.3 六类闭集**：`agent` / `transport` / `runner` / `model_queue` / `timeout` / `business`，由 launcher 的 `classifyFailure` 判定 —— **machine 只报原生事实（报得出才报，判不出就不报该键，不造第 7 值）**；`timeout` 类**必带子键** `diagnostics.timeoutScope`（`acp-prompt` / `runner-deadline` 两条路径同归 `timeout`、靠子键分家）；`model_queue` 本版 machine **恒不产出**（无独立信号，判定归 orch 启发式标注）；**闭集校验、落库与重试策略表归 orch**，旧值 `infra` / `task` 自 2.3 起非法、machine 不再产出）+ `diagnostics`（桥内细分与计量键经现成 `artifacts` 通道上带 `name="machine-diagnostics"`，launcher `buildResult` **先摘除再取文本**后填入，剩余 artifacts 原样回传 ⇒ 不污染 resultText）。
 - **diagnostics 白名单 = 取证链的机内侧（v0.8.9 · M4）**：桥写什么、launcher 放行什么，两表必须同键集（`parseBridgeDiagnostics` / `BridgeDiagnostics` / `RunnerTaskDiagnostics`），漏放一个键 = 事实断在机内、orch 看不见；契约由 `test/acp-session.test.ts` 的「桥写键集（除 `stage`）⇔ launcher 放行键集」等式锚住。v0.8.9 新增放行：`turn` · `sessionReused` · `promptChars` · `injectedChars` · `resultChars` · `blockCount` · `replayDropped` · `outcomeAmbiguous` · `ambiguousReason` · `sessionMapSize` · `sessionMapOldestAgeDays` · **`staleChunkCount`（v0.8.10 · M-N2 新增放行，残段丢弃计数哨兵、恒报）**（`partialTail` 收进 `BridgeDiagnostics` 供 M3 续跑拼 prompt，但在回传投影 `bridgeForReport` 处**剥离** ⇒ 只上带长度键 `partialTailChars`）。**归因五键不走本白名单** —— `stopCause` / `stopCauseTaskId` / `ghostRoundCancelled` / `cancelQuiesceMs` / `cancelUnsupported` 是 **launcher 自产键**（不经桥），见「并发语义」节④。**成功轮也带 diagnostics**（v0.8.9 起桥在成功出口挂留痕）。
 - **`business` 判据的不确定守卫（v0.8.9 · M4）**：`containsFailedOutcomeBlock(text, bridge)` 在桥标 `outcomeAmbiguous=true`（多块 / 跨轮重放漏出 / 跨轮 messageId 命中）时**不据此判 `business`** ⇒ 退回账面 `state`、判不出即**不报 `failureKind` 键**。取向是单向的：`business` **不在自动重试闭集**内，误判会把任务冻成「等宿主改方案」，漏判只让宿主按无 kind 的失败照常裁决 —— **宁可漏判，不可把 completed 误打成 business**。标志只读，launcher 不复算歧义判据（判据事实源在桥）。
-- **「保留」≠ 提供读点**：命名空间保留键清单见 `agent-kinds.ts` 的 `RESERVED_AGENT_CONFIG_FLAT_KEYS`。
+- **「保留」≠ 提供读点**：命名空间保留键清单见 `agent-kinds.ts` 的 `RESERVED_AGENT_CONFIG_FLAT_KEYS`（v0.10.2 · M-4 起含 `roles`，且该清单**有运行期消费者** = `agent-roles.ts` `agentRolesErrors()` 校验①，不再是纯测试锚）。
+- **kind 扩展的顺序纪律（◄ v0.10.2 配置模板拆分：原写在 `config/config.json.default` 的 qoder-cn 条目注释里，现由本 README 承载）**：新增 `agentKind` 名的 PR **须先增补保留平铺键名清单**（现成员 = `backendCmd` / `model` / `systemPrompt` / `systemPromptMode` / `timeouts` / `agentCard` / `events` / `mcp` / `roles`），机械锚 = `AGENT_KINDS ∩ RESERVED_AGENT_CONFIG_FLAT_KEYS = ∅`；**保留只占命名空间，不等于该键已有平铺读点**（当前真有读点的 = `backendCmd` · `model` · `systemPrompt` · `systemPromptMode` · `roles`，其余四名是占位）。
 - **outcome 约定注入的唯一落点 = ACP 桥缺省**（单一源 `agent-outcome.ts`），不随项目配置覆盖。
 - **opencode serve 前置后端（sidecar）已随迁 ACP 退役**：桥直接 spawn 后端，无独立后端进程、无端口预分配。
+
+### 职责位 `taskType` 派发链与 per-request 覆盖（v0.10.2 · M-2）
+
+**载体分层**（两段、两个载体，互不混用）：
+
+- **orch → machine 段** = `dispatch` 命令**顶层可选单键 `taskType?`**（逐字照 `readOnly?: true` 先例 ⇒ 可整键忽略 ⇒ **协议 2.3 不升**）。解析层**宽容透传**（`parseRunnerCommand`：缺键 / 非串 / 空串 ⇒ 视为未传 = 现状；合法与非法取值**都透**，合法性不在此判）。
+- **machine → 后端 agent 段** = A2A `message/send` 的 **`message.metadata`**（**本版新建载体、仓内此前零命中 ⇒ 无既有先例可循，形状在此定**）：`{ taskType, ...本机 roles 命中的旋钮 }`。**`taskType` 未传 ⇒ 发送体不落 `metadata` 键 ⇒ 载荷逐字现状**。桥侧**唯一解析点** = `acp-bridge/a2a-server.ts` 的 `parseRoleIntent()`（registry / session / index 一律接**已解析的 typed 字段**，不得二次解析 `metadata`）。**双通道以 `metadata` 为准**：派发消息正文的 `taskType=` 外壳行仅面向人 / 后端 agent，machine **不解析正文、不校验一致性**。
+- **映射事实源 = machine**：orch 只送 `taskType` 意图、**不送具体 model**；具体旋钮取值由本机 `agentConfig.roles.<taskType>` 经 `roleOverridesOf()`（**只读、不校验** ⇒ 校验单一实现点在 `agent-roles.ts`，不长出第二套判据）映射后进 `metadata`。
+
+**未知 / 非法职责位的硬拒（F-C11 三条，落点 = intake）**：
+
+- 执法点 = `RunnerCommandExecutor.handle()` 的 dispatch 分支、`startDispatch` **之前** ⇒ **不登记台账、不过并发闸、不 `ensure`、不发 A2A**，也**不回落缺省 `unit_agent`**；
+- **(a)** `failureKind` **复用既有 `agent` 类**（显式定类，不走 `classifyFailure` —— 其输入信号在本路径一条都不成立）⇒ **不造第 7 值**；
+- **(b)** 硬拒**经既有 outbox 交卷**（`.a2a/outbox/<taskId>.json` → `/runner/result`）—— 台账在 `startDispatch` 内才登记，**静默丢弃 = orch 只能等孤儿墙钟**；`claimToken` 经回传**凭证**原样带回（缺 token ⇒ 桥侧拒收 ⇒ 等于没回传），不进结果 schema；
+- **(c)** 原因 = 稳定 token **`unknown_task_type=<原值>`**（唯一拼装点 `illegalTaskTypeDetail()`，原值**原样回显**、不归一不修剪），同串写进 `text` 与 warn 日志 ⇒ orch / 宿主按前缀字面匹配即可。
+
+**四旋钮 per-request 覆盖（`M2-a` 档 = 同 `agentKind` / 同后端进程内）**：`model` / `mode` / `collaboration_mode` / `systemPrompt(+Mode)` 的**值来源**从构造器字段改为**本轮生效值** —— 唯一解析点 = `AcpSessionRunner.resolveTurnKnobs()`，逐键「**override 有效则覆盖、否则回落构造器**」（有效 = 非空串；`systemPromptMode` = `append`/`replace` 之一 ⇒ 与构造器归一化口径**逐字同形**）。**下发时机 / 请求体形状 / fail-fast 口径 / 零请求条件全部不变**；任一覆盖键命中时打一行 `per-request 覆盖生效（键=…）` 留痕。
+**不动的部分**：`contextId → sessionId` 阶梯、首轮注入判据 `isFirstTurn`、M-N2 捕获窗簿记；**`M2-b`（跨 `agentKind` / 跨 `backendCmd` 切换）= 本版边界外**（桥进程的命令本身不可 per-request 改）。**`risk` 只进 bundle、不进本路** —— 它的生效点是 `acp/permission.ts` 的 `sessionId→risk` 路由（**v0.10.2 · M-3 承载**，见下条）。
+**risk 会话级路由（v0.10.2 · M-3，补 F-M2 漏点）**：权限处理器仍是进程级单注册，但 `session/request_permission` 的 params 带 `sessionId` ⇒ `createPermissionHandler` 经**处理器与 runner 共享的 `SessionRiskRegistry`**（装配点 = `startBridge`）按会话取档：`AcpSessionRunner.execute` 在会话建立后把 `overrides.risk`（经 `normalizeRisk` 三档闭集归一，非法 ⇒ 不登记）登记进表 ⇒ 该会话的权限请求按**会话档**决策；未登记 ⇒ **回落进程级 `--risk`**（判定与日志逐字现状）。三档判定矩阵（read 拒 / write 批 / full 批 always）不因本节点改动；真链路用例见 `test/v0102-m3-e2e-session-risk.test.ts`。
+**回落源** = `BridgeArgs` → `startBridge` 的装配（CLI 值语义由「本轮唯一取值」抬为「进程级缺省」）⇒ **删掉该装配即失去回落语义**；无新增 flag、不带 `metadata` ⇒ 逐字现状。
 
 ### 认证
 
 - `opencode` / `codex` / `claude`：沿用各自 CLI 的用户级凭据（`~/.codex/config.toml`、`~/.claude/settings.json`）；
 - `qoder-cn`：优先文件凭据 `~/.qoder-cn/.auth`（`qodercn` CLI 登录），备选 env `QODERCN_PERSONAL_ACCESS_TOKEN`（经 Launcher 进程环境透传）。
 
-四 kind 项目示例 + 「适配器安装与后端命令示例」见 `config/config.json.default`。
+四 kind 项目示例（完整可运行、含逐 kind 的 `backendCmd` 覆盖写法）见 `config/config.json.example`（◄ v0.10.2 配置模板拆分：`config/config.json.default` 里的 `_adapterComment` / `_modelComment` / `_gateComment` / `_rolesComment` 等说明键随瘦身撤销，其口径全部由本 README 承载 —— 适配器安装与后端命令见「后端命令」节、模型取值判据见「model 通路」节、并发闸见「并发语义」节②、职责位见「键位口径与自定义注入」节）。

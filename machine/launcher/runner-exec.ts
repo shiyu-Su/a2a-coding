@@ -60,10 +60,22 @@
  *   （{@link RunnerCommandExecutor.runGated}）：满位则**排队（FIFO）**，放行后才起 `executeDispatch`
  *   ⇒ 派发预算从放行时刻起算、不吃排队时长；跨项目全局闸本版不做；
  * - {@link DispatchCommand.readOnly}：**仅显式 `true` 进读档**，其余按写（保守缺省 ⇒ 老桥不下发即现状）。
+ *
+ * v0.10.2 · 节点 M-2（角色化，改造文档 §2.3 F-M2 / F-C11）本模块承担三件：
+ * - {@link DispatchCommand.taskType}：**可选职责位单键**（orch → machine 段载体 = dispatch 顶层，
+ *   逐字照 `readOnly` 先例 ⇒ 协议 2.3 **不升**；取值闭集见 `task-types.ts`）；
+ * - **未知 / 非法职责位硬拒（F-C11 三条）**：拒的落点 = **intake**（`handle` 的 dispatch 分支、
+ *   `startDispatch` 台账登记**之前**）——(a) **不新增 `failureKind` 第 7 值**，复用既有 `agent` 类；
+ *   (b) 硬拒**必须经既有 outbox 回传该 `taskId` 的 `failed` 终态**（静默丢弃 ⇒ orch 只能等孤儿墙钟，
+ *   因为台账在 `startDispatch` 内才登记）；(c) 原因 = 稳定可断言 token `unknown_task_type=<原值>`；
+ * - **machine → 后端 agent 段的新载体** = `message/send` 的 **A2A `message.metadata`**（仓内**首个**
+ *   出现点，无既有先例）：`taskType` 存在才落 `metadata` 对象、键才写；**不传 ⇒ 载荷逐字现状**。
  */
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import type { ProjectConfig } from "../types.js";
+import { isTaskType, type TaskType } from "../task-types.js";
+import { ROLE_CONFIG_KEYS } from "../agent-roles.js";
 import {
   A2A_TERMINAL_STATES,
   artifactsOf,
@@ -323,6 +335,13 @@ export interface DispatchCommand {
    * 老桥不下发该键 ⇒ 读到 `undefined` 天然落写档 = v0.8.9 现状（不动 `PROTOCOL_VERSION`）。
    */
   readOnly?: true;
+  /**
+   * 职责位（v0.10.2 · M-2；改造文档 §2.3 F-M2 / F-C11）：**orch → machine 段载体 = dispatch 顶层单键**
+   * （逐字照 {@link DispatchCommand.readOnly} 先例 ⇒ 可忽略可选字段，协议 2.3 **不升**）。
+   * 取值 = `task-types.ts` 的 `TASK_TYPES` 闭集；**缺省语义 `unit_agent`**（缺键 ⇒ 现状形态）。
+   * 未知 / 非法取值 ⇒ intake 硬拒（见 {@link illegalTaskTypeDetail}），**不回落缺省**。
+   */
+  taskType?: TaskType;
 }
 
 /** 停止命令：停止本机项目 Agent（in-flight>0 时拒收） */
@@ -553,6 +572,59 @@ export function laneOfReadOnly(readOnly: unknown): DispatchLane {
   return readOnly === true ? "read" : "write";
 }
 
+/**
+ * 未知 / 非法职责位的**稳定可断言原因 token**（v0.10.2 · M-2 · F-C11(c)）：
+ * 唯一拼装点 —— intake 硬拒的 `text` 与日志都取本函数，orch / 宿主按前缀字面匹配即可。
+ * `<原值>` **原样回显**（不归一、不修剪），因为「送进来的到底是什么」正是排查要的facts。
+ */
+export function illegalTaskTypeDetail(rawTaskType: string): string {
+  return `unknown_task_type=${rawTaskType}`;
+}
+
+/**
+ * `agentConfig.roles` 的**宽容读点**（v0.10.2 · M-2 · F-C2 / F-C6）：
+ * `roles = { <taskType>: { model?, systemPrompt?, systemPromptMode?, risk? } }`，per project 一处。
+ *
+ * 本函数**只读、不校验**：`roles` 的四条 fail-closed 校验（角色名不撞保留键 / `risk` rank 序 /
+ * 子对象内未知键即拒 / 未配则逐字现状）**单一实现点 = `../agent-roles.ts` `agentRolesErrors()`**
+ * （v0.10.2 · M-4 落地，加载期 + 自检面共用），此处提前拒绝只会造成两套判据。
+ * 因此取值形态不合规（无 `roles` / 非对象 / 值非串）⇒ **该键不落**，等价「未配 ⇒ 逐字现状」。
+ */
+export function roleOverridesOf(
+  agentConfig: Record<string, unknown> | undefined,
+  taskType: TaskType,
+): Record<string, unknown> {
+  const roles = agentConfig?.["roles"];
+  if (typeof roles !== "object" || roles === null || Array.isArray(roles)) return {};
+  const role = (roles as Record<string, unknown>)[taskType];
+  if (typeof role !== "object" || role === null || Array.isArray(role)) return {};
+  const record = role as Record<string, unknown>;
+  const overrides: Record<string, unknown> = {};
+  for (const key of ROLE_CONFIG_KEYS) {
+    const value = record[key];
+    if (typeof value === "string" && value.length > 0) overrides[key] = value;
+  }
+  return overrides;
+}
+
+/**
+ * machine → 后端 agent 段的 **`message.metadata` 载体**（v0.10.2 · M-2 · F-M2 / F-C6；
+ * 改造文档 §2.3：该载体为本版**新建**，仓内此前零命中 ⇒ 无既有先例可循，形状在此定）。
+ *
+ * - **不传 `taskType` ⇒ 返回 `undefined`**（发送体不落 `metadata` 键 ⇒ 载荷**逐字现状**，验收判据②）；
+ * - 传了则 `metadata.taskType` **必带**，`overrides` 内的四旋钮按本机 `roles` 配了才带
+ *   （**映射事实源 = machine**：orch 只送 `taskType` 意图、不送具体 model，F-C2）；
+ * - **双通道以 `metadata` 为准**（F-C6）：派发消息正文的 `taskType=` 外壳行仅面向人 / 后端 agent，
+ *   本侧**不解析正文、不校验一致性**。
+ */
+export function buildDispatchMetadata(
+  taskType: TaskType | undefined,
+  agentConfig: Record<string, unknown> | undefined,
+): Record<string, unknown> | undefined {
+  if (taskType === undefined) return undefined;
+  return { taskType, ...roleOverridesOf(agentConfig, taskType) };
+}
+
 /** 一档的并发上限（两档独立，见 {@link DispatchLaneLimits}） */
 export interface DispatchLaneCounts {
   write: number;
@@ -781,6 +853,13 @@ export function parseRunnerCommand(body: unknown): RunnerCommand | null {
     const base: DispatchCommand = { type: "dispatch", taskId, projectId, contextId, payload };
     // v0.8.10 · M-N5：只认显式 `true`（缺省 / 其它取值 ⇒ 按写档，见 `DispatchCommand.readOnly`）
     if (o["readOnly"] === true) base.readOnly = true;
+    // v0.10.2 · M-2：**解析层宽容透传**（缺键 / 非串 / 空串 ⇒ 视为未传 = 现状；合法性**不在此处判定**）。
+    // 执法点在 intake（{@link RunnerCommandExecutor.handle} 的 dispatch 分支）—— 本函数返回 `null`
+    // 的语义是「静默忽略」，非法值若在此拒 ⇒ 命令被丢 ⇒ orch 只能等孤儿墙钟（F-C11(b) 陷阱）。
+    const taskType = o["taskType"];
+    if (typeof taskType === "string" && taskType.length > 0) {
+      base.taskType = taskType as TaskType;
+    }
     if (typeof claimToken === "string" && claimToken.length > 0) {
       return { ...base, claimToken };
     }
@@ -1370,14 +1449,69 @@ export class RunnerCommandExecutor {
   /** 处理一条命令；dispatch 返回 null（结果走 outbox），其余返回回执 */
   async handle(command: RunnerCommand): Promise<RunnerCommandAck | null> {
     switch (command.type) {
-      case "dispatch":
+      case "dispatch": {
+        // v0.10.2 · M-2 · F-C11：未知 / 非法职责位 ⇒ **intake 硬拒**，落点在 `startDispatch`
+        // **之前**（台账登记之前 ⇒ 不占并发闸、不计 in-flight、不 `ensure`，也不回落缺省 `unit_agent`）。
+        const rawTaskType = command.taskType as string | undefined;
+        if (rawTaskType !== undefined && !isTaskType(rawTaskType)) {
+          this.rejectTaskType(command, rawTaskType);
+          return null;
+        }
         this.startDispatch(command);
         return null;
+      }
       case "stop":
         return await this.handleStop(command);
       case "cancel-task":
         return await this.handleCancel(command);
     }
+  }
+
+  /**
+   * 未知 / 非法职责位的硬拒回传（v0.10.2 · M-2 · F-C11 三条）。
+   *
+   * - **(a) 不新增 `failureKind` 第 7 值** —— 复用既有 `agent` 类（「派发对象起不来 / 不认」是
+   *   载体侧对该意图的归属；`classifyFailure` 的输入信号在这里一条都不成立，故**显式定类**而非走判定）；
+   * - **(b) 必须经既有 outbox 回传该 `taskId` 的 `failed` 终态** —— 静默丢弃（返回 null / 只 warn）
+   *   会让 orch 收不到任何结果、只能等孤儿墙钟：台账在 `startDispatch` 内才登记，本路径**不登记台账**，
+   *   因此没有任何后续结算会替它交卷；`claimToken` 经 `credential` 原样带回（桥侧 `/runner/result`
+   *   校验 token，缺 token ⇒ 拒收 ⇒ 等于没回传）；
+   * - **(c) 原因 = 稳定可断言 token**（{@link illegalTaskTypeDetail} ⇒ `unknown_task_type=<原值>`），
+   *   写在 `text`，orch / 宿主可字面匹配。
+   *
+   * `deliver` 是 fire-and-forget 语义（文件 outbox 自落盘重试），故本方法不 await；
+   * 失败只 warn —— 与 {@link executeDispatch} 的交卷路径同一纪律。
+   */
+  private rejectTaskType(command: DispatchCommand, rawTaskType: string): void {
+    const detail = illegalTaskTypeDetail(rawTaskType);
+    this.logger.warn(
+      `[runner] 派发拒收（未知职责位）：taskId=${command.taskId} project=${command.projectId} ${detail}`,
+    );
+    const result: RunnerTaskResult = {
+      taskId: command.taskId,
+      machineId: this.machineId,
+      projectId: command.projectId,
+      contextId: command.contextId,
+      state: "failed",
+      failureKind: "agent",
+      diagnostics: { elapsedMs: 0, stage: "ensure" },
+      text: detail,
+      artifacts: [],
+      finishedAt: this.isoNow(),
+    };
+    const credential =
+      command.claimToken !== undefined && command.claimToken.length > 0
+        ? { claimToken: command.claimToken }
+        : undefined;
+    void (async (): Promise<void> => {
+      try {
+        await this.outbox.deliver(result, credential);
+      } catch (err: unknown) {
+        this.logger.error(
+          `[runner] 拒收回传出错（taskId=${command.taskId}）：${errorMessage(err)}`,
+        );
+      }
+    })();
   }
 
   /**
@@ -1946,6 +2080,12 @@ export class RunnerCommandExecutor {
   ): Promise<{ settled: unknown; timedOut: boolean }> {
     const remaining = (): number => deadline - this.now().getTime();
     trace.stage = "send";
+    // v0.10.2 · M-2：**machine → 后端 agent 段的角色意图载体** = A2A `message.metadata`（本版新建）。
+    // `taskType` 未传 ⇒ `metadata` 为 `undefined` ⇒ **不落该键**（发送体逐字现状，验收判据②）。
+    const metadata = buildDispatchMetadata(
+      command.taskType,
+      this.host.getProject(command.projectId).agentConfig,
+    );
     const settledSend = await postJsonRpc(
       endpoint,
       "message/send",
@@ -1955,6 +2095,7 @@ export class RunnerCommandExecutor {
           parts: [{ kind: "text", text: payloadText(command.payload) }],
           messageId: randomUUID(),
           contextId: command.contextId,
+          ...(metadata !== undefined ? { metadata } : {}),
         },
         configuration: { blocking: false },
       },
