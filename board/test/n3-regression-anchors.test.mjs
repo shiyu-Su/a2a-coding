@@ -604,11 +604,12 @@ test("N3-⑧（纪律钉·单点钉）五枚导出常量：声明唯一、注入
     1,
     "server.ts 只经 pageSchedule 一处按常量注入三枚脚本（同页、同通路；拖拽常量与弹窗常量分立不可共置）",
   );
-  // v0.9.3 增补 ②：排期页同挂 vendored mermaid（浮层换入的依赖图经 a2aRenderMermaid 钩子补渲）⇒ 常量注入各恰好 1 处
+  // v0.9.3 增补 ② → v0.10.3 N2c：详情页依赖图改自绘（零脚本）⇒ 常量注入只剩 pageSchedule 一枚
+  // （浮层内点开的文档页仍用 vendored mermaid 渲染）；pageFeatureDetail 整页档不再注入。
   assert.equal(
     count(server, /mermaidAssetScriptTag\(\) \+ mermaidRenderScript\(\)/g),
-    2,
-    "mermaid 资产+渲染脚本常量注入 = pageSchedule（浮层补渲）与 pageFeatureDetail（整页档）两处",
+    1,
+    "mermaid 资产+渲染脚本常量注入 = pageSchedule 一枚（浮层内文档页仍用）；详情页自绘 ⇒ 不再注入",
   );
   // v0.9.8 REQ-2026-10-03-02：第七枚**仅 manage 页**注入（页隔离 = 单点，照门户 / 排期页先例）
   assert.equal(

@@ -117,6 +117,38 @@ test("parseFeatureDetail: 任务行时刻/队列字段缺键 ⇒ null（老桥�
   assert.equal(t.claimedBy, null);
 });
 
+// --- v0.10.3 N1：taskType（职责位）透传 —— 值域归桥，板不译写 / 不校验 / 不设闭集假设 --------
+
+test("parseFeatureDetail: taskType 带键 ⇒ 原样透出（含桥侧任意取值，板不译写、不当闭集）", () => {
+  const view = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [
+      { taskId: "t1", projectId: "p", state: "completed", taskType: "dev_manager" },
+      { taskId: "t2", projectId: "p", state: "completed", taskType: "product_manager" },
+      { taskId: "t3", projectId: "p", state: "completed", taskType: "桥侧新值" },
+    ],
+  });
+  assert.equal(view.tasks[0].taskType, "dev_manager");
+  assert.equal(view.tasks[1].taskType, "product_manager");
+  assert.equal(view.tasks[2].taskType, "桥侧新值", "未知值原样照抄（不吞、不归一）");
+});
+
+test("parseFeatureDetail: taskType 缺键 ⇒ null（老桥容错；不回落 \"\"、不臆造 unit_agent 缺省）", () => {
+  const view = parseFeatureDetail({
+    ok: true,
+    feature: { featureId: "F1", state: "executing" },
+    tasks: [
+      { taskId: "t1", projectId: "p", state: "completed" },
+      { taskId: "t2", projectId: "p", state: "completed", taskType: 42 },
+      { taskId: "t3", projectId: "p", state: "completed", taskType: null },
+    ],
+  });
+  assert.equal(view.tasks[0].taskType, null, "缺键 ⇒ null（不得是 \"\"、不得是 \"unit_agent\"）");
+  assert.equal(view.tasks[1].taskType, null, "非字符串 ⇒ null（口径同 queueState）");
+  assert.equal(view.tasks[2].taskType, null);
+});
+
 test("parseTrace: 三面字段 waitReason/position/waitedSince/projectBusy/readOccupants", () => {
   const view = parseTrace({
     ok: true,

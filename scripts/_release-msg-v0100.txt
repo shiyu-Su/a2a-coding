@@ -1,0 +1,19 @@
+v0.10.0: 版本面单一事实源（引擎两表 versions/releases + 写端点四路 + 发版闸/两把锁/自动转换执法下沉 + 版本聚合只读面 + repo 标识透传 + 一次性迁移；主轨 1f937738 29 节点 + 承接重建 31155242 + 缺陷修复 97225fb4 + 规范落笔 b00472b1）+ 停同升按兼容契约分组首次实操（orch/board 升 0.10.0、machine 保持 0.9.8、flow 四戳 v0.10.0）+ 回归套件 7 处旧版本锚修正（停同升 5 处 / 字面序比较 2 处）+ 根回归 1372/1372
+
+- orch（引擎）：新增 versions（台账，三态）+ releases（快照，不可变）两表，键 (owner_group, version)；
+  写端点四路 GET/POST/PATCH/DELETE；发版闸判据、released 锁、排期写状态锁、notstart→active 自动转换
+  全部落引擎在事实源进程执法（宿主 MCP 直写同受执法）；版本聚合只读面（零新实体，join features.version ×
+  tasks.project_id）；repo 消费四处、原值入快照不归一不回查；PROTOCOL.md 版本规则改写为判据式（协议保持 2.3）。
+- board：事实源翻转（本地台账降读缓存/降级投影）；建删设状态改向引擎发意图；删除渲染期自动转换与节流表；
+  版本列 = 引擎 Release 清单 ∪ 卡派生版号；读投影锁 fail-closed；orch_* 错误码显示映射。
+  单测 7 条红当场修掉（锁源切引擎投影后两个文件仍桩本地台账 ⇒ 改桩，断言语义一字未动）。
+- machine：ProjectConfig 新增可选 repo 键（配置了才解析/播报/随注册载荷 projects[].repo 上报，不推断不归一）；
+  协议常量不动（2.3）⇒ 产品版本保持 0.9.8。
+- flow：spec/需求流程.md §7 新增「单元版本同升纪律（按兼容契约分组）」四条口径 + 两条引注；§7 新增「文档 mv
+  分家」；§8 收口判据/标记 released/登记 stage=发版 三处按事实源落引擎改写；四戳齐翻 v0.10.0。
+- 根/宿主：停「四处 package.json + 三处 lock 同升」改按兼容契约分组；CHANGELOG 分区；tag 命名空间
+  <project>/vX.Y.Z（本版 orch/v0.10.0 · board/v0.10.0）；回归套件 7 处旧版本锚修正。
+
+门禁：根回归 1372/1372 · orch 526/0 fail/1 skip · board 1382/1382 · machine 567/567。
+验收：用户 2026-10-09「我测了 通过」。
+待用户重启：orch 桥 + board（本轨按纪律只构建、未自火）；machine 不重启（本版未发版）。

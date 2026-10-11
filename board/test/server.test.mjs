@@ -57,7 +57,9 @@ function fakeClient(overrides = {}) {
         featureState: "executing",
         nodes: [
           {
-            taskId: "t2",
+            // v0.10.3 N3 并表后：行的事实源 = tasks，trace 只按 taskId 命中后填「为什么没跑」一列
+            // ⇒ 夹具的 trace 节点必须是 tasks 的成员（真实数据里 trace.nodes ⊆ tasks，本就是子集）。
+            taskId: "t1",
             projectId: "p",
             state: "submitted",
             lane: "read",

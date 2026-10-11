@@ -129,6 +129,8 @@ export interface FeatureTaskItem {
    * 增补轨 III N1 依赖图节点「任务要点」的数据源；老桥 / 缺键 ⇒ null（容错回退裸 taskId）。
    */
   prompt: string | null;
+  /** 职责位原样透传（值域归桥，板不自造中文词，口径同 trace `waitReason`）。 */
+  taskType: string | null;
 }
 
 /**
@@ -545,6 +547,7 @@ export function parseFeatureDetail(json: unknown): FeatureDetailView {
       claimedAt: str(t.claimedAt),
       claimedBy: str(t.claimedBy),
       prompt: str(t.prompt),
+      taskType: str(t.taskType),
     };
   });
   return {

@@ -1076,13 +1076,10 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string, spaceOrg: string |
   const turnProgress = renderTurnProgress(deriveTurnProgress(busy, queuePosition));
   const chainState = renderChainStateLine(chainLine, f.featureId, awaiting !== null);
   const answerForm = awaiting === null ? "" : renderAnswerForm(f.featureId, awaiting.question);
-  // T2 依赖图：mermaid 源经 application/json 数据通道注入（非可执行脚本、不入 n3 闭集）；
-  // 渲染脚本只在区块存在且 vendored 资产在盘时挂（缺资产 ⇒ 源文本降级可见，不 404 静默）。
+  // T2 依赖图（v0.10.3 N2c 起 = 管道制自绘 DOM/CSS）：区块**零脚本** ⇒ 详情页整页档不再注入
+  // mermaid 资产与渲染脚本。排期页 `schedulePageScripts` 的那一枚**保留**（浮层内点开的文档页
+  // 仍要渲染 mermaid —— 摘错 ⇒ 浮层里 mermaid 退化成源文本）。
   const graph = renderDependencyGraphSection(detail.tasks);
-  const extraScripts =
-    graph.needsMermaid && vendoredAssetExists(ctx.docs.staticRoot, MERMAID_ASSET.file)
-      ? mermaidAssetScriptTag() + mermaidRenderScript()
-      : "";
   // 版本切片读面（v0.9.6 B3）：详情页的排期锁 = **该卡归属组织**的 released 切片
   // （归属缺失 ⇒ 空串桶 `""`，与 `migrateLedgerOrgs` 的未归属桶同构）—— 他组织的同版号不锁本卡。
   // **v0.10.0 B4**：切片的数据源由本地台账换成**引擎版本台账投影**（锁判据 `isVersionLocked` 零改动）。
@@ -1116,7 +1113,6 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string, spaceOrg: string |
         acceptanceHtml: renderAcceptanceSection(detail.acceptance),
       },
     ),
-    extraScripts,
   };
 }
 

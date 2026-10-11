@@ -1,5 +1,5 @@
 /**
- * 板只读视图（BD3）：需求列表 / 需求详情（含 trace 三面）/ 任务 / 项目·机器。
+ * 板只读视图（BD3）：需求列表 / 需求详情（含执行明细单表）/ 任务 / 项目·机器。
  *
  * 全部为**纯函数**（输入已归一的视图数据，输出正文 HTML 片段），规则一律取自
  * `derive.ts`，不散落在模板字符串里。所有动态值经 `escapeHtml`。
@@ -9,10 +9,12 @@ import type {
   EngineVersionsProjection,
   FeatureDetailView,
   FeatureListItem,
+  FeatureTaskItem,
   FeatureTraceView,
   ProjectTasksView,
   ProjectVersionsField,
   ProjectsView,
+  TraceNode,
 } from "../bridge-client.js";
 import { projectVersionsOf } from "../bridge-client.js";
 import {
@@ -46,6 +48,7 @@ import { NO_OWNER_GROUP_LABEL } from "../orgs-view.js";
 import { orgSpaceLink } from "../org-space.js";
 import type { GroupRow, OrgGroupsOutcome, OrgPoolOutcome, OrgProjectsOutcome } from "../orgs-view.js";
 import { LAST_MEMBER_REMOVE_CODE, LAST_MEMBER_REMOVE_DISPLAY, MEMBER_ADD_RESIDENCY_NOTE, MEMBER_GROUP_CONFLICT_CODE } from "../group-admin.js";
+import { nodeStateOf, taskDigest, taskOrdinalMap, taskSummaryLines } from "../graph-view.js";
 import type {
   AgentInflightModel,
   AgentInflightProject,
@@ -534,10 +537,11 @@ ${lockHint}
 
 /**
  * 详情页组装的**上层件**（v0.9.5 C1/C5/C6 · 由 `server.ts` 按宿主面数据渲染后下传）：
- * **REQ-2026-09-30-04 件2 改版**：三层骨架 → **主栏 + 320px 侧栏**两栏（标题与阶段步条通栏在最上）：
+ * **REQ-2026-09-30-04 件2 改版**：三层骨架 → **主栏 + 侧栏**两栏（标题与阶段步条通栏在最上）；
+ * **v0.10.3 N2c**：依赖图卡由侧栏上移主栏（管道制要宽度），侧栏收敛为四卡。
  * 主栏 = 引导卡（品牌浅底）→ 轮次进度 / 链状态行 → 动作区卡（与澄清框互斥）→ 最近一轮卡
- * → 折叠层（需求原文 · 执行明细 · 验收轨迹，默认收起）；
- * 侧栏 = 元数据卡（compact 两列）→ 阶段产出卡 → 依赖图卡 → 排期卡。
+ * → **依赖图卡** → 折叠层（需求原文 · 执行明细 · 验收轨迹，默认收起）；
+ * 侧栏 = 元数据卡（compact 两列）→ 归属卡 → 阶段产出卡 → 排期卡。
  * 缺省 `{}` ⇒ 这些件不渲染（未接线调用方行为不变）。
  */
 export interface FeatureDetailExtras {
@@ -702,6 +706,86 @@ export function renderFeatureOwnershipCard(projects: FeatureDetailView["projects
   return `${head}\n<dl class="b-meta">${body}</dl>`;
 }
 
+/**
+ * 执行明细单表的固定列序（v0.10.3 N3 · 改造文档 §2-4，**顺序即判据**）：
+ * 「三面表」退役后其信息各归一列 —— waitReason / 位次 / 写门 / 读档占位 / 已等待 合成「为什么没跑」，
+ * 创建·开始·结束三时刻**裁掉**（时刻原值走 `/tasks` 面追溯）。
+ */
+const EXECUTION_COLUMNS: readonly string[] = [
+  "#",
+  "taskId",
+  "项目",
+  "职责位",
+  "状态",
+  "要点",
+  "为什么没跑",
+  "失败类",
+  "重派",
+  "依赖",
+  "排队时长",
+  "执行时长",
+] as const;
+
+/**
+ * 执行明细单表的行（v0.10.3 N3）：一行一任务，**按 `taskOrdinalMap` 升序**（与图上 chip 同一张编号表，
+ * 不在本处第二处派生）；`taskId` 去重口径同 {@link taskOrdinalMap}（首见即留）。
+ * trace 命中 ⇒ 填「为什么没跑」，终态 / 无 trace ⇒ `—`；在飞不做「至 now」推算（两时长函数照用）。
+ */
+function renderExecutionRows(
+  tasks: readonly FeatureTaskItem[],
+  trace: FeatureTraceView | null,
+  nowMs: number,
+): string[] {
+  const ordinals = taskOrdinalMap(tasks);
+  const byId = new Map<string, FeatureTaskItem>();
+  for (const t of tasks) if (!byId.has(t.taskId)) byId.set(t.taskId, t);
+  const traceByTask = new Map<string, TraceNode>();
+  if (trace !== null) {
+    for (const n of trace.nodes) if (!traceByTask.has(n.taskId)) traceByTask.set(n.taskId, n);
+  }
+  const ordered = [...byId.values()].sort((a, b) => {
+    const oa = ordinals.get(a.taskId) ?? Number.POSITIVE_INFINITY;
+    const ob = ordinals.get(b.taskId) ?? Number.POSITIVE_INFINITY;
+    if (oa !== ob) return oa < ob ? -1 : 1;
+    return a.taskId < b.taskId ? -1 : a.taskId > b.taskId ? 1 : 0;
+  });
+  return ordered.map((t) => {
+    const traceNode = traceByTask.get(t.taskId) ?? null;
+    const info = nodeStateOf(t, traceNode);
+    const summary = taskSummaryLines(taskDigest(t.prompt));
+    const wait = traceNode === null ? null : traceWaitDisplay(traceNode, nowMs);
+    const waitText =
+      wait === null
+        ? "—"
+        : `${wait.waitReason} · 第 ${wait.position} 位 · ${wait.writeGate} · ${wait.readOccupants} · 已等待 ${wait.waited}`;
+    const deps = (t.dependencies ?? []).map((d) => {
+      const o = ordinals.get(d);
+      return o === undefined ? shortId(d) : `#${o}`;
+    });
+    const prompt = t.prompt ?? null;
+    return (
+      "<tr>" +
+      `<td>${String(ordinals.get(t.taskId) ?? "—")}</td>` +
+      `<td class="mono" title="${escapeHtml(t.taskId)}">${escapeHtml(shortId(t.taskId))}</td>` +
+      `<td>${escapeHtml(t.projectId)}</td>` +
+      `<td>${escapeHtml(t.taskType ?? "—")}</td>` +
+      `<td><span class="dg-chip dg-${info.key}">${escapeHtml(info.label)}</span></td>` +
+      (prompt === null
+        ? "<td>—</td>"
+        : `<td title="${escapeHtml(prompt)}">${summary === null ? "—" : summary.map(escapeHtml).join("<br/>")}</td>`) +
+      (wait === null
+        ? "<td>—</td>"
+        : `<td title="${escapeHtml(`${waitText} · 自 ${wait.waitedSince} · 在等谁 ${wait.blockedOn}`)}">${escapeHtml(waitText)}</td>`) +
+      `<td>${escapeHtml(t.failureKind ?? "—")}</td>` +
+      `<td>${t.retryCount === null ? "—" : String(t.retryCount)}</td>` +
+      `<td>${escapeHtml(deps.length === 0 ? "—" : deps.join("、"))}</td>` +
+      `<td>${escapeHtml(formatDurationBetween(t.queuedAt, t.claimedAt))}</td>` +
+      `<td>${escapeHtml(formatDurationBetween(t.startedAt, t.finishedAt))}</td>` +
+      "</tr>"
+    );
+  });
+}
+
 export function renderFeatureDetail(
   detail: FeatureDetailView,
   trace: FeatureTraceView | null,
@@ -715,68 +799,33 @@ export function renderFeatureDetail(
   const d = deriveDisplayStage(f.state, f.stage);
   const head = `<h2>${escapeHtml(f.title === "" ? f.featureId : f.title)} <span class="muted mono" title="${escapeHtml(f.featureId)}">${escapeHtml(f.featureId)}</span>${renderParentFeatureBadge(f.parentFeatureId)}</h2>\n${renderStageStepBar(d)}`;
 
-  const taskRows = detail.tasks.map((t) => {
-    return (
-      "<tr>" +
-      `<td class="mono">${escapeHtml(shortId(t.taskId))}</td>` +
-      `<td>${escapeHtml(t.projectId)}</td>` +
-      `<td>${escapeHtml(label(TASK_STATE_LABELS, t.state))}</td>` +
-      `<td>${escapeHtml(t.lane)}</td>` +
-      `<td>${escapeHtml(t.failureKind ?? "—")}</td>` +
-      `<td>${t.retryCount === null ? "—" : t.retryCount}</td>` +
-      `<td>${escapeHtml(t.dependencies === null ? "—" : t.dependencies.map(shortId).join(", "))}</td>` +
-      `<td>${escapeHtml(stamp(t.createdAt))}</td>` +
-      `<td>${escapeHtml(stamp(t.startedAt))}</td>` +
-      `<td>${escapeHtml(stamp(t.finishedAt))}</td>` +
-      `<td>${escapeHtml(formatDurationBetween(t.queuedAt, t.claimedAt))}</td>` +
-      `<td>${escapeHtml(formatDurationBetween(t.startedAt, t.finishedAt))}</td>` +
-      "</tr>"
-    );
-  });
-  // C2 空区块短路①：任务 0 ⇒ 任务表整节不渲染（空表也是噪声，Step 0 卡尤甚）。
-  const tasks =
-    taskRows.length === 0
+  // v0.10.3 N3：任务表与「进展三面」表**并为一张 12 列单表**（三面表退役）。
+  // 行的事实源 = `detail.tasks` 全集，序 = `taskOrdinalMap` 升序（编号与图上 chip 同一张表）；
+  // trace 只按 taskId 命中后填「为什么没跑」一列，终态 / 无 trace ⇒ `—`。
+  const rows = renderExecutionRows(detail.tasks, trace, nowMs);
+  const executionTable =
+    rows.length === 0
       ? ""
-      : `<h2>任务（${detail.tasks.length}）</h2>
-<table><thead><tr><th>taskId</th><th>项目</th><th>状态</th><th>档</th><th>失败类</th><th>重派</th><th>依赖</th><th>创建</th><th>开始</th><th>结束</th><th>排队时长</th><th>执行时长</th></tr></thead>
-<tbody>${taskRows.join("")}</tbody></table>`;
-  let traceHtml: string;
-  if (trace === null) {
-    // C2 执行注记（R1）：**trace 读取失败不属短路范围** —— 读失败仍如实显示（不静默）。
-    traceHtml = `<h2>进展三面（在等谁 / 位次 / 为什么没跑）</h2><p class="hint err">trace 读取失败：${escapeHtml(traceError ?? "未知错误")}（桥 trace 接口不可达时如实显示，不静默）</p>`;
-  } else if (trace.nodes.length === 0) {
-    // C2 空区块短路②：trace 成功但无非终态节点（无在飞 / 无排队 / 无失败可等）⇒ 整节不渲染。
-    traceHtml = "";
-  } else {
-    const rows = trace.nodes.map((n) => {
-      const w = traceWaitDisplay(n, nowMs);
-      return (
-        "<tr>" +
-        `<td class="mono">${escapeHtml(shortId(n.taskId))}</td>` +
-        `<td>${escapeHtml(n.projectId)}</td>` +
-        `<td>${escapeHtml(label(TASK_STATE_LABELS, n.state))}</td>` +
-        `<td>${escapeHtml(n.lane)}</td>` +
-        `<td class="mono">${escapeHtml(w.waitReason)}</td>` +
-        `<td>${escapeHtml(w.writeGate)}</td>` +
-        `<td>${escapeHtml(w.readOccupants)}</td>` +
-        `<td>${escapeHtml(w.position)}</td>` +
-        `<td>${escapeHtml(w.waited)} <span class="muted">自 ${escapeHtml(w.waitedSince)}</span></td>` +
-        `<td>${escapeHtml(w.blockedOn)}</td>` +
-        "</tr>"
-      );
-    });
-    traceHtml = `<h2>进展三面（在等谁 / 位次 / 为什么没跑）</h2>
+      : `<h2>任务（${rows.length}）</h2>
+<table><thead><tr>${EXECUTION_COLUMNS.map((c) => `<th>${c}</th>`).join("")}</tr></thead>
+<tbody>${rows.join("")}</tbody></table>
 ${foldCalibration(
   "口径：trace 数据从哪来",
-  `<p class="hint">数据 = <code>GET /api/features/:id/trace</code> 原样复用；<code>waitReason</code> 为八值闭集，原样显示。</p>`,
-)}
-<table><thead><tr><th>taskId</th><th>项目</th><th>状态</th><th>档</th><th>waitReason</th><th>写门（projectBusy）</th><th>读档占位（readOccupants）</th><th>位次</th><th>已等待（只取 waitedSince）</th><th>在等谁</th></tr></thead>
-<tbody>${rows.join("")}</tbody></table>`;
-  }
+  `<p class="hint">数据 = <code>GET /api/features/:id/trace</code> 原样复用；「为什么没跑」列的 <code>waitReason</code> 为八值闭集，原样显示。</p>`,
+)}`;
+  const traceHint =
+    trace === null
+      ? `<p class="hint err">trace 读取失败：${escapeHtml(traceError ?? "未知错误")}（桥 trace 接口不可达时如实显示，不静默）</p>`
+      : "";
+  // C2 空区块短路①+②：任务 0 ∧ trace 空 ⇒ 整节不渲染；
+  // **C2 执行注记（R1）：trace 读取失败不属短路范围** —— 读失败仍如实显示（不静默）。
+  const executionBody = `${traceHint}${executionTable}`;
   // C2 空区块短路③：无任务 ⇒ 依赖图不渲染（graph-view 侧同判据；此处再兜一层，未接线调用方也不出空节）。
-  // 件2：依赖图从「执行明细」折叠里**移出**，独立成侧栏卡（图是看图，不必与两张表同区）。
+  // 件2 → v0.10.3 N2c：依赖图先移出「执行明细」折叠（独立卡），本节点再**从侧栏上移主栏**
+  // （管道制要宽度）；外壳函数与 `feat-graph` 类名一律保留（「无任务 ⇒ 图卡不渲」的锚读的就是类名）。
   const graphCard = featCard(extras.graphHtml ?? "", "feat-graph");
-  const execution = foldSection("执行明细（任务 / 进展三面）", `${tasks}${traceHtml}`);
+  const execution =
+    executionBody === "" ? "" : foldSection("执行明细（任务 / 为什么没跑）", executionBody);
   const stageOutputsSection = renderStageOutputs(f.featureId, f.decisions, f.version ?? null);
   // M6：排期表单上详情页（GET 面）；缺省不渲染 ⇒ 未接线的调用方保持旧行为。
   const scheduleForm = withScheduleForm ? renderScheduleForm(f.featureId, f.version, releasedVersions) : "";
@@ -785,15 +834,17 @@ ${foldCalibration(
   const terminal = isTerminalFeatureState(f.state);
   // ---- 件2 两栏装配 ------------------------------------------------------
   // 主栏自上而下 = 下一步引导卡（品牌浅底）→ 轮次进度 / 链状态行 → 动作区卡（与澄清框互斥，
-  // 判据 = `awaitingAnswer`，见 7ee29786）→ 最近一轮卡 → 折叠层（需求原文 / 执行明细 / 验收轨迹）。
+  // 判据 = `awaitingAnswer`，见 7ee29786）→ 最近一轮卡 → **依赖图卡** → 折叠层（需求原文 / 执行明细 / 验收轨迹）。
+  // 侧栏 = **四卡**：元数据 → 归属 → 阶段产出 → 排期（v0.10.3 N2c 起依赖图已移出侧栏）。
   // **DOM 序即契约**：轮次进度行与链状态行必须**早于**动作区与回答框 —— 件B 有界轮询按
   // 「`.turn-progress` 在回答表单之前」定位刷新面，停链表单同样须早于动作区锚点。
+  // ⇒ 依赖图卡只能插在 `turnCard` **之后**（不得提到 `statusLines` 之前，否则顶掉件B 的刷新面定位）。
   const guide = featGuideCard(extras.nextStepHtml ?? "");
   const statusLines = `${extras.turnProgressHtml ?? ""}${extras.chainStateHtml ?? ""}`;
   const actionCard = featCard(terminal ? "" : `${extras.actionAreaHtml ?? ""}${extras.answerFormHtml ?? ""}`, "feat-action");
   const turnCard = featCard(extras.turnTraceHtml ?? "", "feat-turn");
   const folds = `${foldSection("需求原文", renderRequirementOrigin(f.requirement))}${execution}${foldSection("验收轨迹", extras.acceptanceHtml ?? "")}`;
-  const side = `${featCard(renderFeatureMetaCard(f), "feat-meta")}${featCard(renderFeatureOwnershipCard(detail.projects), "feat-ownership")}${featCard(stageOutputsSection, "feat-outputs")}${graphCard}${featCard(scheduleForm, "feat-schedule")}`;
+  const side = `${featCard(renderFeatureMetaCard(f), "feat-meta")}${featCard(renderFeatureOwnershipCard(detail.projects), "feat-ownership")}${featCard(stageOutputsSection, "feat-outputs")}${featCard(scheduleForm, "feat-schedule")}`;
   return `${extras.spaceNavHtml ?? ""}
 ${head}
 <div class="feat-cols">
@@ -802,6 +853,7 @@ ${guide}
 ${statusLines}
 ${actionCard}
 ${turnCard}
+${graphCard}
 ${folds}
 </div>
 <div class="feat-side">

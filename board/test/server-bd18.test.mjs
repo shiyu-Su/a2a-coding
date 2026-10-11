@@ -19,7 +19,7 @@ import { createBoardServer } from "../dist/server.js";
 
 const NOW = Date.parse("2026-09-24T12:00:00Z");
 
-function fakeClient(featureOver = {}, traceReturn = undefined) {
+function fakeClient(featureOver = {}, traceReturn = undefined, tasksReturn = []) {
   return {
     client: {
       baseUrl: "http://fake",
@@ -40,7 +40,7 @@ function fakeClient(featureOver = {}, traceReturn = undefined) {
             updatedAt: "u",
             ...featureOver,
           },
-          tasks: [],
+          tasks: tasksReturn,
         };
       },
       async getFeatureTrace(featureId) {
@@ -106,11 +106,11 @@ function fakeFace(awaiting = null, busyTurn = null, latest = null, chainSnapshot
   return face;
 }
 
-async function withServer(run, { feature, hostFace, trace } = {}) {
+async function withServer(run, { feature, hostFace, trace, tasks } = {}) {
   const handle = await createBoardServer({
     host: "127.0.0.1",
     port: 0,
-    client: fakeClient(feature ?? {}, trace).client,
+    client: fakeClient(feature ?? {}, trace, tasks ?? []).client,
     now: () => NOW,
     defaultGroup: "g",
     ...(hostFace === undefined ? { hostFace: fakeFace() } : hostFace === null ? {} : { hostFace }),
@@ -540,7 +540,7 @@ test("C4-页面：桥详情出参含 requirement ⇒ 需求原文在折叠层（
 // C1 页级正锚（件2 改版）：主栏序 = 步条 → 引导卡 → 动作区 → 最近一轮 → 折叠 → 侧栏元数据卡
 // ---------------------------------------------------------------------------
 
-test("C1-页面（正锚）：两栏拼接序 = 阶段步条 → 引导行 → 动作区 → 最近一轮 → 侧栏元数据卡", async () => {
+test("C1-页面（正锚）：两栏拼接序 = 阶段步条 → 引导行 → 动作区 → 最近一轮 → 依赖图 → 侧栏元数据卡", async () => {
   await withServer(async (base) => {
     const { text } = await detail(base);
     const marks = [
@@ -548,18 +548,40 @@ test("C1-页面（正锚）：两栏拼接序 = 阶段步条 → 引导行 → �
       text.indexOf('<p class="hint nextstep">'),
       text.indexOf("<h2>动作</h2>"),
       text.indexOf("<h2>最近一轮</h2>"),
+      text.indexOf("<h2>依赖图"),
       text.indexOf('<div class="feat-side">'),
       text.indexOf("<dt>审批门（approval）</dt>"),
     ];
-    assert.equal(marks.every((i) => i >= 0), true, "六处结构锚都在场");
+    assert.equal(marks.every((i) => i >= 0), true, "七处结构锚都在场");
     assert.deepEqual(
       [...marks].sort((a, b) => a - b),
       marks,
-      "引导行不在动作区之前 / 元数据卡不在侧栏 ⇒ 件2 两栏序回归",
+      "引导行不在动作区之前 / 依赖图在主栏（侧栏之前）/ 元数据卡不在侧栏 ⇒ 件2 + N2c 两栏序回归",
     );
     assert.equal(text.includes("<th>阶段（显示）</th>"), false, "阶段双行已由阶段步条替代");
   }, {
     feature: { approval: "待审批", requirement: "要一个只读的排期导出" },
+    // v0.10.3 N2c：依赖图卡要有内容才在场 ⇒ 喂一枚最小任务（缺省 tasks=[] ⇒ 图卡短路不渲）
+    tasks: [
+      {
+        taskId: "task-depgraph",
+        projectId: "p",
+        state: "completed",
+        lane: "write",
+        failureKind: null,
+        retryCount: null,
+        dependencies: null,
+        prompt: null,
+        createdAt: "c",
+        startedAt: null,
+        finishedAt: null,
+        queueState: null,
+        queuedAt: "2026-09-24T00:00:00Z",
+        claimedAt: null,
+        claimedBy: null,
+        taskType: null,
+      },
+    ],
     hostFace: fakeFace(null, null, {
       turnId: "turn-page-1",
       state: "succeeded",

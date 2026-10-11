@@ -1056,7 +1056,7 @@ export function renderPage(params: PageParams): string {
     --b-r-8: 8px;
     /* 尺度 · 列宽与投影 */
     --b-kcol-w: 264px;
-    --b-feat-side: 320px;
+    --b-feat-side: 264px;
     --b-shadow-1: 0 1px 2px rgba(15, 23, 32, .08);
     --b-shadow-2: 0 6px 24px rgba(15, 23, 32, .16);
   }
@@ -1112,6 +1112,10 @@ export function renderPage(params: PageParams): string {
   details.fold[open] > summary { margin-bottom: 6px; border-bottom: 1px solid #8884; padding-bottom: 4px; }
   details.fold h2 { display: inline; font-size: 14px; margin: 0; border: none; }
   details.fold h3 { font-size: 13px; margin: 14px 0 6px; }
+  /* v0.10.3 N3 遮挡治理的主机制：宽表的溢出带被折叠体自己的横滚吃掉，不再压进相邻轨
+     （.feat-side 是 sticky 定位元素，绘制序在文档流之上 ⇒ 溢出即遮挡）。
+     下方的 @container 回落只管观感，不承担遮挡治理；无 @container 支持时本条依旧成立。 */
+  .fold-body { overflow-x: auto; }
   details.calib { margin: 6px 0; font-size: 11px; color: #888; }
   details.calib > summary { cursor: pointer; font-style: italic; }
   details.req-src { margin: 6px 0; }
@@ -1140,15 +1144,29 @@ export function renderPage(params: PageParams): string {
   .md .mermaid-block[data-rendered="1"] pre.mermaid-src { display: none; }
   .md .mermaid-block[data-rendered="1"] .mermaid-svg:empty { display: none; }
   .md .mermaid-block svg { max-width: 100%; height: auto; }
-  /* T2 详情页依赖图：与 .md 文档页同构的 mermaid 块样式（选择器另起一行，不并入上行锚定口径） */
-  .dep-graph .mermaid-block { margin: 10px 0; overflow-x: auto; }
-  .dep-graph .mermaid-block[data-rendered="1"] pre.mermaid-src { display: none; }
-  .dep-graph .mermaid-block[data-rendered="1"] .mermaid-svg:empty { display: none; }
-  .dep-graph .mermaid-block svg { max-width: 100%; height: auto; }
-  /* 增补轨 III N1 节点布局放宽：长标签（project + 要点）使画布变宽，整体缩到容器宽会让
-     节点文字不可读 ⇒ 依赖图按原生尺寸渲染、超宽由上面的 overflow-x 横向滚动承担 */
-  .dep-graph .mermaid-block[data-rendered="1"] svg { max-width: none; height: auto; }
-  .dep-graph .mermaid-block .nodeLabel { font-size: 13px; word-break: break-word; }
+  /* v0.10.3 N2c 依赖图管道制（自绘 DOM/CSS · 零脚本）：管道 = 每 project 一枚原生 details，
+     体内只有 chip 与箭头（零连线坐标层）；横滚职责由原 .dep-graph .mermaid-block 迁到 .pipe-body。
+     取色只引既有 --b-* token —— 状态色的事实源仍是 graph-view 的 TASK_STATE_COLORS（图例 inline style）。 */
+  .pipe { border: 1px solid var(--b-line); border-radius: var(--b-r-6); margin-bottom: var(--b-sp-8); background: var(--b-surface-2); }
+  .pipe > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: var(--b-sp-8); padding: var(--b-sp-6) var(--b-sp-12); font-size: var(--b-fs-13); font-weight: 600; color: var(--b-text); }
+  .pipe > summary::-webkit-details-marker { display: none; }
+  .pipe-body { display: flex; align-items: center; flex-wrap: wrap; gap: 0; padding: var(--b-sp-8) var(--b-sp-12) var(--b-sp-12); overflow-x: auto; }
+  .dg-chip { display: inline-flex; align-items: center; gap: var(--b-sp-4); border: 1px solid var(--b-line); border-radius: var(--b-r-8); padding: 2px var(--b-sp-8); font-size: var(--b-fs-12); background: var(--b-surface); color: var(--b-text); white-space: nowrap; }
+  /* v0.10.3 增补 A1 chip 六态着色补齐：上条基础规则只给中性 border/background ⇒ 状态类是空钩子。
+     本组七条 = dg-<NodeState key> 闭集（done/running/queued/failed/frozen/ask/unknown，与 graph-view
+     NODE_STATE_ORDER 同序）；色值逐字复用图例在用的同一事实源 graph-view NODE_STATE_COLORS
+     （其值 = TASK_STATE_COLORS 的重新指派 + ask 既有色 + 回落 NEUTRAL_TASK_COLOR），CSS 侧不新造色值。
+     chip 可见文字仍恒为 #编号（不加 ●◐○ 状态符，状态由本组配色与 title 承载）。 */
+  .dg-chip.dg-done { border-color: #dafbe1; background: #dafbe1; }      /* ← TASK_STATE_COLORS.completed */
+  .dg-chip.dg-running { border-color: #e3eef7; background: #e3eef7; }   /* ← TASK_STATE_COLORS.working */
+  .dg-chip.dg-queued { border-color: #fff4ce; background: #fff4ce; }    /* ← TASK_STATE_COLORS 的 input-required 档（图例同档转派） */
+  .dg-chip.dg-failed { border-color: #ffe7e6; background: #ffe7e6; }    /* ← TASK_STATE_COLORS.failed */
+  .dg-chip.dg-frozen { border-color: #f3e5d0; background: #f3e5d0; }    /* ← TASK_STATE_COLORS.blocked */
+  .dg-chip.dg-ask { border-color: #ece2fb; background: #ece2fb; }       /* ← NODE_STATE_COLORS.ask（图例在用的既有色） */
+  .dg-chip.dg-unknown { border-color: #f2f3f5; background: #f2f3f5; }   /* ← NEUTRAL_TASK_COLOR（不可辨，不表具体态） */
+  .dg-arrow { color: var(--b-text-4); padding: 0 var(--b-sp-6); font-size: var(--b-fs-13); }
+  .dg-dep { font-size: var(--b-fs-11); color: var(--b-text-3); border: 1px solid var(--b-line); border-radius: var(--b-r-8); padding: 0 var(--b-sp-4); margin-left: 2px; }
+  .dg-edges { margin-top: var(--b-sp-4); font-size: var(--b-fs-12); color: var(--b-text-3); }
   .dg-legend { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; font-size: 12px; color: #667; }
   .dg-legend i { display: inline-block; width: 12px; height: 12px; border: 1px solid #8886; border-radius: 3px; }
   a.fl { color: inherit; }
@@ -1289,6 +1307,16 @@ export function renderPage(params: PageParams): string {
     .feat-cols { grid-template-columns: minmax(0, 1fr); }
     .feat-side { position: static; }
   }
+  /* v0.10.3 N3 回落单列的**观感**面（原型 v1 锁定：机制 = 容器查询、阈值 = 1000px）：
+     @media 判的是视口宽度，而排期浮层 dialog.fd 宽 min(880px, 92vw) ⇒ 视口 >900 时浮层内
+     **永不回落**；把浮层体声明为 query container 后，回落按**容器**宽度判。
+     ⚠ 本块不治理遮挡（遮挡由上面 .fold-body{overflow-x:auto} 治好）—— 浏览器不认 @container
+     时这里整块失效，观感退回两栏，遮挡不因此复现，故**不得把它当承重墙**。 */
+  dialog.fd .fd-body { container-type: inline-size; }
+  @container (max-width: 1000px) {
+    .feat-cols { grid-template-columns: minmax(0, 1fr); }
+    .feat-side { position: static; }
+  }
   /* 各块自带原生 <h2> ⇒ 卡头就是它（不叠第二层标题，标题文案与 class 一律不动） */
   .feat-card > h2:first-child { margin: 0 0 var(--b-sp-12); padding-bottom: var(--b-sp-6); border-bottom: 1px solid var(--b-line); border-radius: 0; font-size: var(--b-fs-14); color: var(--b-brand-ink); }
   /* 引导卡 = 品牌浅底（引导行文案与 class 不变，只换承载面） */
@@ -1299,7 +1327,7 @@ export function renderPage(params: PageParams): string {
   .b-meta-row { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: var(--b-sp-8); }
   .b-meta-row dt { color: var(--b-text-3); }
   .b-meta-row dd { margin: 0; font-family: ui-monospace, Consolas, monospace; word-break: break-word; }
-  /* 侧栏定宽里的表与 mermaid 图：横向滚动由既有 .dep-graph 口径承担，表不撑破卡 */
+  /* 侧栏定宽里的表：不撑破卡（依赖图已上移主栏，横滚归 .pipe-body） */
   .feat-side table { font-size: var(--b-fs-11); }
 </style>
 </head>

@@ -26,6 +26,7 @@ import {
   buildOrgPortalCards,
   VIEW_NOTES,
 } from "../dist/web/views.js";
+import { renderDependencyGraphSection, taskOrdinalMap } from "../dist/graph-view.js";
 
 const NOW = Date.parse("2026-09-24T12:00:00Z");
 
@@ -623,7 +624,9 @@ const traceFixture = {
   featureState: "executing",
   nodes: [
     {
-      taskId: "t2",
+      // v0.10.3 N3：并表后 trace 只按 taskId 命中任务行 ⇒ 夹具的节点必须是 detailFixture.tasks 的成员
+      // （真实数据里 trace.nodes ⊆ tasks，本就是子集）。
+      taskId: "t1",
       projectId: "p",
       state: "submitted",
       lane: "read",
@@ -649,14 +652,18 @@ test("renderFeatureDetail: state/stage/version/approval 全显示 + 派生标注
   assert.match(html, /已通过/);
 });
 
-test("renderFeatureDetail: B13-③ 三面表 —— waitReason 原样 + 读档占位 + 写门未挡", () => {
+test("renderFeatureDetail: N3 并表后「为什么没跑」= traceWaitDisplay 出参合成一列（waitReason 原样 + 写门 + 读档占位 + 位次）", () => {
   const html = renderFeatureDetail(detailFixture, traceFixture, null, NOW);
   assert.match(html, /read_lane_running/);
   assert.doesNotMatch(html, /读闸运行中|等待远程/);
   assert.match(html, /写门未挡/);
   assert.match(html, /读档占位 1 个：r1@m1/);
-  assert.match(html, /位次/);
-  assert.match(html, /<td>3<\/td>/);
+  assert.match(html, /第 3 位/);
+  assert.equal(
+    html.indexOf("写门（projectBusy）"),
+    -1,
+    "三面表 <th> 字面退役（单元格文本里的「写门占用（taskId=…」不属本判据）",
+  );
 });
 
 test("renderFeatureDetail: B13-① 等待时长只由 waitedSince 单时钟派生（显示原值可核对）", () => {
@@ -781,22 +788,34 @@ test("件2 阶段步条三档边界：已发版 = 五段全勾 · 验收中挂�
   assert.match(unknown, /当前阶段 = <b>未知（登记缺失）<\/b> <span class="muted">（登记 · 未归档到步条，如实显示）<\/span>/);
 });
 
-test("件2 侧栏四卡序：元数据卡（compact 两列）→ 阶段产出卡 → 依赖图卡 → 排期卡；依赖图已移出执行明细折叠", () => {
+test("件2 侧栏四卡序：元数据卡（compact 两列）→ 阶段产出卡 → 排期卡；v0.10.3 N2c 依赖图已移出侧栏、上移主栏", () => {
   const html = renderFeatureDetail(detailFixture, null, null, NOW, true, [], {
     graphHtml: "<h2>依赖图（1 节点 · 0 边）</h2><p class=\"hint dg-legend-row\">图例</p>",
+    nextStepHtml: '<p class="hint nextstep">引导行</p>',
+    turnTraceHtml: "<h2>最近一轮</h2>",
   });
-  const marks = [
+  // 侧栏 = 四枚锚（v0.10.3 N2c 起依赖图不在侧栏）
+  const sideMarks = [
     html.indexOf('<div class="feat-side">'),
     html.indexOf("<dt>引擎态</dt>"),
     html.indexOf("<h2>阶段产出</h2>"),
-    html.indexOf("<h2>依赖图"),
     html.indexOf("<h2>排期</h2>"),
   ];
-  assert.equal(marks.every((i) => i >= 0), true, "五处侧栏锚都在场");
-  assert.deepEqual([...marks].sort((a, b) => a - b), marks, "侧栏卡序 = 元数据 → 阶段产出 → 依赖图 → 排期");
+  assert.equal(sideMarks.every((i) => i >= 0), true, "四处侧栏锚都在场");
+  assert.deepEqual([...sideMarks].sort((a, b) => a - b), sideMarks, "侧栏卡序 = 元数据 → 阶段产出 → 排期");
   assert.match(html, /<div class="b-meta-row"><dt>审批门（approval）<\/dt><dd>已通过<\/dd><\/div>/, "元数据 = 名 / 值两列（dl），不再是 4×2 大表");
   assert.equal(html.includes("<table><tbody>\n<tr><th>引擎态</th>"), false, "原 4×2 大表整块退场");
-  assert.ok(html.indexOf("<h2>依赖图") > html.indexOf("执行明细"), "依赖图不再嵌在执行明细折叠内（移出为独立卡）");
+  // 主栏序 = 引导行 → 最近一轮 → 依赖图 → 折叠层（依赖图卡在 turnCard 之后、折叠层之前）
+  const mainMarks = [
+    html.indexOf('<p class="hint nextstep">'),
+    html.indexOf("<h2>最近一轮</h2>"),
+    html.indexOf("<h2>依赖图"),
+    html.indexOf("执行明细"),
+  ];
+  assert.equal(mainMarks.every((i) => i >= 0), true, "四处主栏锚都在场");
+  assert.deepEqual([...mainMarks].sort((a, b) => a - b), mainMarks, "主栏序 = 引导行 → 最近一轮 → 依赖图 → 折叠层");
+  assert.ok(html.indexOf("<h2>依赖图") < html.indexOf('<div class="feat-side">'), "依赖图不在侧栏（已上移主栏）");
+  assert.ok(html.indexOf("<h2>依赖图") < html.indexOf("执行明细"), "依赖图上移主栏、位于折叠层之前");
 });
 
 test("件2 空块短路照旧：无任务 / trace 空 / 无图 / 无表单 ⇒ 侧栏只剩元数据卡，主栏不空转", () => {
@@ -808,18 +827,18 @@ test("件2 空块短路照旧：无任务 / trace 空 / 无图 / 无表单 ⇒ �
   assert.match(html, /<div class="b-card feat-card feat-meta">[\s\S]*<h2>需求信息<\/h2>/, "侧栏元数据卡恒在场");
 });
 
-test("C2 renderFeatureDetail 空区块短路：任务 0 ⇒ 任务表不出；trace 空节点 ⇒ 三面表不出；trace 读失败 ⇒ 不短路", () => {
+test("C2 renderFeatureDetail 空区块短路（N3 并表后）：任务 0 ⇒ 单表不出；trace 空节点 ⇒ 不出；trace 读失败 ⇒ 不短路", () => {
   const empty = renderFeatureDetail({ ...detailFixture, tasks: [] }, { ...traceFixture, nodes: [] }, null, NOW);
-  assert.equal(empty.includes("<h2>任务（"), false, "任务 0 ⇒ 任务表整节不渲染");
-  assert.equal(empty.includes('<td class="mono">read_lane_running</td>'), false, "trace 成功但空 ⇒ 三面表不出");
+  assert.equal(empty.includes("<h2>任务（"), false, "任务 0 ⇒ 执行明细单表整节不渲染");
+  assert.equal(empty.includes("read_lane_running"), false, "trace 成功但空 ⇒ 该列不出");
   assert.equal(empty.includes("执行明细"), false, "任务 0 ∧ trace 空 ⇒ 执行明细区整体消失（C2 的验收面）");
 
   const withTask = renderFeatureDetail(detailFixture, traceFixture, null, NOW);
   assert.match(withTask, /<h2>任务（1）<\/h2>/, "对照：有任务照常渲染");
-  assert.match(withTask, /<td class="mono">read_lane_running<\/td>/, "对照：trace 有非终态节点照常渲染");
+  assert.match(withTask, /read_lane_running · 第 3 位/, "对照：trace 有非终态节点 ⇒ 合成文本照常进「为什么没跑」列");
 
   const failed = renderFeatureDetail(detailFixture, null, "桥返回 HTTP 500", NOW);
-  assert.match(failed, /进展三面.*trace 读取失败/s, "读失败不属短路范围（不静默，既有锚同款）");
+  assert.match(failed, /执行明细.*trace 读取失败/s, "读失败不属短路范围（不静默，既有锚同款；N3 起三面表并单表 ⇒ 判据串随标题改词）");
 });
 
 test("C2 renderAcceptanceSection 短路④：单段 ∧ 零失败 ⇒ 整节不渲染；多段或有失败 ⇒ 照渲染", () => {
@@ -967,27 +986,130 @@ const timingsTask = {
   claimedBy: "m1",
 };
 
-test("renderFeatureDetail: 任务行三时刻 + 排队时长（queuedAt→claimedAt）/ 执行时长（startedAt→finishedAt）", () => {
+test("renderFeatureDetail: N3 单表 12 列 = # / taskId / 项目 / 职责位 / 状态 / 要点 / 为什么没跑 / 失败类 / 重派 / 依赖 / 排队时长 / 执行时长", () => {
   const html = renderFeatureDetail(
     { ...detailFixture, tasks: [timingsTask] },
     null,
     "trace 关闭",
     NOW,
   );
-  assert.match(html, /<th>创建<\/th><th>开始<\/th><th>结束<\/th><th>排队时长<\/th><th>执行时长<\/th>/);
-  assert.match(html, /2026-09-26T00:01:30Z/);
+  assert.match(
+    html,
+    /<th>#<\/th><th>taskId<\/th><th>项目<\/th><th>职责位<\/th><th>状态<\/th><th>要点<\/th><th>为什么没跑<\/th><th>失败类<\/th><th>重派<\/th><th>依赖<\/th><th>排队时长<\/th><th>执行时长<\/th>/,
+  );
+  assert.equal(html.includes("2026-09-26T00:01:30Z"), false, "三时刻原值不再上表（时长列仍在，时刻走 /tasks 面追溯）");
   assert.match(html, /<td>1m 0s<\/td>/); // 排队时长 queuedAt→claimedAt = 60s
   assert.match(html, /<td>5m 0s<\/td>/); // 执行时长 startedAt→finishedAt = 300s
+  const thead = html.slice(html.indexOf("<thead>"), html.indexOf("</thead>"));
+  assert.equal((thead.match(/<th>/g) ?? []).length, 12, "表头单元格计数 === 12");
+  assert.equal((thead.match(/创建/g) ?? []).length, 0, "「创建」列头退役（grep 判据 = 0）");
 });
 
-test("renderFeatureDetail: 任务行时刻/时长缺字段 ⇒ 新增 5 列全容错为 —（老桥容错，不炸页、不推算）", () => {
+test("N-8 反向锚：三时刻原值（ISO 串）不得再出现在执行明细表 HTML 上", () => {
+  const html = renderFeatureDetail({ ...detailFixture, tasks: [timingsTask] }, null, "trace 关闭", NOW);
+  const body = html.slice(html.indexOf('<div class="fold-body">'), html.indexOf("</details>", html.indexOf("执行明细")));
+  assert.equal(/\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}(?:\.\d+)?Z/.test(body), false, "挡后人回补时刻列（时刻原值只走 /tasks 面）");
+});
+
+// --- v0.10.3 N3：编号单点（图 ↔ 表）与遮挡治理分工（降级断言） --------------------------
+
+/** 取 CSS 里 marker 之后完整的 `{…}` 块（花括号计数 ⇒ 嵌套 @container 安全）。 */
+function cssBlockAfter(css, markerRe) {
+  const m = markerRe.exec(css);
+  assert.ok(m !== null, `CSS 须命中 ${markerRe}`);
+  const open = css.indexOf("{", m.index);
+  let depth = 0;
+  for (let i = open; i < css.length; i += 1) {
+    if (css[i] === "{") depth += 1;
+    else if (css[i] === "}") {
+      depth -= 1;
+      if (depth === 0) return css.slice(open, i + 1);
+    }
+  }
+  assert.fail(`${markerRe} 的花括号不闭合`);
+}
+
+/** 取「执行明细」折叠节的 .fold-body 内容（含 `<div class="fold-body">` 起头）。 */
+function executionFoldBody(html) {
+  const at = html.indexOf('<summary>执行明细（任务 / 为什么没跑）</summary><div class="fold-body">');
+  assert.ok(at >= 0, "执行明细节须以 foldSection 形态在场（标题串含「执行明细」四字）");
+  const start = at + '<summary>执行明细（任务 / 为什么没跑）</summary>'.length;
+  return html.slice(start, html.indexOf("</div></details>", start));
+}
+
+test("N3 遮挡治理分工：.fold-body 横滚 = 承重墙，@container 回落只管观感（降级断言）", () => {
+  const css = renderPage({ title: "t", active: "home", bodyHtml: "<p>b</p>" });
+
+  // ① 主机制独立成立（不嵌在任何回落块里）
+  const wall = cssBlockAfter(css, /\.fold-body\s*\{/);
+  assert.match(wall, /overflow-x:\s*auto/, "宽表溢出带由折叠体自己的横滚吃掉 ⇒ 不压进相邻轨");
+
+  // ② 观感面：机制 = 容器查询、阈值 = 1000px（原型 v1 锁定），只管两栏 → 单列
+  const containerHead = "@container (max-width: 1000px)";
+  const fallback = cssBlockAfter(css, /@container \(max-width: 1000px\)\s*\{/);
+  assert.match(fallback, /\.feat-cols\s*\{\s*grid-template-columns:\s*minmax\(0,\s*1fr\);\s*\}/, "回落 = 单列");
+  assert.equal(css.includes("container-type: inline-size"), true, "承载面声明在场（浮层体 = query container）");
+
+  // ③ 降级判据：整段删掉容器查询块（模拟不支持 @container 的浏览器）⇒ 承重墙一条不少
+  const degraded = css.replace(`${containerHead} ${fallback}`, "");
+  assert.equal(degraded === css, false, "该删得掉 ⇒ 本判据不是空转");
+  assert.equal(degraded.includes(containerHead), false, "回落块已摘除");
+  assert.match(degraded, /\.fold-body\s*\{\s*overflow-x:\s*auto\s*\}/, "摘除回落块后横滚规则依旧独立 ⇒ 遮挡不因此复现");
+
+  // ④ 结构侧：单表**恒**在 .fold-body 内（纯 HTML 判据，与容器宽度无关 ⇒ 窄容器也不越轨）
+  const html = renderFeatureDetail({ ...detailFixture, tasks: [timingsTask] }, null, "trace 关闭", NOW);
+  const body = executionFoldBody(html);
+  assert.ok(body.startsWith('<div class="fold-body">'), "折叠体即容器");
+  assert.equal(body.indexOf("<table>") > 0, true, "表格在 .fold-body 之内（不在其外）");
+});
+
+test("N3 编号单点：图上 chip 的 #n == 单表首列 #n（同 taskId ⇒ 同编号，同一张 taskOrdinalMap）", () => {
+  const tasks = [
+    { ...timingsTask, taskId: "aa1", queuedAt: "2026-09-26T00:03:00Z" },
+    { ...timingsTask, taskId: "aa2", queuedAt: "2026-09-26T00:01:00Z", dependencies: ["aa1"] },
+    { ...timingsTask, taskId: "aa3", queuedAt: null, dependencies: ["aa2"] },
+  ];
+  const ordinals = taskOrdinalMap(tasks);
+  assert.deepEqual([...ordinals.entries()], [["aa2", 1], ["aa1", 2], ["aa3", 3]], "queuedAt 升序、null 沉底（单点口径）");
+
+  const graph = renderDependencyGraphSection(tasks, 1);
+  const html = renderFeatureDetail({ ...detailFixture, tasks }, null, "trace 关闭", NOW, false, [], {
+    graphHtml: graph.html,
+  });
+  for (const [taskId, ordinal] of ordinals) {
+    assert.equal(
+      graph.html.includes(`title="${taskId} · #${ordinal} · `),
+      true,
+      `图侧 chip 带 #${ordinal}（${taskId}）`,
+    );
+    const at = html.indexOf(`<td class="mono" title="${taskId}">`);
+    const tr = html.slice(html.lastIndexOf("<tr>", at), html.indexOf("</tr>", at));
+    const cells = tr.slice("<tr>".length).split("</td>").slice(0, -1);
+    assert.equal(cells[0], `<td>${ordinal}`, `表侧首列 = #${ordinal}（同一张编号表，不得第二处派生）`);
+    const deps = (tasks.find((t) => t.taskId === taskId).dependencies ?? []).map((d) => `#${ordinals.get(d)}`);
+    if (deps.length > 0) {
+      assert.equal(cells[9], `<td>${deps.join("、")}`, "依赖列引的也是 #n（不是短标串）");
+    }
+  }
+});
+
+test("renderFeatureDetail: 单表行 12 列 + 老桥缺字段逐格容错为 —（不炸页、不推算）", () => {
   const html = renderFeatureDetail(detailFixture, null, "trace 关闭", NOW);
-  const start = html.indexOf('<tr><td class="mono">t1</td>');
+  const start = html.indexOf('<tr><td>1</td><td class="mono" title="t1">t1</td>');
   const end = html.indexOf("</tr>", start);
   const row = html.slice(start, end);
   const cells = row.slice("<tr>".length).split("</td>").slice(0, -1);
-  assert.equal(cells.length, 12, "任务行固定 12 列（7 原有 + 三时刻 + 两时长）");
-  assert.deepEqual(cells.slice(-5), ["<td>—", "<td>—", "<td>—", "<td>—", "<td>—"], "末 5 列（创建/开始/结束/排队/执行）缺字段 ⇒ 全 —");
+  assert.equal(cells.length, 12, "任务行固定 12 列（N3 列序：# / taskId / 项目 / 职责位 / 状态 / 要点 / 为什么没跑 / 失败类 / 重派 / 依赖 / 排队时长 / 执行时长）");
+  assert.deepEqual(
+    cells.slice(-5),
+    ["<td>timeout", "<td>1", "<td>t0", "<td>—", "<td>—"],
+    "末 5 列换人（旧=创建/开始/结束/排队/执行 ⇒ 新=失败类/重派/依赖/排队/执行）；老桥缺时长字段 ⇒ 末两列 —；依赖 t0 不在本需求任务集 ⇒ 无编号可引，回落短标不吞",
+  );
+  assert.deepEqual(
+    [cells[3], cells[5], cells[6]],
+    ["<td>—", "<td>—", "<td>—"],
+    "老桥缺 taskType / prompt / trace ⇒ 职责位、要点、为什么没跑三格 = —（不臆造）",
+  );
 });
 
 test("renderFeatureDetail: 在飞任务（有 startedAt 无 finishedAt）执行时长如实 —（不做至 now 推算）", () => {
