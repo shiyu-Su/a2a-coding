@@ -9,6 +9,8 @@ import {
   sortVersions,
   comparePoolEntry,
   sortPoolEntries,
+  compareFeatureCard,
+  sortFeatureCards,
 } from "../dist/version-order.js";
 
 // ---------------------------------------------------------------------------
@@ -154,4 +156,85 @@ test("sortPoolEntries: 保留条目其它字段", () => {
     { createdAt: "2026-09-26T00:00:00Z", featureId: "F-b", title: "乙" },
   ]);
   assert.deepEqual(out.map((e) => [e.featureId, e.title]), [["F-b", "乙"], ["F-a", "甲"]]);
+});
+
+// ---------------------------------------------------------------------------
+// 版本列卡序（REQ-2026-10-12-02）：六档序 · 同档二级键复用池尺 · 未列值兜底
+// ---------------------------------------------------------------------------
+
+test("sortFeatureCards: 六档序全序锚（十张卡 createdAt 同值 ⇒ 唯一变量 = 状态档）· 档序相邻值两两相异", () => {
+  const t = "2026-10-12T00:00:00Z";
+  // 档位：failed ｜ waiting_approval·reviewing·needs_input ｜ executing·integrating·testing ｜ completed ｜ cancelled ｜ 未列值兜底
+  // 同档 createdAt 同值 ⇒ 档内二级键 = featureId 字典序：卡 id 按期望序编为 F-a…F-j，档内序即书写序
+  const seq = [
+    "failed", "waiting_approval", "reviewing", "needs_input",
+    "executing", "integrating", "testing", "completed", "cancelled", "unlisted",
+  ];
+  const fid = (i) => `F-${"abcdefghij"[i]}`;
+  const cards = seq.map((state, i) => ({ state, createdAt: t, featureId: fid(i) }));
+  const shuffled = [
+    cards[7], cards[2], cards[9], cards[0], cards[5], cards[3], cards[8], cards[1], cards[6], cards[4],
+  ];
+  assert.deepEqual(
+    sortFeatureCards(shuffled).map((e) => e.featureId),
+    seq.map((_, i) => fid(i)),
+  );
+  // 防「两档共用一秩」的哑实现：相邻取值两两比较，前必须严格小于后（全序 + 反对称 ⇒ 秩严格递增）
+  for (let i = 0; i + 1 < seq.length; i++) {
+    const a = { state: seq[i], createdAt: t, featureId: "F-a" };
+    const b = { state: seq[i + 1], createdAt: t, featureId: "F-b" };
+    assert.equal(compareFeatureCard(a, b), -1, `rank(${seq[i]}) 须严格小于 rank(${seq[i + 1]})`);
+    assert.equal(compareFeatureCard(b, a), 1, `rank(${seq[i + 1]}) 须严格大于 rank(${seq[i]})`);
+  }
+});
+
+test("compareFeatureCard: 同档二级键 = createdAt 降序 · 缺值/非法沉底 · 全缺按 featureId · 与输入顺序无关", () => {
+  const mk = (featureId, createdAt) => ({ state: "executing", createdAt, featureId });
+  const nu = mk("F-new", "2026-10-12T00:00:00Z");
+  const od = mk("F-old", "2026-10-01T00:00:00Z");
+  const nl = mk("F-null", null);
+  const bd = mk("F-bad", "c"); // Date.parse("c") = NaN ⇒ 视同缺值
+  // 缺值与非法同秩 ⇒ 二者之间落回池尺 featureId 兜底（F-bad < F-null）
+  assert.deepEqual(
+    sortFeatureCards([nl, bd, od, nu]).map((e) => e.featureId),
+    ["F-new", "F-old", "F-bad", "F-null"],
+  );
+  assert.deepEqual(
+    sortFeatureCards([bd, nu, nl, od]).map((e) => e.featureId),
+    ["F-new", "F-old", "F-bad", "F-null"],
+  );
+  // 全缺 ⇒ 档内落回池尺 featureId 兜底（与输入顺序无关）
+  const allNil = [mk("F-d", null), mk("F-b", undefined), mk("F-c", "nope"), mk("F-a", null)];
+  assert.deepEqual(
+    sortFeatureCards(allNil).map((e) => e.featureId),
+    ["F-a", "F-b", "F-c", "F-d"],
+  );
+  assert.deepEqual(
+    sortFeatureCards([...allNil].reverse()).map((e) => e.featureId),
+    ["F-a", "F-b", "F-c", "F-d"],
+  );
+});
+
+test("sortFeatureCards: 未列值兜底一律沉 cancelled 之下（含 constructor 原型链负钉）· 不改入参 · 保留其它字段", () => {
+  const t = "2026-10-12T00:00:00Z";
+  const unlisted = [
+    { state: "", createdAt: t, featureId: "F-emp" },
+    { state: "weird", createdAt: t, featureId: "F-weird" },
+    { state: null, createdAt: t, featureId: "F-null" },
+    { state: "constructor", createdAt: t, featureId: "F-ctor" }, // 原型链负钉：字面量表会命中 Object.prototype.constructor ⇒ NaN 秩、比较器失全序
+    { state: "cancelled", createdAt: t, featureId: "F-cancelled" },
+  ];
+  const shuffled = [unlisted[3], unlisted[0], unlisted[4], unlisted[2], unlisted[1]];
+  const out = sortFeatureCards(shuffled);
+  const states = out.map((e) => e.state);
+  // 四枚未列值（含 null）一律沉 cancelled 之下；未列值之间档内同秩 ⇒ 落回池尺 featureId 字典序
+  assert.deepEqual(states, ["cancelled", "constructor", "", null, "weird"]);
+  // 不改入参（照 sortPoolEntries「不改动入参」写法）
+  assert.deepEqual(shuffled.map((e) => e.state), ["constructor", "", "cancelled", null, "weird"]);
+  // 保留其它字段（照 sortPoolEntries「保留其它字段」写法）
+  const withExtra = sortFeatureCards([
+    { state: "failed", createdAt: t, featureId: "F-a", title: "甲" },
+    { state: "unlisted-z", createdAt: t, featureId: "F-b", title: "乙" },
+  ]);
+  assert.deepEqual(withExtra.map((e) => [e.featureId, e.title]), [["F-a", "甲"], ["F-b", "乙"]]);
 });

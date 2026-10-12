@@ -404,7 +404,7 @@ test("BD3-③（过滤 · 页面 · §9-c 翻向）：在用组织管理页给�
     const text = await on.text();
     assert.match(text, /<input type="hidden" name="action" value="disable">/, "停用 = 同一条 POST /orgs 的动作分流");
     assert.match(text, /action="\/orgs"[\s\S]*?<input type="hidden" name="org" value="在用组"/, "在用组织管理页给停用按钮");
-    assert.doesNotMatch(text, /<script src>/, "纯 SSR：零新脚本常量（N3 七元闭集不动）");
+    assert.doesNotMatch(text, /<script src>/, "纯 SSR：零新脚本常量（N3 八元闭集不动）");
 
     const off = await fetch(`${base}/org/${encodeURIComponent("停用组")}/manage`);
     assert.equal(off.status, 410, "停用组织的空间不再开放 ⇒ 管理页同档位（不另立「置灰」形态）");

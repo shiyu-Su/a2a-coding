@@ -265,17 +265,18 @@ export function deriveScheduleGateOpen(stage: string | null, approval: string | 
 // ---------------------------------------------------------------------------
 
 /**
- * 色档闭集（六档）。视图只认档位，不认状态名 —— 新增引擎态时改本映射一处，
+ * 色档闭集（七档）。视图只认档位，不认状态名 —— 新增引擎态时改本映射一处，
  * 不在模板里散写条件。**`locked` = 显式锁定语义预留档**；
  * 「已发版」（`completed` ∧ `stage=发版`）的派生显示仍归 `ok`。
  */
-export type CardColorTier = "brand" | "warn" | "ok" | "danger" | "locked" | "neutral";
+export type CardColorTier = "brand" | "warn" | "ok" | "danger" | "locked" | "neutral" | "cancelled";
 
 /**
  * 引擎态 → 色档（纯函数，与 {@link deriveDisplayStage} / {@link deriveScheduleGateOpen}
  * 同一规则源侧）：在途主链四态（`executing`/`integrating`/`testing`/`reviewing`）→ `brand`；
  * 待确认 `waiting_approval` → `warn`；`completed` → `ok`；`failed` → `danger`；
- * `needs_input` / `cancelled` / `null` / 未知值 → `neutral`（不猜、不吞，回落中性档）。
+ * `cancelled` → `cancelled`（独立档）；
+ * `needs_input` / `null` / 未知值 → `neutral`（不猜、不吞，回落中性档）。
  */
 export function deriveCardColorTier(state: string | null): CardColorTier {
   switch (state) {
@@ -290,6 +291,8 @@ export function deriveCardColorTier(state: string | null): CardColorTier {
       return "ok";
     case "failed":
       return "danger";
+    case "cancelled":
+      return "cancelled";
     default:
       return "neutral";
   }
@@ -643,17 +646,12 @@ export function deriveNextStepHint(input: NextStepInput): string {
 }
 
 // ---------------------------------------------------------------------------
-// B13-② 指标口径标注 + §2.2-13 并行度文案（固定文案，视图直接引用）
+// B13-② 指标口径标注（固定文案，视图直接引用）
 // ---------------------------------------------------------------------------
 
 /** 「在飞数」指标口径标注 —— 凡显示桥 `/health inFlightCount` 一类指标必须伴随此句。 */
 export const INFLIGHT_CALIBRATION_NOTE =
   "口径：在飞数取自桥 /health inFlightCount，含 machine 闸内排队待放行任务 ⇒ ≠ 实际在跑数（会高估）。";
-
-/** §2.2-13 并行度口径 —— 板上任何「并行」表述统一引用本常量。 */
-export const PARALLELISM_NOTE =
-  "并行度口径：编排侧并行 ≠ 改造侧并行；写串行不变；「读并行」仅在节点声明 read 档且 machine 配 " +
-  "maxConcurrentReads ≥ 2 时才真发生（缺省 1/1）⇒ DAG 拆宽 ≠ 并行。板不承诺「多需求并行」。";
 
 /**
  * Agent View 页脚口径行（v0.9.3 B-T3）：本页只呈现 orch 看得见的在飞面 ——
@@ -663,9 +661,6 @@ export const PARALLELISM_NOTE =
 export const AGENT_VIEW_CALIBRATION_NOTE =
   "口径：闸内排队与 machine 读席占用 orch 不可见，两个时钟不得相加。";
 
-/** B13 三条显示口径脚注（列表 / 详情 / trace 视图统一挂载）。 */
-export const B13_CALIBRATION_NOTES: readonly string[] = [
-  "等待时长只取 waitedSince（orch 领取队列的等待与 machine 闸内等待是两个时钟，不得相加）。",
-  INFLIGHT_CALIBRATION_NOTE,
-  "projectBusy 只反映写门；写门未挡却没开工时以 readOccupants[]（读档占位）为准；waitReason 原样显示（八值闭集，不自造中文词）。",
-];
+/** trace / 等待面读账口径（原 B13 脚注第 3 条，收敛为单点常量）。 */
+export const TRACE_READ_NOTE =
+  "projectBusy 只反映写门；写门未挡却没开工时以 readOccupants[]（读档占位）为准；waitReason 原样显示（八值闭集，不自造中文词）。";

@@ -370,8 +370,9 @@ export interface EngineProjectVersionEntry {
  * - `empty` ⇒ 字段在场但**零合法条目** —— 这是**合法事实**（「未登记，本版本起生效」档），
  *   与 `absent`（面未上线）**两种显示必须可区分**；
  * - `absent` ⇒ 顶层字段**缺位 / 非数组** ⇒ project 面单独降级（`error` 文案含「引擎 project 版本面
- *   未上线」；v0.10.2 起**唯一显示面** = 管理页「配置核对」卡第三行，`empty` / `absent` 的可区分性
- *   就落在这一行 ⇒ 项目卡新列对二者同显 `—`，裁定④），
+ *   未上线」；v0.10.2 起**唯一显示面** = 管理页页头「核对源健康度」短条第三档（⑧a 起卡面降为短条），
+ *   `empty` / `absent` 的可区分性
+ *   就落在这一档 ⇒ 项目卡新列对二者同显 `—`，裁定④），
  *   **Group 面（版本列 / 锁 / 门户摘要）一切照常**，不牵连排期写门（project 降级**不进** fail-closed）。
  */
 export type ProjectVersionsField =

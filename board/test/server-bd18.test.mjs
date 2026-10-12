@@ -501,10 +501,10 @@ test("C5-页面（负锚）任何档位的详情页都不出现「触发一轮�
 });
 
 // ---------------------------------------------------------------------------
-// C4 页级（件2 改版）：需求原文 = 主栏折叠层首节（默认收起，标题与原文形态不变）
+// C4 页级（① 只允许一层折叠）：需求原文 = 主栏折叠层首节（默认收起，正文直显全文）
 // ---------------------------------------------------------------------------
 
-test("C4-页面：桥详情出参含 requirement ⇒ 需求原文在折叠层（截断 + 展开全文）；缺字段 ⇒ 整区不渲染", async () => {
+test("C4-页面：桥详情出参含 requirement ⇒ 需求原文在外层折叠层内直显全文；缺字段 ⇒ 整区不渲染", async () => {
   const long = "板「标记 released」的闸判据对曾有取消轨的版本永久失真：".repeat(6);
   await withServer(async (base) => {
     const { text } = await detail(base);
@@ -513,10 +513,24 @@ test("C4-页面：桥详情出参含 requirement ⇒ 需求原文在折叠层（
       /<details class="fold"><summary>需求原文<\/summary>[\s\S]*?<h2>需求原文<\/h2>/,
       "件2：需求原文进主栏折叠层（默认收起），区内标题仍在场",
     );
-    assert.match(text, /<details class="req-src">/, "超长原文走原生 details（零脚本）");
-    const block = text.slice(text.indexOf("<summary>需求原文</summary>"), text.indexOf('<div class="feat-side">'));
-    assert.ok(block.indexOf("</summary>") < block.indexOf('<pre class="result">'), "折叠态 = 截断、展开态 = 全文");
-    assert.ok(block.indexOf("req-src") > 0, "原文块在主栏内（侧栏之前）");
+    // 负钉抬为**区域结构**口径（不钉类名字面量 ⇒ 改版后不转恒真）：原文区内 `<details` 计数 = 1
+    const originHead = '<details class="fold"><summary>需求原文</summary>';
+    const originStart = text.indexOf(originHead);
+    assert.ok(originStart >= 0, "原文正文落在外层折叠层内");
+    const nextFold = text.indexOf('<details class="fold">', originStart + originHead.length);
+    const sideStart = text.indexOf('<div class="feat-side">');
+    assert.ok(originStart < sideStart, "原文块在主栏内（侧栏之前）");
+    const originRegion = text.slice(originStart, nextFold >= 0 ? nextFold : sideStart);
+    assert.equal(originRegion.split("<details").length - 1, 1, "原文区只允许一层折叠（内层折叠已摘）");
+    assert.ok(
+      originRegion.indexOf("</summary>") < originRegion.indexOf('<pre class="result">'),
+      "序判据保留：外层折叠的 summary 早于正文",
+    );
+    assert.ok(
+      originRegion.indexOf('<h2>需求原文</h2>\n<pre class="result">') > 0,
+      "原文折叠体内 = 直显全文的 <pre>",
+    );
+    assert.ok(originRegion.includes(long), "长原文全文直显（120 字截断档已取消）");
     assert.ok(
       text.indexOf('<p class="hint nextstep">') < text.indexOf("<h2>需求原文</h2>"),
       "件2 主栏序：引导卡在原文折叠层之前",

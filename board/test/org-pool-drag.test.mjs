@@ -4,13 +4,15 @@
  * N1 钉的是 SSR 面（池集合差 / 两栏渲染 / 服务端 draggable 判据 / 降级不炸页），本文件钉的是
  * 第七枚常量 {@link MEMBER_DRAG_SCRIPT} 与**真实写径**的接缝，改造文档 §3 固定口径逐条：
  *  ① **分层**：拖拽只是体验层，落点仍以服务端投影与 409 为准 ⇒ 脚本提交的请求形状必须与
- *     手填表单**逐字一致**（同路由、同三参数、同编码），服务端零改动即可服务拖放（拖-②③）；
+ *     **既有写路由逐字一致**（同路由、同三参数、同编码），服务端零改动即可服务拖放（拖-②③；
+ *     ⑦b 起手填表单已退役 ⇒ 对账对象从「表单字段」改为「路由入参」）；
  *  ② **失败可见**：409 冲突卡 / 末位闸卡必须在 `Accept: text/html` 档里以 `.err-ov-card`
  *     出现（脚本据此叠浮层），且冲突卡自带所属组链接（拖-④⑤）；
  *  ③ **不放宽 CSRF**：同源 `Origin` 档承担认证，跨站仍 403 且零出网 —— 拖放路径不是后门（拖-⑥）；
  *  ④ **页隔离**：第七枚只随 `/org/<名>/manage` 注入（门户 / 排期 / 详情 / 项目 / Agent 页一律不带），
- *     闭集七元但**按页注入**，不给任何页面白扩脚本面（拖-①）；
- *  ⑤ **无 JS 回落**：两枚手填表单保留 DOM 且可原生提交；快照面降级档表单仍是主通路（拖-⑦）。
+ *     闭集八元但**按页注入**，不给任何页面白扩脚本面（拖-①）；
+ *  ⑤ **⑦b 起拖拽是唯一成员写通路**：无 JS / 无 DnD ⇒ 该页无成员写面（两枚手填表单与其折叠宿主已退役，
+ *     快照面降级档同样不再有表单兜底）—— 负锚见拖-⑦，登记改造文档 §6。
  *
  * 范围外（归 N1 / 闭集锚）：池集合差纯函数、两栏渲染结构、N3-⑦/⑧ 全站闭集枚数锚（在 n3-regression-anchors）。
  */
@@ -246,8 +248,10 @@ test("拖-① 页隔离：第七枚常量只在 /org/alpha/manage 注入（门�
     assert.equal(bareScriptCount(await (await fetch(`${base}/`)).text()), 2, "门户计数不因本需求扩（提交守卫 + 泛化弹窗）");
     assert.equal(
       bareScriptCount(await (await fetch(`${base}/org/alpha/schedule`)).text()),
-      5,
-      "空间排期页计数不因本需求扩（看板注入面五枚，排期拖拽仍是独立第六枚）",
+      6,
+      // v0.10.4 REQ-2026-10-11-03 N5：计数翻新（八枚闭集内、非野长）= 看板注入面四枚 + mermaid 渲染 +
+      // 提交守卫/err-ov + 页级就地刷新第八枚；上方「不带第七枚」的页隔离负钉逐字不动。
+      "空间排期页计数 = 六枚（v0.10.4 起含页级就地刷新第八枚；排期拖拽仍是独立枚，闭集八元不野扩）",
     );
   });
 });
@@ -256,7 +260,7 @@ test("拖-① 页隔离：第七枚常量只在 /org/alpha/manage 注入（门�
 // ②③ 拖放写路径 = 既有路由逐字复用
 // ---------------------------------------------------------------------------
 
-test("拖-② 拖放左→右（add）：同源 Origin + 无守卫头 + urlencoded 三参数 ⇒ 路由接受、出网入参与手填表单同形、回执页仍可继续拖", async () => {
+test("拖-② 拖放左→右（add）：同源 Origin + 无守卫头 + urlencoded 三参数 ⇒ 路由接受、出网入参与既有写路由同形、回执页仍可继续拖", async () => {
   const { calls, impl } = memberWriteStub([okAdd]);
   await withBoard({ groupMemberWriteImpl: impl }, async (base) => {
     const res = await postLikeScript(base, "alpha", { action: "add", machineId: "m1", projectId: "p-free" });
@@ -266,7 +270,7 @@ test("拖-② 拖放左→右（add）：同源 Origin + 无守卫头 + urlencod
       op: MEMBER_OP_ADD,
       groupName: "alpha",
       members: [{ machineId: "m1", projectId: "p-free" }],
-    }, "拖放的三参数经既有解析路径落到与表单**同一**出网载荷（服务端零改动）");
+    }, "拖放的三参数经既有解析路径落到该路由的出网载荷（服务端零改动 ⇒ ⑦b 后这是唯一一发）");
     assert.equal(calls[0].options.group, "alpha", "组身份 = 目标组织（取自 data-org，非表单可见字段）");
     const html = await res.text();
     assert.ok(html.includes('id="member-pool"'), "有内容回执页复用管理页装配 ⇒ 拖完接着拖，不必二次导航");
@@ -274,7 +278,7 @@ test("拖-② 拖放左→右（add）：同源 Origin + 无守卫头 + urlencod
   });
 });
 
-test("拖-③ 拖放右→左（remove）与 add 同径同参；且脚本载荷三键与手填表单字段逐项相等（不新增第四参数）", async () => {
+test("拖-③ 拖放右→左（remove）与 add 同径同参；脚本载荷三键 = 闭集（不新增第四参数，⑦ 起无表单可对账）", async () => {
   const { calls, impl } = memberWriteStub([okRemove]);
   await withBoard({ groupMemberWriteImpl: impl }, async (base) => {
     const res = await postLikeScript(base, "alpha", { action: "remove", machineId: "m1", projectId: "p-a1" });
@@ -285,11 +289,13 @@ test("拖-③ 拖放右→左（remove）与 add 同径同参；且脚本载荷�
     const manage = await (await fetch(`${base}/org/alpha/manage`)).text();
     const [, scriptKeysRaw] = /new URLSearchParams\(\{([^}]*)\}\)/.exec(MEMBER_DRAG_SCRIPT) ?? [];
     const scriptKeys = [...new Set((scriptKeysRaw ?? "").match(/(\w+)\s*:/g)?.map((k) => k.slice(0, -1)) ?? [])].sort();
-    const memberForms = [...manage.matchAll(/<form method="post" action="\/orgs\/alpha\/members"[\s\S]*?<\/form>/g)].map((m) => m[0]);
-    assert.equal(memberForms.length, 2, "加 / 删两枚成员表单在位（本锚只与它们对账，不涉停用 / agent 配置表单）");
-    const formKeys = [...new Set(memberForms.flatMap((f) => [...f.matchAll(/<input[^>]*name="(\w+)"/g)].map((m) => m[1])))].sort();
-    assert.deepEqual(scriptKeys, ["action", "machineId", "projectId"], "拖拽载荷闭集 = 三键");
-    assert.deepEqual(formKeys, scriptKeys, "拖拽参数与成员表单字段**逐字相等** ⇒ 两输入面共用同一条写径，无第四参数");
+    assert.deepEqual(scriptKeys, ["action", "machineId", "projectId"], "拖拽载荷闭集 = 三键（既是唯一写通路，闭集也不得野扩第四参数）");
+    // ⑦b（REQ-2026-10-11-05 N8）：两枚手填表单退役 ⇒ 原「与表单字段逐字相等」的对账锚改判为**显式负钉**
+    assert.equal(
+      manage.includes('<form method="post" action="/orgs/alpha/members"'),
+      false,
+      "⑦b 成员手填表单退役 ⇒ 拖拽是本页唯一成员写通路（表单若复活，本条红）",
+    );
     assert.match(manage, /data-org="alpha"/, "脚本提交的 org 来自服务端渲染的 data-org");
   });
 });
@@ -328,7 +334,7 @@ test("拖-⑤ 末位成员移出 ⇒ 板侧写前闸 409 + 浮层卡 + 零出网
 });
 
 // ---------------------------------------------------------------------------
-// ⑥ CSRF 不放宽 / ⑦ 无 JS 回落
+// ⑥ CSRF 不放宽（⑦「无 JS 回落 = 手填表单」整条随 ⑦b 表单退役删除，见 §2⑦ / §6）
 // ---------------------------------------------------------------------------
 
 test("拖-⑥（负向）跨站 Origin ⇒ 403 CSRF、成员写零触达（同源档承载拖放认证，但不放宽）", async () => {
@@ -340,23 +346,28 @@ test("拖-⑥（负向）跨站 Origin ⇒ 403 CSRF、成员写零触达（同�
   });
 });
 
-test("拖-⑦ 无 JS 回落：SSR 直出 open 的折叠宿主 + 两枚原生可提交表单（含降级档），DOM 未删", async () => {
+test("拖-⑦ ⑦b 退役钉：折叠宿主与两枚手填表单不复活（拖拽是唯一成员写通路）· 内联脚本枚数不随退役变", async () => {
   await withBoard({}, async (base) => {
     const html = await (await fetch(`${base}/org/alpha/manage`)).text();
-    assert.match(html, /<details class="m-fold" id="member-forms-fold" open>/, "SSR 直出 open ⇒ 折叠只在 JS 可用时发生，无 JS 即原样展开");
-    const add = /<form method="post" action="\/orgs\/alpha\/members"[^>]*>[\s\S]*?<\/form>/.exec(html);
-    assert.ok(add, "加成员表单在页面里（原生 method/action 齐备 ⇒ 无 JS 照常提交）");
-    assert.match(add[0], /<input type="hidden" name="action" value="add">/);
-    assert.match(html, /<input type="hidden" name="action" value="remove">/, "删成员表单同径");
-    assert.equal(bareScriptCount(html), 2, "回落面不靠脚本：第七枚只是增强");
+    assert.equal(html.includes('id="member-forms-fold"'), false, "⑦b 折叠宿主已删（复活即红）");
+    assert.equal(html.includes('<details class="m-fold"'), false, "⑦b 不再有任何 .m-fold 折叠宿主");
+    assert.equal(html.includes("<summary>手填表单"), false, "⑦b 折叠条文案不再出现");
+    assert.equal(html.includes('action="/orgs/alpha/members"'), false, "⑦b 页内不再有成员写表单（POST 该路由只剩拖拽脚本一发）");
+    assert.equal(html.includes('<div class="b-forms">'), false, "⑦b 双表单宿主 div.b-forms 随卡删除");
+    assert.equal(bareScriptCount(html), 2, "退役不改变内联脚本枚数（提交守卫 + 成员两栏拖拽）");
+    assert.ok(html.includes('id="member-pool"'), "对照：两栏池容器仍在（否则上面负锚是空锚）");
   });
-  // 快照读失败（无池可拖）⇒ 拖拽入口消失，表单照在（回落面反而是唯一通路）
+  // 快照读失败（无池可拖）⇒ 拖拽入口消失，且**没有手填表单兜底**（⑦ 裁定的降级面消失，登记 §6）
   await withBoard(
     { client: fakeClient({ async getRegistryProjects() { throw new Error("快照面爆炸（假）"); } }) },
     async (base) => {
       const html = await (await fetch(`${base}/org/alpha/manage`)).text();
       assert.equal(html.includes('id="member-pool"'), false, "降级档不给拖拽载荷");
-      assert.match(html, /<form method="post" action="\/orgs\/alpha\/members"/, "降级档表单仍是主通路");
+      assert.equal(
+        html.includes('<form method="post" action="/orgs/alpha/members"'),
+        false,
+        "⑦b 降级档无成员写通路（原「表单仍是主通路」锚随退役翻向）",
+      );
     },
   );
 });

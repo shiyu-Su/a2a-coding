@@ -272,7 +272,7 @@ test("增补五A-② 样式面：徽标行新选择器在场 · .khd 首因子�
 });
 
 // ---------------------------------------------------------------------------
-// 增补五 件B（REQ-2026-10-02-05）：排期卡按状态着色（9 态 → 6 档，左缘色条）
+// 增补五 件B（REQ-2026-10-02-05）：排期卡按状态着色（9 态 → 7 档，左缘色条）
 // ---------------------------------------------------------------------------
 
 /** 取某张卡的卡根 class 属性值（cardOf 以 `<div class="kcard` 切段 ⇒ 段首到首个 `"` 即类名余部）。 */
@@ -283,7 +283,7 @@ function cardClasses(html, featureId) {
   return `kcard${m[1]}`;
 }
 
-test("增补五B-① 卡根档类 = 状态族（6 档闭集）· 行为判据字面未动", () => {
+test("增补五B-① 卡根档类 = 状态族（7 档闭集）· 行为判据字面未动", () => {
   const cases = [
     ["executing", "kst-brand"],
     ["integrating", "kst-brand"],
@@ -293,7 +293,7 @@ test("增补五B-① 卡根档类 = 状态族（6 档闭集）· 行为判据字
     ["completed", "kst-ok"],
     ["failed", "kst-danger"],
     ["needs_input", "kst-neutral"],
-    ["cancelled", "kst-neutral"],
+    ["cancelled", "kst-cancelled"],
     [null, "kst-neutral"],
     ["some-future-state", "kst-neutral"],
   ];
@@ -316,7 +316,7 @@ test("增补五B-① 卡根档类 = 状态族（6 档闭集）· 行为判据字
   }
 });
 
-test("增补五B-② 样式面：六档左缘 3px 色条 + soft 底色 · 取色只引 --b- token（零新色值负钉）· 压暗降至 .75", () => {
+test("增补五B-② 样式面：七档左缘 3px 色条 + soft 底色 · 取色只引 --b- token（零新色值负钉）· 压暗降至 .75", () => {
   const page = renderPage({ title: "t", active: "features", bodyHtml: renderSchedule([], []) });
   const tiers = {
     brand: "--b-brand",
@@ -324,6 +324,7 @@ test("增补五B-② 样式面：六档左缘 3px 色条 + soft 底色 · 取色
     ok: "--b-ok",
     locked: "--b-locked",
     danger: "--b-danger",
+    cancelled: "--b-text-4",
     neutral: "--b-line",
   };
   for (const [tier, token] of Object.entries(tiers)) {
@@ -340,8 +341,39 @@ test("增补五B-② 样式面：六档左缘 3px 色条 + soft 底色 · 取色
   }
   assert.match(page, /\.kcard\.draglocked \{ opacity: \.75/);
   assert.doesNotMatch(page, /\.kcard\.draglocked \{ opacity: \.55/, "旧压暗档已退役（色条优先可见）");
-  // 六档闭集不扩：档类名不得含 newver 子串（撞 w6 建版入口锚）
+  // 七档闭集不扩：档类名不得含 newver 子串（撞 w6 建版入口锚）
   assert.doesNotMatch(page, /kst-[a-z]*newver/, "档类名不占用 newver 子串");
+});
+
+test("⑤ 独立档负钉：kst-cancelled 不压暗 · 档类名互不为子串 · 与 neutral 可辨", () => {
+  const page = renderPage({ title: "t", active: "features", bodyHtml: renderSchedule([], []) });
+  const ruleOf = (tier) => {
+    const hit = page.match(new RegExp(`\\.kcard\\.kst-${tier} \\{[^}]*\\}`));
+    assert.ok(hit !== null, `缺少 .kcard.kst-${tier} 档规则`);
+    return hit[0];
+  };
+  // 压暗仍由 .kcard.draglocked 单点承担：档规则体内不得出现 opacity（照 draglocked 写法另立）
+  for (const tier of Object.keys({ brand: 1, warn: 1, ok: 1, locked: 1, danger: 1, cancelled: 1, neutral: 1 })) {
+    assert.doesNotMatch(ruleOf(tier), /opacity/, `${tier} 档规则体内不得出现 opacity（压暗单点归 draglocked）`);
+  }
+  // 档类名互不为子串（cancelled 同族补钉，照 kst-[a-z]*newver 先例）
+  const names = ["brand", "warn", "ok", "danger", "locked", "cancelled", "neutral"];
+  for (const a of names) {
+    for (const b of names) {
+      if (a === b) continue;
+      assert.ok(!b.includes(a), `档类名 ${b} 不得含 ${a} 子串（选择器钩子互不误伤）`);
+    }
+    // 页面上不得存在「以 <a> 起头的更长档类名」（如 kst-cancelledxxx）—— 本档自身除外
+    const longer = page.match(new RegExp(`kst-[a-z]*${a}[a-z]+`, "g")) ?? [];
+    assert.deepEqual(longer, [], `${a} 档类名不得作为其它档类名的前缀片段出现`);
+  }
+  // 可辨性判据：cancelled 与 neutral 的 background / border-left token 字面不等（不得全等回落态）
+  const bg = (tier) => ruleOf(tier).match(/background: var\((--[a-z0-9-]+)\)/)?.[1];
+  const bl = (tier) => ruleOf(tier).match(/border-left: 3px solid var\((--[a-z0-9-]+)\)/)?.[1];
+  assert.notEqual(bg("cancelled"), bg("neutral"), "cancelled 与 neutral 底色 token 不得全等");
+  assert.notEqual(bl("cancelled"), bl("neutral"), "cancelled 与 neutral 色条 token 不得全等");
+  // 增补②′（REQ-2026-10-12-01）：底色不得与 body 同色 —— 同色即「看起来没变灰」，是本轮用户反馈的根因
+  assert.notEqual(bg("cancelled"), "--b-bg", "已取消档底色不得等于 body 底色（同色即『看起来没变灰』= 本轮用户反馈根因）");
 });
 
 // ---------------------------------------------------------------------------
@@ -399,7 +431,7 @@ test("T5-③ 看板容器与列落点: #schedule-board + 每列 data-version（�
     groupFeaturesByVersion([feature("F1", "v0.9.3"), feature("F2", "backlog-x")]),
     selectRequirementPool([feature("F3", null)]),
   );
-  assert.match(html, /<div class="kanban" id="schedule-board">/, "拖拽脚本的单点锚");
+  assert.match(html, /<div class="kanban" id="schedule-board"/, "拖拽脚本的单点锚（尾部允许件N1 刷新锚属性）");
   assert.match(html, /<div class="kcol" data-version="v0\.9\.3">/);
   assert.match(html, /<div class="kcol" data-version="backlog-x">/, "非 semver 列同样是落点");
   assert.match(html, /<div class="kcol" data-version="">\s*<h3>需求池/, "池列 data-version 空串 ⇒ 拖入 = 清空排期");
@@ -458,6 +490,21 @@ test("N2-⑤ 浮层脚本行为锚（增补轨）：浮层内同源内部链接 
   // 卡片分支不变：仍拦 .kcard 详情链，且保留「同链再点 = 收起」的 toggle 行为
   assert.match(FEATURE_DETAIL_OVERLAY_SCRIPT, /open\(a, true\)/, "卡片分支保留 toggle 收起 + 行为不变");
   assert.match(FEATURE_DETAIL_OVERLAY_SCRIPT, /closest\("\.kcard"\)/, "卡片分支判据未动");
+  // 件D 第三档（REQ-2026-10-11-05 N3）：卡片分支的修饰键早退 —— Ctrl/⌘/Shift/Alt/中键 ⇒ 交回原生开新标签
+  assert.match(
+    FEATURE_DETAIL_OVERLAY_SCRIPT,
+    /if \(e\.button !== 0 \|\| e\.metaKey === true \|\| e\.ctrlKey === true \|\| e\.shiftKey === true \|\| e\.altKey === true\) return;/,
+    "卡片分支修饰键早退（五判齐备，与第八枚同款式）",
+  );
+  // 次序钉：早退必须在 preventDefault + open(a, true) 之前（否则修饰键已被 preventDefault 掐掉）
+  const modAt = FEATURE_DETAIL_OVERLAY_SCRIPT.indexOf("e.metaKey === true");
+  const openAt = FEATURE_DETAIL_OVERLAY_SCRIPT.indexOf("open(a, true)");
+  assert.ok(modAt !== -1 && openAt !== -1 && modAt < openAt, "修饰键早退在 open(a, true) 之前");
+  assert.equal(
+    (FEATURE_DETAIL_OVERLAY_SCRIPT.match(/addEventListener\("click"/g) || []).length,
+    3,
+    "卡片分支不新增 click 委托条数（浮层脚本恒 3 条）",
+  );
   // 两分支顺序：dialog 分支在前（浮层内链接先命中浮层分支），卡片分支兜后
   const dlgAt = FEATURE_DETAIL_OVERLAY_SCRIPT.indexOf('#feat-dialog a[href^="/"]');
   const cardAt = FEATURE_DETAIL_OVERLAY_SCRIPT.indexOf('a[href^="/features/"]');
@@ -564,7 +611,7 @@ test("N2-⑦ 浮层内表单提交锚（真浏览器反馈 ②③）：只拦 di
   assert.doesNotMatch(s, /body\.insertBefore\(card/, "不再把错误卡前置进 .fd-body 文档流（反馈 ① 的根因）");
   assert.match(CSS, /dialog\.fd > \.err-ov-card \{[^}]*position: fixed/, "错误卡 fixed 定位（盖在浮层内容之上）");
   assert.match(CSS, /dialog\.fd > \.err-ov-card \{[^}]*box-shadow: 0 0 0 100vmax/, "半透明遮罩 = 超大 spread shadow（不用 transform，避免打断 fixed 包含块）");
-  assert.match(s, /if \(swapPage\(r\.text\)\) \{ restoreForm\(form\); \} else \{ nativeSubmit\(form\); \}\n        return;/, "抽不到卡 ⇒ 回退换入错误页 main（现行为）+ 复位表单；换不入才降级原生");
+  assert.match(s, /if \(swapPage\(r\.text, false\)\) \{ restoreForm\(form\); \} else \{ nativeSubmit\(form\); \}\n        return;/, "抽不到卡 ⇒ 回退换入错误页 main（现行为）+ 复位表单；换不入才降级原生（件C：c35b4192 起此档传 false，关了不弹回）");
   assert.match(s, /closest\("#feat-dialog #err-ov-close"\)/, "浮层内「知道了」有委托处理");
   assert.match(s, /card\.parentNode\.removeChild\(card\);/, "点「知道了」= 摘掉错误卡（浮层不关）");
   // 反馈 ②：浮层内提交不跳页 ⇒ 提交守卫的禁用/提示行无人复位，本脚本处理完响应后主动恢复表单
@@ -576,7 +623,7 @@ test("N2-⑦ 浮层内表单提交锚（真浏览器反馈 ②③）：只拦 di
   // 降级面：结构不可解析 / fetch 异常 ⇒ 原生提交（此前不动 body ⇒ 表单仍在文档内可 submit）
   assert.match(s, /function nativeSubmit\(form\) \{ restoreForm\(form\); form\.submit\(\); \}/, "降级 = 先恢复表单再原生 form.submit()");
   assert.match(s, /if \(data === null \|\| action === ""\) \{ nativeSubmit\(form\); return; \}/, "FormData 不可构造 / action 属性缺失 ⇒ 降级原生提交（不劣化）");
-  assert.match(s, /if \(!swapPage\(r\.text\)\) \{ nativeSubmit\(form\); return; \}/, "响应不可解析 ⇒ 降级原生提交");
+  assert.match(s, /if \(!swapPage\(r\.text, false\)\) \{ nativeSubmit\(form\); return; \}/, "响应不可解析 ⇒ 降级原生提交");
   assert.match(s, /\.catch\(function \(\) \{ nativeSubmit\(form\); \}\)/, "fetch 网络异常 ⇒ 降级原生提交");
   // 提交期间不改 body ⇒ 降级时表单仍是活节点（form.submit() 对未连接表单是空操作）
   assert.doesNotMatch(s, /body\.textContent = "提交中…"/, "提交前不清空 body（否则降级路径的表单已被摘走）");
@@ -595,10 +642,10 @@ test("N2-⑧ 浮层 409 错误卡去重（用户裁决 (a)）：有卡路径不�
   assert.doesNotMatch(cardPath, /swapPage/, "抽到卡的路径不整体替换 body（重复内容缺陷的根因已除）");
   assert.match(cardPath, /showCard\(parsed\.card\); restoreForm\(form\); return;/, "有卡 ⇒ 动作 = 叠加错误卡 + 复位表单后立即返回（不换 body）");
   // swapPage 只允许出现在无卡的回退位（卡判之后）
-  assert.match(errBranch.slice(errBranch.indexOf("showCard")), /if \(swapPage\(r\.text\)\) \{ restoreForm\(form\); \} else \{ nativeSubmit\(form\); \}/, "无卡 ⇒ 回退才换入错误页 main（换入后复位表单）");
+  assert.match(errBranch.slice(errBranch.indexOf("showCard")), /if \(swapPage\(r\.text, false\)\) \{ restoreForm\(form\); \} else \{ nativeSubmit\(form\); \}/, "无卡 ⇒ 回退才换入错误页 main（换入后复位表单；件C：c35b4192 起此档传 false）");
   // 成功分支维持现状：抽最终页 main 换入 body（详情在浮层内刷新）
   const okBranch = s.slice(s.indexOf("if (r.err) {") + 10, s.indexOf("}).catch(function () { nativeSubmit(form); });"));
-  assert.match(okBranch, /if \(!swapPage\(r\.text\)\) \{ nativeSubmit\(form\); return; \}/, "2xx/3xx 成功分支 = swapPage 换入（换不入 ⇒ 降级原生提交后立即返回，不再走轮询）");
+  assert.match(okBranch, /if \(!swapPage\(r\.text, false\)\) \{ nativeSubmit\(form\); return; \}/, "2xx/3xx 成功分支 = swapPage 换入（换不入 ⇒ 降级原生提交后立即返回，不再走轮询；件C：c35b4192 起此档传 false）");
 });
 
 // REQ-2026-09-29-02 增补 · 件A：浮层提交就地反馈（整页档两动作复刻到浮层分支）
@@ -633,8 +680,12 @@ test("件B 就地进度轮询锚：提交成功后交棒轮询 · 读面 = GET �
   assert.match(s, /pollTicks \+= 1;/, "每拍计数（上限据此生效）");
   // 挂载：成功换页后按回包动作区决定起轮
   assert.match(s, /lastHref = action;\n      startPoll\(okMain\);/, "件B 挂载点 = 提交成功档（读面 URL 对齐本需求详情）");
+  // 打开档已撤（v0.10.4 · REQ-2026-10-11-06 · 增补 Feature c35b4192）：open() 成功换页后**不再**起轮，
+  // 但 lastHref = href 必须保留（二次点击同卡关闭 toggle 的判据）
+  assert.match(s, /if \(swapPage\(text\)\) \{ lastHref = href; \} else \{ fallback\(a\); \}/, "打开档形态 = 只赋 lastHref、不起轮（撤轮后的新形态）");
+  assert.doesNotMatch(s, /lastHref = href; startPoll\(/, "「打开即轮」已随 c35b4192 撤销（不得复活：起轮只剩提交档一档）");
   assert.match(s, /function startPoll\(main\) \{\n    stopPoll\(\);/, "起轮前先停旧轮 ⇒ 恒只一条链（连点不叠加）");
-  assert.match(s, /if \(main === null \|\| !stillBusy\(main\)\) return;/, "回包已收口 ⇒ 根本不起轮");
+  assert.match(s, /if \(main === null\) return;\n    if \(!stillBusy\(main\) && main\.querySelector\("\.dg-chip\.dg-running, \.dg-chip\.dg-queued"\) === null\) return;/, "回包两来源皆已收口 ⇒ 根本不起轮（v0.10.4 件B 扩写：文案 ∨ chip）");
   // 收口判据 = 读面动作区不再显示在飞 / 排队的轮次进度行
   assert.match(s, /function stillBusy\(main\) \{[\s\S]{0,160}\.turn-progress[\s\S]{0,80}在飞[\s\S]{0,40}排队中/, "收口判据取自 .turn-progress 文案（在飞 / 排队中）");
   assert.match(s, /if \(main === null \|\| !stillBusy\(main\)\) \{ stopPoll\(\); return; \}/, "收口 ⇒ 停轮（轮收口即停，不空转）");
@@ -644,6 +695,79 @@ test("件B 就地进度轮询锚：提交成功后交棒轮询 · 读面 = GET �
   assert.match(poll, /fetch\(pollUrl, \{ credentials: "same-origin", headers: \{ Accept: "text\/html" \} \}\)/, "轮询 = 同源 GET 既有详情读面（带 Accept ⇒ 与 open() 同规格）");
   assert.doesNotMatch(poll, /method: "POST"/, "轮询不得是写面（不重复起轮）");
   assert.doesNotMatch(s, /fetch\("\/api|fetch\(`\/|new WebSocket|EventSource|setInterval/, "零新端点、零新通道、零常驻定时器（闭集内自限）");
+});
+
+// REQ-2026-10-11-05 增补 · 件B 拍级 held 闸 + 打开即跟刷（B-1/B-2）
+test("拍级 held 闸锚：闸在收口检查之后 · 换页之前（swapPage(r.text,false)+schedulePoll 相邻序未拆）· heldBody 两路判据 · 闸内零请求零自弹开 · 定义不落进 pollOnce..startPoll 切片", () => {
+  const s = FEATURE_DETAIL_OVERLAY_SCRIPT;
+  // ④ 相邻序钉：闸插在「收口检查之后、换页之前」—— 收口停轮与未收口续排两行仍逐字相邻（:641 钉不放松）
+  assert.match(
+    s,
+    /if \(heldBody\(\)\) \{ schedulePoll\(\); return; \}\n      swapPage\(r\.text, false\);/,
+    "held 闸紧接换页之前（收口检查在前、闸在中、swapPage+schedulePoll 在后）",
+  );
+  // heldBody 体两路判据：① 焦点在 .fd-body 子树（正在填）② 任一 textarea/input 的 value 非空（已填失焦也挡）
+  const hbAt = s.indexOf("function heldBody()");
+  assert.ok(hbAt > 0, "heldBody 定义在位");
+  const hb = s.slice(hbAt, s.indexOf("\n  }", hbAt));
+  assert.doesNotMatch(hb, /body\.contains\(document\.activeElement\)/, "一路旧形（锚内任意焦点皆算在填）已随 c35b4192 T3 收窄 ⇒ 不得复活");
+  assert.match(hb, /isInputFace\(ae\) && body\.contains\(ae\)/, "heldBody 判据一路：焦点须在**输入面**且落在编辑区子树（链接 / 按钮焦点不算）");
+  assert.match(hb, /if \(f\[i\]\.value !== ""\) return true;/, "heldBody 判据二路：已填失焦也挡（value 非空）");
+  assert.match(hb, /querySelectorAll\("textarea, input"\)/, "heldBody 二路仍只认 textarea/input（T3 未扩二路）");
+  assert.doesNotMatch(hb, /data-ov-pending|fetch\(|showModal\(/, "heldBody 体不判挂起标记、不发消息、不开弹层（select/contenteditable 已归一路 helper 白名单，见下方双份同体钉）");
+  // 双份同体（c35b4192 T3）：本枚一份 isInputFace，跨枚逐字一致钉 = live-refresh N-6（两枚都在位后才成立）
+  const helperHits = (s.match(/function isInputFace\(/g) ?? []).length;
+  assert.equal(helperHits, 1, "件B 体内 function isInputFace( 恰 1 处（不得多写、不得全局化共享）");
+  // 闸档自身负钉：闸内只 schedulePoll ⇒ 零请求增量、零自弹开、零常驻轮
+  const gate = /if \(heldBody\(\)\) \{ schedulePoll\(\); return; \}/.exec(s);
+  assert.ok(gate !== null, "摘不到 held 闸档（本钉空转 ⇒ 判红）");
+  assert.doesNotMatch(gate[0], /fetch\(|showModal\(|setInterval/, "held 档零请求、零自弹开、零常驻轮");
+  // 时序自证：闸在收口检查之后、换页之前（indexOf 比较）
+  const closeAt = s.indexOf("if (main === null || !stillBusy(main)) { stopPoll(); return; }");
+  const swapAt = s.indexOf("swapPage(r.text, false);");
+  assert.ok(gate.index > closeAt && gate.index < swapAt, "闸位 = 收口检查之后、换页之前");
+  // ⑤ 负钉切片洁净：heldBody 定义不得落进 pollOnce..startPoll 切片（护 :646/:685 两档的切片计数钉）
+  const poll = s.slice(s.indexOf("function pollOnce()"), s.indexOf("function startPoll("));
+  assert.doesNotMatch(poll, /function heldBody\(/, "heldBody 定义不落进 pollOnce..startPoll 切片（件B/件C 切片钉的取面不受扰动）");
+  assert.ok(hbAt < s.indexOf("function pollOnce()"), "heldBody 落位 = schedulePoll 之后、pollOnce 之前");
+});
+
+// REQ-2026-10-11-03 · 件B 扩写：起轮 / 收口判据的第二来源 = v0.10.3 详情页状态六态 chip class
+test("件B 扩写锚：起轮与收口共认同一串 .dg-chip.dg-running/.dg-queued（本枚恰 2 处）· 周期常量逐字未动 · 文本子串仍在 stillBusy 体内 · 与第八枚零耦合", () => {
+  const s = FEATURE_DETAIL_OVERLAY_SCRIPT;
+  const SEL = 'querySelector(".dg-chip.dg-running, .dg-chip.dg-queued")';
+  const body = (name) => {
+    const i = s.indexOf(`function ${name}(main) {`);
+    assert.ok(i > 0, `${name} 在位`);
+    return s.slice(i, s.indexOf("\n  }", i));
+  };
+  const busy = body("stillBusy");
+  const start = body("startPoll");
+  // ① 两处判据各写一遍同一串选择器（不共享变量 ⇒ 逐字相同可机械核对）
+  const pick = (seg) => seg.match(/querySelector\("(\.dg-chip\.dg-[^"]*)"\)/g) ?? [];
+  assert.equal(pick(busy).length, 1, "收口体内 chip 判据恰 1 处");
+  assert.equal(pick(start).length, 1, "起轮体内 chip 判据恰 1 处");
+  assert.equal(pick(busy)[0], pick(start)[0], "起轮与收口的选择器串逐字相同（否则起了轮第一拍即判收口自停）");
+  assert.equal(pick(busy)[0], SEL, "选择器串 = 在飞 ∨ 排队中 两枚 chip");
+  assert.equal((s.match(/\.dg-chip\.dg-running/g) ?? []).length, 2, "本枚常量体内 .dg-chip.dg-running 恰 2 处（起轮 + 收口）");
+  // ② 负钉一：有界窗口两常量逐字未动（扩写只加判据来源，不改周期、不加常驻轮）
+  assert.match(s, /var POLL_INTERVAL_MS = 5000;\n  var POLL_MAX_TICKS = 240;/, "周期常量 5s × 240 逐字未动");
+  assert.match(s, /pollTimer = setTimeout\(pollOnce, POLL_INTERVAL_MS\);/, "仍是 setTimeout 单链（未换 setInterval 常驻）");
+  assert.doesNotMatch(s, /setInterval/, "件B 不得起页级常驻轮");
+  // ③ 负钉二：件B 按文本子串判第一来源 ⇒ 改名即静默失效，两字面必须留在 stillBusy 体内
+  assert.ok(busy.includes("在飞"), "在飞 子串仍在 stillBusy 体内（N6 文案改档须排本节点之后）");
+  assert.ok(busy.includes("排队中"), "排队中 子串仍在 stillBusy 体内");
+  // ④ 与第八枚（页级就地刷新）零耦合：本枚不引用其任何符号
+  assert.equal((s.match(/PAGE_LIVE/g) ?? []).length, 0, "件B 常量体零 PAGE_LIVE 引用（两枚零耦合）");
+  assert.equal((s.match(/\[data-live\]/g) ?? []).length, 0, "件B 常量体零 data-live 锚引用");
+  // ⑤ 反证（REQ-2026-10-11-05 · 拍级 held 闸 + 打开即跟刷只加不改）：第八枚零耦合两钉之上，
+  //    逐字钉「扩判据来源、插闸、起轮」三步没有顺手改动既有结构 —— 周期/上界/chip 串/解析单点/请求规格
+  assert.equal((s.match(/new DOMParser\(\)/g) ?? []).length, 1, "DOMParser 仍单点（打开档起轮复用 parsePage，不另开摘取通路）");
+  assert.equal((s.match(/Accept: "text\/html"/g) ?? []).length, 3, "fetch 三处（open/postForm/pollOnce）请求规格未扩（held 闸与打开档零新请求）");
+  assert.match(s, /var POLL_INTERVAL_MS = 5000;\n  var POLL_MAX_TICKS = 240;/, "周期与上界逐字未动（20min 触顶 = 已裁已知上界，只登记不调数值）");
+  assert.match(busy, /在飞/, "stillBusy 体内「在飞」字面仍在（文本子串判据未移出）");
+  assert.match(busy, /排队中/, "stillBusy 体内「排队中」字面仍在");
+  assert.equal((s.match(/function heldBody\(/g) ?? []).length, 1, "heldBody 恰一处定义（未顺手抄进闸外或起轮档）");
 });
 
 // REQ-2026-09-29-02 增补 · 件C：收口渲染不得把已关闭的浮层重新弹开
@@ -1069,5 +1193,46 @@ test("B5-⑥（执法面钉 b·两档并置）同名互不染色：project relea
       assert.match(await noFade.text(), /board_version_released/);
       assert.equal(seen.length, 1, "两档各自记账：只有未染色那版真出网");
     },
+  );
+});
+
+// ---------------------------------------------------------------------------
+// 卡序呈现（REQ-2026-10-12-02 · N4）：版本列按状态档；需求池列不受档序
+// ---------------------------------------------------------------------------
+
+test("卡序-①（REQ-2026-10-12-02）renderSchedule 版本列三卡首现位置按状态档单调（failed ① < waiting_approval ② < completed ④）· createdAt 恰为逆序不撼档序；负钉：需求池列仍纯 createdAt 降序", () => {
+  // 三卡 createdAt 降序（DONE > WAIT > FAIL）恰是档序的逆序 ⇒ 断言只可能由档序产生
+  const colHtml = renderSchedule(
+    groupFeaturesByVersion([
+      feature("DONE", "v0.10.4", { state: "completed", createdAt: "2026-03-01T00:00:00Z" }),
+      feature("FAIL", "v0.10.4", { state: "failed", createdAt: "2026-01-01T00:00:00Z" }),
+      feature("WAIT", "v0.10.4", { state: "waiting_approval", createdAt: "2026-02-01T00:00:00Z" }),
+    ]),
+  );
+  const atFail = colHtml.indexOf(`href="/features/FAIL"`);
+  const atWait = colHtml.indexOf(`href="/features/WAIT"`);
+  const atDone = colHtml.indexOf(`href="/features/DONE"`);
+  assert.ok(atFail >= 0 && atWait >= 0 && atDone >= 0, "三卡都渲染进同一版本列");
+  assert.ok(
+    atFail < atWait && atWait < atDone,
+    `档序单调 = FAIL(${String(atFail)}) < WAIT(${String(atWait)}) < DONE(${String(atDone)})`,
+  );
+
+  // 负钉：需求池列不吃档序 —— P_EXEC（档 ③）createdAt 最新 ⇒ 池序仍把它排第一
+  const poolHtml = renderSchedule(
+    [],
+    selectRequirementPool([
+      feature("P_EXEC", null, { state: "executing", createdAt: "2026-03-01T00:00:00Z" }),
+      feature("P_WAIT", null, { state: "waiting_approval", createdAt: "2026-02-01T00:00:00Z" }),
+      feature("P_NEED", null, { state: "needs_input", createdAt: "2026-01-01T00:00:00Z" }),
+    ]),
+  );
+  const atExec = poolHtml.indexOf(`href="/features/P_EXEC"`);
+  const atPoolWait = poolHtml.indexOf(`href="/features/P_WAIT"`);
+  const atNeed = poolHtml.indexOf(`href="/features/P_NEED"`);
+  assert.ok(atExec >= 0 && atPoolWait >= 0 && atNeed >= 0, "三卡都进需求池列（皆非终态）");
+  assert.ok(
+    atExec < atPoolWait && atPoolWait < atNeed,
+    `需求池不受档序，仍纯 createdAt 降序 = EXEC(${String(atExec)}) < WAIT(${String(atPoolWait)}) < NEED(${String(atNeed)})`,
   );
 });

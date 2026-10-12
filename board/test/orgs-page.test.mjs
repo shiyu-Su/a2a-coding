@@ -32,7 +32,7 @@ import {
 } from "../dist/orgs-view.js";
 import { createBoardServer } from "../dist/server.js";
 import { renderPage } from "../dist/web/layout.js";
-import { renderOrgSpaceManagePage } from "../dist/web/views.js";
+import { renderOrgSpaceManagePage, ORG_FEATURES_PAGE_SIZE } from "../dist/web/views.js";
 
 function feature(featureId, ownerGroup, overrides = {}) {
   return {
@@ -246,20 +246,27 @@ test("N6-⑦（§9-c 翻向）GET /orgs ⇒ 303 回门户，重定向不触桥�
   });
 });
 
-test("N3-①（§9-c 新锚）GET /org/<名>/manage: 成员区（声明态清单 + 增删表单）+ 停用表单，表单 action 逐字对齐全局写口", async () => {
+test("N3-①（§9-c 新锚）GET /org/<名>/manage: 池卡 + 停用表单，写表单 action 逐字对齐全局写口；⑦b 成员手填表单退役", async () => {
   await withOrgsServer(async (base) => {
     const res = await get(base, "/org/alpha/manage");
     assert.equal(res.status, 200);
     assert.match(res.text, /管理 · alpha/, "页标题 = 空间内管理");
     // 成员清单 = 3300 全组枚举的该组投影（本用例 groupsFetcher 未装配 ⇒ 如实「未查询」，见 N3-③）
     assert.doesNotMatch(res.text, /成员（声明态/, "REQ-2026-10-10-03 N2：逐组声明态成员清单卡退役 ⇒ 整页不得再出现该区块（声明面健康度改由配置核对卡首行承载，见 N6-⑧）");
-    // 表单 action **不带空间前缀**：归一层不扩写路由，成员写仍是那一条全局 `POST /orgs/{org}/members`
-    assert.match(res.text, /<form method="post" action="\/orgs\/alpha\/members"[^>]*data-submit="已提交，加成员中…" data-ov="1">/);
-    assert.match(res.text, /<input type="hidden" name="action" value="add">/);
-    assert.match(res.text, /<input type="hidden" name="action" value="remove">/);
-    assert.match(res.text, /name="machineId" required/);
-    assert.match(res.text, /name="projectId" required/);
-    assert.doesNotMatch(res.text, /action="\/org\//, "空间内表单的 action 一律全局路径（不出现 `/org/…` 写径变体）");
+    // ⑦b（REQ-2026-10-11-05 N8）：加 / 删成员两枚手填表单与其折叠宿主退役 ⇒ 原「表单在场」正锚翻向显式负钉
+    //（写路由本身不删：拖拽脚本仍 POST 同一条全局 `POST /orgs/{org}/members`，见 org-pool-drag 拖-②③）
+    assert.doesNotMatch(
+      res.text,
+      /<form method="post" action="\/orgs\/alpha\/members"/,
+      "⑦b 成员写表单不复活（拖拽 = 本页唯一成员写通路）",
+    );
+    assert.doesNotMatch(res.text, /id="member-forms-fold"/, "⑦b 手填表单的折叠宿主已删");
+    assert.doesNotMatch(res.text, /<summary>手填表单/, "⑦b 折叠条文案不再出现");
+    assert.doesNotMatch(res.text, /name="machineId"/, "⑦b 手填字段 machineId 随表单删除");
+    assert.doesNotMatch(res.text, /name="projectId"/, "⑦b 手填字段 projectId 随表单删除");
+    assert.doesNotMatch(res.text, /<form method="post"[^>]*action="\/org\//, "空间内**写**表单的 action 一律全局路径（不出现 `/org/…` 写径变体）");
+    // GET 正锚（同裁定 A）：刷新表单的 action **须**带空间前缀 = 本页自身 ⇒ 防后人误改回全局 `/manage`（该路由不存在 ⇒ 404）
+    assert.match(res.text, /<form method="get" action="\/org\/alpha\/manage" class="m-refresh">/, "v0.10.4 项目池刷新表单 = 原生 GET、action 指回本页空间路径");
     // 停用 = 同一条 `POST /orgs`（action=disable），写路由白名单零扩条
     assert.match(res.text, /<form method="post" action="\/orgs" class="inline" data-submit="已提交，停用中…" data-ov="1" data-ov-redirect="\/">/);
     assert.match(res.text, /<input type="hidden" name="org" value="alpha">/);
@@ -301,7 +308,21 @@ test("N6-⑧（§9-c 翻向到 manage）项目面不可达降级: 「不可达�
     assert.match(res.text, /transport_error/);
     assert.match(res.text, /连不上（假）/);
     assert.match(res.text, /F3/, "本组需求表不受项目面失败影响");
-    assert.match(res.text, /声明面成员（3300 <code>GET \/api\/groups<\/code>）/, "声明面健康度仍由核对卡首行承载");
+    assert.match(
+      res.text,
+      /<p class="hint">核对源健康度：[\s\S]*?运行态项目（逐组 <code>a2a_projects<\/code>） <b>读不到<\/b>/,
+      "运行态源不可达 ⇒ 短条第二档如实「读不到」（★REQ-2026-10-11-05 ⑧a：原核对卡第二行 danger 徽标 ⇒ 短条 `<b>` 档；原词逐字保留。本夹具 groupsFetcher 未装配 ⇒ 首档是「未装配」，故不得整页 `includes` 口径判档）",
+    );
+    assert.match(
+      res.text,
+      /<li>运行态项目（逐组 <code>a2a_projects<\/code>）：<code>transport_error<\/code> 连不上（假）<\/li>/,
+      "根因码 + 错误原文落短条的该源说明 `<li>`（原「说明」列内容照搬，换 `<ul>` 承载）",
+    );
+    assert.equal(
+      /核对源健康度：[\s\S]*?配置齐备/.test(res.text),
+      false,
+      "运行态读不到 ⇒ 短条不得谎报「配置齐备」（原「核对卡结论行」锚的同款判据，换包装后仍在）",
+    );
   }, {
     fetcher: async (org) =>
       org === "beta"
@@ -383,7 +404,7 @@ test("BD2-①（§9-b 翻向 · §9-c 再翻）建组织表单渲染锚在门户
     assert.match(home.text, /<label>项目组名 \*<input name="org" required/, "字段名 = write-guard.ORG_FORM_FIELD = org（标签文案 v0.9.7 增补改「项目组名」，字段名不变）");
     assert.match(home.text, /中文 \/ 字母（Latin）\/ 数字/, "闭集 hint 上板");
     assert.match(home.text, /不触桥、不写状态机、不写 machine 配置/, "写面口径上板");
-    assert.doesNotMatch(home.text, /<script src>/, "无外源脚本（§9.5 复用的仍是既有七元闭集内的常量，未引入新枚）");
+    assert.doesNotMatch(home.text, /<script src>/, "无外源脚本（§9.5 复用的仍是既有八元闭集内的常量，未引入新枚）");
     const res = await fetch(`${base}/orgs`, { redirect: "manual" });
     assert.equal(res.status, 303, "§9-c：/orgs 页退役 ⇒ 无任何页面结构可断言（原「不再渲染表单」的负向锚升级为整页下架）");
     assert.equal(res.headers.get("location"), "/");
@@ -631,12 +652,20 @@ test("BD5-④（§9-c 翻向）3300 宕机降级: 成员区整块灰显「组数
   await withOrgsServer(async (base) => {
     const res = await get(base, "/org/alpha/manage");
     assert.equal(res.status, 200, "3300 挂了不炸页");
-    assert.match(res.text, /<span class="b-badge danger">读不到<\/span>/, "声明面不可达的结论档 = 配置核对卡 sourceRow 的 danger 徽标（原「组数据不可用」区块字面随卡退役换新）");
+    assert.match(
+      res.text,
+      /<p class="hint">核对源健康度：声明面成员（3300 <code>GET \/api\/groups<\/code>） <b>读不到<\/b>/,
+      "声明面不可达的结论档 = 页头核对短条首档的档位词（★REQ-2026-10-11-05 ⑧a：原「组数据不可用」区块 ⇒ 配置核对卡 danger 徽标 ⇒ 短条 `<b>` 档；原词「读不到」逐字保留）",
+    );
     assert.match(res.text, /groups_unreachable/);
     assert.match(res.text, /ECONNREFUSED/, "错误原文如实带出");
     assert.match(res.text, /p-alpha/, "运行态项目面（a2a_projects）不受声明面故障影响");
     assert.match(res.text, /F1/, "本组需求表照常");
-    assert.match(res.text, /<input type="hidden" name="action" value="add">/, "成员写表单照常给出（不因声明面宕机而失去管理入口）");
+    assert.doesNotMatch(
+      res.text,
+      /<input type="hidden" name="action" value="add">/,
+      "⑦b 成员手填表单退役 ⇒ 声明面宕机档也不给表单兜底（本页唯一写通路是拖拽，降级档无写面；登记改造文档 §6）",
+    );
   }, {
     fetcher: async (org) =>
       org === "alpha"
@@ -660,7 +689,11 @@ test("BD5-⑤（§9-c 翻向）全组枚举降级鲁棒 + 未装配: 查询器�
   await withOrgsServer(async (base) => {
     const res = await get(base, "/org/alpha/manage");
     assert.equal(res.status, 200);
-    assert.match(res.text, /<span class="b-badge mute">未装配<\/span>/, "未装配 ⇒ 核对卡首行如实标「未装配」（不伪装成有读数）");
+    assert.match(
+      res.text,
+      /<p class="hint">核对源健康度：声明面成员（3300 <code>GET \/api\/groups<\/code>） <b>未装配<\/b>/,
+      "未装配 ⇒ 页头核对短条首档如实标「未装配」（不伪装成有读数；★⑧a 随卡降级换包装，原词保留）",
+    );
     assert.match(res.text, /本区不查询（不编造「齐备」也不编造「缺失」）/, "未装配 ⇒ 不臆造任何一侧结论（原「不编造无成员」语义等价、字面换新）");
   }, { fetcher: async () => ({ ok: true, projects: [] }), groupsFetcher: null });
 });
@@ -692,7 +725,7 @@ const pinHtml = renderOrgSpaceManagePage({
   poolSourceCount: 2,
 });
 
-/** 卡头起点（`b-card-h` 内层标题的字面）—— N-2 的六个比较对象就是其余六块。 */
+/** 卡头起点（`b-card-h` 内层标题的字面）—— N-2 的五个比较对象就是其余五块（⑦b 台账卡退役后）。 */
 const cardHeadAt = (label) => pinHtml.indexOf(`b-card-h">${label}`);
 
 test("置顶-①（N-1 · REQ-2026-10-10-03）项目卡 = 整页第一张 b-card（防「首卡错」）", () => {
@@ -705,24 +738,227 @@ test("置顶-①（N-1 · REQ-2026-10-10-03）项目卡 = 整页第一张 b-card
   );
 });
 
-test("置顶-②（N-2 · REQ-2026-10-10-03）项目卡先于池卡与其余六块（防「相对序错」，与置顶-① 分工不同）", () => {
+test("置顶-②（N-2 · REQ-2026-10-10-03）项目卡先于池卡与其余四块（防「相对序错」，与置顶-① 分工不同；⑦b 台账卡退役后计数 -1；★⑧a 核对卡降为页头短条后计数再 -1）", () => {
   const projectIdx = cardHeadAt("项目");
   assert.ok(projectIdx >= 0, "项目卡卡头在位");
   assert.ok(projectIdx < pinHtml.indexOf('id="member-pool"'), "项目卡先于两栏池容器（置顶后第一块 = 项目）");
   for (const label of [
     "加 / 删项目（两栏拖拽）",
-    "成员（项目组台账）",
     "本组织 agent 配置",
     "停用本组织",
-    "配置核对",
     "需求",
   ]) {
     const at = cardHeadAt(label);
     assert.ok(at >= 0, `其余块「${label}」仍在页上（缺席不得当成「排在后面」）`);
     assert.ok(projectIdx < at, `项目卡必须先于「${label}」`);
   }
+  // ★⑧a 改判：原第五块「配置核对」**卡**已降级为页头短条 ⇒ 不再参与卡序比较；
+  //   它的承载改钉两件事：① 短条在场且**先于**项目卡（页头位，不是卡位）；② 卡头字面「配置核对」不复活。
+  const barIdx = pinHtml.indexOf('<p class="hint">核对源健康度：');
+  assert.ok(barIdx >= 0, "⑧a 页头核对短条在场（缺席不得当成「排在前面」）");
+  assert.ok(barIdx < projectIdx, "核对短条落在页头（`<h2>管理 · …` 之后、项目卡之前）");
+  assert.equal(cardHeadAt("配置核对"), -1, "⑧ 核对卡不复活：整页无「配置核对」卡头");
 });
 
 test("置顶-③（N-3 · REQ-2026-10-10-03 新锚位）退役卡不复活：整页不出现「成员（声明态」（与 N3-① / BD5-③ 各自成条）", () => {
   assert.doesNotMatch(pinHtml, /成员（声明态/, "本夹具（项目面可读 + 声明面已装配 + 池已装配）下同样不得渲出退役的逐组声明态成员清单卡");
+});
+
+test("置顶-④（⑦b · REQ-2026-10-11-05 N8 新锚位）成员手填表单与「成员（项目组台账）」卡不复活（同夹具另成一条）", () => {
+  assert.equal(cardHeadAt("成员（项目组台账）"), -1, "台账卡卡头整块退役 ⇒ 卡头字面在夹具页零命中（拿它当排序对象会静默失效，见置顶-②）");
+  assert.doesNotMatch(pinHtml, /id="member-forms-fold"/, "折叠宿主不复活");
+  assert.doesNotMatch(pinHtml, /<form method="post" action="\/orgs\/alpha\/members"/, "两枚手填表单不复活（拖拽是唯一成员写通路）");
+  assert.doesNotMatch(pinHtml, /<b>末位成员不可删<\/b>/, "卡内常驻「末位不可删」警示条随表单退役（口径只剩服务端 409，登记改造文档 §6）");
+});
+
+// ---------------------------------------------------------------------------
+// ⑨ 管理页需求表链接式分页（REQ-2026-10-11-05 · N11 · 每页 10 条 · 零脚本）
+// ---------------------------------------------------------------------------
+
+/**
+ * 造 n 条某组织的需求，`createdAt` 逐日**递增** ⇒ 复用需求池那把尺（`comparePoolEntry` = createdAt 降序）
+ * 排完后**新号在前**（PF25 第一条），页序可机械核对。
+ */
+const pagedFeatures = (n, org = "alpha", prefix = "PF") =>
+  Array.from({ length: n }, (_, i) =>
+    feature(`${prefix}${String(i + 1).padStart(2, "0")}`, org, {
+      createdAt: new Date(Date.UTC(2026, 0, 1) + i * 86400000).toISOString(),
+    }),
+  );
+
+/** 需求卡整块（卡头 → 该卡收尾 `</div>`，含表体与表尾翻页链）。 */
+function featuresCardRegion(html) {
+  const start = html.indexOf('<p class="b-card-h">需求<span class="b-card-meta">');
+  assert.ok(start >= 0, "需求卡卡头在位（缺席不得当成「行数为 0」）");
+  const end = html.indexOf("</div>", start);
+  assert.ok(end >= 0, "需求卡有收尾");
+  return html.slice(start, end);
+}
+
+const featureRowCount = (html) => (featuresCardRegion(html).match(/<tr><td/g) ?? []).length;
+const pagerOf = (html) => {
+  const region = featuresCardRegion(html);
+  const i = region.indexOf('<nav class="pager">');
+  return i < 0 ? "" : region.slice(i, region.indexOf("</nav>", i) + "</nav>".length);
+};
+/** 翻页链 href 里的 page 尾值（注入面判据：只能是归一后的整数）。 */
+const pagerQueryValues = (html) => [...featuresCardRegion(html).matchAll(/\?page=([^"&]*)/g)].map((m) => m[1]);
+
+const viewPage = (features, paging = {}) =>
+  renderOrgSpaceManagePage({
+    org: "alpha",
+    features,
+    projectsOutcome: PIN_PROJECTS_OK,
+    groupsOutcome: PIN_GROUPS_DECLARED,
+    poolOutcome: PIN_POOL_OK,
+    poolSourceCount: 2,
+    ...paging,
+  });
+
+/** 25 条 alpha 需求的服务端夹具（三页：PF25–16 / PF15–06 / PF05–01）。 */
+function serverWithFeatures(n = 25, org = "alpha", prefix = "PF") {
+  const all = pagedFeatures(n, org, prefix);
+  return {
+    client: fakeClient({
+      async getFeatures() {
+        return { features: all, stateCounts: null };
+      },
+    }),
+    fetcher: async () => ({ ok: true, projects: [] }),
+  };
+}
+
+test("⑨-①（新锚 · 页链在场）total > pageSize ⇒ 翻页链在场、含第二页链、「共 N 条」总数文案；首/末页方向钮不渲灰壳", () => {
+  const all = pagedFeatures(25);
+  const first = viewPage(all.slice(15, 25), { page: 1, pageSize: ORG_FEATURES_PAGE_SIZE, total: 25 });
+  const pager = pagerOf(first);
+  assert.ok(pager !== "", "正常档翻页链必须在场（缺席不得当成「只有一页」）");
+  assert.match(first, /href="\/org\/alpha\/manage\?page=2"/, "第二页链走 orgSpaceLink 口径（路径段 + query）");
+  assert.match(pager, /共 25 条/, "总数文案 = 全量条数（不是本页行数）");
+  assert.match(pager, /第 1\/3 页/);
+  assert.doesNotMatch(pager, /上一页/, "首页 ⇒「上一页」不渲（不渲灰壳）");
+  assert.match(pager, /下一页/, "非末页 ⇒「下一页」在场");
+  const last = viewPage(all.slice(20, 25), { page: 3, pageSize: ORG_FEATURES_PAGE_SIZE, total: 25 });
+  assert.match(pagerOf(last), /上一页/);
+  assert.doesNotMatch(pagerOf(last), /下一页/, "末页 ⇒「下一页」不渲");
+  assert.doesNotMatch(pagerOf(last), /\?page=4/, "末页之后不得有链");
+});
+
+test("⑨-②（新锚 · 行数 = 每页条数 + 排序同尺）HTTP 真通路表体恰 ORG_FEATURES_PAGE_SIZE 行，页序 = comparePoolEntry 的 createdAt 降序", async () => {
+  assert.equal(ORG_FEATURES_PAGE_SIZE, 10, "用户裁定 = 每页 10 条（单点常量唯一定义处）");
+  await withOrgsServer(async (base) => {
+    const p1 = await get(base, "/org/alpha/manage");
+    assert.equal(p1.status, 200);
+    assert.equal(featureRowCount(p1.text), ORG_FEATURES_PAGE_SIZE, "未带 query ⇒ 第 1 页恰每页条数行");
+    assert.match(p1.text, /\/features\/PF25"/, "第 1 页首位 = createdAt 最新者（降序 = 池同一把尺）");
+    assert.match(p1.text, /\/features\/PF16"/, "第 1 页末位 = PF16（切页边界内）");
+    assert.doesNotMatch(p1.text, /\/features\/PF15"/, "PF15 不得出现在第 1 页");
+    const p2 = await get(base, "/org/alpha/manage?page=2");
+    assert.equal(featureRowCount(p2.text), ORG_FEATURES_PAGE_SIZE, "第 2 页同样恰每页条数行");
+    assert.match(p2.text, /\/features\/PF15"/, "第 2 页首位 = PF15（连续序无重排无漏项）");
+    assert.doesNotMatch(p2.text, /\/features\/PF25"/, "第 2 页不得重复第 1 页内容");
+  }, serverWithFeatures());
+});
+
+test("⑨-③（新锚 · 空态）total=0 ⇒ 不渲翻页链，空态行文案逐字未变；不足一页同样不渲链", () => {
+  const empty = viewPage([], { page: 1, pageSize: ORG_FEATURES_PAGE_SIZE, total: 0 });
+  assert.equal(pagerOf(empty), "", "空态不渲链（不得改成「空态 + 一条 1/1 链」）");
+  assert.match(empty, /<tr><td colspan="6" class="empty">（该组织暂无需求）<\/td><\/tr>/, "既有空态行原文案保留（含 colspan 6）");
+  assert.match(empty, /本组 0 条/, "卡头报全量条数（0）");
+  const single = viewPage(pagedFeatures(3), { page: 1, pageSize: ORG_FEATURES_PAGE_SIZE, total: 3 });
+  assert.equal(pagerOf(single), "", "单页档 ⇒ 不渲噪音链");
+  assert.equal(featureRowCount(single), 3);
+});
+
+test("⑨-④（新锚 · fail-closed 回落）非法 / 越界 page ⇒ 一律第 1 页照常渲染，页面不回显原值", async () => {
+  await withOrgsServer(async (base) => {
+    for (const raw of ["abc", "%3Cscript%3Ealert(1)%3C%2Fscript%3E", "0", "-3", "2.5", "", "99"]) {
+      const res = await get(base, `/org/alpha/manage?page=${raw}`);
+      assert.equal(res.status, 200, `非法/越界 page=${raw} ⇒ 不 400`);
+      assert.equal(featureRowCount(res.text), ORG_FEATURES_PAGE_SIZE, `page=${raw} ⇒ 回落第 1 页且满页渲染（不得空白页）`);
+      assert.match(res.text, /第 1\/3 页/, `page=${raw} ⇒ 归一为第 1 页`);
+      assert.match(res.text, /\/features\/PF25"/, `page=${raw} ⇒ 渲的是第 1 页内容`);
+      for (const v of pagerQueryValues(res.text)) {
+        assert.match(v, /^\d*$/, `href 里的 page 只能是归一后的整数（原值 ${raw} 不得进拼接）`);
+      }
+    }
+    const inj = await get(base, "/org/alpha/manage?page=%3Cscript%3Ealert(1)%3C%2Fscript%3E");
+    assert.doesNotMatch(inj.text, /alert\(1\)/, "反射型注入面：原样回显零命中");
+    assert.doesNotMatch(inj.text, /page=abc/, "非法原值不得出现在任何 href / 文案里");
+  }, serverWithFeatures());
+});
+
+test("⑨-⑤（新锚 · 缺省向后兼容）三参数全不传 ⇒ 全量渲染 + 零翻页链 + 卡头文案逐字不变", () => {
+  const all = pagedFeatures(25);
+  const full = viewPage(all);
+  assert.equal(featureRowCount(full), 25, "缺省 ⇒ 全量渲染（不切页）");
+  assert.equal(pagerOf(full), "", "缺省 ⇒ 不渲链（既有形态零变化）");
+  assert.match(full, /本组 25 条/, "卡头文案与本节点改动前逐字一致");
+  assert.doesNotMatch(full, /\?page=/, "缺省档整页零 query ⇒ 老锚面不可能因本节点被改判");
+});
+
+test("⑨-⑥（新锚 · 零脚本负钉）分页无任何脚本承载（内联闭集八元不扩）", () => {
+  const paged = viewPage(pagedFeatures(25).slice(15, 25), {
+    page: 2,
+    pageSize: ORG_FEATURES_PAGE_SIZE,
+    total: 25,
+  });
+  assert.doesNotMatch(paged, /<script[^>]*page/, "分页无脚本承载（翻页链只可能是 <a href>）");
+  assert.doesNotMatch(featuresCardRegion(paged), /<script/, "需求卡区块（表体 + 翻页链）零 <script");
+  assert.doesNotMatch(paged, /data-live/, "本节点不接 live 槽（页级就地刷新是 N5 的形态，不扩锚）");
+});
+
+test("⑨-⑦（新锚 · PRG 保页码）agent 配置写成功 303 回带原页码；无 page / 非法 page ⇒ 干净 URL（既有 303 锚逐字不变）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "board-n11-prg-"));
+  try {
+    mkdirSync(join(dir, "data"), { recursive: true });
+    const ledgerFile = join(dir, "data", "orgs.json");
+    writeFileSync(
+      ledgerFile,
+      JSON.stringify({ version: 2, orgs: [{ org: "alpha", disabledAt: null, agentKind: null, agentModel: null }] }, null, 2) + "\n",
+      "utf8",
+    );
+    await withOrgsServer(
+      async (base) => {
+        const post = (referer) =>
+          fetch(`${base}/orgs`, {
+            method: "POST",
+            redirect: "manual",
+            headers: { origin: base, referer, "content-type": "application/x-www-form-urlencoded" },
+            body: new URLSearchParams({ org: "alpha", action: "setHostAgent", agentKind: "qoder", agentModel: "" }).toString(),
+          });
+        const kept = await post(`${base}/org/alpha/manage?page=3`);
+        assert.equal(kept.status, 303);
+        assert.equal(kept.headers.get("location"), "/org/alpha/manage?page=3", "PRG 回带原页码 ⇒ 写后不跳回第 1 页");
+        const clean = await post(`${base}/org/alpha/manage`);
+        assert.equal(clean.headers.get("location"), "/org/alpha/manage", "无 page 键 ⇒ 干净 URL（既有 HA-① 锚不变）");
+        const bogus = await post(`${base}/org/alpha/manage?page=%3Cscript%3E`);
+        assert.equal(bogus.headers.get("location"), "/org/alpha/manage", "非法页码不进 Location（不回显原值）");
+      },
+      { fetcher: async () => ({ ok: true, projects: [] }), orgsLedgerFile: ledgerFile },
+    );
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
+});
+
+test("⑨-⑧（新锚 · 编码自测）org 名需百分号编码时第 2 页链 round-trip 仍在同一 org 的第 2 页（段编码不被 query 吞）", async () => {
+  // 闭集内合法、且 URL 段必须百分号编码的档位 = 中文名。空格 / `/` 不在组织名闭集内（validateOrgName
+  // 禁 空格 # ? % /），故那两档在**运行态不可达**（见回执「自测项结论」），此处取段编码的真实档。
+  const org = "研发一组";
+  const encoded = encodeURIComponent(org);
+  await withOrgsServer(async (base) => {
+    const p2 = await get(base, `/org/${encoded}/manage?page=2`);
+    assert.equal(p2.status, 200, "编码段 + query 组合仍命中同一 org 的 manage 页（不掉门户、不 404）");
+    assert.equal(featureRowCount(p2.text), ORG_FEATURES_PAGE_SIZE);
+    assert.match(p2.text, /\/features\/CF15"/, "第 2 页内容 = 连续序第 11–20 条");
+    assert.ok(
+      featuresCardRegion(p2.text).includes(`href="/org/${encoded}/manage?page=3"`),
+      `链里的路径段按 orgSpaceLink 编码、query 未被吞（实测 href=${featuresCardRegion(p2.text).match(/href="[^"]*page=3"/)?.[0] ?? "无"}）`,
+    );
+    assert.doesNotMatch(p2.text, /%25/, "不得二次编码（%E7… 不得变 %25E7…）");
+    const p3 = await get(base, `/org/${encoded}/manage?page=3`);
+    assert.equal(p3.status, 200);
+    assert.match(p3.text, /第 3\/3 页/);
+  }, serverWithFeatures(25, org, "CF"));
 });

@@ -358,14 +358,12 @@ test("BD9-④s answer：有内容 ⇒ 交 answerRequirement（同 contextId 续�
 // 页面：确认按钮（文案诚实）+ 回答框（仅在适用时出现）
 // ---------------------------------------------------------------------------
 
-test("BD9-页面（v0.9.5 C5 档位化）：approval = 待审批 ⇒ 动作区出确认档（文案诚实 = 给 agent 的指令，非「板上批准」）；无 awaiting 轮 ⇒ 不显示回答框", async () => {
+test("BD9-页面（v0.9.5 C5 档位化）：approval = 待审批 ⇒ 动作区出确认档；无 awaiting 轮 ⇒ 不显示回答框", async () => {
   await withServer(async (base) => {
     const page = await req(base, "/features/F1");
     assert.equal(page.status, 200);
     assert.match(page.text, /action="\/features\/F1\/confirm"/);
     assert.match(page.text, /<button type="submit">确认改造文档 → 放行执行<\/button>/);
-    assert.match(page.text, /不存在「板上批准」/, "口径长文仍在（折叠层里，展开可见）");
-    assert.match(page.text, /feature_approval_not_ready|approval 非「待审批」/, "文案须明说 agent 可能不放行的例子");
     assert.equal(page.text.includes('action="/features/F1/answer"'), false, "无 awaiting 轮不得显示回答框");
   });
 });

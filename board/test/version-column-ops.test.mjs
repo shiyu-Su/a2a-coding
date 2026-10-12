@@ -10,7 +10,7 @@
  *   3. 重开 = `setStatus` + `status=active`（**增补十起前台不出入口，仅后台表单直投**）；
  * - 入口可见性与迁移矩阵同源（`notstart → released` 矩阵禁止 ⇒ 该列不出「标记已发版」）；
  * - 台账无登记的列（历史脏列 = 只由卡片派生）⇒ 无操作（台账里无可删 / 可改状态的条目）；
- * - **内联脚本闭集七元不扩**（列头操作零 `<script>`；「二次确认」由明确文案承担）；
+ * - **内联脚本闭集八元不扩**（列头操作零 `<script>`；「二次确认」由明确文案承担）；
  * - 读面不突变：GET 排期页（B5a 后 = `/org/<名>/schedule`）渲染操作行不得改写台账文件。
  *
  * **REQ-2026-09-28-04 增补十（父改造文档 §9.5）改口本件**：已发版为终态 ⇒ `released` 列**不再渲染
@@ -199,7 +199,7 @@ test("A2-⑤ 表单都打既有的 POST /versions（隐藏字段 action 分流�
   assert.doesNotMatch(nasty, /<script>alert/, "台账脏值进隐藏字段与 title 必须转义");
 });
 
-test("A2-⑥ 零脚本（内联闭集七元不扩）+ 闸文案由框头 title/aria 写明", () => {
+test("A2-⑥ 零脚本（内联闭集八元不扩）+ 闸文案由框头 title/aria 写明", () => {
   const ledger = ledgerWith([["v0.9.7", "notstart"], ["v0.9.3", "released"]]);
   const html = renderSchedule(groupFeaturesByVersion([], ["v0.9.7", "v0.9.3"]), [], [], ledger);
   assert.doesNotMatch(html, /<script/, "本件纯 SSR：删除入口不引入任何脚本常量");

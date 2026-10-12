@@ -181,5 +181,5 @@ test("B4-④ Group 面照常：版本列 / 已发版锁 / 需求池与 project �
 // **语义由管理页「恰一次 `/api/versions`」锚承接**（改造文档 §2.3 B-2，两处交叉注明）：
 //   · 管理页侧 = N4 `manage-read-and-origin-anchors` 新增的「一次渲染 = 恰一次 `/api/versions`」读数锚；
 //   · 排期页侧 = `test/v0101-server-projection-two-tier.test.mjs` 的 **B2-④**（同判据存续，未随本档退役）；
-//   · 「零新增内联脚本」= `test/n3-regression-anchors.test.mjs` 的 **N3-⑪**（全站七元闭集锚）。
+//   · 「零新增内联脚本」= `test/n3-regression-anchors.test.mjs` 的 **N3-⑪**（全站八元闭集锚）。
 // 区块体内脚本判据的主语已不存在 ⇒ 一并退役，守门语义由上述三处吸收。

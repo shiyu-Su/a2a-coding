@@ -7,7 +7,7 @@
  * ② **v0.9.6 B4 改版（REQ-2026-09-28-07 口径 4 / 9 / 24）**：骨架与页头按钮的宿主由全局 `/schedule`
  *    **迁到组织空间排期页** `/org/<名>/`（台账唯一键 = `(org, version)` ⇒ 全局页无组织上下文，
  *    表单零 org 字段、org 只从路径取）；组织门户不渲染；
- * ③ 闭集七元不扩：骨架零 `<script>`、弹窗交互仍在 `NEW_REQUIREMENT_DIALOG_SCRIPT` 体内（wire 委托）；
+ * ③ 闭集八元不扩：骨架零 `<script>`、弹窗交互仍在 `NEW_REQUIREMENT_DIALOG_SCRIPT` 体内（wire 委托）；
  * ④ 服务端写口零改动：表单档提交仍落既有闸与台账（空间档经归一层剥前缀命中同一条 `POST /versions`）。
  *
  * 增补十一 E1（§9.6）起：看板尾虚列拖拽 `prompt()` 路径已撤除（负向锚在
@@ -62,7 +62,7 @@ test("B8-①（B4 改版）renderNewVersionDialog(org)：dialog.fd 骨架 · 关
   assert.match(html, /归属组织 = <b>alpha<\/b>/, "组织只读展示（同 BD8 提需求免选形态）");
   assert.match(html, /<label>版本号 \*<input name="version" required placeholder="如 v0\.10\.0/, "版本号输入框含占位提示");
   assert.match(html, /<button type="submit">创建版本<\/button>/, "提交钮");
-  assert.doesNotMatch(html, /<script/, "骨架零脚本（闭集七元不扩）");
+  assert.doesNotMatch(html, /<script/, "骨架零脚本（闭集八元不扩）");
 });
 
 test("B8-①b（B4）组织名含特殊字符 ⇒ action 的 URL 段经 encodeURIComponent 转义", () => {
@@ -107,7 +107,7 @@ test("B8-②（B4 改版 · B5a 整页退役）GET /schedule ⇒ 303：建版本
   });
 });
 
-test("B8-②b 组织门户 GET /：不渲染新版本骨架（建版本单入口 = 空间排期页；闭集仍七元）", async () => {
+test("B8-②b 组织门户 GET /：不渲染新版本骨架（建版本单入口 = 空间排期页；闭集仍八元）", async () => {
   await withServer(fakeClient([feature("F1", "v0.9.3")]), async (base) => {
     const html = await (await fetch(`${base}/`)).text();
     assert.doesNotMatch(html, /id="new-version-dialog"/, "门户无骨架");
@@ -139,7 +139,7 @@ test("B8-②c（B4 改版）空间排期页 GET /org/alpha/：按钮 + 骨架 + 
 // ③ 闭集与拖拽侧撤除
 // ---------------------------------------------------------------------------
 
-test("B8-③（E1 改版）虚列拖拽 prompt() 路径已撤除；内联脚本字面量闭集仍七元", () => {
+test("B8-③（E1 改版）虚列拖拽 prompt() 路径已撤除；内联脚本字面量闭集仍八元", () => {
   assert.doesNotMatch(
     DRAG_SCHEDULE_SCRIPT,
     /window\.prompt|prompt\(/,

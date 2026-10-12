@@ -286,33 +286,34 @@ test("BD7-④b（§9-b 翻向 · B5a 重指看板宿主 ·  B6 门户摘切换�
 });
 
 // ---------------------------------------------------------------------------
-// ④c 件2：需求详情页也携带空间 tab 行（无激活态，作空间上下文与返回口）
+// ④c 件2 → ③ → ①′（REQ-2026-10-12-01 增补）：详情页**摘除**空间 tab 行，返回链一并摘除
+//     （出路 = 侧栏一级门户 + 二级组排期 / 浮层三出口，正文不再携带返回口）
 // ---------------------------------------------------------------------------
 
-test("BD7-④c（件2）：详情页带空间 tab 行且**无激活态**；归属缺失或已停用 ⇒ 不给死链", async () => {
+test("BD7-④c（③ 摘 tab 行 · ①′ 摘返回链）：全局档与空间档详情页均**不含** `b-tabs`，且均**不出**返回链", async () => {
   await withNavServer({ ...DISK, ...LEDGER_LIVE }, async (base) => {
     const globalPage = await (await fetch(`${base}/features/F-A1`)).text();
-    const row = /<div class="b-tabs">[\s\S]*?<\/div>/.exec(globalPage);
-    assert.ok(row !== null, "全局详情页按卡面 ownerGroup 带出空间 tab 行");
-    assert.match(row[0], /项目组空间 <b>组织甲<\/b>/, "行内组织 = 该卡归属组（不臆造默认组）");
-    assert.doesNotMatch(row[0], /class="fl on"/, "详情页不属于任何一档视图 ⇒ 三枚皆无激活态");
-    assert.match(row[0], /<a class="fl" href="\/org\/%E7%BB%84%E7%BB%87%E7%94%B2\/schedule">排期<\/a>/);
+    // ★改判（原「按 ownerGroup 带出 tab 行」四断言）：主语翻向 —— 详情页整页零 b-tabs
+    assert.ok(!globalPage.includes('class="b-tabs"'), "全局详情页不渲空间 tab 行（③ 摘除）");
+    assert.doesNotMatch(globalPage, /项目组空间 <b>/, "tab 行原文形态锚随之消失（不得以别种壳残留）");
+    assert.doesNotMatch(globalPage, /class="fl on"/, "详情页不属于任何一档视图 ⇒ 无激活态（原 `>排期<` 定界锚抬为整页负钉）");
+    // ★翻负钉①（原「返回链逐字」正钉）：①′ 起详情页不出返回链
+    assert.doesNotMatch(globalPage, /← 返回排期|← 回门户/, "①′ 详情页不出返回链（全局档入口）——出路 = 侧栏 / 浮层三出口");
     const spacePage = await (await fetch(`${base}/org/${ENC_JIA}/features/F-A1`)).text();
-    assert.match(
-      spacePage,
-      /<div class="b-tabs"><p class="hint">项目组空间 <b>组织甲<\/b>/,
-      "空间档同形（路由组织优先，行仍是无激活态档）",
-    );
-    assert.doesNotMatch(spacePage, /class="fl on"[^>]*>排期</, "空间详情页不得把「排期」误标为当前档");
-    // 浮层换页容器取的是 `<main>` 正文 ⇒ tab 行随正文一起进浮层（返回口在浮层内可用）
-    assert.ok(globalPage.indexOf('<div class="b-tabs">') < globalPage.indexOf('<div class="b-steps">'), "tab 行在正文最前");
+    // ★改判（原「空间档同形 = 同一条无激活态 tab 行」）：同档同判据 —— 两档均不含 tab 行
+    assert.ok(!spacePage.includes('class="b-tabs"'), "空间档详情页同样不含 tab 行（摘除对两档一致）");
+    // ★翻负钉（原「空间档返回链同形」正钉）：空间档入口独立一枚，不与全局档互代
+    assert.doesNotMatch(spacePage, /← 返回排期|← 回门户/, "①′ 空间档入口同样不出返回链");
   });
-  // 组织乙在台账里停用 ⇒ 其卡的详情页不带该行（空间路由点了必 410，不给死链）
+  // 组织乙在台账里停用 ⇒ 归属不可得：今天这页本就没有 tab 行，①′ 起也不得有任何返回链
   await withNavServer(
     { ...DISK, ledgerOrgs: [{ org: "组织甲" }, { org: "组织乙", disabledAt: "2026-09-27T00:00:00Z" }] },
     async (base) => {
       const page = await (await fetch(`${base}/features/F-B1`)).text();
-      assert.equal(page.includes('class="b-tabs"'), false, "归属组织已停用 ⇒ 不渲空间 tab 行");
+      // ★转恒真抬负钉（原 `assert.equal(page.includes('class="b-tabs"'), false)` 摘后为恒真）
+      assert.ok(!page.includes('class="b-tabs"'), "归属组织已停用 ⇒ 无 tab 行（显式负钉，不是摘除后的空转）");
+      // ★翻负钉②（原「归属不可得 ⇒ 回落门户」正钉）：停用档入口同样不出返回链
+      assert.doesNotMatch(page, /← 回门户|← 返回排期/, "①′ 停用档入口亦不出返回链（原「回落门户」形态退役）");
     },
   );
 });

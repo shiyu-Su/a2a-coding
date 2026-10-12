@@ -24,7 +24,7 @@ import {
   renderOrgSpaceManagePage,
   renderOrgPortal,
   buildOrgPortalCards,
-  VIEW_NOTES,
+  LIVE_INTERVALS,
 } from "../dist/web/views.js";
 import { renderDependencyGraphSection, taskOrdinalMap } from "../dist/graph-view.js";
 
@@ -48,17 +48,14 @@ test("escapeHtml: 五字符全转义；null/undefined 为空串", () => {
   assert.equal(escapeHtml(undefined), "");
 });
 
-test("renderPage: 标题转义 + 侧栏一级菜单高亮 + 口径脚注逐条渲染", () => {
+test("renderPage: 标题转义 + 侧栏一级菜单高亮", () => {
   const html = renderPage({
     title: `页 <x>`,
     active: "home",
     bodyHtml: "<p>正文</p>",
-    notes: ["注 A", "注 <B>"],
   });
   assert.match(html, /<title>页 &lt;x&gt; · board<\/title>/);
   assert.match(html, /<a href="\/" class="on">项目组门户<\/a>/);
-  assert.match(html, /<li>注 A<\/li>/);
-  assert.match(html, /<li>注 &lt;B&gt;<\/li>/);
 });
 
 test("REQ-04 Q2 + 件1：导航闭集收一枚「项目组门户」⇒ /projects 与 /agents 撤出导航（页面保留、深链可达）", () => {
@@ -128,6 +125,11 @@ test("件1-② 外壳骨架 = grid〔216px 固定侧栏 | 主区〕· 品牌区�
   const css = pageCss(withBtn);
   assert.match(css, /body \{[^}]*display: grid;[^}]*grid-template-columns: 216px minmax\(0, 1fr\)/, "外壳 = 216px 侧栏 + 主区两列 grid");
   assert.match(css, /\.sidebar \{[^}]*position: sticky/, "侧栏固定（滚动不离场）");
+  // 增补③′（REQ-2026-10-12-01）：侧栏 nav 选择器收敛作用域 —— 裸 nav 会泄漏去块化 .pager 的翻页链
+  assert.match(css, /\.sidebar nav \{[^}]*display: block/, "侧栏 nav 规则随作用域收敛在场");
+  assert.match(css, /\.sidebar nav a \{[^}]*display: block/, "侧栏 nav a 块化在场（泄漏面已摘）");
+  assert.match(css, /\.sidebar nav a\.on \{/, "侧栏当前项高亮规则在场");
+  assert.equal(/^\s*nav\s*[,{]/m.test(css), false, "裸 nav 元素选择器不得复现（未限定作用域 ⇒ 会块化 .pager）");
   assert.doesNotMatch(css, /main \{[^}]*max-width/, "主区去封宽 = main 不再限宽（随视口铺满）");
   assert.doesNotMatch(css, /max-width: 1180px/, "全站不留封宽常量");
   assert.match(css, /\.page-head \{[^}]*display: flex[^}]*justify-content: space-between/, "页标题栏 = flex（页面名左 · 操作钮右）");
@@ -136,6 +138,14 @@ test("件1-② 外壳骨架 = grid〔216px 固定侧栏 | 主区〕· 品牌区�
   assert.doesNotMatch(sideOf(withBtn), /v\d+\.\d+\.\d+/, "侧栏不挂版本徽标（版本口径仍以 /health 为准，只是不在板面显示）");
   const plain = renderPage({ title: "t", active: "schedule", bodyHtml: "<p>b</p>" });
   assert.doesNotMatch(plain, /new-req-open/, "其它页无该按钮（不注入按钮位）");
+});
+
+test("件1-②b（增补③′）.pager 版式正钉：flex 一行 + 特异性压过 a.fl + 零新色值/零 opacity", () => {
+  const css = pageCss(renderPage({ title: "t", active: "features", bodyHtml: "" }));
+  assert.match(css, /\.pager \{[^}]*display: flex/, "翻页链 = flex 一行（markup 零改动，版式全在 CSS）");
+  assert.match(css, /\.pager a\.fl \{/, "必须存在 .pager a.fl（否则被全站 a.fl{color:inherit} 吞色）");
+  assert.doesNotMatch(css, /\.pager \{[^}]*#[0-9a-fA-F]{3,8}/, ".pager 零新色值字面");
+  assert.doesNotMatch(css, /\.pager \{[^}]*opacity/, ".pager 零 opacity（压暗单点归 .kcard.draglocked）");
 });
 
 test("BOARD_CSP: 无外部资源（default-src none + 仅内联 style + 同源表单）", () => {
@@ -217,7 +227,7 @@ test("轨14-守卫脚本：一段内联 · 零外源 · 零求值 · 只作用�
   assert.match(SUBMIT_GUARD_SCRIPT, /\.disabled = true/, "禁用的是提交按钮");
 });
 
-// --- v0.9.4 增补二 §9.1-②：data-ov 写表单的 fetch 报错呈现（闭集七元内扩写，不新枚） -------
+// --- v0.9.4 增补二 §9.1-②：data-ov 写表单的 fetch 报错呈现（闭集内扩写、不新枚；枚数沿革 七元〔v0.9.4 侧〕→ 八元〔v0.10.4 起〕） -------
 
 test("增补二/五-守卫脚本扩写：data-ov 表单 = fetch 提交 · 成功按 data-ov-redirect 跳转（缺省 reload）· 4xx 抽 .err-ov-card 浮层不跳页 · 让位已拦截事件", () => {
   const s = SUBMIT_GUARD_SCRIPT;
@@ -244,7 +254,7 @@ test("增补三-ovSubmit 目标 URL = getAttribute(\"action\") 属性值 · 空 
   assert.match(s, /if \(data === null \|\| action === ""\) \{ ovRestore\(form\); form\.submit\(\); return; \}/, "action 属性缺失 ⇒ 回落原生提交（不劣化）");
 });
 
-// --- v0.9.4 增补四 §9.3：浮层卡「知道了」委托关闭（闭集七元内扩写，不新枚） -------
+// --- v0.9.4 增补四 §9.3：浮层卡「知道了」委托关闭（闭集内扩写、不新枚；枚数沿革 七元〔v0.9.4 侧〕→ 八元〔v0.10.4 起〕） -------
 
 test("增补四-守卫脚本扩写：document 级委托摘 .err-ov-card「知道了」（closest 口径对齐 /schedule 侧）", () => {
   const s = SUBMIT_GUARD_SCRIPT;
@@ -252,7 +262,7 @@ test("增补四-守卫脚本扩写：document 级委托摘 .err-ov-card「知道
   assert.match(s, /closest\("#err-ov-close"\)/, "只认「知道了」按钮（与 /schedule 侧浮层脚本同款 id 判据）");
   assert.match(s, /closest\("\.err-ov-card"\)/, "委托关闭 = closest + err-ov-card 组合");
   assert.match(s, /card\.parentNode\.removeChild\(card\)/, "命中 ⇒ 从 DOM 摘除该卡片");
-  // 闭集七元不扩：不引入其它六枚常量的单点标记
+  // 闭集八元不扩：不引入其它六枚常量的单点标记
   assert.doesNotMatch(s, /getElementById\("(feat-dialog|new-req-dialog|schedule-board|err-ov|member-pool)"\)/, "不踩其余六枚常量归类标记（N3-⑦ 闭集唯一）");
 });
 
@@ -266,10 +276,10 @@ test("增补三-负向锚：三枚 fetch 拦截常量直读 form.action 零出�
   }
 });
 
-test("增补二-表单标记：manage 成员增删 / 停用 + 门户建组织带 data-ov=\"1\"（其余写表单不扩）", () => {
+test("增补二-表单标记：manage 停用 + 门户建组织带 data-ov=\"1\"（⑦b 成员增删表单退役后闭集收窄，其余写表单不扩）", () => {
   const manage = renderOrgSpaceManagePage({ org: "alpha", features: [], projectsOutcome: null, groupsOutcome: null });
-  assert.equal((manage.match(/data-ov="1"/g) ?? []).length, 4, "加 / 删 / 停用 / agent 配置四枚表单（v0.9.8 按项目组配 agent +1）");
-  assert.match(manage, /action="\/orgs\/alpha\/members"[^>]*data-ov="1"/);
+  assert.equal((manage.match(/data-ov="1"/g) ?? []).length, 2, "停用 / agent 配置两枚表单（⑦b 加 / 删成员手填表单退役 −2）");
+  assert.doesNotMatch(manage, /action="\/orgs\/alpha\/members"/, "⑦b 成员写表单退役 ⇒ 页内不再出现该 action（写路由仍在，只由拖拽脚本提交）");
   assert.match(manage, /action="\/orgs" class="inline" data-submit="已提交，停用中…" data-ov="1" data-ov-redirect="\/"/, "停用表单带 data-ov-redirect=/（§9.4-② 成功跳门户）");
   const portal = renderOrgPortal(buildOrgPortalCards(["甲"], []));
   assert.match(portal, /action="\/orgs" class="w"[^>]*data-ov="1"/, "门户建组织同口径");
@@ -428,12 +438,23 @@ test("N7-页面（负向）无在飞 / 排队轮 ⇒ 整行不渲染；进度行
 });
 
 // REQ-2026-09-29-02 件D：口径行由「板不自动刷新」改为准确两档表述（动作区自动刷新 / 其余不自动刷新）。
-test("N7-页面（件D 新口径文案锚）动作区提交后自动刷新进度至本轮收口，其余内容仍需重载本页", () => {
+// REQ-2026-10-11-03 件D 翻新：整页只读区由第八枚页级脚本就地刷新 ⇒ 静态档改为「只读区自动更新 / 含输入区不自动更新」。
+test("N7-页面（件D 新口径文案锚）动作区提交后自动刷新进度至本轮收口，只读区自动更新而含输入区仍需重载", () => {
   const html = renderTurnProgress({ turnId: "turn-run", round: 4, state: "running", position: null });
   assert.match(html, /轮次进度：<b>第 4 轮 在飞<\/b>/, "在飞档主体不变（既有口径不弱化）");
   assert.match(html, /浮层内提交后动作区自动刷新进度至本轮收口/, "自动档 = 浮层动作区");
-  assert.match(html, /其余内容重载本页看最新/, "静态档 = 其余内容仍须重载");
+  assert.ok(
+    html.includes(`本页只读区每 ${String(LIVE_INTERVALS.feature / 1000)}s 自动更新`),
+    "动态档 = 只读区页级就地刷新，周期数值只来自 LIVE_INTERVALS.feature 单点（src 与本处不得各写一套数字）",
+  );
+  assert.match(html, /含输入的区域不自动更新/, "静态档 = 含输入/表单的区域仍须重载");
   assert.doesNotMatch(html, /板不自动刷新/, "旧的笼统表述已退役（与件B 行为矛盾的根因文案）");
+  assert.doesNotMatch(html, /整页不自动刷新/, "旧断言不得残留");
+  // 件B 子串锚（硬约束 A）：stillBusy 按文本子串判收口 ⇒ 改字即静默废掉浮层轮询，两档各跑一次函数级断言
+  assert.match(html, /在飞/, "件B 子串「在飞」在位（running 档）");
+  const queuedHtml = renderTurnProgress({ turnId: "turn-qd", round: 5, state: "queued", position: null });
+  assert.match(queuedHtml, /排队中/, "件B 子串「排队中」在位（queued 档）");
+  assert.match(queuedHtml, /本页只读区每 \d+s 自动更新；含输入的区域不自动更新/, "尾段文案与状态档无关（两档共用同一串）");
 });
 
 // --- REQ-v0.9.2 N8：详情页验收轨迹块（消费 acceptance，板不重算） ---------------- --------
@@ -587,6 +608,13 @@ test("B1 renderFeatureDetail: parentFeatureId 非空 ⇒ 标题徽标 + 深链�
   const head = html.slice(0, html.indexOf("</h2>"));
   assert.match(head, /增补 · 父需求 <a class="fl" href="\/features\/P1">P1<\/a>/);
   assert.doesNotMatch(renderFeatureDetail(detailFixture, traceFixture, null, NOW), /增补 · 父需求/);
+  // 件D 第三档（REQ-2026-10-11-05 N3）：正文头部「整页打开」链 —— 浮层靠它回整页
+  assert.match(head, /<a class="fd-fullpage" href="\/features\/F1" target="_blank"/, "正文头部整页打开链（浮层靠它回整页）");
+  assert.equal(
+    html.split("<script").length - 1,
+    0,
+    "详情正文零内联脚本（链是纯 <a> + target=_blank，靠浮层导航分支放行，不新增第九枚）",
+  );
 });
 
 // ---------------------------------------------------------------------------
@@ -678,9 +706,9 @@ test("renderFeatureDetail: trace 读取失败 ⇒ 可见错误，不静默", () 
   assert.match(html, /trace 读取失败：桥返回 HTTP 500/);
 });
 
-// --- v0.9.5 C4：需求原文上详情页（常驻层 · 120 字截断 + 原生 details 展开全文，零脚本） ------
+// --- v0.9.5 C4（① 只允许一层折叠）：需求原文上详情页 = 外层 foldSection 一层 · 正文直显全文 ----
 
-test("C4 renderFeatureDetail: 需求原文常驻层 —— 短文本直显 / 超长截断进 details / 转义 / 缺值不渲染", () => {
+test("C4 renderFeatureDetail: 需求原文只一层折叠 —— 长短档一律直显全文 / 区内无第二层 details / 转义 / 缺值不渲染", () => {
   const short = renderFeatureDetail(
     { ...detailFixture, feature: { ...detailFixture.feature, requirement: "要一个只读的排期导出" } },
     traceFixture,
@@ -688,7 +716,6 @@ test("C4 renderFeatureDetail: 需求原文常驻层 —— 短文本直显 / 超
     NOW,
   );
   assert.match(short, /<h2>需求原文<\/h2>\n<pre class="result">要一个只读的排期导出<\/pre>/);
-  assert.doesNotMatch(short, /<details class="req-src">/, "不超长 ⇒ 不套折叠层（一眼看完的东西不该多点一下）");
 
   const long = renderFeatureDetail(
     { ...detailFixture, feature: { ...detailFixture.feature, requirement: "甲".repeat(200) } },
@@ -696,7 +723,26 @@ test("C4 renderFeatureDetail: 需求原文常驻层 —— 短文本直显 / 超
     null,
     NOW,
   );
-  assert.match(long, /<details class="req-src"><summary>甲{120}…<\/summary><pre class="result">甲{200}<\/pre>/, "折叠态 = 截断 120 字，展开 = 全文");
+  assert.match(long, /<h2>需求原文<\/h2>\n<pre class="result">甲{200}<\/pre>/, "长档同样直显全文（120 字截断档已取消）");
+
+  // 负钉抬为**区域结构**口径（不钉类名字面量 ⇒ 改版后不转恒真）：原文区内 `<details` 计数 = 1，
+  // 即外层唯一折叠层在场、内层折叠已摘；任何第二层 details 重现都会被拦。
+  const originHead = '<details class="fold"><summary>需求原文</summary>';
+  const originRegionOf = (html) => {
+    const start = html.indexOf(originHead);
+    assert.ok(start >= 0, "原文正文落在外层折叠层内");
+    const bounds = [
+      html.indexOf('<details class="fold">', start + originHead.length),
+      html.indexOf('<div class="feat-side">'),
+    ].filter((i) => i >= 0);
+    return html.slice(start, bounds.length === 0 ? html.length : Math.min(...bounds));
+  };
+  for (const [label, html] of [["短档", short], ["长档", long]]) {
+    const region = originRegionOf(html);
+    assert.equal(region.split("<details").length - 1, 1, `${label} ⇒ 原文区只允许一层折叠`);
+    assert.match(region, /<pre class="result">/, `${label} ⇒ 正文直显在折叠体内`);
+  }
+  assert.match(originRegionOf(long), /<pre class="result">甲{200}<\/pre>/, "展开一次即见全文");
 
   const unsafe = renderFeatureDetail(
     { ...detailFixture, feature: { ...detailFixture.feature, requirement: '<img src=x onerror="alert(1)">' } },
@@ -1005,6 +1051,39 @@ test("renderFeatureDetail: N3 单表 12 列 = # / taskId / 项目 / 职责位 / 
   assert.equal((thead.match(/创建/g) ?? []).length, 0, "「创建」列头退役（grep 判据 = 0）");
 });
 
+test("REQ-04同源复色：执行明细状态列与图 chip 同用 nodeStateOf ⇒ working∧claimed 出 dg-running 类", () => {
+  const html = renderFeatureDetail(
+    {
+      ...detailFixture,
+      tasks: [
+        {
+          taskId: "c1",
+          projectId: "board",
+          state: "working",
+          lane: "write",
+          failureKind: null,
+          retryCount: null,
+          dependencies: [],
+          prompt: null,
+          createdAt: null,
+          startedAt: null,
+          finishedAt: null,
+          queueState: "claimed",
+          queuedAt: "2026-09-26T00:00:00Z",
+          claimedAt: "2026-09-26T00:01:00Z",
+          claimedBy: "m1",
+        },
+      ],
+    },
+    null,
+    "trace 关闭",
+    NOW,
+  );
+  assert.match(html, /class="dg-chip dg-running"/, "表内状态 chip 须命中在飞档（修复前此处为 dg-unknown）");
+  assert.ok(html.includes("执行中·已认领"), "同一档中文标签落进表内 chip 文案");
+  assert.equal(html.includes("dg-unknown"), false, "working∧claimed 不得再落回落档");
+});
+
 test("N-8 反向锚：三时刻原值（ISO 串）不得再出现在执行明细表 HTML 上", () => {
   const html = renderFeatureDetail({ ...detailFixture, tasks: [timingsTask] }, null, "trace 关闭", NOW);
   const body = html.slice(html.indexOf('<div class="fold-body">'), html.indexOf("</details>", html.indexOf("执行明细")));
@@ -1122,11 +1201,6 @@ test("renderFeatureDetail: 在飞任务（有 startedAt 无 finishedAt）执行�
   assert.doesNotMatch(html, /<td>5m 0s<\/td>/);
   assert.match(html, /<td>1m 0s<\/td>/); // 排队时长 queuedAt→claimedAt 不受在飞影响
   assert.ok(html.includes("<td>—</td></tr>"), "末列执行时长 = —");
-});
-
-test("VIEW_NOTES: 每页统一挂 B13 三条 + 并行度文案", () => {
-  assert.equal(VIEW_NOTES.length, 4);
-  assert.match(VIEW_NOTES.join("\n"), /编排侧并行 ≠ 改造侧并行/);
 });
 
 // ---------------------------------------------------------------------------
@@ -1389,13 +1463,11 @@ test("N4 renderTurnOutcome：结果页带回执 ⇒ 渲「本轮回执」卡（�
 // BD18 → v0.9.5 C5 档位化：确认档只在审批门出现 + 「下一步」引导行（视图层）
 // ---------------------------------------------------------------------------
 
-test("BD18（档位化）：待审批 ⇒ 确认档按钮可点（无 disabled）+ 诚实口径仍在折叠层 + 无补充框", () => {
+test("BD18（档位化）：待审批 ⇒ 确认档按钮可点（无 disabled）+ 无补充框", () => {
   const html = renderActionArea("F1", actionInput({ approval: "待审批" }));
   assert.match(html, /<button type="submit">确认改造文档 → 放行执行<\/button>/);
   assert.doesNotMatch(html, /disabled/, "待审批档不得出现 disabled");
   assert.match(html, /action="\/features\/F1\/confirm"/);
-  assert.match(html, /不存在「板上批准」/, "既有的诚实文案不丢（折叠层里，展开可见）");
-  assert.match(html, /feature_approval_not_ready/, "文案仍明说 agent 可能不放行的例子");
   assert.doesNotMatch(html, /name="supplement"/, "确认档是固定指令模板通道，不掺自由文本");
 });
 

@@ -4,9 +4,10 @@
  * 钉住的语义（改版式前后的**行为边界**，防止后续把写面通路一起改掉）：
  *  ① 任务页选单档 = 过滤卡（GET 表单标记逐字不动，只外套卡）+ 快捷项目 chips + 默认带出结果卡；
  *  ② 默认带出只在**空间档 ∧ 声明面可判定**时发生（C2 读失败档不得外泄项目、也不带出）；
- *  ③ 管理页 = 成员表卡 + 加/减成员双表单卡（末位成员 409 落成卡内 `.b-note danger`）
- *     + 配置核对卡（正常态一行「配置齐备」· warn 档落警示条且仍「不参与任何判定」）；
- *  ④ **写面闭集不劣化**：manage 页 `data-ov="1"` 恰 3 枚、表单 action 与 hidden 字段逐字不变。
+ *  ③ 管理页 = 两栏池卡（⑦b 起加 / 减成员双表单卡与「成员（项目组台账）」卡退役，成员写只剩拖拽）
+ *     + 页头核对短条（★⑧a：原「配置核对」卡降级为一条 `<p class="hint">`；正常态尾串「配置齐备」
+ *       · warn 档落警示条且仍「不参与任何判定」）；
+ *  ④ **写面闭集随 ⑦b 收窄**：manage 页 `data-ov="1"` 恰 2 枚（停用 / agent 配置）、余下表单 action 与 hidden 字段逐字不变。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -82,7 +83,7 @@ test("件5-①c（查询档）：renderTasks 复用同一张结果卡", () => {
   assert.match(html, /过滤：<span class="mono">limit=10<\/span>/, "过滤回显保留");
 });
 
-test("件5-③（管理页 · 正常态）：成员表卡 + 双表单卡 + 末位 409 警示条 + 配置核对卡", () => {
+test("件5-③（管理页 · 正常态）：池卡 + 停用表单 + 页头核对短条（⑦b 双表单卡与台账卡退役；★⑧a 核对卡降为短条）", () => {
   const html = renderOrgSpaceManagePage({
     org: "alpha",
     features: [],
@@ -97,17 +98,25 @@ test("件5-③（管理页 · 正常态）：成员表卡 + 双表单卡 + 末�
       groups: [{ name: "alpha", memberCount: 1, members: [{ machineId: "win-a", projectId: "board" }] }],
     },
   });
-  assert.match(html, /<div class="b-forms">[\s\S]*?加成员[\s\S]*?删成员/, "加 / 减成员双表单卡并列");
-  assert.doesNotMatch(html, /成员（声明态/, "REQ-2026-10-10-03 N2：逐组声明态成员清单卡退役 ⇒ 管理页不再出现该区块（计数与观测时刻改由核对卡 / 池卡承载，见 :108）");
-  assert.match(
+  assert.doesNotMatch(html, /<div class="b-forms">[\s\S]*?加成员[\s\S]*?删成员/, "⑦b 加 / 减成员双表单卡退役（不复活）");
+  assert.doesNotMatch(html, /id="member-forms-fold"/, "⑦b 折叠宿主随表单一起删除");
+  assert.doesNotMatch(html, /成员（项目组台账）/, "⑦b 「成员（项目组台账）」卡整块退役 ⇒ 卡头字面亦不得出现（装配序随挂载删除收窄）");
+  assert.doesNotMatch(html, /成员（声明态/, "REQ-2026-10-10-03 N2：逐组声明态成员清单卡退役 ⇒ 管理页不再出现该区块（计数与观测时刻改由页头核对短条 / 池卡承载，见 :108）");
+  assert.doesNotMatch(
     html,
     new RegExp(`<p class="b-note danger"><b>末位成员不可删</b>[\\s\\S]*?${LAST_MEMBER_REMOVE_CODE}`),
-    "末位成员 409 口径落成卡内警示条",
+    "⑦b 卡内常驻「末位成员不可删」警示条随表单退役（判据只剩服务端 409 + 末位行不给 draggable）",
   );
-  assert.ok(html.includes(LAST_MEMBER_REMOVE_DISPLAY), "警示条文案 = 常量逐字（锚同步不重写）");
-  assert.match(html, /<p class="b-note ok">配置齐备 · 上次核对时间 2026-10-02T01:00:00\.000Z<\/p>/, "两源齐备 ⇒ 正常态一行");
-  assert.equal((html.match(/data-ov="1"/g) ?? []).length, 4, "写面浮层档闭集不劣化（加 / 删 / 停用 / agent 配置恰四枚，v0.9.8 增补）");
+  assert.equal(html.includes(LAST_MEMBER_REMOVE_DISPLAY), false, "⑦b 警示条文案（常量逐字）不再出现在管理页（只在 409 浮层档出现）");
+  assert.match(
+    html,
+    /<p class="hint">核对源健康度：[\s\S]*?配置齐备 · 上次核对时间 2026-10-02T01:00:00\.000Z<\/p>/,
+    '两源齐备 ⇒ 正常态一行（★REQ-2026-10-11-05 ⑧a：原卡内独立 `<p class="b-note ok">` 并入页头短条尾串，原词逐字保留）',
+  );
+  assert.equal((html.match(/data-ov="1"/g) ?? []).length, 2, "写面浮层档闭集 = 停用 / agent 配置两枚（⑦b 加 / 删成员表单退役）");
   assert.match(html, /<form method="post" action="\/orgs" class="inline" data-submit="已提交，停用中…" data-ov="1" data-ov-redirect="\/">/, "停用表单标记逐字不动");
+  assert.match(html, /<p class="b-card-h">加 \/ 删项目（两栏拖拽）/, "对照：池卡卡头在位（本夹具未装配 poolOutcome ⇒「未查询」档，上面的负锚非空锚）");
+  assert.match(html, /<p class="b-card-h">本组织 agent 配置/, "对照：agent 配置卡在位（余下两枚浮层表单的宿主）");
 });
 
 test("v0.9.8-agent 配置卡（已配档）：预填当前值 + 来源标注「本组织」；只配 kind ⇒ model 标「后端缺省」（不沿用全局）", () => {
@@ -204,7 +213,7 @@ test("v0.9.8-增补 K-5（优先档）：板侧建议清单 == 规范源 PROTOCO
   );
 });
 
-test("件5-③b（管理页 · warn 档）：warnings 落配置核对卡警示条，仍纯呈现", () => {
+test("件5-③b（管理页 · warn 档）：warnings 落页头核对短条的警示条，仍纯呈现", () => {
   const html = renderOrgSpaceManagePage({
     org: "alpha",
     features: [],

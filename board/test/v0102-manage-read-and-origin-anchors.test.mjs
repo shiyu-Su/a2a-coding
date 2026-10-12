@@ -11,9 +11,9 @@
  *
  * **B. 硬口径 8 · 钉一（不同通路不得合流）** —— 「版本投影读不到」走 `/api/versions` **HTTP 面**、
  *  「项目卡不可达」走 `a2a_projects` **MCP 面**，两条通路各判各的：
- *  · 正向 ⇒ 允许「**有行 + 列全 `—` + 核对卡报读不到**」这一**合法组合**（投影根因码不得漏进项目卡）；
- *  · 反向 ⇒ 项目卡不可达**不得**把核对卡第三行拖成读不到（第三行照常「可读」）；
- *  · stale 档 ⇒ 列取**最后一次投影**照常显号、不带提示，同轮核对卡报「本次读不到」（两卡结论不同源）。
+ *  · 正向 ⇒ 允许「**有行 + 列全 `—` + 短条报读不到**」这一**合法组合**（投影根因码不得漏进项目卡）；
+ *  · 反向 ⇒ 项目卡不可达**不得**把短条第三源拖成读不到（第三源照常「可读」）；
+ *  · stale 档 ⇒ 列取**最后一次投影**照常显号、不带提示，同轮短条报「本次读不到」（两源结论不同源）。
  *
  * **C. 硬口径 8 · 钉二（不得加第 5 档）** —— 8787 **整挂**时两路同源失败，新列**自然不现**：
  *  该不现由「**无表**」产生（项目卡走自己的「不可达」早退分支、表根本不渲），**不是列自己判的**
@@ -21,7 +21,7 @@
  *  **不得**为「8787 整挂」增设第 4 / 5 档。
  *
  * 范围外（归它处）：列的取值三子判据与形制 = N3（`v0102-manage-project-column`）；
- * 核对卡第三行的三态闭集与判据序 = N2（`v0102-config-check-third-row`）；排期页零处钉 = N5。
+ * 第三源的三态闭集与判据序 = N2（`v0102-config-check-third-row`）；排期页零处钉 = N5。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
@@ -42,7 +42,7 @@ import {
 
 const OBSERVED_AT = "2026-10-10T00:00:00.000Z";
 const ORG = "alpha";
-/** ④ 档1（本进程从未读到过投影）的根因码 —— 诚实通道的唯一落点在核对卡。 */
+/** ④ 档1（本进程从未读到过投影）的根因码 —— 诚实通道的唯一落点在页头核对短条。 */
 const NEVER_CODE = "project_versions_group_projection_unreadable";
 
 const GROUPS_OK = {
@@ -97,7 +97,9 @@ function manageHtml(versionProjection, overrides = {}) {
 }
 
 // ---------------------------------------------------------------------------
-// HTML 切片 helpers（区域分立：项目卡 / 新列表 / 核对卡第三行 / 第一行）
+// HTML 切片 helpers（区域分立：项目卡 / 新列表 / 短条第三源 / 短条第一源）
+// ★REQ-2026-10-11-05 ⑧b：⑧ 核对卡已降级为页头短条 ⇒ 取行对象从卡表 `<tr>` 换成
+//   「标签 → `<b>` 档位词」段 + 该源说明 `<li>`（与 `v0102-config-check-third-row` 同法）。
 // ---------------------------------------------------------------------------
 
 /** 新列所在的表（按新表头三段定位，与 N3 同法）。 */
@@ -120,14 +122,38 @@ function projectCardMeta(html) {
   return hit === null ? null : hit[1];
 }
 
-function versionRow(html) {
-  const hit = html.match(/<tr[^>]*><td>引擎版本台账投影[\s\S]*?<\/tr>/);
-  return hit === null ? "" : hit[0];
+const LABEL_GROUPS = "声明面成员（3300 <code>GET /api/groups</code>）";
+const LABEL_VERSION = "引擎版本台账投影（project 档 · <code>GET /api/versions</code>）";
+
+/** 页头短条正文（`<p class="hint">核对源健康度：…</p>` 冒号之后）；短条不在场 ⇒ ""。 */
+function barText(html) {
+  const hit = html.match(/<p class="hint">核对源健康度：([\s\S]*?)<\/p>/);
+  return hit === null ? "" : hit[1];
 }
 
-function groupsRow(html) {
-  const hit = html.match(/<tr[^>]*><td>声明面成员[\s\S]*?<\/tr>/);
-  return hit === null ? "" : hit[0];
+/** 短条内某源那一档（标签起 → 其 `<b>` 档位词止）+ 该源的说明 `<li>`；该源不参评 ⇒ ""。 */
+function barFace(html, label) {
+  const bar = barText(html);
+  const at = bar.indexOf(label);
+  if (at < 0) return "";
+  const segHit = bar.slice(at).match(/^[\s\S]*?<b>[^<]*<\/b>/);
+  const liAt = html.indexOf(`<li>${label}：`);
+  const liEnd = liAt < 0 ? -1 : html.indexOf("</li>", liAt);
+  const note = liEnd < 0 ? "" : html.slice(liAt, liEnd + 5);
+  return (segHit === null ? "" : segHit[0]) + note;
+}
+
+/** 短条内某源的档位词（`未装配` / `读不到` / `本次读不到` / `可读`）；不参评 ⇒ ""。 */
+function barTier(html, label) {
+  const hit = barFace(html, label).match(/<b>([^<]*)<\/b>/);
+  return hit === null ? "" : hit[1];
+}
+
+/** 负钉护栏：短条段为空时「某串不在场」的断言会退化成恒真 ⇒ 先钉住在场。 */
+function barFacePresent(html, label, where) {
+  const face = barFace(html, label);
+  assert.notEqual(face, "", `${where}：「${label.slice(0, 8)}…」短条段须在场（否则本条负钉是恒真锚）`);
+  return face;
 }
 
 // ---------------------------------------------------------------------------
@@ -253,7 +279,7 @@ test("N4-A4（★页内单点钉）pageOrgSpaceManage 的 fan-out 内 versionPro
 // B. 硬口径 8 · 钉一 —— 投影读不到 ⇎ 项目卡不可达（两条通路不得合流）
 // ===========================================================================
 
-test("N4-B1（★合法组合 · 真通路）投影读不到 ∧ 运行态可读 ⇒「有行 + 列全 — + 核对卡报读不到」", async () => {
+test("N4-B1（★合法组合 · 真通路）投影读不到 ∧ 运行态可读 ⇒「有行 + 列全 — + 短条报读不到」", async () => {
   await withManageServer({ engineVersionsFetcher: engineProjectionAbsentFetcher() }, async (base) => {
     const res = await fetch(`${base}/org/${ORG}/manage`);
     assert.equal(res.status, 200, "HTTP 面读不到不得炸页");
@@ -263,8 +289,9 @@ test("N4-B1（★合法组合 · 真通路）投影读不到 ∧ 运行态可读
     assert.match(table, /<td>—<\/td>/, "无号可取 ⇒ 列显 —");
     assert.equal(projectCardMeta(html), "运行态 1 项", "项目卡走自己的正常档");
     assert.equal(projectCard(html).includes("不可达"), false, "★投影根因不得并入项目卡的 !outcome.ok 分支");
-    assert.equal(projectCard(html).includes(NEVER_CODE), false, "根因码唯一落点 = 核对卡，不得漏进列体");
-    assert.match(versionRow(html), new RegExp(NEVER_CODE), "核对卡如实报第三源读不到");
+    assert.equal(projectCard(html).includes(NEVER_CODE), false, "根因码唯一落点 = 页头核对短条，不得漏进列体");
+    assert.equal(barTier(html, LABEL_VERSION), "读不到", "短条走第三源自己的档");
+    assert.match(barFacePresent(html, LABEL_VERSION, "B1"), new RegExp(NEVER_CODE), "短条如实报第三源读不到");
     assert.equal(html.includes("配置齐备"), false, "第三源读不到 ⇒ 不谎报齐备");
   });
 });
@@ -275,35 +302,37 @@ test("N4-B1b 同档的纯视图面：projection=null 与老引擎 absent 两档�
     assert.equal(projectCardMeta(html), "运行态 1 项", `${name} ⇒ 项目卡仍走正常档`);
     assert.match(projectsTable(html), /<th>已发布的最新版本号<\/th>/, `${name} ⇒ 列照渲`);
     assert.match(projectsTable(html), /<td>—<\/td>/, `${name} ⇒ 列显 —`);
-    assert.match(versionRow(html), /<span class="b-badge danger">读不到<\/span>/, `${name} ⇒ 核对卡走自己的档`);
+    assert.equal(barTier(html, LABEL_VERSION), "读不到", `${name} ⇒ 短条走自己的档（原卡表 danger 徽标）`);
+    barFacePresent(html, LABEL_VERSION, `${name} B1b`);
   }
   const absent = manageHtml(feed(absentProjection));
   assert.equal(projectCard(absent).includes("project_versions_field_missing"), false, "老引擎根因码不落项目卡");
-  assert.match(versionRow(absent), /project_versions_field_missing/, "根因码在核对卡（唯一诚实通道）");
+  assert.match(barFace(absent, LABEL_VERSION), /project_versions_field_missing/, "根因码在页头核对短条（唯一诚实通道）");
 });
 
-test("N4-B2（★反向不合流 · 真通路）项目卡不可达 ∧ 投影可读 ⇒ 核对卡第三行照常「可读」", async () => {
+test("N4-B2（★反向不合流 · 真通路）项目卡不可达 ∧ 投影可读 ⇒ 短条第三源照常「可读」", async () => {
   await withManageServer({ projectsFetcherThrows: true }, async (base) => {
     const res = await fetch(`${base}/org/${ORG}/manage`);
     assert.equal(res.status, 200);
     const html = await res.text();
     assert.match(projectCard(html), /不可达（<code>org_query_failed<\/code>）/, "MCP 面失败走项目卡自己的档");
     assert.equal(projectsTable(html), "", "不可达档不补表");
-    assert.match(versionRow(html), /<span class="b-badge ok">可读<\/span>/, "★HTTP 面不受牵连");
-    assert.equal(versionRow(html).includes("org_query_failed"), false, "项目卡根因不得并进第三行");
+    assert.equal(barTier(html, LABEL_VERSION), "可读", "★HTTP 面不受牵连");
+    assert.equal(barFacePresent(html, LABEL_VERSION, "B2").includes("org_query_failed"), false, "项目卡根因不得并进第三源档");
     assert.equal(html.includes(NEVER_CODE), false, "投影读到了 ⇒ 不出「从未读到」根因");
   });
 });
 
-test("N4-B3（stale 也是合法组合）列取最后一次投影照常显号、不带提示 ∧ 核对卡报「本次读不到」", () => {
+test("N4-B3（stale 也是合法组合）列取最后一次投影照常显号、不带提示 ∧ 短条报「本次读不到」", () => {
   const html = manageHtml(feed(liveProjection, "引擎版本台账投影不可读（versions_unreachable · 夹具）"));
   assert.match(projectsTable(html), /<td>v0\.10\.2<\/td>/, "值取最后一次投影 ⇒ 列不空、也不因 stale 退成 —");
   assert.equal(projectsTable(html).includes("versions_unreachable"), false, "列体不带根因");
   assert.equal(projectsTable(html).includes("本次读不到"), false, "列不带 stale 提示（裁定④）");
-  assert.match(versionRow(html), /<span class="b-badge danger">本次读不到<\/span>/);
-  assert.match(versionRow(html), /值取最后一次投影/);
+  const face = barFacePresent(html, LABEL_VERSION, "B3");
+  assert.equal(barTier(html, LABEL_VERSION), "本次读不到");
+  assert.match(face, /值取最后一次投影/);
   assert.equal(projectCardMeta(html), "运行态 1 项", "stale 不改写项目卡分支（同一合流禁令）");
-  assert.equal(html.includes("配置齐备"), false, "两卡结论不同源 ⇒ 不谎报齐备");
+  assert.equal(html.includes("配置齐备"), false, "两源结论不同源 ⇒ 不谎报齐备");
 });
 
 // ===========================================================================
@@ -321,18 +350,19 @@ test("N4-C1（★8787 整挂）两路同源失败 ⇒ 无表 + 全页零处新�
       assert.equal(projectsTable(html), "");
       assert.equal(projectCardMeta(html), "不可达", "走既有早退档，不是新增档");
       assert.match(projectCard(html), /不可达（<code>org_query_failed<\/code>）/);
-      assert.match(versionRow(html), new RegExp(NEVER_CODE), "核对卡走既有档1");
+      assert.match(barFacePresent(html, LABEL_VERSION, "C1"), new RegExp(NEVER_CODE), "短条走既有档1");
       assert.equal(html.includes("配置齐备"), false);
     },
   );
 });
 
-test("N4-C1b 整挂只挂 8787：声明面（3300）那一行照常可读 ⇒ 降级按源收口、不陪绑", async () => {
+test("N4-C1b 整挂只挂 8787：声明面（3300）那一档照常可读 ⇒ 降级按源收口、不陪绑", async () => {
   await withManageServer(
     { projectsFetcherThrows: true, engineVersionsFetcher: engineProjectionAbsentFetcher() },
     async (base) => {
       const html = await (await fetch(`${base}/org/${ORG}/manage`)).text();
-      assert.match(groupsRow(html), /<span class="b-badge ok">可读<\/span>/, "3300 没挂 ⇒ 第一行不得陪绑降级");
+      assert.equal(barTier(html, LABEL_GROUPS), "可读", "3300 没挂 ⇒ 第一源不得陪绑降级");
+      barFacePresent(html, LABEL_GROUPS, "C1b");
     },
   );
 });

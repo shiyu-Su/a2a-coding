@@ -537,14 +537,18 @@ test("三轮N1-⑧vendored mermaid 资产完好性（N2c 摘除只及详情页�
 // ---------------------------------------------------------------------------
 // N2a（v0.10.3 板详情页重构 · 构图与六态纯函数层）：
 // N-3 六态映射逐格 / N-4 编号一致性 / N-5 排序键确定性。
-// queueState 字面值以 N1 探针（改造文档 §2 M-3）为准 = running/queued/settled，无 claimed。
+// queueState 值域事实源 = 引擎读面真机回执（REQ-2026-10-11-04 核实）= claimed（在飞）/
+// settled（排队，未派发）；running / queued 是板历史同义词，仍在白名单内。
 // ---------------------------------------------------------------------------
 
 test("N2a-N3六态映射：completed/working×queueState/failed/blocked/input-required 逐格 + 回落不吞不猜", () => {
-  // N1 交回字面值与派发文本一致断言（若桥侧值域漂移，本条先红）
-  assert.deepEqual([...QUEUE_STATE_RUNNING], ["running"], "「已认领」档原值 = N1 交回的 running");
-  assert.deepEqual([...QUEUE_STATE_QUEUED], ["queued"], "「排队」档原值 = N1 交回的 queued");
-  assert.ok(!QUEUE_STATE_RUNNING.has("claimed") && !QUEUE_STATE_QUEUED.has("claimed"), "板内样本无 claimed，不得硬编码");
+  // 白名单 = 实测值 + 历史同义词（若桥侧值域漂移，本条先红）
+  assert.deepEqual([...QUEUE_STATE_RUNNING].sort(), ["claimed", "running"], "「已认领」档 = 实测 claimed + 板历史同义词 running（闭合，不多不少）");
+  assert.equal(QUEUE_STATE_RUNNING.size, 2, "白名单不得静默长第三枚同义词（新增须过边界轮）");
+  assert.deepEqual([...QUEUE_STATE_QUEUED].sort(), ["queued", "settled"], "「排队」档 = 实测 settled + 板历史同义词 queued（闭合，不多不少）");
+  assert.equal(QUEUE_STATE_QUEUED.size, 2, "白名单不得静默长第三枚同义词（新增须过边界轮）");
+  assert.ok(QUEUE_STATE_RUNNING.has("claimed"), "claimed = 实测在飞档（M-3 翻案，REQ-2026-10-11-04 核实）");
+  assert.ok(QUEUE_STATE_QUEUED.has("settled"), "settled = 实测排队档");
 
   assert.equal(nodeStateOf(task("t1", "completed"), null).key, "done");
   assert.equal(nodeStateOf(task("t1", "failed"), null).key, "failed");
@@ -552,9 +556,9 @@ test("N2a-N3六态映射：completed/working×queueState/failed/blocked/input-re
   assert.equal(nodeStateOf(task("t1", "input-required"), null).key, "ask");
   assert.equal(nodeStateOf(task("t1", "working", [], { queueState: "running" }), null).key, "running");
   assert.equal(nodeStateOf(task("t1", "working", [], { queueState: "queued" }), null).key, "queued");
-  // 回落第七格：null / 已核集之外的值（含 settled）⇒ unknown，**不得判成 queued**
+  // 回落格：null / 命中集之外的值 ⇒ unknown，**不得判成 queued**
   assert.equal(nodeStateOf(task("t1", "working", [], { queueState: null }), null).key, "unknown", "null ⇒ 回落，不是 queued");
-  assert.equal(nodeStateOf(task("t1", "working", [], { queueState: "settled" }), null).key, "unknown", "已核集之外的值 ⇒ 回落");
+  assert.equal(nodeStateOf(task("t1", "working", [], { queueState: "settled" }), null).key, "queued", "settled 命中第 3 档（补键前误落回落）");
   assert.equal(nodeStateOf(task("t1", "working", [], { queueState: "" }), null).key, "unknown", "空串按缺省处理 ⇒ 回落");
   assert.equal(nodeStateOf(task("t1", "working"), null).key, "unknown");
   // claimedAt 非空不作主判（不得据此判 running）
@@ -570,6 +574,48 @@ test("N2a-N3六态映射：completed/working×queueState/failed/blocked/input-re
   assert.equal(nodeStateOf(task("t1", "working", [], { queueState: null }), null).label, "执行中（不可辨）");
   assert.equal(nodeStateOf(task("t1", "working", [], { queueState: "weird" }), null).label, "执行中(weird)", "未知原样值出「原样值」，不吞不猜");
   assert.equal(nodeStateOf(task("t1", "mystery-state"), null).label, "mystery-state", "未知 state 延续原样态名口径");
+});
+
+test("REQ-04真机值域补键：claimed/settled 映射 + 补键不误染 state 五档 + 图上不带被挡原因", () => {
+  // 实测在飞档 claimed ⇒ running
+  assert.equal(nodeStateOf(task("t1", "working", [], { queueState: "claimed" }), null).key, "running", "claimed = 实测在飞档");
+  assert.equal(nodeStateOf(task("t1", "working", [], { queueState: "claimed" }), null).label, "执行中·已认领", "claimed 走既有 running 展示词");
+  // 实测排队档 settled ⇒ queued
+  assert.equal(nodeStateOf(task("t1", "working", [], { queueState: "settled" }), null).key, "queued", "settled = 实测排队档");
+  // 交叉例：settled ∧ claimedAt/queuedAt 皆 null ⇒ 仍 queued（主判只认 queueState，缺时刻不降档）
+  assert.equal(
+    nodeStateOf(task("t1", "working", [], { queueState: "settled", claimedAt: null, queuedAt: null }), null).key,
+    "queued",
+    "实测 settled 行可无 claimedAt/queuedAt ⇒ 主判只认 queueState，缺时刻不降档",
+  );
+  // 不反推例：claimed 行也带 finishedAt ⇒ 不得用时间戳反推在飞
+  assert.equal(
+    nodeStateOf(
+      task("t1", "working", [], {
+        queueState: "claimed",
+        startedAt: "2026-10-11T00:00:00Z",
+        finishedAt: "2026-10-11T00:05:00Z",
+      }),
+      null,
+    ).key,
+    "running",
+    "实测 claimed 行也带 finishedAt ⇒ 主判只认 queueState，不得用时间戳反推在飞",
+  );
+  // 补键不误染 state 五档：blocked / completed 分支先于 working
+  assert.equal(nodeStateOf(task("t1", "blocked", [], { queueState: "settled" }), null).key, "frozen", "补 settled 不误染冻结节点");
+  assert.equal(nodeStateOf(task("t1", "completed", [], { queueState: "settled" }), null).key, "done", "补 settled 不误染已完成节点");
+  // trace 兜底取数路径同样吃到补键
+  assert.equal(
+    nodeStateOf(task("t1", "working"), { queueState: "claimed", waitReason: "ready_pending_dispatch" }).key,
+    "running",
+    "trace 兜底路径的 claimed 同样命中 running",
+  );
+  // 可证伪例：详情面 tasks 行无 waitReason 键 ⇒ 图面第 3 档不带被挡原因（enrichment 未纳入本卡）
+  assert.equal(
+    nodeStateOf(task("t1", "working", [], { queueState: "settled" }), null).waitReason,
+    null,
+    "详情面 tasks 行不带 waitReason ⇒ 图面 queued 档无被挡原因（enrichment 未纳入本卡，不得视为已落地）",
+  );
 });
 
 test("N2a-N4管道分组与编号一致性：6 任务 / 3 project ⇒ 3 条管道 projectId 升序、组内序 = taskOrdinalMap 号序、节点集不丢不重", () => {

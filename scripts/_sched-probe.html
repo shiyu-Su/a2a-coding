@@ -1,0 +1,2379 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<meta name="referrer" content="same-origin">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>空间 · a2a-coding · 排期 · board</title>
+<style>
+  /* REQ-2026-09-30-04 §2.0：--b- 设计 token 层（浅色单档，值取自原型稿 v2.3）。
+     本层是「唯一取色/取尺度入口」的预备件：既有规则内的字面量替换属后续节点，本轮只建层。 */
+  :root {
+    color-scheme: light;
+    /* 品牌 */
+    --b-brand: #2f6f9e;
+    --b-brand-ink: #1f4f73;
+    --b-brand-soft: #e8f1f8;
+    --b-brand-line: #b7d2e6;
+    /* 语义（前景 / 底 / 线 三档一组）：ok · warn · danger · locked */
+    --b-ok: #1f7a44;
+    --b-ok-bg: #e7f4ec;
+    --b-ok-line: #a9d8ba;
+    --b-warn: #9a6100;
+    --b-warn-bg: #fbf1e0;
+    --b-warn-line: #e6c489;
+    --b-danger: #b42318;
+    --b-danger-bg: #fbe9e7;
+    --b-danger-line: #e8a29c;
+    --b-locked: #6f4e21;
+    --b-locked-bg: #f3e5d0;
+    --b-locked-line: #a67c52;
+    /* 文本（1 主 · 2 次 · 3 弱 · 4 最弱） */
+    --b-text: #28323c;
+    --b-text-2: #46586a;
+    --b-text-3: #64727d;
+    --b-text-4: #7d8794;
+    /* 面与线 */
+    --b-bg: #f4f6f8;
+    --b-surface: #ffffff;
+    --b-surface-2: #f8fafc;
+    --b-line: #d8dee4;
+    --b-overlay: rgba(15, 23, 32, .45);
+    /* 尺度 · 字号 */
+    --b-fs-11: 11px;
+    --b-fs-12: 12px;
+    --b-fs-13: 13px;
+    --b-fs-14: 14px;
+    --b-fs-15: 15px;
+    --b-fs-18: 18px;
+    /* 尺度 · 间距 */
+    --b-sp-4: 4px;
+    --b-sp-6: 6px;
+    --b-sp-8: 8px;
+    --b-sp-12: 12px;
+    --b-sp-16: 16px;
+    --b-sp-24: 24px;
+    /* 尺度 · 圆角 */
+    --b-r-3: 3px;
+    --b-r-4: 4px;
+    --b-r-6: 6px;
+    --b-r-8: 8px;
+    /* 尺度 · 列宽与投影 */
+    --b-kcol-w: 264px;
+    --b-feat-side: 264px;
+    --b-shadow-1: 0 1px 2px rgba(15, 23, 32, .08);
+    --b-shadow-2: 0 6px 24px rgba(15, 23, 32, .16);
+  }
+  * { box-sizing: border-box; }
+  /* REQ-2026-09-30-04 件1：全站外壳 = grid〔216px 固定侧栏 | 主区〕（原型 v2.3 样张①） */
+  body { margin: 0; display: grid; grid-template-columns: 216px minmax(0, 1fr); min-height: 100vh; font: 14px/1.55 system-ui, "Segoe UI", "Microsoft YaHei", sans-serif; color: var(--b-text); background: var(--b-bg); }
+  h1 { font-size: 18px; margin: 0 0 6px; }
+  h2 { font-size: 15px; margin: 24px 0 8px; border-bottom: 1px solid #8884; padding-bottom: 4px; }
+  /* ── 件1 外壳：侧栏（品牌 / 一级菜单 / 二级项目组菜单）── */
+  .sidebar { position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto; background: var(--b-surface); border-right: 1px solid var(--b-line); padding: var(--b-sp-16) 0 var(--b-sp-24); }
+  .brand { padding: 0 var(--b-sp-16) var(--b-sp-12); font-size: var(--b-fs-15); font-weight: 700; letter-spacing: .02em; color: var(--b-brand-ink); }
+  nav { display: block; margin: 0 0 var(--b-sp-4); }
+  nav a { display: block; padding: var(--b-sp-6) var(--b-sp-16); font-size: var(--b-fs-13); color: var(--b-text-2); text-decoration: none; border-left: 2px solid transparent; }
+  /* 当前态 = 品牌浅底 + 左侧 2px 色条 */
+  nav a.on { background: var(--b-brand-soft); border-left-color: var(--b-brand); color: var(--b-brand-ink); font-weight: 600; }
+  .side-orgs { margin-top: var(--b-sp-12); }
+  .side-orgs-label { margin: 0 var(--b-sp-16) var(--b-sp-4); font-size: var(--b-fs-11); color: var(--b-text-4); }
+  .side-orgs a { display: block; padding: var(--b-sp-4) var(--b-sp-16) var(--b-sp-4) var(--b-sp-24); font-size: var(--b-fs-13); color: var(--b-text-2); text-decoration: none; }
+  /* 当前空间 = 缩进项高亮圆点 */
+  .side-orgs a.on { color: var(--b-brand-ink); font-weight: 600; }
+  .side-orgs a.on::before { content: "●"; font-size: 8px; color: var(--b-brand); margin-right: var(--b-sp-6); vertical-align: 2px; }
+  /* ── 件1 外壳：主区（页标题栏 + 内容画布）── */
+  .main-col { min-width: 0; padding: var(--b-sp-16) var(--b-sp-24) 0; }
+  .page-head { display: flex; align-items: baseline; justify-content: space-between; gap: var(--b-sp-12); margin: 0 0 var(--b-sp-12); }
+  .page-head h1 { margin: 0; }
+  .page-actions { display: flex; gap: var(--b-sp-8); }
+  main { padding-bottom: var(--b-sp-24); }
+  .hint { color: #777; margin: 6px 0; }
+  .hint.err { color: #b42318; }
+  .hint.warn { color: #b26a00; }
+  pre.result { background: #8881; border: 1px solid #8884; border-radius: 6px; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, Consolas, monospace; font-size: 12px; margin: 6px 0; }
+  table { border-collapse: collapse; width: 100%; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
+  th, td { border: 1px solid #8884; padding: 4px 6px; text-align: left; vertical-align: top; }
+  th { background: #8881; }
+  td.empty { color: #888; }
+  tr.warn td { color: #b42318; }
+  .muted { color: #888; font-size: 11px; }
+  .mono { font-family: ui-monospace, Consolas, monospace; }
+  ul.notes { color: #777; font-size: 12px; margin: 10px 0 0; padding-left: 18px; }
+  form { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
+  form.w { flex-direction: column; align-items: stretch; gap: 6px; padding: 10px 12px; border: 1px solid #8884; border-radius: 6px; }
+  form.w label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: #667; }
+  form.w button { align-self: flex-start; }
+  input, button, select, textarea { font: inherit; padding: 3px 8px; }
+  button:disabled { opacity: .45; cursor: not-allowed; }
+  p.submit-pending { color: #b26a00; font-weight: 600; }
+  p.nextstep { border-left: 3px solid #5678; padding: 4px 10px; background: #8881; border-radius: 0 6px 6px 0; }
+  p.turn-progress { border-left: 3px solid #b26a0088; padding: 4px 10px; background: #8881; border-radius: 0 6px 6px 0; color: #b26a00; }
+  textarea { resize: vertical; }
+  /* v0.9.5 C3/C5/C6：原生 details 折叠（零脚本）+ 档位化动作区按钮 */
+  details.fold { margin: 10px 0; border: 1px solid #8884; border-radius: 6px; padding: 6px 10px; background: #8881; }
+  details.fold > summary { cursor: pointer; font-size: 14px; font-weight: 600; color: #567; }
+  details.fold[open] > summary { margin-bottom: 6px; border-bottom: 1px solid #8884; padding-bottom: 4px; }
+  details.fold h2 { display: inline; font-size: 14px; margin: 0; border: none; }
+  details.fold h3 { font-size: 13px; margin: 14px 0 6px; }
+  /* v0.10.3 N3 遮挡治理的主机制：宽表的溢出带被折叠体自己的横滚吃掉，不再压进相邻轨
+     （.feat-side 是 sticky 定位元素，绘制序在文档流之上 ⇒ 溢出即遮挡）。
+     下方的 @container 回落只管观感，不承担遮挡治理；无 @container 支持时本条依旧成立。 */
+  .fold-body { overflow-x: auto; }
+  details.calib { margin: 6px 0; font-size: 11px; color: #888; }
+  details.calib > summary { cursor: pointer; font-style: italic; }
+  details.req-src { margin: 6px 0; }
+  details.req-src > summary { cursor: pointer; color: #667; background: #8881; border: 1px dashed #8884; border-radius: 6px; padding: 6px 10px; white-space: pre-wrap; word-break: break-word; }
+  button.quiet { align-self: flex-start; font-size: 12px; padding: 2px 10px; opacity: .7; }
+  p.turn-trace { color: #667; }
+  details.turn-summary { margin: 4px 0 0; }
+  details.turn-summary > summary { cursor: pointer; color: #667; background: #8881; border: 1px solid #8884; border-radius: 6px; padding: 4px 8px; white-space: pre-wrap; word-break: break-word; font-size: 12px; }
+  /* v0.9.6 N4：轮回执卡（要点 / 待用户 / 下一步三行 + 产出指引）—— 零脚本，折叠沿用上面的 details 口径 */
+  div.receipt-card { border: 1px solid #8884; border-left: 3px solid #5678; border-radius: 6px; padding: 6px 10px; margin: 6px 0; background: #8881; }
+  div.receipt-card p.receipt-row { margin: 2px 0; color: #445; font-size: 13px; }
+  div.receipt-card p.receipt-row b { color: #567; }
+  div.receipt-card p.receipt-docs { margin: 6px 0 2px; font-size: 12px; }
+  div.receipt-card + details.turn-summary { margin-top: 6px; }
+  code { background: #8881; padding: 0 3px; border-radius: 3px; }
+  .md h1 { font-size: 17px; margin: 18px 0 6px; }
+  .md h2 { font-size: 15px; }
+  .md h3 { font-size: 14px; }
+  .md h4, .md h5, .md h6 { font-size: 13px; margin: 16px 0 6px; }
+  .md p { margin: 8px 0; }
+  .md ul, .md ol { margin: 8px 0; padding-left: 22px; }
+  .md li { margin: 2px 0; }
+  .md-t th, .md-t td { font-family: inherit; font-size: 13px; }
+  blockquote.md-q { margin: 8px 0; padding: 4px 10px; border-left: 3px solid #8886; color: #667; background: #8881; border-radius: 0 6px 6px 0; }
+  .md .mermaid-block { margin: 10px 0; overflow-x: auto; }
+  .md .mermaid-block[data-rendered="1"] pre.mermaid-src { display: none; }
+  .md .mermaid-block[data-rendered="1"] .mermaid-svg:empty { display: none; }
+  .md .mermaid-block svg { max-width: 100%; height: auto; }
+  /* v0.10.3 N2c 依赖图管道制（自绘 DOM/CSS · 零脚本）：管道 = 每 project 一枚原生 details，
+     体内只有 chip 与箭头（零连线坐标层）；横滚职责由原 .dep-graph .mermaid-block 迁到 .pipe-body。
+     取色只引既有 --b-* token —— 状态色的事实源仍是 graph-view 的 TASK_STATE_COLORS（图例 inline style）。 */
+  .pipe { border: 1px solid var(--b-line); border-radius: var(--b-r-6); margin-bottom: var(--b-sp-8); background: var(--b-surface-2); }
+  .pipe > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: var(--b-sp-8); padding: var(--b-sp-6) var(--b-sp-12); font-size: var(--b-fs-13); font-weight: 600; color: var(--b-text); }
+  .pipe > summary::-webkit-details-marker { display: none; }
+  .pipe-body { display: flex; align-items: center; flex-wrap: wrap; gap: 0; padding: var(--b-sp-8) var(--b-sp-12) var(--b-sp-12); overflow-x: auto; }
+  .dg-chip { display: inline-flex; align-items: center; gap: var(--b-sp-4); border: 1px solid var(--b-line); border-radius: var(--b-r-8); padding: 2px var(--b-sp-8); font-size: var(--b-fs-12); background: var(--b-surface); color: var(--b-text); white-space: nowrap; }
+  /* v0.10.3 增补 A1 chip 六态着色补齐：上条基础规则只给中性 border/background ⇒ 状态类是空钩子。
+     本组七条 = dg-<NodeState key> 闭集（done/running/queued/failed/frozen/ask/unknown，与 graph-view
+     NODE_STATE_ORDER 同序）；色值逐字复用图例在用的同一事实源 graph-view NODE_STATE_COLORS
+     （其值 = TASK_STATE_COLORS 的重新指派 + ask 既有色 + 回落 NEUTRAL_TASK_COLOR），CSS 侧不新造色值。
+     chip 可见文字仍恒为 #编号（不加 ●◐○ 状态符，状态由本组配色与 title 承载）。 */
+  .dg-chip.dg-done { border-color: #dafbe1; background: #dafbe1; }      /* ← TASK_STATE_COLORS.completed */
+  .dg-chip.dg-running { border-color: #e3eef7; background: #e3eef7; }   /* ← TASK_STATE_COLORS.working */
+  .dg-chip.dg-queued { border-color: #fff4ce; background: #fff4ce; }    /* ← TASK_STATE_COLORS 的 input-required 档（图例同档转派） */
+  .dg-chip.dg-failed { border-color: #ffe7e6; background: #ffe7e6; }    /* ← TASK_STATE_COLORS.failed */
+  .dg-chip.dg-frozen { border-color: #f3e5d0; background: #f3e5d0; }    /* ← TASK_STATE_COLORS.blocked */
+  .dg-chip.dg-ask { border-color: #ece2fb; background: #ece2fb; }       /* ← NODE_STATE_COLORS.ask（图例在用的既有色） */
+  .dg-chip.dg-unknown { border-color: #f2f3f5; background: #f2f3f5; }   /* ← NEUTRAL_TASK_COLOR（不可辨，不表具体态） */
+  .dg-arrow { color: var(--b-text-4); padding: 0 var(--b-sp-6); font-size: var(--b-fs-13); }
+  .dg-dep { font-size: var(--b-fs-11); color: var(--b-text-3); border: 1px solid var(--b-line); border-radius: var(--b-r-8); padding: 0 var(--b-sp-4); margin-left: 2px; }
+  .dg-edges { margin-top: var(--b-sp-4); font-size: var(--b-fs-12); color: var(--b-text-3); }
+  .dg-legend { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; font-size: 12px; color: #667; }
+  .dg-legend i { display: inline-block; width: 12px; height: 12px; border: 1px solid #8886; border-radius: 3px; }
+  a.fl { color: inherit; }
+  /* v0.9.6 B5b（口径 22）：空间二级导航行的当前视图钩子（inline font-weight 保留，本行只管可点态颜色） */
+  a.fl.on { color: inherit; }
+  .err-ov { position: fixed; inset: 0; z-index: 50; display: flex; align-items: center; justify-content: center; background: #0006; padding: 16px; }
+  .err-ov-card { max-width: 560px; width: 100%; background: Canvas; border: 1px solid #b4231888; border-radius: 8px; padding: 14px 18px 16px; box-shadow: 0 6px 24px #0004; }
+  .err-ov-card h2 { font-size: 15px; margin: 0 0 8px; border: none; color: #b42318; padding: 0; }
+  .err-ov-card p { margin: 4px 0; white-space: pre-wrap; word-break: break-word; }
+  .err-ov-card .err-ov-code { color: #888; font-size: 11px; }
+  .err-ov-field { font-size: 12px; margin: 2px 0; }
+  .err-ov-field-label { color: #888; margin-right: 6px; }
+  .err-ov-field-value { color: inherit; word-break: break-word; }
+  .err-ov-card button { margin-top: 10px; }
+  .kanban { display: flex; gap: 12px; align-items: flex-start; overflow-x: auto; padding-bottom: 6px; }
+  .kcol { flex: 0 0 260px; border: 1px solid #8884; border-radius: 6px; background: #8881; padding: 6px 8px 8px; }
+  /* 件3（REQ-2026-09-30-04）：卡两层化（标题行 ≤2 行截断 + 一行元信息）
+     增补五 件A（REQ-2026-10-02-05）：卡内固定四行序（名称 → id 行 → 状态徽标 → 阶段+任务数）
+     —— 行为类 .kcard / .kcard[draggable="true"] / .kcol / .kcol.dragover 逐字未改（拖拽双条件闸契约） */
+  .kcol > h3 { font-size: 13px; margin: 2px 0 8px; border-bottom: 1px solid #8884; padding: 2px 22px 4px 2px; position: sticky; top: 0; z-index: 1; background: var(--b-surface); border-radius: 4px; }
+  /* 件3 列头 sticky 的滚动面：.kanban 的 overflow-x:auto 使它成为滚动祖先，而它纵向永不滚 ⇒ 列内 sticky 悬不住。
+     故把纵向滚动收到列上（max-height + overflow-y），列头随列内滚动常驻。
+     选择器锁 #schedule-board ⇒ 组织门户（#org-portal）版式零影响。 */
+  #schedule-board > .kcol { max-height: calc(100vh - 120px); overflow-y: auto; padding-top: 0; }
+  #schedule-board > .kcol > h3 { margin-top: 0; padding-top: 6px; }
+  .kcard { border: 1px solid #8884; border-radius: 6px; background: Canvas; padding: 6px 8px; margin: 0 0 6px; font-size: 12px; }
+  .kcard > .khd { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; }
+  .kcard > .khd > a { overflow: hidden; display: -webkit-box; -webkit-box-orient: vertical; -webkit-line-clamp: 2; line-clamp: 2; word-break: break-word; }
+  /* 增补五 件A：状态徽标搬出 .khd 独立成行 ⇒ 行内容右靠（.kbadge 的全局 float: right 在 flex 容器内不生效，无需改基元） */
+  .kcard > .kbadge-line { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 2px 6px; margin: 4px 0 0; }
+  .kcard[draggable="true"] { cursor: grab; }
+  /* 增补五 件B（REQ-2026-10-02-05）：按状态着色 —— 卡根档类 kst-档（六档闭集，
+     规则源 derive.ts 的 deriveCardColorTier）= 左缘 3px 色条 + soft 底色；
+     取色一律引既有 --b- token，零新色值。locked 档为显式锁定语义预留；
+     「已发版」（completed ∧ stage=发版）的派生显示归 ok。 */
+  .kcard.draglocked { opacity: .75; } /* 件B：.55 → .75 —— 状态色条优先，避免双层压暗致色条不可见 */
+  .kcard .draglock { color: #b26a00; border-color: #b26a0088; }
+  .kcard.kst-brand { border-left: 3px solid var(--b-brand); background: var(--b-brand-soft); }
+  .kcard.kst-warn { border-left: 3px solid var(--b-warn); background: var(--b-warn-bg); }
+  .kcard.kst-ok { border-left: 3px solid var(--b-ok); background: var(--b-ok-bg); }
+  .kcard.kst-locked { border-left: 3px solid var(--b-locked); background: var(--b-locked-bg); }
+  .kcard.kst-danger { border-left: 3px solid var(--b-danger); background: var(--b-danger-bg); }
+  .kcard.kst-neutral { border-left: 3px solid var(--b-line); background: var(--b-surface-2); }
+  .kcol.dragover { outline: 2px dashed #5b86a8; outline-offset: -2px; }
+  /* v0.9.8 两栏拖拽增删项目（REQ-2026-10-03-02）：池 / 本组两栏与拖拽态 ——
+     行为类另立一族（.m-pool / .mcol / .mrow），.kcol / .kcard 的排期拖拽契约逐字不动；
+     取色一律引既有 --b- token（同增补五 件B 口径）。 */
+  .m-pool { display: flex; gap: 10px; align-items: flex-start; flex-wrap: wrap; }
+  .mcol { flex: 1 1 240px; min-width: 0; border: 1px solid var(--b-line); border-radius: 6px; background: var(--b-surface-2); padding: 6px 8px 8px; min-height: 84px; }
+  .mcol-h { font-size: 12px; font-weight: 600; margin: 0 0 6px; color: #567; }
+  .mcol-sub { font-weight: 400; color: #778; font-size: 11px; margin-left: 6px; }
+  .mrow { border: 1px solid #8884; border-radius: 6px; background: Canvas; padding: 4px 7px; margin: 0 0 5px; font-size: 12px; }
+  .mrow[draggable="true"] { cursor: grab; }
+  .mcol.dragover { outline: 2px dashed #5b86a8; outline-offset: -2px; }
+  .m-fold { margin: 6px 0 0; }
+  .m-fold > summary { cursor: pointer; color: #567; font-size: 12px; }
+  .err-ov-card.drag-err-overlay { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; width: min(560px, 92vw); z-index: 70; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }
+  /* 增补二 §9.1-②：data-ov 写表单 fetch 报错的浮层卡（与拖拽错误卡同款版式，不跳页） */
+  .err-ov-card.ov-err-overlay { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; width: min(560px, 92vw); z-index: 70; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }
+  .kbadge { float: right; margin-left: 6px; font-size: 11px; color: #567; border: 1px solid #8886; border-radius: 8px; padding: 0 6px; white-space: nowrap; }
+  .vbadge { float: none; cursor: help; }
+  .vbadge.locked { color: #654321; border-color: #a67c52; background: #f3e5d0; font-weight: 600; }
+  .vbadge.wip { color: #25567a; border-color: #5b86a8; background: #e3eef7; }
+  .vbadge.closed { color: #3a5a40; border-color: #6b8f71; background: #e6f0e8; }
+  .vbadge.notstart { color: #666; border-color: #9996; background: #ddd4; }
+  /* 增补十一 E2（§9.6）：删除入口 × 钉在版本框头右上角（仅未开始版本渲染本表单）
+     —— E3 撤除列头操作行（.vops / form.vop）后，版本列头仅剩本一处写入口 */
+  .kcol > h3 form.vdel { position: absolute; top: -2px; right: 0; margin: 0; }
+  .kcol > h3 form.vdel button { font-size: 12px; line-height: 1; padding: 0 5px; color: #a33; background: transparent; border: 1px solid #a336; border-radius: 4px; }
+  .kmeta { margin: 4px 0 0; color: #667; font-size: 11px; }
+  .tpoints { margin: 4px 0 0; padding-left: 16px; color: #667; font-size: 11px; }
+  .tpoints li { margin: 1px 0; }
+  .tpoints .tcurrent { color: inherit; font-weight: 600; }
+  dialog.fd { width: min(880px, 92vw); max-height: 86vh; overflow-y: auto; margin: auto; border: 1px solid #8888; border-radius: 8px; padding: 12px 18px 16px; background: Canvas; color: CanvasText; box-shadow: 0 8px 32px #0005; }
+  dialog.fd::backdrop { background: #0006; }
+  dialog.fd > button { margin: 0 0 8px; }
+  dialog.fd .fd-body > h2:first-child { margin-top: 0; }
+  dialog.fd > .err-ov-card { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; z-index: 60; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }
+  /* 件1：页头动作钮改由 .page-head 的 flex 归位到标题右侧（原 float: right 随顶栏形态退役） */
+  /* ── 件5（REQ-2026-09-30-04）：页面卡片基元（空间·任务页 / 空间·管理页）──
+     取色与取尺度一律走 --b- token；与看板 .kcard 分立（看板卡有拖拽语义，不互用）。 */
+  .b-card { border: 1px solid var(--b-line); border-radius: var(--b-r-8); background: var(--b-surface); box-shadow: var(--b-shadow-1); padding: var(--b-sp-12) var(--b-sp-16) var(--b-sp-16); margin: 0 0 var(--b-sp-16); }
+  .b-card > .b-card-h { display: flex; align-items: baseline; justify-content: space-between; gap: var(--b-sp-8); margin: 0 0 var(--b-sp-12); padding-bottom: var(--b-sp-6); border-bottom: 1px solid var(--b-line); font-size: var(--b-fs-14); font-weight: 600; color: var(--b-brand-ink); }
+  .b-card-h > .b-card-meta { font-weight: 400; font-size: var(--b-fs-12); color: var(--b-text-4); }
+  .b-card > :last-child { margin-bottom: 0; }
+  .b-card th { background: var(--b-surface-2); }
+  .b-card th, .b-card td { border-color: var(--b-line); }
+  /* 过滤卡：GET 查询表单不加任何属性（写/读面表单锚逐字保留），靠后代选择器排版 */
+  .b-filter form { flex-wrap: wrap; align-items: flex-end; margin: 0; }
+  .b-filter form label { display: flex; flex-direction: column; gap: 2px; font-size: var(--b-fs-12); color: var(--b-text-3); }
+  .b-filter form input, .b-filter form select { min-width: 150px; }
+  /* 快捷项目 chips（当前项 = 品牌浅底） */
+  .b-chips { display: flex; flex-wrap: wrap; gap: var(--b-sp-6); align-items: center; margin: var(--b-sp-8) 0 0; }
+  .b-chips-label { font-size: var(--b-fs-11); color: var(--b-text-4); margin-right: var(--b-sp-4); }
+  .b-chips a { display: inline-block; padding: 2px 10px; border: 1px solid var(--b-line); border-radius: 999px; background: var(--b-surface-2); color: var(--b-text-2); font-size: var(--b-fs-12); text-decoration: none; }
+  .b-chips a:hover { border-color: var(--b-brand-line); color: var(--b-brand-ink); }
+  .b-chips a.on { border-color: var(--b-brand-line); background: var(--b-brand-soft); color: var(--b-brand-ink); font-weight: 600; }
+  /* 并列表单（加 / 减成员双卡）；嵌套在卡内的子卡换浅面，避免与外卡同色失边 */
+  .b-forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--b-sp-12); align-items: start; }
+  .b-forms > .b-card { margin: 0; }
+  .b-card .b-card { background: var(--b-surface-2); }
+  /* 卡内警示条（缺文件 / 末位成员 409 口径 / 齐备态一行） */
+  .b-note { border: 1px solid var(--b-warn-line); border-left: 3px solid var(--b-warn); background: var(--b-warn-bg); color: var(--b-warn); border-radius: var(--b-r-6); padding: var(--b-sp-6) var(--b-sp-12); margin: var(--b-sp-8) 0; font-size: var(--b-fs-12); }
+  .b-note.danger { border-color: var(--b-danger-line); border-left-color: var(--b-danger); background: var(--b-danger-bg); color: var(--b-danger); }
+  .b-note.ok { border-color: var(--b-ok-line); border-left-color: var(--b-ok); background: var(--b-ok-bg); color: var(--b-ok); }
+  /* 状态徽标（任务态 / 核对态） */
+  .b-badge { display: inline-block; padding: 0 var(--b-sp-6); border: 1px solid var(--b-line); border-radius: var(--b-r-3); background: var(--b-surface-2); color: var(--b-text-2); font-size: var(--b-fs-11); white-space: nowrap; }
+  .b-badge.run { border-color: var(--b-brand-line); background: var(--b-brand-soft); color: var(--b-brand-ink); }
+  .b-badge.ok { border-color: var(--b-ok-line); background: var(--b-ok-bg); color: var(--b-ok); }
+  .b-badge.warn { border-color: var(--b-warn-line); background: var(--b-warn-bg); color: var(--b-warn); }
+  .b-badge.danger { border-color: var(--b-danger-line); background: var(--b-danger-bg); color: var(--b-danger); }
+  .b-badge.mute { color: var(--b-text-4); }
+  /* ── REQ-2026-10-11-03 件E：页级就地刷新的恒在壳 / 「上次更新」条 ──
+     壳恒在、内容可空（0→N 首现也能刷出）；取色一律引既有 --b- token，**零新色值**；
+     零新脚本（交互面 = 页面脚本闭集第八枚 {@link PAGE_LIVE_SCRIPT}）。 */
+  .live-slot { display: block; }
+  .live-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--b-sp-6); font-size: var(--b-fs-12); color: var(--b-text-3); }
+  .live-clock { color: var(--b-text-2); }
+  .live-now { margin: 0; padding: 0 var(--b-sp-6); border: 1px solid var(--b-line); border-radius: var(--b-r-3); background: var(--b-surface-2); color: var(--b-text-2); font-size: var(--b-fs-11); cursor: pointer; }
+  /* ── 件2（REQ-2026-09-30-04）：空间 tab 行 / 阶段步条 / 需求详情主·侧两栏 ──
+     取色与取尺度一律走 --b- token；**零新脚本**（tab 高亮 = 服务端渲染的 class，折叠仍是原生 details）。 */
+  /* 空间 tab 行（当前 tab = 品牌浅底 + 下沿 2px；详情页携带本行时无激活态 ⇒ 三枚皆为普通链接） */
+  .b-tabs { margin: 0 0 var(--b-sp-12); padding: 0 var(--b-sp-4) var(--b-sp-4); border-bottom: 1px solid var(--b-line); }
+  .b-tabs > .hint { margin: 0; }
+  .b-tabs a.fl { display: inline-block; margin: 0 var(--b-sp-4); padding: var(--b-sp-4) var(--b-sp-12); border-radius: var(--b-r-4) var(--b-r-4) 0 0; border-bottom: 2px solid transparent; color: var(--b-text-2); text-decoration: none; }
+  .b-tabs a.fl:hover { color: var(--b-brand-ink); background: var(--b-surface-2); }
+  .b-tabs a.fl.on { background: var(--b-brand-soft); border-bottom-color: var(--b-brand); color: var(--b-brand-ink); }
+  /* 阶段步条：五段圆点 + 连线（完成段打勾、当前段实底），替代元数据表的阶段双行 */
+  .b-steps { display: flex; flex-wrap: wrap; align-items: center; gap: var(--b-sp-4); margin: 0 0 var(--b-sp-16); padding: var(--b-sp-8) var(--b-sp-12); border: 1px solid var(--b-line); border-radius: var(--b-r-8); background: var(--b-surface); box-shadow: var(--b-shadow-1); font-size: var(--b-fs-12); }
+  .b-step { display: inline-flex; align-items: center; gap: var(--b-sp-4); color: var(--b-text-3); white-space: nowrap; }
+  .b-step-dot { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border: 1px solid var(--b-line); border-radius: 50%; background: var(--b-surface-2); color: var(--b-ok); font-size: var(--b-fs-11); font-style: normal; }
+  .b-step-name { font-weight: 400; }
+  .b-step.done .b-step-dot { border-color: var(--b-ok-line); background: var(--b-ok-bg); }
+  .b-step.done .b-step-name { color: var(--b-text-2); }
+  .b-step.cur .b-step-dot { border-color: var(--b-brand); background: var(--b-brand); }
+  .b-step.cur .b-step-name { color: var(--b-brand-ink); font-weight: 600; }
+  .b-step-line { display: inline-block; width: 18px; height: 1px; background: var(--b-line); }
+  .b-step-line.done { background: var(--b-brand-line); }
+  .b-steps-cur { margin-left: auto; color: var(--b-text-3); }
+  /* 两栏：主栏自适应 + 侧栏定宽；窄窗（含浮层 dialog 收窄时）回落单列 */
+  .feat-cols { display: grid; grid-template-columns: minmax(0, 1fr) var(--b-feat-side); gap: var(--b-sp-16); align-items: start; }
+  .feat-main, .feat-side { min-width: 0; }
+  .feat-side { position: sticky; top: var(--b-sp-16); }
+  @media (max-width: 900px) {
+    .feat-cols { grid-template-columns: minmax(0, 1fr); }
+    .feat-side { position: static; }
+  }
+  /* v0.10.3 N3 回落单列的**观感**面（原型 v1 锁定：机制 = 容器查询、阈值 = 1000px）：
+     @media 判的是视口宽度，而排期浮层 dialog.fd 宽 min(880px, 92vw) ⇒ 视口 >900 时浮层内
+     **永不回落**；把浮层体声明为 query container 后，回落按**容器**宽度判。
+     ⚠ 本块不治理遮挡（遮挡由上面 .fold-body{overflow-x:auto} 治好）—— 浏览器不认 @container
+     时这里整块失效，观感退回两栏，遮挡不因此复现，故**不得把它当承重墙**。 */
+  dialog.fd .fd-body { container-type: inline-size; }
+  @container (max-width: 1000px) {
+    .feat-cols { grid-template-columns: minmax(0, 1fr); }
+    .feat-side { position: static; }
+  }
+  /* 各块自带原生 <h2> ⇒ 卡头就是它（不叠第二层标题，标题文案与 class 一律不动） */
+  .feat-card > h2:first-child { margin: 0 0 var(--b-sp-12); padding-bottom: var(--b-sp-6); border-bottom: 1px solid var(--b-line); border-radius: 0; font-size: var(--b-fs-14); color: var(--b-brand-ink); }
+  /* 引导卡 = 品牌浅底（引导行文案与 class 不变，只换承载面） */
+  .feat-guide { background: var(--b-brand-soft); border-color: var(--b-brand-line); }
+  .feat-guide > .nextstep { margin: 0; border-left-color: var(--b-brand); background: transparent; }
+  /* 侧栏元数据卡：compact 两列（名 / 值），替代原 4×2 大表 */
+  .b-meta { display: grid; gap: var(--b-sp-4); margin: 0; font-size: var(--b-fs-12); }
+  .b-meta-row { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: var(--b-sp-8); }
+  .b-meta-row dt { color: var(--b-text-3); }
+  .b-meta-row dd { margin: 0; font-family: ui-monospace, Consolas, monospace; word-break: break-word; }
+  /* 侧栏定宽里的表：不撑破卡（依赖图已上移主栏，横滚归 .pipe-body） */
+  .feat-side table { font-size: var(--b-fs-11); }
+</style>
+</head>
+<body>
+<aside class="sidebar">
+<div class="brand">board</div>
+<nav><a href="/">项目组门户</a></nav>
+<div class="side-orgs"><p class="side-orgs-label">项目组</p><a href="/org/a2a-coding/" class="on">a2a-coding</a><a href="/org/probe-dlg/">probe-dlg</a><a href="/org/shop-image/">shop-image</a></div></aside>
+<div class="main-col">
+<header class="page-head">
+<h1>空间 · a2a-coding · 排期</h1><div class="page-actions"><button type="button" id="new-req-open" class="header-actions">＋ 新增需求</button><button type="button" id="new-version-open" class="header-actions" hidden>＋ 新版本</button></div>
+</header>
+<main>
+<div class="b-tabs"><p class="hint">项目组空间 <b>a2a-coding</b>：<a class="fl on" href="/org/a2a-coding/schedule" style="font-weight:700">排期</a> · <a class="fl" href="/org/a2a-coding/tasks">任务</a> · <a class="fl" href="/org/a2a-coding/manage">管理</a></p></div><h2>排期看板</h2><p class="hint live-bar" data-live-note>上次更新 <b class="live-clock mono">--:--:--</b><button type="button" class="fl live-now" data-live-now hidden>⟳ 立即更新</button></p><div class="kanban" id="schedule-board" data-live="sched-board" data-live-interval="30000"><div class="kcol" data-version="">
+<h3>需求池 <span class="muted">(23)</span></h3>
+<div class="kcard kst-warn" draggable="true" data-feature="831192ba-ec33-44e0-ba19-e95b221042c9" data-version="">
+<div class="khd"><a class="fl" href="/features/831192ba-ec33-44e0-ba19-e95b221042c9">测试下放 project：发版回归改为各单元自测（Step 2 增自测步骤）</a></div>
+<p class="kmeta"><span class="mono muted" title="831192ba-ec33-44e0-ba19-e95b221042c9">831192ba</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：用户原话（2026-10-11）：「当前发版会触发回归测试，实际需要将测试 下放到project中（比如step2中增加自测的步骤（stage里有testing，但是实际并没有形成完成的测试吧））」。
+
+要点记录：
+- 现状：发版时由宿主跑…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="1808b6bd-33c7-46f5-927d-23a7457a3df5" data-version="">
+<div class="khd"><a class="fl" href="/features/1808b6bd-33c7-46f5-927d-23a7457a3df5">增补轨流程约束：增补卡 Step 0/1/2 不减配（研发经理出场 + 清单回执强制，直接对话模式同规）</a></div>
+<p class="kmeta"><span class="mono muted" title="1808b6bd-33c7-46f5-927d-23a7457a3df5">1808b6bd</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：用户 2026-10-11 在 v0.10.3 增补卡 `162b504c`（chip 六态着色）验收对话中的流程观察，原话：「所以 执行流程上 还是需要约束：增补卡的step0、step1、step2（研发经理确定任务） 目…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="770de678-3d1d-42e0-8b43-152c663175bb" data-version="">
+<div class="khd"><a class="fl" href="/features/770de678-3d1d-42e0-8b43-152c663175bb">任务要点结构化：研发经理拆任务时显式给出任务要点（派发消息要点行 / 引擎 summary 字段，Step 0 定路径）</a></div>
+<p class="kmeta"><span class="mono muted" title="770de678-3d1d-42e0-8b43-152c663175bb">770de678</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**用户原话（2026-10-11，一字不改）**：「要点是不是可以让研发经理给呢？即研发经理拆分任务的时候，给出任务要点和任务详情这样」
+
+**来源与背景**：v0.10.3 卡 `5b980baf`（板详情页重构）Step 0/1 期间…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="efd2caaf-89c2-40d2-a6cf-b14f61840e1b" data-version="">
+<div class="khd"><a class="fl" href="/features/efd2caaf-89c2-40d2-a6cf-b14f61840e1b">宿主 agent 轮回执格式约束（固定小节结构，让板侧需求卡读面更清晰）</a></div>
+<p class="kmeta"><span class="mono muted" title="efd2caaf-89c2-40d2-a6cf-b14f61840e1b">efd2caaf</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**用户原话（2026-10-10，一字不改）**：「那可不可以增加一个约束：约束宿主agent每次返回的消息格式（主要是为了让板侧用户看到卡片时 更清晰）」
+
+**背景**：v0.10.3 卡 `edca37b1`（组级职责与宿主定位）已…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="cd52eb07-d7c7-440b-9147-04093d44fea6" data-version="">
+<div class="khd"><a class="fl" href="/features/cd52eb07-d7c7-440b-9147-04093d44fea6">执行底座观测面与韧性余项（合集：cancel「真静默」观测面 · 桥孤儿生命周期【须先核是否仍成立】· v0.4.0 遗留验证项【先对账】）</a></div>
+<p class="kmeta"><span class="mono muted" title="cd52eb07-d7c7-440b-9147-04093d44fea6">cd52eb07</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：planlog 终版归档「orch 工具面」「端到端」「未排期需求」三段的三条**余项**；用户 2026-10-10 指示保留成卡。**三条均须 Step 0 先核「是否仍成立」**（多条可能已被 v0.7.x–v0.8.1…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="f6d8d7ef-6eac-4895-9b76-a24572d0a727" data-version="">
+<div class="khd"><a class="fl" href="/features/f6d8d7ef-6eac-4895-9b76-a24572d0a727">跨组协作（归属互斥 + 授权共享 · Group 需求收件箱与跨组流转 · 跨 Feature 依赖 · 跨组进度可见）【顺延待重新排期】</a></div>
+<p class="kmeta"><span class="mono muted" title="f6d8d7ef-6eac-4895-9b76-a24572d0a727">f6d8d7ef</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：planlog 终版归档「架构方向派生需求」E 段 +「待办版本规划」表的「顺延（待重新排期）· 跨组协作」行（**原 v0.11.0 主题**，2026-09-24 被挤出原位）。用户 2026-10-10 指示保留成卡。
+…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="ed3943e8-4c93-410e-9289-bfe7246db715" data-version="">
+<div class="khd"><a class="fl" href="/features/ed3943e8-4c93-410e-9289-bfe7246db715">安全与治理（跨机鉴权 · 机器/Agent 身份 · 审计日志 · 多租户）【方向已采纳、时机待排】</a></div>
+<p class="kmeta"><span class="mono muted" title="ed3943e8-4c93-410e-9289-bfe7246db715">ed3943e8</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：planlog 终版归档「权限与安全」节 +「待办版本规划」表的「顺延（待定）· 安全与治理」行 + 「v0.12.0+（初定）· 身份与多租户」行 + 「跨版本登记项 · ④ 安全与治理」。用户 2026-10-10 指示保…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="11431c23-d437-4334-b9e0-cf529a15c49d" data-version="">
+<div class="khd"><a class="fl" href="/features/11431c23-d437-4334-b9e0-cf529a15c49d">多机 / 多环境配置面（合集：agent 配置归属迁移 machine→orch · 后端 CLI 代理 · Claude workspace 源默认加载 · 环境=构建主机模型）</a></div>
+<p class="kmeta"><span class="mono muted" title="11431c23-d437-4334-b9e0-cf529a15c49d">11431c23</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：planlog 终版归档「配置管理（未来待办）」「多环境扩展」两段的四条**未排期**条目；用户 2026-10-10 指示保留成卡。**四条各自有独立触发条件与前置，Step 0 时逐条裁哪几条进。**
+
+**① agent…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="044908ad-a166-4b54-8746-1b33e8d656b2" data-version="">
+<div class="khd"><a class="fl" href="/features/044908ad-a166-4b54-8746-1b33e8d656b2">orch artifacts 生产写口（`inputs` 引用恒「未找到产物」的修复 · 方案已定稿、触发条件驱动）</a></div>
+<p class="kmeta"><span class="mono muted" title="044908ad-a166-4b54-8746-1b33e8d656b2">044908ad</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：planlog 终版归档「未排期需求」段（原 `REQ-v0.9.1-2026-09-25-01`，**2026-09-25 用户裁废弃、自 v0.9.1 撤下**；确认单 v2 + **改造文档 v2 留档 `doc/v0.…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="9e58dbb5-f34f-4a46-af5a-3f5d5229a5dd" data-version="">
+<div class="khd"><a class="fl" href="/features/9e58dbb5-f34f-4a46-af5a-3f5d5229a5dd">「写不挡读」：同 project 写节点在飞时允许只读节点并行（v0.8.10 的另一半 · 刻意未放开的策略翻转）</a></div>
+<p class="kmeta"><span class="mono muted" title="9e58dbb5-f34f-4a46-af5a-3f5d5229a5dd">9e58dbb5</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：planlog 终版归档「未排期需求」段（v0.8.10 验收 2026-09-24 暴露的「另一半」，用户原话「可以吧 planlog 里记录下」）；**未过 Step 0**。用户 2026-10-10 指示保留成卡。
+
+…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="3c669088-797d-4bc8-9ba2-9828ee8870b4" data-version="">
+<div class="khd"><a class="fl" href="/features/3c669088-797d-4bc8-9ba2-9828ee8870b4">多 tree 并行 + 发版流程剥离（一需求一树 · 同 project 多需求真并行 · 集成与发版自成一段流程）【v0.11.x · Step 0 已落】</a></div>
+<p class="kmeta"><span class="mono muted" title="3c669088-797d-4bc8-9ba2-9828ee8870b4">3c669088</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：planlog 终版归档「v0.11.x 版本待办」（原 `REQ-v0.11.0-2026-09-24-01`，**Step 0 产出已落** = `doc/v0.11.0/多tree并行与发版流程剥离-需求确认单.md` …</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="97aa36c2-392f-4c99-8904-78612d4cae7c" data-version="">
+<div class="khd"><a class="fl" href="/features/97aa36c2-392f-4c99-8904-78612d4cae7c">接入更多后端 CLI 的前置：找回 planlog 遗留项「B5 · orch 退化为 kind 无关（闭集只在 machine）」+ 首批新 kind 接入（dsh / kimicode / pi 家族）</a></div>
+<p class="kmeta"><span class="mono muted" title="97aa36c2-392f-4c99-8904-78612d4cae7c">97aa36c2</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：用户 2026-10-10 口述（新需求，**入需求池**）。
+
+**用户原话（一字不改）**：「以前 **planlog 里，遗留了一个未来接入更多 agent 的前置改进项**，**需要找回来**，有**打算接入更多的 c…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="c2dca213-9176-49db-8425-8a5a93bec99a" data-version="">
+<div class="khd"><a class="fl" href="/features/c2dca213-9176-49db-8425-8a5a93bec99a">machine 各 project「独立端口」可否重构掉（早期 A2A-over-HTTP 设计遗留 · 现已统一走 ACP）</a></div>
+<p class="kmeta"><span class="mono muted" title="c2dca213-9176-49db-8425-8a5a93bec99a">c2dca213</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：用户 2026-10-10 口述（新需求，**入需求池**）。
+
+**用户原话（一字不改）**：「当前 **machine 部分，各 project 需要分配独立端口**；这块**看有办法重构掉吗**？因为是**早期设计遗留下…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="b33eddc0-efb7-4ca0-9b5e-3274207243d3" data-version="">
+<div class="khd"><a class="fl" href="/features/b33eddc0-efb7-4ca0-9b5e-3274207243d3">终结「另立 Feature」绕法：节点超时拆小 / 假完成重开 —— 统一触发场景与执行流程（承接轨任务须由 dev_manager 出）+ 未来引擎原语替代</a></div>
+<p class="kmeta"><span class="mono muted" title="b33eddc0-efb7-4ca0-9b5e-3274207243d3">b33eddc0</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：用户 2026-10-10 就 `63ecefc8`（引擎原语）与 `917514aa`（假完成处置）两卡的**合并裁定**。
+
+**用户原话（一字不改，两段）**
+1. 「`63ecefc8` 和 `917514aa` 这两…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="7521c5a9-ebb5-49c4-84f1-ed45dd16011c" data-version="">
+<div class="khd"><a class="fl" href="/features/7521c5a9-ebb5-49c4-84f1-ed45dd16011c">整理优化各 project 的 README（体例统一 + 配置说明简明化）</a></div>
+<p class="kmeta"><span class="mono muted" title="7521c5a9-ebb5-49c4-84f1-ed45dd16011c">7521c5a9</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：用户 2026-10-10 原话「**主要是 readme 里的文字太多了 感觉很难看**，希望能**统一每个 project 的 readme 文档格式**，同时对于**配置说明**这块，能够有**比较简明的文档格式**去说…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="c27db64c-3f17-485f-b937-5b838e0ac370" data-version="">
+<div class="khd"><a class="fl" href="/features/c27db64c-3f17-485f-b937-5b838e0ac370">流程纪律的执行保障：flow spec 如何对 orch agent 强制生效（自建 orch agent 内嵌 system prompt / 框架限死 / 可查口 + 引擎校验）</a></div>
+<p class="kmeta"><span class="mono muted" title="c27db64c-3f17-485f-b937-5b838e0ac370">c27db64c</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：用户 2026-10-10 提出（**未来解决**，并入需求池）。
+
+**问题一句话**：**`flow/spec/*` 不是 orch agent 的 `system_prompt` 来源**，规范改了**不保证被执行者读到…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="ba67ef7e-60b1-4271-8d22-30cf0cbde4fa" data-version="">
+<div class="khd"><a class="fl" href="/features/ba67ef7e-60b1-4271-8d22-30cf0cbde4fa">flow 快照随版重导：纪律正文分发到组织工作区（板侧接线，未来版本）</a></div>
+<p class="kmeta"><span class="mono muted" title="ba67ef7e-60b1-4271-8d22-30cf0cbde4fa">ba67ef7e</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**来源**：用户 2026-10-10 裁定「**flow 快照的问题 加一个待办需求 未来版本解决**」。
+
+**问题**：板侧组织工作区的 `flow/spec/` 是**死副本** —— 板种子化（`board/src/org-se…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="af5f6b0a-39f2-441d-abe5-53e22f0cdcc5" data-version="">
+<div class="khd"><a class="fl" href="/features/af5f6b0a-39f2-441d-abe5-53e22f0cdcc5">部署解耦：板 / 桥 / machine 可独立部署（无同机要求、无互相依赖）</a></div>
+<p class="kmeta"><span class="mono muted" title="af5f6b0a-39f2-441d-abe5-53e22f0cdcc5">af5f6b0a</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：**用户 2026-10-09 原话（一字不改）**：「我希望 板、桥、machine 相互之间 是没有同机部署要求的（即三者都可以独立部署），也不存在互相依赖」。
+
+**来源**：v0.10.2「角色化」Step 0 取证时，用户追问「板…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="f6ae68d2-5d43-437e-bda1-d545cdc3475c" data-version="">
+<div class="khd"><a class="fl" href="/features/f6ae68d2-5d43-437e-bda1-d545cdc3475c">monorepo 下 project CLI 不得向上加载仓库根配置（只允许 workspace + 用户级；各 agentKind 生效）</a></div>
+<p class="kmeta"><span class="mono muted" title="f6ae68d2-5d43-437e-bda1-d545cdc3475c">f6ae68d2</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：【待排期 · 需求池】monorepo 下 project CLI 不得向上加载仓库根配置。
+
+**问题**：monorepo 场景下，各 project（单元）的 CLI / agent 启动时会**向上加载「仓库根」（含 `.git` …</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="80b9a556-d9c2-448f-accb-57b54af473b7" data-version="">
+<div class="khd"><a class="fl" href="/features/80b9a556-d9c2-448f-accb-57b54af473b7">machine 侧父退孙活守卫缺口</a></div>
+<p class="kmeta"><span class="mono muted" title="80b9a556-d9c2-448f-accb-57b54af473b7">80b9a556</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：machine 侧“直接子已退、孙仍活”守卫缺口（候选需求，先入池，Step0 未起）：machine launcher 的停动作本身是真树杀（win32 taskkill /T /F，POSIX 进程组杀），无板式同款缺陷；但 hasEx…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="83136097-ea14-4b31-a29d-4e497ff0cc10" data-version="">
+<div class="khd"><a class="fl" href="/features/83136097-ea14-4b31-a29d-4e497ff0cc10">板上「发版」按钮：版内需求全完成后走完整发版流程</a></div>
+<p class="kmeta"><span class="mono muted" title="83136097-ea14-4b31-a29d-4e497ff0cc10">83136097</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：用户 2026-09-28 提出（原话「真正有需要的 应该是 发版 按钮，当版内需求都完成的情况下，走完整发版流程」；并裁「可以 发版按钮 放在 0.9.5」）。背景：「标记已发版」只是手工状态登记、价值低；需要的是「发版入口」。形态初判（…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="895cefbb-b64c-499d-9bdb-be0bed99b92d" data-version="">
+<div class="khd"><a class="fl" href="/features/895cefbb-b64c-499d-9bdb-be0bed99b92d">需求池列隐藏终态卡（防增量）</a></div>
+<p class="kmeta"><span class="mono muted" title="895cefbb-b64c-499d-9bdb-be0bed99b92d">895cefbb</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：来源：REQ-2026-09-28-05「清理需求池里的历史数据」方案收窄时登记的缺口（用户 2026-09-28 裁「那这个需求 就算是完成了」，板侧池列隐藏（B1–B4）未实施）。内容：需求池列的选卡判据当前只有版本判据（未排期即入池、…</p></div>
+<div class="kcard kst-warn" draggable="true" data-feature="ff987884-61fe-405d-8cad-fd4287adf02b" data-version="">
+<div class="khd"><a class="fl" href="/features/ff987884-61fe-405d-8cad-fd4287adf02b">版本串行：限制多版本并行进行</a></div>
+<p class="kmeta"><span class="mono muted" title="ff987884-61fe-405d-8cad-fd4287adf02b">ff987884</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+<p class="kmeta">需求：用户 2026-09-27 提出（版本管理面 REQ-2026-09-27-05 讨论中引申）：未来需要限制「不允许多版本并行」——同一时刻至多一个版本处于进行中（active），与 flow §7 同版串行纪律（需求间串行）呼应，把串行从…</p></div>
+</div>
+<div class="kcol" data-version="v0.10.5">
+<h3>v0.10.5 <span class="kbadge vbadge notstart" title="台账未登记该版，徽标由卡片阶段派生：名下全是想法卡（stage = 需求分析）或无卡 ⇒ 未开始。">未开始</span> <span class="muted">(2)</span></h3>
+<div class="kcard kst-warn" draggable="true" data-feature="26bfa4f5-f02e-4e7c-9428-f6bdf990becb" data-version="v0.10.5">
+<div class="khd"><a class="fl" href="/features/26bfa4f5-f02e-4e7c-9428-f6bdf990becb">建组 / 关联 project 即触发了解各 project 分工（组级角色的共同前提）</a></div>
+<p class="kmeta"><span class="mono muted" title="26bfa4f5-f02e-4e7c-9428-f6bdf990becb">26bfa4f5</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard kst-warn" draggable="true" data-feature="8505bd69-fb4a-450b-b644-e45b6550ae27" data-version="v0.10.5">
+<div class="khd"><a class="fl" href="/features/8505bd69-fb4a-450b-b644-e45b6550ae27">Feature 演进与 Group Version 生命周期</a></div>
+<p class="kmeta"><span class="mono muted" title="8505bd69-fb4a-450b-b644-e45b6550ae27">8505bd69</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.10.4">
+<h3>v0.10.4 <span class="kbadge vbadge wip" title="台账未登记该版，徽标由卡片阶段派生：名下存在已确认卡（stage ≠ 需求分析）⇒ 进行中。">进行中</span> <span class="muted">(5)</span></h3>
+<div class="kcard draglocked kst-brand">
+<div class="khd"><a class="fl" href="/features/c997a0bb-44f8-478b-8f1d-63ac59271bf9">增补（858e9e46）：graph 锚冻结修复（details 默认展开误触跳拍）+ 浮层打开即 5s 有界跟刷</a></div>
+<p class="kmeta"><span class="mono muted" title="c997a0bb-44f8-478b-8f1d-63ac59271bf9">c997a0bb</span> <span class="mono muted" title="858e9e46-7ad0-41d9-afba-83f30eecefb2"><a class="fl" href="/features/858e9e46-7ad0-41d9-afba-83f30eecefb2">858e9e46</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">评审中（reviewing）</span></p>
+<p class="kmeta">阶段：验收中 · 任务数：4</p>
+</div>
+<div class="kcard draglocked kst-warn">
+<div class="khd"><a class="fl" href="/features/464a0475-06d5-462d-aebc-cebd20579a1d">管理页项目池手动刷新：按钮拉取实时在线的未加入组的项目（不整页跳转）</a></div>
+<p class="kmeta"><span class="mono muted" title="464a0475-06d5-462d-aebc-cebd20579a1d">464a0475</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：4</p>
+</div>
+<div class="kcard draglocked kst-brand">
+<div class="khd"><a class="fl" href="/features/5a6ed454-14db-4b36-9326-9ce720a48de4">依赖图 chip 非完成态不着色：执行中/已认领只显灰，设计的分色未呈现（v0.10.3 六态着色的真机缺口）</a></div>
+<p class="kmeta"><span class="mono muted" title="5a6ed454-14db-4b36-9326-9ce720a48de4">5a6ed454</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">评审中（reviewing）</span></p>
+<p class="kmeta">阶段：验收中 · 任务数：3</p>
+</div>
+<div class="kcard draglocked kst-warn">
+<div class="khd"><a class="fl" href="/features/4ca97bcd-5cea-4287-8317-eb8f1a690f25">板卡片呈现统一（五项重建）：需求卡片内结构优化（原文展开层次 / 说明精简 / 去卡上方链接）+ 板卡片风格对齐 Apple 风（含排期面板已取消卡置灰）</a></div>
+<p class="kmeta"><span class="mono muted" title="4ca97bcd-5cea-4287-8317-eb8f1a690f25">4ca97bcd</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-brand">
+<div class="khd"><a class="fl" href="/features/858e9e46-7ad0-41d9-afba-83f30eecefb2">板面免手刷：数据变更自动更新（orch agent 新增卡片 / 任务状态变更）+ 快捷项点击局部更新（不整页跳转）—— 依赖甲卡先定稿</a></div>
+<p class="kmeta"><span class="mono muted" title="858e9e46-7ad0-41d9-afba-83f30eecefb2">858e9e46</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">评审中（reviewing）</span></p>
+<p class="kmeta">阶段：验收中 · 任务数：10</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.10.3">
+<h3>v0.10.3 <span class="kbadge vbadge locked" title="该版已登记为已发版 ⇒ 排期锁定（不可排入 / 改入 / 改出）。">🔒 已发版</span> <span class="muted">(6)</span></h3>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/162b504c-f878-45b8-b6d5-ab49bb7bf2a2">增补（5b980baf）：依赖图 chip 六态着色补齐（状态变体 CSS 缺失）</a></div>
+<p class="kmeta"><span class="mono muted" title="162b504c-f878-45b8-b6d5-ab49bb7bf2a2">162b504c</span> <span class="mono muted" title="5b980baf-4d05-4786-9aa8-7c70e511c96b"><a class="fl" href="/features/5b980baf-4d05-4786-9aa8-7c70e511c96b">5b980baf</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：1</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/5b980baf-4d05-4786-9aa8-7c70e511c96b">板详情页重构：依赖图重做（信息增强 + 渲染健壮收口）+ 执行明细遮挡重设计</a></div>
+<p class="kmeta"><span class="mono muted" title="5b980baf-4d05-4786-9aa8-7c70e511c96b">5b980baf</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：6</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/3b7ea660-a5e8-4c85-ba7a-35d01c043080">组级职责与宿主定位：组级两职责正名落 flow + 宿主 agent 定位落笔（承接重立）</a></div>
+<p class="kmeta"><span class="mono muted" title="3b7ea660-a5e8-4c85-ba7a-35d01c043080">3b7ea660</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：5</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="fbce0b37-c0ec-4086-a7c7-93cbc2ba6718" data-version="v0.10.3">
+<div class="khd"><a class="fl" href="/features/fbce0b37-c0ec-4086-a7c7-93cbc2ba6718">依赖图渲染修复第三轮（方案 A）：mermaid 节点 tooltip/label 源文本清洗 + tooltip 截断</a></div>
+<p class="kmeta"><span class="mono muted" title="fbce0b37-c0ec-4086-a7c7-93cbc2ba6718">fbce0b37</span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/edca37b1-7332-4200-8129-62e30dde5112">组级 agent 形态与流程纪律：组级两职责正名落 flow + 会话切分矩阵定稿（一个角色还是多个角色 —— 待推进时再裁）</a></div>
+<p class="kmeta"><span class="mono muted" title="edca37b1-7332-4200-8129-62e30dde5112">edca37b1</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：3</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="67c34186-2a77-4f73-aaf9-41f1c579daa7" data-version="v0.10.3">
+<div class="khd"><a class="fl" href="/features/67c34186-2a77-4f73-aaf9-41f1c579daa7">组级角色化：组级产品负责人 + 桥协调者（自 v0.10.2 拆出，落下一版）</a></div>
+<p class="kmeta"><span class="mono muted" title="67c34186-2a77-4f73-aaf9-41f1c579daa7">67c34186</span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.10.2">
+<h3>v0.10.2 <span class="kbadge vbadge locked" title="该版已登记为已发版 ⇒ 排期锁定（不可排入 / 改入 / 改出）。">🔒 已发版</span> <span class="muted">(12)</span></h3>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/f2dcb141-a315-4c48-9c8d-ae5400cc18c8">排期展示分流：管理页项目卡加「已发布最新版本号」一列 + 需求卡片加归属块 + 排期页摘块（重建·带 version）</a></div>
+<p class="kmeta"><span class="mono muted" title="f2dcb141-a315-4c48-9c8d-ae5400cc18c8">f2dcb141</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：9</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/39248358-cd0e-4d84-b84e-73289ae27477">增补（f2dcb141）：管理页「项目表」置顶 + 去掉「成员（声明态）」表（重复面去重）</a></div>
+<p class="kmeta"><span class="mono muted" title="39248358-cd0e-4d84-b84e-73289ae27477">39248358</span> <span class="mono muted" title="f2dcb141-a315-4c48-9c8d-ae5400cc18c8"><a class="fl" href="/features/f2dcb141-a315-4c48-9c8d-ae5400cc18c8">f2dcb141</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：6</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/25aa4b44-fc25-4254-b487-e452be0ec40f">配置模板拆分（config.default / config.example）与各单元配置 README</a></div>
+<p class="kmeta"><span class="mono muted" title="25aa4b44-fc25-4254-b487-e452be0ec40f">25aa4b44</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：9</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="0d226585-c583-43c4-94f8-7db9de5368e8" data-version="v0.10.2">
+<div class="khd"><a class="fl" href="/features/0d226585-c583-43c4-94f8-7db9de5368e8">流程规范落笔：建卡即带 version（漏带 ⇒ 过门后锁死、唯一出路 cancel 重建）</a></div>
+<p class="kmeta"><span class="mono muted" title="0d226585-c583-43c4-94f8-7db9de5368e8">0d226585</span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/4d7cf009-72d9-45c3-96a6-66f9fb96b296">角色化（组级 PM / project 级 PjM / 桥协调者）</a></div>
+<p class="kmeta"><span class="mono muted" title="4d7cf009-72d9-45c3-96a6-66f9fb96b296">4d7cf009</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：12</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/66b7bb9c-7ea9-4754-bb69-ab9a22e2d04e">增补六：宿主自办项三条语义下沉 flow（承接增补五的 DAG 拆分漏项）</a></div>
+<p class="kmeta"><span class="mono muted" title="66b7bb9c-7ea9-4754-bb69-ab9a22e2d04e">66b7bb9c</span> <span class="mono muted" title="4d7cf009-72d9-45c3-96a6-66f9fb96b296"><a class="fl" href="/features/4d7cf009-72d9-45c3-96a6-66f9fb96b296">4d7cf009</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：1</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/d90743d2-8147-4bad-a6e8-070098b54a59">增补五：流程纪律落点迁移（AGENTS.md 的纪律语义下沉 flow，宿主只留接入层）</a></div>
+<p class="kmeta"><span class="mono muted" title="d90743d2-8147-4bad-a6e8-070098b54a59">d90743d2</span> <span class="mono muted" title="4d7cf009-72d9-45c3-96a6-66f9fb96b296"><a class="fl" href="/features/4d7cf009-72d9-45c3-96a6-66f9fb96b296">4d7cf009</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：3</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/64f109a2-a5d5-44ad-b416-d8d9faff64ff">增补三：工序→职责位对照表 + 出场时点修正（Step 0 = product_manager）</a></div>
+<p class="kmeta"><span class="mono muted" title="64f109a2-a5d5-44ad-b416-d8d9faff64ff">64f109a2</span> <span class="mono muted" title="4d7cf009-72d9-45c3-96a6-66f9fb96b296"><a class="fl" href="/features/4d7cf009-72d9-45c3-96a6-66f9fb96b296">4d7cf009</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：2</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/e851a64b-3ead-4296-b474-a6c9c245c7a7">增补：TASK_TYPES 成员 pjm 更名为 project_manager</a></div>
+<p class="kmeta"><span class="mono muted" title="e851a64b-3ead-4296-b474-a6c9c245c7a7">e851a64b</span> <span class="mono muted" title="4d7cf009-72d9-45c3-96a6-66f9fb96b296"><a class="fl" href="/features/4d7cf009-72d9-45c3-96a6-66f9fb96b296">4d7cf009</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：2</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/a130ad1b-cb26-4821-aa93-3d75d533d482">增补：machine config.json.default 增补 roles 配置说明（重建·带 version）</a></div>
+<p class="kmeta"><span class="mono muted" title="a130ad1b-cb26-4821-aa93-3d75d533d482">a130ad1b</span> <span class="mono muted" title="4d7cf009-72d9-45c3-96a6-66f9fb96b296"><a class="fl" href="/features/4d7cf009-72d9-45c3-96a6-66f9fb96b296">4d7cf009</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：1</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="0741cd4a-3786-41fa-950c-4223ba2db935" data-version="v0.10.2">
+<div class="khd"><a class="fl" href="/features/0741cd4a-3786-41fa-950c-4223ba2db935">增补：单元 README 体例统一 + 配置说明简明格式（文字太多太难读）</a></div>
+<p class="kmeta"><span class="mono muted" title="0741cd4a-3786-41fa-950c-4223ba2db935">0741cd4a</span> <span class="mono muted" title="25aa4b44-fc25-4254-b487-e452be0ec40f"><a class="fl" href="/features/25aa4b44-fc25-4254-b487-e452be0ec40f">25aa4b44</a></span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="7bdcd24c-abe2-44a6-8dcd-fabffbd64e82" data-version="v0.10.2">
+<div class="khd"><a class="fl" href="/features/7bdcd24c-abe2-44a6-8dcd-fabffbd64e82">增补四：step 间会话复用纪律（换角色即换 ctx / 生成具体任务复用研发经理会话 / 执行节点全新 session）</a></div>
+<p class="kmeta"><span class="mono muted" title="7bdcd24c-abe2-44a6-8dcd-fabffbd64e82">7bdcd24c</span> <span class="mono muted" title="4d7cf009-72d9-45c3-96a6-66f9fb96b296"><a class="fl" href="/features/4d7cf009-72d9-45c3-96a6-66f9fb96b296">4d7cf009</a></span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.10.1">
+<h3>v0.10.1 <span class="kbadge vbadge locked" title="该版已登记为已发版 ⇒ 排期锁定（不可排入 / 改入 / 改出）。">🔒 已发版</span> <span class="muted">(4)</span></h3>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/c6fa6ff4-a5e0-436e-9485-9a33cf3b9b16">v0.10.1 承接轨（重建）：board 测试与文档收尾（B5 拆小 + B6/B7）</a></div>
+<p class="kmeta"><span class="mono muted" title="c6fa6ff4-a5e0-436e-9485-9a33cf3b9b16">c6fa6ff4</span> <span class="mono muted" title="88026fcd-bf7c-4ac0-9a70-cffc77c79262"><a class="fl" href="/features/88026fcd-bf7c-4ac0-9a70-cffc77c79262">88026fcd</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：5</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/88026fcd-bf7c-4ac0-9a70-cffc77c79262">版本事实源下沉 project（Project RC / Project Version）</a></div>
+<p class="kmeta"><span class="mono muted" title="88026fcd-bf7c-4ac0-9a70-cffc77c79262">88026fcd</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：20</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/3df58f98-6362-4f9f-9bf5-26f17c4991be">v0.10.1 承接轨：board 测试与文档收尾（B5 拆小 + B6/B7）</a></div>
+<p class="kmeta"><span class="mono muted" title="3df58f98-6362-4f9f-9bf5-26f17c4991be">3df58f98</span> <span class="mono muted" title="88026fcd-bf7c-4ac0-9a70-cffc77c79262"><a class="fl" href="/features/88026fcd-bf7c-4ac0-9a70-cffc77c79262">88026fcd</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：5</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="3a648dd3-919a-4281-9438-6c443412cc5a" data-version="v0.10.1">
+<div class="khd"><a class="fl" href="/features/3a648dd3-919a-4281-9438-6c443412cc5a">[F1 复验探针] v0.10.1 版号可被引用（用完即 cancel）</a></div>
+<p class="kmeta"><span class="mono muted" title="3a648dd3-919a-4281-9438-6c443412cc5a">3a648dd3</span> <span class="mono muted" title="1f937738-4275-481b-ac3e-dec1d0a7153c"><a class="fl" href="/features/1f937738-4275-481b-ac3e-dec1d0a7153c">1f937738</a></span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.10.0">
+<h3>v0.10.0 <span class="kbadge vbadge locked" title="该版已登记为已发版 ⇒ 排期锁定（不可排入 / 改入 / 改出）。">🔒 已发版</span> <span class="muted">(7)</span></h3>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/b00472b1-1982-4cf8-8cbd-443d57ce5516">v0.10.0 规范落笔：把「停同升」分组口径（协议对端成组 / 产品版本各自独立）写进 flow 版本纪律</a></div>
+<p class="kmeta"><span class="mono muted" title="b00472b1-1982-4cf8-8cbd-443d57ce5516">b00472b1</span> <span class="mono muted" title="1f937738-4275-481b-ac3e-dec1d0a7153c"><a class="fl" href="/features/1f937738-4275-481b-ac3e-dec1d0a7153c">1f937738</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：1</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/97225fb4-8a6f-466e-bd4b-004af6d1f21c">v0.10.0 缺陷修复：版本台账 owner_group 写口缺失（新建版号无法被引用）</a></div>
+<p class="kmeta"><span class="mono muted" title="97225fb4-8a6f-466e-bd4b-004af6d1f21c">97225fb4</span> <span class="mono muted" title="1f937738-4275-481b-ac3e-dec1d0a7153c"><a class="fl" href="/features/1f937738-4275-481b-ac3e-dec1d0a7153c">1f937738</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：1</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/31155242-1d86-49dc-a5e7-0007b1c33489">v0.10.0 尾段承接·重建（B5 拆两节点：列源并集 / 门户摘要+启动日志；B6 只构建）</a></div>
+<p class="kmeta"><span class="mono muted" title="31155242-1d86-49dc-a5e7-0007b1c33489">31155242</span> <span class="mono muted" title="1f937738-4275-481b-ac3e-dec1d0a7153c"><a class="fl" href="/features/1f937738-4275-481b-ac3e-dec1d0a7153c">1f937738</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：3</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/1f937738-4275-481b-ac3e-dec1d0a7153c">版本面单一事实源（Release 对象 + 版本聚合读面 + 停同升）</a></div>
+<p class="kmeta"><span class="mono muted" title="1f937738-4275-481b-ac3e-dec1d0a7153c">1f937738</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：29</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/f929f17c-afa4-4587-abd0-cc0aa93920bb">v0.10.0 发版准备：按兼容契约分组升版（orch / board 升 0.10.0；machine 不升；flow 四戳盘点）</a></div>
+<p class="kmeta"><span class="mono muted" title="f929f17c-afa4-4587-abd0-cc0aa93920bb">f929f17c</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：4</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="e3710f9f-e872-4d1d-8beb-c96ace3408b4" data-version="v0.10.0">
+<div class="khd"><a class="fl" href="/features/e3710f9f-e872-4d1d-8beb-c96ace3408b4">[验收探针⑤] 直写已发版 version 应被 released 锁拒（用完即 cancel）</a></div>
+<p class="kmeta"><span class="mono muted" title="e3710f9f-e872-4d1d-8beb-c96ace3408b4">e3710f9f</span> <span class="mono muted" title="1f937738-4275-481b-ac3e-dec1d0a7153c"><a class="fl" href="/features/1f937738-4275-481b-ac3e-dec1d0a7153c">1f937738</a></span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/42cbd9db-dca8-4849-a9ce-eccaaff31c96">v0.10.0 尾段承接（B4 产物核验 + B5 版本列并集 + B6 板载体升级）</a></div>
+<p class="kmeta"><span class="mono muted" title="42cbd9db-dca8-4849-a9ce-eccaaff31c96">42cbd9db</span> <span class="mono muted" title="1f937738-4275-481b-ac3e-dec1d0a7153c"><a class="fl" href="/features/1f937738-4275-481b-ac3e-dec1d0a7153c">1f937738</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造 · 任务数：3</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.9.8">
+<h3>v0.9.8 <span class="kbadge vbadge locked" title="版本台账状态：已发版。">🔒 已发版</span> <span class="muted">(11)</span></h3>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/1ef62596-840d-47d3-9d27-7331d0c30548">【重建】项目池恒空缺陷修复（原轨 approve 瞬间被判 failed，零方案变动）</a></div>
+<p class="kmeta"><span class="mono muted" title="1ef62596-840d-47d3-9d27-7331d0c30548">1ef62596</span> <span class="mono muted" title="c5d17953-5a30-4751-b6ea-a3fd42c18099"><a class="fl" href="/features/c5d17953-5a30-4751-b6ea-a3fd42c18099">c5d17953</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/c5d17953-5a30-4751-b6ea-a3fd42c18099">项目组加/删项目改两栏拖拽 · 重建（拆 N1 数据渲染 → N2 脚本锚 → N3 复核）</a></div>
+<p class="kmeta"><span class="mono muted" title="c5d17953-5a30-4751-b6ea-a3fd42c18099">c5d17953</span> <span class="mono muted" title="493a3c62-cc87-4bc5-9a26-cc99b5021b34"><a class="fl" href="/features/493a3c62-cc87-4bc5-9a26-cc99b5021b34">493a3c62</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/f156f278-5c37-4e81-8e89-c93e6c65d99d">【增补】agent 配置卡 agentKind 改建议下拉（datalist），模型保留手填</a></div>
+<p class="kmeta"><span class="mono muted" title="f156f278-5c37-4e81-8e89-c93e6c65d99d">f156f278</span> <span class="mono muted" title="5cd80758-1911-4bed-a079-a77b09de1c7d"><a class="fl" href="/features/5cd80758-1911-4bed-a079-a77b09de1c7d">5cd80758</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/5cd80758-1911-4bed-a079-a77b09de1c7d">板侧 agent 模型按项目组生效（管理页按组织配置，未配回落全局默认）</a></div>
+<p class="kmeta"><span class="mono muted" title="5cd80758-1911-4bed-a079-a77b09de1c7d">5cd80758</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/7feb5b12-b027-407a-86bf-75916665e917">【增补】启动横幅时间戳前缀修复（横幅拆两次 write）</a></div>
+<p class="kmeta"><span class="mono muted" title="7feb5b12-b027-407a-86bf-75916665e917">7feb5b12</span> <span class="mono muted" title="51208ff1-154d-4e1b-8d8c-6d427b6822f5"><a class="fl" href="/features/51208ff1-154d-4e1b-8d8c-6d427b6822f5">51208ff1</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/51208ff1-154d-4e1b-8d8c-6d427b6822f5">心跳自火静默作废板侧待澄清问题（监视中 ∧ awaiting 可达）</a></div>
+<p class="kmeta"><span class="mono muted" title="51208ff1-154d-4e1b-8d8c-6d427b6822f5">51208ff1</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/ff31651e-6121-473e-9bf5-4e6eaeb3a1e3">v0.9.8 发版准备：单元版本件与 lock 同升（四单元盘点/同升）</a></div>
+<p class="kmeta"><span class="mono muted" title="ff31651e-6121-473e-9bf5-4e6eaeb3a1e3">ff31651e</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/bb437c9f-b4ff-4466-82bf-3b5a4b657177">【增补·重建】项目池恒空缺陷：池数据源改用桥注册表全集投影</a></div>
+<p class="kmeta"><span class="mono muted" title="bb437c9f-b4ff-4466-82bf-3b5a4b657177">bb437c9f</span> <span class="mono muted" title="c5d17953-5a30-4751-b6ea-a3fd42c18099"><a class="fl" href="/features/c5d17953-5a30-4751-b6ea-a3fd42c18099">c5d17953</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：7</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/615d1dd1-6b05-41ce-bc39-6d0b6c2d990c">【增补】项目池恒空缺陷：池数据源被组视野过滤，移出项目界面消失</a></div>
+<p class="kmeta"><span class="mono muted" title="615d1dd1-6b05-41ce-bc39-6d0b6c2d990c">615d1dd1</span> <span class="mono muted" title="c5d17953-5a30-4751-b6ea-a3fd42c18099"><a class="fl" href="/features/c5d17953-5a30-4751-b6ea-a3fd42c18099">c5d17953</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：6</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/493a3c62-cc87-4bc5-9a26-cc99b5021b34">板交互改造：两栏拖拽增删项目 + 看板画布横向拖移</a></div>
+<p class="kmeta"><span class="mono muted" title="493a3c62-cc87-4bc5-9a26-cc99b5021b34">493a3c62</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="c1e9f76e-d3d1-446a-9860-1da528d2cef0" data-version="v0.9.8">
+<div class="khd"><a class="fl" href="/features/c1e9f76e-d3d1-446a-9860-1da528d2cef0">【探针·用完即cancel】心跳交人闸 E2E</a></div>
+<p class="kmeta"><span class="mono muted" title="c1e9f76e-d3d1-446a-9860-1da528d2cef0">c1e9f76e</span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.9.7">
+<h3>v0.9.7 <span class="kbadge vbadge locked" title="版本台账状态：已发版。">🔒 已发版</span> <span class="muted">(10)</span></h3>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/46d08132-6620-4790-bd9f-371b8c991b06">【增补】链状态行监视档感知 awaiting：监视中∧待澄清不再同页矛盾</a></div>
+<p class="kmeta"><span class="mono muted" title="46d08132-6620-4790-bd9f-371b8c991b06">46d08132</span> <span class="mono muted" title="351a3db6-8d5c-4cd8-9266-510155b9d912"><a class="fl" href="/features/351a3db6-8d5c-4cd8-9266-510155b9d912">351a3db6</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/351a3db6-8d5c-4cd8-9266-510155b9d912">监视中隐藏动作提交：动作区在场 ⇔ 球在用户手里</a></div>
+<p class="kmeta"><span class="mono muted" title="351a3db6-8d5c-4cd8-9266-510155b9d912">351a3db6</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/7ee29786-0909-4ccc-8ee9-a1d79b6cb0da">输入面恒为一个：动作区与澄清框按主链状态互斥渲染</a></div>
+<p class="kmeta"><span class="mono muted" title="7ee29786-0909-4ccc-8ee9-a1d79b6cb0da">7ee29786</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/45d8fe6b-a4be-417b-9284-015d3011d07a">【增补五】排期卡内容重排（名称→id行→状态→阶段）+ 按状态着色</a></div>
+<p class="kmeta"><span class="mono muted" title="45d8fe6b-a4be-417b-9284-015d3011d07a">45d8fe6b</span> <span class="mono muted" title="18f787db-5e8d-4161-a72f-071e708611e7"><a class="fl" href="/features/18f787db-5e8d-4161-a72f-071e708611e7">18f787db</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/18f787db-5e8d-4161-a72f-071e708611e7">【增补四】任务页与管理页说明文字清理：口径折叠删除 + notes 移出</a></div>
+<p class="kmeta"><span class="mono muted" title="18f787db-5e8d-4161-a72f-071e708611e7">18f787db</span> <span class="mono muted" title="1130d66d-7077-4cb5-9d89-212d00304188"><a class="fl" href="/features/1130d66d-7077-4cb5-9d89-212d00304188">1130d66d</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/1130d66d-7077-4cb5-9d89-212d00304188">【增补三】门户与排期板说明文字彻底清理：摘要行/口径折叠删除 + 排期 notes 移除</a></div>
+<p class="kmeta"><span class="mono muted" title="1130d66d-7077-4cb5-9d89-212d00304188">1130d66d</span> <span class="mono muted" title="8194588a-0374-4701-9ad7-8d6cc8de43c4"><a class="fl" href="/features/8194588a-0374-4701-9ad7-8d6cc8de43c4">8194588a</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/8194588a-0374-4701-9ad7-8d6cc8de43c4">【增补二】门户页说明文字再清理：目录根行入折叠 + 全局口径 notes 移出门户</a></div>
+<p class="kmeta"><span class="mono muted" title="8194588a-0374-4701-9ad7-8d6cc8de43c4">8194588a</span> <span class="mono muted" title="c5d20af6-9813-459c-a3b5-cad2ffa236fe"><a class="fl" href="/features/c5d20af6-9813-459c-a3b5-cad2ffa236fe">c5d20af6</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/c5d20af6-9813-459c-a3b5-cad2ffa236fe">【增补】验收收尾三件：门户页文案改名 + 门户口径折叠 + 主区去封宽铺满</a></div>
+<p class="kmeta"><span class="mono muted" title="c5d20af6-9813-459c-a3b5-cad2ffa236fe">c5d20af6</span> <span class="mono muted" title="bcfdc5e1-4dc3-4b14-8140-1e44be2ff7c8"><a class="fl" href="/features/bcfdc5e1-4dc3-4b14-8140-1e44be2ff7c8">bcfdc5e1</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/bcfdc5e1-4dc3-4b14-8140-1e44be2ff7c8">板样式优化</a></div>
+<p class="kmeta"><span class="mono muted" title="bcfdc5e1-4dc3-4b14-8140-1e44be2ff7c8">bcfdc5e1</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/960642da-fe0c-4f57-a4ea-3e77690bb969">v0.9.7 发版准备：单元版本号与 lock 同升</a></div>
+<p class="kmeta"><span class="mono muted" title="960642da-fe0c-4f57-a4ea-3e77690bb969">960642da</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.9.6">
+<h3>v0.9.6 <span class="kbadge vbadge locked" title="版本台账状态：已发版。">🔒 已发版</span> <span class="muted">(7)</span></h3>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/9fed1ed6-5526-4bf0-a8aa-f1f9da5b25f1">【增补】存量组织补播与板重启回填（父：板驱动需求接入文档模板）</a></div>
+<p class="kmeta"><span class="mono muted" title="9fed1ed6-5526-4bf0-a8aa-f1f9da5b25f1">9fed1ed6</span> <span class="mono muted" title="09f9fb2e-e8bb-489c-adf9-6e13de5aa824"><a class="fl" href="/features/09f9fb2e-e8bb-489c-adf9-6e13de5aa824">09f9fb2e</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/09f9fb2e-e8bb-489c-adf9-6e13de5aa824">板驱动需求接入文档模板（需求确认单/改造文档模板进板侧）</a></div>
+<p class="kmeta"><span class="mono muted" title="09f9fb2e-e8bb-489c-adf9-6e13de5aa824">09f9fb2e</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/b65b4974-5a01-42d2-98c2-e491af9c4744">板轮回执样式（收尾回执块契约 + 详情页结构化展示与折叠）</a></div>
+<p class="kmeta"><span class="mono muted" title="b65b4974-5a01-42d2-98c2-e491af9c4744">b65b4974</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/1aed5695-9106-48e6-900f-b50f1fdbcd58">验收增补：全局两页摘切换器 + 版本说明串移除</a></div>
+<p class="kmeta"><span class="mono muted" title="1aed5695-9106-48e6-900f-b50f1fdbcd58">1aed5695</span> <span class="mono muted" title="ed5904f9-938b-424e-8061-bc340cdce015"><a class="fl" href="/features/ed5904f9-938b-424e-8061-bc340cdce015">ed5904f9</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/ed5904f9-938b-424e-8061-bc340cdce015">组织作用域收敛 · 重建（b 读面收口 + c 任务面）</a></div>
+<p class="kmeta"><span class="mono muted" title="ed5904f9-938b-424e-8061-bc340cdce015">ed5904f9</span> <span class="mono muted" title="85eb3849-1595-4243-b078-4a732a319734"><a class="fl" href="/features/85eb3849-1595-4243-b078-4a732a319734">85eb3849</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/c8386503-f38f-4371-adbe-f833efafaa40">v0.9.6 发版准备：单元版本号与 lock 同升</a></div>
+<p class="kmeta"><span class="mono muted" title="c8386503-f38f-4371-adbe-f833efafaa40">c8386503</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/85eb3849-1595-4243-b078-4a732a319734">组织作用域收敛：版本按组织 + 排期/任务须选组织</a></div>
+<p class="kmeta"><span class="mono muted" title="85eb3849-1595-4243-b078-4a732a319734">85eb3849</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.9.5">
+<h3>v0.9.5 <span class="kbadge vbadge locked" title="版本台账状态：已发版。">🔒 已发版</span> <span class="muted">(21)</span></h3>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/b0f8c557-7201-4d50-938e-76cb991d26d6">v0.9.5 发版准备：单元版本号与 lock 同升</a></div>
+<p class="kmeta"><span class="mono muted" title="b0f8c557-7201-4d50-938e-76cb991d26d6">b0f8c557</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/2f66dfc6-3694-450f-a8bb-b2ee341beafb">需求池内不展示已取消的需求</a></div>
+<p class="kmeta"><span class="mono muted" title="2f66dfc6-3694-450f-a8bb-b2ee341beafb">2f66dfc6</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/cd5803bc-02bd-467b-91be-ee0e3bb1d1a1">板宿主桥模型透传（hostModel）</a></div>
+<p class="kmeta"><span class="mono muted" title="cd5803bc-02bd-467b-91be-ee0e3bb1d1a1">cd5803bc</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/1892b017-5a06-40fd-8a23-4965b3519925">板 stop 孤儿进程处置</a></div>
+<p class="kmeta"><span class="mono muted" title="1892b017-5a06-40fd-8a23-4965b3519925">1892b017</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/9f73b1d4-cc8a-4154-9ead-080e42201937">详情页增补：提交即时反馈与第N轮进度（浮层零反馈缺陷修复）</a></div>
+<p class="kmeta"><span class="mono muted" title="9f73b1d4-cc8a-4154-9ead-080e42201937">9f73b1d4</span> <span class="mono muted" title="5c739397-50e1-45c8-b3a0-18b791ffbb9a"><a class="fl" href="/features/5c739397-50e1-45c8-b3a0-18b791ffbb9a">5c739397</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/5c739397-50e1-45c8-b3a0-18b791ffbb9a">需求详情页读面精简（阶段化分层）·重建</a></div>
+<p class="kmeta"><span class="mono muted" title="5c739397-50e1-45c8-b3a0-18b791ffbb9a">5c739397</span> <span class="mono muted" title="58832829-3b4d-4638-a011-ead423950e8d"><a class="fl" href="/features/58832829-3b4d-4638-a011-ead423950e8d">58832829</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/787caa31-063e-4c29-9f07-8de4b7248c2d">09增补三：建卡即自动首轮（提交需求直接拉起 agent 需求分析）</a></div>
+<p class="kmeta"><span class="mono muted" title="787caa31-063e-4c29-9f07-8de4b7248c2d">787caa31</span> <span class="mono muted" title="b641da60-b38e-4633-9be8-9f450a402568"><a class="fl" href="/features/b641da60-b38e-4633-9be8-9f450a402568">b641da60</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/fbaa15aa-e246-478a-b9b9-ac716207b06d">09增补二：停链自愈（auto 可解冻）+ 链状态可见</a></div>
+<p class="kmeta"><span class="mono muted" title="fbaa15aa-e246-478a-b9b9-ac716207b06d">fbaa15aa</span> <span class="mono muted" title="b641da60-b38e-4633-9be8-9f450a402568"><a class="fl" href="/features/b641da60-b38e-4633-9be8-9f450a402568">b641da60</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/079c6130-913b-4aa8-b2a2-81e1b3fe7869">09增补：Step0/1 监视判据 + 撞车不停链 + 停链可见可自愈</a></div>
+<p class="kmeta"><span class="mono muted" title="079c6130-913b-4aa8-b2a2-81e1b3fe7869">079c6130</span> <span class="mono muted" title="b641da60-b38e-4633-9be8-9f450a402568"><a class="fl" href="/features/b641da60-b38e-4633-9be8-9f450a402568">b641da60</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/b641da60-b38e-4633-9be8-9f450a402568">板上需求推进流程操作过于繁琐，需要精简板上需求推进的流程设计</a></div>
+<p class="kmeta"><span class="mono muted" title="b641da60-b38e-4633-9be8-9f450a402568">b641da60</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/cd84a94e-fb27-4a88-9bc3-2fd9fcd6da0a">发版闸判据修订：cancelled 计入完成 + failed 须先收口</a></div>
+<p class="kmeta"><span class="mono muted" title="cd84a94e-fb27-4a88-9bc3-2fd9fcd6da0a">cd84a94e</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="bc987238-1cfa-4ea3-8acf-dcc7088b5820" data-version="v0.9.5">
+<div class="khd"><a class="fl" href="/features/bc987238-1cfa-4ea3-8acf-dcc7088b5820">需求池内不展示已取消的卡片</a></div>
+<p class="kmeta"><span class="mono muted" title="bc987238-1cfa-4ea3-8acf-dcc7088b5820">bc987238</span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="6578b299-3cc9-4414-9d34-29df2817b015" data-version="v0.9.5">
+<div class="khd"><a class="fl" href="/features/6578b299-3cc9-4414-9d34-29df2817b015">��̽�롤���꼴cancel�������Զ����ָ���</a></div>
+<p class="kmeta"><span class="mono muted" title="6578b299-3cc9-4414-9d34-29df2817b015">6578b299</span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="2b74df58-dcb7-4d63-93e4-98c33ff9d45d" data-version="v0.9.5">
+<div class="khd"><a class="fl" href="/features/2b74df58-dcb7-4d63-93e4-98c33ff9d45d">【探针·用完即cancel】监视唤醒复验</a></div>
+<p class="kmeta"><span class="mono muted" title="2b74df58-dcb7-4d63-93e4-98c33ff9d45d">2b74df58</span> <span class="mono muted" title="b641da60-b38e-4633-9be8-9f450a402568"><a class="fl" href="/features/b641da60-b38e-4633-9be8-9f450a402568">b641da60</a></span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/4f2a509d-d6ea-4207-9c43-f9bf3968675b">【探针·用完即cancel】 failed-to-cancel reachability probe</a></div>
+<p class="kmeta"><span class="mono muted" title="4f2a509d-d6ea-4207-9c43-f9bf3968675b">4f2a509d</span> <span class="mono muted" title="cd84a94e-fb27-4a88-9bc3-2fd9fcd6da0a"><a class="fl" href="/features/cd84a94e-fb27-4a88-9bc3-2fd9fcd6da0a">cd84a94e</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/f974c829-6263-48ec-bf79-40fb29ef5704">【探针·用完即cancel】 提交反馈浮层探针</a></div>
+<p class="kmeta"><span class="mono muted" title="f974c829-6263-48ec-bf79-40fb29ef5704">f974c829</span> <span class="mono muted" title="9f73b1d4-cc8a-4154-9ead-080e42201937"><a class="fl" href="/features/9f73b1d4-cc8a-4154-9ead-080e42201937">9f73b1d4</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/58832829-3b4d-4638-a011-ead423950e8d">需求详情页读面精简（阶段化分层）</a></div>
+<p class="kmeta"><span class="mono muted" title="58832829-3b4d-4638-a011-ead423950e8d">58832829</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/8f373cc7-f22b-42be-883a-ebeb981c7d00">【探针·用完即cancel】 failed-to-cancel reachability probe</a></div>
+<p class="kmeta"><span class="mono muted" title="8f373cc7-f22b-42be-883a-ebeb981c7d00">8f373cc7</span> <span class="mono muted" title="cd84a94e-fb27-4a88-9bc3-2fd9fcd6da0a"><a class="fl" href="/features/cd84a94e-fb27-4a88-9bc3-2fd9fcd6da0a">cd84a94e</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="977476be-c63e-475a-890a-085655d1029a" data-version="v0.9.5">
+<div class="khd"><a class="fl" href="/features/977476be-c63e-475a-890a-085655d1029a">probe-idea</a></div>
+<p class="kmeta"><span class="mono muted" title="977476be-c63e-475a-890a-085655d1029a">977476be</span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/568d5bb0-4855-489a-9313-1cafeeea34a7">【探针·用完即cancel】 control probe</a></div>
+<p class="kmeta"><span class="mono muted" title="568d5bb0-4855-489a-9313-1cafeeea34a7">568d5bb0</span> <span class="mono muted" title="cd84a94e-fb27-4a88-9bc3-2fd9fcd6da0a"><a class="fl" href="/features/cd84a94e-fb27-4a88-9bc3-2fd9fcd6da0a">cd84a94e</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/df14831a-464c-4b8d-a6ef-1651f9121d27">【探针·用完即cancel】 failed-to-cancel reachability probe</a></div>
+<p class="kmeta"><span class="mono muted" title="df14831a-464c-4b8d-a6ef-1651f9121d27">df14831a</span> <span class="mono muted" title="cd84a94e-fb27-4a88-9bc3-2fd9fcd6da0a"><a class="fl" href="/features/cd84a94e-fb27-4a88-9bc3-2fd9fcd6da0a">cd84a94e</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.9.4">
+<h3>v0.9.4 <span class="kbadge vbadge locked" title="版本台账状态：已发版。">🔒 已发版</span> <span class="muted">(19)</span></h3>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/dd5d7022-cdcd-4110-9066-489419bdc525">v0.9.4 发版收尾：服务重启核验版本横幅 + 遗留空配置文件清理</a></div>
+<p class="kmeta"><span class="mono muted" title="dd5d7022-cdcd-4110-9066-489419bdc525">dd5d7022</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/94924cbe-8d2c-423e-b83f-34a5a6b56af5">v0.9.4 发版准备：单元版本号与 lock 同升 + 遗留文件清理</a></div>
+<p class="kmeta"><span class="mono muted" title="94924cbe-8d2c-423e-b83f-34a5a6b56af5">94924cbe</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/90bf469c-e9a0-4c7a-9764-8d9891a95805">需求二增补十一：版本入口二选一 + 删除入口上框 + 前台撤标记已发版</a></div>
+<p class="kmeta"><span class="mono muted" title="90bf469c-e9a0-4c7a-9764-8d9891a95805">90bf469c</span> <span class="mono muted" title="5d07f595-d76e-4f34-8053-76435148bb75"><a class="fl" href="/features/5d07f595-d76e-4f34-8053-76435148bb75">5d07f595</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/8ebce662-3608-4f1b-b847-1241af204793">需求二增补十：已发版列去重开入口（后台保留）</a></div>
+<p class="kmeta"><span class="mono muted" title="8ebce662-3608-4f1b-b847-1241af204793">8ebce662</span> <span class="mono muted" title="5d07f595-d76e-4f34-8053-76435148bb75"><a class="fl" href="/features/5d07f595-d76e-4f34-8053-76435148bb75">5d07f595</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/65b46063-ae83-4bd1-9b2f-bdfe0ccf05c6">需求二增补九：派生版本徽标按卡片阶段判定</a></div>
+<p class="kmeta"><span class="mono muted" title="65b46063-ae83-4bd1-9b2f-bdfe0ccf05c6">65b46063</span> <span class="mono muted" title="5d07f595-d76e-4f34-8053-76435148bb75"><a class="fl" href="/features/5d07f595-d76e-4f34-8053-76435148bb75">5d07f595</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/70ba1e0e-e238-465b-a908-ce7221b2d6eb">需求二增补八：新建版本改新增需求同款弹窗</a></div>
+<p class="kmeta"><span class="mono muted" title="70ba1e0e-e238-465b-a908-ce7221b2d6eb">70ba1e0e</span> <span class="mono muted" title="5d07f595-d76e-4f34-8053-76435148bb75"><a class="fl" href="/features/5d07f595-d76e-4f34-8053-76435148bb75">5d07f595</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/134d0f7a-7a8c-4e41-9b0e-eb8ff822f2ff">需求二增补七：版本入口落点归位 + 版本列操作接线</a></div>
+<p class="kmeta"><span class="mono muted" title="134d0f7a-7a8c-4e41-9b0e-eb8ff822f2ff">134d0f7a</span> <span class="mono muted" title="5d07f595-d76e-4f34-8053-76435148bb75"><a class="fl" href="/features/5d07f595-d76e-4f34-8053-76435148bb75">5d07f595</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/7de29ce9-d329-490a-ace9-55e6bb51b7db">主需求增补六：门户建组织改按钮弹窗</a></div>
+<p class="kmeta"><span class="mono muted" title="7de29ce9-d329-490a-ace9-55e6bb51b7db">7de29ce9</span> <span class="mono muted" title="a5772e85-3dfa-4bad-b8c2-d7bf2733ac61"><a class="fl" href="/features/a5772e85-3dfa-4bad-b8c2-d7bf2733ac61">a5772e85</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/b6897446-9b92-4acc-9136-12c964ca05a3">主需求增补五（二次拆节点）：停用释放成员 + 跳转落点 + 文案</a></div>
+<p class="kmeta"><span class="mono muted" title="b6897446-9b92-4acc-9136-12c964ca05a3">b6897446</span> <span class="mono muted" title="a5772e85-3dfa-4bad-b8c2-d7bf2733ac61"><a class="fl" href="/features/a5772e85-3dfa-4bad-b8c2-d7bf2733ac61">a5772e85</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/0caf4eb7-f5e2-4db0-9af4-856ff098b6b8">主需求增补四：浮层卡知道了委托关闭补齐</a></div>
+<p class="kmeta"><span class="mono muted" title="0caf4eb7-f5e2-4db0-9af4-856ff098b6b8">0caf4eb7</span> <span class="mono muted" title="a5772e85-3dfa-4bad-b8c2-d7bf2733ac61"><a class="fl" href="/features/a5772e85-3dfa-4bad-b8c2-d7bf2733ac61">a5772e85</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/f89ad3f3-e8e6-43bc-8a6a-630795f04cec">主需求增补三：form.action 同名遮蔽缺陷修复</a></div>
+<p class="kmeta"><span class="mono muted" title="f89ad3f3-e8e6-43bc-8a6a-630795f04cec">f89ad3f3</span> <span class="mono muted" title="a5772e85-3dfa-4bad-b8c2-d7bf2733ac61"><a class="fl" href="/features/a5772e85-3dfa-4bad-b8c2-d7bf2733ac61">a5772e85</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/96064423-4c1c-4301-ba47-52a8a26c0f59">主需求增补二：末位成员拒写文案业务化 + 写表单不跳页</a></div>
+<p class="kmeta"><span class="mono muted" title="96064423-4c1c-4301-ba47-52a8a26c0f59">96064423</span> <span class="mono muted" title="a5772e85-3dfa-4bad-b8c2-d7bf2733ac61"><a class="fl" href="/features/a5772e85-3dfa-4bad-b8c2-d7bf2733ac61">a5772e85</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/f9854f88-4793-4b3d-a596-ae0310693c23">主需求验收增补轨：组织管理闭环与组织门户（N3 拆节点重建）</a></div>
+<p class="kmeta"><span class="mono muted" title="f9854f88-4793-4b3d-a596-ae0310693c23">f9854f88</span> <span class="mono muted" title="a5772e85-3dfa-4bad-b8c2-d7bf2733ac61"><a class="fl" href="/features/a5772e85-3dfa-4bad-b8c2-d7bf2733ac61">a5772e85</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/e173b139-709d-4edc-808a-5e1dd179c7e9">清理需求池里的历史数据</a></div>
+<p class="kmeta"><span class="mono muted" title="e173b139-709d-4edc-808a-5e1dd179c7e9">e173b139</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/5d07f595-d76e-4f34-8053-76435148bb75">排期看板「新增版本」入口</a></div>
+<p class="kmeta"><span class="mono muted" title="5d07f595-d76e-4f34-8053-76435148bb75">5d07f595</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/a5772e85-3dfa-4bad-b8c2-d7bf2733ac61">V2 板上组织管理</a></div>
+<p class="kmeta"><span class="mono muted" title="a5772e85-3dfa-4bad-b8c2-d7bf2733ac61">a5772e85</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/a37b58fd-9c95-4e8c-875b-7c647fb6839b">主需求增补五（拆节点重建）：停用释放成员 + 停用跳转落点</a></div>
+<p class="kmeta"><span class="mono muted" title="a37b58fd-9c95-4e8c-875b-7c647fb6839b">a37b58fd</span> <span class="mono muted" title="a5772e85-3dfa-4bad-b8c2-d7bf2733ac61"><a class="fl" href="/features/a5772e85-3dfa-4bad-b8c2-d7bf2733ac61">a5772e85</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/1f7973a1-d7a8-4782-9311-f39d3b49b701">主需求增补五：停用释放成员 + 停用跳转落点</a></div>
+<p class="kmeta"><span class="mono muted" title="1f7973a1-d7a8-4782-9311-f39d3b49b701">1f7973a1</span> <span class="mono muted" title="a5772e85-3dfa-4bad-b8c2-d7bf2733ac61"><a class="fl" href="/features/a5772e85-3dfa-4bad-b8c2-d7bf2733ac61">a5772e85</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/3351be11-9a33-4d42-b789-c0cb0dd54de6">主需求验收增补轨：组织管理闭环与组织门户</a></div>
+<p class="kmeta"><span class="mono muted" title="3351be11-9a33-4d42-b789-c0cb0dd54de6">3351be11</span> <span class="mono muted" title="a5772e85-3dfa-4bad-b8c2-d7bf2733ac61"><a class="fl" href="/features/a5772e85-3dfa-4bad-b8c2-d7bf2733ac61">a5772e85</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.9.3">
+<h3>v0.9.3 <span class="kbadge vbadge locked" title="版本台账状态：已发版。">🔒 已发版</span> <span class="muted">(13)</span></h3>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/28b1e7a5-31ce-478d-8ac1-770e90944bf9">登记 releasedVersions += v0.9.3 并重启（发版收尾）</a></div>
+<p class="kmeta"><span class="mono muted" title="28b1e7a5-31ce-478d-8ac1-770e90944bf9">28b1e7a5</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/1af36ea0-24b7-463f-ab19-ff918911fe47">v0.9.3 发版准备：单元版本号与 lock 同升</a></div>
+<p class="kmeta"><span class="mono muted" title="1af36ea0-24b7-463f-ab19-ff918911fe47">1af36ea0</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/78ba839a-f08f-4cd3-a9c1-cf11ee715899">排期页新增需求弹窗（废弃需求列表页）</a></div>
+<p class="kmeta"><span class="mono muted" title="78ba839a-f08f-4cd3-a9c1-cf11ee715899">78ba839a</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/a765a5e0-c860-43b9-a799-26c174fbee7b">需求2 增补轨 II：依赖图渲染修复（第二轮）+ 锁定徽标文案</a></div>
+<p class="kmeta"><span class="mono muted" title="a765a5e0-c860-43b9-a799-26c174fbee7b">a765a5e0</span> <span class="mono muted" title="df5bbde7-1b1e-4e89-a298-d3ace9901c68"><a class="fl" href="/features/df5bbde7-1b1e-4e89-a298-d3ace9901c68">df5bbde7</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/1eb14427-5422-4073-8e40-6ca740f55d47">需求2 验收增补轨：提示行降噪 + 依赖图渲染修复 + Timeline 退役</a></div>
+<p class="kmeta"><span class="mono muted" title="1eb14427-5422-4073-8e40-6ca740f55d47">1eb14427</span> <span class="mono muted" title="df5bbde7-1b1e-4e89-a298-d3ace9901c68"><a class="fl" href="/features/df5bbde7-1b1e-4e89-a298-d3ace9901c68">df5bbde7</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/df5bbde7-1b1e-4e89-a298-d3ace9901c68">板多视图与 3300 收编（Timeline / Graph / Agent View）</a></div>
+<p class="kmeta"><span class="mono muted" title="df5bbde7-1b1e-4e89-a298-d3ace9901c68">df5bbde7</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/738e5784-b656-47fd-82bf-61fd6a8a318f">flow 规范修订：验收增补挂主需求 + 运维嵌套 + 混合反馈分拣</a></div>
+<p class="kmeta"><span class="mono muted" title="738e5784-b656-47fd-82bf-61fd6a8a318f">738e5784</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/f8c3a55a-dfc3-4113-8bdf-d99e7bd9c05c">载体升级补漏：orch 桥加载 3300 退役代码</a></div>
+<p class="kmeta"><span class="mono muted" title="f8c3a55a-dfc3-4113-8bdf-d99e7bd9c05c">f8c3a55a</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/47e61a7f-f964-4e66-97bf-ee54c4f0586e">需求2 增补轨 III：依赖图节点可读化（project 标识 + 任务要点）</a></div>
+<p class="kmeta"><span class="mono muted" title="47e61a7f-f964-4e66-97bf-ee54c4f0586e">47e61a7f</span> <span class="mono muted" title="df5bbde7-1b1e-4e89-a298-d3ace9901c68"><a class="fl" href="/features/df5bbde7-1b1e-4e89-a298-d3ace9901c68">df5bbde7</a></span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="49945cf9-0907-4f1c-bcf6-2340cc396781" data-version="v0.9.3">
+<div class="khd"><a class="fl" href="/features/49945cf9-0907-4f1c-bcf6-2340cc396781">排期页新增需求弹窗（废弃需求列表页）</a></div>
+<p class="kmeta"><span class="mono muted" title="49945cf9-0907-4f1c-bcf6-2340cc396781">49945cf9</span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：2</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/b201154e-8855-4054-ad3a-cc1a14b39e81">载体升级：orch 桥与板服务加载需求 1 新代码</a></div>
+<p class="kmeta"><span class="mono muted" title="b201154e-8855-4054-ad3a-cc1a14b39e81">b201154e</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="be8d4231-45d2-4139-b62a-873612b499c8" data-version="v0.9.3">
+<div class="khd"><a class="fl" href="/features/be8d4231-45d2-4139-b62a-873612b499c8">probe-parent-b</a></div>
+<p class="kmeta"><span class="mono muted" title="be8d4231-45d2-4139-b62a-873612b499c8">be8d4231</span> <span class="mono muted" title="738e5784-b656-47fd-82bf-61fd6a8a318f"><a class="fl" href="/features/738e5784-b656-47fd-82bf-61fd6a8a318f">738e5784</a></span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="b4e87fee-74c7-4718-ae1e-583b6c0e5e11" data-version="v0.9.3">
+<div class="khd"><a class="fl" href="/features/b4e87fee-74c7-4718-ae1e-583b6c0e5e11">探针：parentFeatureId 真机验证</a></div>
+<p class="kmeta"><span class="mono muted" title="b4e87fee-74c7-4718-ae1e-583b6c0e5e11">b4e87fee</span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.9.2">
+<h3>v0.9.2 <span class="kbadge vbadge locked" title="版本台账状态：已发版。">🔒 已发版</span> <span class="muted">(27)</span></h3>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/81386532-cda8-431a-8164-5d4c94c9931e">登记 releasedVersions += v0.9.2 并重启（发版收尾）</a></div>
+<p class="kmeta"><span class="mono muted" title="81386532-cda8-431a-8164-5d4c94c9931e">81386532</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/8158c1b5-c20b-411a-9235-a08979fce70e">v0.9.2 发版准备：单元版本号与 lock 同升</a></div>
+<p class="kmeta"><span class="mono muted" title="8158c1b5-c20b-411a-9235-a08979fce70e">8158c1b5</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/0d83511d-7917-4687-b62c-bdc381e4c300">排期版本状态与已发版锁定</a></div>
+<p class="kmeta"><span class="mono muted" title="0d83511d-7917-4687-b62c-bdc381e4c300">0d83511d</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/f0e344c7-33ec-412f-853d-f51988edc42e">浮层错误卡覆盖层化</a></div>
+<p class="kmeta"><span class="mono muted" title="f0e344c7-33ec-412f-853d-f51988edc42e">f0e344c7</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/33d2de39-78ad-402f-82d9-29d8bec53b80">浮层 409 错误卡去重</a></div>
+<p class="kmeta"><span class="mono muted" title="33d2de39-78ad-402f-82d9-29d8bec53b80">33d2de39</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/65cd03e1-8961-4274-bbef-87ba795f60fe">浮层与看板反馈三连修</a></div>
+<p class="kmeta"><span class="mono muted" title="65cd03e1-8961-4274-bbef-87ba795f60fe">65cd03e1</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/a366712c-f03f-41e6-8ec3-cea144acdc60">浮层内链接导航</a></div>
+<p class="kmeta"><span class="mono muted" title="a366712c-f03f-41e6-8ec3-cea144acdc60">a366712c</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/34c97fea-ecab-4b07-bf92-2186c1e391dd">浮层 fetch 的 CSP connect-src 修复</a></div>
+<p class="kmeta"><span class="mono muted" title="34c97fea-ecab-4b07-bf92-2186c1e391dd">34c97fea</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/af7cbab5-7ba5-4849-a48e-9b6019012563">首页改排期面板与需求弹出页</a></div>
+<p class="kmeta"><span class="mono muted" title="af7cbab5-7ba5-4849-a48e-9b6019012563">af7cbab5</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/b12cb027-3d7a-4a2c-83e4-a3398b977b46">阶段产出条目样式简化</a></div>
+<p class="kmeta"><span class="mono muted" title="b12cb027-3d7a-4a2c-83e4-a3398b977b46">b12cb027</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/8d7bf3fb-db5a-4c9f-b6fe-79d752ed07c1">阶段产出按需求归约</a></div>
+<p class="kmeta"><span class="mono muted" title="8d7bf3fb-db5a-4c9f-b6fe-79d752ed07c1">8d7bf3fb</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/733ea59a-76c3-46c0-bf74-1e1788018b74">排期看板与需求池</a></div>
+<p class="kmeta"><span class="mono muted" title="733ea59a-76c3-46c0-bf74-1e1788018b74">733ea59a</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/6540a67c-8812-46ab-bb9a-2688df017c63">板界面打磨</a></div>
+<p class="kmeta"><span class="mono muted" title="6540a67c-8812-46ab-bb9a-2688df017c63">6540a67c</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/8a1c0d9a-7f58-47a6-bf0f-bd267fed1287">板服务重启对齐 0.9.2 版本横幅（发版收尾）</a></div>
+<p class="kmeta"><span class="mono muted" title="8a1c0d9a-7f58-47a6-bf0f-bd267fed1287">8a1c0d9a</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/b08b3d82-c034-41fd-8578-b3eb22ddf9dd">首页浮层脚本注入修复</a></div>
+<p class="kmeta"><span class="mono muted" title="b08b3d82-c034-41fd-8578-b3eb22ddf9dd">b08b3d82</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/54871da0-9431-4dc0-83e4-761b1bc6eed2">板服务重启加载覆盖层修复（自测基建 XII）</a></div>
+<p class="kmeta"><span class="mono muted" title="54871da0-9431-4dc0-83e4-761b1bc6eed2">54871da0</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/785939a3-6026-4233-a3ef-6d52b586e6a0">板服务重启加载错误卡去重（自测基建 XI）</a></div>
+<p class="kmeta"><span class="mono muted" title="785939a3-6026-4233-a3ef-6d52b586e6a0">785939a3</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/bd10c9b4-46a2-430a-8004-902d3b6b76c3">板服务重启加载三连修（自测基建 X）</a></div>
+<p class="kmeta"><span class="mono muted" title="bd10c9b4-46a2-430a-8004-902d3b6b76c3">bd10c9b4</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/6cb3cf83-270b-4448-bbdc-f320ca3f0c9b">登记 releasedVersions 首批并重启（自测基建 IX）</a></div>
+<p class="kmeta"><span class="mono muted" title="6cb3cf83-270b-4448-bbdc-f320ca3f0c9b">6cb3cf83</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/97981d7a-fb66-4369-b23d-14b65e0bb664">板服务重启加载浮层导航（自测基建 VIII）</a></div>
+<p class="kmeta"><span class="mono muted" title="97981d7a-fb66-4369-b23d-14b65e0bb664">97981d7a</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/95a9cfe6-da9b-4abd-bb38-9c8da36f92f5">板服务重启加载 CSP 修复（自测基建 VII）</a></div>
+<p class="kmeta"><span class="mono muted" title="95a9cfe6-da9b-4abd-bb38-9c8da36f92f5">95a9cfe6</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/e3d738e7-80cf-4b07-a90c-1e1672045e7e">板服务重启加载注入修复（自测基建 VI）</a></div>
+<p class="kmeta"><span class="mono muted" title="e3d738e7-80cf-4b07-a90c-1e1672045e7e">e3d738e7</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/3aedc84d-3f5f-498d-bfa7-ddfb853857c2">板服务重启加载增补 4 代码（自测基建 V）</a></div>
+<p class="kmeta"><span class="mono muted" title="3aedc84d-3f5f-498d-bfa7-ddfb853857c2">3aedc84d</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/8df264a7-1aa8-4b24-b7bf-a9273fa473bf">板服务重启加载条目简化代码（自测基建 IV）</a></div>
+<p class="kmeta"><span class="mono muted" title="8df264a7-1aa8-4b24-b7bf-a9273fa473bf">8df264a7</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/131ae85f-e0f1-48c1-ae87-95d51e356ee7">板服务重启加载增补 3 代码（自测基建 III）</a></div>
+<p class="kmeta"><span class="mono muted" title="131ae85f-e0f1-48c1-ae87-95d51e356ee7">131ae85f</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/04781f8d-1575-4f26-8964-ba75f120422a">板服务重启加载需求 2 代码（自测基建 II）</a></div>
+<p class="kmeta"><span class="mono muted" title="04781f8d-1575-4f26-8964-ba75f120422a">04781f8d</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/7a2d7a70-ccf8-439f-a68e-f3e8076fdc36">板服务重启加载 v0.9.2（自测基建）</a></div>
+<p class="kmeta"><span class="mono muted" title="7a2d7a70-ccf8-439f-a68e-f3e8076fdc36">7a2d7a70</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.9.1">
+<h3>v0.9.1 <span class="kbadge vbadge locked" title="版本台账状态：已发版。">🔒 已发版</span> <span class="muted">(12)</span></h3>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/85fa04a1-f9f8-4c4b-a908-e05e746ec6c9">v0.9.1 需求3 增补 · 文档渲染（markdown 子集 + mermaid）</a></div>
+<p class="kmeta"><span class="mono muted" title="85fa04a1-f9f8-4c4b-a908-e05e746ec6c9">85fa04a1</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/e2c1a7a9-abcc-4a1c-8af6-e154045b3f17">v0.9.1 需求2 验收前置 · 板服务重启载新代码</a></div>
+<p class="kmeta"><span class="mono muted" title="e2c1a7a9-abcc-4a1c-8af6-e154045b3f17">e2c1a7a9</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/105dcec9-caac-47d1-a5a3-611f22bcb209">v0.9.1 发版收尾 · 板服务重启对齐版本横幅</a></div>
+<p class="kmeta"><span class="mono muted" title="105dcec9-caac-47d1-a5a3-611f22bcb209">105dcec9</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/765eef8a-e022-4734-b88d-239ecde3a9ad">v0.9.1 发版准备 · 单元版本号与 lock 同升</a></div>
+<p class="kmeta"><span class="mono muted" title="765eef8a-e022-4734-b88d-239ecde3a9ad">765eef8a</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/add92cf2-3b0d-4b98-b077-21ed84bb6d3b">v0.9.1 需求3 · 阶段产出上板</a></div>
+<p class="kmeta"><span class="mono muted" title="add92cf2-3b0d-4b98-b077-21ed84bb6d3b">add92cf2</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/6b86d09c-2cc6-4e7c-9de0-eb1a562eaf0e">v0.9.1 需求2 · 板侧错误提示弹窗化</a></div>
+<p class="kmeta"><span class="mono muted" title="6b86d09c-2cc6-4e7c-9de0-eb1a562eaf0e">6b86d09c</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/6565de4f-f8c4-495c-93bf-4c833f5f554d">v0.9.1 需求3 增补 II · 板服务重启</a></div>
+<p class="kmeta"><span class="mono muted" title="6565de4f-f8c4-495c-93bf-4c833f5f554d">6565de4f</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/98c39da1-5e13-4f2a-858b-7bb767f52fa1">v0.9.1 需求3 增补 II · mermaid SVG 落点修正</a></div>
+<p class="kmeta"><span class="mono muted" title="98c39da1-5e13-4f2a-858b-7bb767f52fa1">98c39da1</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/9907b6f2-0245-498e-8f29-545a9db2cc94">v0.9.1 需求3 渲染增补 · 板服务重启</a></div>
+<p class="kmeta"><span class="mono muted" title="9907b6f2-0245-498e-8f29-545a9db2cc94">9907b6f2</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/d3d21d1a-5b56-41b2-8cf7-6f063ab46fcb">v0.9.1 需求2/3 联合验收前置 · 板服务重启</a></div>
+<p class="kmeta"><span class="mono muted" title="d3d21d1a-5b56-41b2-8cf7-6f063ab46fcb">d3d21d1a</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/16fa5dc4-62b9-4310-bc2d-d93545845aa9">v0.9.1 需求3 增补 · 产出登记打开链补源 B 通路</a></div>
+<p class="kmeta"><span class="mono muted" title="16fa5dc4-62b9-4310-bc2d-d93545845aa9">16fa5dc4</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/4f3e3359-c568-423e-8274-41401037f90d">v0.9.1 需求1 · Feature Integration/Acceptance 判据与载体</a></div>
+<p class="kmeta"><span class="mono muted" title="4f3e3359-c568-423e-8274-41401037f90d">4f3e3359</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+</div>
+<div class="kcol" data-version="v0.9.0">
+<h3>v0.9.0 <span class="kbadge vbadge locked" title="版本台账状态：已发版。">🔒 已发版</span> <span class="muted">(21)</span></h3>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/5ae43a7d-8e32-4d85-93a5-5c7219560b8c">【探针②·用完即cancel】验 approve 写回 approval=已通过</a></div>
+<p class="kmeta"><span class="mono muted" title="5ae43a7d-8e32-4d85-93a5-5c7219560b8c">5ae43a7d</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-neutral">
+<div class="khd"><a class="fl" href="/features/c082c8d8-8949-4cc5-bb1b-1634e621b521">【探针·用完即cancel】v0.9.0 真机验收 · stage/approval 登记字段</a></div>
+<p class="kmeta"><span class="mono muted" title="c082c8d8-8949-4cc5-bb1b-1634e621b521">c082c8d8</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：改造方案 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-brand">
+<div class="khd"><a class="fl" href="/features/0b091abc-29d3-49bd-84c8-cb500d726e23">v0.9.0 第 1 条：Web 看板与确认入口（板前台 · 需求即 Feature · 宿主可选）</a></div>
+<p class="kmeta"><span class="mono muted" title="0b091abc-29d3-49bd-84c8-cb500d726e23">0b091abc</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">测试中（testing）</span></p>
+<p class="kmeta">阶段：回归中 · 任务数：16</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/850b3aa9-454c-4ce4-943b-1e812730466d">看下各项目代码</a></div>
+<p class="kmeta"><span class="mono muted" title="850b3aa9-454c-4ce4-943b-1e812730466d">850b3aa9</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已发版 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/16806ac7-2d5b-4dc7-874f-341b392dcba5">v0.9.0 收口轨 13 · 详情页可用性（确认按钮按 approval 条件化 + 下一步引导）</a></div>
+<p class="kmeta"><span class="mono muted" title="16806ac7-2d5b-4dc7-874f-341b392dcba5">16806ac7</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard kst-warn" draggable="true" data-feature="9e74e829-121f-4ec8-92ef-511cdfa453b6" data-version="v0.9.0">
+<div class="khd"><a class="fl" href="/features/9e74e829-121f-4ec8-92ef-511cdfa453b6">看下各项目的代码</a></div>
+<p class="kmeta"><span class="mono muted" title="9e74e829-121f-4ec8-92ef-511cdfa453b6">9e74e829</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/754cd552-00ba-4b0b-ba41-9a46ab474fd3">v0.9.0 收口轨 12 · 修 Referrer-Policy 掐掉表单档兜底（页面提交需求被自相矛盾挡住）</a></div>
+<p class="kmeta"><span class="mono muted" title="754cd552-00ba-4b0b-ba41-9a46ab474fd3">754cd552</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/214401c7-b95b-436b-a9e6-057ddb97442d">v0.9.0 收口轨 11 · 修写面 CSRF 对「来源不可知」的误拒（Origin 缺失/空/字面 null 应退 Referer）</a></div>
+<p class="kmeta"><span class="mono muted" title="214401c7-b95b-436b-a9e6-057ddb97442d">214401c7</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/076b6231-df80-443b-8a91-2564bf8b43ff">v0.9.0 收口轨 10 · host 绑定前置留痕 + 组织子目录改由板自动创建</a></div>
+<p class="kmeta"><span class="mono muted" title="076b6231-df80-443b-8a91-2564bf8b43ff">076b6231</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/5ff92ce9-2098-472b-b9bd-c9db272b8f74">v0.9.0 收口轨 9 · orgsDir/workspace 存在性校验 + spawn 错误归因（板侧）</a></div>
+<p class="kmeta"><span class="mono muted" title="5ff92ce9-2098-472b-b9bd-c9db272b8f74">5ff92ce9</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/ed7019bf-0cf5-43e2-afa9-493429fe89b0">v0.9.0 收口轨 8 · 板服务化（配置化 BD12″ + 后台静默 boardctl BD13″）</a></div>
+<p class="kmeta"><span class="mono muted" title="ed7019bf-0cf5-43e2-afa9-493429fe89b0">ed7019bf</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/4056ee7d-d28a-44f5-889a-203ab3df7bd0">v0.9.0 收口轨 5 · 组织名由用户在前台创建/指定（板级配置降为可选默认）</a></div>
+<p class="kmeta"><span class="mono muted" title="4056ee7d-d28a-44f5-889a-203ab3df7bd0">4056ee7d</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-danger">
+<div class="khd"><a class="fl" href="/features/cb9693dc-957a-4a9a-a097-035ae1263452">v0.9.0 收口轨 7 · 板服务化承接（boardctl 后台静默 + POST /shutdown + pidfile/日志）</a></div>
+<p class="kmeta"><span class="mono muted" title="cb9693dc-957a-4a9a-a097-035ae1263452">cb9693dc</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">失败（failed）</span></p>
+<p class="kmeta">阶段：改造 · 任务数：1</p>
+</div>
+<div class="kcard draglocked kst-danger">
+<div class="khd"><a class="fl" href="/features/26582b33-ec94-466a-99dd-afed922690fe">v0.9.0 收口轨 6 · 板的服务化（配置文件+template+default · 后台静默运行 boardctl）</a></div>
+<p class="kmeta"><span class="mono muted" title="26582b33-ec94-466a-99dd-afed922690fe">26582b33</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">失败（failed）</span></p>
+<p class="kmeta">阶段：改造 · 任务数：1</p>
+</div>
+<div class="kcard kst-warn" draggable="true" data-feature="34717640-5b5e-49da-bef7-b426266a8be2" data-version="v0.9.0">
+<div class="khd"><a class="fl" href="/features/34717640-5b5e-49da-bef7-b426266a8be2">BD11 �����֤ �� ������˶�</a></div>
+<p class="kmeta"><span class="mono muted" title="34717640-5b5e-49da-bef7-b426266a8be2">34717640</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard kst-warn" draggable="true" data-feature="351a6d79-ca60-421e-a216-74ce7db2f75c" data-version="v0.9.0">
+<div class="khd"><a class="fl" href="/features/351a6d79-ca60-421e-a216-74ce7db2f75c">BD11 �����֤ �� ��֯���ɱ�������</a></div>
+<p class="kmeta"><span class="mono muted" title="351a6d79-ca60-421e-a216-74ce7db2f75c">351a6d79</span></p>
+<p class="kbadge-line"><span class="kbadge">待审批（waiting_approval）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/c3a5d843-648b-4c21-97ee-f7b5863ad33c">v0.9.0 收口轨 3 · 板写面接线（`POST /requirements` 提需求 + 表单 + 写端点安全）</a></div>
+<p class="kmeta"><span class="mono muted" title="c3a5d843-648b-4c21-97ee-f7b5863ad33c">c3a5d843</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/a4b4bff1-aa02-47cd-a78c-87bb60af0232">v0.9.0 收口轨 2 · 板上「各态分布」改用 per-feature stateCounts 本地聚合（并修 TODO 判据）</a></div>
+<p class="kmeta"><span class="mono muted" title="a4b4bff1-aa02-47cd-a78c-87bb60af0232">a4b4bff1</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/7c44b021-3eba-4ecd-b968-4eef0cfd2913">v0.9.0 收口轨 4 · 配置面口径对齐（组织名去缺省兜底 + 注释/README 对齐）</a></div>
+<p class="kmeta"><span class="mono muted" title="7c44b021-3eba-4ecd-b968-4eef0cfd2913">7c44b021</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+<div class="kcard kst-neutral" draggable="true" data-feature="b1b068d1-43d3-411f-850f-b1a778c454e3" data-version="v0.9.0">
+<div class="khd"><a class="fl" href="/features/b1b068d1-43d3-411f-850f-b1a778c454e3">[̽�롤BD7 �� cancel] ��д����������֤</a></div>
+<p class="kmeta"><span class="mono muted" title="b1b068d1-43d3-411f-850f-b1a778c454e3">b1b068d1</span></p>
+<p class="kbadge-line"><span class="kbadge">已取消（cancelled）</span></p>
+<p class="kmeta">阶段：需求分析 · 任务数：0</p>
+</div>
+<div class="kcard draglocked kst-ok">
+<div class="khd"><a class="fl" href="/features/3ae7d649-8e00-4056-83fa-83bc6aadd72a">v0.9.0 收口轨 · `/api/features` 补 `stateCounts` 投影（板真机冒烟缺口）</a></div>
+<p class="kmeta"><span class="mono muted" title="3ae7d649-8e00-4056-83fa-83bc6aadd72a">3ae7d649</span></p>
+<p class="kbadge-line"><span class="kbadge draglock">🔒 排期已锁</span><span class="kbadge">已完成（completed）</span></p>
+<p class="kmeta">阶段：已完成 · 任务数：0</p>
+</div>
+</div></div>
+<dialog class="fd" id="feat-dialog">
+<button type="button" id="feat-dialog-close">关闭</button>
+<div class="fd-body"></div>
+</dialog><dialog class="fd" id="new-req-dialog">
+<button type="button" id="new-req-close">关闭</button>
+<div class="fd-body"><h2>提需求</h2>
+<p class="hint">组织目录根（orgsDir）<b>就绪</b>：<code>G:\code\board-code</code></p>
+<p class="hint">建一条需求 = 以<b>空间路径组织（免选）</b>经唯一写封装（<code>requirement.ts</code>）在桥侧建 Feature，落初态 <code>waiting_approval</code>（登记 <code>stage=需求分析</code> · <code>approval=未发起</code>）。板<b>不写状态机</b>：审批 / 推进 / 取消一律归编排 agent。</p>
+<form method="post" action="/org/a2a-coding/requirements" class="w" data-submit="已提交，建需求中…">
+<label>组织（免选 · 空间路径决定）<input type="hidden" name="group" value="a2a-coding"><span class="muted"> a2a-coding</span></label>
+<label>标题 *<input name="title" required placeholder="需求的简短摘要"></label>
+<label>版本<input name="version" placeholder="如 v0.9.2；留空 = 未排期（进需求池）"></label>
+<p class="hint warn">已发版版本（版本台账标记 <code>released</code>）<b>排期锁定</b>：<code>v0.10.0</code> · <code>v0.10.1</code> · <code>v0.10.2</code> · <code>v0.10.3</code> · <code>v0.9.0</code> · <code>v0.9.1</code> · <code>v0.9.2</code> · <code>v0.9.3</code> · <code>v0.9.4</code> · <code>v0.9.5</code> · <code>v0.9.6</code> · <code>v0.9.7</code> · <code>v0.9.8</code> —— 已发版版本不可排入新需求（服务端 409 拒绝；在板上把版本标记 released / 重开为进行中即实时生效）。字段仍可输入，执法在服务端。</p>
+<label>需求原文<textarea name="requirement" rows="3" placeholder="可选"></textarea></label>
+<p class="hint">组织 = <b>a2a-coding</b>（组织空间路径决定，免选；服务端以路径为准，不一致 ⇒ 409 <code>board_org_mismatch</code>）</p>
+<button type="submit">提交需求</button>
+</form></div>
+</dialog><dialog class="fd" id="new-version-dialog">
+<button type="button" id="new-version-close">关闭</button>
+<div class="fd-body"><h2>新版本</h2>
+<p class="hint">在版本台账（<code>.data/versions.json</code>）登记一个空版本 ⇒ 看板出现新列；初态 <code>notstart</code>，首张卡过确认门后自动转 <code>active</code>。</p>
+<p class="hint">归属组织 = <b>a2a-coding</b>（当前空间，由服务端按路径注入；表单不含 org 字段，同版号在其它组织可各自登记）</p>
+<form method="post" action="/org/a2a-coding/versions" class="w" data-submit="已提交，建版本中…" data-ov="1">
+<input type="hidden" name="action" value="create">
+<label>版本号 *<input name="version" required placeholder="如 v0.10.0（x.y.z，可带 v 前缀）"></label>
+<button type="submit">创建版本</button>
+</form></div>
+</dialog><script>
+(function () {
+  var dlg = document.getElementById("feat-dialog");
+  if (dlg === null || typeof dlg.showModal !== "function" || typeof fetch !== "function") return;
+  var body = dlg.querySelector(".fd-body");
+  var lastHref = "";
+  function fallback(a) { window.location.href = a.href; }
+  function restoreForm(form) {
+    var btns = form.querySelectorAll("button[disabled]");
+    for (var i = 0; i < btns.length; i += 1) {
+      btns[i].disabled = false;
+      btns[i].removeAttribute("aria-disabled");
+    }
+    var p = form.querySelector(".submit-pending");
+    if (p !== null && p.parentNode !== null) { p.parentNode.removeChild(p); }
+    form.removeAttribute("data-ov-pending");
+  }
+  // 件A：浮层分支自行完成整页档 SUBMIT_GUARD 的两动作（该守卫对本表单已 defaultPrevented 早退）。
+  // 按钮判定走 .type 属性而非选择器串 —— 提交守卫的闭集归类标记正是那个选择器字面量（N3-⑦ 每枚
+  // 恰好 1 处），本常量体内再写一遍会造成两枚脚本归类歧义；属性口径也天然盖住「隐式提交」的单按钮表单。
+  function markPending(form) {
+    if (form.querySelector(".submit-pending") !== null) return false;
+    var note = form.getAttribute("data-submit") || "已提交，处理中…";
+    var all = form.querySelectorAll("button");
+    for (var i = 0; i < all.length; i += 1) {
+      if (all[i].type !== "submit") continue;
+      all[i].disabled = true;
+      all[i].setAttribute("aria-disabled", "true");
+    }
+    var p = document.createElement("p");
+    p.className = "hint submit-pending";
+    p.textContent = note;
+    form.appendChild(p);
+    return true;
+  }
+  // 件B：有界进度轮询 —— 复用既有详情读面 GET + swapPage 通路，零新端点、零新写面。
+  // 上界 5s × 240 = 20 分钟 = 与宿主 turn 窗口同量级（窗上限 10min、含结构余量的最坏总框 25min）；
+  // 收口 / 关浮层任一命中即提前停，故这只是一个"漏停 also 停"的兜底天花板。
+  var POLL_INTERVAL_MS = 5000;
+  var POLL_MAX_TICKS = 240;
+  var pollTimer = null;
+  var pollTicks = 0;
+  var pollUrl = "";
+  function stopPoll() {
+    if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
+    pollTicks = 0;
+  }
+  // 件B 收口判据两来源（v0.10.4 · REQ-2026-10-11-03）：① 动作区文案 —— 文本子串「在飞 / 排队中」
+  // 是判据，改名即静默失效，故两字面不得移出本体；② 执行明细六态 chip —— 选择器串必须与
+  // startPoll 起轮判据**逐字相同**（只扩起轮不扩收口 ⇒ 起了轮第一拍即判收口自停）。
+  function stillBusy(main) {
+    var m = main.querySelector(".turn-progress");
+    if (m !== null && (m.textContent.indexOf("在飞") !== -1 || m.textContent.indexOf("排队中") !== -1)) return true;
+    return main.querySelector(".dg-chip.dg-running, .dg-chip.dg-queued") !== null;
+  }
+  function schedulePoll() {
+    if (pollTicks >= POLL_MAX_TICKS) { stopPoll(); return; }
+    pollTimer = setTimeout(pollOnce, POLL_INTERVAL_MS);
+  }
+  // 拍级 held 闸（v0.10.4 · REQ-2026-10-11-05 增补 B-2）：swapPage 换的是整份 <main> 全子节点
+  // 替换 .fd-body —— 用户正在浮层里填表时换页 = 连同表单与已填输入一起冲掉。两路判据：
+  // ① 焦点在编辑区子树（正在填）；② 任一 textarea/input 的 value 非空（已填失焦也挡）。
+  // 只判这两路文本控件面，不扩其它控件、不判挂起标记（口径见 JSDoc「拍级 held 闸」段）。
+  function heldBody() {
+    if (body === null) return false;
+    if (body.contains(document.activeElement)) return true;
+    var f = body.querySelectorAll("textarea, input");
+    for (var i = 0; i < f.length; i += 1) { if (f[i].value !== "") return true; }
+    return false;
+  }
+  function pollOnce() {
+    pollTimer = null;
+    // 件C：浮层已被用户关闭 ⇒ 停轮即可，**不得 showModal 把它重新弹开**，也不改 dlg.open。
+    if (!dlg.open || pollUrl === "") { stopPoll(); return; }
+    pollTicks += 1;
+    fetch(pollUrl, { credentials: "same-origin", headers: { Accept: "text/html" } }).then(function (res) {
+      return res.text().then(function (text) { return { ok: res.ok, text: text }; });
+    }).then(function (r) {
+      if (!r.ok) { schedulePoll(); return; }
+      // 读面不可解析（拿不到 main）⇒ 无从判收口，保守续轮，窗口耗尽自然停
+      var main = parsePage(r.text).main;
+      // 件C：这一拍之间用户可能已关浮层 ⇒ 只停轮，收口渲染不落 showModal
+      if (!dlg.open || pollUrl === "") { stopPoll(); return; }
+      // 收口（本轮不再在飞 / 排队）⇒ 停轮，末次真实进度已由服务端渲染留在动作区
+      if (main === null || !stillBusy(main)) { stopPoll(); return; }
+      // 拍级 held 闸：本拍若用户正在/已在浮层内填写 ⇒ 不换页，只排下一拍（零请求增量、不自弹开）
+      if (heldBody()) { schedulePoll(); return; }
+      swapPage(r.text, false);
+      schedulePoll();
+    }).catch(function () { schedulePoll(); });
+  }
+  // 起轮判据 = 仍忙（动作区文案 ∨ 执行明细 chip）；chip 串与 stillBusy 逐字相同
+  // ⇒ 起轮与收口不会各执一套判据（只扩起轮 ⇒ 起了轮第一拍即判收口自停，本节点要防的缺陷）。
+  function startPoll(main) {
+    stopPoll();
+    if (main === null) return;
+    if (!stillBusy(main) && main.querySelector(".dg-chip.dg-running, .dg-chip.dg-queued") === null) return;
+    pollUrl = lastHref;
+    pollTicks = 1;
+    schedulePoll();
+  }
+  function nativeSubmit(form) { restoreForm(form); form.submit(); }
+  function parsePage(html) {
+    var doc = new DOMParser().parseFromString(html, "text/html");
+    return { main: doc.querySelector("main"), card: doc.querySelector(".err-ov-card") };
+  }
+  function dropCard() {
+    var kids = dlg.children;
+    for (var i = kids.length - 1; i >= 0; i -= 1) {
+      if (kids[i].classList.contains("err-ov-card") && kids[i].parentNode !== null) { kids[i].parentNode.removeChild(kids[i]); }
+    }
+  }
+  function showCard(card) {
+    dropCard();
+    dlg.appendChild(card);
+    if (!dlg.open) dlg.showModal();
+  }
+  function swapPage(html, reopen) {
+    var parsed = parsePage(html);
+    var main = parsed.main;
+    var card = parsed.card;
+    if (main === null && card === null) return false;
+    dropCard();
+    if (body !== null) {
+      while (body.firstChild !== null) { body.removeChild(body.firstChild); }
+      if (card !== null) { body.appendChild(card); }
+      if (main !== null) { while (main.firstChild !== null) { body.appendChild(main.firstChild); } }
+    }
+    // 件C：reopen 传 false（后台轮询）时**绝不**把已关闭的浮层重新弹开。
+    if (reopen !== false && !dlg.open) { dlg.showModal(); }
+    // 搬运节点不跑内联 script（DOMParser 惰性文档）⇒ 详情页依赖图/文档 mermaid 换入后
+    // 须主动补渲（钩子由 docs-render.mermaidRenderScript 暴露；无该全局 = 本页未挂 mermaid，跳过）。
+    // showModal 在先：渲染不得落在 display:none 容器（98c39da1 前科口径）。
+    if (typeof window.a2aRenderMermaid === "function") { try { window.a2aRenderMermaid(); } catch (err) {} }
+    return true;
+  }
+  function open(a, toggle) {
+    var href = a.getAttribute("href") || "";
+    if (toggle && href === lastHref && dlg.open) { dlg.close(); dlg.returnValue = ""; return; }
+    stopPoll();
+    dlg.returnValue = "";
+    if (body !== null) body.textContent = "加载中…";
+    fetch(href, { credentials: "same-origin", headers: { Accept: "text/html" } }).then(function (res) {
+      if (!res.ok) { fallback(a); return null; }
+      return res.text();
+    }).then(function (text) {
+      if (text === null || text === undefined) return;
+      // 打开即跟刷（v0.10.4 · REQ-2026-10-11-05 增补 B-1）：lastHref 先赋（startPoll 内 pollUrl=lastHref），
+      // 摘 main 复用 parsePage（DOMParser 单点不扩）；详情页含未收口轮次时打开浮层即跟刷
+      if (swapPage(text)) { lastHref = href; startPoll(parsePage(text).main); } else { fallback(a); }
+    }).catch(function () { fallback(a); });
+  }
+  function postForm(form) {
+    var data;
+    try { data = new URLSearchParams(new FormData(form)); } catch (err) { data = null; }
+    // 增补三 §9.2：action 走 getAttribute（同名字段遮蔽属性直读），空 ⇒ 原生提交回落
+    var action = form.getAttribute("action") || "";
+    if (data === null || action === "") { nativeSubmit(form); return; }
+    dlg.returnValue = "";
+    fetch(action, {
+      method: "POST",
+      body: data,
+      credentials: "same-origin",
+      headers: { Accept: "text/html" },
+    }).then(function (res) {
+      if (!res.ok) { return res.text().then(function (text) { return { err: true, text: text }; }); }
+      return res.text().then(function (text) { return { err: false, text: text }; });
+    }).then(function (r) {
+      if (r.err) {
+        var parsed = parsePage(r.text);
+        if (parsed.card !== null) { showCard(parsed.card); restoreForm(form); return; }
+        if (swapPage(r.text)) { restoreForm(form); } else { nativeSubmit(form); }
+        return;
+      }
+      // 成功（303 跟随后即详情页）：抽 main 换入 body ⇒ 旧表单连同禁用态与提示行一并离场。
+      var okMain = parsePage(r.text).main;
+      if (!swapPage(r.text)) { nativeSubmit(form); return; }
+      // 件B：换入页动作区仍是「在飞 / 排队」⇒ 交棒有界轮询（读面 = 本表单的详情 URL）；
+      // 已收口 / 摘不到 main ⇒ 不起轮，静态读面即最新事实。startPoll 内先 stopPoll ⇒ 恒只一条链。
+      lastHref = action;
+      startPoll(okMain);
+      restoreForm(form);
+    }).catch(function () { nativeSubmit(form); });
+  }
+  document.addEventListener("click", function (e) {
+    var t = e.target;
+    if (t === null || typeof t.closest !== "function") return;
+    var dismiss = t.closest("#feat-dialog #err-ov-close");
+    if (dismiss !== null) {
+      e.preventDefault();
+      var card = dismiss.closest(".err-ov-card");
+      if (card !== null && card.parentNode !== null) { card.parentNode.removeChild(card); }
+      return;
+    }
+    var nav = t.closest('#feat-dialog a[href^="/"]');
+    if (nav !== null) {
+      if (nav.hasAttribute("target")) return;
+      e.preventDefault();
+      open(nav, false);
+      return;
+    }
+    var a = t.closest('a[href^="/features/"]');
+    if (a === null || a.closest(".kcard") === null) return;
+    if (e.button !== 0 || e.metaKey === true || e.ctrlKey === true || e.shiftKey === true || e.altKey === true) return;
+    e.preventDefault();
+    open(a, true);
+  });
+  document.addEventListener("submit", function (e) {
+    var form = e.target;
+    if (form === null || typeof form.closest !== "function") return;
+    if (form.closest("#feat-dialog") === null) return;
+    if ((form.getAttribute("method") || "").toLowerCase() !== "post") return;
+    e.preventDefault();
+    // 件A：就地即时反馈（禁用提交按钮 + 挂提示行）+ 连点拦截（挂起标记二次到达即吞掉）。
+    // 整页档的 SUBMIT_GUARD 因本行 preventDefault 而早退（defaultPrevented 语义未动）。
+    if (form.getAttribute("data-ov-pending") === "1") return;
+    if (!markPending(form)) return;
+    form.setAttribute("data-ov-pending", "1");
+    postForm(form);
+  });
+  var closeBtn = document.getElementById("feat-dialog-close");
+  if (closeBtn !== null) closeBtn.addEventListener("click", function () { stopPoll(); dlg.close(); dlg.returnValue = ""; });
+  dlg.addEventListener("cancel", function () { stopPoll(); dlg.returnValue = ""; });
+  dlg.addEventListener("click", function (e) {
+    if (e.target !== dlg) return;
+    var r = dlg.getBoundingClientRect();
+    var inBox = e.clientX >= r.left && e.clientX <= r.right && e.clientY >= r.top && e.clientY <= r.bottom;
+    if (!inBox) { stopPoll(); dlg.close(); dlg.returnValue = ""; }
+  });
+})();
+</script><script>
+(function () {
+  function wire(dlg, openBtn, inline) {
+    if (dlg === null || typeof dlg.showModal !== "function") return;
+    var dlgId = dlg.getAttribute("id") || "";
+    var form = dlg.querySelector("form");
+    function restoreForm() {
+      if (form === null) return;
+      var btns = form.querySelectorAll("button[disabled]");
+      for (var i = 0; i < btns.length; i += 1) {
+        btns[i].disabled = false;
+        btns[i].removeAttribute("aria-disabled");
+      }
+      var p = form.querySelector(".submit-pending");
+      if (p !== null && p.parentNode !== null) { p.parentNode.removeChild(p); }
+    }
+    function closeAndReload() { dlg.close(); dlg.returnValue = ""; window.location.reload(); }
+    function dropCard() {
+      var kids = dlg.children;
+      for (var i = kids.length - 1; i >= 0; i -= 1) {
+        if (kids[i].classList.contains("err-ov-card") && kids[i].parentNode !== null) { kids[i].parentNode.removeChild(kids[i]); }
+      }
+    }
+    function showCard(card) {
+      dropCard();
+      dlg.appendChild(card);
+      if (!dlg.open) dlg.showModal();
+    }
+    function submitNative() {
+      if (form === null) return;
+      restoreForm();
+      form.submit();
+    }
+    var closeBtn = dlg.querySelector("button");
+    if (closeBtn !== null) {
+      closeBtn.addEventListener("click", function () { dlg.close(); dlg.returnValue = ""; });
+    }
+    if (openBtn !== null) {
+      openBtn.hidden = false;
+      openBtn.addEventListener("click", function () {
+        dropCard();
+        dlg.returnValue = "";
+        dlg.showModal();
+      });
+    }
+    if (inline !== null) inline.hidden = true;
+    document.addEventListener("click", function (e) {
+      var t = e.target;
+      if (t === null || typeof t.closest !== "function") return;
+      var dismiss = dlgId === "" ? null : t.closest("#" + dlgId + " #err-ov-close");
+      if (dismiss === null) return;
+      e.preventDefault();
+      var card = dismiss.closest(".err-ov-card");
+      if (card !== null && card.parentNode !== null) { card.parentNode.removeChild(card); }
+    });
+    if (form !== null) {
+      form.addEventListener("submit", function (e) {
+        e.preventDefault();
+        var data;
+        try { data = new URLSearchParams(new FormData(form)); } catch (err) { data = null; }
+        // 增补三 §9.2：action 走 getAttribute（同名字段遮蔽属性直读），空 ⇒ 原生提交回落
+        var action = form.getAttribute("action") || "";
+        if (data === null || action === "") { submitNative(); return; }
+        dlg.returnValue = "";
+        fetch(action, {
+          method: "POST",
+          body: data,
+          credentials: "same-origin",
+          headers: { Accept: "text/html" },
+        }).then(function (res) {
+          return res.text().then(function (text) { return { ok: res.ok, text: text }; });
+        }).then(function (r) {
+          if (!r.ok) {
+            var doc = new DOMParser().parseFromString(r.text, "text/html");
+            var card = doc.querySelector(".err-ov-card");
+            if (card === null) { closeAndReload(); return; }
+            showCard(card);
+            restoreForm();
+            return;
+          }
+          closeAndReload();
+        }).catch(function () { closeAndReload(); });
+      });
+    }
+    dlg.addEventListener("cancel", function () { dlg.returnValue = ""; });
+    dlg.addEventListener("click", function (e) {
+      if (e.target !== dlg) return;
+      var rect = dlg.getBoundingClientRect();
+      var inBox = e.clientX >= rect.left && e.clientX <= rect.right && e.clientY >= rect.top && e.clientY <= rect.bottom;
+      if (!inBox) { dlg.close(); dlg.returnValue = ""; }
+    });
+  }
+  wire(document.getElementById("new-req-dialog"), document.getElementById("new-req-open"), null);
+  wire(document.getElementById("new-org-dialog"), document.getElementById("new-org-open"), document.getElementById("new-org-inline"));
+  // 增补七 a（§9.1-a）+ 增补八（§9.3）+ 增补十一 E1（§9.6）：「＋ 新版本」按钮**在排期看板页头**
+  // （原门户首页那处已撤除；看板尾虚列拖拽建版本入口已撤 ⇒ 本按钮是全站唯一创建入口）——
+  // 点击 ⇒ showModal() 打开 #new-version-dialog（与「＋ 新增需求」同款弹窗）；
+  // 表单提交复用 wire()：POST /versions(action=create) → 新版本空列出现。
+  // 成功（303 跟随后 ok）⇒ 关弹窗整页刷新（本页即 /schedule，语义同跳看板）；失败抽 .err-ov-card
+  // 叠加为 dialog 直接子元素（弹窗不关、「知道了」委托摘卡、表单值保留可改后重提）。
+  // 无 JS ⇒ 按钮服务端 hidden 且表单原生 POST 回落（整页 PRG，不显死按钮）；非排期页无此按钮 ⇒ 早退空转。
+  function wireNewVersion(btn) {
+    if (btn === null) return;
+    var dlg = document.getElementById("new-version-dialog");
+    if (dlg === null || typeof dlg.showModal !== "function") { btn.hidden = false; return; }
+    wire(dlg, btn, null);
+  }
+  wireNewVersion(document.getElementById("new-version-open"));
+})();
+</script><script>
+(function () {
+  var board = document.getElementById("schedule-board");
+  if (board === null || typeof fetch !== "function" || typeof DragEvent !== "function") return;
+  function colOf(node) {
+    var el = node;
+    while (el !== null && el !== board) {
+      if (el.nodeType === 1 && typeof el.getAttribute === "function" && el.getAttribute("data-version") !== null) return el;
+      el = el.parentNode;
+    }
+    return null;
+  }
+  function dropCard() {
+    var kids = document.body.children;
+    for (var i = kids.length - 1; i >= 0; i -= 1) {
+      if (kids[i].classList && kids[i].classList.contains("err-ov-card") && kids[i].parentNode !== null) { kids[i].parentNode.removeChild(kids[i]); }
+    }
+  }
+  function showCard(card) {
+    dropCard();
+    card.classList.add("drag-err-overlay");
+    document.body.appendChild(card);
+    var btn = card.querySelector("#err-ov-close");
+    if (btn !== null) btn.addEventListener("click", dropCard);
+  }
+  function submitDrag(featureId, version) {
+    fetch("/features/" + encodeURIComponent(featureId) + "/schedule", {
+      method: "POST",
+      body: new URLSearchParams({ version: version }),
+      credentials: "same-origin",
+      headers: { Accept: "text/html" }
+    }).then(function (res) {
+      if (res.ok) { window.location.reload(); return null; }
+      return res.text();
+    }).then(function (text) {
+      if (text === null || text === undefined) return;
+      var doc = new DOMParser().parseFromString(text, "text/html");
+      var card = doc.querySelector(".err-ov-card");
+      if (card === null) { window.location.reload(); return; }
+      showCard(card);
+    }).catch(function () { window.location.reload(); });
+  }
+  document.addEventListener("dragstart", function (e) {
+    var card = e.target !== null && typeof e.target.closest === "function" ? e.target.closest(".kcard[draggable=true]") : null;
+    if (card === null) return;
+    var id = card.getAttribute("data-feature");
+    if (id === null) return;
+    e.dataTransfer.setData("text/plain", id);
+    e.dataTransfer.effectAllowed = "move";
+  });
+  document.addEventListener("dragover", function (e) {
+    var col = colOf(e.target);
+    if (col === null) return;
+    e.preventDefault();
+    e.dataTransfer.dropEffect = "move";
+    col.classList.add("dragover");
+  });
+  document.addEventListener("dragleave", function (e) {
+    var col = colOf(e.target);
+    if (col !== null) col.classList.remove("dragover");
+  });
+  document.addEventListener("drop", function (e) {
+    var col = colOf(e.target);
+    if (col === null) return;
+    e.preventDefault();
+    col.classList.remove("dragover");
+    var id = e.dataTransfer.getData("text/plain");
+    if (id === "") return;
+    var card = document.querySelector('.kcard[data-feature="' + id + '"]');
+    if (card === null) return;
+    var target = col.getAttribute("data-version");
+    if ((card.getAttribute("data-version") || "") === (target || "")) return;
+    submitDrag(id, target === null ? "" : target);
+  });
+  document.addEventListener("dragend", function (e) {
+    if (e.target !== null && typeof e.target.closest === "function" && e.target.closest(".kcard[draggable=true]") !== null) {
+      var cols = board.querySelectorAll(".kcol.dragover");
+      for (var i = 0; i < cols.length; i += 1) cols[i].classList.remove("dragover");
+    }
+  });
+})();
+</script><script src="/static/mermaid.min.js" defer></script><script>
+(function () {
+  function renderBlocks() {
+    if (typeof window.mermaid === "undefined") { return false; }
+    try { window.mermaid.initialize({ startOnLoad: false, securityLevel: "strict" }); } catch (e) { return false; }
+    var nodes = document.querySelectorAll('.mermaid-block[data-src]:not([data-rendered="1"])');
+    var seq = 0;
+    Array.prototype.forEach.call(nodes, function (host) {
+      var srcEl = document.getElementById(host.getAttribute("data-src"));
+      if (srcEl === null) { return; }
+      var def;
+      try { def = JSON.parse(srcEl.textContent || ""); } catch (e) { return; }
+      var pre = host.querySelector("pre.mermaid-src");
+      if (pre === null) { return; }
+      seq += 1;
+      var id = "a2a-mermaid-" + seq;
+      window.mermaid.render(id, def).then(function (r) {
+        /* SVG 必须落在 PRE 之外的可见兄弟容器：pre.result 在 data-rendered=1 时隐藏，嵌套进去即不可见 */
+        var out = document.createElement("div");
+        out.className = "mermaid-svg";
+        out.innerHTML = r.svg;
+        host.insertBefore(out, pre);
+        host.setAttribute("data-rendered", "1");
+      }, function () { /* 渲染失败：保留源文本，不整页崩 */ });
+    });
+    return true;
+  }
+  /* 浮层补渲钩子：FEATURE_DETAIL_OVERLAY_SCRIPT 换入 <main>（showModal 之后）调用；幂等，已渲染块不重复扫 */
+  window.a2aRenderMermaid = renderBlocks;
+  /* defer 库先于 DOMContentLoaded 执行 ⇒ DC 一次；load 再兜一次（幂等扫描，防极迟就绪的加载形态） */
+  if (document.readyState === "loading") {
+    document.addEventListener("DOMContentLoaded", renderBlocks);
+  } else { renderBlocks(); }
+  window.addEventListener("load", renderBlocks);
+})();
+</script><script>
+(function () {
+  if (document.querySelectorAll("[data-live]").length === 0 || typeof fetch !== "function" || typeof DOMParser !== "function") return;
+  var timed = document.querySelector("[data-live-interval]");
+  var intervalMs = timed === null ? 0 : parseInt(timed.getAttribute("data-live-interval"), 10);
+  if (!(intervalMs > 0)) return;
+  var timer = null;
+  var busy = false;
+  var dragging = false;
+  // 跳拍判据（锚级）：焦点在本锚子树内 = 用户正在填；本锚含已展开折叠 = 用户正在看
+  // 豁免类只有 pipe（依赖图管道，src/graph-view.ts:471 渲为默认 open）——不豁免则 graph 锚
+  // 被自家默认展开态永久冻结、永不刷新。
+  function holdAnchor(el) {
+    if (el.contains(document.activeElement)) return true;
+    return el.querySelector("details[open]:not(.pipe)") !== null;
+  }
+  // 跳拍判据（整拍级）：任一 dialog 开着 ⇒ 让位（件B 浮层档自有节奏）
+  function anyDialogOpen() {
+    var list = document.querySelectorAll("dialog");
+    for (var i = 0; i < list.length; i += 1) { if (list[i].open === true) return true; }
+    return false;
+  }
+  function keyOf(el) { return el.getAttribute("data-live") || ""; }
+  function findAnchor(doc, key) {
+    var list = doc.querySelectorAll("[data-live]");
+    for (var i = 0; i < list.length; i += 1) { if (keyOf(list[i]) === key) return list[i]; }
+    return null;
+  }
+  function scrollMap(root) {
+    var map = {};
+    var cols = root.querySelectorAll(".kcol");
+    for (var i = 0; i < cols.length; i += 1) {
+      var v = cols[i].getAttribute("data-version");
+      if (v !== null) map[v] = cols[i].scrollTop;
+    }
+    return map;
+  }
+  function restoreScroll(root, map) {
+    var cols = root.querySelectorAll(".kcol");
+    for (var i = 0; i < cols.length; i += 1) {
+      var v = cols[i].getAttribute("data-version");
+      if (v === null || !Object.prototype.hasOwnProperty.call(map, v)) continue;
+      cols[i].scrollTop = map[v];
+    }
+  }
+  // 只搬子节点、**不替换锚元素本身**（拖拽脚本加载期缓存了 #schedule-board 作上溯边界）
+  function swapChildren(target, source) {
+    var before = scrollMap(target);
+    while (target.firstChild !== null) { target.removeChild(target.firstChild); }
+    while (source.firstChild !== null) { target.appendChild(source.firstChild); }
+    restoreScroll(target, before);
+  }
+  function pad2(n) { return n < 10 ? "0" + n : "" + n; }
+  function writeClock() {
+    var el = document.querySelector(".live-clock");
+    if (el === null) return;
+    var t = new Date();
+    el.textContent = pad2(t.getHours()) + ":" + pad2(t.getMinutes()) + ":" + pad2(t.getSeconds());
+  }
+  function swapAll(text) {
+    var doc = new DOMParser().parseFromString(text, "text/html");
+    var live = document.querySelectorAll("[data-live]");
+    var changed = 0;
+    for (var i = 0; i < live.length; i += 1) {
+      var el = live[i];
+      var key = keyOf(el);
+      if (key === "" || holdAnchor(el)) continue;
+      var src = findAnchor(doc, key);
+      if (src === null) continue;
+      swapChildren(el, src);
+      changed += 1;
+    }
+    if (changed > 0) writeClock();
+  }
+  function scheduleNext() { timer = setTimeout(tick, intervalMs); }
+  function tick() {
+    timer = null;
+    if (busy) return;
+    if (document.hidden || dragging || anyDialogOpen()) { scheduleNext(); return; }
+    busy = true;
+    fetch(location.pathname + location.search, { credentials: "same-origin", headers: { Accept: "text/html" } }).then(function (res) {
+      return res.ok ? res.text() : null;
+    }).then(function (text) {
+      busy = false;
+      if (text !== null && text !== undefined) swapAll(text);
+      scheduleNext();
+    }).catch(function () { busy = false; scheduleNext(); });
+  }
+  function runOneTick() {
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+    tick();
+  }
+  document.addEventListener("dragstart", function () { dragging = true; });
+  document.addEventListener("dragend", function () { dragging = false; });
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) runOneTick(); });
+  var nowBtn = document.querySelector(".live-now");
+  if (nowBtn !== null) { nowBtn.hidden = false; }
+  // ── 任务页局部动线：三条委托（chips / 不带过滤重查·换项目 / 过滤表单）+ pushState · popstate ──
+  // 共同闸 = 目标 pathname ∈ {/tasks, /org/<名>/tasks} ∧ 当前页也在这两档 ⇒ 才拦并局部化；
+  // 其余（含需求详情一类的跨页链）一律放行原生导航 ⇒ 全站 pushState 只发生在任务页三动线。
+  // 本枚活在 TS 模板字符串内：单反斜杠转义斜杠会被源码层当 NonEscapeCharacter 吃掉 ⇒ 运行值成裸斜杠
+  // 即整枚 parse 不过（钉 = live-refresh B4 / B8），故此处必须双写反斜杠。
+  function onTasksPath(p) {
+    return p === "/tasks" || /^\/org\/[^/]+\/tasks$/.test(p);
+  }
+  function tasksUrl(raw) {
+    if (raw === null || raw === undefined || raw === "" || onTasksPath(location.pathname) === false) return null;
+    var url = null;
+    try { url = new URL(raw, location.href); } catch (e) { return null; }
+    if (url.origin !== location.origin) return null;
+    return onTasksPath(url.pathname) ? url : null;
+  }
+  // 跨档回落判据（不猜）：回包与当前页的 [data-live] key 集合必须**完全相同** —— 少一枚 = 摘不到，
+  // 多一枚 = 当前页无该壳（换了地址栏却补不出过滤卡）⇒ 两种都交回整页导航。
+  function sameKeySet(text) {
+    var doc = new DOMParser().parseFromString(text, "text/html");
+    var now = document.querySelectorAll("[data-live]");
+    var next = doc.querySelectorAll("[data-live]");
+    var have = 0;
+    for (var i = 0; i < now.length; i += 1) { if (keyOf(now[i]) !== "") have += 1; }
+    var got = 0;
+    for (var j = 0; j < next.length; j += 1) {
+      var key = keyOf(next[j]);
+      if (key === "") continue;
+      got += 1;
+      if (findAnchor(document, key) === null) return false;
+    }
+    return have === got;
+  }
+  // 打新 URL → 成功且同档 ⇒ 复用主体换锚（跳拍判据 / 滚动回填 / 时钟单一写入者）→ pushState → 回排下拍。
+  // 清掉待发的定时拍再跑 ⇒ 与常驻链共用同一条链，绝不并起两条（在飞一拍未回 ⇒ 交回整页导航）。
+  function liveGo(url, push) {
+    var target = url.pathname + url.search;
+    if (busy === true) { location.assign(target); return; }
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+    busy = true;
+    fetch(target, { credentials: "same-origin", headers: { Accept: "text/html" } }).then(function (res) {
+      return res.ok ? res.text() : null;
+    }).then(function (text) {
+      busy = false;
+      if (text === null || text === undefined || sameKeySet(text) === false) { scheduleNext(); location.assign(target); return; }
+      if (push === true) history.pushState(null, "", target);
+      swapAll(text);
+      scheduleNext();
+    }).catch(function () { busy = false; scheduleNext(); });
+  }
+  document.addEventListener("click", function (ev) {
+    if (ev.target === null || ev.target.closest === undefined) return;
+    // ⟳ 立即更新：原直绑并入本条委托 ⇒ 全常量体 click 恒一条
+    if (ev.target.closest(".live-now") !== null) { runOneTick(); return; }
+    if (ev.button !== 0 || ev.metaKey === true || ev.ctrlKey === true || ev.shiftKey === true || ev.altKey === true) return;
+    var link = ev.target.closest(".b-chips a, .b-card a.fl");
+    if (link === null) return;
+    var url = tasksUrl(link.getAttribute("href"));
+    if (url === null) return;
+    ev.preventDefault();
+    liveGo(url, true);
+  });
+  document.addEventListener("submit", function (ev) {
+    var form = ev.target;
+    if (form === null || form.tagName !== "FORM") return;
+    if (form.closest('[data-live="tasks-filter"]') === null) return;
+    if ((form.getAttribute("method") || "").toLowerCase() !== "get") return;
+    var url = tasksUrl(form.getAttribute("action"));
+    if (url === null) return;
+    var query = "";
+    try { query = new URLSearchParams(new FormData(form)).toString(); } catch (e) { return; }
+    url.search = query;
+    ev.preventDefault();
+    liveGo(url, true);
+  });
+  window.addEventListener("popstate", function () {
+    var url = tasksUrl(location.href);
+    if (url === null) return;
+    liveGo(url, false);
+  });
+  scheduleNext();
+})();
+</script>
+
+</main>
+</div>
+
+<script>
+(function () {
+  function ovShowCard(card) {
+    var old = document.querySelectorAll("body > .err-ov-card.ov-err-overlay");
+    for (var i = 0; i < old.length; i += 1) { if (old[i].parentNode !== null) { old[i].parentNode.removeChild(old[i]); } }
+    card.classList.add("ov-err-overlay");
+    document.body.appendChild(card);
+  }
+  function ovRestore(form) {
+    form.removeAttribute("data-ov-pending");
+    var btns = form.querySelectorAll("button[disabled]");
+    for (var i = 0; i < btns.length; i += 1) {
+      btns[i].disabled = false;
+      btns[i].removeAttribute("aria-disabled");
+    }
+    var p = form.querySelector(".submit-pending");
+    if (p !== null && p.parentNode !== null) { p.parentNode.removeChild(p); }
+  }
+  function ovSubmit(form) {
+    var data;
+    try { data = new URLSearchParams(new FormData(form)); } catch (err) { data = null; }
+    // 增补三 §9.2：必须 getAttribute —— 成员/停用表单带 name="action" 字段，
+    // HTMLFormElement 的 [LegacyOverrideBuiltIns] 会让同名字段遮蔽 action 属性直读。
+    var action = form.getAttribute("action") || "";
+    if (data === null || action === "") { ovRestore(form); form.submit(); return; }
+    fetch(action, {
+      method: "POST",
+      body: data,
+      credentials: "same-origin",
+      headers: { Accept: "text/html" }
+    }).then(function (res) {
+      return res.text().then(function (text) { return { ok: res.ok, text: text }; });
+    }).then(function (r) {
+      // 增补五 §9.4-②：表单带 data-ov-redirect 时成功改跳该落点（停用后刷新当前空间页必 410），
+      // 无该属性 ⇒ 维持原 reload 口径。
+      var redirect = form.getAttribute("data-ov-redirect") || "";
+      if (r.ok) { gotoAfterSubmit(redirect); return; }
+      var doc = new DOMParser().parseFromString(r.text, "text/html");
+      var card = doc.querySelector(".err-ov-card");
+      if (card === null) { window.location.reload(); return; }
+      ovRestore(form);
+      ovShowCard(card);
+    }).catch(function () { gotoAfterSubmit(""); });
+  }
+  function gotoAfterSubmit(redirect) {
+    if (redirect !== "") { window.location.href = redirect; return; }
+    window.location.reload();
+  }
+  document.addEventListener("submit", function (e) {
+    var form = e.target;
+    if (!form || typeof form.querySelectorAll !== "function") return;
+    if ((form.getAttribute("method") || "").toLowerCase() !== "post") return;
+    if (e.defaultPrevented) return;
+    if ((form.getAttribute("data-ov") || "") === "1") {
+      if (form.getAttribute("data-ov-pending") === "1") { e.preventDefault(); return; }
+      form.setAttribute("data-ov-pending", "1");
+    }
+    var note = form.getAttribute("data-submit") || "已提交，处理中…";
+    var btns = form.querySelectorAll("button[type=submit]");
+    for (var i = 0; i < btns.length; i += 1) {
+      btns[i].disabled = true;
+      btns[i].setAttribute("aria-disabled", "true");
+    }
+    if (form.querySelector(".submit-pending") === null) {
+      var p = document.createElement("p");
+      p.className = "hint submit-pending";
+      p.textContent = note;
+      form.appendChild(p);
+    }
+    if (form.getAttribute("data-ov") === "1") { e.preventDefault(); ovSubmit(form); }
+  });
+  // 增补四 §9.3：document 级委托摘「知道了」（DOMParser 搬入的卡不跑自带脚本；
+  // 委托天然覆盖动态注入卡，口径对齐 /schedule 侧 closest(...err-ov-card...) 先例）。
+  document.addEventListener("click", function (e) {
+    var t = e.target;
+    if (t === null || typeof t.closest !== "function") return;
+    var btn = t.closest("#err-ov-close");
+    if (btn === null) return;
+    var card = btn.closest(".err-ov-card");
+    if (card !== null && card.parentNode !== null) { card.parentNode.removeChild(card); }
+  });
+})();
+</script>
+</body>
+</html>

@@ -208,7 +208,7 @@ import { SuspendLedgerStore, defaultSuspendLedgerFile, type SuspendedEntry } fro
 import { statDirKind } from "./host-runtime.js";
 import { readVersion } from "./version.js";
 import { isVersionLocked } from "./version-status.js";
-import { normalizeVersion } from "./version-order.js";
+import { normalizeVersion, sortPoolEntries } from "./version-order.js";
 import { defaultRepoRoot, readDoc, type DocsSource } from "./docs-read.js";
 import { docsMoveRegistrations, executeDocsMove, planDocsMove, type DocsMoveResult } from "./docs-move.js";
 import { defaultStaticRoot, findVendoredAsset, VENDORED_ASSETS, MERMAID_ASSET, mermaidAssetScriptTag, mermaidRenderScript, vendoredAssetExists } from "./docs-render.js";
@@ -267,6 +267,7 @@ import {
   NEW_REQUIREMENT_DIALOG_SCRIPT,
   DRAG_SCHEDULE_SCRIPT,
   MEMBER_DRAG_SCRIPT,
+  PAGE_LIVE_SCRIPT,
   type ErrorOverlayField,
   type ErrorOverlayParams,
   type NavKey,
@@ -274,10 +275,10 @@ import {
 } from "./web/layout.js";
 import {
   BRIDGE_UNREACHABLE_CODE,
-  VIEW_NOTES,
   buildOrgPortalCards,
   errorFamilyLabel,
   groupFeaturesByVersion,
+  ORG_FEATURES_PAGE_SIZE,
   projectionLedgerOf,
   projectionVersionNames,
   renderAcceptanceSection,
@@ -617,11 +618,6 @@ interface Page {
   extraScripts?: string;
   /** REQ-2026-09-30-04 件1：组织上下文 = 侧栏二级菜单（项目组清单 + 当前空间高亮）数据源；`undefined` ⇒ 侧栏不出该块。 */
   orgNav?: PageOrgNav;
-  /**
-   * REQ-2026-10-02-02 件B / REQ-2026-10-02-03 件B / REQ-2026-10-02-04 件B：门户、排期、空间管理页不收全站口径说明（`ul.notes`）。
-   * `true` ⇒ 本页 notes 置空（layout 侧空数组不渲染该块）；其余页不传 ⇒ 照旧渲染 `VIEW_NOTES`。
-   */
-  noNotes?: boolean;
 }
 
 function sendPage(res: ServerResponse, page: Page): void {
@@ -632,7 +628,6 @@ function sendPage(res: ServerResponse, page: Page): void {
       title: page.title,
       active: page.active,
       bodyHtml: page.bodyHtml + (page.extraScripts ?? ""),
-      notes: page.noNotes === true ? [] : VIEW_NOTES,
       headerActions: page.headerActions,
       errorOverlay: page.errorOverlay,
       orgNav: page.orgNav,
@@ -854,7 +849,8 @@ export function projectVersionTierOf(projection: EngineVersionsProjection | null
  * project 档**三态显示闭集**里「读不到」那一档的降级条正文单点（v0.10.1 B2 · C-7：
  * 在场有行 / 在场无行 / 读不到）：`live` 与 `empty` ⇒ `null`（**无降级条** —— `empty` 是
  * **合法事实**「未登记，本版本起生效」，由 project 档自己渲文案，不是降级），
- * `absent` ⇒ 一行含**根因码**的提示。**唯一消费面 = 管理页「配置核对」卡第三行**（v0.10.2 落点④）——
+ * `absent` ⇒ 一行含**根因码**的提示。**唯一消费面 = 管理页页头「核对源健康度」短条第三档**（v0.10.2 落点④；
+ * ⑧a 起该面由「配置核对卡」降为页头短条，消费面不变）——
  * 其它读面不得各写一套降级文案。
  */
 export function projectVersionDegradationText(field: ProjectVersionsField): string | null {
@@ -961,6 +957,7 @@ async function renderScheduleBoard(
  * `NEW_REQUIREMENT_DIALOG_SCRIPT`（那边接 `#new-org-dialog`），故本常量注入点由一处变两处；闭集枚数不扩。
  * v0.9.3 增补 ②：浮层换入的详情页依赖图/文档 mermaid 不经脚本执行（搬运节点不跑 `<script>`）⇒
  * 本页同挂 vendored 库 + 渲染脚本，浮层经 window.a2aRenderMermaid 钩子补渲（缺资产 ⇒ 不挂，源文本降级）。
+ * v0.10.4 REQ-2026-10-11-03 N5：页级就地刷新（第八枚）同页、同通路**串尾追加**（排期页 = 定时档宿主）。
  */
 function schedulePageScripts(ctx: Ctx): string {
   return (
@@ -969,7 +966,7 @@ function schedulePageScripts(ctx: Ctx): string {
     DRAG_SCHEDULE_SCRIPT +
     (vendoredAssetExists(ctx.docs.staticRoot, MERMAID_ASSET.file)
       ? mermaidAssetScriptTag() + mermaidRenderScript()
-      : "")
+      : "") + PAGE_LIVE_SCRIPT
   );
 }
 
@@ -988,8 +985,6 @@ function schedulePageScripts(ctx: Ctx): string {
  * **B6**：门户不另挂组清单（件1 起全站唯一处 = 侧栏二级菜单）；卡增「已发版 / 进行中」版本摘要行
  * （**v0.10.0 尾段 N2 起 = 引擎版本台账投影只读喂入**，纯读面不做自动点亮，派生档带 `*`）。
  * 内联脚本闭集保持**七元**（N3-⑦/⑧ 纪律锚；门户新增的这点脚本是既有第五枚内的泛化，非新枚）。
- * **件B（REQ-2026-10-02-02）**：门户不收全站口径说明（页底 `ul.notes`）—— 经 `noNotes` 单点开关摘除
- * （`VIEW_NOTES` 常量与数据源不动，其余 `sendPage` 调用点照旧渲染；增补三 件B 起排期页同挂本开关）。
  */
 async function pageOrgPortal(ctx: Ctx): Promise<Page> {
   const view = await ctx.client.getFeatures();
@@ -1007,16 +1002,15 @@ async function pageOrgPortal(ctx: Ctx): Promise<Page> {
     headerActions: '<button type="button" id="new-org-open" class="header-actions" hidden>＋ 建项目组</button>',
     bodyHtml: renderOrgPortal(buildOrgPortalCards(orgNav.orgs, view.features, summaryLedger), orgsStatusOf(ctx.host)),
     extraScripts: NEW_REQUIREMENT_DIALOG_SCRIPT,
-    noNotes: true,
   };
 }
 
 /**
  * 需求详情页（整页与 `#feat-dialog` 浮层共用同一正文）。
- * `spaceOrg`（件2）= 空间路由带进来的组织名；全局档传 `null` / 不传 ⇒ 回落该卡 `ownerGroup`
- * （见 {@link detailSpaceOrg}），两者皆不可得 ⇒ 正文不带空间 tab 行。
+ * **①′（REQ-2026-10-12-01 增补）**：正文不带空间 tab 行、也不带返回链 ⇒ 本函数无空间路由入参。
+ * 出路 = 侧栏（一级门户 `/` + 二级组排期 `/org/<名>/schedule`）/ 浮层三出口（关闭钮 · ESC · 点遮罩）。
  */
-async function pageFeatureDetail(ctx: Ctx, featureId: string, spaceOrg: string | null = null): Promise<Page> {
+async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
   const detail = await ctx.client.getFeature(featureId);
   let trace = null;
   let traceError: string | null = null;
@@ -1088,9 +1082,6 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string, spaceOrg: string |
     versionProjectionLedgerOf(detailProjection),
     (f.ownerGroup ?? "").trim(),
   );
-  // 件2：空间 tab 行（详情页**无激活态**，作空间上下文与返回口）；归属不可得 ⇒ 空串不渲。
-  const spaceOrgOfCard = detailSpaceOrg(ctx, spaceOrg, f.ownerGroup);
-  const spaceNavHtml = spaceOrgOfCard === null ? "" : renderSpaceNav(spaceOrgOfCard, null);
   return {
     title: `需求 ${featureId.slice(0, 8)}`,
     active: "features",
@@ -1102,7 +1093,6 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string, spaceOrg: string |
       true,
       lockedVersions,
       {
-        spaceNavHtml,
         nextStepHtml: renderNextStepGuide(nextStepInput),
         actionAreaHtml: renderActionArea(f.featureId, nextStepInput),
         turnTraceHtml: renderTurnTrace(latestTurn),
@@ -1113,6 +1103,9 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string, spaceOrg: string |
         acceptanceHtml: renderAcceptanceSection(detail.acceptance),
       },
     ),
+    // v0.10.4 REQ-2026-10-11-03 N5：详情页整页档收第八枚（单档盖 `/features/:id` 与空间档两入口）。
+    // 文档页 `/features/:id/docs` 走 `renderDocPage` 的 `extraScripts`，**不经本路** ⇒ 不收（bd14 既有负钉）。
+    extraScripts: PAGE_LIVE_SCRIPT,
   };
 }
 
@@ -1359,12 +1352,12 @@ async function pageTasks(
       // 空间任务页不套用（空间侧导航归 B5b 处置）。
       active: org === null ? "projects" : "tasks",
       orgNav,
-      // 增补四 件A（REQ-2026-10-02-04）：选单档不收全站口径说明（口径折叠已删，notes 一并摘除）
-      noNotes: true,
       // B5b ④：空间档补二级导航行（全局档不渲）；件1 起组清单归侧栏，本行只留三枚 tab
       bodyHtml:
         (org === null ? "" : renderSpaceNav(org, "tasks")) +
         renderTasksPick(projects, projectsError, org, membershipError, preview),
+      // v0.10.4 REQ-2026-10-11-03 N5：任务页选单档收第八枚（三动线局部化的宿主；动线在 views 侧）。
+      extraScripts: PAGE_LIVE_SCRIPT,
     });
     return;
   }
@@ -1400,9 +1393,9 @@ async function pageTasks(
     // v0.9.6 B5a：全局 `?project=` 详情页同款归「项目」高亮（口径 37/38）；空间档不套用
     active: org === null ? "projects" : "tasks",
     orgNav: org !== null ? { org, orgs: orgNav?.orgs ?? [] } : orgNav,
-    // 增补四 件A（REQ-2026-10-02-04）：全局深链档同款不收全站口径说明（两档全摘）
-    noNotes: true,
     bodyHtml: renderTasks(view, filter, org, homeOrg),
+    // v0.10.4 REQ-2026-10-11-03 N5：任务页深链档（`/tasks?project=X` 与空间档同款）收第八枚。
+    extraScripts: PAGE_LIVE_SCRIPT,
   });
 }
 
@@ -1756,7 +1749,7 @@ async function handle(
       }
       if (spaceRoute.kind === "feature_detail") {
         try {
-          sendPage(res, { ...(await pageFeatureDetail(ctx, spaceRoute.featureId, spaceRoute.org)), orgNav: spaceNav });
+          sendPage(res, { ...(await pageFeatureDetail(ctx, spaceRoute.featureId)), orgNav: spaceNav });
         } catch (err) {
           sendPage(res, bridgeDownPage(`目标 = ${url.pathname}`, err, "features", spaceNav));
         }
@@ -1766,7 +1759,11 @@ async function handle(
         if (spaceRoute.view === "schedule") {
           sendPage(res, await pageOrgSpaceSchedule(ctx, spaceRoute.org, resolved.features, spaceNav));
         } else if (spaceRoute.view === "manage") {
-          sendPage(res, await pageOrgSpaceManage(ctx, spaceRoute.org, resolved.features, spaceNav));
+          // ⑨ 需求表页码（query 不进 `parseOrgSpacePath` 的段归一，另取）；非法值由 pageOrgSpaceManage fail-closed 回落第 1 页
+          sendPage(
+            res,
+            await pageOrgSpaceManage(ctx, spaceRoute.org, resolved.features, spaceNav, url.searchParams.get("page")),
+          );
         } else {
           await pageTasks(ctx, url, res, req.headers.accept, spaceRoute.org, spaceNav);
         }
@@ -2029,30 +2026,17 @@ function featureOrgGroups(features: readonly FeatureListItem[]): string[] {
  * 「需求」枚随 `/org/<名>/features` 整页退役；末段「← 回全局」撤（回全局动线由侧栏一级菜单承担）。
  * 当前视图在 inline `font-weight:700` 之外另挂 `class="fl on"` —— 空间页位置的唯一断言钩子。
  *
- * **件2（REQ-2026-09-30-04）**：`view = null` ⇒ **无激活态**档（需求详情页也携带本行，作空间上下文与
- * 返回口；本行不属于任何一档视图，故不得高亮任一枚）。tab 行外套 `<div class="b-tabs">` 供样式定位，
+ * **件2（REQ-2026-09-30-04）**：`view = null` ⇒ **无激活态**档（曾供需求详情页携带本行作空间上下文与
+ * 返回口）。tab 行外套 `<div class="b-tabs">` 供样式定位，
  * `<p class="hint">项目组空间 …` 的原文形态逐字不动（BD7 的窗口定界锚靠它）。
+ *
+ * **③（REQ-2026-10-11-05）· ①′（REQ-2026-10-12-01 增补）**：详情页不携本行，正文亦无返回链出口 ⇒
+ * `null` 档无调用方；本体与 `b-tabs` 样式**一律不动**（任务 / 排期 / 管理三页仍是人可点的唯一入口）。
  */
 function renderSpaceNav(org: string, view: OrgSpaceView | null): string {
   const link = (v: OrgSpaceView, text: string): string =>
     `<a class="fl${v === view ? " on" : ""}" href="${escapeHtml(orgSpaceLink(org, v))}"${v === view ? ' style="font-weight:700"' : ""}>${text}</a>`;
   return `<div class="b-tabs"><p class="hint">项目组空间 <b>${escapeHtml(org)}</b>：${link("schedule", "排期")} · ${link("tasks", "任务")} · ${link("manage", "管理")}</p></div>`;
-}
-
-/**
- * 详情页的空间归属（件2 tab 行的数据源，三态）：
- * - 空间路由进来 ⇒ 用路由组织（存在性 / 停用已由 `resolveOrgSpaceRoute` 放行）；
- * - 全局 `/features/:id` 进来 ⇒ 回落该卡 `ownerGroup`（trim 后非空 ∧ **未停用** ⇒ 才给行；
- *   停用名点了必 410 ⇒ 不给死链）；
- * - 两者皆空 / 归属缺失 ⇒ `null` ⇒ 详情页不渲 tab 行（**不臆造默认组织**，同 C3 深链页头口径）。
- */
-function detailSpaceOrg(ctx: Ctx, routeOrg: string | null | undefined, ownerGroup: string | null | undefined): string | null {
-  const fromRoute = (routeOrg ?? "").trim();
-  if (fromRoute !== "") return fromRoute;
-  const fromCard = (ownerGroup ?? "").trim();
-  if (fromCard === "") return null;
-  const disabled = disabledOrgNames(ctx.orgsLedger.load().ledger);
-  return disabled.includes(fromCard) ? null : fromCard;
 }
 
 /**
@@ -2078,14 +2062,48 @@ async function pageOrgSpaceSchedule(ctx: Ctx, org: string, all: readonly Feature
       '<button type="button" id="new-version-open" class="header-actions" hidden>＋ 新版本</button>',
     // B5b ⑤：看板页头 `<h2>` 由本页给出（`renderSchedule` 不再自带）
     bodyHtml: `${renderSpaceNav(org, "schedule")}<h2>排期看板</h2>${await renderScheduleBoard(ctx, features, ledger, org)}`,
-    // 增补三 件B（REQ-2026-10-02-03）：排期页不收全站口径说明（复用增补二 `noNotes` 单点开关）
-    noNotes: true,
     extraScripts: schedulePageScripts(ctx),
   };
 }
 
 /** 空间三页宕页/桥宕档的高亮统一挂「排期」（NAV 组织感知见 {@link orgNavOf}）。 */
 const SPACE_ACTIVE: NavKey = "schedule";
+
+/**
+ * **⑨ 需求表页码归一（REQ-2026-10-11-05 N11）**：fail-closed 回落第 1 页 —— 缺失 / 空 / 非数字 /
+ * 非整数 / `<1` / 起点越界（> 末页）一律 **1**（**不 400、不空白页、不猜**）。
+ * 归一后的整数才是进 `?page=` 拼接的值 ⇒ 非法原文永不被回显（无反射型注入面）。
+ */
+function normalizeFeaturePage(raw: string | null | undefined, total: number, pageSize: number): number {
+  const n = Number((raw ?? "").trim());
+  if (!Number.isInteger(n) || n < 1) return 1;
+  const pageCount = Math.max(1, Math.ceil(total / pageSize));
+  return n > pageCount ? 1 : n;
+}
+
+/**
+ * **⑨ 写回执页码的取值通道**：从 `Referer` 的 query 取原页码原文（同源表单 POST 与拖拽 fetch 默认带
+ * 全 URL，含本页 query）⇒ **不为此改任何表单**（不动池卡刷新表单 / 配置卡表单 / 停用表单，也不扩脚本面）。
+ * 无 Referer / 非 URL / 无 `page` 键 ⇒ `null`（**原样交 {@link normalizeFeaturePage} 处置 ⇒ 第 1 页**，
+ * fail-closed 不猜；与「刷新钮回第 1 页」同档，登 §6）。
+ */
+function pageRawFromReferer(referer: string | undefined): string | null {
+  if (referer === undefined || referer === "") return null;
+  try {
+    return new URL(referer).searchParams.get("page");
+  } catch {
+    return null;
+  }
+}
+
+/**
+ * **⑨ 写回执保页码（303 档）**：Post-Redirect-Get 的 Location 回带原页码 `?page=N`，使写后不跳回第 1 页。
+ * 拼进 Location 的是**归一后的正整数**（不是回显的用户输入）；非法 / 第 1 页 ⇒ 不附 query（干净 URL）。
+ */
+function managePageQueryFromReferer(referer: string | undefined): string {
+  const n = Number((pageRawFromReferer(referer) ?? "").trim());
+  return Number.isInteger(n) && n > 1 ? `?page=${String(n)}` : "";
+}
 
 /**
  * `GET /org/<名>/manage`（v0.9.4 §9-c · REQ-2026-09-27-06 N3）：**空间内管理页** ——
@@ -2101,7 +2119,13 @@ const SPACE_ACTIVE: NavKey = "schedule";
  * 供配置核对卡第三行按 project 档三态如实核对（该源**读不到不进**项目卡的 `!outcome.ok` 分支 —— 两条通路）。
  * 停用组织进本路由已由归一层挡下（410 `board_org_space_gone`，同空间口径）。
  */
-async function pageOrgSpaceManage(ctx: Ctx, org: string, all: readonly FeatureListItem[], orgNav: PageOrgNav): Promise<Page> {
+async function pageOrgSpaceManage(
+  ctx: Ctx,
+  org: string,
+  all: readonly FeatureListItem[],
+  orgNav: PageOrgNav,
+  pageRaw?: string | null,
+): Promise<Page> {
   const groupsOutcome =
     ctx.orgGroups === null
       ? Promise.resolve<OrgGroupsOutcome | null>(null)
@@ -2149,12 +2173,21 @@ async function pageOrgSpaceManage(ctx: Ctx, org: string, all: readonly FeatureLi
   // v0.9.8 按项目组配 agent：配置卡数据源 = 本次已读台账记录 + configView（零新读面；宿主面未装配 ⇒ 全局两键 null）
   const orgRec = findOrgRecord(ctx.orgsLedger.load().ledger, org);
   const faceConfig = ctx.host === null ? null : ctx.host.configView();
+  // ⑨ 需求表分页（REQ-2026-10-11-05 N11）：**先排全量、再切页** —— 排序复用需求池**同一把尺**
+  // （`version-order.sortPoolEntries` → `comparePoolEntry`：createdAt 降序、缺值沉底、同值 featureId
+  // 字典序兜底 ⇒ 全序、与输入顺序无关）；**不新建比较器、不引入新排序键**。
+  // 切片只发生在本页这一处（排期面 / 池面的全量读面不动）；每页条数取单点常量 {@link ORG_FEATURES_PAGE_SIZE}。
+  const featuresSorted = sortPoolEntries(featuresOfOrg(all, org));
+  const featureTotal = featuresSorted.length;
+  const featurePage = normalizeFeaturePage(pageRaw, featureTotal, ORG_FEATURES_PAGE_SIZE);
+  const featureRows = featuresSorted.slice(
+    (featurePage - 1) * ORG_FEATURES_PAGE_SIZE,
+    featurePage * ORG_FEATURES_PAGE_SIZE,
+  );
   return {
     title: `空间 · ${org} · 管理`,
     active: SPACE_ACTIVE,
     orgNav,
-    // 增补四 件B（REQ-2026-10-02-04）：管理页不收全站口径说明（复用 `noNotes` 单点开关；成员写回执入口复用本函数 ⇒ 两入口同效）
-    noNotes: true,
     // v0.9.8 两栏拖拽（REQ-2026-10-03-02）：第七枚脚本**仅本页**注入（页隔离由入口守卫 `#member-pool` 承担；
     // 成员写成功回执也复用本函数 ⇒ 回执页同样可继续拖拽）
     extraScripts: MEMBER_DRAG_SCRIPT,
@@ -2162,7 +2195,11 @@ async function pageOrgSpaceManage(ctx: Ctx, org: string, all: readonly FeatureLi
       renderSpaceNav(org, "manage") +
       renderOrgSpaceManagePage({
         org,
-        features: featuresOfOrg(all, org),
+        features: featureRows,
+        // ⑨ 三枚齐传（HTTP 通路恒有值）；未传的既有调用点 ⇒ 全量渲染（向后兼容判据）。
+        page: featurePage,
+        pageSize: ORG_FEATURES_PAGE_SIZE,
+        total: featureTotal,
         groupsOutcome: groups,
         projectsOutcome: projects,
         poolOutcome,
@@ -2174,7 +2211,7 @@ async function pageOrgSpaceManage(ctx: Ctx, org: string, all: readonly FeatureLi
           globalKind: faceConfig?.kind ?? null,
           globalModel: faceConfig?.hostModel ?? null,
         },
-        // 配置核对卡第三行（④）：三档判据的原料一次给全 —— 投影本体（null = 从未读到）、
+        // 页头「核对源健康度」短条第三档（④）：三档判据的原料一次给全 —— 投影本体（null = 从未读到）、
         // 本次读失败根因（非 null = stale，值取最后一次投影）、`absent` 档降级文案单点。
         versionProjection: {
           projection,
@@ -2736,7 +2773,10 @@ async function handleSetOrgHostAgent(
     });
     return;
   }
-  res.writeHead(303, { location: orgSpaceLink(name, "manage"), "cache-control": "no-store" });
+  res.writeHead(303, {
+    location: orgSpaceLink(name, "manage") + managePageQueryFromReferer(headers.referer),
+    "cache-control": "no-store",
+  });
   res.end();
 }
 
@@ -3087,8 +3127,15 @@ async function handleWriteOrgMembers(
   let page: Page;
   try {
     // §9-c：成员写的宿主页 = 该组织空间内管理页（`/orgs` 页退役）；刷新失败不得伪装成写失败（也不回 502）。
+    // ⑨ 写回执保页码：拖拽 fetch 同源带 Referer ⇒ 回执页仍停在原页（取不到 ⇒ 第 1 页，fail-closed）。
     const view = await ctx.client.getFeatures();
-    page = await pageOrgSpaceManage(ctx, org.name, view.features, orgNavOf(ctx, org.name, featureOrgGroups(view.features)));
+    page = await pageOrgSpaceManage(
+      ctx,
+      org.name,
+      view.features,
+      orgNavOf(ctx, org.name, featureOrgGroups(view.features)),
+      pageRawFromReferer(headers.referer),
+    );
   } catch (err) {
     const nav = orgNavOf(ctx, org.name);
     page = {

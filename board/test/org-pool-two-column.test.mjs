@@ -17,8 +17,8 @@
  *  ③ **池行只带一枚时间提示**（B-4）：`最后上报于 {lastReportedAt}（非实时探测）`；
  *     注册表投影**不采信、不渲染** `status` / `online`（会冒充在线），也不带任何组语义字段（C-2）
  *     —— 负锚见池-⑯（含「锚拒得住假出参」的生效证据），正锚见池-⑮；
- *  ④ **回落面不劣化**：手填表单保留 DOM（SSR 直出 `open` 的 `<details>`，无 JS 即常态可见、照常原生提交）；
- *     写面闭集不扩（两栏本身零表单）；
+ *  ④ **⑦b 起回落面即无写面**（用户 2026-10-11 裁「仅留拖拽、不考虑无 JS 降级」）：两枚手填表单与折叠宿主
+ *     已退役 ⇒ 拖拽是本页唯一成员写通路，写面浮层档闭集随之从四枚收窄为两枚（停用 / agent 配置）；
  *  ⑤ **`draggable` 由服务端判据渲染**（末位成员行不给拖）—— 脚本只是体验层；
  *  ⑥ **单面失败不炸页**：池读的 any 失败（含注入 client 缺该方法、桥侧 fail-closed 抛出）一律收口为
  *     池区降级，页面其余照常（本区四档灰化先例）。
@@ -39,17 +39,16 @@ import {
   poolRowsFromSnapshot,
 } from "../dist/orgs-view.js";
 import { renderOrgSpaceManagePage } from "../dist/web/views.js";
-import { LAST_MEMBER_REMOVE_CODE, MEMBER_GROUP_CONFLICT_CODE } from "../dist/group-admin.js";
 import { createBoardServer } from "../dist/server.js";
 
 // ---------------------------------------------------------------------------
 // 切片 helper（必须在任何顶层求值之前定义 —— `twoColumnHtml` 在模块顶层渲染，
 // helper 定义在其后时仍处于 TDZ，各测试便只能内联重复切片式）
-// 界只用两枚稳定 DOM 锚（`data-side` / `member-forms-fold`），样式类锚不作切片界（见文末负向钉）。
+// 界只用两枚稳定 DOM 锚（`data-side` / `org-host-agent-kind-list`），样式类锚不作切片界（见文末负向钉）。
 // ---------------------------------------------------------------------------
 
 const poolColumn = (html) => html.slice(html.indexOf('data-side="pool"'), html.indexOf('data-side="own"'));
-const ownColumn = (html) => html.slice(html.indexOf('data-side="own"'), html.indexOf("member-forms-fold"));
+const ownColumn = (html) => html.slice(html.indexOf('data-side="own"'), html.indexOf('id="org-host-agent-kind-list"'));
 
 // ---------------------------------------------------------------------------
 // 夹具
@@ -237,10 +236,8 @@ test("池-⑦ 两栏 SSR：左池右本组 · 行带 draggable 与载荷属性 �
   assert.match(twoColumnHtml, /池 1 项 · 本组 2 项 · 观测时刻 2026-10-03T01:00:00\.000Z/, "卡头给两侧计数与快照观测时刻");
 });
 
-test("池-⑧ hint 一条：三源观测时钟口径 + 以服务端投影与 409 为准（两枚码逐字）", () => {
-  assert.match(twoColumnHtml, /三个数据源各有自己的观测时刻/, "快照 / 声明面 / 运行态三个时钟如实标源");
-  assert.match(twoColumnHtml, /<b>落点以服务端投影与 409 为准<\/b>/, "拖拽落点不做客户端裁决");
-  assert.ok(twoColumnHtml.includes(MEMBER_GROUP_CONFLICT_CODE) && twoColumnHtml.includes(LAST_MEMBER_REMOVE_CODE), "两枚既有的 409 码逐字出现在 hint（复用既有守卫，不新增）");
+test("池-⑧ 卡尾常驻说明退役（⑥）", () => {
+  assert.doesNotMatch(twoColumnHtml, /两栏<b>同源|瞬时滞后|拖拽只做增强/, "⑥ 卡尾常驻说明已退役（承载降级见改造文档 §6）");
 });
 
 test("池-⑨ 末位成员行不给 draggable（同写前闸判据，拖不动即拖不了）", () => {
@@ -276,14 +273,21 @@ test("池-⑩ 降级两档整块灰化且不给出任何拖拽载荷", () => {
   assert.equal(unknown.includes('id="member-pool"'), false);
 });
 
-test("池-⑪ 手填表单保留 DOM 且默认展开（无 JS 回落面不劣化）· 写面闭集不扩", () => {
+test("池-⑪ ⑦b 手填表单与其折叠宿主退役（拖拽是唯一成员写通路）· 写面闭集随之收窄", () => {
   for (const html of [twoColumnHtml, renderOrgSpaceManagePage({ org: "alpha", features: [], projectsOutcome: null, groupsOutcome: null, poolOutcome: null })]) {
-    assert.match(html, /<details class="m-fold" id="member-forms-fold" open>/, "SSR 直出 **open** ⇒ 折叠只是 JS 可用时的收纳，DOM 未删");
-    assert.match(html, /<summary>手填表单（加 \/ 删成员）<\/summary>\n<div class="b-card">[\s\S]*?加成员[\s\S]*?删成员/, "两枚表单紧随折叠条，展开即常态");
-    assert.match(html, /<form method="post" action="\/orgs\/alpha\/members"[^>]*data-submit="已提交，加成员中…" data-ov="1">/, "加成员表单 action 逐字对齐全局写口（零改动）");
-    assert.match(html, /<input type="hidden" name="action" value="add">[\s\S]*?<input type="hidden" name="action" value="remove">/, "add / remove 两枚隐藏分流字段在位");
+    assert.doesNotMatch(html, /<details class="m-fold" id="member-forms-fold"/, "⑦b 折叠宿主已删（三档之一复活即红：正常档与「未查询」档）");
+    assert.doesNotMatch(html, /<summary>手填表单（加 \/ 删成员）<\/summary>/, "⑦b 折叠条 summary 不复活");
+    assert.doesNotMatch(html, /<form method="post" action="\/orgs\/alpha\/members"[^>]*data-ov="1">/, "⑦b 加 / 删成员两枚表单不复活");
+    assert.doesNotMatch(
+      html,
+      /<input type="hidden" name="action" value="add">[\s\S]*?<input type="hidden" name="action" value="remove">/,
+      "⑦b add / remove 两枚隐藏分流字段随表单删除（成员写只剩拖拽脚本一发）",
+    );
+    assert.doesNotMatch(html, /<div class="b-forms">/, "⑦b 双表单宿主 div.b-forms 随卡删除");
+    assert.match(html, /class="m-refresh"/, "对照：池卡刷新口在两档都在位（退役没摘掉整张池卡 ⇒ 上面的负锚非空锚）");
   }
-  assert.equal((twoColumnHtml.match(/data-ov="1"/g) ?? []).length, 4, "两栏**零表单**：写面浮层档闭集仍是加 / 删 / 停用 / agent 配置四枚，不扩");
+  assert.match(twoColumnHtml, /data-side="own"/, "对照：正常档右栏「本组项目」仍在位（退役只摘表单卡，不摘拖拽面）");
+  assert.equal((twoColumnHtml.match(/data-ov="1"/g) ?? []).length, 2, "两栏**零表单**：写面浮层档闭集 = 停用 / agent 配置两枚（⑦b 加 / 删成员表单退役）");
 });
 
 // ---------------------------------------------------------------------------
@@ -384,8 +388,13 @@ test("池-⑬ 快照读失败不炸页：池区降级「不可用」+ 透传码�
       assert.equal(res.status, 200, "快照读失败 ⇒ 只降级池区，不整页 502");
       assert.match(text, /<span class="b-card-meta">不可用<\/span>/, "池区档名如实「不可用」");
       assert.match(text, /snapshot_unreachable[\s\S]*?快照面爆炸（假）/, "结构化码 + 根因原文呈现，不静默");
-      assert.match(text, /<tr[^>]*><td>声明面成员/, "成员区照常呈现（替身锚 = 配置核对卡首行 <tr><td>，不依赖成员区文案）");
-      assert.match(text, /<form method="post" action="\/orgs\/alpha\/members"/, "手填表单在失败档仍是主通路（照常可用）");
+      assert.match(text, /<p class="hint">核对源健康度：声明面成员（3300 <code>GET \/api\/groups<\/code>） <b>未装配<\/b>/, "成员区照常呈现（⑧a 替身锚 = 页头短条内声明面成员的档位徽标；本夹具 orgGroupsFetcher 未注入 ⇒ 实际档位 = 未装配，钉的是「短条在场且如实标档」，不依赖成员区文案）");
+      assert.doesNotMatch(
+        text,
+        /<form method="post" action="\/orgs\/alpha\/members"/,
+        "⑦b 手填表单退役 ⇒ 失败档不再有「表单仍是主通路」的兜底（本档无成员写面；降级登记改造文档 §6）",
+      );
+      assert.match(text, /<form method="get" action="\/org\/alpha\/manage" class="m-refresh">/, "对照：降级档保留的出路 = 刷新口（重查后才有可拖的池）");
     },
   );
 });
@@ -519,7 +528,7 @@ test("池-⑱（切片负向钉 · REQ-2026-10-10-03 N1）样式类锚不得再�
   const selfSource = readFileSync(fileURLToPath(import.meta.url), "utf8");
   // needle 用字符类拆开书写（inde[x]Of / [c]lass），本文件里因此不存在「样式类当界」的那串字面量本身。
   const styleBound = /inde[x]Of\s*\(\s*['"]?[^)'"]*[c]lass=/;
-  assert.equal(styleBound.test(selfSource), false, "切片界只用两枚 DOM 锚（data-side / member-forms-fold）；样式类随重构漂移 ⇒ 拿它当界会静默切成空片段，锚看似在跑实则不验任何东西");
+  assert.equal(styleBound.test(selfSource), false, "切片界只用两枚 DOM 锚（data-side / org-host-agent-kind-list）；样式类随重构漂移 ⇒ 拿它当界会静默切成空片段，锚看似在跑实则不验任何东西");
   const sliceSites = selfSource.split("\n").filter((line) => /\.slice\([^{]*inde[x]Of/.test(line));
   assert.equal(sliceSites.length, 2, "全文件只有两枚 helper 的定义行取界，测试体内不得再各写一份内联切片式");
   assert.ok(sliceSites.every((line) => /^const (pool|own)Column = /.test(line)), "取界的两行就是 poolColumn / ownColumn 的定义行");
@@ -555,7 +564,7 @@ test("池-⑲（迁入锚 · REQ-2026-10-10-03 N3）本组成员计数 + 本组�
     /<div class="mrow" draggable="true" data-machine="win-a" data-project="board"><span class="mono">win-a<\/span> \/ <span class="mono">board<\/span>/,
     "本组完整清单不减（两项成员行逐条落右栏；两项 ⇒ 非末位 ⇒ 行带 draggable，与末位闸同判据）",
   );
-  assert.match(html, /<p class="b-note ok">配置齐备 · 上次核对时间 2026-09-27T02:00:00\.000Z<\/p>/, "observedAt 上页（声明是快照不是实时）—— 无 warn 夹具的正常档一行");
+  assert.match(html, /<p class="hint">核对源健康度：[\s\S]*?配置齐备 · 上次核对时间 2026-09-27T02:00:00\.000Z<\/p>/, "observedAt 上页（声明是快照不是实时）—— 无 warn 夹具的正常档一行（⑧a：原独立段 <p class=\"b-note ok\"> 折入页头短条尾串，原词不变）");
 });
 
 // ---------------------------------------------------------------------------

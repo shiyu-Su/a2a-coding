@@ -8,9 +8,18 @@
  * + 新增需求弹窗 {@link NEW_REQUIREMENT_DIALOG_SCRIPT}
  * + 排期拖拽 {@link DRAG_SCHEDULE_SCRIPT}（v0.9.3 B-T5 增枚；与弹窗常量分立、不可共置）
  * + 成员两栏拖拽 {@link MEMBER_DRAG_SCRIPT}（v0.9.8 REQ-2026-10-03-02，闭集六→**七元**；
- *   与排期拖拽常量分立、不可共置 —— 那枚的入口守卫 `#schedule-board` 不因本页而扩））；
- * 刷新 = 浏览器重载；**唯一例外** = 浮层动作区提交后的**有界进度轮询**（复用既有详情读面 +
- * 既有 {@link FEATURE_DETAIL_OVERLAY_SCRIPT} 的 `swapPage` 通路，零新端点、零新枚脚本，见该常量注记）。
+ *   与排期拖拽常量分立、不可共置 —— 那枚的入口守卫 `#schedule-board` 不因本页而扩）
+ * + 页级就地刷新 {@link PAGE_LIVE_SCRIPT}（v0.10.4 REQ-2026-10-11-03，闭集七→**八元**；
+ *   入口守卫 = 页面上有无 `[data-live]` 锚，不复用他枚的页专属 `getElementById` 锚））；
+ * 刷新 = 浏览器重载；**自动更新只有两档**（v0.10.4 · REQ-2026-10-11-03 件D 校准，旧口径
+ * 「唯一例外 = 浮层动作区轮询」已随之退役）=
+ * ① **浮层动作区** = 件B 提交后的**有界进度轮询**（复用既有详情读面 +
+ * 既有 {@link FEATURE_DETAIL_OVERLAY_SCRIPT} 的 `swapPage` 通路，零新端点、零新枚脚本，见该常量注记）；
+ * ② **只读页的锚级就地换块** = 第八枚 {@link PAGE_LIVE_SCRIPT}，周期取 `views.ts` `LIVE_INTERVALS`
+ * 单点经 SSR 属性下发，只替换 `[data-live]` 锚的子节点 ⇒ **不是整页重载**；**写面**表单（侧栏四卡的
+ * 排期表单 / 宿主轮三入口 / 成员与组织表单）不在锚内 ⇒ 仍须重载本页。**唯一含输入的锚** = 任务页的只读
+ * GET 过滤卡 `tasks-filter`：它按改造文档 §2.2 就在锚内，其保护靠**焦点态跳拍**（`activeElement` 落在锚
+ * 子树内 ⇒ 该锚该拍跳过）而非「排除在锚外」。除此之外不存在第三种自动刷新。
  */
 
 /**
@@ -268,13 +277,51 @@ export const SUBMIT_GUARD_SCRIPT = `<script>
  *   实查**整个 `<main>`**〔页面级，非仅动作区——见下方 `stillBusy`〕，= 本轮仍 `running` / `queued`），
  *   起一条**有界**轮询（{@link POLL_INTERVAL_MS} × {@link POLL_MAX_TICKS}，20 分钟量级 = 与宿主 turn
  *   窗口同量级），每拍 `GET` 本详情 URL（带 `Accept: "text/html"`，与 `open()` 同规格）经 `swapPage`
- *   刷回动作区，用户看到真实「第 N 轮 在飞 / 排队中」。收口判据 = 回包**不再**含在飞 / 排队的
- *   `.turn-progress` ⇒ 停；浮层已关 / 窗口耗尽 ⇒ 同样停。**零新增端点、零新增写面**：复用
+ *   刷回**浮层编辑区**（准确口径：`swapPage` 是整份回包 `<main>` 的**全子节点逐个替换** `.fd-body`
+ *   —— 不止动作区，页面级进度行 / 依赖图 / 执行明细一并换；旧的「刷回动作区」是低估，v0.10.4 校正），
+ *   用户看到真实「第 N 轮 在飞 / 排队中」。收口判据 = 回包**不再**含在飞 / 排队的
+ *   `.turn-progress`（且执行明细也无在飞 / 排队 chip，见下方「起轮 / 收口判据的第二来源」）⇒ 停；
+ *   浮层已关 / 窗口耗尽 ⇒ 同样停。**零新增端点、零新增写面**：复用
  *   `GET /features/:id` 读面与既有 `swapPage` 渲染通路；轮询只活在浮层脚本内（无 `#feat-dialog`
- *   的页面整段空转），故不存在「整页自动刷新」。
- * - **件C（竞态）**：`swapPage(html, reopen)` 增第二参 —— 后台轮询传 `false`，**浮层已被用户关闭时
- *   不得 `showModal()` 把它重新弹开**（原实现每次 `swapPage` 末尾无条件补弹，与关闭动作竞态）；
+ *   的页面整段空转）。
+ *   **准确表述（v0.10.4 · REQ-2026-10-11-03）**：本枚不是、也从未是「整页自动刷新」—— 它只在
+ *   **浮层开着**时把详情读面的回包经 `swapPage` 换进浮层动作区；浮层之外那侧的页面级自动更新由
+ *   **第八枚「页级就地刷新」脚本**承担，其形态同样是**锚级就地换块**（只替换 `[data-live]` 锚的
+ *   子节点），**不是整页重载** —— 两枚之间零耦合（本枚不引用第八枚的任何符号）。
+ *   **起轮一档 = 提交档（v0.10.4 · REQ-2026-10-11-06 增补 c35b4192 撤「打开档」）**：件B 的起轮**只**在
+ *   「浮层内提交成功」后发生 —— 曾于 REQ-2026-10-11-05 增补 B-1 加过「打开档」（`open()` 成功换页后
+ *   按回包是否仍忙起轮，用户**打开即跟刷**），**该档已随 c35b4192 整体撤销**：打开的详情页一律**不**
+ *   自动跟刷，要看最新进度就重开浮层或提交一轮。`open()` 内 `lastHref = href` **保留**（它是二次点击
+ *   同卡关闭 toggle 的判据，与起轮无关）。提交档复用同一条有界链（startPoll 内先 stopPoll ⇒ 恒只一条）。
+ * - **拍级 held 闸（v0.10.4 · REQ-2026-10-11-05 增补 B-2；一路判据随 REQ-2026-10-11-06 T3 收窄）**：
+ *   因 `swapPage` 换的是**整份 `<main>` 全子节点替换 `.fd-body`**（见上条校正），用户正在浮层里填表时
+ *   换页 = 连同表单与已填输入一起冲掉。故每拍换页**之前**先过 {@link heldBody} 闸，两路**分档**：
+ *   **一路 = 焦点落在「输入面」**（{@link isInputFace} 白名单 = `INPUT` / `TEXTAREA` / `SELECT` /
+ *   `contentEditable`，且焦点须在 `.fd-body` 子树内）⇒ 正在填；**链接 / 按钮的焦点不算在填**（否则
+ *   「点卡片开浮层 ⇒ 浏览器把焦点还原到那张 `<a>`」会让闸自我维持地永停，与第八枚同族缺陷）；
+ *   **二路 = 任一 `textarea`/`input` 的 value 非空**（**已填失焦也挡**；本路判据面随 T3 **未扩**）。
+ *   任一成立 ⇒ 本拍**不换页**，只 `schedulePoll` 排下一拍。
+ *   闸内**零请求、零 `showModal`、不改 `dlg.open`**；不判 `data-ov-pending`（拍级闸只判「填没填」），
+ *   也**不加第三路**（`details[open]` 不算在填）。上界 20 分钟触顶即停 = 已裁的已知上界，只登记不调数值。
+ *   已知副作用（已裁、留此登记）：收口那一拍若被 held 挡住 ⇒ 本轮不再强渲收口末态（收口检查在闸
+ *   **之前**，二者不冲突：收口拍仍正常停轮；仅「未收口 ∧ held」拍跳过换页），浮层重开 / 下次提交即见最新。
+ * - **件C（竞态 · 「关了又被弹开」）**：`swapPage(html, reopen)` 的第二参 —— 传 `false` ⇒ **浮层已被
+ *   用户关闭时不得 `showModal()` 把它重新弹开**（原实现每次 `swapPage` 末尾无条件补弹，与关闭动作竞态）。
+ *   **三个弹开点逐一列全**：① `pollOnce` 后台轮询档传 `false`（v0.10.4 既有）；② `postForm` **两档**
+ *   （4xx 回包档与成功档）均传 `false`（v0.10.4 · REQ-2026-10-11-06 增补）—— 提交在飞时用户关掉浮层，
+ *   回包不得把它弹回，抽不到的错误卡同理（卡不可见 ⇒ 重开重提，已登记 §6）；③ `showCard` 的无条件补弹
+ *   **已删**（挂卡不改变开关态）。**反向硬约束**：`open()` 里那处 `swapPage(text)` **必须保持 reopen 缺省**
+ *   —— 它是浮层唯一的开启路径，「三处一律传 `false`」是误读，会把整条浮层链路杀死。
  *   轮询命中「已关浮层」时只 `stopPoll`，不改 `dlg.open`、不落渲染。
+ * - **起轮 / 收口判据的第二来源（v0.10.4 · REQ-2026-10-11-03 · 件B 扩写）**：两条判据除上述
+ *   `.turn-progress` 文案外，**∨** `main.querySelector(".dg-chip.dg-running, .dg-chip.dg-queued")`
+ *   —— 事实源 = **v0.10.3 详情页状态六态着色**已有的 chip class（`src/graph-view.ts` 与执行明细单表
+ *   渲染的 `dg-${info.key}`），**零新标记**。三条纪律：
+ *   ① **起轮（{@link startPoll}）与收口（{@link stillBusy}）必须认同一串选择器** —— 只扩起轮不扩收口
+ *   ⇒ 起了轮的第一拍即判「已收口」自停（本节点要防的真实缺陷）；
+ *   ② 两处选择器串**逐字相同**，且各只出现一次（合计 2 处）；
+ *   ③ 件B 仍按**文本子串**判第一来源 ⇒ `在飞` / `排队中` 二字面**不得**从 `stillBusy` 体内移除
+ *   （改名即静默失效；与整站文案改档〔N6〕共享此约束，故 N6 须排本节点之后）。
  *
  * 脚本字面量本身不含用户数据 ⇒ 无注入面
  * （与 {@link SUBMIT_GUARD_SCRIPT} 同规格：单点常量、纯内联、无 `src=`、无 `</script` 字面量）。
@@ -326,13 +373,35 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
     if (pollTimer !== null) { clearTimeout(pollTimer); pollTimer = null; }
     pollTicks = 0;
   }
+  // 件B 收口判据两来源（v0.10.4 · REQ-2026-10-11-03）：① 动作区文案 —— 文本子串「在飞 / 排队中」
+  // 是判据，改名即静默失效，故两字面不得移出本体；② 执行明细六态 chip —— 选择器串必须与
+  // startPoll 起轮判据**逐字相同**（只扩起轮不扩收口 ⇒ 起了轮第一拍即判收口自停）。
   function stillBusy(main) {
     var m = main.querySelector(".turn-progress");
-    return m !== null && (m.textContent.indexOf("在飞") !== -1 || m.textContent.indexOf("排队中") !== -1);
+    if (m !== null && (m.textContent.indexOf("在飞") !== -1 || m.textContent.indexOf("排队中") !== -1)) return true;
+    return main.querySelector(".dg-chip.dg-running, .dg-chip.dg-queued") !== null;
   }
   function schedulePoll() {
     if (pollTicks >= POLL_MAX_TICKS) { stopPoll(); return; }
     pollTimer = setTimeout(pollOnce, POLL_INTERVAL_MS);
+  }
+  // 「输入面」白名单（v0.10.4 · REQ-2026-10-11-06 T3）：只有真在填的焦点才算 held，
+  // 链接 / 按钮的焦点不算 —— 否则「点卡片开浮层 ⇒ 焦点还原到那张 <a>」会让闸自我维持地永停。
+  // ⚠ 本 helper 与第八枚（页级就地刷新）常量内**同名同体**（两枚独立 IIFE 无法函数级共享 ⇒ 双份同体，
+  // 件B chip 串双写先例同形）；逐字一致由跨枚钉 live-refresh N-6 钉死 —— **勿合并、勿全局化、勿单改**。
+  function isInputFace(node) { if (node === null || node === undefined) return false; var tag = node.tagName; if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true; return node.isContentEditable === true; }
+  // 拍级 held 闸（v0.10.4 · REQ-2026-10-11-05 增补 B-2 · 一路随 REQ-2026-10-11-06 T3 收窄）：
+  // swapPage 换的是整份 <main> 全子节点替换 .fd-body —— 用户正在浮层里填表时换页 = 连同表单与已填
+  // 输入一起冲掉。两路判据：① 焦点落在**输入面**且在本编辑区子树内（正在填；链接 / 按钮焦点不算）；
+  // ② 任一 textarea/input 的 value 非空（已填失焦也挡；本路未扩）。
+  // 只判这两路，不扩其它控件、不加第三路（details[open] 不算在填）、不判挂起标记（口径见 JSDoc「拍级 held 闸」段）。
+  function heldBody() {
+    if (body === null) return false;
+    var ae = document.activeElement;
+    if (ae !== null && isInputFace(ae) && body.contains(ae)) return true;
+    var f = body.querySelectorAll("textarea, input");
+    for (var i = 0; i < f.length; i += 1) { if (f[i].value !== "") return true; }
+    return false;
   }
   function pollOnce() {
     pollTimer = null;
@@ -349,13 +418,18 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
       if (!dlg.open || pollUrl === "") { stopPoll(); return; }
       // 收口（本轮不再在飞 / 排队）⇒ 停轮，末次真实进度已由服务端渲染留在动作区
       if (main === null || !stillBusy(main)) { stopPoll(); return; }
+      // 拍级 held 闸：本拍若用户正在/已在浮层内填写 ⇒ 不换页，只排下一拍（零请求增量、不自弹开）
+      if (heldBody()) { schedulePoll(); return; }
       swapPage(r.text, false);
       schedulePoll();
     }).catch(function () { schedulePoll(); });
   }
+  // 起轮判据 = 仍忙（动作区文案 ∨ 执行明细 chip）；chip 串与 stillBusy 逐字相同
+  // ⇒ 起轮与收口不会各执一套判据（只扩起轮 ⇒ 起了轮第一拍即判收口自停，本节点要防的缺陷）。
   function startPoll(main) {
     stopPoll();
-    if (main === null || !stillBusy(main)) return;
+    if (main === null) return;
+    if (!stillBusy(main) && main.querySelector(".dg-chip.dg-running, .dg-chip.dg-queued") === null) return;
     pollUrl = lastHref;
     pollTicks = 1;
     schedulePoll();
@@ -374,7 +448,6 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
   function showCard(card) {
     dropCard();
     dlg.appendChild(card);
-    if (!dlg.open) dlg.showModal();
   }
   function swapPage(html, reopen) {
     var parsed = parsePage(html);
@@ -406,6 +479,8 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
       return res.text();
     }).then(function (text) {
       if (text === null || text === undefined) return;
+      // 打开档已撤（v0.10.4 · REQ-2026-10-11-06 c35b4192）：这里**不起轮**，打开只渲染静态读面；
+      // lastHref = href 必须保留 —— 它是二次点击同卡关闭 toggle 的判据，与起轮无关。
       if (swapPage(text)) { lastHref = href; } else { fallback(a); }
     }).catch(function () { fallback(a); });
   }
@@ -428,12 +503,14 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
       if (r.err) {
         var parsed = parsePage(r.text);
         if (parsed.card !== null) { showCard(parsed.card); restoreForm(form); return; }
-        if (swapPage(r.text)) { restoreForm(form); } else { nativeSubmit(form); }
+        // 件C：错误档不补弹（浮层已被用户关闭 ⇒ 卡只挂上、不自弹开）
+        if (swapPage(r.text, false)) { restoreForm(form); } else { nativeSubmit(form); }
         return;
       }
       // 成功（303 跟随后即详情页）：抽 main 换入 body ⇒ 旧表单连同禁用态与提示行一并离场。
       var okMain = parsePage(r.text).main;
-      if (!swapPage(r.text)) { nativeSubmit(form); return; }
+      // 件C：成功档同样不补弹 —— 提交在飞时用户已关浮层 ⇒ 回包不得把它重新弹开
+      if (!swapPage(r.text, false)) { nativeSubmit(form); return; }
       // 件B：换入页动作区仍是「在飞 / 排队」⇒ 交棒有界轮询（读面 = 本表单的详情 URL）；
       // 已收口 / 摘不到 main ⇒ 不起轮，静态读面即最新事实。startPoll 内先 stopPoll ⇒ 恒只一条链。
       lastHref = action;
@@ -460,6 +537,7 @@ export const FEATURE_DETAIL_OVERLAY_SCRIPT = `<script>
     }
     var a = t.closest('a[href^="/features/"]');
     if (a === null || a.closest(".kcard") === null) return;
+    if (e.button !== 0 || e.metaKey === true || e.ctrlKey === true || e.shiftKey === true || e.altKey === true) return;
     e.preventDefault();
     open(a, true);
   });
@@ -779,8 +857,6 @@ export const DRAG_SCHEDULE_SCRIPT = `<script>
  *
  * 执法永远在服务端与桥 O1（本脚本只是体验层）：**能不能拖由服务端渲染判据决定** ——
  * 末位成员行不带 `draggable`、池不可用时整块不带 `data-machine`，拖不动即拖不了。
- * 顺带一件：JS 可用时把**手填表单的宿主** `#member-forms-fold` 收起（`open = false`，**只折叠不删 DOM**，
- * 口径照门户 `#new-org-inline` 先例）⇒ 输入面恒为一个；无 JS 时 `<details open>` 原样可见。
  *
  * 与 {@link DRAG_SCHEDULE_SCRIPT} 同规格：单点常量、纯内联、无 `src=`、不含用户数据、
  * 体内无 `</script` 字面量；**闭集钉「每枚恰好 1 处」**（N3-⑦/⑧/⑨）。
@@ -791,8 +867,6 @@ export const MEMBER_DRAG_SCRIPT = `<script>
   if (pool === null || typeof fetch !== "function" || typeof DragEvent !== "function") return;
   var org = pool.getAttribute("data-org");
   if (org === null || org === "") return;
-  var fold = document.getElementById("member-forms-fold");
-  if (fold !== null) fold.open = false;
   function colOf(node) {
     var el = node;
     while (el !== null && el !== document) {
@@ -879,6 +953,250 @@ export const MEMBER_DRAG_SCRIPT = `<script>
 </script>`;
 
 /**
+ * **页级就地刷新**（v0.10.4 · REQ-2026-10-11-03 · 页面脚本闭集**第八枚**）：排期 / 详情整页 /
+ * 任务三处只读页进页即常驻**一条** `setTimeout` 自递归链，按页周期 `GET` **当前 URL**，`DOMParser`
+ * 解析回包后逐锚（`[data-live]`，key = 其 `data-live` 值）以**节点搬运只换其子节点** ⇒ 数据变化
+ * 就地可见，不整页重载、不换 `<main>`、不本地乐观改 DOM。
+ *
+ * 判据要点（形态由改造文档 §2 定，此处只记本枚的执法面）：
+ * - **入口守卫** = `[data-live]` 数量为 0 ⇒ 立即 return（不收 `#schedule-board` / `#member-pool`
+ *   一类页专属锚，故与既有七枚互不牵连；页隔离由本守卫承担，非刷新页整段空转）；
+ * - **周期** = 第一枚带 `data-live-interval` 的锚（数值来自 `views.ts` 的 `LIVE_INTERVALS` 单点，
+ *   **不进本常量体**）；取不到 ⇒ 整段不起轮；
+ * - **跳拍判据四条（v0.10.4 · REQ-2026-10-11-06 T3 收窄）**：锚级（只跳该锚）= ① 焦点落在**本锚子树内
+ *   的输入面**（{@link isInputFace} 白名单 = `INPUT` / `TEXTAREA` / `SELECT` / `contentEditable`）
+ *   ⇒ 跳该锚；**链接 / 按钮的焦点不算在填**（旧判据「锚子树含 `document.activeElement`」把「焦点还原到
+ *   卡片链 / 列头钮」误当正在填 ⇒ 整板无声永停 = 本卡修的根因；白名单**不含 `closest("form")`**，
+ *   纳入即复发）② 锚内含 `details[open]:not(.pipe)` ⇒ 跳该锚（已展开的执行明细 / 最近一轮摘要；`pipe` =
+ *   依赖图管道，服务端默认 `open`，是唯一豁免类，否则 graph 锚永不刷新）；
+ *   **已裁代价**（用户 2026-10-11 裁接受）：用户手动收起的管道在下一拍被服务端默认 `open` 重刷回来；
+ *   整拍级 = ③ 拖拽进行中（本枚自挂一对被动 `dragstart` / `dragend` 布尔标记，不 preventDefault、
+ *   不读别的常量的 `.dragover` class ⇒ 零跨枚耦合）④ `document.hidden`；`visibilitychange` 回前台 ⇒
+ *   立即补一拍。**已撤两样**：旧「任一 `dialog.open` ⇒ 让位」（浮层档自有节奏，本枚不为它让位）与
+ *   「整拍闸挡在 fetch **之前**」（改到换块**之前**复查，见下条结构性兜底）。
+ *   另有**换块跳过** = 回包摘不到同 key 锚 ⇒ 跳过该锚、**绝不清空**；
+ * - **结构性兜底（`tick` 终体，同条 T3）**：链的每一路出口都必须排下一拍，且失败要出声 ——
+ *   ① `busy` 早退 ⇒ 排拍不发请求（fetch 永不 settle 时 ⟳ 不被吞的唯一解）；② 回包不可读 / 整拍闸 /
+ *   换块之后三档全部 `scheduleNext`（出声不吞拍）；③ `busy = false` 必在 handler 首行（否则 swapAll
+ *   真抛时 catch 无它 = 一次异常永停）；④ `scheduleNext` 为 clear-then-set（`busy` 分支与回包 handler
+ *   抢同一 timer 单槽 ⇒ 必清才恒一条链；排拍字面量仍恰 1 处）。零换块 / swapAll 抛错 / 回包不可读 /
+ *   fetch 异常各经 `console.warn` / `console.error` 出声，不得静默；**不加第三个拖拽监听**；
+ * - **滚动保护** = 换块前按 `.kcol` 的 `data-version` **为键**记 `scrollTop`、换后同键回填
+ *   （以列索引为键会在新增/删除列时错位 ⇒ 禁）；key 集合变化的列不回填；
+ * - **时钟单一写入者** = 本脚本：**至少一枚锚成功换块**的那一拍才拨 `.live-clock`（零换块 ⇒ 不拨并
+ *   `console.warn` 出声，不静默）；`⟳`（`.live-now`）由服务端渲染为 `hidden` ⇒ 本脚本显形（无 JS 不出
+ *   死钮，口径照 `#new-req-open` 先例），点击 = 跑同一拍函数，**不起第二条链**；详情浮层内的那份控制条
+ *   是**死钟**（浮层自有件B 的节奏）⇒ 由 CSS 整条隐藏（`dialog.fd .live-bar`），不为此加任何 JS 判据；
+ * - **只读** = `GET` 当前 URL（`credentials:"same-origin"` + `Accept: "text/html"`，**无 `method:`**），
+ *   打的仍是既有 GET 面；零 `setInterval` / 零 `WebSocket` / 零 `EventSource` / 零 `innerHTML` /
+ *   零 `meta-refresh`；在飞一拍未回 ⇒ 不叠第二拍（回包后统一排下拍 ⇒ 全页恒一条链）。
+ *
+ * **任务页三动线已在本常量体内补齐**（委托 + `pushState` / `popstate`，`click` 恒一条 = ⟳ 亦并入该委托）：
+ * 注入点（三处按页）仍由 N5 承 ⇒ **本轮产物在各页尚未生效**（预期状态，不 `import` 进 `server.ts`）。
+ * 与其余七枚同规格：单点常量、纯内联字面量、无 `src=`、体内零插值零用户数据、零裸结束标签；
+ * **闭集钉「每枚恰好 1 处」**（N3-⑥/⑦/⑧/⑨/⑪）。取容器一律走 `[data-live]` / `closest` 选择器，
+ * 不得复用他枚的 `getElementById` 锚（否则 N3-⑦ 归类歧义）。
+ */
+export const PAGE_LIVE_SCRIPT = `<script>
+(function () {
+  if (document.querySelectorAll("[data-live]").length === 0 || typeof fetch !== "function" || typeof DOMParser !== "function") return;
+  var timed = document.querySelector("[data-live-interval]");
+  var intervalMs = timed === null ? 0 : parseInt(timed.getAttribute("data-live-interval"), 10);
+  if (!(intervalMs > 0)) return;
+  var timer = null;
+  var busy = false;
+  var dragging = false;
+  // 「输入面」白名单（v0.10.4 · REQ-2026-10-11-06 T3）：只有真在填的焦点才算 held，
+  // 链接 / 按钮的焦点不算 —— 否则「点开卡片 ⇒ 焦点还原到那条 <a>」「列头删除钮拿到焦点」会让本枚
+  // 自我维持地永停（本卡修的根因）。⚠ 白名单**不含「焦点在本锚内某 form 中」这一档**（不写 closest 到
+  // form 的解法）：纳入 ⇒ 列头删除钮拿到焦点 = 整板再次无声永停，根因复发。
+  // ⚠ 本 helper 与件B（详情浮层）常量内**同名同体**（两枚独立 IIFE 无法函数级共享 ⇒ 双份同体，
+  // 件B chip 串双写先例同形）；逐字一致由跨枚钉 live-refresh N-6 钉死 —— **勿合并、勿全局化、勿单改**。
+  function isInputFace(node) { if (node === null || node === undefined) return false; var tag = node.tagName; if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true; return node.isContentEditable === true; }
+  // 跳拍判据（锚级）：① 焦点落在**本锚子树内的输入面** = 用户正在填；② 本锚含已展开折叠 = 用户正在看。
+  // 豁免类只有 pipe（依赖图管道，src/graph-view.ts:471 渲为默认 open）——不豁免则 graph 锚
+  // 被自家默认展开态永久冻结、永不刷新。
+  function holdAnchor(el) { var ae = document.activeElement; if (ae !== null && isInputFace(ae) && el.contains(ae)) return true; return el.querySelector("details[open]:not(.pipe)") !== null; }
+  function keyOf(el) { return el.getAttribute("data-live") || ""; }
+  function findAnchor(doc, key) {
+    var list = doc.querySelectorAll("[data-live]");
+    for (var i = 0; i < list.length; i += 1) { if (keyOf(list[i]) === key) return list[i]; }
+    return null;
+  }
+  function scrollMap(root) {
+    var map = {};
+    var cols = root.querySelectorAll(".kcol");
+    for (var i = 0; i < cols.length; i += 1) {
+      var v = cols[i].getAttribute("data-version");
+      if (v !== null) map[v] = cols[i].scrollTop;
+    }
+    return map;
+  }
+  function restoreScroll(root, map) {
+    var cols = root.querySelectorAll(".kcol");
+    for (var i = 0; i < cols.length; i += 1) {
+      var v = cols[i].getAttribute("data-version");
+      if (v === null || !Object.prototype.hasOwnProperty.call(map, v)) continue;
+      cols[i].scrollTop = map[v];
+    }
+  }
+  // 只搬子节点、**不替换锚元素本身**（拖拽脚本加载期缓存了 #schedule-board 作上溯边界）
+  function swapChildren(target, source) {
+    var before = scrollMap(target);
+    while (target.firstChild !== null) { target.removeChild(target.firstChild); }
+    while (source.firstChild !== null) { target.appendChild(source.firstChild); }
+    restoreScroll(target, before);
+  }
+  function pad2(n) { return n < 10 ? "0" + n : "" + n; }
+  function writeClock() {
+    var el = document.querySelector(".live-clock");
+    if (el === null) return;
+    var t = new Date();
+    el.textContent = pad2(t.getHours()) + ":" + pad2(t.getMinutes()) + ":" + pad2(t.getSeconds());
+  }
+  function swapAll(text) {
+    var doc = new DOMParser().parseFromString(text, "text/html");
+    var live = document.querySelectorAll("[data-live]");
+    var changed = 0;
+    for (var i = 0; i < live.length; i += 1) {
+      var el = live[i];
+      var key = keyOf(el);
+      if (key === "" || holdAnchor(el)) continue;
+      var src = findAnchor(doc, key);
+      if (src === null) continue;
+      swapChildren(el, src);
+      changed += 1;
+    }
+    if (changed > 0) { writeClock(); } else { console.warn("[live] 本拍零换块（全部锚 held 或回包摘不到同 key）"); }
+  }
+  // 排拍 = clear-then-set：busy 早退分支与回包 handler 抢的是**同一个 timer 单槽**，不先清就可能出现
+  // 两条链并存；字面量仍恰 1 处（B7 排拍单点不破）。
+  function scheduleNext() { if (timer !== null) clearTimeout(timer); timer = setTimeout(tick, intervalMs); }
+  // 结构性兜底（v0.10.4 · REQ-2026-10-11-06 T3）：本链任何一路出口都必须排下一拍，且失败要出声。
+  // 四条所以然钉死形态，改动前请对照 live-refresh N-3 / N-4：
+  //   ① busy 早退**排拍**（不是 return）—— fetch 永不 settle（悬挂连接）时 ⟳ 不被吞的唯一解：
+  //      这一拍不发请求，但链还得续着，否则整页从此不再自动更新；
+  //   ② 三档出口（回包不可读 / 整拍闸 / 换块之后）全部 scheduleNext ⇒ 出声不吞拍；
+  //   ③ busy = false 必在 handler **首行** —— 放在 swapAll 之后的话，swapAll 真抛时 catch 里
+  //      没有它，busy 永真 = 一次异常把整条链永停；
+  //   ④ 整拍闸（hidden / dragging）从 fetch **之前**挪到换块**之前**（回包后复查）—— 在飞期间
+  //      用户切后台 / 起拖 ⇒ 回包也不再动 DOM。**不加第三个拖拽监听**：dragging 的唯一致因是
+  //      「回包在拖拽中摘走拖拽源」，由本复查堵住 ⇒ addEventListener 仍恰 6（B7）。
+  function tick() {
+    timer = null;
+    if (busy) { scheduleNext(); return; }
+    busy = true;
+    fetch(location.pathname + location.search, { credentials: "same-origin", headers: { Accept: "text/html" } }).then(function (res) {
+      return res.ok ? res.text() : null;
+    }).then(function (text) {
+      busy = false;
+      if (text === null || text === undefined || text === "") {
+        console.warn("[live] 回包不可读（非 2xx 或空体），本拍跳过");
+        scheduleNext();
+        return;
+      }
+      if (document.hidden || dragging) { scheduleNext(); return; }
+      try { swapAll(text); } catch (err) { console.error("[live] swapAll 抛错，本拍跳过", err); }
+      scheduleNext();
+    }).catch(function (err) {
+      busy = false;
+      console.warn("[live] fetch 异常，本拍跳过", err);
+      scheduleNext();
+    });
+  }
+  function runOneTick() {
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+    tick();
+  }
+  document.addEventListener("dragstart", function () { dragging = true; });
+  document.addEventListener("dragend", function () { dragging = false; });
+  document.addEventListener("visibilitychange", function () { if (!document.hidden) runOneTick(); });
+  var nowBtn = document.querySelector(".live-now");
+  if (nowBtn !== null) { nowBtn.hidden = false; }
+  // ── 任务页局部动线：三条委托（chips / 不带过滤重查·换项目 / 过滤表单）+ pushState · popstate ──
+  // 共同闸 = 目标 pathname ∈ {/tasks, /org/<名>/tasks} ∧ 当前页也在这两档 ⇒ 才拦并局部化；
+  // 其余（含需求详情一类的跨页链）一律放行原生导航 ⇒ 全站 pushState 只发生在任务页三动线。
+  // 本枚活在 TS 模板字符串内：单反斜杠转义斜杠会被源码层当 NonEscapeCharacter 吃掉 ⇒ 运行值成裸斜杠
+  // 即整枚 parse 不过（钉 = live-refresh B4 / B8），故此处必须双写反斜杠。
+  function onTasksPath(p) {
+    return p === "/tasks" || /^\\/org\\/[^/]+\\/tasks$/.test(p);
+  }
+  function tasksUrl(raw) {
+    if (raw === null || raw === undefined || raw === "" || onTasksPath(location.pathname) === false) return null;
+    var url = null;
+    try { url = new URL(raw, location.href); } catch (e) { return null; }
+    if (url.origin !== location.origin) return null;
+    return onTasksPath(url.pathname) ? url : null;
+  }
+  // 跨档回落判据（不猜）：回包与当前页的 [data-live] key 集合必须**完全相同** —— 少一枚 = 摘不到，
+  // 多一枚 = 当前页无该壳（换了地址栏却补不出过滤卡）⇒ 两种都交回整页导航。
+  function sameKeySet(text) {
+    var doc = new DOMParser().parseFromString(text, "text/html");
+    var now = document.querySelectorAll("[data-live]");
+    var next = doc.querySelectorAll("[data-live]");
+    var have = 0;
+    for (var i = 0; i < now.length; i += 1) { if (keyOf(now[i]) !== "") have += 1; }
+    var got = 0;
+    for (var j = 0; j < next.length; j += 1) {
+      var key = keyOf(next[j]);
+      if (key === "") continue;
+      got += 1;
+      if (findAnchor(document, key) === null) return false;
+    }
+    return have === got;
+  }
+  // 打新 URL → 成功且同档 ⇒ 复用主体换锚（跳拍判据 / 滚动回填 / 时钟单一写入者）→ pushState → 回排下拍。
+  // 清掉待发的定时拍再跑 ⇒ 与常驻链共用同一条链，绝不并起两条（在飞一拍未回 ⇒ 交回整页导航）。
+  function liveGo(url, push) {
+    var target = url.pathname + url.search;
+    if (busy === true) { location.assign(target); return; }
+    if (timer !== null) { clearTimeout(timer); timer = null; }
+    busy = true;
+    fetch(target, { credentials: "same-origin", headers: { Accept: "text/html" } }).then(function (res) {
+      return res.ok ? res.text() : null;
+    }).then(function (text) {
+      busy = false;
+      if (text === null || text === undefined || sameKeySet(text) === false) { scheduleNext(); location.assign(target); return; }
+      if (push === true) history.pushState(null, "", target);
+      swapAll(text);
+      scheduleNext();
+    }).catch(function () { busy = false; scheduleNext(); });
+  }
+  document.addEventListener("click", function (ev) {
+    if (ev.target === null || ev.target.closest === undefined) return;
+    // ⟳ 立即更新：原直绑并入本条委托 ⇒ 全常量体 click 恒一条
+    if (ev.target.closest(".live-now") !== null) { runOneTick(); return; }
+    if (ev.button !== 0 || ev.metaKey === true || ev.ctrlKey === true || ev.shiftKey === true || ev.altKey === true) return;
+    var link = ev.target.closest(".b-chips a, .b-card a.fl");
+    if (link === null) return;
+    var url = tasksUrl(link.getAttribute("href"));
+    if (url === null) return;
+    ev.preventDefault();
+    liveGo(url, true);
+  });
+  document.addEventListener("submit", function (ev) {
+    var form = ev.target;
+    if (form === null || form.tagName !== "FORM") return;
+    if (form.closest('[data-live="tasks-filter"]') === null) return;
+    if ((form.getAttribute("method") || "").toLowerCase() !== "get") return;
+    var url = tasksUrl(form.getAttribute("action"));
+    if (url === null) return;
+    var query = "";
+    try { query = new URLSearchParams(new FormData(form)).toString(); } catch (e) { return; }
+    url.search = query;
+    ev.preventDefault();
+    liveGo(url, true);
+  });
+  window.addEventListener("popstate", function () {
+    var url = tasksUrl(location.href);
+    if (url === null) return;
+    liveGo(url, false);
+  });
+  scheduleNext();
+})();
+</script>`;
+
+/**
  * 一级导航单点（REQ-2026-09-30-04 件1 · 件1 口径：全站唯一侧栏的**一级菜单仅一枚**）。
  * 历史：v0.9.4 §9-b 首页 = 组织门户；v0.9.6 B5a 闭集六 → 三枚（摘排期 / 任务 / 宿主桥）；
  * 本轮三 → 一枚 —— 「项目」（`/projects`）与「Agent」（`/agents`）**只撤导航、不撤路由**
@@ -891,7 +1209,7 @@ const NAV: ReadonlyArray<{ key: NavKey; href: string; text: string }> = [
 /**
  * **侧栏二级菜单 = 各项目组**（REQ-2026-09-30-04 件1，替换原「顶栏组织切换器」形态）：
  * 各组织 → `/org/<名>/`（= 该空间排期）的**服务端渲染链接列表**，当前空间项挂 `class="on"`
- * （样式给出左侧圆点高亮）⇒ **零新脚本**，内联脚本闭集不扩（现七元）（N3-⑦/⑧ 纪律锚）。
+ * （样式给出左侧圆点高亮）⇒ **零新脚本**，内联脚本闭集不扩（现八元）（N3-⑦/⑧ 纪律锚）。
  * 清单为空 ⇒ 整块不渲染（无组可切时不留空占位，同原切换器口径）。
  * 原 {@link renderOrgSwitcher}（顶栏文字组 + 空间正文行右档）随本形态变更删除 ——
  * 空间正文的二级导航行（`server.ts` 的 `renderSpaceNav`）不再重复挂组清单。
@@ -912,8 +1230,6 @@ export interface PageParams {
   active: NavKey;
   /** 已转义的正文 HTML 片段 */
   bodyHtml: string;
-  /** 页面级口径脚注（B13 / 并行度等，逐条渲染，内部已转义） */
-  notes?: readonly string[];
   /** 页头动作区（随标题渲染的**字面量**按钮等，REQ-2026-09-26-04「＋ 新增需求」；不承载用户数据） */
   headerActions?: string;
   /** 错误浮层（REQ 弹窗化 · 表单档错误出口专用；全部字段在本函数内 escapeHtml，调用方传原始值） */
@@ -921,7 +1237,7 @@ export interface PageParams {
   /**
    * **组织上下文（BD7；REQ-2026-09-30-04 件1 起 = 侧栏二级菜单数据源）**：
    * 给出当前组织空间（可空）+ 项目组清单。清单 = **纯服务端渲染的链接列表**
-   * （各组织 → `/org/<名>/` 整页跳转）⇒ 零新脚本，内联脚本闭集不扩（现七元）（N3-⑦/⑧ 纪律锚）。
+   * （各组织 → `/org/<名>/` 整页跳转）⇒ 零新脚本，内联脚本闭集不扩（现八元）（N3-⑦/⑧ 纪律锚）。
    * 件1 起原「组织切换器挂位三态」（`orgSwitcher`）随顶栏形态一并退役：全站只有一处侧栏，
    * 组清单不再需要在正文里重复挂载。
    */
@@ -989,10 +1305,6 @@ export function renderPage(params: PageParams): string {
     (n) => `<a href="${n.href}"${n.key === params.active ? ' class="on"' : ""}>${escapeHtml(n.text)}</a>`,
   ).join("");
   const sideOrgs = renderSideOrgs(params.orgNav);
-  const notes =
-    params.notes && params.notes.length > 0
-      ? `<ul class="notes">${params.notes.map((x) => `<li>${escapeHtml(x)}</li>`).join("")}</ul>`
-      : "";
   const overlay = params.errorOverlay === undefined ? "" : renderErrorOverlay(params.errorOverlay);
   return `<!doctype html>
 <html lang="zh-CN">
@@ -1068,10 +1380,10 @@ export function renderPage(params: PageParams): string {
   /* ── 件1 外壳：侧栏（品牌 / 一级菜单 / 二级项目组菜单）── */
   .sidebar { position: sticky; top: 0; align-self: start; height: 100vh; overflow-y: auto; background: var(--b-surface); border-right: 1px solid var(--b-line); padding: var(--b-sp-16) 0 var(--b-sp-24); }
   .brand { padding: 0 var(--b-sp-16) var(--b-sp-12); font-size: var(--b-fs-15); font-weight: 700; letter-spacing: .02em; color: var(--b-brand-ink); }
-  nav { display: block; margin: 0 0 var(--b-sp-4); }
-  nav a { display: block; padding: var(--b-sp-6) var(--b-sp-16); font-size: var(--b-fs-13); color: var(--b-text-2); text-decoration: none; border-left: 2px solid transparent; }
+  .sidebar nav { display: block; margin: 0 0 var(--b-sp-4); }
+  .sidebar nav a { display: block; padding: var(--b-sp-6) var(--b-sp-16); font-size: var(--b-fs-13); color: var(--b-text-2); text-decoration: none; border-left: 2px solid transparent; }
   /* 当前态 = 品牌浅底 + 左侧 2px 色条 */
-  nav a.on { background: var(--b-brand-soft); border-left-color: var(--b-brand); color: var(--b-brand-ink); font-weight: 600; }
+  .sidebar nav a.on { background: var(--b-brand-soft); border-left-color: var(--b-brand); color: var(--b-brand-ink); font-weight: 600; }
   .side-orgs { margin-top: var(--b-sp-12); }
   .side-orgs-label { margin: 0 var(--b-sp-16) var(--b-sp-4); font-size: var(--b-fs-11); color: var(--b-text-4); }
   .side-orgs a { display: block; padding: var(--b-sp-4) var(--b-sp-16) var(--b-sp-4) var(--b-sp-24); font-size: var(--b-fs-13); color: var(--b-text-2); text-decoration: none; }
@@ -1095,7 +1407,6 @@ export function renderPage(params: PageParams): string {
   tr.warn td { color: #b42318; }
   .muted { color: #888; font-size: 11px; }
   .mono { font-family: ui-monospace, Consolas, monospace; }
-  ul.notes { color: #777; font-size: 12px; margin: 10px 0 0; padding-left: 18px; }
   form { display: flex; gap: 8px; align-items: center; margin: 8px 0; }
   form.w { flex-direction: column; align-items: stretch; gap: 6px; padding: 10px 12px; border: 1px solid #8884; border-radius: 6px; }
   form.w label { display: flex; flex-direction: column; gap: 2px; font-size: 12px; color: #667; }
@@ -1118,8 +1429,6 @@ export function renderPage(params: PageParams): string {
   .fold-body { overflow-x: auto; }
   details.calib { margin: 6px 0; font-size: 11px; color: #888; }
   details.calib > summary { cursor: pointer; font-style: italic; }
-  details.req-src { margin: 6px 0; }
-  details.req-src > summary { cursor: pointer; color: #667; background: #8881; border: 1px dashed #8884; border-radius: 6px; padding: 6px 10px; white-space: pre-wrap; word-break: break-word; }
   button.quiet { align-self: flex-start; font-size: 12px; padding: 2px 10px; opacity: .7; }
   p.turn-trace { color: #667; }
   details.turn-summary { margin: 4px 0 0; }
@@ -1198,7 +1507,7 @@ export function renderPage(params: PageParams): string {
   /* 增补五 件A：状态徽标搬出 .khd 独立成行 ⇒ 行内容右靠（.kbadge 的全局 float: right 在 flex 容器内不生效，无需改基元） */
   .kcard > .kbadge-line { display: flex; flex-wrap: wrap; justify-content: flex-end; gap: 2px 6px; margin: 4px 0 0; }
   .kcard[draggable="true"] { cursor: grab; }
-  /* 增补五 件B（REQ-2026-10-02-05）：按状态着色 —— 卡根档类 kst-档（六档闭集，
+  /* 增补五 件B（REQ-2026-10-02-05）：按状态着色 —— 卡根档类 kst-档（七档闭集，
      规则源 derive.ts 的 deriveCardColorTier）= 左缘 3px 色条 + soft 底色；
      取色一律引既有 --b- token，零新色值。locked 档为显式锁定语义预留；
      「已发版」（completed ∧ stage=发版）的派生显示归 ok。 */
@@ -1209,6 +1518,7 @@ export function renderPage(params: PageParams): string {
   .kcard.kst-ok { border-left: 3px solid var(--b-ok); background: var(--b-ok-bg); }
   .kcard.kst-locked { border-left: 3px solid var(--b-locked); background: var(--b-locked-bg); }
   .kcard.kst-danger { border-left: 3px solid var(--b-danger); background: var(--b-danger-bg); }
+  .kcard.kst-cancelled { border-left: 3px solid var(--b-text-4); background: var(--b-line); }
   .kcard.kst-neutral { border-left: 3px solid var(--b-line); background: var(--b-surface-2); }
   .kcol.dragover { outline: 2px dashed #5b86a8; outline-offset: -2px; }
   /* v0.9.8 两栏拖拽增删项目（REQ-2026-10-03-02）：池 / 本组两栏与拖拽态 ——
@@ -1245,6 +1555,10 @@ export function renderPage(params: PageParams): string {
   dialog.fd > button { margin: 0 0 8px; }
   dialog.fd .fd-body > h2:first-child { margin-top: 0; }
   dialog.fd > .err-ov-card { position: fixed; inset: 0; margin: auto; height: fit-content; max-height: 80vh; overflow-y: auto; z-index: 60; box-shadow: 0 0 0 100vmax #0006, 0 6px 24px #0004; }
+  /* v0.10.4 · REQ-2026-10-11-06 T3：浮层内那份控制条是死钟（第八枚只服务页侧，浮层档自有件B 节奏）
+     ⇒ 整条隐藏。特异性 0-2-1 高于页侧同名规则（0-1-0），与书写序无关，故不动页侧那条；
+     同一段落里的 ⟳ 钮一并隐藏 —— 副本无损失，该耦合只登记、不加出口。 */
+  dialog.fd .live-bar { display: none; }
   /* 件1：页头动作钮改由 .page-head 的 flex 归位到标题右侧（原 float: right 随顶栏形态退役） */
   /* ── 件5（REQ-2026-09-30-04）：页面卡片基元（空间·任务页 / 空间·管理页）──
      取色与取尺度一律走 --b- token；与看板 .kcard 分立（看板卡有拖拽语义，不互用）。 */
@@ -1264,6 +1578,12 @@ export function renderPage(params: PageParams): string {
   .b-chips a { display: inline-block; padding: 2px 10px; border: 1px solid var(--b-line); border-radius: 999px; background: var(--b-surface-2); color: var(--b-text-2); font-size: var(--b-fs-12); text-decoration: none; }
   .b-chips a:hover { border-color: var(--b-brand-line); color: var(--b-brand-ink); }
   .b-chips a.on { border-color: var(--b-brand-line); background: var(--b-brand-soft); color: var(--b-brand-ink); font-weight: 600; }
+  /* 增补③′（REQ-2026-10-12-01）：翻页链版式 —— 裸 nav 元素选择器收敛到 .sidebar 后
+     本族补回 flex 一行（此前全站无任何 .pager 规则 ⇒ 链上 <a> 落回默认块化，竖排）。
+     取色一律引既有 --b- token；a.fl 须带 .pager 前缀才压得过全站 a.fl{color:inherit} 的特异性。 */
+  .pager { display: flex; flex-wrap: wrap; align-items: baseline; gap: var(--b-sp-4) var(--b-sp-6); margin: var(--b-sp-8) 0 0; font-size: var(--b-fs-12); color: var(--b-text-3); }
+  .pager a.fl { color: var(--b-text-2); text-decoration: none; }
+  .pager a.fl:hover { color: var(--b-brand-ink); }
   /* 并列表单（加 / 减成员双卡）；嵌套在卡内的子卡换浅面，避免与外卡同色失边 */
   .b-forms { display: grid; grid-template-columns: repeat(auto-fit, minmax(280px, 1fr)); gap: var(--b-sp-12); align-items: start; }
   .b-forms > .b-card { margin: 0; }
@@ -1279,6 +1599,13 @@ export function renderPage(params: PageParams): string {
   .b-badge.warn { border-color: var(--b-warn-line); background: var(--b-warn-bg); color: var(--b-warn); }
   .b-badge.danger { border-color: var(--b-danger-line); background: var(--b-danger-bg); color: var(--b-danger); }
   .b-badge.mute { color: var(--b-text-4); }
+  /* ── REQ-2026-10-11-03 件E：页级就地刷新的恒在壳 / 「上次更新」条 ──
+     壳恒在、内容可空（0→N 首现也能刷出）；取色一律引既有 --b- token，**零新色值**；
+     零新脚本（交互面 = 页面脚本闭集第八枚 {@link PAGE_LIVE_SCRIPT}）。 */
+  .live-slot { display: block; }
+  .live-bar { display: flex; flex-wrap: wrap; align-items: center; gap: var(--b-sp-6); font-size: var(--b-fs-12); color: var(--b-text-3); }
+  .live-clock { color: var(--b-text-2); }
+  .live-now { margin: 0; padding: 0 var(--b-sp-6); border: 1px solid var(--b-line); border-radius: var(--b-r-3); background: var(--b-surface-2); color: var(--b-text-2); font-size: var(--b-fs-11); cursor: pointer; }
   /* ── 件2（REQ-2026-09-30-04）：空间 tab 行 / 阶段步条 / 需求详情主·侧两栏 ──
      取色与取尺度一律走 --b- token；**零新脚本**（tab 高亮 = 服务端渲染的 class，折叠仍是原生 details）。 */
   /* 空间 tab 行（当前 tab = 品牌浅底 + 下沿 2px；详情页携带本行时无激活态 ⇒ 三枚皆为普通链接） */
@@ -1342,7 +1669,6 @@ ${sideOrgs}</aside>
 </header>
 <main>
 ${params.bodyHtml}
-${notes}
 </main>
 </div>
 ${overlay}

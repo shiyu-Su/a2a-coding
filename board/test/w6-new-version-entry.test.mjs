@@ -13,7 +13,8 @@
  *    不再渲染 / 不再存在 ⇒ 本文件以**负向锚**钉「虚列与哨兵不再出现」。
  *
  * 闭集纪律：交互**全在既有脚本常量体内**（`NEW_REQUIREMENT_DIALOG_SCRIPT` /
- * `DRAG_SCHEDULE_SCRIPT`）—— 内联脚本闭集保持**七元**、CSP 不动（全站闭集钉见
+ * `DRAG_SCHEDULE_SCRIPT`）—— 内联脚本闭集保持**七元**（v0.9.8 起）/ **八元**（★v0.10.4 起新增页级
+ * 就地刷新 `PAGE_LIVE_SCRIPT`）、CSP 不动（全站闭集钉见
  * `n3-regression-anchors.test.mjs` N3-⑦/⑧；本文件补「不踩其它常量标记」的归属唯一锚）。
  */
 import { test } from "node:test";
@@ -60,7 +61,7 @@ test("W6-①（E1 改版）renderSchedule 不再挂虚列壳：哨兵 data-newve
   assert.doesNotMatch(html, /拖卡到此/, "拖卡建版本口径文案已撤");
   // 池列仍以 data-version="" 标记；件3 起它是看板**首列**（最左）
   assert.match(html, /<div class="kcol" data-version="">/, "池列 data-version 空串不变（清空排期落点）");
-  const board = html.slice(html.indexOf('<div class="kanban" id="schedule-board">'), html.indexOf("<dialog"));
+  const board = html.slice(html.indexOf('<div class="kanban" id="schedule-board"'), html.indexOf("<dialog"));
   assert.ok(
     board.indexOf('<div class="kcol"') === board.indexOf('<div class="kcol" data-version=""'),
     "池列是看板首列（件3：需求池最左，其右为版本列）",
@@ -159,9 +160,10 @@ test("W6-④（B4 改版）GET /org/alpha/：空间页头带「＋ 新版本」�
     );
     assert.ok(html.includes(NEW_REQUIREMENT_DIALOG_SCRIPT), "新版本交互仍在弹窗常量内（第六枚内扩写）");
     // 闭集不扩：入口迁空间页**不新增任何脚本枚**。B5a 起全局排期页退役 ⇒ 「与全局页同计数」的对照物失效，
-    // 等价式改钉**绝对枚数 5**（提交守卫 + err-ov 关闭 + 详情浮层 + 新增需求/版本弹窗 + 拖拽 = 看板注入面，
+    // 等价式改钉**绝对枚数**（提交守卫 + err-ov 关闭 + 详情浮层 + 新增需求/版本弹窗 + 拖拽 = 看板注入面，
     // 与 schedule-page N2-④ 同一口径；bare `<script>` 计数与是否 vendored mermaid 资产无关）。
-    assert.equal((html.match(/<script>/g) ?? []).length, 5, "空间排期页可执行内联脚本 = 五枚（第七枚只随 manage 页，本页不扩）");
+    // ★v0.10.4 REQ-2026-10-11-03 N5 同轮翻新计数（条数不减、只翻值）：第八枚 `PAGE_LIVE_SCRIPT` 随本页串尾追加 ⇒ 五枚 → **六枚**。
+    assert.equal((html.match(/<script>/g) ?? []).length, 6, "空间排期页可执行内联脚本 = 六枚（v0.10.4 起含页级就地刷新第八枚，本页仍是唯一看板宿主）");
     for (const m of html.matchAll(/<script[^>]*src="([^"]*)"/g)) {
       assert.match(m[1], /^\/static\//, "外源脚本面不变（仅既有同源 mermaid 资产，CSP 不动）");
     }
@@ -187,7 +189,7 @@ test("W6-⑤（E1 改版 + B4 迁入口 · B5a 整页退役）`GET /schedule` �
     assert.doesNotMatch(html, /data-newversion|kcol newver|<h3>需求池/, "退役路径不渲染任何看板正文");
     // B4：建版本入口归空间页 ⇒ 退役的全局页既无按钮也无骨架（写口路由仍在，留作纯 HTTP 兜底）
     assert.doesNotMatch(html, /id="new-version-open"|id="new-version-dialog"/, "退役路径不出建版本按钮与骨架");
-    assert.doesNotMatch(html, /<script>/, "退役路径不注入看板脚本（闭集七元不因此扩）");
+    assert.doesNotMatch(html, /<script>/, "退役路径不注入看板脚本（闭集八元不因此扩）");
     const board = await (await fetch(`${base}/org/alpha/schedule`)).text();
     assert.match(board, /<h3>需求池/, "需求池列仍是看板尾列（宿主 = 空间排期页）");
     assert.doesNotMatch(board, /data-newversion|kcol newver/, "虚列壳哨兵不随宿主迁移而复生");
@@ -203,8 +205,8 @@ test("W6-⑤b（B4 · B5a 改版）GET /org/alpha/：唯一入口三件齐（按
     assert.match(html, /<dialog class="fd" id="new-version-dialog">/, "弹窗骨架在空间页");
     assert.match(html, /action="\/org\/alpha\/versions"/, "表单 action 带空间前缀（org 由路径决定）");
     assert.doesNotMatch(html, /<input[^>]*name="org"/, "表单不带 org 字段（口径 4）");
-    // 脚本闭集不扩：同 W6-④ 的绝对枚数五枚锚（B5a 起全局页退役，无对照物）
-    assert.equal((html.match(/<script>/g) ?? []).length, 5, "空间页可执行内联脚本 = 五枚（第七枚只随 manage 页，本页不扩）");
+    // 脚本闭集不扩：同 W6-④ 的绝对枚数锚（B5a 起全局页退役，无对照物；★v0.10.4 起该锚随第八枚翻为六枚）
+    assert.equal((html.match(/<script>/g) ?? []).length, 6, "空间页可执行内联脚本 = 六枚（v0.10.4 起含页级就地刷新第八枚）");
     assert.doesNotMatch(html, /<script type="text\/template"/, "不为入口迁移引入任何新的脚本载体");
   });
 });

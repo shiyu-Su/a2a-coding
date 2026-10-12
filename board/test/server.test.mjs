@@ -323,18 +323,18 @@ test("BD10-⑤：默认组织未配置（defaultGroup = null，即 resolveDefaul
 });
 
 // ---------------------------------------------------------------------------
-// REQ-2026-10-02-02 件B / REQ-2026-10-02-04 件B（回归锚）：notes 逐页摘除（门户 → 任务页），
-// 详情页 notes 正钉保留（防 sendPage 单点开关误伤其余页）；任务页口径折叠块一并补负钉
+// REQ-2026-10-02-02 件B / REQ-2026-10-02-04 件B（回归锚）→ REQ-2026-10-11-05 ②A 升为全站负钉：
+// 页底口径说明（`ul.notes`）全站退役；任务页口径折叠块负钉保留
 // ---------------------------------------------------------------------------
 
-test("件B：页底 notes 门户 / 任务页摘除 · 详情页保留 · 任务页无口径折叠（增补四补负钉）", async () => {
+test("②A：页底 notes 全站退役（门户 / 详情 / 任务页均无）· 任务页无口径折叠", async () => {
   await withServer(async (base) => {
     const home = await get(base, "/");
     assert.equal(home.status, 200);
     assert.doesNotMatch(home.text, /<ul class="notes"/, "门户不收全局口径说明");
     const detail = await get(base, "/features/F1");
     assert.equal(detail.status, 200);
-    assert.match(detail.text, /<ul class="notes"/, "详情页的页底 notes 照旧保留（单点开关不误伤）");
+    assert.doesNotMatch(detail.text, /<ul class="notes"/, "②A：详情页页底 notes 已随全站口径说明退役");
     const tasks = await get(base, "/tasks?project=p");
     assert.equal(tasks.status, 200);
     assert.doesNotMatch(tasks.text, /<ul class="notes"/, "增补四：全局任务页不收全站口径说明");

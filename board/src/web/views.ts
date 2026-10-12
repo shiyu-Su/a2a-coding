@@ -19,10 +19,9 @@ import type {
 import { projectVersionsOf } from "../bridge-client.js";
 import {
   AGENT_VIEW_CALIBRATION_NOTE,
-  B13_CALIBRATION_NOTES,
   INFLIGHT_CALIBRATION_NOTE,
   LATEST_TURN_SUMMARY_MAX,
-  PARALLELISM_NOTE,
+  TRACE_READ_NOTE,
   deriveActionAffordance,
   deriveCardColorTier,
   deriveDisplayStage,
@@ -47,7 +46,7 @@ import type { HostStatusEntry, StopBridgeOutcome, TriggerDisposition, TriggerTur
 import { NO_OWNER_GROUP_LABEL } from "../orgs-view.js";
 import { orgSpaceLink } from "../org-space.js";
 import type { GroupRow, OrgGroupsOutcome, OrgPoolOutcome, OrgProjectsOutcome } from "../orgs-view.js";
-import { LAST_MEMBER_REMOVE_CODE, LAST_MEMBER_REMOVE_DISPLAY, MEMBER_ADD_RESIDENCY_NOTE, MEMBER_GROUP_CONFLICT_CODE } from "../group-admin.js";
+import { MEMBER_ADD_RESIDENCY_NOTE } from "../group-admin.js";
 import { nodeStateOf, taskDigest, taskOrdinalMap, taskSummaryLines } from "../graph-view.js";
 import type {
   AgentInflightModel,
@@ -55,7 +54,7 @@ import type {
   AgentMachineRow,
   BridgeIdentityOutcome,
 } from "../agent-view.js";
-import { compareVersionOrder, isUnscheduled, normalizeVersion, sortPoolEntries } from "../version-order.js";
+import { compareVersionOrder, isUnscheduled, normalizeVersion, sortFeatureCards, sortPoolEntries } from "../version-order.js";
 import { isVersionLocked } from "../version-status.js";
 import { isConfirmedCard } from "../version-transition.js";
 import { findVersionRecord, isVersionStatus, type VersionLedgerStatus, type VersionOrgFilter, type VersionsLedger } from "../versions-ledger.js";
@@ -101,6 +100,25 @@ const TASK_FILTER_STATES = [
   "cancelled",
   "blocked",
 ] as const;
+
+/**
+ * 只读页常驻刷新的周期单点（REQ-2026-10-11-03 件N1 · 改造文档 §2.1 换块契约）：毫秒整数，
+ * **只经 SSR 属性下发**（每页第一枚锚上的周期属性），不进任何脚本字面量 ⇒ 脚本不内置周期。
+ */
+export const LIVE_INTERVALS: Readonly<{ schedule: number; tasks: number; feature: number }> = {
+  schedule: 30000,
+  tasks: 15000,
+  feature: 15000,
+};
+
+/**
+ * 页级「上次更新」控制条（件N1）：**恒在所有锚之外**，三页各调一次（单点函数）。
+ * 服务端不写任何时刻 —— 占位 `--:--:--` 由脚本在「至少一枚锚成功换块」的那一拍改写；
+ * `⟳` 钮缺省 `hidden` ⇒ 无 JS 环境不出死钮。周期不进本条（只挂每页第一枚锚）。
+ */
+export function renderLiveBar(intervalMs: number): string {
+  return `<p class="hint live-bar" data-live-note>上次更新 <b class="live-clock mono">--:--:--</b><button type="button" class="fl live-now" data-live-now hidden>⟳ 立即更新</button></p>`;
+}
 
 function label(map: Readonly<Record<string, string>>, value: string | null): string {
   if (value === null || value === "") return "—";
@@ -266,7 +284,7 @@ function foldSection(summary: string, content: string): string {
  * 其余条目原样保留（登记即产出记录，不再两处重复）。
  * 无含 doc 路径的条目 ⇒ 「无（本需求未登记产出）」+ 口径一句；不回落版本目录清单（用户裁决）。
  * `currentVersion` 传入时（排期表单在本页渲染）区首追加 M6 改版失联警示行，不传 ⇒ 行为不变。
- * v0.9.5 C3：本区整体在折叠层内（{@link foldSection}），口径长文再套一层 {@link foldCalibration}。
+ * v0.9.5 C3：本区整体在折叠层内（{@link foldSection}）。
  */
 function renderStageOutputs(
   featureId: string,
@@ -287,21 +305,7 @@ function renderStageOutputs(
   const warning =
     currentVersion === undefined ? "" : renderVersionSwitchWarningLine(decisions, currentVersion);
   return `<h2>阶段产出</h2>
-${foldCalibration(
-  "口径：产出从哪来、怎么打开",
-  `<p class="hint">数据 = 本需求 Feature Context 的 <code>decisions</code>（宿主 agent 经 <code>advance</code> 逐轮 append）：条目 = <code>decisions</code> 登记的文档文件名（剥去 <code>doc/{版本}/</code> 前缀作链接文字，登记路径不再展示），含 <code>doc/…&#47;*.md</code> 路径的条目即产出条目，打开经板读文档面守卫（版本白名单 / 根内收 / 仅 .md，版本取当前排期值）。链接不带 src ⇒ 服务端先查主仓、未命中自动回落组织工作区（实际来源在文档页头标注）。</p>`,
-)}
 ${warning}${body}`;
-}
-
-/**
- * 口径长文折叠（v0.9.5 C3）：把「说明数据从哪来 / 执法在哪」的长句包进原生 `<details>`（默认收起）。
- * **零脚本** —— 展开收起是 `<details>` 的原生行为，不新增页面脚本（N3 闭集锚不动）。
- * 传入空串 ⇒ 空串（调用方条件化时不必再判）。
- */
-export function foldCalibration(summary: string, content: string): string {
-  if (content === "") return "";
-  return `<details class="calib"><summary>${escapeHtml(summary)}</summary><div class="calib-body">${content}</div></details>`;
 }
 
 /**
@@ -512,11 +516,6 @@ export function renderScheduleForm(
     ? `<p class="hint warn">本需求现排期版本 <code>${escapeHtml(current)}</code> <b>已发版（🔒 锁定）</b>：不可移出、取消排期或改入其它版本（服务端 409 拒绝；同版本无变化提交放行）。在版本台账把该版重开为进行中即实时生效。</p>`
     : "";
   return `<h2>排期</h2>
-${foldCalibration(
-  "口径：排期写改什么、锁在哪",
-  `<p class="hint">排期写 = 板唯一放开的登记字段写（经 <code>feature-schedule.ts</code> 走 advance「<code>to</code> = 当前态 ∧ 仅 <code>version</code>」特例，<b>不写状态机迁移</b>）；留空提交 = 删除排期（回需求池）。改版前先看「阶段产出」区的失联警示。</p>
-<p class="hint">已发版版本（版本台账标记 <code>released</code> = 列头标 🔒 已发版）不可改入 / 移出（服务端 409 执法）；字段仍可输入，执法在服务端。</p>`,
-)}
 ${lockHint}
 <form method="post" action="/features/${encodeURIComponent(featureId)}/schedule" class="w" data-submit="已提交，排期写入中…">
 <label>版本<input name="version" value="${escapeHtml(current)}" placeholder="如 v0.9.2；留空 = 删除排期"></label>
@@ -545,11 +544,6 @@ ${lockHint}
  * 缺省 `{}` ⇒ 这些件不渲染（未接线调用方行为不变）。
  */
 export interface FeatureDetailExtras {
-  /**
-   * 件2：空间 tab 行（`排期 · 任务 · 管理`，详情页**无激活态**，作空间上下文与返回口）。
-   * 空 ⇒ 不渲染（未接线调用方行为不变）。渲染位 = 正文最前（整页与 `#feat-dialog` 浮层同形）。
-   */
-  spaceNavHtml?: string;
   /** C1 引导行（字段表之后第一屏） */
   nextStepHtml?: string;
   /** C5 单动作区（补充框 + 状态感知按钮；终态 / 未装配 ⇒ 空串） */
@@ -568,21 +562,15 @@ export interface FeatureDetailExtras {
   acceptanceHtml?: string;
 }
 
-/** 需求原文的截断口径（C4 · 复用 {@link truncate} 的板侧单点）。 */
-const REQUIREMENT_TRUNCATE_MAX = 120;
-
 /**
- * C4 需求原文上详情页（head 区常驻，与字段表同屏）：
- * 120 字截断 + 展开全文 = 原生 `<details>`（零脚本）；老桥 / 未填 ⇒ 不渲染该区块。
+ * C4 需求原文正文（**只允许一层折叠**）：本函数只出 `<h2>` + `<pre class="result">` 全文，
+ * 折叠层由外层 `foldSection("需求原文", …)` 唯一承担（展开一次即见全文，不再内套第二层）。
+ * 空本金不渲（返回空串 ⇒ 外层 `foldSection` 自短路）；老桥 / 未填 ⇒ 同一路径。
  */
 function renderRequirementOrigin(requirement: string | null | undefined): string {
   const text = (requirement ?? "").trim();
   if (text === "") return "";
-  if (text.length <= REQUIREMENT_TRUNCATE_MAX) {
-    return `<h2>需求原文</h2>\n<pre class="result">${escapeHtml(text)}</pre>`;
-  }
-  return `<h2>需求原文</h2>
-<details class="req-src"><summary>${escapeHtml(truncate(text, REQUIREMENT_TRUNCATE_MAX))}</summary><pre class="result">${escapeHtml(text)}</pre></details>`;
+  return `<h2>需求原文</h2>\n<pre class="result">${escapeHtml(text)}</pre>`;
 }
 
 /**
@@ -797,7 +785,11 @@ export function renderFeatureDetail(
 ): string {
   const f = detail.feature;
   const d = deriveDisplayStage(f.state, f.stage);
-  const head = `<h2>${escapeHtml(f.title === "" ? f.featureId : f.title)} <span class="muted mono" title="${escapeHtml(f.featureId)}">${escapeHtml(f.featureId)}</span>${renderParentFeatureBadge(f.parentFeatureId)}</h2>\n${renderStageStepBar(d)}`;
+  // 件N1 锚 1/5 `steps`：详情页第一枚锚 ⇒ 页面周期属性挂它（`.b-steps` 本体逐字不动）。
+  // 件D 第三档（REQ-2026-10-11-05 增补 N3）：头部「整页打开」链带 `target="_blank"` ⇒ 浮层导航分支
+  // （`layout.ts` 的 `hasAttribute("target")` 放行）原样交回浏览器原生开新标签；链在 head 不在锚内
+  // ⇒ 第八枚永不替换它。
+  const head = `<h2>${escapeHtml(f.title === "" ? f.featureId : f.title)} <span class="muted mono" title="${escapeHtml(f.featureId)}">${escapeHtml(f.featureId)}</span>${renderParentFeatureBadge(f.parentFeatureId)} <a class="fd-fullpage" href="/features/${escapeHtml(f.featureId)}" target="_blank" rel="noopener">整页打开</a></h2>\n<div class="live-slot" data-live="steps" data-live-interval="${String(LIVE_INTERVALS.feature)}">${renderStageStepBar(d)}</div>`;
 
   // v0.10.3 N3：任务表与「进展三面」表**并为一张 12 列单表**（三面表退役）。
   // 行的事实源 = `detail.tasks` 全集，序 = `taskOrdinalMap` 升序（编号与图上 chip 同一张表）；
@@ -809,10 +801,7 @@ export function renderFeatureDetail(
       : `<h2>任务（${rows.length}）</h2>
 <table><thead><tr>${EXECUTION_COLUMNS.map((c) => `<th>${c}</th>`).join("")}</tr></thead>
 <tbody>${rows.join("")}</tbody></table>
-${foldCalibration(
-  "口径：trace 数据从哪来",
-  `<p class="hint">数据 = <code>GET /api/features/:id/trace</code> 原样复用；「为什么没跑」列的 <code>waitReason</code> 为八值闭集，原样显示。</p>`,
-)}`;
+<p class="hint">${escapeHtml(TRACE_READ_NOTE)}</p>`;
   const traceHint =
     trace === null
       ? `<p class="hint err">trace 读取失败：${escapeHtml(traceError ?? "未知错误")}（桥 trace 接口不可达时如实显示，不静默）</p>`
@@ -823,9 +812,11 @@ ${foldCalibration(
   // C2 空区块短路③：无任务 ⇒ 依赖图不渲染（graph-view 侧同判据；此处再兜一层，未接线调用方也不出空节）。
   // 件2 → v0.10.3 N2c：依赖图先移出「执行明细」折叠（独立卡），本节点再**从侧栏上移主栏**
   // （管道制要宽度）；外壳函数与 `feat-graph` 类名一律保留（「无任务 ⇒ 图卡不渲」的锚读的就是类名）。
-  const graphCard = featCard(extras.graphHtml ?? "", "feat-graph");
-  const execution =
-    executionBody === "" ? "" : foldSection("执行明细（任务 / 为什么没跑）", executionBody);
+  // 件N1 锚 4/5 `graph` / 锚 5/5 `exec`：恒在壳包住图卡与执行明细折叠（空正文 ⇒ 壳在场、内容空）。
+  const graphCard = `<div class="live-slot" data-live="graph">${featCard(extras.graphHtml ?? "", "feat-graph")}</div>`;
+  const execution = `<div class="live-slot" data-live="exec">${
+    executionBody === "" ? "" : foldSection("执行明细（任务 / 为什么没跑）", executionBody)
+  }</div>`;
   const stageOutputsSection = renderStageOutputs(f.featureId, f.decisions, f.version ?? null);
   // M6：排期表单上详情页（GET 面）；缺省不渲染 ⇒ 未接线的调用方保持旧行为。
   const scheduleForm = withScheduleForm ? renderScheduleForm(f.featureId, f.version, releasedVersions) : "";
@@ -840,15 +831,18 @@ ${foldCalibration(
   // 「`.turn-progress` 在回答表单之前」定位刷新面，停链表单同样须早于动作区锚点。
   // ⇒ 依赖图卡只能插在 `turnCard` **之后**（不得提到 `statusLines` 之前，否则顶掉件B 的刷新面定位）。
   const guide = featGuideCard(extras.nextStepHtml ?? "");
-  const statusLines = `${extras.turnProgressHtml ?? ""}${extras.chainStateHtml ?? ""}`;
+  // 件N1 锚 2/5 `turn-prog`：`statusLines` 拆两枚 —— 轮次进度行进恒在壳，链状态行**不进锚**
+  // （含停链 `form`+`button`，属输入/动作面）；两行相对顺序不变（上注「DOM 序即契约」逐字保留）。
+  const statusLines = `<div class="live-slot" data-live="turn-prog">${extras.turnProgressHtml ?? ""}</div>${extras.chainStateHtml ?? ""}`;
   const actionCard = featCard(terminal ? "" : `${extras.actionAreaHtml ?? ""}${extras.answerFormHtml ?? ""}`, "feat-action");
-  const turnCard = featCard(extras.turnTraceHtml ?? "", "feat-turn");
+  // 件N1 锚 3/5 `turn`：最近一轮卡（`featCard` 空正文短路 ⇒ 壳恒在，0→N 首现那拍摘得到）。
+  const turnCard = `<div class="live-slot" data-live="turn">${featCard(extras.turnTraceHtml ?? "", "feat-turn")}</div>`;
   const folds = `${foldSection("需求原文", renderRequirementOrigin(f.requirement))}${execution}${foldSection("验收轨迹", extras.acceptanceHtml ?? "")}`;
   const side = `${featCard(renderFeatureMetaCard(f), "feat-meta")}${featCard(renderFeatureOwnershipCard(detail.projects), "feat-ownership")}${featCard(stageOutputsSection, "feat-outputs")}${featCard(scheduleForm, "feat-schedule")}`;
-  return `${extras.spaceNavHtml ?? ""}
-${head}
+  return `${head}
 <div class="feat-cols">
 <div class="feat-main">
+${renderLiveBar(LIVE_INTERVALS.feature)}
 ${guide}
 ${statusLines}
 ${actionCard}
@@ -936,6 +930,12 @@ export interface TasksPreviewInput {
 }
 
 /**
+ * 任务页的页面周期属性（件N1 判据 6：选单档与深链档**共用同一渲染路径** ⇒ 本页恰 1 处代码产出它）。
+ * 前导空格是属性分隔符 ⇒ 调用方直接接在锚 key 属性之后。
+ */
+const TASKS_LIVE_INTERVAL_ATTR = ` data-live-interval="${String(LIVE_INTERVALS.tasks)}"`;
+
+/**
  * 任务页选单档（`GET /tasks` / `GET /org/<名>/tasks` **不带 `project`** 时）。
  *
  * REQ-2026-09-30-04 件5（原型 v2.3 样张④）：裸查询表单 → **过滤卡**（项目 / 状态 / 条数 + 查询钮）
@@ -977,7 +977,8 @@ export function renderTasksPick(
   const stateSelect = `<option value="">全部</option>${TASK_FILTER_STATES.map(
     (s) => `<option value="${escapeHtml(s)}">${escapeHtml(label(TASK_STATE_LABELS, s))}</option>`,
   ).join("")}`;
-  const previewCard =
+  // 件N1 锚 `tasks-result`（选单档 = 默认带出的结果卡）：恒在壳，未传 preview ⇒ 壳在场、内容空。
+  const previewCard = `<div class="live-slot" data-live="tasks-result">${
     preview === null || previewView === null
       ? ""
       : renderTasksResultCard(
@@ -986,11 +987,16 @@ export function renderTasksPick(
           previewView.reachable
             ? ""
             : `<p class="hint err">项目 ${escapeHtml(previewProject)} 当前不可达${previewView.notice !== null ? `：${escapeHtml(previewView.notice)}` : ""}</p>`,
-        );
-  return `<h2>任务视图</h2>
+        )
+  }</div>`;
+  // 件N1 锚 2/2 `tasks-filter`：本档的第一枚锚 ⇒ 页面周期属性挂它（单点见上）。
+  // （`.b-card.b-filter` 卡体与 `<form>` 标签逐字不动，只套恒在壳）。
+  const filterAnchorOpen = `<div class="live-slot" data-live="tasks-filter"${TASKS_LIVE_INTERVAL_ATTR}>`;
+  return `${renderLiveBar(LIVE_INTERVALS.tasks)}
+<h2>任务视图</h2>
 ${hint}
 ${membershipHint}
-${cardShell(
+${filterAnchorOpen}${cardShell(
   "过滤",
   "点下方项目 chip 或填条件后查询",
   `<form method="get" action="${escapeHtml(tasksBase)}">
@@ -1001,7 +1007,7 @@ ${cardShell(
 </form>
 ${chips === "" ? "" : `<div class="b-chips"><span class="b-chips-label">快捷项目</span>${chips}</div>`}`,
   "b-filter",
-)}
+)}</div>
 ${previewCard}`;
 }
 
@@ -1025,9 +1031,12 @@ export function renderTasks(
             .join(" · "),
         )}</span> <span class="muted">（桥服务端过滤）</span>`;
   const meta = `共 ${String(view.tasks.length)} 条${filterNote} · <a class="fl" href="${escapeHtml(org === null ? "/tasks" : orgSpaceLink(org, "tasks"))}">换项目</a>`;
-  return `<h2>任务 · 项目 <span class="mono">${escapeHtml(view.projectId)}</span></h2>
+  // 件N1 锚 `tasks-result`（深链档本页唯一锚 ⇒ 页面周期属性挂它，单点见上）。
+  const resultAnchorOpen = `<div class="live-slot" data-live="tasks-result"${TASKS_LIVE_INTERVAL_ATTR}>`;
+  return `${renderLiveBar(LIVE_INTERVALS.tasks)}
+<h2>任务 · 项目 <span class="mono">${escapeHtml(view.projectId)}</span></h2>
 ${orgLine}
-${renderTasksResultCard(view, meta, reach)}`;
+${resultAnchorOpen}${renderTasksResultCard(view, meta, reach)}</div>`;
 }
 
 function truncate(text: string, max: number): string {
@@ -1223,7 +1232,7 @@ export interface OrgSpaceManageInput {
   projectsOutcome: OrgProjectsOutcome | null;
   /**
    * 全组枚举结论（3300 只读 `GET <3300>/api/groups`，组结构**声明面** = 本组成员清单的事实源）。
-   * `null` = 查询器未装配 ⇒ 池右栏与核对卡首行标「未查询」；`ok=false` = 3300 宕机 / 配置坏 ⇒
+   * `null` = 查询器未装配 ⇒ 池右栏与页头核对短条首档标「未查询」；`ok=false` = 3300 宕机 / 配置坏 ⇒
    * 二者**灰化**，**本页其余照常渲染**（宕机不得阻断管理页）。与逐组 `a2a_projects`（运行态）**并存、不替代**。
    */
   groupsOutcome: OrgGroupsOutcome | null;
@@ -1231,7 +1240,7 @@ export interface OrgSpaceManageInput {
    * **项目池**（v0.9.8 两栏拖拽 · REQ-2026-10-03-02）= 全量机器项目快照 − 全组（含本组）声明面成员对
    * （{@link computeProjectPool}）。`null` = 全量快照读面未装配 ⇒ 池区标「未查询」；
    * `ok=false` = 快照或声明面任一读失败 ⇒ 池区**整块灰化**（**不给拖拽载荷、不编造假池**），
-   * 手填表单照常可用。页面其余照常渲染。
+   * 两栏容器不呈现（无行可拖 ⇒ 本档无成员写通路）。页面其余照常渲染。
    */
   poolOutcome?: OrgPoolOutcome | null;
   /**
@@ -1252,9 +1261,21 @@ export interface OrgSpaceManageInput {
     globalModel: string | null;
   };
   /**
-   * **引擎版本台账投影（project 档）**核对源（v0.10.2 · REQ-2026-10-10-02 N2）：配置核对卡的
-   * **第三行**，与项目卡「已发布的最新版本号」列**共用同一次** `GET /api/versions` 读取。
-   * **省略 = 未注入 ⇒ 该源不参评**（行不出现，也不参与「配置齐备」闸 —— 不注入即零行为变化）。
+   * **⑨ 需求表分页（REQ-2026-10-11-05 N11）**：三枚**一并缺席 = 全量渲染**（向后兼容既有调用点
+   * 与既有测试锚 —— 未传时渲染结果与本节点改动前逐字一致，形态照 {@link OrgSpaceManageInput.versionProjection}
+   * 的 optional「省略 ⇒ 不参评」先例）。写入侧 = `server.pageOrgSpaceManage`（**先排全量再切页**，
+   * 排序复用 `version-order.comparePoolEntry`，**不新建第二比较器**）；视图只做「渲所给的那一页」。
+   */
+  /** 当前页（1 起）。server 侧已 fail-closed 归一（缺失 / 非有限 / `<1` / 起点越界 ⇒ 第 1 页）⇒ 视图不再回显原值。 */
+  page?: number | null;
+  /** 每页条数（缺省取单点常量 {@link ORG_FEATURES_PAGE_SIZE}）。 */
+  pageSize?: number | null;
+  /** 该组需求**全量**条数（切页之前的总数）—— 渲翻页链与「共 N 条」；不传 ⇒ 不渲链。 */
+  total?: number | null;
+  /**
+   * **引擎版本台账投影（project 档）**核对源（v0.10.2 · REQ-2026-10-10-02 N2）：页头核对短条的
+   * **第三档**，与项目卡「已发布的最新版本号」列**共用同一次** `GET /api/versions` 读取。
+   * **省略 = 未注入 ⇒ 该源不参评**（该档不出现，也不参与「配置齐备」闸 —— 不注入即零行为变化）。
    * 三输入即三档判据的原料：`projection = null` ⇒ 本进程**从未读到过**投影；`failure` 非 `null`
    * ⇒ 本次读失败、值取最后一次投影（**stale**）；project 档 `absent` ⇒ 老引擎档。
    * `degradationText` = `absent` 两档的**降级文案单点**（`server.projectVersionDegradationText`
@@ -1267,7 +1288,54 @@ export interface OrgSpaceManageInput {
   };
 }
 
-function renderOrgFeaturesTable(features: readonly FeatureListItem[]): string {
+/**
+ * **⑨ 需求表每页条数的单点常量**（REQ-2026-10-11-05 N11 · 用户裁定 = 每页 10 条）：
+ * 唯一定义处 —— `server.pageOrgSpaceManage` 的切片与本文件的翻页链都引它，**不得两处各写数字**。
+ */
+export const ORG_FEATURES_PAGE_SIZE = 10;
+
+/**
+ * **⑨ 翻页链**（REQ-2026-10-11-05 N11）：形态唯一合法解 = **链接式服务端分页**（`<a>` 携 query 参数 `page=N`）
+ * —— 客户端脚本分页不可行：内联脚本字面量是**闭集八元**（`n3-regression-anchors` N3-⑦/⑪ 钉），
+ * 新增一枚**可执行内联脚本**即破钉（扫描器按字面量计数，本注释不得书写该标签字面量）；
+ * 也不得用 `<button>`+form 伪装翻页。
+ * 只在 `total > 0` 且**页数 > 1** 时渲（`total = 0` ⇒ 不渲链、空态行原样保留；单页 ⇒ 不渲噪音链）。
+ * **query 全站唯一生成点** = 本函数的 `hrefOf`（不得拼两遍）；页码取**归一后的整数**（`String(n)`），
+ * **不回显用户输入** ⇒ 无反射型注入面。
+ * 路径段编码由 {@link orgSpaceLink} 承担（`encodeURIComponent` 落在段上），query 在其后**不继承段编码**
+ * ⇒ 页链打开后仍在本 org；首 / 末页时对应方向钮**不渲**（不渲灰壳）。
+ */
+function renderOrgFeaturesPager(org: string, page: number, pageSize: number, total: number): string {
+  if (total <= 0) return "";
+  const pageCount = Math.ceil(total / pageSize);
+  if (pageCount <= 1) return "";
+  const hrefOf = (n: number): string => `${escapeHtml(orgSpaceLink(org, "manage"))}?page=${String(n)}`;
+  const cell = (n: number): string =>
+    n === page ? `<b>${String(n)}</b>` : `<a class="fl" href="${hrefOf(n)}">${String(n)}</a>`;
+  // 窗口 = 首页 / 末页 / 当前 ±2（升序直构，不排第二遍）；间隙以「…」纯文本占位，不是钮
+  const window: number[] = [];
+  for (let n = 1; n <= pageCount; n += 1) {
+    if (n === 1 || n === pageCount || Math.abs(n - page) <= 2) window.push(n);
+  }
+  const cells: string[] = [];
+  let prev = 0;
+  for (const n of window) {
+    if (prev !== 0 && n - prev > 1) cells.push(`<span class="muted">…</span>`);
+    cells.push(cell(n));
+    prev = n;
+  }
+  const prevLink = page > 1 ? `<a class="fl" href="${hrefOf(page - 1)}">← 上一页</a>` : "";
+  const nextLink = page < pageCount ? `<a class="fl" href="${hrefOf(page + 1)}">下一页 →</a>` : "";
+  return `<nav class="pager">${prevLink}${cells.join(" · ")}${nextLink}<span class="muted">共 ${String(total)} 条 · 第 ${String(page)}/${String(pageCount)} 页</span></nav>`;
+}
+
+function renderOrgFeaturesTable(
+  org: string,
+  features: readonly FeatureListItem[],
+  page: number | null | undefined,
+  pageSize: number | null | undefined,
+  total: number | null | undefined,
+): string {
   const rows = features.map((f) => {
     const d = deriveDisplayStage(f.state, f.stage);
     return (
@@ -1281,11 +1349,19 @@ function renderOrgFeaturesTable(features: readonly FeatureListItem[]): string {
       "</tr>"
     );
   });
+  // 三枚全缺席 ⇒ 全量渲染 + 卡头文案与本节点改动前逐字一致（向后兼容判据）；
+  // 带 total ⇒ 卡头报**全量**条数（不是本页行数），翻页链附在表尾。
+  const paged = total !== null && total !== undefined;
+  const count = paged ? String(total) : String(features.length);
+  const pager =
+    paged && page !== null && page !== undefined && pageSize !== null && pageSize !== undefined
+      ? renderOrgFeaturesPager(org, page, pageSize, total)
+      : "";
   return cardShell(
     "需求",
-    `本组 ${String(features.length)} 条`,
+    `本组 ${count} 条`,
     `<table><thead><tr><th>需求</th><th>引擎态</th><th>阶段（显示）</th><th>版本</th><th>审批门</th><th>更新</th></tr></thead>
-<tbody>${rows.length === 0 ? emptyRow(6, "（该组织暂无需求）") : rows.join("")}</tbody></table>`,
+<tbody>${rows.length === 0 ? emptyRow(6, "（该组织暂无需求）") : rows.join("")}</tbody></table>${pager}`,
   );
 }
 
@@ -1293,13 +1369,13 @@ function renderOrgFeaturesTable(features: readonly FeatureListItem[]): string {
  * 组织项目卡（运行态 `a2a_projects`，一行 = 一 `(machineId, projectId)`）。
  *
  * 「已发布的最新版本号」列（v0.10.2 · REQ-2026-10-10-02 落点①）取数口径：
- * - 源 = **宿主本次渲染已取到的那份投影**（`versionProjection`，与配置核对卡共用同一次
+ * - 源 = **宿主本次渲染已取到的那份投影**（`versionProjection`，与页头核对短条共用同一次
  *   `GET /api/versions`）⇒ 本函数**不再打上游**；
  * - 值 = 按 `(org, projectId)` 从 project 档取 `status === "released"` 的 **semver 最大**
  *   （照门户摘要 {@link orgVersionSummaryOf} 的写法，用既有 `compareVersionOrder` / `normalizeVersion`，
  *   **不引入第二套比较器**）；`status = open` 的行**不进该列**；
  * - 无已发布版 / 投影为 `null` / project 档 `absent`·`empty` / 未注入 ⇒ 一律 `—`：**「无已发布」与
- *   「读不到」同显 `—`、不加提示、不加 `title`**（诚实通道唯一在配置核对卡，裁定④）；
+ *   「读不到」同显 `—`、不加提示、不加 `title`**（诚实通道唯一在页头核对短条，裁定④）；
  * - 联键 = `entry.projectId` trim 后精确相等 ∧ `entry.org === org`（他 org 的同版号不得染色）；
  * - 同 project 多机 ⇒ 同版号在**多行重复出现**，**不按 `projectId` 去重**（正常形态，不是缺陷）。
  * 三个早退分支（未查询 / 不可达）不带表 ⇒「空态 8 列」只作用于正常分支。
@@ -1431,62 +1507,6 @@ ${renderDisableOrgForm(org)}`,
 }
 
 /**
- * 逐组织的**成员写表单**（v0.9.4 B 档 · BD4 · 纯 SSR，零新脚本常量）：增 / 删各一枚，
- * 都提交到**同一条**路由 `POST /orgs/{org}/members`，靠隐藏字段 <code>action</code> 分流
- * （与 A 档 `POST /orgs` 的 create/disable 同款口径）。落点是 **orch 的 `projectGroup` 段**
- * （经板第三个 MCP 写封装 `group-admin.ts` → O1 受控写工具），**不是板台账、不是 machine 配置**。
- * `machineId` 是否合法**不在板上判**（判据唯一在桥的 dry-run，二处立规则必漂移）。
- * **增补二 §9.1**：删成员的「末位不可删」由板写前闸业务化拒绝（`board_last_member_remove`）；
- * `data-ov="1"` ⇒ 两枚表单浮层报错不跳页（无 JS = 原生 PRG 不劣化）。
- */
-function renderMemberForms(org: string): string {
-  const action = escapeHtml(`/orgs/${encodeURIComponent(org)}/members`);
-  const pairFields = `<label>machineId *<input name="machineId" required placeholder="如 win-a"></label>
-<label>projectId *<input name="projectId" required placeholder="如 board"></label>`;
-  const addCard = cardShell(
-    "加成员",
-    `<span class="mono">POST /orgs/{org}/members</span> · action=add`,
-    `<form method="post" action="${action}" class="w" data-submit="已提交，加成员中…" data-ov="1">
-<input type="hidden" name="action" value="add">
-${pairFields}
-<button type="submit">加成员</button>
-</form>
-<p class="b-note"><b>新增 project 若目标机尚未登记</b> ⇒ 仍须<b>人工重启该机 Launcher</b> 才会被拉起（板不代重启 machine 侧进程）。</p>`,
-  );
-  const removeCard = cardShell(
-    "删成员",
-    `<span class="mono">POST /orgs/{org}/members</span> · action=remove`,
-    `<form method="post" action="${action}" class="w" data-submit="已提交，删成员中…" data-ov="1">
-<input type="hidden" name="action" value="remove">
-${pairFields}
-<button type="submit">删成员</button>
-</form>
-<p class="b-note danger"><b>末位成员不可删</b>（写前拦下 · 409 <code>${escapeHtml(LAST_MEMBER_REMOVE_CODE)}</code>）：${escapeHtml(LAST_MEMBER_REMOVE_DISPLAY)}。</p>`,
-  );
-  return `${cardShell(
-    "成员（项目组台账）",
-    "增 / 删各一枚表单，同源提交",
-    `<div class="b-forms">
-${addCard}
-${removeCard}
-</div>`,
-  )}`;
-}
-
-/**
- * 手填表单的**折叠宿主**（v0.9.8 · REQ-2026-10-03-02 · 渐进增强，照门户 `#new-org-inline` 先例）：
- * SSR 直出 `open` 的 `<details>` ⇒ **无 JS 时两枚表单原样可见、照常原生提交**（回路面不劣化）；
- * JS 可用时 {@link MEMBER_DRAG_SCRIPT} 把 `open` 置 `false` 收起（**只折叠、不移除 DOM** ——
- * 「输入面恒为一个」口径：拖拽面在场时手填面收进折叠条，展开即回落）。
- */
-function renderMemberFormsFold(org: string): string {
-  return `<details class="m-fold" id="member-forms-fold" open>
-<summary>手填表单（加 / 删成员）</summary>
-${renderMemberForms(org)}
-</details>`;
-}
-
-/**
  * 两栏拖拽池的行卡（v0.9.8 · REQ-2026-10-03-02）。
  * **`draggable` 由服务端渲染判据控制**（执法在服务端与桥 O1，脚本只是体验层）：
  * - 池行恒 `draggable="true"` —— 加入若撞别组，由 409 `board_member_group_conflict` 浮层兜底；
@@ -1513,12 +1533,26 @@ function memberDragRow(
 }
 
 /**
+ * 项目池卡的手动刷新表单（v0.10.4 · REQ-2026-10-11-06 · **零脚本 D 档**）：一枚原生 GET 表单，
+ * 提交即整页重载 ⇒ 服务端重跑管理页那四路并行读取，不做任何局部刷新、不接 live 轮询。
+ * **不带 `data-ov` / `data-submit` / `data-live`**：GET 无覆盖层报错语义，也不属 live 槽。
+ * 类名用新的 `m-refresh`，**不复用 `.live-now` 或 `.b-card a.fl`** —— 那两个选择器是第八枚
+ * `PAGE_LIVE_SCRIPT` 的委托选择器，蹭上即把零脚本档悄悄接回脚本面。
+ */
+function renderPoolRefreshForm(org: string): string {
+  return `<form method="get" action="${escapeHtml(orgSpaceLink(org, "manage"))}" class="m-refresh">
+<button type="submit">⟳ 刷新项目池</button>
+</form>`;
+}
+
+/**
  * **两栏拖拽区**（v0.9.8 · REQ-2026-10-03-02 · SSR 直出，拖拽仅作增强）：
  * 左「项目池」= 全量机器项目 − **全组（含本组）声明面**（{@link poolProjects} 的集合差，
  * 故别组成员在池里**完全不显示** —— 显示层过滤，不是写入闸门）；右「本组项目」= 声明面 members
  * （两栏同取 3300 全组枚举的该组投影，不另立事实源）。
  * 降级多档先例：快照未装配 ⇒「未查询」；读失败 / 声明面不可达 ⇒「不可用」整块灰化
- * （**不给拖拽载荷** ⇒ 不给假池编造归属）；两种降级下**下方手填表单照常可用**（回路面不劣化）。
+ * （**不给拖拽载荷** ⇒ 不给假池编造归属）；两种降级下**本页不提供成员写通路**（⑦ 退役手填表单，
+ * 拖拽是唯一写面 ⇒ 降级档只能刷新重查，写入结论以服务端投影与 409 为准）。
  * **退役卡的承接位（v0.10.2 · REQ-2026-10-10-03 N2）**：逐组「成员清单」卡撤销后，「未声明」档由本卡
  * **三出口**同渲同一枚 note —— 「未查询」/「不可用」/ 右栏空态 ⇒ 诚实通道不因删卡失承载。
  * `#member-pool` + `data-org` = {@link MEMBER_DRAG_SCRIPT} 的入口锚与提交目标（页隔离锚点，N3-⑦/⑧）。
@@ -1533,22 +1567,23 @@ function renderMemberPoolColumns(
   sourceCount: number | null = null,
 ): string {
   const title = `加 / 删项目（两栏拖拽）`;
+  const refresh = renderPoolRefreshForm(org);
   const declared = groupsOutcome !== null && groupsOutcome.ok;
   const ownRow = declared ? groupsOutcome.groups.find((g) => g.name === org) : undefined;
   const undeclared = declared && ownRow === undefined;
-  const undeclaredNote = `<p class="hint muted"><b>未声明</b>：orch 的 <code>projectGroup</code> 段尚无名为 <code>${escapeHtml(org)}</code> 的组（盘目录 / 板台账 / 需求归属可先于组存在，不是错误）—— 首次写入即建组带首成员（左栏拖入或下方手填，一次写入）。</p>`;
+  const undeclaredNote = `<p class="hint muted"><b>未声明</b>：orch 的 <code>projectGroup</code> 段尚无名为 <code>${escapeHtml(org)}</code> 的组（盘目录 / 板台账 / 需求归属可先于组存在，不是错误）—— 首次写入即建组带首成员（左栏拖入，一次写入）。</p>`;
   if (pool === null) {
     return cardShell(
       title,
       "未查询",
-      `<p class="hint muted"><b>未查询</b>：全量机器项目快照未装配 ⇒ 本区不呈现池与本组清单（不编造「无项目」）；下方两枚手填表单照常可用。</p>${undeclared ? undeclaredNote : ""}`,
+      `${refresh}<p class="hint muted"><b>未查询</b>：全量机器项目快照未装配 ⇒ 本区不呈现池与本组清单（不编造「无项目」）；成员写本档无拖拽面 ⇒ 刷新本页重查，写入结论以服务端投影与 409 为准。</p>${undeclared ? undeclaredNote : ""}`,
     );
   }
   if (!pool.ok) {
     return cardShell(
       title,
       "不可用",
-      `<p class="hint warn muted"><b>池数据不可用</b>（<code>${escapeHtml(pool.code)}</code>）：${escapeHtml(pool.error)} —— 项目归属未知 ⇒ 本区整块灰化、<b>不给拖拽</b>（刷新本页重查；下方两枚手填表单照常可用）。</p>${undeclared ? undeclaredNote : ""}`,
+      `${refresh}<p class="hint warn muted"><b>池数据不可用</b>（<code>${escapeHtml(pool.code)}</code>）：${escapeHtml(pool.error)} —— 项目归属未知 ⇒ 本区整块灰化、<b>不给拖拽</b>（刷新本页重查；成员写本档无拖拽面 ⇒ 写入结论以服务端投影与 409 为准）。</p>${undeclared ? undeclaredNote : ""}`,
     );
   }
   const own = ownRow?.members ?? [];
@@ -1570,7 +1605,7 @@ function renderMemberPoolColumns(
   return cardShell(
     title,
     `池 ${String(pool.rows.length)} 项 · 本组 ${ownMeta}${pool.observedAt === null ? "" : ` · 观测时刻 ${escapeHtml(pool.observedAt)}`}`,
-    `<div class="m-pool" id="member-pool" data-org="${escapeHtml(org)}">
+    `${refresh}<div class="m-pool" id="member-pool" data-org="${escapeHtml(org)}">
 <div class="mcol" data-side="pool">
 <p class="mcol-h">项目池 <span class="mcol-sub">拖到右栏 = 加入本组</span></p>
 ${poolBody}
@@ -1579,8 +1614,7 @@ ${poolBody}
 <p class="mcol-h">本组项目 <span class="mcol-sub">拖到左栏 = 移出本组</span></p>
 ${ownBody}
 </div>
-</div>
-<p class="hint">两栏<b>同源</b> = 3300 全组枚举的该组投影，左栏另加一次全量项目快照；<b>三个数据源各有自己的观测时刻</b> ⇒ 刚移出的项目在本栏的归属可能瞬时滞后。<b>落点以服务端投影与 409 为准</b>：撞别组 ⇒ 409 <code>${escapeHtml(MEMBER_GROUP_CONFLICT_CODE)}</code>（浮层点名所属组），末位不可删 ⇒ 409 <code>${escapeHtml(LAST_MEMBER_REMOVE_CODE)}</code>。拖拽只做增强 —— 无 JS 时两栏退化为静态清单，下方手填表单照常提交。</p>`,
+</div>`,
   );
 }
 
@@ -1629,79 +1663,99 @@ ${input.action === "add" ? `<p class="b-note">${escapeHtml(MEMBER_ADD_RESIDENCY_
 }
 
 /**
- * **配置核对卡**（REQ-2026-09-30-04 件5 · 原型 v2.3 样张⑤；v0.10.2 N2 加第三行）：本页**已读到的
- * 只读投影**逐源给一行核对结论 —— **① 声明面** 3300 `GET /api/groups` · **② 运行态** 逐组
+ * 核对源**档位词的单点常量**（⑧a：原「配置核对卡」内联字面量抬出为唯一一处 ——
+ * 短条与任何后续读面不得各写一套档位词）。
+ */
+const CONFIG_CHECK_TIER_LABELS = {
+  unassembled: "未装配",
+  unreadable: "读不到",
+  stale: "本次读不到",
+  readable: "可读",
+} as const;
+type ConfigCheckTier = keyof typeof CONFIG_CHECK_TIER_LABELS;
+
+/**
+ * **页头核对短条**（REQ-2026-09-30-04 件5 · 原型 v2.3 样张⑤ 起为「配置核对卡」；
+ * REQ-2026-10-11-05 ⑧a 卡面降级为**页头一条短条** —— **判定逻辑与原卡逐字相同，只换包装**）：
+ * 本页**已读到的只读投影**逐源给一档核对结论 —— **① 声明面** 3300 `GET /api/groups` · **② 运行态** 逐组
  * `a2a_projects` · **③ 引擎版本台账投影（project 档）**（`GET /api/versions`，未注入 ⇒ 不参评），
  * 外加桥 `warnings[]` 的**缺文件 / 配置瑕疵警示条**。
  * **零新触面**：不查盘、不新增只读端点 —— 核对的是本页各读面那次读取的健康度，
  * 因此「上次核对时间」= 声明面那次读取的 `observedAt`（缺 ⇒ 不谎报时间）。
- * 全部**已注入**源可读 ∧ 无 warn ⇒ 正常态一行「配置齐备 · 上次核对时间 …」。
+ * 全部**已注入**源可读 ∧ 无 warn ⇒ 结论「配置齐备 · 上次核对时间 …」。
  *
- * **第三行的三态闭集**（互斥 + 穷尽，改造文档 §2.1 落点④）—— **判据序 ①→②→③ 不可颠倒**：
+ * **第三源的三态闭集**（互斥 + 穷尽，改造文档 §2.1 落点④）—— **判据序 ①→②→③ 不可颠倒**（判序即语义）：
    1. `projection === null` ⇒ **本进程从未读到过**（「读不到」+ 根因码
       `project_versions_group_projection_unreadable`，经降级文案单点带出）；
    2. `projection !== null` ∧ `failure !== null` ⇒ **stale** = 本次读失败、值取 `engineVersionsLastGood`
       （「本次读不到 · 值取最后一次投影」+ `failure` 根因）；
    3. `projection !== null` ∧ `failure === null` ∧ project 档 `absent` ⇒ **老引擎档**（「读不到」+
-      `project_versions_field_missing` / `_invalid`）；
+      `project_versions_field_missing` / `project_versions_field_invalid`）；
    余下（`live` / `empty`）⇒ **「可读」** —— `empty` 是**合法事实**「未登记，本版本起生效」，
    **不得报读不到**。
  * 颠倒 ①/② 的后果：`versionProjectionOf` 读失败时返回的正是最后一次投影，**从未读到**（投影为
- * `null`）同时满足 ② ⇒ 颠倒会渲出**两条根因**。本行也是「投影读不到」的**唯一诚实通道**
- * （项目卡新列刻意不带 stale 提示，裁定④）。
+ * `null`）同时满足 ② ⇒ 颠倒会渲出**两条根因**。本源也是「投影读不到」的**唯一诚实通道**
+ * （项目卡新列刻意不带 stale 提示，裁定④）。**根因码视图不另写一套** —— 三枚全部经
+ * `degradationText`（`server.projectVersionDegradationText` 单点）/ `ProjectVersionsField.code` 带出。
  */
-function renderOrgConfigCheckCard(
+function renderOrgConfigHealthBar(
   groupsOutcome: OrgGroupsOutcome | null,
   projectsOutcome: OrgProjectsOutcome | null,
   versionProjection?: OrgSpaceManageInput["versionProjection"],
 ): string {
-  const sourceRow = (
-    nameHtml: string,
+  const tierWord = (t: ConfigCheckTier): string => escapeHtml(CONFIG_CHECK_TIER_LABELS[t]);
+  /** 已注入两源的档位（原 `sourceRow` 的三分支 —— 档位取值与说明文案逐字照搬）。 */
+  const sourceTier = (
     outcome: { ok: boolean; code?: string; error?: string } | null,
-    danger?: { badge: string; note: string },
-  ): string => {
+  ): { tier: ConfigCheckTier; noteHtml: string | null } => {
     if (outcome === null) {
-      return `<tr><td>${nameHtml}</td><td><span class="b-badge mute">未装配</span></td><td class="muted">本区不查询（不编造「齐备」也不编造「缺失」）</td></tr>`;
+      return { tier: "unassembled", noteHtml: "本区不查询（不编造「齐备」也不编造「缺失」）" };
     }
     if (!outcome.ok) {
-      const note =
-        danger !== undefined
-          ? escapeHtml(danger.note)
-          : `<code>${escapeHtml(outcome.code ?? "unknown")}</code> ${escapeHtml(outcome.error ?? "")}`;
-      return `<tr class="warn"><td>${nameHtml}</td><td><span class="b-badge danger">${escapeHtml(danger?.badge ?? "读不到")}</span></td><td>${note}</td></tr>`;
+      return {
+        tier: "unreadable",
+        noteHtml: `<code>${escapeHtml(outcome.code ?? "unknown")}</code> ${escapeHtml(outcome.error ?? "")}`,
+      };
     }
-    return `<tr><td>${nameHtml}</td><td><span class="b-badge ok">可读</span></td><td class="muted">本次读取正常收敛</td></tr>`;
+    return { tier: "readable", noteHtml: null };
   };
   /**
-   * 第三行（版本台账投影 project 档）：`readable` = 是否计入「全部源可读」闸。
-   * **不造「未装配」档** —— 投影读取器恒在（`ctx.engineVersions`），`sourceRow` 的 null 分支对本源不可达。
+   * 第三源（版本台账投影 project 档）：`readable` = 是否计入「全部源可读」闸。
+   * **不造「未装配」档** —— 投影读取器恒在（`ctx.engineVersions`），未注入时本源整条不出现。
    */
-  const versionProjectionSource = (
+  const versionTier = (
     v: NonNullable<OrgSpaceManageInput["versionProjection"]>,
-  ): { html: string; readable: boolean } => {
-    const nameHtml = "引擎版本台账投影（project 档 · <code>GET /api/versions</code>）";
+  ): { tier: ConfigCheckTier; noteHtml: string | null; readable: boolean } => {
     if (v.projection === null) {
       return {
-        html: sourceRow(nameHtml, { ok: false }, { badge: "读不到", note: v.degradationText ?? "（未取到降级文案 ⇒ 根因码无从展示，请查投影读取面）" }),
+        tier: "unreadable",
+        noteHtml: escapeHtml(v.degradationText ?? "（未取到降级文案 ⇒ 根因码无从展示，请查投影读取面）"),
         readable: false,
       };
     }
     if (v.failure !== null) {
       return {
-        html: sourceRow(nameHtml, { ok: false }, { badge: "本次读不到", note: `值取最后一次投影 · ${v.failure}` }),
+        tier: "stale",
+        noteHtml: escapeHtml(`值取最后一次投影 · ${v.failure}`),
         readable: false,
       };
     }
     const field: ProjectVersionsField = projectVersionsOf(v.projection);
     if (field.status === "absent") {
       return {
-        html: sourceRow(nameHtml, { ok: false }, { badge: "读不到", note: v.degradationText ?? `${field.code} · ${field.error}` }),
+        tier: "unreadable",
+        noteHtml: escapeHtml(v.degradationText ?? `${field.code} · ${field.error}`),
         readable: false,
       };
     }
-    return { html: sourceRow(nameHtml, { ok: true }), readable: true };
+    return { tier: "readable", noteHtml: null, readable: true };
   };
-  const versionSource = versionProjection === undefined ? null : versionProjectionSource(versionProjection);
+  const groupsLabel = "声明面成员（3300 <code>GET /api/groups</code>）";
+  const projectsLabel = "运行态项目（逐组 <code>a2a_projects</code>）";
+  const versionLabel = "引擎版本台账投影（project 档 · <code>GET /api/versions</code>）";
+  const groupsTier = sourceTier(groupsOutcome);
+  const projectsTier = sourceTier(projectsOutcome);
+  const versionSource = versionProjection === undefined ? null : versionTier(versionProjection);
   const warnings = groupsOutcome !== null && groupsOutcome.ok ? groupsOutcome.warnings : [];
   const bothAssembled = groupsOutcome !== null && projectsOutcome !== null;
   const allReadable =
@@ -1713,33 +1767,34 @@ function renderOrgConfigCheckCard(
     (versionSource === null || versionSource.readable);
   const checkedAt =
     groupsOutcome !== null && groupsOutcome.ok ? groupsOutcome.observedAt : null;
-  const summary = allReadable
-    ? warnings.length === 0
-      ? `<p class="b-note ok">配置齐备 · 上次核对时间 ${escapeHtml(checkedAt ?? "（桥未回观测时刻）")}</p>`
-      : ""
-    : "";
+  const src = (labelHtml: string, t: ConfigCheckTier): string => `${labelHtml} <b>${tierWord(t)}</b>`;
+  const parts = [src(groupsLabel, groupsTier.tier), src(projectsLabel, projectsTier.tier)];
+  if (versionSource !== null) parts.push(src(versionLabel, versionSource.tier));
+  /** 不可读源的说明（原「说明」列内容照搬，换 `<ul>` 承载；可读源不重复啰嗦）。 */
+  const notes: { labelHtml: string; noteHtml: string }[] = [];
+  if (groupsTier.noteHtml !== null) notes.push({ labelHtml: groupsLabel, noteHtml: groupsTier.noteHtml });
+  if (projectsTier.noteHtml !== null) notes.push({ labelHtml: projectsLabel, noteHtml: projectsTier.noteHtml });
+  if (versionSource !== null && versionSource.noteHtml !== null) {
+    notes.push({ labelHtml: versionLabel, noteHtml: versionSource.noteHtml });
+  }
+  const absentPart = bothAssembled ? "" : ` · ${escapeHtml("部分源未查询")}`;
+  const verdictPart =
+    allReadable && warnings.length === 0
+      ? ` · 配置齐备 · 上次核对时间 ${escapeHtml(checkedAt ?? "（桥未回观测时刻）")}`
+      : "";
+  const noteList =
+    notes.length === 0
+      ? ""
+      : `\n<ul class="hint muted">${notes
+          .map((n) => `<li>${n.labelHtml}：${n.noteHtml}</li>`)
+          .join("")}</ul>`;
   const warnBar =
     warnings.length === 0
       ? ""
-      : `<p class="b-note"><b>配置瑕疵 ${String(warnings.length)} 条</b>（桥 warn-once 快照，如<b>缺文件 / 缺成员</b>类；<b>仅供呈现、不参与任何判定</b>）：</p><ul class="hint muted">${warnings
+      : `\n<p class="b-note"><b>配置瑕疵 ${String(warnings.length)} 条</b>（桥 warn-once 快照，如<b>缺文件 / 缺成员</b>类；<b>仅供呈现、不参与任何判定</b>）：</p><ul class="hint muted">${warnings
           .map((w) => `<li>${escapeHtml(w)}</li>`)
           .join("")}</ul>`;
-  return cardShell(
-    "配置核对",
-    bothAssembled
-      ? versionSource === null
-        ? "本页两源的读取健康度"
-        : "本页三源的读取健康度"
-      : "部分源未查询",
-    `<table><thead><tr><th>核对源</th><th>结论</th><th>说明</th></tr></thead>
-<tbody>
-${sourceRow("声明面成员（3300 <code>GET /api/groups</code>）", groupsOutcome)}
-${sourceRow("运行态项目（逐组 <code>a2a_projects</code>）", projectsOutcome)}
-${versionSource === null ? "" : versionSource.html}
-</tbody></table>
-${warnBar}
-${summary}`,
-  );
+  return `<p class="hint">核对源健康度：${parts.join(" · ")}${absentPart}${verdictPart}</p>${noteList}${warnBar}`;
 }
 
 /**
@@ -1800,27 +1855,33 @@ function renderOrgHostAgentCard(
  * `/orgs` 组织管理页退役后，逐组织的管理职能落到该组织空间内（复用归一层上下文：
  * 组织不存在 404 / **已停用 410** 同 `org-space.resolveOrgSpaceRoute` 口径，本页只在「在用」组织上渲染）。
  * 页内七块（REQ-2026-09-30-04 件5 卡化，**全部复用既有写口，服务端零改动**），渲出序 =
- * **项目卡**（置顶第一块）= 逐组只读 `a2a_projects`（运行态）；项目深链落**空间任务页**
+ * **页头核对短条**（⑧a · REQ-2026-10-11-05 N9：紧接 `<h2>`，**先于项目卡**；卡面降级为一条
+ *   `<p class="hint">`，本页**已注入**源的读取健康度 + warnings；第三源 = 引擎版本台账投影 project 档，随
+ *   {@link OrgSpaceManageInput.versionProjection} 注入才参评）；
+ * **项目卡** = 逐组只读 `a2a_projects`（运行态）；项目深链落**空间任务页**
  *   `/org/<名>/tasks?project=…`（v0.9.6 C3：manage 页内 org 已知，不再指全局 `/tasks`）；
  * **两栏拖拽池** {@link renderMemberPoolColumns}（左池 / 右本组，v0.9.8 · REQ-2026-10-03-02）
- * → **加 / 减成员双表单卡**（{@link renderMemberFormsFold} 折叠收纳，**DOM 原样保留**，无 JS 即常态可见）
- *   → `POST /orgs/{org}/members`（隐藏 `action`）；**本组织 agent 配置卡**；**停用卡** → `POST /orgs`
- *   （隐藏 `action=disable`，同写口分流；台账标记不物理删目录，恢复 = 同名重建）；**配置核对卡**
- *   （本页**已注入**源的读取健康度 + warnings；第三源 = 引擎版本台账投影 project 档，随
- *   {@link OrgSpaceManageInput.versionProjection} 注入才参评）；**需求卡** = 归一层已持有的该组需求投影（零新触桥面）。
+ *   → 成员写**只此一条拖拽通路** → `POST /orgs/{org}/members`（隐藏 `action`；⑦ 起两枚手填表单与其
+ *   折叠宿主已退役，无 JS / 无拖拽面 ⇒ 该档无页内写通路，登记于改造文档 §6）；**本组织 agent 配置卡**；**停用卡** → `POST /orgs`
+ *   （隐藏 `action=disable`，同写口分流；台账标记不物理删目录，恢复 = 同名重建）；**需求卡** = 归一层已持有的该组需求投影（零新触桥面）。
  * **v0.10.2 · REQ-2026-10-10-03 N2**：逐组「成员清单」卡（3300 全组枚举的该组投影）撤销 ⇒ 声明面那一次
- * 读取的健康度仍由核对卡首行承载，「未声明」档由 {@link renderMemberPoolColumns} 的三出口承接；
+ * 读取的健康度仍由页头核对短条首档承载，「未声明」档由 {@link renderMemberPoolColumns} 的三出口承接；
  * 本页是全站**唯一**注入第七枚内联脚本 {@link MEMBER_DRAG_SCRIPT} 的页（`Page.extraScripts` 页隔离）。
  */
 export function renderOrgSpaceManagePage(input: OrgSpaceManageInput): string {
   return `<h2>管理 · ${escapeHtml(input.org)}</h2>
+${renderOrgConfigHealthBar(input.groupsOutcome, input.projectsOutcome, input.versionProjection)}
 ${renderOrgProjectsTable(input.org, input.projectsOutcome, input.versionProjection)}
 ${renderMemberPoolColumns(input.org, input.poolOutcome ?? null, input.groupsOutcome, input.poolSourceCount ?? null)}
-${renderMemberFormsFold(input.org)}
 ${renderOrgHostAgentCard(input.org, input.hostAgent ?? { orgKind: null, orgModel: null, globalKind: null, globalModel: null })}
 ${renderDisableOrgCard(input.org)}
-${renderOrgConfigCheckCard(input.groupsOutcome, input.projectsOutcome, input.versionProjection)}
-${renderOrgFeaturesTable(input.features)}`;
+${renderOrgFeaturesTable(
+    input.org,
+    input.features,
+    input.page ?? null,
+    input.pageSize ?? ORG_FEATURES_PAGE_SIZE,
+    input.total ?? null,
+  )}`;
 }
 
 // ---------------------------------------------------------------------------
@@ -2035,6 +2096,9 @@ export function projectionLedgerOf(projection: EngineVersionsProjection): Versio
  * 看板呈现侧按此降序展示（件3：需求池最左 + 版本由大到小，见 {@link renderSchedule}），
  * 本函数不动（版本台账等其它读面仍是升序口径）；
  * 列内保持入参顺序（不做列内二次排序 —— 抖动排序键会让卡片跳位）。
+ * **v0.10.4 限定（REQ-2026-10-12-02）**：上句只约束**本函数** —— 本函数仍不排；**呈现侧**
+ * （{@link renderSchedule}）自 v0.10.4 增补起按状态档（`compareFeatureCard`）另排一把，
+ * **不得据此句判「板内列内永不排序」**。
  *
  * **并集（REQ-2026-09-27-05 §2.2 N2 · v0.10.0 尾段 N1 换源）**：列 = **卡派生 ∪ 台账侧版号** ——
  * 台账侧独有版本（尚无卡的「空列」= 新版本入口的落点）与卡独有版本（台账无登记的**历史脏列**）
@@ -2084,7 +2148,7 @@ export function groupFeaturesByVersion(
  * **行为类不重命名**：`.kcard` / `.kcard[draggable="true"]` / `.draglocked` / `.kbadge` / `.kmeta`
  * 逐字保留（拖拽双条件闸与详情浮层委托的判据锚）。
  * **增补五 件B（REQ-2026-10-02-05）按状态着色**：卡根追加状态色档类 `kst-${档}`
- * （{@link deriveCardColorTier} 单一规则源，六元闭集）—— 纯显示层，
+ * （{@link deriveCardColorTier} 单一规则源，七元闭集）—— 纯显示层，
  * 不新增/修改任何行为判据属性（`draggable` / `data-feature` / `data-version` / `draglocked` 原样）。
  */
 export function renderScheduleCard(f: FeatureListItem, withRequirement = false): string {
@@ -2255,6 +2319,9 @@ function renderVersionDelete(
  * （数据纠错通道，**写口与迁移矩阵闸零改动**），真发版动作待「发版」按钮（另立需求 · 归 v0.9.5）。
  * **v0.9.4 增补十（§9.5）**：`released` 列**不再渲染任何操作入口**（去「重开」）⇒ 已发版列 UI =
  * 纯只读（仅 🔒 徽标）。
+ * **v0.10.4 增补（REQ-2026-10-12-02）列内序**：列内序 = `version-order.compareFeatureCard` 单点
+ * （六档状态序 + 同档 `createdAt` 降序 + `featureId` 兜底；本面经 {@link sortFeatureCards} 消费该比较器）。
+ * 30s 换块拍上状态一变即**跨档跳位**，是**裁定后的正常形态**（回指需求确认单），**不得据跳位判回归**。
  */
 export function renderSchedule(
   columns: readonly ScheduleColumn[],
@@ -2268,14 +2335,16 @@ export function renderSchedule(
     .map(
       (c) => `<div class="kcol" data-version="${escapeHtml(c.version)}">
 <h3>${escapeHtml(c.version)}${renderVersionBadge(c.version, c.features, releasedVersions, ledger, org)} <span class="muted">(${String(c.features.length)})</span>${renderVersionDelete(c.version, c.features, ledger, org)}</h3>
-${c.features.map((f) => renderScheduleCard(f)).join("\n")}
+${sortFeatureCards(c.features).map((f) => renderScheduleCard(f)).join("\n")}
 </div>`,
     );
   const poolCol = `<div class="kcol" data-version="">
 <h3>需求池 <span class="muted">(${String(pool.length)})</span></h3>
 ${pool.length === 0 ? `<p class="hint">（无未排期的在途需求 · 终态卡不进需求池）</p>` : pool.map((f) => renderScheduleCard(f, true)).join("\n")}
 </div>`;
-  const board = `<div class="kanban" id="schedule-board">${[poolCol, ...cols].join("\n")}</div>`;
+  // 件N1：排期页锚 = 看板容器**自身**（不套壳 —— 拖拽脚本 `colOf` 以该元素为上溯边界，
+  // 容器节点不可替换）；页面周期属性挂这一枚（本锚即该页第一枚）。
+  const board = `<div class="kanban" id="schedule-board" data-live="sched-board" data-live-interval="${String(LIVE_INTERVALS.schedule)}">${[poolCol, ...cols].join("\n")}</div>`;
   const emptyNote =
     cols.length === 0
       ? `<p class="hint">（无已排期需求：未排期的在途需求都在需求池列）</p>`
@@ -2283,7 +2352,7 @@ ${pool.length === 0 ? `<p class="hint">（无未排期的在途需求 · 终态�
   // 详情浮层骨架（REQ-v0.9.2 增补 ④）：dialog 内容运行时由 FEATURE_DETAIL_OVERLAY_SCRIPT
   // 搬入详情页 <main> 节点，骨架恒空、不嵌任何用户数据；脚本随 renderPage 每页注入，
   // 无 dialog（其它页）或禁 JS 时不生效 ⇒ 卡片 <a> 即整页详情回退。
-  return `${emptyNote}${board}
+  return `${emptyNote}${renderLiveBar(LIVE_INTERVALS.schedule)}${board}
 <dialog class="fd" id="feat-dialog">
 <button type="button" id="feat-dialog-close">关闭</button>
 <div class="fd-body"></div>
@@ -2324,10 +2393,6 @@ export function renderActionArea(featureId: string, input: NextStepInput): strin
     : `<button type="submit"${cls} disabled aria-disabled="true">${escapeHtml(a.label)}</button>`;
   const reasonLine = a.enabled ? "" : `<p class="hint warn">${escapeHtml(a.note)}</p>`;
   return `<h2>动作</h2>
-${foldCalibration(
-  "口径：这个按钮做了什么、没做什么",
-  `<p class="hint">点按钮 = 板按该需求的<b>归属组织</b>起（或复用）宿主桥，以<b>本需求 id 对应的 contextId</b> 发一轮消息给 agent；<b>板不写引擎状态机</b>——推进仍由 agent 经 MCP 走。同组织一时刻只跑一轮 ⇒ 被占用时本轮排队。<b>确认档</b>（<code>approval</code> = 待审批）发的是「用户已确认改造文档，请核对后执行放行」这一轮<b>指令</b>：agent 会先只读核对（文档是否落文件、审批门是否「待审批」），条件不满足（例如 <code>approval</code> 非「待审批」⇒ 桥侧回 <code>feature_approval_not_ready</code>）时它<b>有权不放行</b>并在本轮结论里说明缺什么 —— 板上不存在「批准」这个动作，也不存在「板上批准」。卡住了（无进行中的轮却久无进展）⇒ 本区按钮就是手动接一轮的入口。</p>`,
-)}
 ${reasonLine}<form method="post" action="${target}" class="w" data-submit="${escapeHtml(submitNote)}">
 ${supplementField}
 ${button}
@@ -2508,18 +2573,27 @@ function acceptancePayloadSummary(payload: string | null): string {
  * 详情页「轮次进度」行（REQ-v0.9.2 N7）：该需求有在飞 / 排队的轮时显示「第 N 轮 · 在飞 / 排队中（位次）」，
  * 无 ⇒ 空串（不渲染）。触发一轮受理成功后 303 回本页，这一行就是它该有的落点。
  *
- * **自动刷新的准确口径（REQ-2026-09-29-02 件D）**：整页**不自动刷新**，唯一的自动更新面 =
- * **浮层动作区** —— 在浮层里提交一轮后，板侧有界轮询复用本详情读面把动作区刷成真实「第 N 轮 在飞」，
- * 本轮收口即停（见 `layout.ts` `FEATURE_DETAIL_OVERLAY_SCRIPT` 的件B 注记）；**其余区域**（含整页形态、
- * 其它页）仍须重载本页才见最新。故这一行的收尾提示按两档写清，不再笼统说「板不自动刷新」。
+ * **自动更新的三档准确口径（REQ-2026-10-11-05 增补 N3 第三档；①② 承 REQ-2026-10-11-03 件D，
+ * 取代 REQ-2026-09-29-02 件D 的口径）**：
+ * ① **浮层动作区** = 件B 的**有界**轮询（周期与上界 = `layout.ts` `FEATURE_DETAIL_OVERLAY_SCRIPT`
+ * 内的 `POLL_INTERVAL_MS` × `POLL_MAX_TICKS`，本轮收口即停）—— 在浮层里提交一轮后进度就地累加；
+ * ② **本页只读锚** = 第八枚「页级就地刷新」脚本（`layout.ts` `PAGE_LIVE_SCRIPT`）按
+ * `LIVE_INTERVALS.feature` 常驻，逐 `[data-live]` 锚只换其子节点 —— **锚级就地换块，不是整页重载**。
+ * ③ **浮层打开即跟刷**（件D 第三档）：`open()` 取到详情后**成功档即起轮**，与「是否在浮层里提交过」
+ * 无关 —— 但**仅仍忙才轮**（`stillBusy(main)` 为假 ⇒ 不起轮，**已收口的详情零请求**）；换页走浮层侧
+ * `swapPage`，其语义 = **整份 `<main>` 全换**（不是 ② 那种锚级换块），故浮层内的表单 / 输入区**不保留**
+ * 未提交内容 —— 为此有**拍级 held 闸**：用户正在填 / 已填未提交 ⇒ 本拍不换页，只排下一拍。
+ * **含输入 / 表单的区域**（澄清框、动作区表单、池卡等）不在锚内 ⇒ 仍须重载本页才见最新。
+ * 旧口径「整页静态、唯一自动面 = 浮层动作区」已退役（它描述的正是件D 之前的形态）；
+ * 收尾提示按上述口径写清，周期数值**只经 `liveIntervalMs` 传入**，不在本函数内二次硬编码。
  */
-export function renderTurnProgress(view: TurnProgressView | null): string {
+export function renderTurnProgress(view: TurnProgressView | null, liveIntervalMs: number = LIVE_INTERVALS.feature): string {
   if (view === null) return "";
   const where =
     view.state === "running"
       ? "在飞"
       : `排队中${view.position === null ? "" : ` · 队列第 ${String(view.position)} 位`}`;
-  return `<p class="hint turn-progress">轮次进度：<b>第 ${String(view.round)} 轮 ${where}</b> · <span class="mono">${escapeHtml(view.turnId)}</span> · 浮层内提交后动作区自动刷新进度至本轮收口；其余内容重载本页看最新</p>`;
+  return `<p class="hint turn-progress">轮次进度：<b>第 ${String(view.round)} 轮 ${where}</b> · <span class="mono">${escapeHtml(view.turnId)}</span> · 浮层内提交后动作区自动刷新进度至本轮收口；本页只读区每 ${String(liveIntervalMs / 1000)}s 自动更新；含输入的区域不自动更新</p>`;
 }
 
 /**
@@ -2885,9 +2959,3 @@ export function errorFamilyLabel(code: string): string {
   }
   return code;
 }
-
-// ---------------------------------------------------------------------------
-// 口径脚注（每个数据页统一挂）
-// ---------------------------------------------------------------------------
-
-export const VIEW_NOTES: readonly string[] = [...B13_CALIBRATION_NOTES, PARALLELISM_NOTE];

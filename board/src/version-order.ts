@@ -7,6 +7,7 @@
  * - 未命中者（范围符、预发布段、任意自由文本）**字典序垫底**，组内按字典序、相等则稳定；
  * - 「未排期」判据**只有一条路径** `trim() === ""`（orch 已核实：空串与 NULL 在读面同值，不分两支）；
  * - 需求池排序：`createdAt` 降序，缺值/非法落底，同值以 `featureId` 兜底成全序。
+ * - 版本列卡序：状态档优先，同档 `createdAt` 降序 + `featureId` 兜底。
  *
  * 不做 semver 全规范解析；分组只在板侧做（orch 的 version 无索引），故本文件只依赖入参本身 ——
  * 日后 orch 加索引不改变此处语义。
@@ -99,4 +100,48 @@ export function comparePoolEntry(a: PoolEntry, b: PoolEntry): number {
 /** 需求池排序（返回新数组，不改入参）。 */
 export function sortPoolEntries<T extends PoolEntry>(entries: readonly T[]): T[] {
   return [...entries].sort(comparePoolEntry);
+}
+
+/** 版本列卡片排序入参：需求池两字段 + 引擎态原值（不认显示词）。 */
+export interface FeatureCardEntry extends PoolEntry {
+  state: string | null;
+}
+
+/**
+ * 状态档 → 档位序（六档，值越小越靠前）。用 Map 而非对象字面量：`state` 原值来自桥、
+ * 值域不受板控，字面量在 `constructor` 一类键上会命中 `Object.prototype` 上的函数
+ * ⇒ 得 `NaN` ⇒ 比较器不再全序（静默乱序，比抛错更难查）。Map 无原型洞。
+ */
+const STATE_CARD_TIER_RANK = new Map<string, number>([
+  ["failed", 0],
+  ["waiting_approval", 1],
+  ["reviewing", 1],
+  ["needs_input", 1],
+  ["executing", 2],
+  ["integrating", 2],
+  ["testing", 2],
+  ["completed", 3],
+  ["cancelled", 4],
+]);
+
+/** 兜底档：任何未在上表的取值（含 null）。 */
+const FALLBACK_TIER_RANK = 5;
+
+function stateTierRank(state: string | null): number {
+  if (state === null) return FALLBACK_TIER_RANK;
+  return STATE_CARD_TIER_RANK.get(state) ?? FALLBACK_TIER_RANK;
+}
+
+/**
+ * 版本列卡片排序比较器：先比状态档，同档直接复用需求池尺（`createdAt` 降序、
+ * 缺值/非法沉底、`featureId` 字典序兜底）⇒ 全序、结果与输入顺序无关。
+ */
+export function compareFeatureCard(a: FeatureCardEntry, b: FeatureCardEntry): number {
+  const tierDiff = cmpNumber(stateTierRank(a.state), stateTierRank(b.state));
+  return tierDiff !== 0 ? tierDiff : comparePoolEntry(a, b);
+}
+
+/** 版本列卡片排序（返回新数组，不改入参）。 */
+export function sortFeatureCards<T extends FeatureCardEntry>(entries: readonly T[]): T[] {
+  return [...entries].sort(compareFeatureCard);
 }

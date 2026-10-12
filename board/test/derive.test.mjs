@@ -12,9 +12,8 @@ import {
   traceWaitDisplay,
   terminalFeatureNote,
   UNKNOWN_STAGE_LABEL,
-  B13_CALIBRATION_NOTES,
-  PARALLELISM_NOTE,
   INFLIGHT_CALIBRATION_NOTE,
+  TRACE_READ_NOTE,
   FEATURE_TERMINAL_STATES,
   TURN_STALL_AFTER_MS,
   LATEST_TURN_SUMMARY_MAX,
@@ -64,7 +63,7 @@ test("deriveDisplayStage: 登记缺失（null）⇒ 未知（登记缺失），�
 });
 
 // ---------------------------------------------------------------------------
-// 增补五 件B（REQ-2026-10-02-05）：状态 → 色档（9 态归 6 档，闭集不扩）
+// 增补五 件B（REQ-2026-10-02-05）：状态 → 色档（9 态归 7 档，闭集不扩）
 // ---------------------------------------------------------------------------
 
 test("deriveCardColorTier: 在途主链四态归 brand", () => {
@@ -79,8 +78,12 @@ test("deriveCardColorTier: waiting_approval ⇒ warn · completed ⇒ ok · fail
   assert.equal(deriveCardColorTier("failed"), "danger");
 });
 
-test("deriveCardColorTier: needs_input / cancelled / null / 未知值 ⇒ neutral（不猜、回落中性档）", () => {
-  for (const s of ["needs_input", "cancelled", "blocked", null, "some-future-state"]) {
+test("deriveCardColorTier: cancelled ⇒ cancelled（独立档正钉，不再落 neutral）", () => {
+  assert.equal(deriveCardColorTier("cancelled"), "cancelled");
+});
+
+test("deriveCardColorTier: needs_input / null / 未知值 ⇒ neutral（不猜、回落中性档）", () => {
+  for (const s of ["needs_input", "blocked", null, "some-future-state"]) {
     assert.equal(deriveCardColorTier(s), "neutral", `${s} ⇒ neutral`);
   }
 });
@@ -171,19 +174,19 @@ test("traceWaitDisplay: 终态缺位字段全部显式 —（不臆造）", () =
 });
 
 // ---------------------------------------------------------------------------
-// B13-② + §2.2-13 文案常量
+// B13-② 口径常量
 // ---------------------------------------------------------------------------
 
-test("口径脚注常量齐备（B13 三条 + 在跑数口径 + 并行度）", () => {
-  assert.equal(B13_CALIBRATION_NOTES.length, 3);
-  assert.match(B13_CALIBRATION_NOTES[0], /不得相加/);
-  assert.match(B13_CALIBRATION_NOTES[1], /inFlightCount/);
-  assert.match(B13_CALIBRATION_NOTES[2], /readOccupants/);
+test("口径常量：页底脚注家族退役后仅剩在飞数口径一枚 + TRACE_READ_NOTE 三枚原词保留", async () => {
+  const mod = await import("../dist/derive.js");
+  const noteConstants = Object.keys(mod)
+    .filter((k) => /_NOTES?$/.test(k))
+    .sort();
+  assert.deepEqual(noteConstants, ["AGENT_VIEW_CALIBRATION_NOTE", "INFLIGHT_CALIBRATION_NOTE", "TRACE_READ_NOTE"]);
   assert.match(INFLIGHT_CALIBRATION_NOTE, /≠ 实际在跑数/);
-  assert.match(PARALLELISM_NOTE, /编排侧并行 ≠ 改造侧并行/);
-  assert.match(PARALLELISM_NOTE, /maxConcurrentReads ≥ 2/);
-  assert.match(PARALLELISM_NOTE, /DAG 拆宽 ≠ 并行/);
-  assert.match(PARALLELISM_NOTE, /不承诺「多需求并行」/);
+  assert.match(TRACE_READ_NOTE, /projectBusy/);
+  assert.match(TRACE_READ_NOTE, /readOccupants/);
+  assert.match(TRACE_READ_NOTE, /八值闭集/);
 });
 
 // ---------------------------------------------------------------------------

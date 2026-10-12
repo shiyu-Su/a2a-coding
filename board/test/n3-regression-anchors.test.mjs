@@ -12,15 +12,19 @@
  * ② 浮层三锚（N2）：排期页含 `<dialog` 骨架（详情浮层 + 新增需求弹窗）；开关脚本 = 单点内联字面量
  *    常量（`^<script>`、无 `src=`、不含用户数据）；卡片保留 `<a href="/features/:id">` 无 JS 回退。
  * ③ 纪律钉（本需求最重要的长效锚，BD14 mermaid 白名单先例模式复制）：
- *    「全站 `src/**` 可执行内联脚本字面量清单 ⊆ {提交守卫, err-ov 关闭, mermaid 渲染, 浮层开关, 新增需求弹窗, 排期拖拽, 成员两栏拖拽}」
+ *    「全站 `src/**` 可执行内联脚本字面量清单 ⊆ {提交守卫, err-ov 关闭, mermaid 渲染, 浮层开关, 新增需求弹窗, 排期拖拽, 成员两栏拖拽, 页级就地刷新}」
  *    —— 防 JS 野长；mermaid 的 `<script type="application/json">` 数据通道不是可执行脚本，不在闭集。
  *    v0.9.3 B-T5 起增「排期拖拽」`DRAG_SCHEDULE_SCRIPT`（当时六枚，与弹窗常量分立、不可共置）；
  *    **v0.9.8 REQ-2026-10-03-02 起 = 七元**（新增「成员两栏拖拽」`MEMBER_DRAG_SCRIPT`，
- *    与排期拖拽常量分立、不可共置 —— 那枚的入口守卫 `#schedule-board` 不因其扩）。
+ *    与排期拖拽常量分立、不可共置 —— 那枚的入口守卫 `#schedule-board` 不因其扩）；
+ *    **v0.10.4 REQ-2026-10-11-03 起 = 八元**（新增「页级就地刷新」`PAGE_LIVE_SCRIPT`，
+ *    入口守卫 = 页面上有无 `[data-live]` 锚，不收他枚的页专属锚、不与其共置）。
  * ④ **v0.10.1 C3 · project 版本面带来的纪律面（N3-⑩～⑬）**：★v0.10.2 落点③ 摘块后 ⑩ / ⑩b **改判为
  *    负向「零处」钉** —— 排期页**整页零 pv 元素**（四件闭集 `.pv-block` / `.pvbadge` / 标题字面
- *    「各 project 版本」/ 根因码前缀 `project_versions_`，**范围限排期页**，根因码在管理页「配置核对」卡
- *    **合法出现** ⇒ 不得写成全站零出现）；内联闭集**字面枚数恒七**（摘块是纯删，不动脚本面）；
+ *    「各 project 版本」/ 根因码前缀 `project_versions_`，**范围限排期页**，根因码在管理页页头
+ *    「核对源健康度」短条第三档**合法出现**（★REQ-2026-10-11-05 ⑧a：原「配置核对」**卡**降级为短条
+ *    ⇒ 落点换包装、原词逐字不变）⇒ 不得写成全站零出现）；内联闭集**字面枚数恒七**（摘块是纯删，不动脚本面；
+ *    ★v0.10.4 起该枚数抬为**八**，第八枚属页级刷新需求、不属 project 版本面 ⇒ ⑪ 同步改判）；
  *    `WRITE_ROUTES` **恒 11 条**（C-18③）；板本地台账源码**无 project 维键**（板不落库、project 面无本地缓存）。
  *    本组是**回归面的结构 / 计数钉**（防后续版本顺手扩），不重抄 B1/B3/B4 各单元档的行为级断言。
  */
@@ -36,6 +40,7 @@ import {
   FEATURE_DETAIL_OVERLAY_SCRIPT,
   MEMBER_DRAG_SCRIPT,
   NEW_REQUIREMENT_DIALOG_SCRIPT,
+  PAGE_LIVE_SCRIPT,
   SUBMIT_GUARD_SCRIPT,
 } from "../dist/web/layout.js";
 import { createBoardServer } from "../dist/server.js";
@@ -213,7 +218,7 @@ test("N3-②（§9-b 翻向 · §9.5 泛化 · B5a 重指空间排期页）`/org
     assert.match(alias.text, /<dialog class="fd" id="new-req-dialog">/, "看板 = 新增需求弹窗骨架");
     assert.doesNotMatch(root.text, /id="new-req-dialog"/, "门户不渲染新增需求骨架（提需求在空间排期页）");
     assert.doesNotMatch(alias.text, /id="new-org-dialog"/, "看板不渲染建项目组骨架");
-    assert.doesNotMatch(root.text, /<script[^>]*src=/, "门户无外源脚本（CSP 未动；闭集仍七元）");
+    assert.doesNotMatch(root.text, /<script[^>]*src=/, "门户无外源脚本（CSP 未动；闭集仍八元）");
   });
 });
 
@@ -374,12 +379,13 @@ test("N3-⑤c（B5a 新增 · C1 收编 /tasks）退役页非 GET ⇒ 405 且文
 // ② 浮层三锚（dialog 骨架 / 单点常量 / 无 JS 回退）—— HTTP 面钉在 N3-①，此处补常量规格
 // ---------------------------------------------------------------------------
 
-test("N3-⑥ 浮层/弹窗/拖拽脚本 = 单点内联字面量常量（规格钉：^<script>、无 src=、可执行体不含用户数据插值）", async () => {
+test("N3-⑥ 浮层/弹窗/拖拽/页级刷新脚本 = 单点内联字面量常量（规格钉：^<script>、无 src=、可执行体不含用户数据插值）", async () => {
   for (const script of [
     FEATURE_DETAIL_OVERLAY_SCRIPT,
     NEW_REQUIREMENT_DIALOG_SCRIPT,
     DRAG_SCHEDULE_SCRIPT,
     MEMBER_DRAG_SCRIPT,
+    PAGE_LIVE_SCRIPT,
   ]) {
     assert.match(script, /^<script>/);
     assert.match(script, /<\/script>$/);
@@ -465,11 +471,12 @@ test("N3-⑥c（B-T5）DRAG_SCHEDULE_SCRIPT 行为锚：POST 复用 /features/:i
   assert.doesNotMatch(s, /stage|approval/, "拖拽载荷仍仅 version（stage/approval 只作服务端读判）");
 });
 
-// v0.9.8 REQ-2026-10-03-02：第七枚常量 MEMBER_DRAG_SCRIPT 的行为锚（提交 = 既有成员写路由、参数与手填表单一致）
-test("N3-⑥d（REQ-2026-10-03-02）MEMBER_DRAG_SCRIPT 行为锚：入口守卫 #member-pool · POST /orgs/{org}/members · urlencoded action/machineId/projectId · 成功 reload · 失败抽 .err-ov-card 叠加 · 只认 draggable=true 行 · 不带 x-board-write · 折叠手填表单不删 DOM", () => {
+// v0.9.8 REQ-2026-10-03-02：第七枚常量 MEMBER_DRAG_SCRIPT 的行为锚（提交 = 既有成员写路由、载荷三参数闭集；
+// ⑦b（REQ-2026-10-11-05 N8）起两枚手填表单退役 ⇒ 本枚是全站唯一成员写通路，原「与表单一致」的对账口径改指路由）
+test("N3-⑥d（REQ-2026-10-03-02）MEMBER_DRAG_SCRIPT 行为锚：入口守卫 #member-pool · POST /orgs/{org}/members · urlencoded action/machineId/projectId · 成功 reload · 失败抽 .err-ov-card 叠加 · 只认 draggable=true 行 · 不带 x-board-write · ⑦a 收起分支已退役（N7）", () => {
   const s = MEMBER_DRAG_SCRIPT;
   assert.match(s, /getElementById\("member-pool"\)/, "入口守卫 = manage 页独有的两栏容器锚（非该页整段空转 ⇒ 页隔离）");
-  assert.match(s, /typeof fetch !== "function" \|\| typeof DragEvent !== "function"/, "无 fetch / 无 DnD ⇒ 直接 return（回退面 = 静态清单 + 表单照常）");
+  assert.match(s, /typeof fetch !== "function" \|\| typeof DragEvent !== "function"/, "无 fetch / 无 DnD ⇒ 直接 return（⑦b 起回退面 = 静态清单，**无页内写通路**）");
   assert.match(
     s,
     /fetch\("\/orgs\/" \+ encodeURIComponent\(org\) \+ "\/members"/,
@@ -479,7 +486,7 @@ test("N3-⑥d（REQ-2026-10-03-02）MEMBER_DRAG_SCRIPT 行为锚：入口守卫 
   assert.match(
     s,
     /new URLSearchParams\(\{ action: action, machineId: machineId, projectId: projectId \}\)/,
-    "载荷 = 与手填表单同三参数（action=add|remove · machineId · projectId），服务端解析路径零改动",
+    "载荷 = 既有写路由的三参数（action=add|remove · machineId · projectId），服务端解析路径零改动（⑦b 后无表单可对账 ⇒ 以路由入参为口径）",
   );
   assert.match(s, /credentials: "same-origin"/, "同源凭据（CSRF 走 Origin 同源档）");
   assert.doesNotMatch(s, /x-board-write/, "不带自定义写头（头档会要求预检；本径靠同源 Origin）");
@@ -495,9 +502,17 @@ test("N3-⑥d（REQ-2026-10-03-02）MEMBER_DRAG_SCRIPT 行为锚：入口守卫 
   assert.match(s, /if \(action === "add" && col\.getAttribute\("data-side"\) !== "own"\) return;/, "add 只落在本组栏（拖回池列不发 add）");
   assert.match(s, /if \(action === "remove" && col\.getAttribute\("data-side"\) !== "pool"\) return;/, "remove 只落在池栏（同栏往返零请求）");
   assert.match(s, /e\.preventDefault\(\);\s*\n\s*e\.dataTransfer\.dropEffect = "move";/, "dragover 需 preventDefault 才能落地");
-  assert.match(s, /getElementById\("member-forms-fold"\)/, "手填表单宿主 = 折叠收纳（JS 可用时收起）");
-  assert.match(s, /fold\.open = false/, "只收起、不删 DOM（无 JS 回路面不劣化）");
-  assert.doesNotMatch(s, /removeChild\(fold\)|innerHTML = ""/, "不得删除手填表单节点（范围外红线）");
+  // ⑦a（REQ-2026-10-11-05 N7）：收起分支已退役 ⇒ 两条正向哨兵改判为**显式负钉**（不得留成恒真）
+  assert.doesNotMatch(s, /getElementById\("member-forms-fold"\)/, "⑦a 手填表单宿主的 JS 收起分支已删（脚本不再触碰该宿主）");
+  assert.doesNotMatch(s, /fold\.open\s*=/, "⑦a 不再有 fold.open 赋值（收起语义整体退出脚本；⑦b 折叠宿主 DOM 已随 N8 删除）");
+  // ⑦a 原 doesNotMatch(/removeChild\(fold\)|innerHTML = ""/) 在新形态下恒真 ⇒ 改判为「切片右界锚」显式正钉：
+  const ownBoundLine =
+    /^const ownColumn = \(html\) => html\.slice\(html\.indexOf\('data-side="own"'\), html\.indexOf\('id="org-host-agent-kind-list"'\)\);$/m;
+  for (const rel of ["../test/org-pool-two-column.test.mjs", "../test/org-pool-refresh.test.mjs"]) {
+    const copy = readFileSync(fileURLToPath(new URL(rel, import.meta.url)), "utf8");
+    assert.match(copy, ownBoundLine, `右界锚 = id="org-host-agent-kind-list"（抄本 ${basename(rel)} 在位）`);
+    assert.doesNotMatch(copy, /indexOf\(\s*["']member-forms-fold["']\s*\)/, `旧界不得再充当任何切片界（抄本 ${basename(rel)}）`);
+  }
   // 拖拽载荷闭集 = 三键，不得夹带登记字段
   assert.doesNotMatch(s, /stage|approval/, "载荷仅 action/machineId/projectId（stage/approval 不进写面）");
 });
@@ -509,7 +524,9 @@ test("N3-⑥d（REQ-2026-10-03-02）MEMBER_DRAG_SCRIPT 行为锚：入口守卫 
  * 可执行内联脚本闭集：字面量必须命中且只命中下列一枚体标记（多余命中 = 归类歧义，同样红）。
  * 标记取**转义无关**片段（源码模板字面量里的引号带 `\`，运行时常量不带，两种形态都含这些子串）。
  * v0.9.3 B-T5 起增「排期拖拽」（当时六枚，与「新增需求弹窗」分立两枚、不可共置）；
- * **v0.9.8 REQ-2026-10-03-02 起 = 七元**（新增「成员两栏拖拽」，入口锚 `#member-pool` 仅 manage 页有）。
+ * **v0.9.8 REQ-2026-10-03-02 起 = 七元**（新增「成员两栏拖拽」，入口锚 `#member-pool` 仅 manage 页有）；
+ * **v0.10.4 REQ-2026-10-11-03 起 = 八元**（新增「页级就地刷新」，入口守卫 = 有无 `[data-live]` 锚；
+ * 标记取 `data-live-interval` —— 只在该常量出现的属性名，不含引号 ⇒ 无须另给 runtime 形态）。
  */
 const INLINE_SCRIPT_ALLOWLIST = [
   { key: "提交守卫", marker: "button[type=submit]" },
@@ -519,6 +536,7 @@ const INLINE_SCRIPT_ALLOWLIST = [
   { key: "新增需求弹窗", marker: 'getElementById(\\"new-req-dialog\\")', runtime: 'getElementById("new-req-dialog")' },
   { key: "排期拖拽", marker: 'getElementById(\\"schedule-board\\")', runtime: 'getElementById("schedule-board")' },
   { key: "成员两栏拖拽", marker: 'getElementById(\\"member-pool\\")', runtime: 'getElementById("member-pool")' },
+  { key: "页级就地刷新", marker: "data-live-interval" },
 ];
 
 function listTsFiles(dir) {
@@ -551,7 +569,7 @@ function collectInlineScriptBlocks() {
   return blocks;
 }
 
-test("N3-⑦（纪律钉）全站可执行内联脚本字面量 ⊆ 七元闭集，且每枚恰好 1 处（防 JS 野长 / 防复制）", () => {
+test("N3-⑦（纪律钉）全站可执行内联脚本字面量 ⊆ 八元闭集，且每枚恰好 1 处（防 JS 野长 / 防复制）", () => {
   const blocks = collectInlineScriptBlocks();
   assert.ok(blocks.length > 0, "扫描器必须真的见到字面量（0 = 扫描失效，本锚不许空转）");
   const tally = new Map(INLINE_SCRIPT_ALLOWLIST.map((e) => [e.key, 0]));
@@ -617,6 +635,71 @@ test("N3-⑧（纪律钉·单点钉）五枚导出常量：声明唯一、注入
     1,
     "server.ts 只在 pageOrgSpaceManage 一处经 extraScripts 注入成员两栏拖拽常量（其它页不得带）",
   );
+  // v0.10.4 REQ-2026-10-11-03 N5：第八枚**按页**注入 = 四页四通路（任务页两档 + 详情页整页档走
+  // `extraScripts`，排期页走 `schedulePageScripts` 串尾追加）；门户 / manage / agents / projects /
+  // 文档页一律不收（页隔离负钉 = `org-portal` + `bd14-markdown-render` 既有锚 + live-refresh 新档）。
+  assert.equal(
+    count(server, /extraScripts: PAGE_LIVE_SCRIPT/g),
+    3,
+    "server.ts 只在 pageTasks 两档 + pageFeatureDetail 三处经 extraScripts 注入页级就地刷新常量（其它页不得带）",
+  );
+  assert.equal(
+    count(server, /\+ PAGE_LIVE_SCRIPT/g),
+    1,
+    "server.ts 只在 schedulePageScripts 一处把页级就地刷新常量串尾追加（排期页第四通路）",
+  );
+});
+
+/**
+ * N3-⑧b（v0.10.4 REQ-2026-10-11-03 N5 · **取页自证 · 正负成对**）
+ * 上面两条是源文本单点钉，本条是**运行面**钉：真起板取 HTML ⇒ 四个宿主页各收到第八枚全文，
+ * 四个非宿主页一律收不到（页隔离 = 第七枚 `MEMBER_DRAG_SCRIPT` 先例同款）。
+ * 负钉面**不含**文档页 `/features/:id/docs`（该页 `extraScripts === ""` 由 `bd14-markdown-render` 既有锚把门）。
+ */
+test("N3-⑧b（v0.10.4 N5 · 取页自证）第八枚运行面 = 排期 / 任务两档 / 详情四页全文在场；门户 · manage · agents · projects 四页零处", async () => {
+  const features = [feature("F1", "v0.10.4")];
+  const client = fakeClient(features, {
+    async getFeature(featureId) {
+      return { feature: { ...features[0], featureId, plan: null, decisions: null, contracts: null }, tasks: [], acceptance: null };
+    },
+    async getFeatureTrace(featureId) {
+      return { featureId, featureState: "executing", nodes: [] };
+    },
+    async getProjects() {
+      return {
+        source: "fake",
+        note: null,
+        observedAt: "2026-10-11T00:00:00Z",
+        machines: [
+          {
+            machineId: "m1",
+            error: null,
+            projects: [
+              { projectId: "board", agentKind: "qoder", a2aPort: 1, status: "ok", endpoint: null, startedAt: null },
+            ],
+          },
+        ],
+        runners: [],
+      };
+    },
+    async getTasks(projectId) {
+      return { projectId, reachable: true, notice: null, tasks: [] };
+    },
+  });
+  await withServer(client, async (base) => {
+    for (const path of ["/org/alpha/schedule", "/org/alpha/tasks", "/tasks?project=board", "/features/F1"]) {
+      const res = await fetch(`${base}${path}`);
+      const html = await res.text();
+      assert.equal(res.status, 200, `${path} 可达（本锚不靠 404 蒙混）`);
+      assert.ok(html.includes(PAGE_LIVE_SCRIPT), `${path} 收到第八枚全文（按页注入通路命中）`);
+    }
+    for (const path of ["/", "/org/alpha/manage", "/agents", "/projects"]) {
+      const res = await fetch(`${base}${path}`);
+      const html = await res.text();
+      assert.equal(res.status, 200, `${path} 可达（负钉同样不许靠宕页蒙混）`);
+      assert.equal(html.includes(PAGE_LIVE_SCRIPT), false, `${path} 不收第八枚（覆盖面恰三处 = 方案边界）`);
+    }
+  });
 });
 
 // v0.9.4 增补三 §9.2：全站内联脚本负向锚 —— HTMLFormElement [LegacyOverrideBuiltIns] 使
@@ -651,7 +734,7 @@ test("N3-⑨（增补三 · 负向锚）全站可执行内联脚本零 `form.act
 
 /**
  * 排期页「整页零 pv 元素」**四件闭集**（★v0.10.2 落点③ 改判 · 改造文档 §2.3 B-3）。
- * **范围只钉排期页**：第 4 件（根因码前缀）在管理页「配置核对」卡第三行**合法出现**
+ * **范围只钉排期页**：第 4 件（根因码前缀）在管理页页头「核对源健康度」短条第三档**合法出现**
  * （正向对照见 N3-⑩b 末段）⇒ 本闭集**不得**扩成全站负向钉。
  */
 const PV_ZERO_ON_SCHEDULE = ["pv-block", "pvbadge", "各 project 版本", "project_versions_"];
@@ -699,7 +782,7 @@ test("N3-⑩（★v0.10.2 改判 · C-18① 翻负向）排期页**整页零 pv 
   await withProjectServer(projectFixture(), async (base) => {
     const html = await (await fetch(`${base}/org/alpha/schedule`)).text();
     assertZeroPvElements(html, "live 档排期页");
-    assert.match(html, /<div class="kanban" id="schedule-board">/, "摘块不动看板容器（Group 面照常）");
+    assert.match(html, /<div class="kanban" id="schedule-board"/, "摘块不动看板容器（Group 面照常；尾部允许件N1 刷新锚属性）");
   });
 });
 
@@ -716,19 +799,32 @@ test("N3-⑩b（★v0.10.2 改判 · 三档一律零处）live / empty / absent 
     });
   }
   // ★范围限定的**正向对照**（改造文档 §2.3 B-3：负向钉只钉排期页，不得写成全站）：
-  // 同一 absent 夹具下，根因码在管理页「配置核对」卡第三行**必须**可读 ⇒ 证明上面钉的是「排期页零处」，
-  // 不是「全站零处」。门户零处由 `test/org-portal.test.mjs` 的既有负向锚存续覆盖（原 ⑩b 的门户断言与之重复，已并）。
+  // 同一 absent 夹具下，根因码在管理页页头「核对源健康度」短条第三档**必须**可读 ⇒ 证明上面钉的是
+  // 「排期页零处」，不是「全站零处」。门户零处由 `test/org-portal.test.mjs` 的既有负向锚存续覆盖（原 ⑩b 的门户断言与之重复，已并）。
+  // ★REQ-2026-10-11-05 ⑧b 改判：原落点 = 「配置核对」卡第三行 ⇒ 卡降级为页头短条后，本对照抬为
+  //   **短条内正钉**（档位词 `<b>读不到</b>` ∧ 其说明 `<li>` 带根因码）—— 整页 `includes` 口径太宽，
+  //   卡退役后仍会因别处文案恒真，故按源切片把门。
   await withProjectServer(engineProjectionWithProjectAbsentFetcher([]), async (base) => {
     const manage = await (await fetch(`${base}/org/alpha/manage`)).text();
-    assert.match(manage, /project_versions_/, "根因码的合法落点 = 管理页配置核对卡（排期页负向钉因此必须限范围）");
+    const bar = manage.match(/<p class="hint">核对源健康度：([\s\S]*?)<\/p>/);
+    assert.ok(bar !== null, "管理页页头核对短条必须在场（⑧a 唯一承载面；缺席 ⇒ 下面两条正钉会退化成恒真）");
+    const thirdSeg = bar[1].slice(bar[1].indexOf("引擎版本台账投影"));
+    const noteLi = manage.match(/<li>引擎版本台账投影[\s\S]*?<\/li>/);
+    assert.match(thirdSeg, /<b>读不到<\/b>/, "第三档 = 老引擎 absent 档的档位词「读不到」（原卡表 danger 徽标的替身）");
+    assert.ok(
+      noteLi !== null && /project_versions_/.test(noteLi[0]),
+      "根因码的合法落点 = 页头核对短条第三档的说明 `<li>`（排期页负向钉因此必须限范围）",
+    );
   });
 });
 
-test("N3-⑪（C-18 零新增脚本 · ★v0.10.2 **半退役**）内联闭集仍**七元**；「区块体内零 `<script`」两条随 `.pv-block` 摘除退役", () => {
+test("N3-⑪（C-18 零新增脚本 · ★v0.10.2 **半退役** · ★v0.10.4 改判**八元**）内联闭集 = 八元；「区块体内零 `<script`」两条随 `.pv-block` 摘除退役", () => {
   // 保留的两条 = **全站**内联闭集纪律锚（与本项目区块无关，摘块不动它）。
-  assert.equal(INLINE_SCRIPT_ALLOWLIST.length, 7, "内联闭集枚数恒七（v0.9.8 起；project 面不得扩第八枚）");
+  // ★v0.10.4 改判：第八枚 = `PAGE_LIVE_SCRIPT`（REQ-2026-10-11-03 页级就地刷新），**不构成 project 版本面扩枚**
+  //   —— 原「project 面不得扩枚」语义原样保留：project 版本面（v0.10.1 C3 / v0.10.2 落点③ 摘块）自身零新增脚本。
+  assert.equal(INLINE_SCRIPT_ALLOWLIST.length, 8, "内联闭集枚数 = 八（v0.10.4 起；第八枚属页级刷新，project 版本面仍零枚）");
   const blocks = collectInlineScriptBlocks();
-  assert.equal(blocks.length, 7, `src/** 可执行内联字面量仍七处（实际 ${blocks.length}）`);
+  assert.equal(blocks.length, 8, `src/** 可执行内联字面量八处（实际 ${blocks.length}）`);
   // ★退役的两条（原「区块体内零 `<script`」+「区块体内不得内联常量正文」）：判据主语 = 已不存在的区块体，
   //   其防的「区块自带交互面」随 v0.10.2 落点③ 摘块一并消失；「零新增脚本」由上面两条全站闭集锚继续把门。
 });

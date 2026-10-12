@@ -241,13 +241,17 @@ export function taskOrdinalMap(tasks: readonly FeatureTaskItem[]): Map<string, n
 // ---------------------------------------------------------------------------
 
 /**
- * `queueState`「已认领」档字面值（N1 真机探针 / 改造文档 §2 M-3 定档：板内样本 =
- * `running / queued / settled`，**无 `claimed`** —— 不得硬编码它）。值域归桥：
- * 命中集之外的非空原值 ⇒ 回落 `unknown` 出「原样值」，不吞不猜。
+ * `queueState`「已认领」档字面值白名单。值域事实源 = **引擎读面真机回执**
+ * （`GET /api/features/:id` 的 `tasks[].queueState`，REQ-2026-10-11-04 核实）：
+ * `claimed` = 在飞（已认领）、`settled` = 排队（未派发，`claimedAt` 与 `queuedAt` 皆可为 null）。
+ * `running` 是**板历史口径的同义词**，保留在白名单内（档位语义成立、成本 0 行；删除会连带翻
+ * 夹具与 trace 面锚，无收益）。
+ * **禁止再以板内测试夹具 / 派发消息文本充当「值域样本」** —— 此前 M-3 定档即因此写错。
+ * 命中集之外的非空原值 ⇒ 回落 `unknown` 出「原样值」，不吞不猜（本文件唯一兜底，纪律不动）。
  */
-export const QUEUE_STATE_RUNNING: ReadonlySet<string> = new Set(["running"]);
-/** `queueState`「排队（被挡）」档字面值（同上 M-3）。 */
-export const QUEUE_STATE_QUEUED: ReadonlySet<string> = new Set(["queued"]);
+export const QUEUE_STATE_RUNNING: ReadonlySet<string> = new Set(["claimed", "running"]);
+/** `queueState`「排队（被挡）」档字面值白名单（`settled` = 实测值 + `queued` = 历史同义词，口径同上）。 */
+export const QUEUE_STATE_QUEUED: ReadonlySet<string> = new Set(["settled", "queued"]);
 
 /** 六态 + 一回落的闭集键（渲染层据此查展示词表；`ask` = input-required）。 */
 export type NodeState = "done" | "running" | "queued" | "failed" | "frozen" | "ask" | "unknown";
