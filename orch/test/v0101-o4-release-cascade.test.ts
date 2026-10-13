@@ -539,10 +539,7 @@ test("O4 边界：级联后该 Group 版已 released ⇒ orch_version_released_l
     assert.equal(projectVersionGet("g1", "orch", "1.0.0")?.status, "released", "级联结果稳定");
 
     const fail = mustFailTool(
-      handleFeatureCreate(
-        { title: "想排进已发版", stage: "需求分析", approval: "未发起", version: "1.0.0" },
-        "g1",
-      ),
+      handleFeatureCreate({ title: "想排进已发版", version: "1.0.0" }, "g1"),
     );
     assert.equal(fail.code, "orch_version_released_locked", "released 锁不因级联改动而放宽");
   } finally {

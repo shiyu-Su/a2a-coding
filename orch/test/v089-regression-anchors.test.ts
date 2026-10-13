@@ -42,10 +42,12 @@ import {
   getFeature,
   getQueuedTask,
   getTask,
+  projectVersionCreate,
   runnerProjectsReplace,
   updateFeatureContext,
   upsertRunner,
   upsertTaskResult,
+  versionLedgerCreate,
 } from "../session/store.js";
 import { projectTaskVisibility, type FeatureTaskSummary } from "../bridge/feature-tools.js";
 import type { BridgeCore } from "../bridge/index.js";
@@ -155,6 +157,59 @@ function reDispatched(taskId: string, marker: string): boolean {
  */
 const quiesce = (): Promise<void> => sleep(400);
 
+/** v0.10.5 O7 夹具用版号（{@link toDecomposingFeature}） */
+const RA_GROUP_VERSION = "0.10.5-ra.0";
+const RA_PROJECT_VERSION = "1.0.0";
+
+/**
+ * v0.10.5 O7：建一张停在 `decomposing` 的卡（可挂载、**不派发** —— 调度器只领 `executing` 的节点）。
+ *
+ * 原形态「create → registerFeatureNode → approve」依赖两处旧契约（`create` 缺省即 `待审批`、
+ * `waiting_approval` 可挂载），随 v0.10.5 O4 一并作废。新序列 = `advance(version)` →
+ * `advance(stage=改造方案)` → `advance(approval=待审批)` → `approve`（落 `version_planning`）→
+ * `advance(decomposing, 带归属)`，**停在本格**：先登记节点并断言「登记态 rendered = NULL」，
+ * 再由用例 `enterExecuting` 顶替原 `approve` 的位置触发起派。
+ */
+function toDecomposingFeature(title: string): string {
+  const fid = okOrThrow(core.featureCreate({ title }), "featureCreate").featureId;
+  versionLedgerCreate({ ownerGroup: null, version: RA_GROUP_VERSION });
+  projectVersionCreate({ ownerGroup: null, projectId: "alpha", version: RA_PROJECT_VERSION });
+  okOrThrow(
+    core.featureAdvance({ featureId: fid, to: "waiting_approval", version: RA_GROUP_VERSION }),
+    "排期写 version",
+  );
+  okOrThrow(
+    // 门① 第二前提（增补 bbc7ea28 O3）：抬 stage 须已登记《需求确认单》档名
+    //（本文件的轮标记 `decisionsFor(r)` 在用例里整串覆写，不受本次登记影响）
+    core.featureAdvance({
+      featureId: fid,
+      to: "waiting_approval",
+      stage: "改造方案",
+      decisions: '["doc/v0.8.9/夹具-需求确认单.md","doc/v0.8.9/夹具-改造文档.md"]',
+    }),
+    "门① 抬 stage",
+  );
+  okOrThrow(
+    core.featureAdvance({ featureId: fid, to: "waiting_approval", approval: "待审批" }),
+    "approval 置待审批",
+  );
+  okOrThrow(core.featureApprove({ featureId: fid }), "approve（唯一准入）");
+  okOrThrow(
+    core.featureAdvance({
+      featureId: fid,
+      to: "decomposing",
+      projectVersions: [{ projectId: "alpha", version: RA_PROJECT_VERSION }],
+    }),
+    "出 version_planning 格（带归属）",
+  );
+  return fid;
+}
+
+/** 出 `decomposing` 格进 `executing`（起派扳机 = 原 `approve` 的位置） */
+function enterExecuting(fid: string): void {
+  okOrThrow(core.featureAdvance({ featureId: fid, to: "executing" }), "出 decomposing 格");
+}
+
 /** `a2a_feature_status` 的 tasks 行（按 taskId 取；必须是成功分支） */
 function taskSummary(featureId: string, taskId: string): FeatureTaskSummary {
   const view = okOrThrow(core.featureStatus({ featureId }), "featureStatus");
@@ -178,7 +233,7 @@ async function assertMirrored(taskId: string, row: FeatureTaskSummary): Promise<
 
 test("O4 锚 1：4 次派发（首派/answer 续推/retry 重派/冻结变量的第 4 次重派）后 base 外壳 0 次、快照外壳 1 次、wrappedChars 恒等于一层壳", async () => {
   const BASE = "任务正文O4";
-  const fid = okOrThrow(core.featureCreate({ title: "O4 消息不膨胀" }), "featureCreate").featureId;
+  const fid = toDecomposingFeature("O4 消息不膨胀");
   updateFeatureContext(fid, { plan: PLAN_TEXT, decisions: decisionsFor(0) });
 
   const taskId = okOrThrow(
@@ -191,8 +246,8 @@ test("O4 锚 1：4 次派发（首派/answer 续推/retry 重派/冻结变量的
   const samples: FeatureTaskSummary[] = [];
   const bases: string[] = [];
 
-  // ---- 轮 1：approve → 首派（context 已含标记 R0）----
-  okOrThrow(core.featureApprove({ featureId: fid }), "approve");
+  // ---- 轮 1：首派（`approve` 已随夹具前移，v0.10.5 O7；context 已含标记 R0）----
+  enterExecuting(fid); // 出 `decomposing` 格 → 调度器才认这个节点
   core.kickScheduler();
   await waitFor(() => reDispatched(taskId, MARKERS[0]), "轮 1 首派重新入队");
   bases.push(BASE);

@@ -222,10 +222,7 @@ test("F1 建后即被引用：snake_case 建的版号，带 version 的 advance 
   });
   assert.equal(created.status, 201);
 
-  const featureId = mustOkFeatureCreate(
-    { title: "F1 排期卡", stage: "需求分析", approval: "未发起" },
-    "a2a-coding",
-  );
+  const featureId = mustOkFeatureCreate({ title: "F1 排期卡" }, "a2a-coding");
   const advanced = handleFeatureAdvance(
     { featureId, to: "waiting_approval", version: "0.10.1" },
     "a2a-coding",
@@ -246,7 +243,7 @@ test("F1 建后即被引用：带 version 建卡（create 路径）同享新登�
   await request(port, "POST", VERSIONS_COLLECTION_PATH, { owner_group: "a2a-coding", version: "0.10.2" });
 
   const featureId = mustOkFeatureCreate(
-    { title: "F1 建卡即带版号", version: "0.10.2", stage: "需求分析", approval: "未发起" },
+    { title: "F1 建卡即带版号", version: "0.10.2" },
     "a2a-coding",
   );
   assert.equal(getFeature(featureId)?.version, "0.10.2");

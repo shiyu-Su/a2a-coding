@@ -6,7 +6,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { close, createFeature, createTask, getFeature, rearmForRetry } from "../session/store.js";
+import { close, createFeature, createTask, getFeature, rearmForRetry, versionLedgerCreate } from "../session/store.js";
 import {
   handleFeatureAdvance,
   handleFeatureApprove,
@@ -133,6 +133,27 @@ test("② 五出口拒绝：属另一组 = feature_not_owned；无归属 = featu
 
   // --- 正反例：owner 本人（g1）四路放行；无身份（null）全量放行 ---
   assert.ok(handleFeatureStatus({ featureId: fid }, "g1").ok, "g1 查自己的 Feature ⇒ 放行");
+  // v0.10.5 O6 过门序列：create 不收 stage/approval（初值恒「需求分析 / 未发起」）⇒
+  // 放行 approve 前须经 排期写 version → 登记 stage/approval（门① 守卫要求 version 先落）
+  assert.equal(versionLedgerCreate({ ownerGroup: "g1", version: "v0.10.5" }).ok, true);
+  assert.ok(
+    handleFeatureAdvance({ featureId: fid, to: "waiting_approval", version: "v0.10.5" }, "g1").ok,
+    "owner 排期写 version ⇒ 放行",
+  );
+  assert.ok(
+    handleFeatureAdvance(
+      {
+        featureId: fid,
+        to: "waiting_approval",
+        stage: "改造方案",
+        approval: "待审批",
+        // 门① 第二前提（增补 bbc7ea28 O3）：抬 stage 须已登记《需求确认单》档名
+        decisions: '["doc/v0.10.5/夹具-需求确认单.md","doc/v0.10.5/夹具-改造文档.md"]',
+      },
+      "g1",
+    ).ok,
+    "owner 登记门字段 ⇒ 放行",
+  );
   assert.ok(handleFeatureApprove({ featureId: fid }, "g1").ok, "g1 过审自己的 Feature ⇒ 放行");
   assert.ok(handleFeatureStatus({ featureId: fid }, null).ok, "无身份（未配组/运维）⇒ 全量放行");
   assert.ok(handleFeatureStatus({ featureId: oid }, null).ok, "无身份 ⇒ 存量 NULL 也放行");

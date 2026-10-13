@@ -203,13 +203,19 @@ a2a_call(project="machine", message="把刚才的结果按类型分组", context
 Feature 编排（把一个需求作为 Feature 推进）：
 
 ```text
-# 1) 方案已确认后建 Feature（初态即 waiting_approval，= 改造文档确认门），并同轮登记 DAG 节点
-a2a_feature_create(title="给登录页加记住我", requirement="…")
-a2a_call(project="machine", message="…", mode="execute", featureId="<id>")
+# 1) 提需求即入板：建 Feature（初态即 waiting_approval，登记字段初值恒定 stage=需求分析 + approval=未发起）
+a2a_feature_create(title="给登录页加记住我", requirement="…", version="0.10.5")
 # 2) 用户确认方案后放行：approve = 记录已发生的用户确认（一对一，不可预领/不可补领）
+#    目标态按父链分流：无父（主轨）→ version_planning（定版工序）；有父（增补/承接轨）→ decomposing
 a2a_feature_approve(featureId="<id>")
 #    ⚠️ 不能再用 a2a_feature_advance(to="executing") 绕门 —— 会被拒（feature_approval_required）
-# 3) 桥内 Task DAG 调度器按 dependencies 拓扑派发（同 project 串行、跨 project 并行）
+# 3) 定版工序内先建 Project Version、再写归属；归属非空才出得了格（空 ⇒ feature_attribution_required）
+a2a_feature_advance(featureId="<id>", to="decomposing", projectVersions=[{projectId:"machine",version:"0.9.8"}])
+# 4) 拆任务格内登记 DAG 节点（可挂载态 = executing / decomposing；waiting_approval 已摘出）
+a2a_call(project="machine", message="…", mode="execute", featureId="<id>")
+# 5) 登记完毕 ⇒ advance 进 executing，桥内 Task DAG 调度器按 dependencies 拓扑派发
+#    （同 project 串行、跨 project 并行；decomposing 内登记的节点不占机器资源 —— 派发门只看 executing）
+a2a_feature_advance(featureId="<id>", to="executing")
 # 4) 任务需澄清时 Feature 停 needs_input，补齐答案续推（局部澄清；整案回炉需 cancel + 新建）
 a2a_feature_advance(featureId="<id>", to="executing", answer="…")
 # 5) 任务失败时 Feature 停在 executing 静止（a2a_events 收 feature.failure_report 账单一次），
@@ -217,7 +223,7 @@ a2a_feature_advance(featureId="<id>", to="executing", answer="…")
 a2a_feature_advance(featureId="<id>", retryTaskIds=["<失败节点 taskId>"])
 ```
 
-**主链为 6 态**：`waiting_approval → executing → integrating → testing → reviewing → completed`（Step 0/1 由宿主驱动、**引擎不参与**）。
+**主链为 8 态**：`waiting_approval → version_planning → decomposing → executing → integrating → testing → reviewing → completed`（`version_planning` = `approve` 后的定版工序、`decomposing` = 拆任务与 DAG 登记；Step 0/1 由宿主驱动、**引擎不参与**）。
 
 调度器为**代码组件**，LLM 不参与等待 / 轮询。
 
@@ -455,13 +461,13 @@ Bridge ⇄ Launcher 的线协议以仓库根 [PROTOCOL.md](PROTOCOL.md) 为单�
 
 #### Feature 工具组（6 个）
 
-把一个需求作为 Feature 编排：`a2a_feature_create` 建 Feature → orch 组织各项目分析、汇总方案 → `a2a_feature_advance` 推进到 `waiting_approval` 停下 → 用户 `a2a_feature_approve` 放行 → 桥内 Task DAG 调度器（**同 project 串行、跨 project 并行**）按 `dependencies` 自动派发各项目任务并推进至完成；任务需澄清时 Feature 停 `needs_input`，`a2a_feature_advance(..., answer=…)` 续推；**任务失败时** Feature 保持 `executing` 静止（`a2a_events` 发一次 `feature.failure_report` 账单），宿主 `a2a_feature_advance(..., retryTaskIds=[…])` 重派并解冻。
+把一个需求作为 Feature 编排：`a2a_feature_create` 建 Feature → orch 组织各项目分析、汇总方案 → 卡在 `waiting_approval` 停下 → 用户 `a2a_feature_approve` 放行（主轨落 `version_planning`、增补/承接轨直接落 `decomposing`）→ 定版工序写归属、拆任务格登记 DAG 节点，各由宿主 `advance` 出格（**归属非空是出格凭据**）→ 进 `executing` 后桥内 Task DAG 调度器（**同 project 串行、跨 project 并行**）按 `dependencies` 自动派发各项目任务并推进至完成；任务需澄清时 Feature 停 `needs_input`，`a2a_feature_advance(..., answer=…)` 续推；**任务失败时** Feature 保持 `executing` 静止（`a2a_events` 发一次 `feature.failure_report` 账单），宿主 `a2a_feature_advance(..., retryTaskIds=[…])` 重派并解冻。**`version_planning` / `decomposing` 两格内不派发任何节点、不挂 `needs_input`、不产失败账单**（工序会话是只读同步会话）。
 
-- `a2a_feature_create(title, requirement?, stage?, version?, approval?, contextId?, parentFeatureId?)`：新建 Feature，**初态即 `waiting_approval`**（= 改造文档确认门停靠点，**引擎只做需求实现**），返回 `featureId`。`stage` / `version` / `approval` 是**登记字段（观测面，不是状态机态）**，缺省 `stage=改造方案` + `approval=待审批`；`parentFeatureId` 用于验收增补轨挂主需求。
+- `a2a_feature_create(title, requirement?, version?, contextId?, parentFeatureId?)`：新建 Feature，**初态即 `waiting_approval`**（= 改造文档确认门停靠点，**引擎只做需求实现**），返回 `featureId`。`stage` / `approval` **自 v0.10.5 起不再是入参** —— 初值由引擎硬编码为 `需求分析` + `未发起`（口径见 `flow/spec/引擎映射.md` §3.5「初值恒定」）；`version` 仍是入参；`stage` / `version` / `approval` 都是**登记字段（观测面，不是状态机态）**；`parentFeatureId` 用于验收增补轨挂主需求。
 - `a2a_feature_status(featureId?)`：查看 Feature 详情 / 列表（state + tasks 摘要，含 `failureKind` / `retryCount`；省略 `featureId` 列出全部）。
 - `a2a_feature_trace(featureId)`：**只读**回答「这个 Feature 为什么还没完成」——逐非终态节点给 `waitReason` / `position` / `waitedSince` / `projectBusy` / `lane` / `readOccupants[]`。用于区分「在排队」与「真在跑」（**两个时钟不得相加**：orch 领取队列的等待 ≠ machine 本机闸内等待）。纯读，不落库、不触发调度。
-- `a2a_feature_advance(featureId, to, note?, answer?, retryTaskIds?, stage?, version?, approval?, decisions?, contracts?)`：推进状态机主链（校验合法后继，非法流转被拒）；**`to="executing"` 在 `waiting_approval` 会被拒**（`feature_approval_required`，请用 `approve`）；`answer` 用于 `needs_input` 补齐后续推；**`retryTaskIds`（v0.6.1）用于失败重派**（仅静止失败场景：重派指定未处置 `failed` 节点并自动解冻其被冻下游；不传/非法/与 `answer` 同传 ⇒ 结构化错误拒绝且 Feature 态不变）；**`to` = 当前态 ∧ 仅带登记字段 = 只写登记、不动主链**（`stage` / `version` / `approval` / `decisions` 走这条，`decisions` 为 append 语义）。
-- `a2a_feature_approve(featureId)`：**唯一准入**——`waiting_approval → executing`。语义 = **记录已发生的用户确认（一对一映射：不可预领、不可补领）**：宿主在收到用户确认后**立即**调用，**不是新增一次用户决策**；禁止在用户未确认方案前调用。
+- `a2a_feature_advance(featureId, to, note?, answer?, retryTaskIds?, stage?, version?, approval?, decisions?, contracts?)`：推进状态机主链（校验合法后继，非法流转被拒）；**`to="executing"` 在 `waiting_approval` 会被拒**（`feature_approval_required`，请用 `approve`）；`answer` 用于 `needs_input` 补齐后续推；**`retryTaskIds`（v0.6.1）用于失败重派**（仅静止失败场景：重派指定未处置 `failed` 节点并自动解冻其被冻下游；不传/非法/与 `answer` 同传 ⇒ 结构化错误拒绝且 Feature 态不变）；**`to` = 当前态 ∧ 仅带登记字段 = 只写登记、不动主链**（`stage` / `version` / `approval` / `decisions` 走这条；`decisions` 为**整值替换**语义 —— 补登记须重发全量，不是 append；且必须与某枚登记字段同单发出，单发 `decisions` 会被拒）。
+- `a2a_feature_approve(featureId)`：**唯一准入**——目标态按父链分流（v0.10.5）：无父卡（主轨）`waiting_approval → version_planning`，有父卡（增补轨 / 承接轨）`waiting_approval → decomposing`（不重走定版工序 ⇒ 跳过该格）。语义 = **记录已发生的用户确认（一对一映射：不可预领、不可补领）**：宿主在收到用户确认后**立即**调用，**不是新增一次用户决策**；禁止在用户未确认方案前调用。
 - `a2a_feature_cancel(featureId)`：任意非终态 → `cancelled`（**执行中途"方案整体回炉"只能走这条**：主链无回边）。
 
 #### 配置写工具（1 个）
@@ -497,7 +503,7 @@ a2a-coding/
 │  ├─ bridge/task-watcher.ts      # 任务后台看护（轮询 + 续约至终态落库；onSettled 供调度器接驳）
 │  ├─ bridge/scheduler.ts         # 拓扑并行 Task DAG 调度器（失败传播 blocked / 启动恢复）
 │  ├─ bridge/feature-tools.ts     # Feature 工具组 handler（create / status / trace / advance / approve / cancel）
-│  ├─ feature/state-machine.ts    # Feature 状态机（9 主态 + 异常态；纯函数，非法流转 fail-fast）
+│  ├─ feature/state-machine.ts    # Feature 状态机（8 主态 + 异常态；纯函数，非法流转 fail-fast）
 │  ├─ session/store.ts            # 会话/任务库（node:sqlite；sessions + tasks + features + artifacts + events）
 │  └─ data/                       # 运行态：sessions.sqlite（git 忽略）
 ├─ machine/                       # 部署单元 2（每台执行机器）：每机常驻

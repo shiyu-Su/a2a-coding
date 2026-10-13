@@ -111,6 +111,7 @@ import {
   type FeatureAdvanceArgs,
   type FeatureAdvanceSuccess,
   type FeatureApproveArgs,
+  type FeatureApproveSuccess,
   type FeatureCancelArgs,
   type FeatureCreateArgs,
   type FeatureCreateSuccess,
@@ -1227,9 +1228,11 @@ function buildNodeDispatchMessage(node: TaskRecord, feature: FeatureRecord | nul
 /**
  * `a2a_call` 带 `featureId` —— 登记一个 Feature DAG 节点（本地 id），
  * 不立即派发；由调度器在依赖满足后按拓扑并行派发（每 Feature 批门闩）。
- * 可挂载态 = `MOUNTABLE_FEATURE_STATES`（**常量集合驱动**，现为
- * `executing` / `waiting_approval`；`analyzing`（分析扇出）已随主链收敛**有意撤销**；
- * 登记 ≠ 派发 —— `tick` 只看 `executing`。变更该常量即自动更新文案，经 `join` 取用）；
+ * 可挂载态 = `MOUNTABLE_FEATURE_STATES`（**常量集合驱动**，v0.10.5 O4 收窄后为
+ * `executing` / `decomposing` —— `waiting_approval` 已摘出，DAG 登记时点随主链后移到拆任务格；
+ * `analyzing`（分析扇出）已随主链收敛**有意撤销**；
+ * 登记 ≠ 派发 —— `tick` 只看 `executing`，故 `decomposing` 内登记的节点不占机器资源。
+ * 变更该常量即自动更新文案，经 `join` 取用）；
  * `dependencies` 引用同 Feature 内的本地 taskId；`inputs` 声明本节点引用的上游产物；
  * `readOnly`（v0.8.10 O-N4）声明本节点并发档：仅显式 `true` ⇒ `lane='read'`，否则 `'write'`；
  * `taskType`（v0.10.2 O-2）声明本节点职责位：仅显式带值才落 `tasks.task_type`，
@@ -1965,7 +1968,7 @@ export interface BridgeCore {
   featureCreate(args: FeatureCreateArgs): FeatureCreateSuccess | FeatureToolFailure;
   featureStatus(args: FeatureStatusArgs): FeatureStatusSuccess | FeatureToolFailure;
   featureAdvance(args: FeatureAdvanceArgs): FeatureAdvanceSuccess | FeatureToolFailure;
-  featureApprove(args: FeatureApproveArgs): FeatureStateChangeSuccess | FeatureToolFailure;
+  featureApprove(args: FeatureApproveArgs): FeatureApproveSuccess | FeatureToolFailure;
   featureCancel(args: FeatureCancelArgs): FeatureStateChangeSuccess | FeatureToolFailure;
   /**
    * **只读 trace 投影**（v0.8.10 O-N3 挂成 MCP 工具 `a2a_feature_trace`）：
@@ -2014,7 +2017,7 @@ export function createCore(identity: string | null = null): BridgeCore {
       handleFeatureStatus(args, identity),
     featureAdvance: (args): FeatureAdvanceSuccess | FeatureToolFailure =>
       handleFeatureAdvance(args, identity),
-    featureApprove: (args): FeatureStateChangeSuccess | FeatureToolFailure =>
+    featureApprove: (args): FeatureApproveSuccess | FeatureToolFailure =>
       handleFeatureApprove(args, identity),
     featureCancel: (args): FeatureStateChangeSuccess | FeatureToolFailure =>
       handleFeatureCancel(args, identity),

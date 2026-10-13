@@ -28,8 +28,10 @@ import {
   createTask,
   getQueuedTask,
   markRunnerOffline,
+  projectVersionCreate,
   runnerProjectsReplace,
   upsertRunner,
+  versionLedgerCreate,
 } from "../session/store.js";
 import type { BridgeCore } from "../bridge/index.js";
 
@@ -79,6 +81,10 @@ writeConfig(null);
 // 动态 import：模块加载期常量 `MACHINES_CONFIG_PATH` 此刻才被求值（见文件头「夹具约束」）
 const { createCore } = await import("../bridge/index.js");
 const core: BridgeCore = createCore();
+
+/** v0.10.5 O7 夹具用版号（{@link toDecomposing}） */
+const A7_GROUP_VERSION = "0.10.5-a7.0";
+const A7_PROJECT_VERSION = "1.0.0";
 
 after(() => {
   globalThis.fetch = originalFetch;
@@ -138,6 +144,54 @@ function isFailure(v: unknown): v is FailureShape {
 function expectFailure(v: unknown): FailureShape {
   assert.equal(isFailure(v), true, `期望结构化失败，实得：${JSON.stringify(v)}`);
   return v as FailureShape;
+}
+
+/**
+ * v0.10.5 O7 夹具：把卡走到**可挂载态** `decomposing`。
+ *
+ * 原形态「create 后直接 registerFeatureNode」依赖两处旧契约（`create` 缺省即 `待审批`、
+ * `waiting_approval` 可挂载），二者已随 v0.10.5 O4 作废 ⇒ 挂载集收窄后先撞
+ * `feature_state_invalid`，走不到本用例要锁的成员判据。序列 = advance(version) →
+ * advance(stage=改造方案) → advance(approval=待审批) → approve → advance(decomposing + 归属)。
+ */
+function toDecomposing(featureId: string, projectId: string): void {
+  versionLedgerCreate({ ownerGroup: null, version: A7_GROUP_VERSION });
+  projectVersionCreate({ ownerGroup: null, projectId, version: A7_PROJECT_VERSION });
+  assert.equal(
+    isFailure(core.featureAdvance({ featureId, to: "waiting_approval", version: A7_GROUP_VERSION })),
+    false,
+    "排期写 version 应成功",
+  );
+  assert.equal(
+    isFailure(
+      core.featureAdvance({
+        featureId,
+        to: "waiting_approval",
+        stage: "改造方案",
+        // 门① 第二前提（增补 bbc7ea28 O3）：抬 stage 须已登记《需求确认单》档名
+        decisions: '["doc/v0.8.6/夹具-需求确认单.md","doc/v0.8.6/夹具-改造文档.md"]',
+      }),
+    ),
+    false,
+    "门① 抬 stage 应成功（version 已非空 ∧ 确认单已登记）",
+  );
+  assert.equal(
+    isFailure(core.featureAdvance({ featureId, to: "waiting_approval", approval: "待审批" })),
+    false,
+    "approval 置待审批应成功",
+  );
+  assert.equal(isFailure(core.featureApprove({ featureId })), false, "approve 应放行");
+  assert.equal(
+    isFailure(
+      core.featureAdvance({
+        featureId,
+        to: "decomposing",
+        projectVersions: [{ projectId, version: A7_PROJECT_VERSION }],
+      }),
+    ),
+    false,
+    "出 version_planning 格（带归属）应成功",
+  );
 }
 
 interface RunnerViewShape {
@@ -313,6 +367,8 @@ test("⑤ 非成员登记 Feature 节点 ⇒ 登记前失败（零 I/O、节点�
   const created = core.featureCreate({ title: "A6 单测夹具 Feature" });
   assert.equal(isFailure(created), false);
   const featureId = (created as { ok: true; featureId: string }).featureId;
+  // v0.10.5 O7：挂载集收窄 ⇒ 先走到 decomposing，才测得到「非成员在登记前被拒」这一支
+  toDecomposing(featureId, "alpha");
 
   const registered = core.registerFeatureNode("ghost", "hi", undefined, featureId, []);
   const failure = expectFailure(registered);

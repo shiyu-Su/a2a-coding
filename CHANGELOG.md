@@ -2,6 +2,37 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.10.5] - 2026-10-13
+
+> 主题：**流程一致性（引擎以 Feature 状态约束流程）+ 依赖图按真实依赖边绘制**。主需求 `eb86d5e8`（流程一致性：主链 6→8 态 + `stage` 六值半派生 + `create` 契约收窄 + 门① `version` 守卫；28 节点 DAG，含增补 `bbc7ea28` 唯一准入门修复 / `6cc46dd2` advance 阶段明细 / `ec93e1bd` approve 六条过门条件）+ `804a578d`（依赖图按真实依赖边绘制（分支分叉 / 汇合合并），9 节点，含增补 `d69f494d` 连线接点与疏密）+ `8af7f099`（DAG 依赖只声明直接前置）。**触达面 = orch + flow + board**（machine 零改动、不抬号、不重启）；**停同升分组第六次实操**：orch `0.10.2 → 0.11.0`、board `0.11.0 → 0.12.0`、flow 四戳随版 `v0.10.5`；**协议保持 2.3**（不触发 orch↔machine 同升）。
+
+### Added
+
+- **主链由 6 态扩为 8 态（引擎以 `state` 约束流程）**：在 `waiting_approval` 与 `executing` 之间插入 **`version_planning`**（PjM 版本规划工序）与 **`decomposing`**（拆任务与 DAG 登记）两态。`approve` 后继由 `executing` **抬为 `version_planning`**（主轨）；增补轨 / 承接轨按父链分流**直落 `decomposing`**（不重走定版工序）。两格内**不派发任何 DAG 节点、不挂 `needs_input`、不产失败账单**（工序会话是只读同步会话）。
+- **`stage` 六值全启用 + 半派生**：`需求分析` / `改造方案` / `改造` / `回归` / `验收` / `发版`；其中 `需求分析` / `改造方案` / `发版` 由**宿主显式写**，`改造` / `回归` / `验收` 由**引擎随 `state` 派生写**。事实源抬为 `state`（`stage` 降为观测面读投影）。
+- **`create` 契约收窄（初值恒定）**：`stage` / `approval` **不再是入参**，初值由引擎硬编码为 `需求分析` + `未发起`（`version` 仍是入参）。
+- **门① `version` 守卫**：`stage` 由「需求分析」外迁要求 `features.version` 非空，否则结构化拒收（`feature_group_version_required`）；且需《需求确认单》档名在册（`feature_confirmation_doc_required`）。
+- **`approve` 过门判据由 2 条收紧为 6 条**（增补 `ec93e1bd`）：①② 原有（`state` / `approval`）+ ③ `version` 非空 ④ 确认单在册（照抄门①）+ ⑤ `stage` 非「需求分析」（新码 `feature_requirement_gate_not_passed`）+ ⑥ 任一《改造文档》在册（新码 `feature_design_doc_required`）；判据串插在**任何一笔写之前**、**任一不过 ⇒ 零迁移**。
+- **「本阶段明细」七枚派生导航**（增补 `6cc46dd2`）：`advance` 四出口 / `create` / `approve` / `feature_status` 单查**平铺**返回 —— 回显 `stage` / `approval` / `version` + 派生 `pending` / `gate` / `actor` / `action`（`actor` = **本阶段推进后的推动方**；`cancel` 不带）。
+- **依赖图按真实依赖边绘制**（board `804a578d` + 增补 `d69f494d`）：分支分叉 / 汇合合并，不再把任务拉成一条直线；连线端点落节点边框线**中点**、整体疏密对齐已批准原型。
+
+### Changed
+
+- **`MOUNTABLE_FEATURE_STATES` 摘出 `waiting_approval`** ⇒ `{executing, decomposing}`（H2：DAG 初版登记时点倒转，`waiting_approval` 不再可挂载节点）。
+- **规范落笔（flow 四文件齐翻 `v0.10.5`）**：`需求流程.md`（§0.5 对照表加两格 / §1 骨架 / Step 0 判据 / Step 2 H1·H2 / PjM 抬为态 / 二次拆分过渡形态 / §7 同版串行「名额」单处定名 + 过渡判据）、`引擎映射.md`（§1 有序投影 + 三句硬钉 / §2 表两新行 / §3 门① 与门② 行 / §3.5 值域六枚 + 两条写路径 / §4 三步序）等。
+- **停同升分组第六次实操**：本版 **orch + board** 有真实行为变更（各抬 Project Version），**flow** 正文随版（四戳翻），**machine 零触达保持 `0.10.2`**；协议 2.3 不动。
+- **根回归随版推进**：① `approve` **反锚翻向**（旧负锚「approve 门不看 `stage`」被 ⑤ 推翻 ⇒ 翻为正向断言 `feature_requirement_gate_not_passed` 在场）；② 三条旧锚随版翻向（「主链（6 态）」⇒「主链 = 引擎 `state` 有序投影」+ 两新态在场 / 挂载白名单 `waiting_approval` ⇒ `executing`+`decomposing` / `文档模板.md` 四戳 `v0.10.3` ⇒ `v0.10.5`）；③ `流程一致性-改造文档.md` 补「修订历史 `final` 行」⇒ **根回归 1377 / 1377 全绿**。
+
+### Fixed
+
+- **`approve` 唯一准入可被绕过**（增补 `bbc7ea28`）：`advance(to="version_planning")` 曾可让未过门卡直进 `version_planning`（`approval` 仍 `未发起`）⇒ 守卫泛化为**「`waiting_approval` 出发、凡改动 `state` 的前进边一律拒」**（行序式并集判据 = 主链索引序 ∨ 转移表出边），并补门① **第二前提**（`decisions` 须含《需求确认单》档名，判据 = 已落库 ∪ 本单同写）。
+
+### 固定口径（登记）
+
+- 根回归脚本位于 `.omo/skills/regression-test/`（宿主侧工具、随 `.gitignore` 不入库），本版含 **4 处旧锚翻向**；`doc/` 整树不入库，发版文档快照入 `instruction-doc/v0.10.5/`。
+- **宿主镜像重导**：`README.md` 内嵌的编排/工具面语义含 **4 处旧句式**（`create` 缺省 `改造方案`/`待审批`、`decisions` 标 append、目录注释「9 主态」）已随版改述（`AGENTS.md` 自 v0.10.2 起已「回指」化、无残留）。
+- **未覆盖 / 遗留**（不得默认算通过）：承接轨过门序无真机靶（凭据 = 规范文本 + 单测锚）· `approve` 合规出口未单独真机打（本卡生命周期内 `approve` 发生在载体升级之前；探针走的是非法序）· `feature_status` 列表分支「恒缺明细」仅单测/HTTP 同值锚为凭 · board / flow 侧改动无运行时面（零改 / 规范文本）· `decisions` 单写拒因文案落差（用户裁「先不做」，登记于改造文档 §6 ⑬）· §7 名额口径为纯宿主纪律（引擎不执法、漏把静默）。
+
 ## [v0.10.4] - 2026-10-12
 
 > 主题：**板面免手刷（数据变更自动更新 + 快捷项局部更新）+ 板卡片呈现统一（五项重建）+ 依赖图分色修复 + 管理页项目池手动刷新**。主需求 `858e9e46`（板面免手刷，10 节点，含增补 07 `c997a0bb` / 08 `c35b4192`）+ `4ca97bcd`（板卡片呈现统一，12 节点，含增补 `28df8a08` / `076bbb84`）+ `5a6ed454`（依赖图 chip 非完成态着色，3 节点）+ `464a0475`（管理页项目池手动刷新，4 节点）。**触达面 = board 单侧**（orch / machine 零改动、不抬号；flow 零触达、四戳不翻）；**Project Version = board `0.10.3 → 0.11.0`**（用户 2026-10-11 裁定，非 0.10.4）。

@@ -19,6 +19,7 @@
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
+import { randomUUID } from "node:crypto";
 import { rmSync } from "node:fs";
 import { join } from "node:path";
 import { tmpdir } from "node:os";
@@ -110,6 +111,29 @@ function resetToMemory(): void {
   close();
 }
 
+/**
+ * **测试专用建卡**（v0.10.5 O4）：按指定登记字段建卡。
+ * `a2a_feature_create` 契约下初值恒为「需求分析 / 未发起」（不再收两枚入参）⇒ 需要「已过门」「改造方案」
+ * 等形态的卡只能走存储层直写（不经 handler，等价于存量行形态）。
+ */
+function seedFeatureAt(
+  title: string,
+  ownerGroup: string | null,
+  fields: { stage?: string; approval?: string; version?: string | null; state?: string },
+): string {
+  const featureId = randomUUID();
+  createFeature({
+    featureId,
+    title,
+    ownerGroup,
+    state: (fields.state ?? "waiting_approval") as never,
+    stage: fields.stage,
+    approval: fields.approval,
+    version: fields.version ?? null,
+  });
+  return featureId;
+}
+
 // ---------------------------------------------------------------------------
 // 1：排期写状态锁 `board_schedule_state_locked`（宿主 MCP 直写受锁）
 // ---------------------------------------------------------------------------
@@ -121,22 +145,18 @@ test("O4 排期写状态锁：需求分析∧未发起 的卡可经 advance 排�
     seedVersionLedger(dbPath, [["g1", "1.0.0", "active"]]);
     reopenDefault(dbPath);
 
-    // ① 想法卡（需求分析 / 未发起）⇒ advance 写 version 放行（改版纪律第一档）
-    const idea = mustOk(
-      handleFeatureCreate({ title: "想法挪版", stage: "需求分析", approval: "未发起" }, "g1"),
-    );
+    // ① 想法卡（需求分析 / 未发起 = create 初值恒定，v0.10.5 O4）⇒ advance 写 version 放行（改版纪律第一档）
+    const idea = mustOk(handleFeatureCreate({ title: "想法挪版" }, "g1"));
     mustOk(handleFeatureAdvance({ featureId: idea.featureId, to: "waiting_approval", version: "1.0.0" }));
     assert.equal(getFeature(idea.featureId)?.version, "1.0.0", "需求分析∧未发起 ⇒ 排期写放行");
 
     // ② 已过需求确认门（改造方案 / 待审批）⇒ 引擎挡（非板）
-    const confirmed = mustOk(
-      handleFeatureCreate({ title: "已过门", stage: "改造方案", approval: "待审批" }, "g1"),
-    );
+    const confirmed = seedFeatureAt("已过门", "g1", { stage: "改造方案", approval: "待审批" });
     const fail = mustFail(
-      handleFeatureAdvance({ featureId: confirmed.featureId, to: "waiting_approval", version: "1.0.0" }),
+      handleFeatureAdvance({ featureId: confirmed, to: "waiting_approval", version: "1.0.0" }),
     );
     assert.equal(fail.code, "board_schedule_state_locked", "已过门卡再排期 ⇒ 引擎返回跨单元码");
-    assert.equal(getFeature(confirmed.featureId)?.version, "", "拒绝 ⇒ version 零写入");
+    assert.equal(getFeature(confirmed)?.version, "", "拒绝 ⇒ version 零写入");
     close();
   } finally {
     rmDb(dbPath);
@@ -160,17 +180,12 @@ test("O4 released 锁：已发版版号不可排入 —— 宿主 MCP 直写（c
 
     // create 直写已发版版号 ⇒ 挡
     const cf = mustFail(
-      handleFeatureCreate(
-        { title: "直写已发版", stage: "需求分析", approval: "未发起", version: "9.9.9" },
-        "g1",
-      ),
+      handleFeatureCreate({ title: "直写已发版", version: "9.9.9" }, "g1"),
     );
     assert.equal(cf.code, "orch_version_released_locked", "create 施 released 锁");
 
     // advance 直写已发版版号（卡处于可排期态）⇒ 挡
-    const idea = mustOk(
-      handleFeatureCreate({ title: "想法", stage: "需求分析", approval: "未发起" }, "g1"),
-    );
+    const idea = mustOk(handleFeatureCreate({ title: "想法" }, "g1"));
     const af = mustFail(
       handleFeatureAdvance({ featureId: idea.featureId, to: "waiting_approval", version: "9.9.9" }),
     );
@@ -199,11 +214,9 @@ test("O4 判据优先序：未登记版号 ⇒ orch_version_unknown（先于 rel
     reopenDefault(dbPath);
 
     // 已过门卡 + 未登记版号 ⇒ 存在性先挡（不被状态锁抢先）
-    const confirmed = mustOk(
-      handleFeatureCreate({ title: "已过门", stage: "改造方案", approval: "待审批" }, "g1"),
-    );
+    const confirmed = seedFeatureAt("已过门", "g1", { stage: "改造方案", approval: "待审批" });
     const fail = mustFail(
-      handleFeatureAdvance({ featureId: confirmed.featureId, to: "waiting_approval", version: "8.8.8" }),
+      handleFeatureAdvance({ featureId: confirmed, to: "waiting_approval", version: "8.8.8" }),
     );
     assert.equal(fail.code, "orch_version_unknown", "存在性检查先行（O5 序不变）");
     close();
@@ -315,15 +328,11 @@ test("O4 五码闭集：本节点产出的五个错误码均可复现", () => {
     const seen = new Set<string>();
 
     // board_schedule_state_locked
-    const confirmed = mustOk(
-      handleFeatureCreate({ title: "已过门", stage: "改造方案", approval: "待审批" }, "g1"),
-    );
-    seen.add(mustFail(handleFeatureAdvance({ featureId: confirmed.featureId, to: "waiting_approval", version: "1.0.0" })).code);
+    const confirmed = seedFeatureAt("已过门", "g1", { stage: "改造方案", approval: "待审批" });
+    seen.add(mustFail(handleFeatureAdvance({ featureId: confirmed, to: "waiting_approval", version: "1.0.0" })).code);
 
     // orch_version_released_locked
-    const idea = mustOk(
-      handleFeatureCreate({ title: "想法", stage: "需求分析", approval: "未发起" }, "g1"),
-    );
+    const idea = mustOk(handleFeatureCreate({ title: "想法" }, "g1"));
     seen.add(mustFail(handleFeatureAdvance({ featureId: idea.featureId, to: "waiting_approval", version: "9.9.9" })).code);
 
     // orch_version_unknown（写口存在性）

@@ -4,7 +4,10 @@
  *
  * 锁定的行为面：
  * 1. **(a) 未过门挡归属写** `orch_project_attribution_state_locked`：判据 = `approval = 已通过`，
- *    **不看 `stage`**（`stage = 需求分析` 但已过 `approve` ⇒ 放行；`stage = 改造方案` 未过门 ⇒ 挡）；
+ *    **本锁不看 `stage`**（`stage = 需求分析` 但 `approval` 已「已通过」⇒ 放行；`stage = 改造方案`
+ *    未过门 ⇒ 挡）。⚠ **增补 `ec93e1bd` 起「已过门 ∧ stage 未迁 / ∧ 无 version」两档改由 store 直写
+ *    `approval` 铺出** —— `approve` 自身的过门判据由 2 条收为 6 条，其 ③④⑤ 不再放行这两种形态
+ *    （本锁判据不变，变的是能否**由 `approve` 合法产出**该形态）；
  *    `cancelled` **不得新写**（含「同值重发」也不放开）；`completed` 未发版**仍可补写**；
  *    无 Group Version（`features.version` 空）⇒ 落不下归属（C-21）。
  * 2. **(b) 归属 released 门** `orch_project_version_released_locked`（目标行已 `released` ⇒ 冻结）。
@@ -45,6 +48,7 @@ import {
   openStoreDatabase,
   projectVersionCreate,
   projectVersionGet,
+  updateFeatureRegistration,
   versionLedgerCreate,
 } from "../session/store.js";
 import {
@@ -52,6 +56,8 @@ import {
   checkFeatureAttributionWrites,
   ERR_ATTRIBUTION_CONFLICT,
   ERR_ATTRIBUTION_STATE_LOCKED,
+  ERR_CONFIRMATION_DOC_REQUIRED,
+  ERR_GROUP_VERSION_REQUIRED,
   ERR_PROJECT_VERSION_RELEASED_LOCKED,
   evaluateProjectReleaseGate,
   evaluateReleaseGate,
@@ -147,26 +153,77 @@ function markProjectReleased(
   }
 }
 
-/** 一张「已过门」的卡（create 缺省 = 改造方案 / 待审批 → approve → `executing` + `已通过`） */
+/** 跳板归属的身份（只服务过格，落库后立即经数据面删除 ⇒ 不出现在任何用例的归属计数里） */
+const GATE_PROJECT = "o5-gate";
+const GATE_PROJECT_VERSION = "9.9.9";
+
+/**
+ * 抬 `stage` 那一单携带的产出物登记夹具 —— 门① 第二前提（增补 `bbc7ea28` O3）要《需求确认单》、
+ * 门② 的 ⑥（增补 `ec93e1bd`）要《改造文档》。两枚必须**同单在册**：`decisions` 是整值替换，
+ * 过门时按当场值逐枚查 ⇒ 只登记其一不放行。
+ */
+const CONFIRMATION_DECISIONS = '["doc/v0.10.1/夹具-需求确认单.md","doc/v0.10.1/夹具-改造文档.md"]';
+
+/**
+ * 跨过 O4 **归属门双挂**的两格出口（`version_planning → decomposing → executing`）。
+ * 门判据是「本需求归属非空」，而本节点的用例要的就是「归属集为空 / 由用例自己写」⇒ 借一枚跳板
+ * 归属过格，过完即删（走 store 数据面写口，不经本文件的执法面，与 {@link seedAttribution} 同源）。
+ */
+function crossAttributionGates(featureId: string, group: string | null, groupVersion: string): void {
+  mustOk(
+    featureProjectUpsert({
+      ownerGroup: group,
+      featureId,
+      projectId: GATE_PROJECT,
+      projectVersion: GATE_PROJECT_VERSION,
+      groupVersion,
+      source: "o5-gate",
+    }),
+  );
+  mustOk(handleFeatureAdvance({ featureId, to: "decomposing" }, group));
+  mustOk(handleFeatureAdvance({ featureId, to: "executing" }, group));
+  assert.equal(featureProjectDelete(group, featureId, GATE_PROJECT).deleted, true);
+}
+
+/**
+ * 一张「已过门、停在 `executing`」的卡。
+ *
+ * **v0.10.5 O5 过门序列（新契约定稿，写死照用）**：`create`（**不传** `stage` / `approval` ⇒ 初值恒定
+ * `需求分析` / `未发起`）→ `advance(to=当前态, version=<非空>)` →
+ * `advance(to=当前态, stage="改造方案", approval="待审批")` → `approve`（⇒ `version_planning`）
+ * → 过归属门双挂两格（{@link crossAttributionGates}）⇒ `executing` + `已通过`。
+ * `stage` 形参 = 该卡过门后应携带的阶段（传 `需求分析` ⇒ 跳过门① 与过格，用于「stage 未迁但已过门」档
+ * —— 过格会触发引擎 `stage` 派生写，正是该档要排除的前提）。
+ */
 function approvedFeature(
   dbPath: string,
   group: string | null,
   version: string,
   title: string,
-  stage?: FeatureStage,
+  stage: FeatureStage = "改造方案",
 ): string {
   reopenDefault(dbPath);
-  const created = mustOk(
-    handleFeatureCreate(
-      stage === undefined
-        ? { title, version }
-        : { title, version, stage, approval: "待审批" },
+  const created = mustOk(handleFeatureCreate({ title, version }, group));
+  const featureId = created.featureId;
+  mustOk(handleFeatureAdvance({ featureId, to: "waiting_approval", version }, group));
+  mustOk(
+    handleFeatureAdvance(
+      stage === "需求分析"
+        ? { featureId, to: "waiting_approval", approval: "待审批" }
+        : {
+            featureId,
+            to: "waiting_approval",
+            stage,
+            approval: "待审批",
+            decisions: CONFIRMATION_DECISIONS,
+          },
       group,
     ),
   );
-  mustOk(handleFeatureApprove({ featureId: created.featureId }, group));
+  mustOk(handleFeatureApprove({ featureId }, group));
+  if (stage !== "需求分析") crossAttributionGates(featureId, group, version);
   close();
-  return created.featureId;
+  return featureId;
 }
 
 /** 推进到 `completed`（主链逐格，不经 store 直写 ⇒ 与真实验收路径同形） */
@@ -218,14 +275,9 @@ test("O2 (a) 未过门 ⇒ orch_project_attribution_state_locked；判据 = appr
     seedGroup(dbPath, [["g1", "1.0.0"]]);
     seedProject(dbPath, [["g1", "orch", "0.1.0"]]);
 
-    // ① 想法卡（需求分析 / 未发起）⇒ 挡
+    // ① 想法卡（需求分析 / 未发起 = v0.10.5 O4 起的 create 初值）⇒ 挡
     reopenDefault(dbPath);
-    const idea = mustOk(
-      handleFeatureCreate(
-        { title: "想法卡", stage: "需求分析", approval: "未发起", version: "1.0.0" },
-        "g1",
-      ),
-    );
+    const idea = mustOk(handleFeatureCreate({ title: "想法卡", version: "1.0.0" }, "g1"));
     close();
     let fail = mustFail(
       applyFeatureAttributions(
@@ -239,6 +291,18 @@ test("O2 (a) 未过门 ⇒ orch_project_attribution_state_locked；判据 = appr
     // ② 改造方案 / 待审批（门未过）⇒ 挡
     reopenDefault(dbPath);
     const pending = mustOk(handleFeatureCreate({ title: "待审批卡", version: "1.0.0" }, "g1"));
+    mustOk(
+      handleFeatureAdvance(
+        {
+          featureId: pending.featureId,
+          to: "waiting_approval",
+          stage: "改造方案",
+          approval: "待审批",
+          decisions: CONFIRMATION_DECISIONS,
+        },
+        "g1",
+      ),
+    );
     close();
     fail = mustFail(
       applyFeatureAttributions(
@@ -248,9 +312,14 @@ test("O2 (a) 未过门 ⇒ orch_project_attribution_state_locked；判据 = appr
     );
     assert.equal(fail.code, ERR_ATTRIBUTION_STATE_LOCKED, "approval=待审批 ⇒ 未过门");
 
-    // ③ **不看 stage**：stage 停在「需求分析」但已过 approve ⇒ 放行
-    const earlyStage = approvedFeature(dbPath, "g1", "1.0.0", "stage未迁但已过门", "需求分析");
+    // ③ **不看 stage**：stage 停在「需求分析」但 `approval` 已「已通过」⇒ 放行。
+    // 「已过门而 stage 未迁」这一形态自增补 `ec93e1bd`（门② 六条的 ⑤）起**不可由 `approve` 产出**
+    // ⇒ 本档要钉的是归属写锁的判据（看 approval、不看 stage），改由 store 直写铺出，判据本身不变。
     reopenDefault(dbPath);
+    const earlyStage = mustOk(
+      handleFeatureCreate({ title: "stage未迁但已过门", version: "1.0.0" }, "g1"),
+    ).featureId;
+    updateFeatureRegistration(earlyStage, { approval: "已通过" });
     assert.equal(getFeature(earlyStage)?.stage, "需求分析", "前提：stage 确实未迁");
     mustOk(
       applyFeatureAttributions(
@@ -261,10 +330,29 @@ test("O2 (a) 未过门 ⇒ orch_project_attribution_state_locked；判据 = appr
     close();
     assert.equal(attributions(earlyStage), 1, "门看 approval、不看 stage ⇒ 放行");
 
-    // ④ 无 Group Version（version 空）⇒ 落不下归属（C-21）
+    // ④ 无 Group Version（version 空）⇒ 落不下归属（C-21）。
+    //    **翻向（增补 `ec93e1bd` 门② 六条）**：原句反证「门① 的 version 守卫只挡 `stage` 迁移、不挡
+    //    `approve` ⇒ 未排期卡仍可过第二道门」**整句作废** —— `approve` 现在自持 ③（`version` 非空）与
+    //    ④（确认单在册）两条**照抄门①** 的前提。本档因此拆两截：
+    //    **(i)** 未排期卡的 `approve` 由「放行」翻为「条件 ③ 拒、零迁移」（登记写侧不受六条约束，仍放行）；
+    //    **(ii)** C-21 的归属写锁档**不丢**，改由 store 直写 `approval` 越过已过门形态（③ 档同款手段 ——
+    //    本档要钉的是归属锁判据，不是过门路径；六条自身的锚见 `v0105-x-ec93e1bd-approve-gate-preconditions`）。
     reopenDefault(dbPath);
     const unversioned = mustOk(handleFeatureCreate({ title: "未排期卡" }, "g1"));
-    mustOk(handleFeatureApprove({ featureId: unversioned.featureId }, "g1"));
+    mustOk(
+      handleFeatureAdvance(
+        { featureId: unversioned.featureId, to: "waiting_approval", approval: "待审批" },
+        "g1",
+      ),
+    );
+    close();
+    fail = mustFail(handleFeatureApprove({ featureId: unversioned.featureId }, "g1"));
+    assert.equal(fail.code, ERR_GROUP_VERSION_REQUIRED, "门② 条件 ③：version 空 ⇒ approve 整单拒");
+    assert.equal(getFeature(unversioned.featureId)?.state, "waiting_approval", "拒后主链零迁移");
+    assert.equal(getFeature(unversioned.featureId)?.approval, "待审批", "拒后不落「已通过」");
+    // (ii) C-21：以数据面直写把该卡摆成「已过门 ∧ 无 Group Version」⇒ 归属写锁仍挡
+    reopenDefault(dbPath);
+    updateFeatureRegistration(unversioned.featureId, { approval: "已通过" });
     close();
     fail = mustFail(
       applyFeatureAttributions(
@@ -274,6 +362,22 @@ test("O2 (a) 未过门 ⇒ orch_project_attribution_state_locked；判据 = appr
     );
     assert.equal(fail.code, ERR_ATTRIBUTION_STATE_LOCKED, "无 Group Version ⇒ 无归属");
     assert.equal(attributions(unversioned.featureId), 0);
+
+    // ④b **门② 条件 ④**：`version` 已写（③ 过）∧ `decisions` 缺《需求确认单》⇒ approve 拒、态不变。
+    // （原形态下这张卡**照常放行** = 本增补要堵的「省略门① 直过门②」旁路。）
+    reopenDefault(dbPath);
+    const noConfirmDoc = mustOk(handleFeatureCreate({ title: "缺确认单卡", version: "1.0.0" }, "g1"));
+    mustOk(
+      handleFeatureAdvance(
+        { featureId: noConfirmDoc.featureId, to: "waiting_approval", approval: "待审批" },
+        "g1",
+      ),
+    );
+    close();
+    fail = mustFail(handleFeatureApprove({ featureId: noConfirmDoc.featureId }, "g1"));
+    assert.equal(fail.code, ERR_CONFIRMATION_DOC_REQUIRED, "门② 条件 ④：缺确认单 ⇒ approve 整单拒");
+    assert.equal(getFeature(noConfirmDoc.featureId)?.state, "waiting_approval", "拒后主链零迁移");
+    assert.equal(getFeature(noConfirmDoc.featureId)?.approval, "待审批", "拒后不落「已通过」");
 
     // ⑤ `cancelled` 不得新写（★R3）：**同值重发也不放开**
     const cancelled = approvedFeature(dbPath, "g1", "1.0.0", "取消轨");
@@ -748,6 +852,23 @@ test("O2 releasable：total>0 ∧ completed+cancelled===total（不含 completed
     // 同 project 再加一张 `failed`（open 桶含 failed 的口径钉）
     reopenDefault(dbPath);
     const failedCard = mustOk(handleFeatureCreate({ title: "failed 卡", version: "1.0.0" }, "g1"));
+    mustOk(
+      handleFeatureAdvance({ featureId: failedCard.featureId, to: "waiting_approval", version: "1.0.0" }, "g1"),
+    );
+    mustOk(
+      handleFeatureAdvance(
+        {
+          featureId: failedCard.featureId,
+          to: "waiting_approval",
+          stage: "改造方案",
+          approval: "待审批",
+          // 门① 第二前提 + 门② ⑥（增补 `ec93e1bd`）：抬 stage 同单双档在册，approve 才放行
+          decisions: CONFIRMATION_DECISIONS,
+        },
+        "g1",
+      ),
+    );
+    // 本档只要「已过门 ⇒ 立刻 `failed`」的归档面 ⇒ 不过归属门格（停在 version_planning 即可转 failed）
     mustOk(handleFeatureApprove({ featureId: failedCard.featureId }, "g1"));
     mustOk(handleFeatureAdvance({ featureId: failedCard.featureId, to: "failed" }, "g1"));
     close();

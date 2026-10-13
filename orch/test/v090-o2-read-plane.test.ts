@@ -347,12 +347,22 @@ test("B3″ listEvents(featureId) 只读收窄 + 负向：读面扫过后宿主 
 // ---------------------------------------------------------------------------
 
 test("B3″ feature.stage：create 不发；advance / approve 真变化各发一条并带 from/to", () => {
+  // v0.10.5 O4 门① version 守卫：`stage`「需求分析 → 改造方案」要求 `version` 非空 ⇒ 先排期
+  versionLedgerCreate({ ownerGroup: "gA", version: "v0.9.0" });
   const featureId = featureIdOf(
-    coreA.featureCreate({ title: "登记流水", stage: "需求分析", approval: "未发起" }),
+    coreA.featureCreate({ title: "登记流水", version: "v0.9.0" }),
   );
   assert.equal(stageEvents(featureId).length, 0, "create 是建行不是变更 ⇒ 零事件（既有迁移纪律）");
 
-  mustOk(coreA.featureAdvance({ featureId, to: "waiting_approval", stage: "改造方案" }));
+  // 门① 第二前提（增补 bbc7ea28 O3）：抬 stage 须已登记《需求确认单》档名（decisions 不产事件 ⇒ 下方计数不受影响）
+  mustOk(
+    coreA.featureAdvance({
+      featureId,
+      to: "waiting_approval",
+      stage: "改造方案",
+      decisions: '["doc/v0.9.0/夹具-需求确认单.md","doc/v0.9.0/夹具-改造文档.md"]',
+    }),
+  );
   const afterStage = stageEvents(featureId);
   assert.equal(afterStage.length, 1, "stage 真变化 ⇒ 恰一条");
   assert.deepEqual(fieldsOf(afterStage[0]), [{ field: "stage", from: "需求分析", to: "改造方案" }]);
@@ -391,7 +401,7 @@ test("B3″ feature.stage：同值重复写 ⇒ 零事件；同单多字段 ⇒ 
   // v0.10.0 §7 排期写状态锁：写 `version` 仅当卡处 `需求分析 ∧ 未发起`；存在性亦已执法 ⇒ 先建卡态 + 预登记版号。
   versionLedgerCreate({ ownerGroup: "gA", version: "v0.9.0" });
   // ① 同值重复写（宿主把同一 stage / 同一 version 再 advance 一次）
-  const a = featureIdOf(coreA.featureCreate({ title: "重复写", stage: "需求分析", approval: "未发起" }));
+  const a = featureIdOf(coreA.featureCreate({ title: "重复写" }));
   mustOk(coreA.featureAdvance({ featureId: a, to: "waiting_approval", stage: "需求分析" }));
   assert.equal(stageEvents(a).length, 0, "stage 同值 ⇒ 零事件");
   mustOk(coreA.featureAdvance({ featureId: a, to: "waiting_approval", version: "v0.9.0" }));
@@ -402,7 +412,10 @@ test("B3″ feature.stage：同值重复写 ⇒ 零事件；同单多字段 ⇒ 
   assert.equal(stageEvents(a).length, 1, "approval 写同值（已「未发起」）⇒ 仍零事件");
 
   // ② 同单多字段变更 ⇒ 恰好一条（一次 advance 是一次事实）
-  const b = featureIdOf(coreA.featureCreate({ title: "同单多字段", stage: "需求分析", approval: "未发起" }));
+  // v0.10.5 O6 序列改造：门① version 守卫 ⇒ stage「需求分析」外迁要求**建卡时** version 已非空
+  // （原形态「同单先写 version 再迁 stage」会被整单拒收 ⇒ 改为 create 带版号、advance 改版 + 迁 stage）
+  versionLedgerCreate({ ownerGroup: "gA", version: "v0.9.2" });
+  const b = featureIdOf(coreA.featureCreate({ title: "同单多字段", version: "v0.9.2" }));
   mustOk(
     coreA.featureAdvance({
       featureId: b,
@@ -410,6 +423,8 @@ test("B3″ feature.stage：同值重复写 ⇒ 零事件；同单多字段 ⇒ 
       stage: "改造方案",
       version: "v0.9.0",
       approval: "未发起",
+      // 门① 第二前提（增补 bbc7ea28 O3）：抬 stage 须已登记《需求确认单》档名
+      decisions: '["doc/v0.9.0/夹具-需求确认单.md","doc/v0.9.0/夹具-改造文档.md"]',
     }),
   );
   const bEvents = stageEvents(b);

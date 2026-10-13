@@ -113,6 +113,19 @@ test("M4-④ renderSchedule: 列头 = 版本号 + 卡片数；卡固定四行（
   assert.doesNotMatch(html, /class="kcol"[^>]*><h3>[^<]*待审批/, "按状态分列不做：列头只有版本号");
 });
 
+test("M4-④b 新两态徽标命中中文（v0.10.5 B3）：定版中（version_planning）/ 拆任务中（decomposing）+ 兜底未命中原样透出", () => {
+  const html = renderSchedule(
+    groupFeaturesByVersion([
+      feature("F1", "v0.10.5", { state: "version_planning" }),
+      feature("F2", "v0.10.5", { state: "decomposing" }),
+      feature("F3", "v0.10.5", { state: "future_state" }),
+    ]),
+  );
+  assert.match(html, /<span class="kbadge">定版中（version_planning）<\/span>/, "新格 version_planning 命中中文徽标（原值同屏语义不变）");
+  assert.match(html, /<span class="kbadge">拆任务中（decomposing）<\/span>/, "新格 decomposing 命中中文徽标（原值同屏语义不变）");
+  assert.match(html, /<span class="kbadge">future_state<\/span>/, "兜底分支不动：未命中态原样透出、不吞不猜");
+});
+
 test("M4-⑤ renderSchedule: 空看板如实文案（未排期不进本页，归需求池）；标题 XSS 转义", () => {
   assert.match(renderSchedule([]), /无已排期需求/);
   assert.match(renderSchedule([]), /需求池/);

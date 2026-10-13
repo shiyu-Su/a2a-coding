@@ -37,11 +37,13 @@ import {
   ERR_PROJECT_VERSION_SHAPE,
   featureProjectDelete,
   featureProjectListByFeature,
+  featureProjectUpsert,
   getFeature,
   projectVersionCreate,
   projectVersionGet,
   projectVersionList,
   releaseSnapshotGet,
+  updateFeatureRegistration,
   updateFeatureState,
   versionLedgerCreate,
   versionLedgerGet,
@@ -201,25 +203,71 @@ function nextTitle(tag: string): string {
   return `o8-${tag}-${seq}`;
 }
 
-/** 一张提卡即入板、**未过门**的卡（`waiting_approval` + `未发起`） */
+/** 一张提卡即入板、**未过门**的卡（`waiting_approval` + `未发起` = v0.10.5 O4 起的 create 初值） */
 function poolFeature(version: string, group = GROUP): string {
-  return mustOk(
-    handleFeatureCreate({ title: nextTitle("pool"), version, stage: "需求分析", approval: "未发起" }, group),
-  ).featureId;
+  return mustOk(handleFeatureCreate({ title: nextTitle("pool"), version }, group)).featureId;
 }
 
-/** 一张已过门（`executing` + `已通过`）的卡（`create` 缺省即 `待审批` ⇒ 直接 `approve` 放行） */
+/** 一张已过门（`executing` + `已通过`）的卡（过门序列见下 {@link passGate}） */
 function approvedFeature(version: string, group = GROUP): string {
-  const created = mustOk(handleFeatureCreate({ title: nextTitle("main"), version }, group));
-  mustOk(handleFeatureApprove({ featureId: created.featureId }, group));
-  return created.featureId;
+  const featureId = mustOk(handleFeatureCreate({ title: nextTitle("main"), version }, group)).featureId;
+  passGate(featureId, group);
+  return featureId;
 }
 
-/** 过第一道门（需求确认）+ 落改造文档（`approval=待审批`）+ `approve` 放行 */
+/** 跳板归属的身份（只服务过格 ⇒ 落库后立即经数据面删除，不进任何归属计数） */
+const GATE_PROJECT = "o5-gate";
+const GATE_PROJECT_VERSION = "9.9.9";
+
+/**
+ * 抬 `stage` 那一单携带的产出物登记夹具 —— 门① 第二前提（增补 `bbc7ea28` O3）要《需求确认单》、
+ * 门② 的 ⑥（增补 `ec93e1bd`）要《改造文档》。两枚必须**同单在册**：`decisions` 是整值替换，
+ * 过门时按当场值逐枚查 ⇒ 只登记其一不放行。
+ */
+const CONFIRMATION_DECISIONS = '["doc/v0.10.1/夹具-需求确认单.md","doc/v0.10.1/夹具-改造文档.md"]';
+
+/**
+ * 过门序列（v0.10.5 O5 新契约定稿，写死照用）：
+ * `advance(to=当前态, version=<非空>)` → `advance(to=当前态, stage="改造方案", approval="待审批")` →
+ * `approve` ⇒ `version_planning`（**create 不传 `stage` / `approval`**，初值恒定「需求分析 / 未发起」）。
+ * 随后跨 O4 的**归属门双挂**两格出口落 `executing`：门判据 = 归属非空，而本文件的用例要的是「过门本身
+ * 不落归属」（C-3 写点在过门之后）⇒ 借一枚跳板归属过 `version_planning → decomposing → executing`，
+ * 过完立即经 store 数据面删除（不经本文件的执法面）。
+ * 无 Group Version 的卡（跳板归属无处落 `group_version`）不过格，停在 `version_planning`。
+ */
 function passGate(featureId: string, group = GROUP): void {
-  mustOk(handleFeatureAdvance({ featureId, to: "waiting_approval", stage: "改造方案" }, group));
-  mustOk(handleFeatureAdvance({ featureId, to: "waiting_approval", approval: "待审批" }, group));
+  const feature = getFeature(featureId);
+  const groupVersion = feature?.version ?? "";
+  if (groupVersion !== "") {
+    mustOk(handleFeatureAdvance({ featureId, to: "waiting_approval", version: groupVersion }, group));
+  }
+  mustOk(
+    handleFeatureAdvance(
+      {
+        featureId,
+        to: "waiting_approval",
+        stage: "改造方案",
+        approval: "待审批",
+        decisions: CONFIRMATION_DECISIONS,
+      },
+      group,
+    ),
+  );
   mustOk(handleFeatureApprove({ featureId }, group));
+  if (groupVersion === "") return;
+  mustOk(
+    featureProjectUpsert({
+      ownerGroup: group,
+      featureId,
+      projectId: GATE_PROJECT,
+      projectVersion: GATE_PROJECT_VERSION,
+      groupVersion,
+      source: "o5-gate",
+    }),
+  );
+  mustOk(handleFeatureAdvance({ featureId, to: "decomposing" }, group));
+  mustOk(handleFeatureAdvance({ featureId, to: "executing" }, group));
+  assert.equal(featureProjectDelete(group, featureId, GATE_PROJECT).deleted, true);
 }
 
 /** 归属写的成功出口（`to` = 当前态 ⇒ 只写归属、不动主链）；期望被拒的用例走 `tryAttribute` */
@@ -535,7 +583,12 @@ test("O8 判据 (a) 差集档：无 Group Version 的需求落不下归属（C-2
   try {
     seedProjectVersion({ ownerGroup: GROUP, projectId: "orch", version: "0.1.0" });
     const featureId = mustOk(handleFeatureCreate({ title: nextTitle("noversion") }, GROUP)).featureId;
-    mustOk(handleFeatureApprove({ featureId }, GROUP));
+    // 无 Group Version ⇒ 走不了门①（`stage` 迁移被 version 守卫挡）；本档只把 `approval` 写足再过审，
+    // 卡停在 `version_planning`（跳板归属无处落 `group_version` ⇒ 不过格）——归属写仍须被同一码挡。
+    // 「无 version 却已过审」这一形态自增补 `ec93e1bd`（门② 六条的 ③）起**不可由 `approve` 产出**
+    // ⇒ 本档要钉的是归属写锁的判据（`version` 为空即挡），改由 store 直写铺出，判据本身不变。
+    updateFeatureRegistration(featureId, { approval: "已通过" });
+    updateFeatureState(featureId, "version_planning");
     const failure = mustFail(tryAttribute(featureId, [{ projectId: "orch", version: "0.1.0" }]));
     assert.equal(failure.code, ERR_ATTRIBUTION_STATE_LOCKED);
     assert.equal(featureProjectListByFeature(featureId).length, 0);

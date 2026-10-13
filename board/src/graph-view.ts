@@ -36,8 +36,48 @@
  * —— 管道 = 每 project 一个原生 `<details class="pipe" open>`，节点 = 只标 `#编号` 的 chip
  * （全量 taskId / 状态 / 依赖原值进 `title`）；同管道相邻 chip 间插 `<span class="dg-arrow">→</span>`；
  * 跨管道依赖只出 chip 右上角标 `⇠#k`（≤{@link MAX_DEP_MARKS} 枚，超出折叠 `⇠+#m`）+ 图区底部一行
- * 边清单，**不画线**（体内零连线坐标层）。**图形 HTML 内不出现 prompt 的任何子串**（负向锚 N-2）；
+ * 边清单，**不画线**（体内零连线坐标层）。
+ * ↑ 本段的「位置性箭头」与「体内零连线坐标层」两句已由 **v0.10.5 G5** 推翻（改造文档 §2.1），管道制
+ * 的其余形态（原生 `details.pipe` / `#编号` chip / `title` 全量 / 角标族 / 底部边清单）**逐字继承**。
+ * **图形 HTML 内不出现 prompt 的任何子串**（负向锚 N-2）；
  * **零 script 标签**（不入 n3 可执行内联闭集，也不出数据通道形态）。
+ *
+ * **v0.10.5 G1（REQ-2026-10-12-02 · 改造文档 §2.4-①②）**：渲染层之前补两枚**分层纯函数** ——
+ * {@link layerOfGraph}（全图 Kahn + longest-path，**层距吃全 `edges`** 含跨管道边；**v0.10.5 N2 起入边 = 约简后
+ * `kept`**，层号与吃全边集逐键相同 —— 见测试面「N1约简-④层号差分不变」）与
+ * {@link compressPipeLayers}（每管道把全局层号压成密列）。本节点**不算几何、不渲染、不碰 CSS**。
+ *
+ * **v0.10.5 G2（改造文档 §2.3 / §2.4-③ / §2.5-I4）**：网格几何的**单一事实源** —— `DG_*` 常量块
+ * 与 {@link pipeGridLayout}（列内号序 → `cells[]` + `colX/rowY` + 通道 `lanes[]` / 带 `busLanes[]`
+ * + `width/height`，全整数）。尺寸数字**只在此处存在**，渲染侧经 inline CSS 变量下发；
+ * 本节点**不走线、不产 HTML / CSS、不引布局库**。
+ *
+ * **v0.10.5 G3（改造文档 §2.4-④ / §2.5-I2 I3 / §2.6）**：管道内走线纯函数 {@link routeIntraEdges}
+ * —— 相邻边一枚三次贝塞尔、长边三段（下降弧 → 通道带水平段 → 上升弧，Q1/Q2 处切线同为水平
+ * ⇒ C¹ 连续），出参只给 `d` / `cls`（**不带 HTML**）；`busLane` 按 x 区间装箱、`λ/μ` 按同通道
+ * y 区间装箱。端点 = {@link PipeGridCell} 的边框中点定义式（I2）。**不渲染、不产 HTML、不碰 CSS、
+ * 不画跨管道边、不上减交叉**（用户已裁：允许交叉、只禁共段）。
+ *
+ * **v0.10.5 G5（改造文档 §2.2 / §2.7-④⑤⑥⑦）**：渲染层接管 —— `renderPipeline()` 的病根句
+ * `join('<span class="dg-arrow">→</span>')` **退役**，`.pipe-body` 内改三层包裹：`<div class="dg-grid">`
+ * （inline 下发 `--dg-nw/--dg-nh/--dg-bh` + `width/height`）内含 **每管道恰一枚** `<svg class="dg-links">`
+ * （只出 `<path class="dg-edge" d="…"/>`，**不写** `viewBox` / `width` / `height` / `aria-hidden` ⇒
+ * 用户单位 = CSS px 1:1）+ 每节点一枚 `<span class="dg-cell" style="left:…;top:…">`。
+ * chip 出参字面逐字不动（`⇠#k` 角标**去 sup 内联** ⇒ 移到 cell 的独立角标带 `.dg-deps`，字面与相邻关系不变）。
+ * **带引号属性闭集 = `class` / `title` / `style` / `d`**；inline `style` **只含几何字面**（零 `position:` 声明，
+ * 定位归 CSS）。网格几何走**一次预算回灌**（先走线取 lane 数 → 重算网格 → 再走线），与测试面 `g45Layout` 同形态。
+ * 跨管道机制（`crossIn` / `crossEdgeTexts` / 底部边清单 / 图例 / `hint warn`）**逐字不动**
+ * （**v0.10.5 N2 起本句只指机制** —— 这些面**消费的边集已是约简后 `kept`**：机制逐字不动 ≠ 入边逐字不动，
+ * 见下 N2 段与 {@link transitiveReduce}）；
+ * **不碰 CSS**（N6）· **零脚本**（八元内联闭集不扩）。
+ *
+ * **v0.10.5 N2（REQ-2026-10-12-04 · 改造文档 §2.3-2 / §2.3-3）**：section 层在全图**单次**传递约简，
+ * 五个消费点（`layerOfGraph` / `crossIn` / `crossEdgeTexts` / `planPipe` 走线入参 / `h2` 计数）
+ * **共用同一份 `kept`** —— 分开跑会让走线与 `⇠#k` 角标互相不一致。`h2` 抬为**恒全形**
+ * `依赖图（N 任务 · M 管道 · 声明 K 边（本质 J · 传递省略 R））`（`R = 0` 也出「传递省略 0」，
+ * 它是「已核过、确实不冗余」的正向凭据）；`dropped` **只出计数、不逐条列、不进 `hint warn` 行**
+ * （该行语义只列「画不出的边」= `dangling` / `cycleEdges`）。三处审计面（执行明细依赖列 /
+ * `renderChip` 依赖段 / 等待列 `blockedOn`）**恒保声明原值** —— 两面口径不同是设计而非缺陷。
  */
 import type { FeatureTaskItem, TraceNode } from "./bridge-client.js";
 import { escapeHtml } from "./web/layout.js";
@@ -211,6 +251,65 @@ export function buildTaskGraph(tasks: readonly FeatureTaskItem[]): TaskGraph {
   return { nodes, edges, dangling, cycleEdges };
 }
 
+// ---------------------------------------------------------------------------
+// v0.10.5 N1（REQ-2026-10-12-04 · 改造文档 §2.3-1）：传递约简（构图之后、分层之前的纯函数，无渲染接线）
+// ---------------------------------------------------------------------------
+
+/** {@link transitiveReduce} 出参：本质边集 `kept` 与传递省略边集 `dropped`（两集均按 {@link edgeKey} 定序）。 */
+export interface TransitiveReduction {
+  readonly kept: readonly { from: string; to: string }[];
+  readonly dropped: readonly { from: string; to: string }[];
+}
+
+/**
+ * `to` 在 `E ∖ {(from,to)}` 上是否仍自 `from` 可达 —— 删边测试的单边判据。
+ * 起点 `from` 自身先入 `visited`（既排除「空路径自可达」，也保证脏入参含环时必终止）；
+ * 源点的直接后继先剔掉 `to` 一枚 ⇒ 「本边自己一跳」不计入替代路径。
+ */
+function reachableWithoutEdge(successors: Map<string, string[]>, from: string, to: string): boolean {
+  const visited = new Set<string>([from]);
+  const stack = (successors.get(from) ?? []).filter((t) => t !== to);
+  while (stack.length > 0) {
+    const id = stack.pop() as string;
+    if (id === to) return true;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    for (const next of successors.get(id) ?? []) {
+      if (!visited.has(next)) stack.push(next);
+    }
+  }
+  return false;
+}
+
+/**
+ * 传递约简（改造文档 §2.3-1）：保留 `(u,v)` ⟺ 在 `E ∖ {(u,v)}` 上 `v ∉ reach(u)`。
+ *
+ * **前置条件**：入参已由 {@link buildTaskGraph} 去重 + 滤环 + 去悬空 ⇒ 恒为 DAG；
+ * **不得**以 `cycleEdges` / `dangling` 为输入。
+ * - **在只读原边集上算一次、不得边删边判**：DAG 上任何长度 ≥2 的 `u⇝v` 路径都不经过 `(u,v)` 自身
+ *   ⇒「是否冗余」是**原边集 `E` 上的不变量**、与判边序无关 ⇒ 结果即极大元唯一表示（贪心原地删边
+ *   会把 `b→c` 这类本质边一并吞掉）。
+ * - 出参两集按 {@link edgeKey} 定序 ⇒ 同一边集任意数组序、重复调用逐字相等；入参数组与边对象只读、不回写。
+ * - 消费方 = 渲染层五个消费点共用同一 `kept`（§2.3-2）；三处审计面仍取声明原值（§2.3-5）。
+ */
+export function transitiveReduce(edges: readonly { from: string; to: string }[]): TransitiveReduction {
+  const successors = new Map<string, string[]>();
+  for (const e of edges) {
+    const list = successors.get(e.from);
+    if (list) list.push(e.to);
+    else successors.set(e.from, [e.to]);
+  }
+  const kept: { from: string; to: string }[] = [];
+  const dropped: { from: string; to: string }[] = [];
+  for (const e of edges) {
+    if (reachableWithoutEdge(successors, e.from, e.to)) dropped.push(e);
+    else kept.push(e);
+  }
+  const byKey = (a: { from: string; to: string }, b: { from: string; to: string }): number =>
+    edgeKey(a) < edgeKey(b) ? -1 : 1;
+  return { kept: kept.sort(byKey), dropped: dropped.sort(byKey) };
+}
+
 /**
  * 任务编号单点（v0.10.3 N1）：taskId → 1..N 的**执行序编号**，由 `queuedAt` 升序派生。
  *
@@ -305,6 +404,496 @@ export function buildGraphWithPipelines(tasks: readonly FeatureTaskItem[]): Task
   const graph = buildTaskGraph(tasks);
   const ordinals = taskOrdinalMap(tasks);
   return { ...graph, pipelines: groupPipelines(graph, ordinals) };
+}
+
+// ---------------------------------------------------------------------------
+// v0.10.5 G1（REQ-2026-10-12-02 · 改造文档 §2.4-①②）：全局分层 + 密列压缩（纯派生，无几何 / 无 HTML）
+// ---------------------------------------------------------------------------
+
+/** 号序比较（`ordinals` 缺号 ⇒ `+∞` 沉底、同值按 `taskId` 升序兜稳）—— 与 {@link groupPipelines} 同口径。 */
+const byOrdinal = (ordinals: Map<string, number>) => (a: string, b: string): number => {
+  const oa = ordinals.get(a) ?? Number.POSITIVE_INFINITY;
+  const ob = ordinals.get(b) ?? Number.POSITIVE_INFINITY;
+  if (oa !== ob) return oa < ob ? -1 : 1;
+  return a < b ? -1 : a > b ? 1 : 0;
+};
+
+/**
+ * 全局层号（taskId → 层号，0 起）—— **全图** Kahn 拓扑 + longest-path（改造文档 §2.4-①）。
+ *
+ * - **层距吃全 `edges`（含跨管道边，C3 采纳口径）** ⇒「只依赖他管道节点」的节点照被抬层，
+ *   不会因本管道内无入边而落 layer 0（负钉，由 {@link compressPipeLayers} 侧的列号承接）。
+ * - 入参 `edges` 已由 {@link buildTaskGraph} 滤环 + 去悬空 ⇒ 恒为 DAG，**本函数不再自行净化**
+ *   （无环检测、无环边丢弃）；端点不在 `nodes` 全集的边不入邻接（边集按契约已是节点集的子集）。
+ * - 确定性 = **就绪集按 `ordinals` 号序取**；longest-path 的层号只由前驱集决定 ⇒ 同一图的
+ *   任意入参数组序、重复调用均逐键相等。
+ * - 出参键 = `nodes` 全集 taskId（无入边者 ⇒ 0，含孤立节点，不吞不猜）；节点对象只读、不回写。
+ */
+export function layerOfGraph(
+  nodes: readonly FeatureTaskItem[],
+  ordinals: Map<string, number>,
+  edges: readonly { from: string; to: string }[],
+): Map<string, number> {
+  const layer = new Map<string, number>();
+  const successors = new Map<string, string[]>();
+  const remaining = new Map<string, number>();
+  for (const n of nodes) {
+    layer.set(n.taskId, 0);
+    successors.set(n.taskId, []);
+    remaining.set(n.taskId, 0);
+  }
+  for (const e of edges) {
+    if (!layer.has(e.from) || !layer.has(e.to)) continue;
+    successors.get(e.from)?.push(e.to);
+    remaining.set(e.to, (remaining.get(e.to) ?? 0) + 1);
+  }
+  const order = byOrdinal(ordinals);
+  while (remaining.size > 0) {
+    let pick: string | null = null;
+    for (const [id, left] of remaining) {
+      if (left !== 0) continue;
+      if (pick === null || order(id, pick) < 0) pick = id;
+    }
+    if (pick === null) break;
+    remaining.delete(pick);
+    const next = (layer.get(pick) ?? 0) + 1;
+    for (const succ of successors.get(pick) ?? []) {
+      if (next > (layer.get(succ) ?? 0)) layer.set(succ, next);
+      remaining.set(succ, (remaining.get(succ) ?? 0) - 1);
+    }
+  }
+  return layer;
+}
+
+/**
+ * 密列压缩（taskId → 该管道内的**列号**）—— 把管道内节点的全局层号压成密列
+ * （该管道无节点的中间列不占位，改造文档 §2.4-②）。可证性质：
+ * - **每列非空**、列号从 0 起且连续（值域 = `0..K-1`，K = 该管道出现过的层号枚数）；
+ * - **保序**：全局层号升序 ⇔ 列号严格升序 ⇒「画线边列差 ≥2 ⇔ 中间必有本管道节点」成立；
+ * - 出参插入序 = 列号升序、同列内沿用 `pipe.nodes` 的号序（{@link groupPipelines} 已排）。
+ * 层号缺失 ⇒ 按 0 档（`layerOfGraph` 出参恒覆盖 `nodes` 全集，此路只对窄 `layers` 手工入参生效）。
+ */
+export function compressPipeLayers(pipe: GraphPipeline, layers: Map<string, number>): Map<string, number> {
+  const columnNodes = new Map<number, string[]>();
+  for (const n of pipe.nodes) {
+    const lv = layers.get(n.taskId) ?? 0;
+    const list = columnNodes.get(lv);
+    if (list) list.push(n.taskId);
+    else columnNodes.set(lv, [n.taskId]);
+  }
+  const out = new Map<string, number>();
+  [...columnNodes.keys()]
+    .sort((a, b) => a - b)
+    .forEach((lv, col) => {
+      for (const id of columnNodes.get(lv) ?? []) out.set(id, col);
+    });
+  return out;
+}
+
+// ---------------------------------------------------------------------------
+// v0.10.5 G2（REQ-2026-10-12-02 · 改造文档 §2.3 / §2.4-③ / §2.5-I4）：
+// 网格几何单一事实源 —— DG_* 常量块 + pipeGridLayout（纯几何；不走线、不产 HTML/CSS）
+// ---------------------------------------------------------------------------
+
+/** chip 盒宽（`box-sizing:border-box` ⇒ 右缘恒 = `x + DG_NODE_W`，与 `#n` 位数无关）。 */
+export const DG_NODE_W = 74;
+/** chip 盒高。 */
+export const DG_NODE_H = 28;
+/** 角标带高 —— 每 cell **恒**预留（`⇠#k` 枚数不进 chip 盒，故定宽不被角标撑破）。= 结构事实：外壳恒渲。 */
+export const DG_BADGE_H = 14;
+/** 同列相邻 cell 的纵距。 */
+export const DG_ROW_GAP = 4;
+/** 列间通道带宽下界（吃角标越界：`DG_BADGE_MAX_W - DG_NODE_W = 56 ≤ 56` —— **取等**，不是余量）。 */
+export const DG_COL_GAP_MIN = 56;
+/** 通道内相邻 lane 的 x 间距（λ / μ 的步长）。 */
+export const DG_LANE_PITCH = 14;
+/** 首 lane 距 chip 边的下界（一个通道两侧各留一枚 ⇒ 公式里的 `DG_LANE_MIN * 2`）。 */
+export const DG_LANE_MIN = 22;
+/** 贝塞尔首段控制点长上界（走线侧消费；定义在此，几何单源）。 */
+export const DG_ARC_K_MAX = 34;
+/** 底部通道带每 lane 的高。 */
+export const DG_BUS_PITCH = 12;
+/** 左内缘（= `COL_X[0]`）。 */
+export const DG_PAD_L = 12;
+/** 上内缘（= `ROW_Y[0]`）。 */
+export const DG_PAD_T = 12;
+/** 下内缘（I4 的高度加数）。 */
+export const DG_PAD_B = 12;
+/** 右内缘 —— 最后一列角标越界的**下界**（上界由 I4 用 {@link DG_BADGE_MAX_W} 算足）。 */
+export const DG_PAD_R = 96;
+/**
+ * 角标带越界的**设计界**（改造文档 §2.3 C2：`MAX_DEP_MARKS`=3 + 1 枚折叠 ⇒ 至多 4 枚 × ~32px ≤ 130）。
+ * 供 I4 算足宽度用；**不是机器度量**（SSR 侧无 DOM 度量，真机目测 = G6）。
+ */
+export const DG_BADGE_MAX_W = 130;
+
+/** 单 cell 盒高（角标带 + chip）。 */
+const DG_CELL_H = DG_BADGE_H + DG_NODE_H;
+
+/** {@link pipeGridLayout} 的一枚格位（`x/y` = cell 盒左/上缘；chip 盒在角标带之下）。 */
+export interface PipeGridCell {
+  readonly taskId: string;
+  /** `taskOrdinalMap` 号（纯标识 —— 分层后列序由依赖决定，号序只管列内排布）。 */
+  readonly ordinal: number;
+  readonly col: number;
+  readonly row: number;
+  readonly x: number;
+  readonly y: number;
+  readonly w: number;
+  readonly h: number;
+  /** chip 左缘（= `x`）。 */
+  readonly chipX: number;
+  /** chip 顶缘（= `y + DG_BADGE_H`）。 */
+  readonly chipY: number;
+  /** 端点定义式的源侧横坐标：chip 右缘。 */
+  readonly chipRight: number;
+  /** 端点定义式的纵坐标：chip 右边（左边同）中点。 */
+  readonly chipMidY: number;
+}
+
+/** {@link pipeGridLayout} 的走线预算入参（lane 数由走线侧回灌，**一次收敛不迭代**）。 */
+export interface PipeGridBudget {
+  /** 第 `c` 枚列间通道预留的 lane 数（长度 ≤ `cols-1`，缺省项与非正值按 0 计）。 */
+  readonly gapLanes?: readonly number[];
+  /** 底部通道带的 lane 数（缺省 0 ⇒ 带高 0）。 */
+  readonly busLaneCount?: number;
+}
+
+/** {@link pipeGridLayout} 出参（全整数值；I4 两条不等式由构造保证）。 */
+export interface PipeGridLayout {
+  /** 格位序 = 列号升序、同列内号序升序。 */
+  readonly cells: readonly PipeGridCell[];
+  /** taskId → 格位（走线 / 渲染侧的取数面）。 */
+  readonly cellOf: Map<string, PipeGridCell>;
+  readonly cols: number;
+  readonly rows: number;
+  readonly colX: readonly number[];
+  readonly rowY: readonly number[];
+  /** 第 `c` 枚通道宽（长度 = `cols-1`），恒 ≥ {@link DG_COL_GAP_MIN}。 */
+  readonly gapW: readonly number[];
+  /** 每枚通道的 lane **x 线**（与 `gapW` 同长；λ 即其下标）。 */
+  readonly lanes: readonly (readonly number[])[];
+  readonly busBandTop: number;
+  /** 底部通道带的 lane **y 线**（长度 = 预算的带内 lane 数；busLane 即其下标）。 */
+  readonly busLanes: readonly number[];
+  readonly width: number;
+  readonly height: number;
+}
+
+/** 空网格短路出参（无 cell ⇒ 无列、无行、宽高 0；每次新建，不共享可变 `cellOf`）。 */
+const emptyGrid = (): PipeGridLayout => ({
+  cells: [],
+  cellOf: new Map(),
+  cols: 0,
+  rows: 0,
+  colX: [],
+  rowY: [],
+  gapW: [],
+  lanes: [],
+  busBandTop: 0,
+  busLanes: [],
+  width: 0,
+  height: 0,
+});
+
+/**
+ * 一条管道的网格几何（纯函数，改造文档 §2.4-③）：{@link compressPipeLayers} 的列号 → 格位 / 坐标 / 通道。
+ *
+ * - **列内按号序**（`ordinals` 升序、缺号沉底、同值按 `taskId` 兜稳 —— 与 {@link groupPipelines}
+ *   同口径）⇒ 出参与入参数组序无关；`row` = 列内下标 ⇒ 同列格位两两不同，`rows` = 最大列容量。
+ * - **每列非空**：入参列号按出现值升序重编号（已是密列 ⇒ 恒等），空列在结构上不可表示。
+ * - **通道宽** `gapW[c] = max(DG_COL_GAP_MIN, DG_LANE_MIN*2 + lanes(c)*DG_LANE_PITCH)` —— lane 数由
+ *   走线预算经 `budget.gapLanes` 回灌，本函数**只消费不推算、不迭代**。
+ * - **I4 内容包含**由构造成立：`width = 最右 chip 右缘 + max(DG_PAD_R, DG_BADGE_MAX_W)`、
+ *   `height = max(最后一格底缘, 通道带底) + DG_PAD_B`。
+ * - 空管道 ⇒ 短路 {@link emptyGrid}（渲染侧 `tasks.length===0` 的短路不受影响）。
+ */
+export function pipeGridLayout(
+  pipe: GraphPipeline,
+  columns: Map<string, number>,
+  ordinals: Map<string, number>,
+  budget: PipeGridBudget = {},
+): PipeGridLayout {
+  if (pipe.nodes.length === 0) return emptyGrid();
+
+  const colOf = (taskId: string): number => columns.get(taskId) ?? 0;
+  const colKeys: number[] = [];
+  for (const n of pipe.nodes) {
+    const c = colOf(n.taskId);
+    if (!colKeys.includes(c)) colKeys.push(c);
+  }
+  colKeys.sort((a, b) => a - b);
+
+  const order = byOrdinal(ordinals);
+  const groups: string[][] = colKeys.map(() => []);
+  for (const n of [...pipe.nodes].sort((a, b) => order(a.taskId, b.taskId))) {
+    groups[colKeys.indexOf(colOf(n.taskId))]?.push(n.taskId);
+  }
+
+  const cols = colKeys.length;
+  const rows = Math.max(...groups.map((g) => g.length));
+
+  const gapCount: number[] = [];
+  const gapW: number[] = [];
+  for (let c = 0; c < cols - 1; c += 1) {
+    const n = Math.max(0, budget.gapLanes?.[c] ?? 0);
+    gapCount.push(n);
+    gapW.push(Math.max(DG_COL_GAP_MIN, DG_LANE_MIN * 2 + n * DG_LANE_PITCH));
+  }
+
+  const colX: number[] = [DG_PAD_L];
+  for (let c = 1; c < cols; c += 1) {
+    colX.push((colX[c - 1] ?? DG_PAD_L) + DG_NODE_W + (gapW[c - 1] ?? DG_COL_GAP_MIN));
+  }
+  const lanes: number[][] = gapCount.map((n, c) =>
+    Array.from({ length: n }, (_, i) => (colX[c] ?? DG_PAD_L) + DG_NODE_W + DG_LANE_MIN + i * DG_LANE_PITCH),
+  );
+
+  const rowY = Array.from({ length: rows }, (_, r) => DG_PAD_T + r * (DG_BADGE_H + DG_NODE_H + DG_ROW_GAP));
+
+  const cellOf = new Map<string, PipeGridCell>();
+  const cells: PipeGridCell[] = [];
+  groups.forEach((ids, c) => {
+    ids.forEach((taskId, r) => {
+      const x = colX[c] ?? DG_PAD_L;
+      const y = rowY[r] ?? DG_PAD_T;
+      const chipY = y + DG_BADGE_H;
+      const cell: PipeGridCell = {
+        taskId,
+        ordinal: ordinals.get(taskId) ?? 0,
+        col: c,
+        row: r,
+        x,
+        y,
+        w: DG_NODE_W,
+        h: DG_CELL_H,
+        chipX: x,
+        chipY,
+        chipRight: x + DG_NODE_W,
+        chipMidY: chipY + DG_NODE_H / 2,
+      };
+      cells.push(cell);
+      cellOf.set(taskId, cell);
+    });
+  });
+
+  const contentRight = (colX[cols - 1] ?? DG_PAD_L) + DG_NODE_W;
+  const contentBottom = (rowY[rows - 1] ?? DG_PAD_T) + DG_CELL_H;
+  const busBandTop = contentBottom + DG_ROW_GAP;
+  const busCount = Math.max(0, budget.busLaneCount ?? 0);
+  const busLanes = Array.from({ length: busCount }, (_, i) => busBandTop + Math.floor(DG_BUS_PITCH / 2) + i * DG_BUS_PITCH);
+  const busBandBottom = busBandTop + busCount * DG_BUS_PITCH;
+
+  return {
+    cells,
+    cellOf,
+    cols,
+    rows,
+    colX,
+    rowY,
+    gapW,
+    lanes,
+    busBandTop,
+    busLanes,
+    width: contentRight + Math.max(DG_PAD_R, DG_BADGE_MAX_W),
+    height: Math.max(contentBottom, busBandBottom) + DG_PAD_B,
+  };
+}
+
+// ---------------------------------------------------------------------------
+// v0.10.5 G3（REQ-2026-10-12-02 · 改造文档 §2.4-④ / §2.5-I2 I3 / §2.6）：
+// 通道式走线 —— routeIntraEdges / arcPath / busPath（纯函数；不渲染、不产 HTML、不碰 CSS、不减交叉）
+// ---------------------------------------------------------------------------
+
+/** 边线类名（§2.2 命名纪律 2：单数 `dg-edge`、不含子串 `dg-edges`；容器类 = `dg-links` 由渲染侧给）。 */
+export const DG_EDGE_CLS = "dg-edge";
+
+/**
+ * 一条管道内一条依赖边的走线结果（**只有 path 数据与类名，不含任何 HTML**）。
+ * `adjacent` 档不占通道 ⇒ `busLane` / `lambda` / `mu` / `yb` 均为 −1。
+ */
+export interface RoutedEdge {
+  readonly from: string;
+  readonly to: string;
+  /** 该管道内的列差（`localCol` 差）：1 ⇒ 相邻弧；≥ 2 ⇒ 长边三段。 */
+  readonly colSpan: number;
+  readonly kind: "adjacent" | "long";
+  /** 底部通道带 lane 号（该边水平段所在 y 线的下标）。 */
+  readonly busLane: number;
+  /** 源侧通道（列 `a.col` 之右）的 lane 号，自源 chip 右缘起算。 */
+  readonly lambda: number;
+  /** 目标侧通道（列 `b.col` 之左）的 lane 号，自目标 chip 左缘起算。 */
+  readonly mu: number;
+  /** 该边水平段的 y 线（= `busLaneY(grid, busLane)`）。 */
+  readonly yb: number;
+  readonly cls: string;
+  readonly d: string;
+}
+
+/** 底部通道带第 `lane` 枚的 y 线 —— 与 {@link pipeGridLayout} 的 `busLanes[lane]` 同式。 */
+const busLaneY = (grid: PipeGridLayout, lane: number): number =>
+  grid.busBandTop + Math.floor(DG_BUS_PITCH / 2) + lane * DG_BUS_PITCH;
+
+/** 贝塞尔控制点长 `K = clamp(dx/3, 6, DG_ARC_K_MAX)`（取整 ⇒ 全整数几何）。 */
+const arcK = (dx: number): number => Math.max(6, Math.min(DG_ARC_K_MAX, Math.round(dx / 3)));
+
+/** 相邻边（列差 1）：一枚三次贝塞尔，**两端切线水平** ⇒ 端点即边框中点（判据 1）。 */
+export function arcPath(x0: number, y0: number, x1: number, y1: number): string {
+  const k = arcK(x1 - x0);
+  return `M${x0},${y0} C${x0 + k},${y0} ${x1 - k},${y1} ${x1},${y1}`;
+}
+
+/**
+ * 长边（列差 ≥ 2）三段：下降弧 `P0→Q1` ⇒ 通道带水平段 `Q1→Q2` ⇒ 上升弧 `Q2→P1`。
+ * Q1/Q2 两侧切线同为水平 ⇒ **C¹ 连续（无硬角）**。
+ */
+export function busPath(x0: number, y0: number, tx: number, yb: number, tx2: number, x1: number, y1: number): string {
+  const k1 = arcK(tx - x0);
+  const k2 = arcK(x1 - tx2);
+  return (
+    `M${x0},${y0} C${x0 + k1},${y0} ${tx - k1},${yb} ${tx},${yb}` +
+    ` L${tx2},${yb} C${tx2 + k2},${yb} ${x1 - k2},${y1} ${x1},${y1}`
+  );
+}
+
+/**
+ * 区间装箱（贪心）：按入参序取「与同 lane 已放区间**两两不交**」的首枚，不交 ⇒ 复用，否则另开一枚。
+ * 出参下标 = 入参下标（lane 号自 0 起）。**相切按不交的反面处理**（保守另开 ⇒ 只多占 lane、不叠线）。
+ */
+const packLanes = (items: readonly { lo: number; hi: number }[]): number[] => {
+  const used: { lo: number; hi: number }[][] = [];
+  const out: number[] = [];
+  for (const it of items) {
+    let lane = used.length;
+    for (let i = 0; i < used.length; i += 1) {
+      const slots = used[i];
+      if (slots !== undefined && slots.every((s) => it.hi < s.lo || it.lo > s.hi)) {
+        lane = i;
+        break;
+      }
+    }
+    if (lane === used.length) used.push([]);
+    used[lane]?.push({ lo: it.lo, hi: it.hi });
+    out.push(lane);
+  }
+  return out;
+};
+
+const ySpan = (ya: number, yb: number): { lo: number; hi: number } => ({
+  lo: Math.min(ya, yb),
+  hi: Math.max(ya, yb),
+});
+
+/** 装箱前的可写计划（`lane` 号在装箱阶段回填）。 */
+interface RoutePlan {
+  readonly a: PipeGridCell;
+  readonly b: PipeGridCell;
+  readonly kind: "adjacent" | "long";
+  busLane: number;
+  lambda: number;
+  mu: number;
+  yb: number;
+}
+
+/**
+ * 一枚管道的全部**管道内边**走线（纯函数，改造文档 §2.4-④）。
+ *
+ * - 入参 = 图的边集 + {@link pipeGridLayout} 的网格；两端不同都落在这枚网格里的边（**跨管道边**）
+ *   直接跳过 ⇒ 结构上不可能画线（跨管道只留角标 + 底部边清单，机制逐字不变）。
+ * - **定序** = （源号序, 目标号序）升序、同值按 taskId 兜稳 ⇒ 出参与入参数组序无关（确定性可单测）。
+ * - 相邻边 = {@link arcPath}；长边 = {@link busPath}，`tx = x0 + DG_LANE_MIN + λ·DG_LANE_PITCH`、
+ *   `tx2 = x1 − DG_LANE_MIN − μ·DG_LANE_PITCH`（与网格 `lanes[]` 的 x 线同式）、`yb` = 通道带 lane 线。
+ * - **装箱**：`busLane` 复用条件 = x 区间两两不交；`λ`（源侧通道）与 `μ`（目标侧通道）**分席各自装箱**，
+ *   复用条件 = 两条边在该通道的 y 区间不交。分席 ⇒ 同一通道的预算取「λ 枚数 + μ 枚数」即无 x 碰撞
+ *   （λ 自左起算、μ 自右起算，各自的下标区间在通道内首尾相接、不重叠）。
+ * - 列差 ≤ 1 的边不占任何 lane；**不减交叉**（§2.6：允许交叉、只禁共段）。
+ */
+export function routeIntraEdges(
+  edges: readonly { from: string; to: string }[],
+  grid: PipeGridLayout,
+): readonly RoutedEdge[] {
+  const plans: RoutePlan[] = [];
+  for (const e of edges) {
+    const a = grid.cellOf.get(e.from);
+    const b = grid.cellOf.get(e.to);
+    if (a === undefined || b === undefined) continue;
+    plans.push({
+      a,
+      b,
+      kind: b.col - a.col >= 2 ? "long" : "adjacent",
+      busLane: -1,
+      lambda: -1,
+      mu: -1,
+      yb: -1,
+    });
+  }
+  plans.sort((x, y) => {
+    if (x.a.ordinal !== y.a.ordinal) return x.a.ordinal - y.a.ordinal;
+    if (x.b.ordinal !== y.b.ordinal) return x.b.ordinal - y.b.ordinal;
+    if (x.a.taskId !== y.a.taskId) return x.a.taskId < y.a.taskId ? -1 : 1;
+    return x.b.taskId < y.b.taskId ? -1 : x.b.taskId > y.b.taskId ? 1 : 0;
+  });
+
+  const longs = plans.filter((p) => p.kind === "long");
+  const busPacked = packLanes(longs.map((p) => ({ lo: p.a.chipRight, hi: p.b.chipX })));
+  longs.forEach((p, i) => {
+    p.busLane = busPacked[i] ?? 0;
+    p.yb = busLaneY(grid, p.busLane);
+  });
+
+  const grouped = (keyOf: (p: RoutePlan) => number): Map<number, RoutePlan[]> => {
+    const out = new Map<number, RoutePlan[]>();
+    for (const p of longs) {
+      const k = keyOf(p);
+      const list = out.get(k);
+      if (list) list.push(p);
+      else out.set(k, [p]);
+    }
+    return out;
+  };
+  for (const group of grouped((p) => p.a.col).values()) {
+    const packed = packLanes(group.map((p) => ySpan(p.a.chipMidY, p.yb)));
+    group.forEach((p, i) => {
+      p.lambda = packed[i] ?? 0;
+    });
+  }
+  for (const group of grouped((p) => p.b.col - 1).values()) {
+    const packed = packLanes(group.map((p) => ySpan(p.b.chipMidY, p.yb)));
+    group.forEach((p, i) => {
+      p.mu = packed[i] ?? 0;
+    });
+  }
+
+  return plans.map((p) => {
+    const x0 = p.a.chipRight;
+    const y0 = p.a.chipMidY;
+    const x1 = p.b.chipX;
+    const y1 = p.b.chipMidY;
+    const d =
+      p.kind === "adjacent"
+        ? arcPath(x0, y0, x1, y1)
+        : busPath(
+            x0,
+            y0,
+            x0 + DG_LANE_MIN + p.lambda * DG_LANE_PITCH,
+            p.yb,
+            x1 - DG_LANE_MIN - p.mu * DG_LANE_PITCH,
+            x1,
+            y1,
+          );
+    return {
+      from: p.a.taskId,
+      to: p.b.taskId,
+      colSpan: p.b.col - p.a.col,
+      kind: p.kind,
+      busLane: p.busLane,
+      lambda: p.lambda,
+      mu: p.mu,
+      yb: p.yb,
+      cls: DG_EDGE_CLS,
+      d,
+    };
+  });
 }
 
 /**
@@ -438,40 +1027,109 @@ function renderGraphLegend(): string {
 }
 
 /**
- * 单枚 chip：可见文字 = `#编号`（+ 至多 {@link MAX_DEP_MARKS} 枚跨管道角标），
+ * 单枚 chip：可见文字 = `#编号`（**定宽盒内恒只此一项**，角标已移出到 cell 的 `.dg-deps` 带），
  * 全量 taskId / 状态中文 / waitReason / **依赖原值**只进 `title`（整串经 escapeHtml）。
  * 可见文字与 title 都不含 prompt 的任何子串（负向锚 N-2）。
+ * **出参字面与 N2b 逐字相同**（仅不再内联 `<sup>`）⇒ chip 字面族 / `title` 族锚零翻案。
  */
-function renderChip(
-  task: FeatureTaskItem,
-  ordinal: number,
-  info: NodeStateInfo,
-  crossFromOrdinals: readonly number[],
-): string {
+function renderChip(task: FeatureTaskItem, ordinal: number, info: NodeStateInfo): string {
   const deps = task.dependencies ?? [];
   const titleParts = [task.taskId, `#${ordinal}`, info.label];
   if (info.waitReason !== null) titleParts.push(`被挡：${info.waitReason}`);
   titleParts.push(deps.length > 0 ? `依赖：${deps.join("、")}` : "依赖：无");
+  return `<span class="dg-chip dg-${info.key}" title="${escapeHtml(titleParts.join(" · "))}">#${ordinal}</span>`;
+}
+
+/**
+ * 跨管道依赖角标串（≤{@link MAX_DEP_MARKS} 枚 `⇠#k` + 超出折叠 `⇠+#m`）——
+ * `<sup>` 的**字面与相邻关系与 N2b 逐字一致**，只是落点从 chip 内移到 cell 的角标带。
+ * 无角标 ⇒ 空串，外壳照出（空带 —— 预留由 {@link DG_BADGE_H} 一侧的结构保证）。
+ */
+function renderDepMarks(crossFromOrdinals: readonly number[]): string {
   const marks = [...crossFromOrdinals].sort((a, b) => a - b);
   const shown = marks.slice(0, MAX_DEP_MARKS);
   const hidden = marks.length - shown.length;
-  const sup =
+  return (
     shown.map((o) => `<sup class="dg-dep">⇠#${o}</sup>`).join("") +
-    (hidden > 0 ? `<sup class="dg-dep dg-dep-more">⇠+${hidden}</sup>` : "");
-  return `<span class="dg-chip dg-${info.key}" title="${escapeHtml(titleParts.join(" · "))}">#${ordinal}${sup}</span>`;
+    (hidden > 0 ? `<sup class="dg-dep dg-dep-more">⇠+${hidden}</sup>` : "")
+  );
 }
 
-/** 单条管道 = 一个原生 `<details class="pipe" open>`（体内只有 chip 与箭头，零连线坐标层）。 */
+/** 一枚节点格位 = 绝对定位外壳（inline `style` 只给 `left/top` 两枚几何字面）+ chip + 角标带（**恒渲**，无角标 ⇒ 空带）。 */
+function renderPipeCell(cell: PipeGridCell, chip: string, marks: string): string {
+  return (
+    `<span class="dg-cell" style="left:${cell.x}px;top:${cell.y}px">` +
+    chip +
+    `<span class="dg-deps">${marks}</span>` +
+    `</span>`
+  );
+}
+
+/**
+ * 一条管道的边线层 = **恰一枚** `<svg class="dg-links">`（§2.2 命名纪律 1：`<svg>` 不写任何带引号属性，
+ * 盒模由 CSS `.dg-links{position:absolute;inset:0;width:100%;height:100%}` 给；不写 `viewBox`
+ * ⇒ 用户单位 = CSS px 1:1）。path 只带 `class` + `d`，`d` 字符集 ⊆ `[MLCQHAZ0-9.,\-\s]`（G3 已钉）。
+ */
+function renderPipeSvg(routes: readonly RoutedEdge[]): string {
+  return `<svg class="dg-links">${routes.map((e) => `<path class="${e.cls}" d="${e.d}"/>`).join("")}</svg>`;
+}
+
+/** 一条管道的渲染预案 = 网格几何（含一次预算回灌）+ 管道内走线（跨管道边在 `routeIntraEdges` 侧结构上不入）。 */
+interface PipePlan {
+  readonly grid: PipeGridLayout;
+  readonly routes: readonly RoutedEdge[];
+}
+
+/**
+ * 一次构图 → 走线 → **把 lane 数回灌成预算重算网格** → 再走线（改造文档 §2.4-③「一次收敛不迭代」）。
+ * 回灌只抬 `gapW` / 通道带高，**不改 lane 分配**（λ/μ/`busLane` 由装箱决定，与通道宽无关；G3 已钉）。
+ */
+function planPipe(
+  pipe: GraphPipeline,
+  edges: readonly { from: string; to: string }[],
+  layers: Map<string, number>,
+  ordinals: Map<string, number>,
+): PipePlan {
+  const columns = compressPipeLayers(pipe, layers);
+  const base = pipeGridLayout(pipe, columns, ordinals);
+  const longs = routeIntraEdges(edges, base).filter((e) => e.kind === "long");
+  const gapLanes = new Array<number>(Math.max(0, base.cols - 1)).fill(0);
+  for (const e of longs) {
+    const a = base.cellOf.get(e.from);
+    const b = base.cellOf.get(e.to);
+    if (a === undefined || b === undefined) continue;
+    gapLanes[a.col] = (gapLanes[a.col] ?? 0) + 1;
+    const targetGap = b.col - 1;
+    if (targetGap >= 0 && targetGap < gapLanes.length) gapLanes[targetGap] = (gapLanes[targetGap] ?? 0) + 1;
+  }
+  const grid = pipeGridLayout(pipe, columns, ordinals, { gapLanes, busLaneCount: longs.length });
+  return { grid, routes: routeIntraEdges(edges, grid) };
+}
+
+/** 单条管道 = 一个原生 `<details class="pipe" open>`（体内 = `.dg-grid`：一枚边线层 + 每节点一枚 cell）。 */
 function renderPipeline(pipe: GraphPipeline, ctx: RenderCtx): string {
-  const chips = pipe.nodes
-    .map((n) => renderChip(n, ctx.ordinalOf(n.taskId), ctx.stateOf(n), ctx.crossIn(n.taskId)))
-    .join('<span class="dg-arrow">→</span>');
+  const { grid, routes } = ctx.planOf(pipe);
+  const taskBy = new Map(pipe.nodes.map((n) => [n.taskId, n] as const));
+  const body = grid.cells
+    .map((cell) => {
+      const task = taskBy.get(cell.taskId) as FeatureTaskItem;
+      return renderPipeCell(
+        cell,
+        renderChip(task, ctx.ordinalOf(task.taskId), ctx.stateOf(task)),
+        renderDepMarks(ctx.crossIn(task.taskId)),
+      );
+    })
+    .join("");
   const glyphs = pipe.nodes.map((n) => NODE_STATE_GLYPHS[ctx.stateOf(n).key]).join("");
   return (
     `<details class="pipe" open>\n` +
     `<summary>管道 ${escapeHtml(pipe.projectId)}（${pipe.nodes.length}）` +
     `<span class="dg-pipe-states">${glyphs}</span></summary>\n` +
-    `<div class="pipe-body">${chips}</div>\n` +
+    `<div class="pipe-body">` +
+    `<div class="dg-grid" style="--dg-nw:${DG_NODE_W}px;--dg-nh:${DG_NODE_H}px;--dg-bh:${DG_BADGE_H}px;width:${grid.width}px;height:${grid.height}px">` +
+    renderPipeSvg(routes) +
+    body +
+    `</div></div>\n` +
     `</details>`
   );
 }
@@ -481,12 +1139,16 @@ interface RenderCtx {
   readonly ordinalOf: (taskId: string) => number;
   readonly stateOf: (task: FeatureTaskItem) => NodeStateInfo;
   readonly crossIn: (taskId: string) => readonly number[];
+  readonly planOf: (pipe: GraphPipeline) => PipePlan;
 }
 
 /**
- * 详情页「依赖图」区块（`tasks` = 详情出参任务清单）—— **v0.10.3 N2b 管道制自绘**。
+ * 详情页「依赖图」区块（`tasks` = 详情出参任务清单）—— **v0.10.5 G5 网格 + 通道走线自绘**
+ * （v0.10.3 N2b 管道制自绘的接管版）。
  * **v0.9.5 C2 空区块短路③**：无任务 ⇒ 整节不渲染（判据与语义不变）。
- * 有任务 ⇒ 标题（任务 / 管道 / 边三元计数）+ 图例 + 悬空/环边提示行 + 若干管道 + 跨管道边清单行。
+ * 有任务 ⇒ 标题（任务 / 管道 / 声明·本质·省略三数）+ 图例 + 悬空/环边提示行 + 若干管道 + 跨管道边清单行。
+ * **v0.10.5 N2**：图形面吃**约简后边集** `kept`（全图单次约简、五消费点共用），
+ * 三处审计面（`renderChip` 的 `依赖：` 段等）仍吃声明原值。
  * `idSeq`（页内序号）自 N2b 起**不再被消费**（原为 mermaid 数据通道载体 id 后缀）——
  * N2c 未摘本参数（本节点在 graph-view.ts 的范围 = mermaid 声明键与出口），
  * 摘除待后续节点裁定。
@@ -502,15 +1164,18 @@ export function renderDependencyGraphSection(
   const graph = buildTaskGraph(tasks);
   if (graph.nodes.length === 0) return { html: "" };
 
+  // 全图**单次**传递约简（改造文档 §2.3-2）：管道内边与跨管道边共用同一份 kept
+  const { kept, dropped } = transitiveReduce(graph.edges);
   const ordinals = taskOrdinalMap(tasks);
   const pipelines = groupPipelines(graph, ordinals);
+  const layers = layerOfGraph(graph.nodes, ordinals, kept);
   const projectByTask = new Map<string, string>();
   for (const n of graph.nodes) projectByTask.set(n.taskId, n.projectId);
 
-  // 跨管道边 = edges 中两端不同 project 者（edges 已按 edgeKey 定序去重）
+  // 跨管道边 = kept 中两端不同 project 者（kept 已按 edgeKey 定序去重）
   const crossIn = new Map<string, number[]>();
   const crossEdgeTexts: string[] = [];
-  for (const e of graph.edges) {
+  for (const e of kept) {
     const fromProject = projectByTask.get(e.from);
     const toProject = projectByTask.get(e.to);
     const fromOrdinal = ordinals.get(e.from);
@@ -525,6 +1190,7 @@ export function renderDependencyGraphSection(
     ordinalOf: (taskId) => ordinals.get(taskId) ?? 0,
     stateOf: (task) => nodeStateOf(task, null),
     crossIn: (taskId) => crossIn.get(taskId) ?? [],
+    planOf: (pipe) => planPipe(pipe, kept, layers, ordinals),
   };
 
   const notes: string[] = [];
@@ -544,7 +1210,7 @@ export function renderDependencyGraphSection(
   }
 
   const html =
-    `<h2>依赖图（${graph.nodes.length} 任务 · ${pipelines.length} 管道 · ${graph.edges.length} 边）</h2>\n` +
+    `<h2>依赖图（${graph.nodes.length} 任务 · ${pipelines.length} 管道 · 声明 ${graph.edges.length} 边（本质 ${kept.length} · 传递省略 ${dropped.length}））</h2>\n` +
     `<p class="hint dg-legend-row">${renderGraphLegend()}</p>\n` +
     (notes.length > 0 ? `<p class="hint warn">${notes.join(" · ")}</p>\n` : "") +
     `<div class="dep-graph">\n` +

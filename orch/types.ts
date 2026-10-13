@@ -128,14 +128,19 @@ export type FailureKind = (typeof FAILURE_KINDS)[number];
 export const ORPHAN_FAILURE_KIND: FailureKind = "runner";
 
 /**
- * Feature 状态（v0.3.0；v0.4.1 REQ-04 收敛为 6 态主链）。
- * 主链（6）：waiting_approval → executing → integrating → testing → reviewing → completed；
+ * Feature 状态（v0.3.0；v0.4.1 REQ-04 收敛为 6 态主链；**v0.10.5 O1 扩为 8 态**）。
+ * 主链（8）：waiting_approval → version_planning → decomposing → executing → integrating
+ *   → testing → reviewing → completed；
  * 异常态（3）：needs_input / failed / cancelled；终态：completed / failed / cancelled。
+ * `version_planning` = `approve` 之后的定版工序（PjM 结论收敛 + 归属落库）；
+ * `decomposing` = 本侧任务清单回传 + DAG 节点登记完毕。两新态只加边、不改任何既有出边。
  * 前段三态（discussing / analyzing / planning）已删除：引擎只做需求实现，Step 0/1 不走引擎。
  * 合法流转由 `orch/feature/state-machine.ts` 纯模块强制（非法流转 fail-fast）。
  */
 export type FeatureState =
   | "waiting_approval"
+  | "version_planning"
+  | "decomposing"
   | "executing"
   | "integrating"
   | "testing"
@@ -146,12 +151,12 @@ export type FeatureState =
   | "cancelled";
 
 /**
- * Feature **阶段登记**值域（v0.9.0 B1″，落 `features.stage`）—— **观测面，不是状态机态**。
+ * Feature **阶段登记**值域（v0.9.0 B1″，落 `features.stage`；**v0.10.5 O1 由 5 枚扩为 6 枚，新增「验收」**）。
  *
- * 只登记「引擎看不见的段」（`需求分析` / `改造方案` / `发版`）；`改造` / `回归` / 验收
+ * 只登记「引擎看不见的段」（`需求分析` / `改造方案` / `发版`）；`改造` / `回归` / `验收`
  * **由引擎态派生**，不重复登记。**序校验与回退限制都不做**（B5″）。
  */
-export const FEATURE_STAGES = ["需求分析", "改造方案", "改造", "回归", "发版"] as const;
+export const FEATURE_STAGES = ["需求分析", "改造方案", "改造", "回归", "验收", "发版"] as const;
 
 /** 阶段登记（由 `FEATURE_STAGES` 派生；勿另立第二份清单） */
 export type FeatureStage = (typeof FEATURE_STAGES)[number];
@@ -159,14 +164,19 @@ export type FeatureStage = (typeof FEATURE_STAGES)[number];
 /**
  * `create` 未传 `stage` 时的缺省值：取「改造方案」= 既有调用方（Step 1 产出后建 Feature）
  * 所处的段 ⇒ **既有行为逐字不变**。
+ *
+ * ⚠️ **v0.10.5 O1 起本常量只剩「读侧归一」一职**：`create` 侧的硬编码初值与「未传 ⇒ 本值」
+ * 这条缺省路径随 O4 的 create 契约重构（摘 `stage`/`approval` 两入参、初值钉「需求分析」）退役；
+ * 本值仍是**存量行 NULL 与 ctor 脏值归一的落点**（见 `session/store.ts` 的 `readStage`），故保留。
  */
 export const DEFAULT_FEATURE_STAGE: FeatureStage = "改造方案";
 
 /**
  * Feature **审批门状态**值域（v0.9.0 B1″，落 `features.approval`）—— **单向、无回边**。
  *
- * ⚠️ 字段**不得命名 `state`**（该名已属引擎态）。`approve` 只校验 `approval = 待审批`，
- * **不看 `stage`**（门看门状态，两维正交）。
+ * ⚠️ 字段**不得命名 `state`**（该名已属引擎态）。`approval = 待审批` 是 `approve` 六条过门判据里的
+ * **②**（增补 `ec93e1bd` 起）—— 原句「`approve` 只校验 approval、不看 `stage`」只剩「①② 两条各自不查
+ * `stage`」为真：`stage` 现已是判据 **⑤**（须已离开「需求分析」），但六条**仍不校验 `stage` 迁移序**。
  */
 export const FEATURE_APPROVALS = ["未发起", "待审批", "已通过"] as const;
 
@@ -174,8 +184,9 @@ export const FEATURE_APPROVALS = ["未发起", "待审批", "已通过"] as cons
 export type FeatureApproval = (typeof FEATURE_APPROVALS)[number];
 
 /**
- * `create` 未传 `approval` 时的缺省值：取「待审批」= 既有调用方建完即过审的语义
- * ⇒ `approve` 门对既有调用零红。
+ * `create` 未传 `approval` 时的缺省值（**v0.10.5 O4 起该路径已退役** —— create 摘 `approval`
+ * 入参、初值硬编码「未发起」）。本常量只剩**读侧归一**一职：`NULL`（存量行）⇒ 本值、
+ * **脏值**在 ctor 一次性归一（见 `session/store.ts` 的 `readApproval`），故保留。
  */
 export const DEFAULT_FEATURE_APPROVAL: FeatureApproval = "待审批";
 
@@ -253,7 +264,8 @@ export interface FeatureRecord {
   version: string;
   /**
    * **审批门状态**（v0.9.0 B1″ / B2″，落 `features.approval`）：值域见 {@link FEATURE_APPROVALS}，
-   * `NULL` ⇒ {@link DEFAULT_FEATURE_APPROVAL}。**`approve` 的唯一判据**（`= 待审批` 才放行）。
+   * `NULL` ⇒ {@link DEFAULT_FEATURE_APPROVAL}。`= 待审批` 是 `approve` 的**必要非充分**判据（六条之一，
+   * 增补 `ec93e1bd` 起另加 ③ `version` 非空 / ④ 确认单在册 / ⑤ `stage` 非「需求分析」/ ⑥ 改造文档在册）。
    */
   approval: FeatureApproval;
   createdAt: string;

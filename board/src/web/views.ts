@@ -65,6 +65,8 @@ import type { ErrorOverlayParams } from "./layout.js";
 /** 引擎态中文（**仅展示层**，照 orch 网页面先例；未命中原样显示，不吞不猜）。 */
 const FEATURE_STATE_LABELS: Readonly<Record<string, string>> = {
   waiting_approval: "待审批",
+  version_planning: "定版中",
+  decomposing: "拆任务中",
   executing: "执行中",
   integrating: "集成中",
   testing: "测试中",
@@ -84,12 +86,14 @@ const TASK_STATE_LABELS: Readonly<Record<string, string>> = {
 };
 
 /**
- * 任务视图状态过滤候选（REQ-v0.9.2 N4 · `renderTasksPick` 用）：值域 = 主链 6 态 + 异常 3 态 +
+ * 任务视图状态过滤候选（REQ-v0.9.2 N4 · `renderTasksPick` 用）：值域 = 主链 **8** 态 + 异常 3 态 +
  * `blocked`（良性终态，§4 口径）。
  * （原「需求列表页过滤」共用常量随列表页退役收编于此，REQ-2026-09-26-04 Q3。）
  */
 const TASK_FILTER_STATES = [
   "waiting_approval",
+  "version_planning",
+  "decomposing",
   "executing",
   "integrating",
   "testing",
@@ -584,10 +588,12 @@ function featCard(bodyHtml: string, extraClass = ""): string {
 }
 
 /**
- * 阶段步条的五段（REQ-2026-09-30-04 件2）：词表 = 登记字段 `stage` 值域
- * （`需求分析` / `改造方案` 登记，`改造` / `回归` / `发版` 由引擎态派生，见 `derive.ts`）。
+ * 阶段步条的六段（REQ-2026-09-30-04 件2 · v0.10.5 流程一致性由五段抬到六段）：
+ * 词表 = 登记字段 `stage` 值域（六枚全启用），写入方分两路（**半派生**）——
+ * `改造` / `回归` / `验收` 由**引擎随 `state` 派生写**，`需求分析` ↔ `改造方案` 与
+ * `发版` 由**宿主显式写**（见 `derive.ts` 与 `doc/v0.10.5/流程一致性-改造文档.md` §2.2）。
  */
-const STAGE_STEPS: readonly string[] = ["需求分析", "改造方案", "改造", "回归", "发版"];
+const STAGE_STEPS: readonly string[] = ["需求分析", "改造方案", "改造", "回归", "验收", "发版"];
 
 /** 显示阶段 → 步条档位；`null` = 归档不上（未知 / 终态回落登记值 ⇒ 不高亮、不猜）。 */
 interface StageStepPos {
@@ -595,7 +601,7 @@ interface StageStepPos {
   index: number;
   /** 已打勾的最后一段下标（-1 ⇒ 一段未成） */
   doneThrough: number;
-  /** 段名与真实显示阶段不同时的补注（验收中挂「回归」段、待澄清挂「改造」段） */
+  /** 段名与真实显示阶段不同时的补注（定版中 / 拆任务中挂「改造方案」段、待澄清挂「改造」段；v0.10.5 起「验收中」直挂「验收」段 ⇒ 不再需要补注） */
   qualifier: string | null;
 }
 
@@ -605,6 +611,11 @@ function stageStepPos(d: DisplayStage): StageStepPos | null {
       return { index: 0, doneThrough: -1, qualifier: null };
     case "改造方案":
       return { index: 1, doneThrough: 0, qualifier: null };
+    case "定版中":
+      // v0.10.5 主链新增两态（`version_planning`）同归「改造方案」段 —— 不新增第七段，靠补注显形
+      return { index: 1, doneThrough: 0, qualifier: "定版中" };
+    case "拆任务中":
+      return { index: 1, doneThrough: 0, qualifier: "拆任务中" };
     case "改造中":
       return { index: 2, doneThrough: 1, qualifier: null };
     case "改造中 · 待澄清":
@@ -612,18 +623,18 @@ function stageStepPos(d: DisplayStage): StageStepPos | null {
     case "回归中":
       return { index: 3, doneThrough: 2, qualifier: null };
     case "验收中":
-      return { index: 3, doneThrough: 2, qualifier: "验收中" };
-    case "已完成":
       return { index: 4, doneThrough: 3, qualifier: null };
+    case "已完成":
+      return { index: 5, doneThrough: 4, qualifier: null };
     case "已发版":
-      return { index: 4, doneThrough: 4, qualifier: null };
+      return { index: 5, doneThrough: 5, qualifier: null };
     default:
       return null;
   }
 }
 
 /**
- * 阶段步条（件2）：五段圆点 + 连线，完成段打勾、当前段实底；
+ * 阶段步条（件2）：六段圆点 + 连线，完成段打勾、当前段实底；
  * 尾部一行保留「显示阶段（派生 / 登记）」—— 本条替代原元数据表的
  * 「阶段（显示）」+「阶段（登记）」双行，**派生 / 登记事实与 basis 标注一个不丢**。
  */

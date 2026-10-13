@@ -12,6 +12,10 @@
  * **v0.9.5 C1/C5**（`doc/v0.9.5/需求详情页读面精简-改造文档.md`）：详情页规则源集中到本文件 ——
  * 引导行（{@link deriveNextStepHint}，含卡滞档）与动作区档位（{@link deriveActionAffordance}）
  * 共用同一入参 {@link NextStepInput} = 同一事实源；两者只判显示，不写状态机（写端点与 409 硬闸不变）。
+ *
+ * **v0.10.5 流程一致性**（`doc/v0.10.5/流程一致性-改造文档.md` §2.2 半派生表）：引擎主链 6→8，
+ * `version_planning` / `decomposing` 两态进入本文件的派生覆盖（定版中 / 拆任务中，同归 `brand` 色档）；
+ * 引导行另有**两态专属档**（定版 / 拆任务工序，不说「自动接力」），卡滞判据的态集一并扩到新两态。
  */
 import type { TraceNode } from "./bridge-client.js";
 
@@ -33,6 +37,8 @@ export const UNKNOWN_STAGE_LABEL = "未知（登记缺失）";
  * 其余态（`waiting_approval` / `failed` / `cancelled` / 任何未知值）**原样回落登记值**，
  * 引擎态本身由列表/详情的「状态」列另行显示 —— 不吞、不猜、不自造。
  *
+ * - `version_planning` → 定版中 · `decomposing` → 拆任务中（v0.10.5 主链 6→8：`approve` 落前者，
+ *   PjM 归属落库后入后者，DAG 登记完毕才入 `executing`）
  * - `executing` / `integrating` → 改造中（integrating = 节点全完成后的自动收敛段，仍在改造）
  * - `testing` → 回归中 · `reviewing` → 验收中
  * - `completed` → 已完成；但若登记 `stage = 发版`（发版流程在 completed 之后写入）→ 已发版
@@ -41,6 +47,10 @@ export const UNKNOWN_STAGE_LABEL = "未知（登记缺失）";
 export function deriveDisplayStage(state: string | null, stage: string | null): DisplayStage {
   const registered: DisplayStage = { label: stage ?? UNKNOWN_STAGE_LABEL, basis: "registered" };
   switch (state) {
+    case "version_planning":
+      return { label: "定版中", basis: "derived" };
+    case "decomposing":
+      return { label: "拆任务中", basis: "derived" };
     case "executing":
     case "integrating":
       return { label: "改造中", basis: "derived" };
@@ -273,13 +283,15 @@ export type CardColorTier = "brand" | "warn" | "ok" | "danger" | "locked" | "neu
 
 /**
  * 引擎态 → 色档（纯函数，与 {@link deriveDisplayStage} / {@link deriveScheduleGateOpen}
- * 同一规则源侧）：在途主链四态（`executing`/`integrating`/`testing`/`reviewing`）→ `brand`；
+ * 同一规则源侧）：在途主链六态（`version_planning`/`decomposing`/`executing`/`integrating`/`testing`/`reviewing`）→ `brand`；
  * 待确认 `waiting_approval` → `warn`；`completed` → `ok`；`failed` → `danger`；
  * `cancelled` → `cancelled`（独立档）；
  * `needs_input` / `null` / 未知值 → `neutral`（不猜、不吞，回落中性档）。
  */
 export function deriveCardColorTier(state: string | null): CardColorTier {
   switch (state) {
+    case "version_planning":
+    case "decomposing":
     case "executing":
     case "integrating":
     case "testing":
@@ -455,7 +467,8 @@ export function terminalFeatureNote(state: string | null): string {
 
 /**
  * 卡滞阈值（v0.9.5 C1 · 用户裁定 2026-09-29：**定死 10 分钟、不引配置键**）：
- * `state = executing` ∧ 无在飞 / 排队轮 ∧ 最近一轮距今超过本值 ⇒ 引导行切「建议手动继续」档。
+ * `state ∈ 卡滞态集` ∧ 无在飞 / 排队轮 ∧ 最近一轮距今超过本值 ⇒ 引导行切「建议手动继续」档。
+ * 态集见 {@link STALL_FEATURE_STATES}（v0.10.5 B2 由 `executing` 扩到新两态）。
  */
 export const TURN_STALL_AFTER_MS = 10 * 60 * 1000;
 
@@ -519,26 +532,45 @@ export interface NextStepInput {
   chainPendingCount?: number | null;
 }
 
-/** 卡滞判据（纯函数）：executing ∧ 无在飞 / 排队轮 ∧ 最近一轮距今 > {@link TURN_STALL_AFTER_MS}。 */
-function isStalled(input: NextStepInput): boolean {
-  if (input.state !== "executing") return false;
-  if (input.turnBusy === true) return false;
+/**
+ * 卡滞态集（v0.10.5 B2 扩）：`executing` + 主链新增两态 `version_planning` / `decomposing`。
+ * 新两态同属「引擎不派发节点、等宿主动作」的工序（定版 / 拆任务），工序停住与链停住一样要出声。
+ */
+const STALL_FEATURE_STATES: readonly string[] = ["executing", "version_planning", "decomposing"];
+
+/**
+ * 新两态的工序名（卡滞档**独立分句**用）。`executing` 不在表内 ⇒ 沿用原句
+ * 「agent 好像没接上？」（该句的事实是「引擎本该自动接力却没接力」，对新两态不成立）。
+ */
+const STALL_PROCESS_LABEL: Readonly<Record<string, string>> = {
+  version_planning: "定版",
+  decomposing: "拆任务",
+};
+
+/**
+ * 卡滞判据（纯函数）：态在 {@link STALL_FEATURE_STATES} 内 ∧ 无在飞 / 排队轮 ∧ 最近一轮距今 > {@link TURN_STALL_AFTER_MS}
+ * ⇒ 返回该「距今」毫秒（同一值既作判据、又供文案显示）；任一条件不满足（含不可判 ⇒ 不猜）⇒ `null`。
+ */
+function stalledElapsedMs(input: NextStepInput): number | null {
+  if (input.state === null || !STALL_FEATURE_STATES.includes(input.state)) return null;
+  if (input.turnBusy === true) return null;
+  const elapsedMs = elapsedSinceTurnMs(input);
+  return elapsedMs !== null && elapsedMs > TURN_STALL_AFTER_MS ? elapsedMs : null;
+}
+
+/** 「距今」毫秒（单时钟差值 `nowMs - Date.parse(at)`；缺值 / 非法 ⇒ `null`，不猜）。 */
+function elapsedSinceTurnMs(input: NextStepInput): number | null {
   const at = input.latestTurn?.at ?? null;
   const nowMs = input.nowMs ?? null;
-  if (at === null || nowMs === null) return false;
+  if (at === null || nowMs === null) return null;
   const then = Date.parse(at);
-  if (!Number.isFinite(then)) return false;
-  return nowMs - then > TURN_STALL_AFTER_MS;
+  return Number.isFinite(then) ? nowMs - then : null;
 }
 
 /** 「距今」一行事实（单时钟差值；不可判 ⇒ 空串）。 */
 function sinceTurnLine(input: NextStepInput): string {
-  const at = input.latestTurn?.at ?? null;
-  const nowMs = input.nowMs ?? null;
-  if (at === null || nowMs === null) return "";
-  const then = Date.parse(at);
-  if (!Number.isFinite(then)) return "";
-  return `（最近一轮距今 ${formatElapsed(nowMs - then)}）`;
+  const elapsedMs = elapsedSinceTurnMs(input);
+  return elapsedMs === null ? "" : `（最近一轮距今 ${formatElapsed(elapsedMs)}）`;
 }
 
 function formatElapsed(ms: number): string {
@@ -576,8 +608,13 @@ function factsLine(input: NextStepInput): string {
  * 详情页「下一步」一行提示（纯函数；v0.9.5 C1 升级为「本卡状态 + 该做的一件事」）。
  *
  * **判序纪律保留**：宿主面未装配 > **终态** > 待澄清回答 > needs_input 前置档 > **监视中** > approval 三态；
- * **卡滞档最低**（只在 executing 段内且 `approval = 已通过` 分支里生效）。每档一句「卡在哪 + 等谁 + 做什么」，
- * 文案只指向**页面上真实存在的入口**（动作区按钮 / 澄清框 / 链状态行停链按钮 / config.json）。
+ * **卡滞档最低**（只在 `approval = 已通过` 分支里生效，态集见 {@link STALL_FEATURE_STATES}）。
+ * 每档一句「卡在哪 + 等谁 + 做什么」，文案只指向**页面上真实存在的入口**（动作区按钮 / 澄清框 / 链状态行停链按钮 / config.json）。
+ *
+ * **v0.10.5 B2 专属档**：`version_planning`（等你 / agent 定版 = PjM 工序）与 `decomposing`
+ * （等 agent 拆任务登记 DAG）各有独立文案 —— 这两态上引擎**不派发任何节点**，故不得沿用
+ * 「引擎按 DAG 自动接力」兜底句；卡滞时同走独立分句（「<工序>已 X 未推进」），不得复用
+ * 「agent 好像没接上？」（那句的隐含前提是「引擎本该接力却没接力」）。
  *
  * **v0.9.5 C5 口径**：UI 不再出现「触发一轮」字样（它是底层机制），故本行不得使用该词。
  *
@@ -588,7 +625,7 @@ function factsLine(input: NextStepInput): string {
  * **REQ-2026-09-30-04 监视口径**：链监视中时动作区不渲染（{@link deriveActionAffordance} 的监视中短路），
  * 故监视档只指路**链状态行停链按钮**；文案只描述快照事实（等 N 个子任务），**不预测唤醒时机**
  * （不留第二套「等不等唤醒」口径）。**卡滞档在监视中不可达**是判序的自然结果 ——
- * `isStalled` 只活在 `approval = 已通过` 分支内，监视档排在 approval 三态之前即被遮蔽，不另设执法点。
+ * `stalledElapsedMs` 只活在 `approval = 已通过` 分支内，监视档排在 approval 三态之前即被遮蔽，不另设执法点。
  */
 export function deriveNextStepHint(input: NextStepInput): string {
   const facts = factsLine(input);
@@ -628,9 +665,21 @@ export function deriveNextStepHint(input: NextStepInput): string {
     case APPROVAL_PENDING:
       return `下一步：等你 —— 改造文档已落文件 ⇒ 核对后点「确认改造文档 → 放行执行」（放不放行由 agent 核对后决定）。${facts}`;
     case "已通过": {
-      if (isStalled(input)) {
+      const stalledMs = stalledElapsedMs(input);
+      if (stalledMs !== null) {
         // 卡滞档只在 approval=已通过 分支内评估；链监视中时监视档排在 approval 三态之前 ⇒ 本档不可达（判序自然结果，不另设执法点）。
+        const process = STALL_PROCESS_LABEL[input.state ?? ""];
+        if (process !== undefined) {
+          // 新两态走独立分句：这两态上引擎本就不派发节点，「没接上」的说法不成立，只报「工序未推进」。
+          return `下一步：${process}工序已 ${formatElapsed(stalledMs)} 未推进 · 本页没有进行中的轮 ⇒ 这道工序等 agent 与你的动作（引擎在此不派发任何节点），在动作区点「让 agent 继续」手动接一轮。${facts}`;
+        }
         return `下一步：agent 好像没接上？本页没有进行中的轮${sinceTurnLine(input)}⇒ 若链在监视中先点链状态行「停链」，动作区回来后手动接一轮。${facts}`;
+      }
+      if (input.state === "version_planning") {
+        return `下一步：等你 / agent 定版 —— 审批门已通过，本卡在 PjM 定版工序 ⇒ 等各 project 项目经理回版本规划结论、你确认后由宿主先建 Project Version 再写归属；要推进就在动作区点「让 agent 继续」。${facts}`;
+      }
+      if (input.state === "decomposing") {
+        return `下一步：等 agent 拆任务登记 DAG —— 归属已落，本卡在拆任务工序 ⇒ 等各 project 研发经理回传本侧任务清单、由 agent 收敛后登记节点（登记完毕才进 executing，之后才谈得上按节点跑）。${facts}`;
       }
       if (input.state === "reviewing") {
         return `下一步：等你验收 —— 引擎已把全部节点跑完 ⇒ 若链在监视中先点链状态行「停链」，动作区回来后写明验收结论点「反馈验收结论」（「通过」即收口）。${facts}`;

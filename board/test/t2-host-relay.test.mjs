@@ -114,7 +114,7 @@ test("C1-③ shouldContinue：canceled 恒停（任意引擎态 / 任意条目�
 });
 
 test("C1-④ shouldContinue：succeeded + reviewing / 终态 ⇒ 交人停链（验收/结束）", () => {
-  for (const state of ["reviewing", "integrating", "testing", "completed", "failed", "cancelled", "waiting_approval"]) {
+  for (const state of ["reviewing", "integrating", "testing", "completed", "failed", "cancelled", "waiting_approval", "version_planning", "decomposing"]) {
     const d = shouldContinue({ state: "succeeded" }, snap(state));
     assert.equal(d.action, "stop", `引擎态 ${state} 必须停`);
   }

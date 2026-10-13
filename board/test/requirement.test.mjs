@@ -12,8 +12,6 @@ import {
   parseToolCallEnvelope,
   normalizeMcpBaseUrl,
   RequirementConfigError,
-  REQUIREMENT_STAGE,
-  REQUIREMENT_APPROVAL,
   FEATURE_CREATE_TOOL,
   DEFAULT_MCP_BASE_URL,
 } from "../dist/requirement.js";
@@ -28,19 +26,19 @@ function okEnvelope(payload) {
 }
 
 // ---------------------------------------------------------------------------
-// 断言①：传出的参数确实带 stage="需求分析" + approval="未发起"
+// 断言①：传出的参数**不带** stage / approval（初值由桥硬编码）
 // ---------------------------------------------------------------------------
 
-test("buildFeatureCreateArgs: 始终显式带 stage=需求分析 + approval=未发起 + 调用方 version", () => {
+test("buildFeatureCreateArgs: 不带 stage / approval（v0.10.5 起由桥硬编码初值）+ 调用方 version", () => {
   const args = buildFeatureCreateArgs({ title: "板的唯一封装", version: "v0.9.0", requirement: "原文", contextId: "c1" });
-  assert.equal(args.stage, "需求分析");
-  assert.equal(args.approval, "未发起");
+  assert.equal(args.stage, undefined);
+  assert.equal(args.approval, undefined);
   assert.equal(args.version, "v0.9.0");
   assert.equal(args.title, "板的唯一封装");
   assert.equal(args.requirement, "原文");
   assert.equal(args.contextId, "c1");
-  assert.equal(REQUIREMENT_STAGE, "需求分析");
-  assert.equal(REQUIREMENT_APPROVAL, "未发起");
+  assert.equal(Object.hasOwn(args, "stage"), false, "板不得再发 stage 键（否则成桥外第二处初值执法点）");
+  assert.equal(Object.hasOwn(args, "approval"), false, "板不得再发 approval 键");
 });
 
 test("buildFeatureCreateArgs（M6）: version 发送前 trim；空 / 纯空白 ⇒ 空串出网（未排期，不抛不拒）", () => {
@@ -66,7 +64,7 @@ test("buildFeatureCreateArgs（N4 · 三态）: 合法 x.y.z（可带 v 前缀�
   }
 });
 
-test("createRequirement: 出网 body 的 arguments 确实携带 stage/approval（端到端捕获）", async () => {
+test("createRequirement: 出网 body 的 arguments 不带 stage/approval 两键（端到端捕获）", async () => {
   let capturedBody = null;
   const fetchImpl = async (_url, init) => {
     capturedBody = JSON.parse(String(init.body));
@@ -74,9 +72,9 @@ test("createRequirement: 出网 body 的 arguments 确实携带 stage/approval�
   };
   const out = await createRequirement({ title: "甲", version: "v0.9.0" }, { group: "a2a-coding", fetchImpl });
   assert.equal(out.ok, true);
-  // 「提前批准一个方案未定的需求」机制上不可能：证据 = 出网参数强制带这两值。
-  assert.equal(capturedBody.params.arguments.stage, "需求分析");
-  assert.equal(capturedBody.params.arguments.approval, "未发起");
+  // 「提前批准一个方案未定的需求」机制上不可能：证据 = 板侧根本不发这两键（初值由桥硬编码）。
+  assert.equal(Object.hasOwn(capturedBody.params.arguments, "stage"), false);
+  assert.equal(Object.hasOwn(capturedBody.params.arguments, "approval"), false);
   assert.equal(capturedBody.params.name, "a2a_feature_create");
 });
 

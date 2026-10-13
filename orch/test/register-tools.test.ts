@@ -89,10 +89,10 @@ test("③ 对偶校验：inquiry 带 featureId ⇒ feature_not_allowed_for_inqui
   assert.equal(validateCallMode({ mode: "inquiry" }).ok, true);
 });
 
-test("挂载态常量：executing / waiting_approval（analyzing 能力已撤销，常量集合驱动）", () => {
+test("挂载态常量：executing / decomposing（v0.10.5 O4 收窄摘除 waiting_approval，常量集合驱动）", () => {
   assert.deepEqual(
     [...MOUNTABLE_FEATURE_STATES],
-    ["executing", "waiting_approval"],
-    "常量集合驱动：描述与文案经 join 自动跟随；analyzing 已随主链收敛移除",
+    ["executing", "decomposing"],
+    "常量集合驱动：描述与文案经 join 自动跟随；waiting_approval 已随挂载白名单收窄摘除（DAG 初版登记只在 decomposing）",
   );
 });

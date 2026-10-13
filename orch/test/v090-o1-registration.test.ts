@@ -2,16 +2,16 @@
  * v0.9.0 O1（REQ-v0.9.0-2026-09-24-01 · 改造文档 §3.1 B1″ / B2″）——
  * **登记字段 `stage` / `version` / `approval`：加列 + 写口 + 审批门校验 + 读侧归一**。
  *
- * 锁定的行为面：
- * 1. **向后兼容（缺省）**：`create` 不传三参 ⇒ `stage = 改造方案` + `approval = 待审批` +
- *    `version = ""`，既有调用（建完即 `approve`）逐字不变；
- * 2. **闭集校验在 handler**（schema 侧只 `z.string()`）：非法值 ⇒ `feature_invalid_stage` /
+ * 锁定的行为面（v0.10.5 O6 按新契约改写：`create` 不收 `stage`/`approval`、初值恒定，
+ * 过门序列 = create → advance(version) → advance(stage+approval) → approve）：
+ * 1. **初值恒定**：`create` ⇒ `stage = 需求分析` + `approval = 未发起`（引擎硬编码，无兼容分叉）；
+ * 2. **闭集校验在 advance 写口**（schema 侧只 `z.string()`）：非法值 ⇒ `feature_invalid_stage` /
  *    `feature_invalid_approval`，且**零写入**；
  * 3. **`advance` 登记特例**：`to` = 当前态 ∧ 带登记字段 ⇒ 只写登记、**主链态不变**
  *    （转移表零改动：不带登记字段时「当前态 → 当前态」仍被拒）；**无终态守卫**
  *    （`completed` 后仍可写 `发版`）；
  * 4. **`approve` 校验 `approval = 待审批`**（不看 `stage`）：不满足 ⇒ `feature_approval_not_ready`，
- *    **不放行、不改状态**；放行时把门落 `已通过`（单向、无回边）；
+ *    **不放行、不改状态**；放行时把门落 `已通过`（单向、无回边），后继 = `version_planning`（无父）；
  * 5. **读侧单点归一**：`NULL`（存量行）⇒ 缺省、**不 throw**；脏值在 ctor 一次性归一 + 告警，
  *    二次启动不再告警（幂等）、不改 `updated_at`、不写事件。
  */
@@ -26,6 +26,7 @@ import {
   createFeature,
   getFeature,
   openStoreDatabase,
+  projectVersionCreate,
   updateFeatureRegistration,
   versionLedgerCreate,
 } from "../session/store.js";
@@ -54,6 +55,77 @@ function mustOk<T extends { ok: boolean }>(outcome: T): Extract<T, { ok: true }>
 function mustFail(outcome: Outcome): FeatureToolFailure {
   if (outcome.ok) throw new Error("期望失败，实际成功");
   return outcome;
+}
+
+/**
+ * 抬 `stage` 那一单携带的产出物登记夹具 —— 门① 第二前提（增补 `bbc7ea28` O3）要《需求确认单》、
+ * 门② 的 ⑥（增补 `ec93e1bd`）要《改造文档》。两枚必须**同单在册**：`decisions` 是整值替换，
+ * 过门时按当场值逐枚查 ⇒ 只登记其一不放行。
+ */
+const CONFIRMATION_DECISIONS = '["doc/v0.9.0/夹具-需求确认单.md","doc/v0.9.0/夹具-改造文档.md"]';
+
+/**
+ * v0.10.5 O6 过门序列（新契约定稿，写死照用）：`create`（**不传** `stage`/`approval`）→
+ * `advance(to=当前态, version="<非空>")` → `advance(to=当前态, stage="改造方案", approval="待审批")`
+ * → `approve`（无父卡落 `version_planning`）。返回 `featureId`。
+ * 前置：版号已 {@link seedLedger}（门① `version` 守卫要求排期先写定，version 必须在 stage 之前落）；
+ * 抬 `stage` 那一单同带《需求确认单》登记（增补 `bbc7ea28` 门① 第二前提）。
+ */
+function readyFeature(title: string, version = "v0.9.0"): string {
+  const created = mustOk(handleFeatureCreate({ title }));
+  mustOk(handleFeatureAdvance({ featureId: created.featureId, to: "waiting_approval", version }));
+  mustOk(
+    handleFeatureAdvance({
+      featureId: created.featureId,
+      to: "waiting_approval",
+      stage: "改造方案",
+      approval: "待审批",
+      decisions: CONFIRMATION_DECISIONS,
+    }),
+  );
+  return created.featureId;
+}
+
+/** 过门后落 `version_planning` 的卡（主轨无父 ⇒ `approve` 后继即工序格） */
+function approvedFeature(title: string): string {
+  const featureId = readyFeature(title);
+  mustOk(handleFeatureApprove({ featureId }));
+  return featureId;
+}
+
+/**
+ * 走到 `decomposing` 的卡 —— 出 `version_planning` 格须过**归属门**（v0.10.5 O4 双挂），
+ * 故同单携带归属（project 台账行已由 {@link seedProjectVersion} 预建）。
+ */
+function decomposingFeature(title: string): string {
+  const featureId = approvedFeature(title);
+  mustOk(
+    handleFeatureAdvance({
+      featureId,
+      to: "decomposing",
+      projectVersions: [{ projectId: PROJECT_ID, version: PROJECT_VERSION }],
+    }),
+  );
+  return featureId;
+}
+
+/** 走到 `executing` 的卡（归属已在前一格落库 ⇒ 本格出口归属门放行） */
+function executingFeature(title: string): string {
+  const featureId = decomposingFeature(title);
+  mustOk(handleFeatureAdvance({ featureId, to: "executing" }));
+  return featureId;
+}
+
+/** 归属写的前置：project 台账行（C-15 不隐式建版）；每用例 `close()` 后需重灌 */
+const PROJECT_ID = "p-o6";
+const PROJECT_VERSION = "1.0.0";
+function seedProjectVersion(): void {
+  const outcome = projectVersionCreate({
+    ownerGroup: null,
+    projectId: PROJECT_ID,
+    version: PROJECT_VERSION,
+  });
+  if (!outcome.ok) throw new Error(`project 台账建版失败：${outcome.code} ${outcome.message}`);
 }
 
 /** 临时库路径（每次调用唯一，避免并行用例互踩） */
@@ -91,23 +163,26 @@ function seedLedger(version: string): void {
 // 1 / 2：create 缺省与显式值、闭集校验
 // ---------------------------------------------------------------------------
 
-test("v0.9.0 B1″：create 不传登记字段 ⇒ 缺省「改造方案 / 待审批 / 空版本」（向后兼容锚）", () => {
+test("v0.9.0 B1″（v0.10.5 改写）：create 初值恒定 ⇒ 需求分析 / 未发起 / 空版本", () => {
+  // 作废锚（原位留理由，O6）：原「向后兼容锚」断言 create 缺省落「改造方案 + 待审批」且建完即可
+  // approve —— 该缺省形态所依赖的「create 可传/可缺省 stage、approval」能力已于 v0.10.5 O4 删除，
+  // 初值改由引擎硬编码，旧断言对象不复存在；本用例改写为新契约的「初值恒定」锚。
   close();
-  const created = mustOk(handleFeatureCreate({ title: "既有调用方" }));
+  const created = mustOk(handleFeatureCreate({ title: "初值恒定" }));
   // 出参回显三字段（恒非空）
-  assert.equal(created.stage, "改造方案", "缺省 stage = 改造方案");
-  assert.equal(created.approval, "待审批", "缺省 approval = 待审批");
+  assert.equal(created.stage, "需求分析", "初值恒定 stage = 需求分析");
+  assert.equal(created.approval, "未发起", "初值恒定 approval = 未发起");
   assert.equal(created.version, "", "version 缺省空");
-  // 落库读回同值（读侧归一不改变有值行）
+  // 落库读回同值
   const stored = getFeature(created.featureId);
-  assert.equal(stored?.stage, "改造方案");
-  assert.equal(stored?.approval, "待审批");
+  assert.equal(stored?.stage, "需求分析");
+  assert.equal(stored?.approval, "未发起");
   assert.equal(stored?.version, "");
-  // 既有行为：建完即可过审（缺省恰为「待审批」⇒ 不新增一次用户决策）
+  // 新契约：建完不得直接 approve（approval = 未发起 ⇒ 门未过），须先走 advance 登记序列
   assert.equal(
-    mustOk(handleFeatureApprove({ featureId: created.featureId })).state,
-    "executing",
-    "缺省行过审放行 = 既有行为逐字不变",
+    mustFail(handleFeatureApprove({ featureId: created.featureId })).code,
+    "feature_approval_not_ready",
+    "初值「未发起」⇒ 直接 approve 被拒（旧「建完即过审」形态已随兼容锚作废）",
   );
   close();
 });
@@ -118,9 +193,7 @@ test("v0.9.0 B1″：板口径 create 显式传「需求分析 + 未发起」⇒
   const created = mustOk(
     handleFeatureCreate({
       title: "板建需求",
-      stage: "需求分析",
       version: "v0.9.0",
-      approval: "未发起",
     }),
   );
   assert.equal(created.state, "waiting_approval", "初态不因登记字段而变（登记是观测面）");
@@ -131,15 +204,24 @@ test("v0.9.0 B1″：板口径 create 显式传「需求分析 + 未发起」⇒
   close();
 });
 
-test("v0.9.0 B1″：非法 stage / approval ⇒ feature_invalid_stage / feature_invalid_approval", () => {
+test("v0.9.0 B1″（v0.10.5 改写）：闭集校验收口 advance-only ⇒ 非法 stage / approval = feature_invalid_stage / feature_invalid_approval", () => {
+  // 作废锚（原位留理由，O6）：原两枚 **create 侧**错误码用例断言的是「create 可传 stage/approval
+  // 并闭集校验」这一 v0.10.5 O4 已删除的能力（旧键被 strip、create 侧不再产这两枚码）⇒ 改为 advance-only。
   close();
-  const badStage = mustFail(handleFeatureCreate({ title: "脏 stage", stage: "等待审批" }));
+  const created = mustOk(handleFeatureCreate({ title: "脏 stage" }));
+  const badStage = mustFail(
+    handleFeatureAdvance({ featureId: created.featureId, to: "waiting_approval", stage: "等待审批" }),
+  );
   assert.equal(badStage.code, "feature_invalid_stage");
   assert.match(badStage.error, /需求分析/, "错误文案须给出闭集全清单");
 
-  const badApproval = mustFail(handleFeatureCreate({ title: "脏 approval", approval: "已通过门" }));
+  const badApproval = mustFail(
+    handleFeatureAdvance({ featureId: created.featureId, to: "waiting_approval", approval: "已通过门" }),
+  );
   assert.equal(badApproval.code, "feature_invalid_approval");
   assert.match(badApproval.error, /未发起 \/ 待审批 \/ 已通过/);
+  assert.equal(getFeature(created.featureId)?.stage, "需求分析", "拒绝路径零写入");
+  assert.equal(getFeature(created.featureId)?.approval, "未发起", "拒绝路径零写入");
   close();
 });
 
@@ -150,7 +232,7 @@ test("v0.9.0 B1″：advance 侧同样闭集校验（非法值 ⇒ 结构化拒�
     handleFeatureAdvance({ featureId: created.featureId, to: "waiting_approval", stage: "发布" }),
   );
   assert.equal(bad.code, "feature_invalid_stage");
-  assert.equal(getFeature(created.featureId)?.stage, "改造方案", "拒绝路径零写入");
+  assert.equal(getFeature(created.featureId)?.stage, "需求分析", "拒绝路径零写入（初值 = 需求分析）");
   assert.equal(getFeature(created.featureId)?.state, "waiting_approval");
 
   const badApproval = mustFail(
@@ -171,14 +253,16 @@ test("v0.9.0 B1″：advance 侧同样闭集校验（非法值 ⇒ 结构化拒�
 
 test("v0.9.0 B1″：advance 特例「to = 当前态」只写登记，主链态不变（需求确认门凭据）", () => {
   close();
-  const created = mustOk(
-    handleFeatureCreate({ title: "需求确认门", stage: "需求分析", approval: "未发起" }),
-  );
+  seedLedger("v0.9.0");
+  const created = mustOk(handleFeatureCreate({ title: "需求确认门" }));
+  // v0.10.5 O4 门① version 守卫：stage 由「需求分析」外迁以 version 非空为前提 ⇒ 先排期写 version
+  mustOk(handleFeatureAdvance({ featureId: created.featureId, to: "waiting_approval", version: "v0.9.0" }));
   const out = mustOk(
     handleFeatureAdvance({
       featureId: created.featureId,
       to: "waiting_approval", // = 当前态
       stage: "改造方案", // 用户确认需求内容 ⇒ 迁移即动作凭据
+      decisions: CONFIRMATION_DECISIONS, // 门① 第二前提（增补 bbc7ea28 O3）
     }),
   );
   assert.equal(out.from, "waiting_approval", "特例不是流转：from === state");
@@ -200,38 +284,37 @@ test("v0.9.0 B1″：不带登记字段时「to = 当前态」仍被状态机拒
 
 test("v0.9.0 B1″：登记特例**无终态守卫** ⇒ completed 后仍可写 stage = 发版", () => {
   close();
-  const created = mustOk(handleFeatureCreate({ title: "发版登记" }));
-  mustOk(handleFeatureApprove({ featureId: created.featureId }));
+  seedLedger("v0.9.0");
+  seedProjectVersion();
+  const featureId = executingFeature("发版登记");
   for (const to of ["integrating", "testing", "reviewing", "completed"] as const) {
-    mustOk(handleFeatureAdvance({ featureId: created.featureId, to }));
+    mustOk(handleFeatureAdvance({ featureId, to }));
   }
-  assert.equal(getFeature(created.featureId)?.state, "completed");
+  assert.equal(getFeature(featureId)?.state, "completed");
 
-  const out = mustOk(
-    handleFeatureAdvance({ featureId: created.featureId, to: "completed", stage: "发版" }),
-  );
+  const out = mustOk(handleFeatureAdvance({ featureId, to: "completed", stage: "发版" }));
   assert.equal(out.state, "completed", "终态不被本特例拒绝，也不被改写");
-  assert.equal(getFeature(created.featureId)?.stage, "发版", "发版登记必须写得进去");
+  assert.equal(getFeature(featureId)?.stage, "发版", "发版登记必须写得进去");
   close();
 });
 
 test("v0.9.0 B1″：登记字段与合法流转同单生效（advance 带 to = 合法后继 + stage / approval）", () => {
   close();
-  seedLedger("v0.9.0"); // 供下方反向锚使用（存在性先于排期锁）
-  const created = mustOk(handleFeatureCreate({ title: "同单" }));
-  mustOk(handleFeatureApprove({ featureId: created.featureId }));
+  seedLedger("v0.9.0"); // 供过门序列与下方排期锁说明
+  seedProjectVersion(); // v0.10.5 归属门：出 version_planning 格须有归属
+  const featureId = executingFeature("同单");
   // v0.10.0 §7 排期写状态锁：`version` 仅 `需求分析 ∧ 未发起` 可写；本卡已过门 ⇒ 同单不携 version
   // （版本写面覆盖见 v0.10.0 O4/O5 用例），此处锚「登记字段与合法流转同单落库」本身。
   const out = mustOk(
     handleFeatureAdvance({
-      featureId: created.featureId,
+      featureId,
       to: "integrating",
       stage: "回归",
       approval: "已通过",
     }),
   );
   assert.equal(out.state, "integrating", "合法流转照常");
-  const after = getFeature(created.featureId);
+  const after = getFeature(featureId);
   assert.equal(after?.stage, "回归");
   assert.equal(after?.approval, "已通过", "同单登记字段一并落库");
   close();
@@ -239,34 +322,34 @@ test("v0.9.0 B1″：登记字段与合法流转同单生效（advance 带 to = 
 
 test("v0.9.0 B1″：过门卡同单写 version ⇒ 排期写状态锁拒（新判定口径，零写入）", () => {
   close();
-  seedLedger("v0.9.0"); // 存在性先于两把锁 ⇒ 先登记，红点才收敛到状态锁
-  const created = mustOk(handleFeatureCreate({ title: "过门后写 version" }));
-  mustOk(handleFeatureApprove({ featureId: created.featureId }));
+  seedLedger("v0.9.0"); // 过门序列的排期写
+  seedLedger("v0.9.1"); // 存在性先于两把锁 ⇒ 先登记，红点才收敛到状态锁
+  seedProjectVersion();
+  const featureId = executingFeature("过门后写 version");
   const blocked = mustFail(
     handleFeatureAdvance({
-      featureId: created.featureId,
+      featureId,
       to: "integrating",
       stage: "回归",
-      version: "v0.9.0",
+      version: "v0.9.1",
     }),
   );
   assert.equal(blocked.code, "board_schedule_state_locked", "过门卡写 version ⇒ 排期写状态锁拒");
-  const after = getFeature(created.featureId);
+  const after = getFeature(featureId);
   assert.equal(after?.state, "executing", "拒绝 ⇒ 主链态零变更");
-  assert.equal(after?.version, "", "拒绝 ⇒ version 零写入");
+  assert.equal(after?.version, "v0.9.0", "拒绝 ⇒ version 零写入（保留过门前排期值）");
   close();
 });
 
 test("v0.9.0 B1″：改造期（executing）写登记不抖振状态、不触碰节点面", () => {
   close();
-  const created = mustOk(handleFeatureCreate({ title: "静止期登记" }));
-  mustOk(handleFeatureApprove({ featureId: created.featureId }));
-  const out = mustOk(
-    handleFeatureAdvance({ featureId: created.featureId, to: "executing", stage: "改造方案" }),
-  );
+  seedLedger("v0.9.0");
+  seedProjectVersion();
+  const featureId = executingFeature("静止期登记");
+  const out = mustOk(handleFeatureAdvance({ featureId, to: "executing", stage: "改造方案" }));
   assert.equal(out.state, "executing");
   assert.equal(out.rearmed, undefined, "不带 retryTaskIds ⇒ 不产生重派动作");
-  assert.equal(getFeature(created.featureId)?.stage, "改造方案");
+  assert.equal(getFeature(featureId)?.stage, "改造方案");
   close();
 });
 
@@ -276,12 +359,11 @@ test("v0.9.0 B1″：改造期（executing）写登记不抖振状态、不触�
 
 test("v0.9.0 F2：特例 + note 同传 ⇒ note 真的落库（plan）并回显，主链态仍不变", () => {
   close();
-  const created = mustOk(
-    handleFeatureCreate({ title: "特例带 note", stage: "需求分析", approval: "未发起" }),
-  );
+  seedLedger("v0.9.0");
+  const featureId = readyFeature("特例带 note"); // v0.10.5 门① version 守卫 ⇒ 序列内先排期
   const out = mustOk(
     handleFeatureAdvance({
-      featureId: created.featureId,
+      featureId,
       to: "waiting_approval", // = 当前态 ⇒ 走登记特例
       stage: "改造方案",
       note: "需求确认单已落文件，用户 2026-09-24 确认",
@@ -289,7 +371,7 @@ test("v0.9.0 F2：特例 + note 同传 ⇒ note 真的落库（plan）并回显�
   );
   assert.equal(out.ok, true);
   assert.equal(out.note, "需求确认单已落文件，用户 2026-09-24 确认", "出参回显同合法流转路径");
-  const after = getFeature(created.featureId);
+  const after = getFeature(featureId);
   assert.equal(after?.plan, "需求确认单已落文件，用户 2026-09-24 确认", "F2：note 不得被早退丢弃");
   assert.equal(after?.stage, "改造方案", "同单登记字段照写");
   assert.equal(after?.state, "waiting_approval", "特例仍不做状态流转");
@@ -301,7 +383,7 @@ test("v0.9.0 F2：特例 + decisions / contracts 同传 ⇒ 三者一起落库",
   seedLedger("v0.9.0"); // 存在性执法：先登记版号
   // 排期写状态锁（v0.10.0 §7）：写 version 要求卡处 `需求分析 ∧ 未发起` ⇒ 建卡即此态
   const created = mustOk(
-    handleFeatureCreate({ title: "特例带契约", stage: "需求分析", approval: "未发起" }),
+    handleFeatureCreate({ title: "特例带契约" }),
   );
   mustOk(
     handleFeatureAdvance({
@@ -339,7 +421,7 @@ test("v0.9.0 F2：特例只传 Context 不传登记 ⇒ 不走特例（仍被状
 test("v0.9.0 B2″：approval ≠ 待审批 ⇒ approve 结构化拒绝，且不改状态、不落已通过", () => {
   close();
   const created = mustOk(
-    handleFeatureCreate({ title: "门未发起", stage: "需求分析", approval: "未发起" }),
+    handleFeatureCreate({ title: "门未发起" }),
   );
   const denied = mustFail(handleFeatureApprove({ featureId: created.featureId }));
   assert.equal(denied.code, "feature_approval_not_ready");
@@ -351,29 +433,33 @@ test("v0.9.0 B2″：approval ≠ 待审批 ⇒ approve 结构化拒绝，且不
 
 test("v0.9.0 B2″：过审把门落「已通过」（单向、无回边）", () => {
   close();
-  const created = mustOk(handleFeatureCreate({ title: "已批过" }));
+  seedLedger("v0.9.0");
+  const featureId = readyFeature("已批过");
   assert.equal(
-    mustOk(handleFeatureApprove({ featureId: created.featureId })).state,
-    "executing",
+    mustOk(handleFeatureApprove({ featureId })).state,
+    "version_planning",
+    "v0.10.5 主轨无父 ⇒ approve 后继 = version_planning（PjM 工序格）",
   );
-  assert.equal(getFeature(created.featureId)?.approval, "已通过", "过审即落定门状态");
-  const again = mustFail(handleFeatureApprove({ featureId: created.featureId }));
+  assert.equal(getFeature(featureId)?.approval, "已通过", "过审即落定门状态");
+  const again = mustFail(handleFeatureApprove({ featureId }));
   assert.equal(again.code, "feature_state_invalid", "态检查在前：已离门 ⇒ 仍报态不符");
-  assert.equal(getFeature(created.featureId)?.state, "executing");
+  assert.equal(getFeature(featureId)?.state, "version_planning");
   close();
 });
 
 test("v0.9.0 B2″：门看 approval 不看 stage（两维正交）", () => {
   close();
-  const created = mustOk(
-    handleFeatureCreate({ title: "正交", stage: "需求分析", approval: "未发起" }),
-  );
+  seedLedger("v0.9.0");
+  const created = mustOk(handleFeatureCreate({ title: "正交" }));
+  // v0.10.5 门① version 守卫 ⇒ stage 外迁前先排期写 version
+  mustOk(handleFeatureAdvance({ featureId: created.featureId, to: "waiting_approval", version: "v0.9.0" }));
   // 只把 stage 推到「改造方案」仍不过审 —— 门只看 approval
   mustOk(
     handleFeatureAdvance({
       featureId: created.featureId,
       to: "waiting_approval",
       stage: "改造方案",
+      decisions: CONFIRMATION_DECISIONS, // 门① 第二前提（增补 bbc7ea28 O3）
     }),
   );
   assert.equal(
@@ -390,8 +476,8 @@ test("v0.9.0 B2″：门看 approval 不看 stage（两维正交）", () => {
   );
   assert.equal(
     mustOk(handleFeatureApprove({ featureId: created.featureId })).state,
-    "executing",
-    "approval 到位即放行",
+    "version_planning",
+    "approval 到位即放行（无父卡落 version_planning）",
   );
   assert.equal(getFeature(created.featureId)?.stage, "改造方案", "approve 不顺手改 stage");
   close();
@@ -527,7 +613,8 @@ test("v0.9.0 B1″：updateFeatureRegistration 只改提供的字段、不碰 st
 });
 
 test("v0.9.0：闭集值域与改造文档逐字一致（防自行扩缩）", () => {
-  assert.deepEqual([...FEATURE_STAGES], ["需求分析", "改造方案", "改造", "回归", "发版"]);
+  // v0.10.5 O1：`stage` 值域由 5 枚扩为 6 枚（新增「验收」），序照主链后段
+  assert.deepEqual([...FEATURE_STAGES], ["需求分析", "改造方案", "改造", "回归", "验收", "发版"]);
   assert.deepEqual([...FEATURE_APPROVALS], ["未发起", "待审批", "已通过"]);
 });
 

@@ -15,7 +15,7 @@ import type { CallToolResult } from "@modelcontextprotocol/sdk/types.js";
 import { z } from "zod";
 import { BRIDGE_VERSION } from "../version.js";
 import type { BridgeCore } from "./index.js";
-import type { FeatureState, TaskType } from "../types.js";
+import type { FeatureState } from "../types.js";
 import { TASK_TYPES } from "../types.js";
 import { CONFIG_WRITE_GROUP_OPS } from "./config-write.js";
 
@@ -52,13 +52,17 @@ function isFailure(v: unknown): v is { ok: false } {
 
 /**
  * Feature 挂载态（**常量集合驱动**）：仅这些态的 Feature 可挂 `a2a_call(mode="execute")` 的 DAG 节点。
- * 登记 ≠ 派发（调度器 `tick` 只看 `executing`，见 `bridge/scheduler.ts`）。
+ * **v0.10.5 O4 收窄**：摘除 `waiting_approval` —— DAG 登记时点随主链后移，唯一合法登记窗口 =
+ * `decomposing`（拆任务中，H2「DAG 初版登记仅在 decomposing 合法」）与 `executing`
+ * （执行期增量新节点）。
+ * 登记 ≠ 派发（调度器 `tick` 只看 `executing`，见 `bridge/scheduler.ts`）⇒ `decomposing` 内
+ * 登记完的节点**不占机器资源**，直到宿主 advance 进 `executing` 才被派发。
  * 变更本数组即自动更新工具描述 / `to` 描述 / 挂载门错误文案（均经 `join` 取用）。
  * `analyzing`（分析扇出）已随"引擎只做需求实现"的收敛**有意撤销**（REQ-v0.4.1-2026-09-16-01；
  * 枚举本身的收紧在 N2b）。
  * （实际挂载门在 `bridge/index.ts` 的 `registerFeatureNode`，N1c 起复用本常量。）
  */
-export const MOUNTABLE_FEATURE_STATES: readonly FeatureState[] = ["executing", "waiting_approval"];
+export const MOUNTABLE_FEATURE_STATES: readonly FeatureState[] = ["executing", "decomposing"];
 
 /**
  * `a2a_call` 的执行意图（**必填，无缺省** —— REQ-v0.4.1-2026-09-16-01 §2.5）：
@@ -464,7 +468,10 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_feature_create",
     {
       description:
-        "新建 Feature（一条需求，**初始态 waiting_approval** = 主链起点 / 审批门停靠点）。返回 featureId 供后续 advance/approve/cancel/status 引用；方案确认后请用 a2a_feature_approve 放行（唯一准入）。",
+        "新建 Feature（一条需求，**初始态 waiting_approval** = 主链起点 / 审批门停靠点；登记字段**初值恒定** —— stage=需求分析 + approval=未发起，由引擎硬编码，**本工具不收这两枚入参**，v0.10.5 O4）。返回 featureId 供后续 advance/approve/cancel/status 引用；写完改造文档后置 approval=待审批（经 a2a_feature_advance 写登记字段），确认后用 a2a_feature_approve 放行（唯一准入）。" +
+          "**成功出参带「本阶段明细」七枚**（增补 `6cc46dd2` · **平铺在顶层**，与 `featureId`/`state` 同级、无包装对象）= 回显三枚 `stage`/`approval`/`version`（引擎已存值**原样**回显，不翻译、不重新推导）+ 派生四枚 `pending`/`gate`/`actor`/`action`（本阶段还差哪件**登记欠账** / 奔哪道用户门 / 本阶段推动方 / 该做什么的能力陈述）。" +
+          "**`actor` = 本阶段（推进后）的推动方 / 执行方**（`host` / `user` / `engine`），**不是「此刻谁在等」**；派生四枚是 flow `引擎映射.md` §2 表「驱动方」列的**同源投影**（单值投影 ⇒ 该列的复合值「宿主（+ 用户确认）」在此有损，不得当等价替身读）。" +
+          "**静止与失败由 `tasks[]` / `a2a_feature_trace` 承载** ⇒ `actor` 不得当作「谁卡住了」的凭据。",
       inputSchema: {
         title: z.string().min(1).describe("Feature 标题（需求的简短摘要）"),
         requirement: z.string().optional().describe("需求原文（可选）"),
@@ -472,24 +479,16 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           .string()
           .optional()
           .describe("Feature 级会话上下文（落 features.context_id，跨任务 / 跨 worker 启停复用）"),
-        // v0.9.0 B1″ 登记字段：**schema 侧不收口**（`z.string()` 而非 `.enum()`），闭集校验在 handler
-        stage: z
-          .string()
-          .optional()
-          .describe(
-            "阶段登记（观测面，**不是状态机态**）：需求分析 / 改造方案 / 改造 / 回归 / 发版。" +
-              "**缺省「改造方案」**⇒ 不传时既有行为不变；板建需求显式传「需求分析」。非法值 ⇒ feature_invalid_stage",
-          ),
+        // v0.10.5 O4「初值恒定」：`stage` / `approval` 两参**已从 create 契约摘除**（初值由引擎
+        // 硬编码 = 需求分析 / 未发起，无兼容分叉）。多传的旧键由 zod 默认 strip **静默丢弃**。
+        // `version` 保留 —— 未排期停靠 / 撤排期 / released 锁 / 板拖拽建卡都依赖它。
         version: z
           .string()
           .optional()
-          .describe("版本登记（自由文本，如 v0.9.0；缺省空）：仅供看板 / 台账展示，引擎不解释"),
-        approval: z
-          .string()
-          .optional()
           .describe(
-            "审批门状态登记：未发起 / 待审批 / 已通过（单向、无回边）。**缺省「待审批」**⇒ 既有调用建完即可过审；" +
-              "板建需求显式传「未发起」。非法值 ⇒ feature_invalid_approval",
+            "版本登记（排期语义，可省略 = 未排期停靠未登记桶；空串 = 撤排期）：须 semver 形状 vX.Y.Z，" +
+              "非法形状 ⇒ feature_invalid_version_shape；非空须已在引擎版本台账存在 ⇒ 否则 orch_version_unknown；" +
+              "已 released 版 ⇒ orch_version_released_locked",
           ),
         // v0.9.3 O1：父需求登记（增补轨挂主需求）。校验在 handler（存在性 + 带身份过滤可见性，
         // 不可见 ⇒ 同 feature_not_found，不新增第二拒绝码）；schema 侧仅收成串入参
@@ -508,9 +507,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           title: args.title,
           requirement: args.requirement,
           contextId: args.contextId,
-          stage: args.stage,
           version: args.version,
-          approval: args.approval,
           parentFeatureId: args.parentFeatureId,
         });
         return outcome.ok ? textResult(outcome) : errorResult(outcome);
@@ -524,7 +521,13 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_feature_status",
     {
       description:
-        "查询 Feature 详情（state + tasks 摘要 + artifacts + **归属** `projects`〔v0.10.1 O7：本需求触达哪些 project、各落哪个 Project Version，无归属 ⇒ 空数组〕）；省略 featureId 时列出全部 Feature（含任务数，并带 `attributionsByFeature` map = `featureId → 归属清单`，**一条 SQL** 批量取）。",
+        "查询 Feature 详情（state + tasks 摘要 + artifacts + **归属** `projects`〔v0.10.1 O7：本需求触达哪些 project、各落哪个 Project Version，无归属 ⇒ 空数组〕）；省略 featureId 时列出全部 Feature（含任务数，并带 `attributionsByFeature` map = `featureId → 归属清单`，**一条 SQL** 批量取）。" +
+          "**单查成功出参带「本阶段明细」七枚**（增补 `6cc46dd2` · **平铺在顶层**，与 `feature`/`tasks` 同级、无包装对象）= 回显三枚 `stage`/`approval`/`version` + 派生四枚 `pending`/`gate`/`actor`/`action`；**列表分支逐字不带**（七枚在列表出参上恒缺）。" +
+          "回显三枚与同层 `feature.*` **逐字同值**（同一行、同一读口 ⇒ 无第二份事实源），派生四枚与 `advance` / `approve` 出口**同源同值**（同一纯函数）。" +
+          "**`pending` = 登记欠账按固定序（确认单 → 排期 `version` → 门① 抬 `stage` → 改造文档 → `approval` 待审批）逐项扫描后报的欠账清单，不按当前格过滤**（`executing` 格上确认单未登记 ⇒ 仍报 `requirement-doc`；当前各行至多 1 枚 = 首个未清项，数组形态为「两件事同时等」预留）；异常 / 终态四格恒 `[]`。其语义 = **登记事实**（`decisions` 里有没有那个档名），**不证文件存在** —— `decisions` 是宿主自报自由文本且**整值替换**，漏重发会让明细倒退，属正常后果。" +
+          "**`actor` = 本阶段（推进后）的推动方 / 执行方**（`host` / `user` / `engine`；终态 ⇒ `null` = 本阶段无推动方，**不得读成「卡住」**），**不是「此刻谁在等」**；派生四枚是 flow `引擎映射.md` §2 表「驱动方」列的**同源投影**（单值投影 ⇒ 不得当等价替身读）。" +
+          "**静止与失败由 `tasks[]` / `a2a_feature_trace` 承载** ⇒ `actor` 不得当作「谁卡住了」的凭据（`executing` 格的 `engine` 不表示「现在有在跑」）。" +
+          "另注：异常 / 终态四格（`needs_input` / `completed` / `failed` / `cancelled`）的 `stage` **保持当时值、不参与推导** ⇒ 本工具照读回显、不臆造、也不另存一枚标记「陈旧 `stage`」。",
       inputSchema: {
         featureId: z.string().optional().describe("Feature ID；省略则列出全部"),
       },
@@ -543,14 +546,14 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_feature_advance",
     {
       description:
-        "orch agent 驱动 Feature 主链推进（如 integrating→testing→reviewing→completed）；状态机校验合法后继，非法流转被拒。**waiting_approval→executing 已禁用**（唯一准入 = a2a_feature_approve，错误码 feature_approval_required）。needs_input 恢复用 to=executing 并携带 answer。**重派失败节点**用 retryTaskIds（须显式 to=executing，与 answer 互斥；重派 + 解冻闭包外 blocked 下游，不改 Feature 态）。**登记字段**用 stage / version / approval（`to` = 当前态时 = 只写登记、不动主链；无终态守卫，completed 后仍可写「发版」）。**归属（承诺集）**用 projectVersions（v0.10.1 O3 **独立分支**：非空即写全量归属、同值幂等可重发；`to` = 当前态时只补归属、主链零变更，与合法流转同单则归属 + 迁移同单生效；判据不过 ⇒ 整单拒绝且主链零迁移）。",
+        "orch agent 驱动 Feature 主链推进（如 integrating→testing→reviewing→completed）；状态机校验合法后继，非法流转被拒。**waiting_approval 出格须改走 a2a_feature_approve**（它是唯一准入，拒 ⇒ feature_approval_required；**守卫泛化**：按行前提把关、不按 to 取值点名 —— 从该态出发凡改动 state 的前进边一律拒，归档边 cancelled/failed 放行；非法目标仍先报 feature_transition_invalid）。needs_input 恢复用 to=executing 并携带 answer。**重派失败节点**用 retryTaskIds（须显式 to=executing，与 answer 互斥；重派 + 解冻闭包外 blocked 下游，不改 Feature 态）。**登记字段**用 stage / version / approval（`to` = 当前态时 = 只写登记、不动主链；无终态守卫，completed 后仍可写「发版」）。**门① 两前提（v0.10.5 O4 · 增补 bbc7ea28 O3）**：stage 由「需求分析」外迁（= 登记需求确认动作）要求 ① features.version **非空**，未排期 ⇒ feature_group_version_required；② 可见 decisions（已落库 ∪ 本单同写）已登记本需求的《需求确认单》路径，未登记 ⇒ feature_confirmation_doc_required。**缺哪报哪**（两枚独立码、不合并）、整单拒绝零写入（拒后卡仍「需求分析 ∧ 未发起」⇒ 排期锁仍开，善后后重试同一迁移）；②的唯一豁免 = retryTaskIds 重派路径（那是派发语义操作、不是过门；①三路同受）。**归属（承诺集）**用 projectVersions（v0.10.1 O3 **独立分支**：非空即写全量归属、同值幂等可重发；`to` = 当前态时只补归属、主链零变更，与合法流转同单则归属 + 迁移同单生效；判据不过 ⇒ 整单拒绝且主链零迁移）。**归属门双挂（v0.10.5 O4）**：version_planning→decomposing 与 decomposing→executing 两枚转移要求本需求**归属非空**（已落库或本单同写），空 ⇒ feature_attribution_required、主链零迁移。**四条成功出口（登记特例 / 只补归属 / 合法流转 / retryTaskIds 重派）各带「本阶段明细」七枚**（增补 `6cc46dd2` · **平铺在顶层**，与 `state`/`note` 同级、无包装对象）= 回显三枚 `stage`/`approval`/`version`（引擎已存值**原样**回显，不翻译、不重新推导）+ 派生四枚 `pending`/`gate`/`actor`/`action`（本阶段还差哪件**登记欠账** / 奔哪道用户门 / 本阶段推动方 / 该做什么的能力陈述）。明细按**写后重读**的那一行算 ⇒ `actor` 报的是**推进后**那一格的人，不是「被离开的那一格」；出口**非事务**（重读与写是同函数不同语句，**不追求**快照一致性）。**`actor` = 本阶段（推进后）的推动方 / 执行方**（`host` / `user` / `engine`；终态 ⇒ `null` = 本阶段无推动方，**不得读成「卡住」**），**不是「此刻谁在等」**；派生四枚是 flow `引擎映射.md` §2 表「驱动方」列的**同源投影**（单值投影 ⇒ 该列的复合值「宿主（+ 用户确认）」在此有损，不得当等价替身读）。**静止与失败由 `tasks[]` / `a2a_feature_trace` 承载** ⇒ `actor` 不得当作「谁卡住了」的凭据（`executing` 格的 `engine` 不表示「现在有在跑」）。",
       inputSchema: {
         featureId: z.string().min(1).describe("Feature ID"),
         to: z
           .string()
           .min(1)
           .describe(
-            "目标状态：waiting_approval / executing / integrating / testing / reviewing / completed / needs_input / failed / cancelled（非法后继被状态机拒绝；**waiting_approval→executing 须改用 a2a_feature_approve**）",
+            "目标状态：waiting_approval / version_planning / decomposing / executing / integrating / testing / reviewing / completed / needs_input / failed / cancelled（非法后继被状态机拒绝；**waiting_approval 的任何前进边都须改用 a2a_feature_approve**——守卫按行前提把关、不按本取值点名；出 version_planning / decomposing 两格须已有归属，见 a2a_feature_advance 说明）",
           ),
         note: z
           .string()
@@ -582,7 +585,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           .string()
           .optional()
           .describe(
-            "阶段登记（闭集：需求分析 / 改造方案 / 改造 / 回归 / 发版；非法值 ⇒ feature_invalid_stage）。" +
+            "阶段登记（闭集：需求分析 / 改造方案 / 改造 / 回归 / 验收 / 发版；非法值 ⇒ feature_invalid_stage）。" +
               "**观测面，不是状态机态**：不改主链、不发状态事件；序与回退都不校验。",
           ),
         version: z.string().optional().describe("版本登记（自由文本，无闭集；引擎不解释）"),
@@ -591,7 +594,10 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           .optional()
           .describe(
             "审批门状态登记（闭集：未发起 / 待审批 / 已通过；非法值 ⇒ feature_invalid_approval）。" +
-              "写完改造文档后置「待审批」= 过审的前置；a2a_feature_approve 放行时落「已通过」。",
+              "写完改造文档后置「待审批」= 过审的**前置之一**（= approve 六条里的 ②）；a2a_feature_approve 放行时落「已通过」。" +
+              "**本登记写自身不受六条约束**（六条只约束 approve 动作），但把 `approval` 置「待审批」后 approve 仍会查 ③④⑤⑥：" +
+              "未排期 / 未登记《需求确认单》/ `stage` 仍「需求分析」/ 未登记《改造文档》⇒ approve 被拒（增补 `ec93e1bd`）。" +
+              "序 = 排期写 version → 登记确认单并过门①（抬 stage）→ 落改造文档并登记 → 置待审批 → approve。",
           ),
         // v0.10.1 O3 归属（承诺集）写：**独立分支**（不入登记字段特例判据），照 retryTaskIds 先例：
         // `projectVersions` 非空即触发；`to` = 当前态时跳过 canTransition（转移表零改动、无自环）
@@ -651,13 +657,18 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_feature_approve",
     {
       description:
-        "审批门（**唯一准入**）：waiting_approval → executing；非该态调用被拒。该操作 = 记录**已发生**的用户确认（一对一映射：不可预领、不可补领）—— 禁止在用户确认方案前调用。",
+        "审批门（**唯一准入**）：非 waiting_approval 态调用被拒。**过门判据 = 六条（增补 `ec93e1bd` / 引擎映射 §3 门②行），任一不过 ⇒ 结构化拒收、零迁移（state / approval 逐字不动）**：① `state = waiting_approval`（码 `feature_state_invalid`）· ② `approval = 待审批`（码 `feature_approval_not_ready`）· ③ `version` **非空**（未排期 ⇒ `feature_group_version_required`）· ④ `decisions` 已登记《需求确认单》档名（⇒ `feature_confirmation_doc_required`；③④ **照抄门① 两条前提** ⇒ 省略门① 的卡不得直接过门②）· ⑤ `stage` 非「需求分析」（需求确认门未过 ⇒ `feature_requirement_gate_not_passed`）· ⑥ `decisions` 含**任一**《改造文档》档名（⇒ `feature_design_doc_required`）。**④⑥ 两枚档名须同时在册**：`decisions` 是整值替换 ⇒ 补登记时须**重发全量两枚**（只发新枚会把 ④ 打回）。六条**只约束 `approve` 这一个动作、不约束 `approval` 的登记写侧**（advance 的「to = 当前态 ∧ 带登记字段」特例不受本行约束），且**不校验 stage 迁移序**（⑤ 只查当场值）。目标态按父链分流（v0.10.5 O4）——**无父卡（主轨）→ version_planning**（PjM 版本规划工序自占一格），**有父卡（增补 / 承接轨）→ decomposing**（不重走 PjM 工序 ⇒ 跳过 version_planning）；两态内**不派发任何节点**。该操作 = 记录**已发生**的用户确认（一对一映射：不可预领、不可补领）—— 禁止在用户确认方案前调用。" +
+          "**成功出参带「本阶段明细」七枚**（增补 `6cc46dd2` · **平铺在顶层**，与 `featureId`/`from`/`state` 同级、无包装对象）= 回显三枚 `stage`/`approval`/`version` + 派生四枚 `pending`/`gate`/`actor`/`action`；按**写后重读**的那一行算 ⇒ `approval` 回显「已通过」（已落库值，非写前快照的「待审批」）、明细报**迁入的那一格**（`gate` 随之落 `null` —— 已离开用户门）。" +
+          "**`actor` = 本阶段（推进后）的推动方 / 执行方**（此处报迁入格的推动方 = 宿主），**不是「此刻谁在等」**；派生四枚是 flow `引擎映射.md` §2 表「驱动方」列的**同源投影**（单值投影 ⇒ 不得当等价替身读）。" +
+          "**静止与失败由 `tasks[]` / `a2a_feature_trace` 承载** ⇒ `actor` 不得当作「谁卡住了」的凭据。",
       inputSchema: {
         featureId: z.string().min(1).describe("Feature ID"),
       },
     },
     async (args) => {
       try {
+        // 本工具入参面**只有 `featureId`**（不收 `decisions`）⇒ 六条里的 ④⑥ 只看**已落库**的 `decisions`
+        // 当场值：门① 判据面的「已落库 ∪ 本单同写」并集豁免在 approve 侧不存在（增补 `ec93e1bd`）
         const outcome = core.featureApprove({ featureId: args.featureId });
         if (!outcome.ok) return errorResult(outcome);
         core.kickScheduler();

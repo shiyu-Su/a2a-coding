@@ -41,10 +41,12 @@ import {
   getFeature,
   getQueuedTask,
   getTask,
+  projectVersionCreate,
   runnerProjectsReplace,
   updateFeatureContext,
   upsertRunner,
   upsertTaskResult,
+  versionLedgerCreate,
 } from "../session/store.js";
 import type { BridgeCore } from "../bridge/index.js";
 
@@ -88,6 +90,10 @@ writeFileSync(
 
 const { createCore } = await import("../bridge/index.js");
 const core: BridgeCore = createCore();
+
+/** v0.10.5 O7 夹具用版号（{@link toMountedState}） */
+const O7_GROUP_VERSION = "0.10.5-o3.0";
+const O7_PROJECT_VERSION = "1.0.0";
 
 upsertRunner({ runnerId: "m1", machineId: "m1", protocolVersion: "2.0" });
 runnerProjectsReplace("m1", [
@@ -166,11 +172,63 @@ function anchorTaskTypes(): string[] {
 /** 节点 id → 所属 Feature（只读面按 featureId 查询用） */
 const TASK_TO_FEATURE = new Map<string, string>();
 
-function newFeature(title: string, plan: string | null): string {
+function newFeature(
+  title: string,
+  plan: string | null,
+  target: "decomposing" | "executing" = "executing",
+): string {
   const fid = okOrThrow(core.featureCreate({ title }), "featureCreate").featureId;
   assert.ok(fid !== undefined);
   if (plan !== null) updateFeatureContext(fid, { plan });
+  toMountedState(fid, target);
+  // 门① 抬 stage 同单登记的《需求确认单》（增补 bbc7ea28 O3 第二前提）不入本文件的外壳断言 ⇒ 过门后清回空
+  updateFeatureContext(fid, { decisions: null });
   return fid;
+}
+
+/**
+ * v0.10.5 O7：把卡走到**可挂载态**（挂载集已收窄为 { executing, decomposing }）。
+ *
+ * 原形态「create 后直接 registerFeatureNode、注册完再 approve」依赖两处旧契约（`create` 缺省即
+ * `待审批` ⇒ 建完就能过审；`waiting_approval` 可挂载），二者随 v0.10.5 O4 一并作废。新序列 =
+ * `advance(version)` → `advance(stage=改造方案)` → `advance(approval=待审批)` → `approve`
+ * （无父卡落 `version_planning`）→ `advance(decomposing, 带归属)` →〔可选〕`advance(executing)`。
+ * 缺省停在 `executing`（本文件的派发锚需要）；`decomposing` 档 = **可挂载但不派发**
+ * （调度器只领 `state='executing'` 的节点，O4 ⑥ 的机器凭据）。
+ */
+function toMountedState(fid: string, target: "decomposing" | "executing"): void {
+  versionLedgerCreate({ ownerGroup: null, version: O7_GROUP_VERSION });
+  projectVersionCreate({ ownerGroup: null, projectId: "alpha", version: O7_PROJECT_VERSION });
+  okOrThrow(
+    core.featureAdvance({ featureId: fid, to: "waiting_approval", version: O7_GROUP_VERSION }),
+    "排期写 version",
+  );
+  okOrThrow(
+    // 门① 第二前提（增补 bbc7ea28 O3）：抬 stage 须已登记《需求确认单》档名
+    core.featureAdvance({
+      featureId: fid,
+      to: "waiting_approval",
+      stage: "改造方案",
+      decisions: '["doc/v0.10.2/夹具-需求确认单.md","doc/v0.10.2/夹具-改造文档.md"]',
+    }),
+    "门① 抬 stage",
+  );
+  okOrThrow(
+    core.featureAdvance({ featureId: fid, to: "waiting_approval", approval: "待审批" }),
+    "approval 置待审批",
+  );
+  okOrThrow(core.featureApprove({ featureId: fid }), "approve（唯一准入）");
+  okOrThrow(
+    core.featureAdvance({
+      featureId: fid,
+      to: "decomposing",
+      projectVersions: [{ projectId: "alpha", version: O7_PROJECT_VERSION }],
+    }),
+    "出 version_planning 格（带归属）",
+  );
+  if (target === "executing") {
+    okOrThrow(core.featureAdvance({ featureId: fid, to: "executing" }), "出 decomposing 格");
+  }
 }
 
 function registerNode(
@@ -343,7 +401,7 @@ test("v0.10.2 O3 行为锚①：缺省节点派发消息外壳逐字不变、无
   const fid = newFeature("O3 缺省不注入", "方案D");
   const taskId = registerNode(BASE, fid);
 
-  okOrThrow(core.featureApprove({ featureId: fid }), "approve");
+  // v0.10.5 O7：`approve` 已随夹具前移（挂载集收窄 ⇒ 注册必须发生在过门之后），此处不再重复过门
   core.kickScheduler();
   await waitFor(() => dispatchRoundDone(taskId, "方案D"), "缺省节点首派");
   await quiesce();
@@ -377,7 +435,7 @@ test("v0.10.2 O3 行为锚②：非缺省注入 taskType= 行，两轮派发后�
   const fid = newFeature("O3 非缺省注入", "方案X1");
   const taskId = registerNode(BASE, fid, "dev_manager");
 
-  okOrThrow(core.featureApprove({ featureId: fid }), "approve");
+  // v0.10.5 O7：`approve` 已随夹具前移（同上）
   core.kickScheduler();
   await waitFor(() => dispatchRoundDone(taskId, "方案X1"), "轮 1 首派");
   await quiesce();
@@ -408,10 +466,12 @@ test("v0.10.2 O3 行为锚②：非缺省注入 taskType= 行，两轮派发后�
 
   // —— 其余非缺省值：落库原样（注入行由 ③ 的闸门静态锚覆盖，值无关）——
   for (const taskType of nonDefaults) {
-    const probeFid = newFeature(`O3 遍历 ${taskType}`, null);
+    // v0.10.5 O7：探针卡停在 `decomposing`（可挂载、调度器不领 —— 旧形态停在未过门的
+    // `waiting_approval` 已不可登记节点）；「不派发」这一断言语义不变，凭据换格
+    const probeFid = newFeature(`O3 遍历 ${taskType}`, null, "decomposing");
     const probeId = registerNode(`正文-${taskType}`, probeFid, taskType);
     assert.equal(getTask(probeId)?.taskType, taskType, `${taskType} 应原样落库`);
-    assert.equal(getFeature(probeFid)?.state, "waiting_approval", "遍历节点不派发（Feature 未过门）");
+    assert.equal(getFeature(probeFid)?.state, "decomposing", "遍历节点不派发（Feature 未进 executing）");
   }
 
   report(taskId, fid, "completed", "o3-final");

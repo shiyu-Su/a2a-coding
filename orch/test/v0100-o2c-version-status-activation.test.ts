@@ -31,7 +31,7 @@ import {
   versionLedgerCreate,
   versionLedgerStatus,
 } from "../session/store.js";
-import { handleFeatureApprove, handleFeatureCreate } from "../bridge/feature-tools.js";
+import { handleFeatureAdvance, handleFeatureApprove, handleFeatureCreate } from "../bridge/feature-tools.js";
 import { startHttpTransport } from "../bridge/transports/http.js";
 import type { HttpTransportHandle } from "../bridge/transports/http.js";
 import {
@@ -323,6 +323,19 @@ test("O2c 自动转换触发点 approve：waiting_approval 过审 ⇒ 版号 not
   assert.equal(created.ok, true, `建卡应成功（实际 ${JSON.stringify(created)}）`);
   if (!created.ok) return;
   assert.equal(versionLedgerStatus(null, version).status, "notstart", "approve 前仍 notstart");
+
+  // v0.10.5 O6 过门序列：create 不收 stage/approval（初值恒「需求分析 / 未发起」）⇒
+  // approve 前须经 advance 登记抬门（version 已在 create 写定，门① version 守卫直接满足；
+  // 增补 bbc7ea28 O3 第二前提 ⇒ 抬 stage 同单登记《需求确认单》档名）
+  const staged = handleFeatureAdvance({
+    featureId: created.featureId,
+    to: "waiting_approval",
+    stage: "改造方案",
+    decisions: '["doc/v0.10.0/夹具-需求确认单.md","doc/v0.10.0/夹具-改造文档.md"]',
+  });
+  assert.equal(staged.ok, true, `登记 stage 应成功（实际 ${JSON.stringify(staged)}）`);
+  const gated = handleFeatureAdvance({ featureId: created.featureId, to: "waiting_approval", approval: "待审批" });
+  assert.equal(gated.ok, true, `登记 approval 应成功（实际 ${JSON.stringify(gated)}）`);
 
   const approved = handleFeatureApprove({ featureId: created.featureId });
   assert.equal(approved.ok, true, `approve 应成功（实际 ${JSON.stringify(approved)}）`);

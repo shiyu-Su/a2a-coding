@@ -19,7 +19,7 @@ import assert from "node:assert/strict";
 import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
-import { getQueuedTask } from "../session/store.js";
+import { getQueuedTask, projectVersionCreate, versionLedgerCreate } from "../session/store.js";
 import type { BridgeCore } from "../bridge/index.js";
 
 // ---------------------------------------------------------------------------
@@ -65,6 +65,10 @@ const coreA: BridgeCore = createCore("gA");
 const coreB: BridgeCore = createCore("gB");
 const coreAnon: BridgeCore = createCore(null); // 未配组 / 3300 运维全量视图
 
+/** v0.10.5 O7 夹具用版号（Group 档 + project 档各一枚，全文件共用） */
+const GROUP_VERSION = "0.10.5-mount.0";
+const PROJECT_VERSION = "1.0.0";
+
 after(() => {
   globalThis.fetch = originalFetch;
   rmSync(CFG_DIR, { recursive: true, force: true });
@@ -101,14 +105,77 @@ function featureIdOf(created: unknown): string {
   return (created as { ok: true; featureId: string }).featureId;
 }
 
+/**
+ * **把卡走到可挂载态 `decomposing`**（v0.10.5 O7 · 挂载集收窄的连带改写）。
+ *
+ * 原形形态是「`featureCreate` 后直接 `registerFeatureNode`」—— 该形态依赖旧契约两点，均已作废：
+ * `create` 缺省即 `待审批`（建完就能过审）与 `waiting_approval` 可挂载。v0.10.5 O4 起
+ * `MOUNTABLE_FEATURE_STATES = { executing, decomposing }`，故本夹具走新过门序列：
+ * `advance(version)` → `advance(stage=改造方案)` → `advance(approval=待审批)` → `approve`
+ * （无父卡落 `version_planning`）→ `advance(to=decomposing, projectVersions)`（出格须过归属门）。
+ *
+ * 前置：`seedLedgers` 已把 Group 台账行与 project 台账行灌好（C-15 不隐式建版）。
+ */
+function toMountable(core: BridgeCore, featureId: string, projectId: string): void {
+  assert.equal(
+    isFailure(core.featureAdvance({ featureId, to: "waiting_approval", version: GROUP_VERSION })),
+    false,
+    "排期写 version 应成功",
+  );
+  assert.equal(
+    isFailure(
+      core.featureAdvance({
+        featureId,
+        to: "waiting_approval",
+        stage: "改造方案",
+        // 门① 第二前提（增补 bbc7ea28 O3）：抬 stage 须已登记《需求确认单》档名
+        decisions: '["doc/v0.10.1/夹具-需求确认单.md","doc/v0.10.1/夹具-改造文档.md"]',
+      }),
+    ),
+    false,
+    "门① 抬 stage 应成功（version 已非空 ∧ 确认单已登记）",
+  );
+  assert.equal(
+    isFailure(core.featureAdvance({ featureId, to: "waiting_approval", approval: "待审批" })),
+    false,
+    "approval 置待审批应成功",
+  );
+  assert.equal(isFailure(core.featureApprove({ featureId })), false, "approve 应放行");
+  assert.equal(
+    isFailure(
+      core.featureAdvance({
+        featureId,
+        to: "decomposing",
+        projectVersions: [{ projectId, version: PROJECT_VERSION }],
+      }),
+    ),
+    false,
+    "出 version_planning 格（带归属）应成功",
+  );
+}
+
+/**
+ * 台账预灌：Group 版号 + 该 owner_group 档下的 project 版号行（C-15 不隐式建版）。
+ * 重复调用无害（已存在的建版失败被吞 —— 夹具只关心「行在不在」）。
+ */
+function seedLedgers(ownerGroup: string | null): void {
+  versionLedgerCreate({ ownerGroup, version: GROUP_VERSION });
+  projectVersionCreate({ ownerGroup, projectId: "alpha", version: PROJECT_VERSION });
+  projectVersionCreate({ ownerGroup, projectId: "beta", version: PROJECT_VERSION });
+}
+
 // ===========================================================================
 // R-1：跨组 execute 挂载必须被拒（与 ownershipFailure 同源）
 // ===========================================================================
 
 test("R-1 跨组挂载 execute 节点 ⇒ feature_not_owned 拒 + 不泄漏他组组名；同组 / 无身份放行；被拒节点零入库零出站", () => {
   outboundCount = 0;
+  seedLedgers("gB");
   const fidB = featureIdOf(coreB.featureCreate({ title: "gB 的 Feature" }));
   assert.equal(taskCount(coreB, fidB), 0, "初态无节点");
+  // v0.10.5 O7：挂载集收窄 ⇒ 攻击与放行两支都必须在可挂载态（decomposing）上测，
+  // 否则先撞 `feature_state_invalid` 而根本走不到归属判据（本用例锁的是 R-1 的归属校验，不是挂载门）。
+  toMountable(coreB, fidB, "beta");
 
   // 攻击面：gA 连接把自己组内项目 `alpha` 挂进 **gB 的** Feature。
   // `alpha ∈ gA` ⇒ `assertMember` 会放行，唯一能拦下的是 R-1 的归属校验（owner_group vs identity）。
@@ -132,7 +199,10 @@ test("R-1 跨组挂载 execute 节点 ⇒ feature_not_owned 拒 + 不泄漏他�
 
 test("R-1 存量无归属 Feature（owner_group=NULL）被组身份挂载 ⇒ fail-closed 拒（与五出口同源的 NULL 支）；无身份放行", () => {
   outboundCount = 0;
+  seedLedgers(null);
   const oid = featureIdOf(coreAnon.featureCreate({ title: "存量无归属（NULL）" }));
+  // v0.10.5 O7：同款挂载集收窄连带 —— 先把卡走到 decomposing，才谈得上测 NULL 支的 fail-closed。
+  toMountable(coreAnon, oid, "alpha");
 
   // gA 身份操作 owner_group=NULL 的存量 Feature ⇒ 拒（fail-closed，不猜默认组）。
   const denied = expectFailure(coreA.registerFeatureNode("alpha", "hi", undefined, oid, []));

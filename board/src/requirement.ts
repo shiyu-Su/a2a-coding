@@ -8,9 +8,10 @@
  * 在**并列的第二个 MCP 写封装** `feature-schedule.ts`，不在本文件（`test/requirement.test.mjs`
  * 以源码扫描坐实：create 命中集 == {requirement.ts}、approve/cancel 零命中、advance 命中集 == {feature-schedule.ts}）。
  *
- * **两种 `waiting_approval` 不再歧义的机制**：板建的需求**显式**传 `stage = 需求分析` +
- * `approval = 未发起`（与既有 12 处调用的唯一行为区别 —— 那些走缺省 `stage = 改造方案` /
- * `approval = 待审批`）。缺省值由桥给出，故「提前批准一个方案未定的需求」在机制上不可能。
+ * **初值由桥硬编码（v0.10.5 create 契约重构）**：`a2a_feature_create` **不再收** `stage` /
+ * `approval` 两枚入参 —— 桥在入口固定写入 `stage = 需求分析` + `approval = 未发起`。板因此
+ * **不发这两键**：板侧一旦再传，就成了桥之外的第二处初值执法点（两处可不一致）；不发 ⇒
+ * 「提前批准一个方案未定的需求」在机制上不可能（旧形态「板显式传两值」由本契约取代）。
  *
  * **N5 起分层**：通用 MCP 客户端能力（端点组装 / tools/call 请求体 / 信封解析 / 一次
  * 调用的 fetch 链路）在 `mcp-client.ts`；本文件只保留 `a2a_feature_create` 的**入参口径**
@@ -30,10 +31,6 @@ import { parseVersion } from "./version-order.js";
 
 /** 桥 MCP 端点缺省基址（8787 = 编排桥 streamable-HTTP 面；只读运维视图另在 3300）。 */
 export const DEFAULT_MCP_BASE_URL = "http://127.0.0.1:8787";
-
-/** 板建需求的固定登记口径（见文件头「两种 waiting_approval」）。 */
-export const REQUIREMENT_STAGE = "需求分析";
-export const REQUIREMENT_APPROVAL = "未发起";
 
 /** 被封装的唯一工具名（源码扫描断言以此为锚）。 */
 export const FEATURE_CREATE_TOOL = "a2a_feature_create";
@@ -121,8 +118,8 @@ export function buildMcpEndpoint(baseUrl: string, group: string): string {
 }
 
 /**
- * 组装 `a2a_feature_create` 的入参对象 —— **始终显式带上** `stage` / `approval` / `version`。
- * 这是「板建的需求停在『需求分析 + 审批门未发起』」的机制落点（纯函数，供断言①）。
+ * 组装 `a2a_feature_create` 的入参对象 —— **只带** `title` / `version`（外加可选 `requirement` /
+ * `contextId`）。`stage` / `approval` **不出板**（初值由桥硬编码，见文件头；纯函数，供断言①的负钉）。
  *
  * **semver 收口（v0.9.4 N4 / 改造文档 §2.5）**：`version` 发送前 `trim()`；**空串 = 未排期 ⇒ 放行**
  * （M6 合法路径），非空则必须命中 `version-order.parseVersion` 的 `x.y.z`（可带 `v` 前缀）——
@@ -146,8 +143,6 @@ export function buildFeatureCreateArgs(input: CreateRequirementInput): Record<st
   const args: Record<string, unknown> = {
     title,
     version,
-    stage: REQUIREMENT_STAGE,
-    approval: REQUIREMENT_APPROVAL,
   };
   if (input.requirement !== undefined) args.requirement = input.requirement;
   if (input.contextId !== undefined) args.contextId = input.contextId;
@@ -192,7 +187,7 @@ function normalizeCreateOutcome(outcome: mcpClient.ToolCallOutcome): CreateRequi
 // ---------------------------------------------------------------------------
 
 /**
- * 板侧建一条需求 = 以组身份调一次 `a2a_feature_create`（显式传 `stage`/`approval`）。
+ * 板侧建一条需求 = 以组身份调一次 `a2a_feature_create`（**不传** `stage` / `approval` —— 初值由桥硬编码）。
  * 不抛业务错误：桥返回失败、传输层异常，一律归一为 {@link RequirementFailed}（不吞）。
  * 仅当调用方参数违反前置（空组名 / 空标题）时抛 {@link RequirementConfigError}。
  */

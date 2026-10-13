@@ -2,10 +2,9 @@
 import { execFileSync } from 'node:child_process';
 
 const sh = (cmd, opts = {}) => {
-  const [c, ...args] = cmd.split(' ');
   try {
-    const out = execFileSync(c, args, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000, ...opts });
-    return { ok: true, out: out.trim() };
+    const out = execFileSync(cmd, { encoding: 'utf8', stdio: ['ignore', 'pipe', 'pipe'], timeout: 300000, shell: true, ...opts });
+    return { ok: true, out: String(out).trim() };
   } catch (e) {
     return { ok: false, out: (e.stdout || '') + (e.stderr || String(e.message)).slice(0, 400) };
   }
@@ -24,4 +23,4 @@ console.log('  /health:', await health('http://127.0.0.1:3400/health'));
 
 console.log('\n══ orch / machine：本版零触达 ⇒ 不动（只报现状对齐）══');
 console.log('  orch /health:', await health('http://127.0.0.1:8787/health'));
-console.log('  machine /health:', await health('http://127.0.0.1:3010/health'));
+console.log('  machine /health:', await health('http://127.0.0.1:3100/health'));

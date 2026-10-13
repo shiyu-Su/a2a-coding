@@ -165,10 +165,10 @@ function okEnvelope(payload) {
 }
 
 // ---------------------------------------------------------------------------
-// ① 参数装配：组名来自**提需求表单**（BD11 反转 BD7-①）+ 恒带 stage=需求分析 / approval=未发起
+// ① 参数装配：组名来自**提需求表单**（BD11 反转 BD7-①）+ 出网**不带** stage / approval 两键（初值由桥硬编码）
 // ---------------------------------------------------------------------------
 
-test("BD11-①（反转 BD7-①）：表单组织名透传进 MCP URL 首段；出网恒带 stage=需求分析 + approval=未发起", async () => {
+test("BD11-①（反转 BD7-①）：表单组织名透传进 MCP URL 首段；出网不带 stage / approval 两键", async () => {
   const { fn, captured } = realCreateCapturing(
     okEnvelope({ ok: true, featureId: "F-9", state: "waiting_approval", stage: "需求分析", version: "v0.9.0", approval: "未发起" }),
   );
@@ -188,8 +188,10 @@ test("BD11-①（反转 BD7-①）：表单组织名透传进 MCP URL 首段；�
       assert.notDeepEqual(captured.urls, ["http://127.0.0.1:8787/board-cfg-group/mcp"], "板级默认不得覆盖表单所填组织名");
       const args = captured.bodies[0].params.arguments;
       assert.equal(captured.bodies[0].params.name, "a2a_feature_create");
-      assert.equal(args.stage, "需求分析");
-      assert.equal(args.approval, "未发起");
+      assert.equal(args.stage, undefined, "板侧不再发 stage 键（初值由桥硬编码）");
+      assert.equal(args.approval, undefined, "板侧不再发 approval 键");
+      assert.equal(Object.hasOwn(args, "stage"), false);
+      assert.equal(Object.hasOwn(args, "approval"), false);
       assert.equal(args.version, "v0.9.0");
       assert.equal(args.title, "板写面接线");
       // 组身份仍**不进** create 的 arguments（它由 URL 首段承载，桥据此定 owner_group）

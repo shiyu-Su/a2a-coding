@@ -162,18 +162,20 @@ test("sortPoolEntries: 保留条目其它字段", () => {
 // 版本列卡序（REQ-2026-10-12-02）：六档序 · 同档二级键复用池尺 · 未列值兜底
 // ---------------------------------------------------------------------------
 
-test("sortFeatureCards: 六档序全序锚（十张卡 createdAt 同值 ⇒ 唯一变量 = 状态档）· 档序相邻值两两相异", () => {
+test("sortFeatureCards: 六档序全序锚（十二张卡 createdAt 同值 ⇒ 唯一变量 = 状态档）· 档序相邻值两两相异", () => {
   const t = "2026-10-12T00:00:00Z";
-  // 档位：failed ｜ waiting_approval·reviewing·needs_input ｜ executing·integrating·testing ｜ completed ｜ cancelled ｜ 未列值兜底
-  // 同档 createdAt 同值 ⇒ 档内二级键 = featureId 字典序：卡 id 按期望序编为 F-a…F-j，档内序即书写序
+  // 档位：failed ｜ waiting_approval·reviewing·needs_input ｜ version_planning·decomposing·executing·integrating·testing ｜ completed ｜ cancelled ｜ 未列值兜底
+  // 同档 createdAt 同值 ⇒ 档内二级键 = featureId 字典序：卡 id 按期望序编为 F-a…F-l，档内序即书写序
   const seq = [
     "failed", "waiting_approval", "reviewing", "needs_input",
-    "executing", "integrating", "testing", "completed", "cancelled", "unlisted",
+    "version_planning", "decomposing", "executing", "integrating", "testing",
+    "completed", "cancelled", "unlisted",
   ];
-  const fid = (i) => `F-${"abcdefghij"[i]}`;
+  const fid = (i) => `F-${"abcdefghijkl"[i]}`;
   const cards = seq.map((state, i) => ({ state, createdAt: t, featureId: fid(i) }));
   const shuffled = [
-    cards[7], cards[2], cards[9], cards[0], cards[5], cards[3], cards[8], cards[1], cards[6], cards[4],
+    cards[11], cards[3], cards[7], cards[0], cards[9], cards[4],
+    cards[10], cards[2], cards[6], cards[1], cards[8], cards[5],
   ];
   assert.deepEqual(
     sortFeatureCards(shuffled).map((e) => e.featureId),

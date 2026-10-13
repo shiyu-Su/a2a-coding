@@ -111,12 +111,18 @@ export interface FeatureCardEntry extends PoolEntry {
  * 状态档 → 档位序（六档，值越小越靠前）。用 Map 而非对象字面量：`state` 原值来自桥、
  * 值域不受板控，字面量在 `constructor` 一类键上会命中 `Object.prototype` 上的函数
  * ⇒ 得 `NaN` ⇒ 比较器不再全序（静默乱序，比抛错更难查）。Map 无原型洞。
+ *
+ * rank 2 = **在途档**（v0.10.5 主链 6→8）：`version_planning` / `decomposing` 与
+ * `executing` / `integrating` / `testing` 同档 —— 必须与 `derive.ts` 的色档「在途主链」
+ * （`brand`）同档，只改其一即「色条在途、卡面沉底」自相矛盾。
  */
 const STATE_CARD_TIER_RANK = new Map<string, number>([
   ["failed", 0],
   ["waiting_approval", 1],
   ["reviewing", 1],
   ["needs_input", 1],
+  ["version_planning", 2],
+  ["decomposing", 2],
   ["executing", 2],
   ["integrating", 2],
   ["testing", 2],

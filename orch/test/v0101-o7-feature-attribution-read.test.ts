@@ -23,7 +23,9 @@ import assert from "node:assert/strict";
 import {
   ERR_PROJECT_VERSION_EXISTS,
   ERR_VERSION_EXISTS,
+  featureProjectDelete,
   featureProjectListByFeature,
+  featureProjectUpsert,
   getDefaultStore,
   projectVersionCreate,
   versionLedgerCreate,
@@ -71,12 +73,57 @@ function nextTitle(tag: string): string {
   return `o7-${tag}-${seq}`;
 }
 
-/** 一张已过门的卡（归属写点 = `approve` 过门之后，C-3） */
+/** 跳板归属的身份（只服务过格 ⇒ 落库后立即经 store 数据面删除，不进任何读面断言） */
+const GATE_PROJECT = "o5-gate";
+const GATE_PROJECT_VERSION = "9.9.9";
+
+/**
+ * 抬 `stage` 那一单携带的产出物登记夹具 —— 门① 第二前提（增补 `bbc7ea28` O3）要《需求确认单》、
+ * 门② 的 ⑥（增补 `ec93e1bd`）要《改造文档》。两枚必须**同单在册**：`decisions` 是整值替换，
+ * 过门时按当场值逐枚查 ⇒ 只登记其一不放行。
+ */
+const CONFIRMATION_DECISIONS = '["doc/v0.10.1/夹具-需求确认单.md","doc/v0.10.1/夹具-改造文档.md"]';
+
+/**
+ * 一张已过门的卡（`executing` + `已通过`，归属集为空）。
+ *
+ * **v0.10.5 O5 过门序列（新契约定稿，写死照用）**：`create`（**不传** `stage` / `approval` ⇒ 初值恒定
+ * `需求分析` / `未发起`）→ `advance(to=当前态, version=<非空>)` →
+ * `advance(to=当前态, stage="改造方案", approval="待审批")` → `approve` ⇒ `version_planning`；
+ * 再借一枚跳板归属跨 O4 的**归属门双挂**两格出口（`version_planning → decomposing → executing`）、
+ * 过完即删 —— 本文件测的是读面，「无归属」档必须真的是零行。
+ */
 function approvedFeature(group: string, version: string, tag = "main"): string {
   const featureId = mustOk(
     handleFeatureCreate({ title: nextTitle(tag), version }, group),
   ).featureId;
+  mustOk(handleFeatureAdvance({ featureId, to: "waiting_approval", version }, group));
+  mustOk(
+    handleFeatureAdvance(
+      {
+        featureId,
+        to: "waiting_approval",
+        stage: "改造方案",
+        approval: "待审批",
+        decisions: CONFIRMATION_DECISIONS,
+      },
+      group,
+    ),
+  );
   mustOk(handleFeatureApprove({ featureId }, group));
+  mustOk(
+    featureProjectUpsert({
+      ownerGroup: group,
+      featureId,
+      projectId: GATE_PROJECT,
+      projectVersion: GATE_PROJECT_VERSION,
+      groupVersion: version,
+      source: "o5-gate",
+    }),
+  );
+  mustOk(handleFeatureAdvance({ featureId, to: "decomposing" }, group));
+  mustOk(handleFeatureAdvance({ featureId, to: "executing" }, group));
+  assert.equal(featureProjectDelete(group, featureId, GATE_PROJECT).deleted, true);
   return featureId;
 }
 

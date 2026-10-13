@@ -83,6 +83,15 @@ test("件5-①c（查询档）：renderTasks 复用同一张结果卡", () => {
   assert.match(html, /过滤：<span class="mono">limit=10<\/span>/, "过滤回显保留");
 });
 
+test("件5-①d（状态过滤下拉枚数）：主链 8 态 + 异常 3 态 + blocked + 全部 = 13 枚 option（v0.10.5 B3 新两格 +2）", () => {
+  const html = renderTasksPick(projectsFixture, null);
+  const select = html.match(/<select name="state">([\s\S]*?)<\/select>/);
+  assert.ok(select, "状态过滤下拉在场");
+  assert.equal((select[1].match(/<option /g) ?? []).length, 13, "option 枚数 = 13（原 11 + 新两格）");
+  assert.match(select[1], /<option value="version_planning">/, "定版中进过滤候选");
+  assert.match(select[1], /<option value="decomposing">/, "拆任务中进过滤候选");
+});
+
 test("件5-③（管理页 · 正常态）：池卡 + 停用表单 + 页头核对短条（⑦b 双表单卡与台账卡退役；★⑧a 核对卡降为短条）", () => {
   const html = renderOrgSpaceManagePage({
     org: "alpha",

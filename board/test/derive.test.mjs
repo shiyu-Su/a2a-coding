@@ -21,7 +21,7 @@ import {
 } from "../dist/derive.js";
 
 // ---------------------------------------------------------------------------
-// 派生规则（§2.2-9）：引擎态 → 改造 / 回归 / 验收，逐例 + 边界
+// 派生规则（§2.2-9）：引擎态 → 定版 / 拆任务 / 改造 / 回归 / 验收，逐例 + 边界
 // ---------------------------------------------------------------------------
 
 test("deriveDisplayStage: 主链派生逐例", () => {
@@ -34,6 +34,11 @@ test("deriveDisplayStage: 主链派生逐例", () => {
 
 test("deriveDisplayStage: completed + 登记发版 ⇒ 已发版（发版在 completed 之后写入）", () => {
   assert.deepEqual(deriveDisplayStage("completed", "发版"), { label: "已发版", basis: "derived" });
+});
+
+test("deriveDisplayStage: v0.10.5 主链新增两态 ⇒ 定版中 / 拆任务中（正钉派生，不回落 registered）", () => {
+  assert.deepEqual(deriveDisplayStage("version_planning", "改造方案"), { label: "定版中", basis: "derived" });
+  assert.deepEqual(deriveDisplayStage("decomposing", "改造方案"), { label: "拆任务中", basis: "derived" });
 });
 
 test("deriveDisplayStage: 边界态回落登记值（waiting_approval / failed / cancelled / blocked）", () => {
@@ -63,11 +68,11 @@ test("deriveDisplayStage: 登记缺失（null）⇒ 未知（登记缺失），�
 });
 
 // ---------------------------------------------------------------------------
-// 增补五 件B（REQ-2026-10-02-05）：状态 → 色档（9 态归 7 档，闭集不扩）
+// 增补五 件B（REQ-2026-10-02-05）：状态 → 色档（11 态归 7 档，闭集不扩）
 // ---------------------------------------------------------------------------
 
-test("deriveCardColorTier: 在途主链四态归 brand", () => {
-  for (const s of ["executing", "integrating", "testing", "reviewing"]) {
+test("deriveCardColorTier: 在途主链六态归 brand", () => {
+  for (const s of ["version_planning", "decomposing", "executing", "integrating", "testing", "reviewing"]) {
     assert.equal(deriveCardColorTier(s), "brand", `${s} ⇒ brand`);
   }
 });
@@ -283,7 +288,7 @@ test("监视-derive 引导行监视档：如实描述快照事实（等 N 个子
   assert.doesNotMatch(noCount, /等 \d+ 个/);
 });
 
-test("监视-derive 卡滞档在监视中不可达（判序自然结果：isStalled 只活在已通过分支，监视档排前）", () => {
+test("监视-derive 卡滞档在监视中不可达（判序自然结果：卡滞判据只活在已通过分支，监视档排前）", () => {
   const at = "2026-09-29T10:00:00Z";
   const then = Date.parse(at);
   const base = {
@@ -475,6 +480,63 @@ test("C1-derive 卡滞档（负向四闸）：阈值内 / 有在飞轮 / 无轮�
 
 test("C1-derive 卡滞阈值 = 定死 10 分钟（本版不引配置键）", () => {
   assert.equal(TURN_STALL_AFTER_MS, 10 * 60 * 1000);
+});
+
+test("B2-derive 引导行专属档：version_planning ⇒ 等你 / agent 定版（PjM 工序 · 指「让 agent 继续」）", () => {
+  const hint = deriveNextStepHint({ ...NS, approval: "已通过", state: "version_planning" });
+  assert.match(hint, /等你 \/ agent 定版.*PjM 定版工序/);
+  assert.match(hint, /先建 Project Version 再写归属/, "工序落库顺序须与规范一致（先建版、再写归属）");
+  assert.match(hint, /点「让 agent 继续」/, "该档动作区按钮 =「让 agent 继续」（文案只指在场入口）");
+});
+
+test("B2-derive 引导行专属档：decomposing ⇒ 等 agent 拆任务登记 DAG", () => {
+  const hint = deriveNextStepHint({ ...NS, approval: "已通过", state: "decomposing" });
+  assert.match(hint, /等 agent 拆任务登记 DAG/);
+  assert.match(hint, /等各 project 研发经理回传本侧任务清单.*登记节点/);
+});
+
+test("B2-derive（负钉）新两态文案不得说「引擎按 DAG 自动接力」：该两态引擎不派发任何节点", () => {
+  for (const state of ["version_planning", "decomposing"]) {
+    const hint = deriveNextStepHint({ ...NS, approval: "已通过", state });
+    assert.doesNotMatch(hint, /自动接力/, `${state} 档不沿用 executing 兜底句`);
+    assert.doesNotMatch(hint, /刷新本页看进展/, `${state} 档不沿用 executing 兜底句（无节点可看进展）`);
+  }
+  // executing 的兜底句逐字不破（既有档不随新态改写）
+  assert.match(deriveNextStepHint({ ...NS, approval: "已通过", state: "executing" }), /引擎按 DAG 自动接力/);
+});
+
+test("B2-derive 卡滞档态集扩：version_planning / decomposing ∧ 无在飞轮 ∧ 超阈值 ⇒ 独立分句「工序已 X 未推进」", () => {
+  const at = "2026-10-12T10:00:00Z";
+  const then = Date.parse(at);
+  const over = { turnBusy: false, latestTurn: { state: "succeeded", summary: "s", at }, nowMs: then + TURN_STALL_AFTER_MS + 60_000 };
+  const vp = deriveNextStepHint({ ...NS, ...over, approval: "已通过", state: "version_planning" });
+  const dc = deriveNextStepHint({ ...NS, ...over, approval: "已通过", state: "decomposing" });
+  assert.match(vp, /定版工序已 11min 未推进/, "「已 Xmin 未推进」= nowMs - at 单时钟差值");
+  assert.match(dc, /拆任务工序已 11min 未推进/);
+  for (const hint of [vp, dc]) {
+    assert.doesNotMatch(hint, /好像没接上/, "不复用 executing 原句（那句预设「引擎本该接力」）");
+    assert.match(hint, /本页没有进行中的轮/);
+  }
+  // executing 的卡滞原句逐字不破
+  assert.match(deriveNextStepHint({ ...NS, ...over, approval: "已通过", state: "executing" }), /agent 好像没接上/);
+});
+
+test("B2-derive 卡滞态集边界（负钉）：态集外（waiting_approval / testing / reviewing / integrating）⇒ 一律不出「工序已…未推进」分句", () => {
+  const at = "2026-10-12T10:00:00Z";
+  const then = Date.parse(at);
+  const over = { turnBusy: false, latestTurn: { state: "succeeded", summary: "s", at }, nowMs: then + 999 * 3600_000 };
+  for (const state of ["waiting_approval", "integrating", "testing", "reviewing"]) {
+    assert.doesNotMatch(
+      deriveNextStepHint({ ...NS, ...over, approval: "已通过", state }),
+      /工序已.*未推进|好像没接上/,
+      `${state} 不属卡滞态集`,
+    );
+  }
+  // 新两态仍受负向四闸约束：有在飞轮 / 无轮次 / 未给 nowMs ⇒ 不切卡滞档（回落专属档）
+  const base = { ...NS, approval: "已通过", state: "version_planning", latestTurn: { state: "succeeded", summary: "s", at }, nowMs: then + 999 * 3600_000 };
+  assert.match(deriveNextStepHint({ ...base, turnBusy: true }), /等你 \/ agent 定版/);
+  assert.match(deriveNextStepHint({ ...base, latestTurn: null }), /等你 \/ agent 定版/);
+  assert.match(deriveNextStepHint({ ...base, nowMs: undefined }), /等你 \/ agent 定版/);
 });
 
 test("BD18-derive 下一步：终态先行（completed / cancelled / failed 不再引导点按钮）", () => {

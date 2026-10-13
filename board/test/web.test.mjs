@@ -795,17 +795,20 @@ test("C1 renderFeatureDetail 第一屏（件2 两栏改版）：标题 → 阶�
 
 // --- 件2 正锚：阶段步条 / 侧栏四卡（REQ-2026-09-30-04） --------------------------------------
 
-test("件2 阶段步条：五段齐备 · 完成段打勾 · 当前段实底 · 派生/登记标注不丢 · 阶段双行退场", () => {
+test("件2 阶段步条：六段齐备 · 完成段打勾 · 当前段实底 · 派生/登记标注不丢 · 阶段双行退场", () => {
   const html = renderFeatureDetail(detailFixture, null, null, NOW); // executing + stage=改造方案 ⇒ 改造中（派生）挂第 3 段
   assert.match(html, /<span class="b-step done"><i class="b-step-dot">✓<\/i><b class="b-step-name">需求分析<\/b><\/span>/);
   assert.match(html, /<span class="b-step done"><i class="b-step-dot">✓<\/i><b class="b-step-name">改造方案<\/b><\/span>/);
   assert.match(html, /<span class="b-step cur"><i class="b-step-dot"><\/i><b class="b-step-name">改造<\/b><\/span>/);
+  assert.match(html, /<span class="b-step"><i class="b-step-dot"><\/i><b class="b-step-name">回归<\/b><\/span>/, "v0.10.5 新增「验收」段之前的「回归」段 = 未到达（不高亮、不打勾）");
+  assert.match(html, /<span class="b-step"><i class="b-step-dot"><\/i><b class="b-step-name">验收<\/b><\/span>/, "「验收」自成一格（不再挤「回归」的补注）");
   assert.match(html, /<span class="b-step"><i class="b-step-dot"><\/i><b class="b-step-name">发版<\/b><\/span>/, "未到达段 = 无态（不高亮、不打勾）");
+  assert.equal((html.match(/<b class="b-step-name">/g) ?? []).length, 6, "六段齐备");
   assert.match(html, /当前 = <b>改造中<\/b> <span class="muted">（派生）<\/span>/, "显示阶段 + 派生标注随步条走（原代表述不丢）");
   assert.equal(html.includes("阶段（显示）") || html.includes("阶段（登记）"), false, "元数据表的阶段双行已由步条替代");
 });
 
-test("件2 阶段步条三档边界：已发版 = 五段全勾 · 验收中挂「回归」段带补注 · 归档不上不猜", () => {
+test("件2 阶段步条三档边界：已发版 = 六段全勾 · 验收中直挂「验收」段 · 归档不上不猜", () => {
   const released = renderFeatureDetail(
     { ...detailFixture, feature: { ...detailFixture.feature, state: "completed", stage: "发版" } },
     null,
@@ -813,7 +816,7 @@ test("件2 阶段步条三档边界：已发版 = 五段全勾 · 验收中挂�
     NOW,
   );
   assert.equal(released.includes("b-step cur"), false, "已发版 ⇒ 无当前段（全段完成）");
-  assert.equal((released.match(/b-step done/g) ?? []).length, 5, "五段全打勾");
+  assert.equal((released.match(/b-step done/g) ?? []).length, 6, "六段全打勾");
   assert.match(released, /当前 = <b>已发版<\/b>/);
 
   const reviewing = renderFeatureDetail(
@@ -822,7 +825,7 @@ test("件2 阶段步条三档边界：已发版 = 五段全勾 · 验收中挂�
     null,
     NOW,
   );
-  assert.match(reviewing, /<b class="b-step-name">回归 · 验收中<\/b>/, "验收挂回归段，段名补注如实");
+  assert.match(reviewing, /<span class="b-step cur"><i class="b-step-dot"><\/i><b class="b-step-name">验收<\/b><\/span>/, "验收中 = 「验收」段自身带态（第 5 段 cur，不再挂「回归」补注）");
 
   const unknown = renderFeatureDetail(
     { ...detailFixture, feature: { ...detailFixture.feature, state: "failed", stage: null } },
@@ -832,6 +835,27 @@ test("件2 阶段步条三档边界：已发版 = 五段全勾 · 验收中挂�
   );
   assert.equal(unknown.includes("b-step done") || unknown.includes("b-step cur"), false, "归档不上 ⇒ 一段不高亮");
   assert.match(unknown, /当前阶段 = <b>未知（登记缺失）<\/b> <span class="muted">（登记 · 未归档到步条，如实显示）<\/span>/);
+});
+
+test("件2 阶段步条 v0.10.5 新增两态：定版中 / 拆任务中 归「改造方案」段带补注（不新增第七段）", () => {
+  const planning = renderFeatureDetail(
+    { ...detailFixture, feature: { ...detailFixture.feature, state: "version_planning" } },
+    null,
+    null,
+    NOW,
+  );
+  assert.match(planning, /<b class="b-step-name">改造方案 · 定版中<\/b>/, "version_planning ⇒ 段名仍是「改造方案」，补注「定版中」");
+  assert.equal((planning.match(/<b class="b-step-name">/g) ?? []).length, 6, "两态不得抬出第七段");
+  assert.equal(planning.includes('<b class="b-step-name">改造 · 定版中</b>'), false, "补注只挂本态所在段，不串到「改造」段");
+
+  const decomposing = renderFeatureDetail(
+    { ...detailFixture, feature: { ...detailFixture.feature, state: "decomposing" } },
+    null,
+    null,
+    NOW,
+  );
+  assert.match(decomposing, /<b class="b-step-name">改造方案 · 拆任务中<\/b>/, "decomposing ⇒ 「改造方案」段 + 补注「拆任务中」");
+  assert.equal((decomposing.match(/<b class="b-step-name">/g) ?? []).length, 6, "两态不得抬出第七段");
 });
 
 test("件2 侧栏四卡序：元数据卡（compact 两列）→ 阶段产出卡 → 排期卡；v0.10.3 N2c 依赖图已移出侧栏、上移主栏", () => {

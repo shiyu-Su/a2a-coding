@@ -5,22 +5,48 @@
  * **纯函数**（`planResume` = 重派 / 解冻计划，无副作用、不触发调度），
  * 不触碰 A2A / 不触发调度（调度 kick 由 `bridge/index.ts` 在工具返回后统一发起）。
  *
- * - `handleFeatureCreate`  新建 Feature（**初态 `waiting_approval`** = 主链起点；落 `contextId` 到
- *                          `features.context_id`）
+ * - `handleFeatureCreate`  新建 Feature（**初态 `waiting_approval`** = 主链起点；登记字段**初值恒定**
+ *                          —— `stage=需求分析` + `approval=未发起` 由引擎硬编码，**不再是入参**，
+ *                          v0.10.5 O4；落 `contextId` 到 `features.context_id`）；
+ *                          成功出参带**本阶段明细七枚**（增补 `6cc46dd2` N4 · {@link FeatureCreateSuccess}）
  * - `handleFeatureStatus`  查询单个 Feature 详情 / 全部列表（state + tasks 摘要 + artifacts；
  *                          v0.9.1 起单查增量扩 `acceptance` 聚合块 = 主链段轨迹 + 失败账单 + 节点态计数；
  *                          v0.10.1 O7 起单查扩 `projects`、列表扩 `attributionsByFeature` = 归属（承诺集）
- *                          只读面，两条面各走一条 SQL）
+ *                          只读面，两条面各走一条 SQL；
+ *                          **增补 `6cc46dd2` N5**：单查带**本阶段明细七枚**（{@link FeatureStatusSingleSuccess}）、
+ *                          **列表分支不带**（七枚在列表出参上恒缺）
  * - `handleFeatureAdvance` orch agent 驱动主链推进（状态机校验合法后继；`note`→plan、
  *                          `decisions`/`contracts` 可选落 Feature Context；`answer` 用于 needs_input 补齐）；
- *                          **`waiting_approval → executing` 已禁用** —— 唯一准入 = `handleFeatureApprove`，
- *                          错误码 `feature_approval_required`；**`retryTaskIds`**（§2.3）走**显式特例**：
+ *                          **`waiting_approval` 出格须 `approve`**（增补 `bbc7ea28` O1 守卫泛化）——
+ *                          准入守卫**按行前提把关、不按 `to` 取值点名**：从该态出发凡改动 `state` 的
+ *                          **前进边**一律拒为 `feature_approval_required`（唯一准入 = `handleFeatureApprove`），
+ *                          **归档边**（`cancelled` / `failed`，非主链态）放行；位置在 `canTransition` **之后**
+ *                          ⇒ 非法目标仍报 `feature_transition_invalid`（错误区分）；
+ *                          **`retryTaskIds`**（§2.3）走**显式特例**：
  *                          跳过 `canTransition`（转移表零改动、无自环）、重派指定 `failed` 节点 +
  *                          解冻闭包**外**的 `blocked` 下游，**不改 Feature 态**；
  *                          **`projectVersions`**（v0.10.1 O3 / C-17）走**归属独立分支**：非空即写
  *                          承诺集（全量重发、同值幂等），`to` = 当前态时同样跳过 `canTransition`，
- *                          与合法流转同单时归属 + 迁移一起生效（归属拒 ⇒ 主链零迁移）
- * - `handleFeatureApprove` 审批门：`waiting_approval → executing`
+ *                          与合法流转同单时归属 + 迁移一起生效（归属拒 ⇒ 主链零迁移）；
+ *                          **归属门双挂（v0.10.5 O4）**：`version_planning → decomposing` 与
+ *                          `decomposing → executing` 两枚转移以「本需求归属非空」为出格凭据，
+ *                          空 ⇒ {@link ERR_FEATURE_ATTRIBUTION_REQUIRED}、主链零迁移；
+ *                          **门① 两前提（v0.10.5 O4 · 增补 `bbc7ea28` O3）**：`stage` 由「需求分析」
+ *                          外迁以「`version` 非空 ∧ 可见 `decisions` 已登记《需求确认单》路径」为前提，
+ *                          缺哪报哪（{@link ERR_GROUP_VERSION_REQUIRED} / {@link ERR_CONFIRMATION_DOC_REQUIRED}）、
+ *                          整单拒绝零写入
+ * - `handleFeatureApprove` 审批门（**唯一准入**）：**目标态按父链分流**（v0.10.5 O4）——
+ *                          无父卡（主轨）`waiting_approval → version_planning`；有父卡（增补 / 承接轨）
+ *                          直接 `→ decomposing`（不重走 PjM 工序 ⇒ 跳过 `version_planning` 格）。
+ *                          既有三条判据（非 `waiting_approval` 拒 / `approval` 须 `待审批` /
+ *                          放行同轮 `notstart→active`）**零改动**；**增补 `ec93e1bd` 起在其后另加四条**
+ *                          （③ `version` 非空 / ④ 确认单在册 / ⑤ `stage` 非「需求分析」/ ⑥ 改造文档在册；
+ *                          序 ③→④→⑤→⑥，③④ 照抄门① 两前提，⑤⑥ 新码
+ *                          {@link ERR_REQUIREMENT_GATE_NOT_PASSED} / {@link ERR_DESIGN_DOC_REQUIRED}）；
+ *                          入参面**零改动**；
+ *                          成功出参 = {@link FeatureApproveSuccess}（增补 `6cc46dd2` N4 · 基类型 ∧
+ *                          明细七枚）—— 明细**只挂 `approve` 自己的出口形**、不宽化 `cancel` 共用的
+ *                          {@link FeatureStateChangeSuccess}
  * - `handleFeatureCancel`  非收口态 → `cancelled`；**`failed` 亦可经此归档为 `cancelled`**
  *                          （v0.9.5 O1：仅迁 Feature 态、不动节点账面；`completed`/`cancelled` 拒）
  * - `handleFeatureTrace`   **只读**投影「这个 Feature 为什么还没完成」（在等谁 / 排队位次 / 占位档）；
@@ -84,6 +110,7 @@ import type { TaskLane, TaskType } from "../types.js";
 import {
   allowedTransitions,
   canTransition,
+  FEATURE_MAIN_CHAIN,
   isFeatureState,
   isTerminalFeatureState,
 } from "../feature/state-machine.js";
@@ -100,13 +127,22 @@ import type {
   TaskState,
 } from "../types.js";
 import {
-  DEFAULT_FEATURE_APPROVAL,
-  DEFAULT_FEATURE_STAGE,
   FEATURE_APPROVALS,
   FEATURE_STAGES,
   isFeatureApproval,
   isFeatureStage,
 } from "../types.js";
+
+/**
+ * **create 硬编码初值**（v0.10.5 O4 / §3.5「初值恒定」条）：`a2a_feature_create` 不再收
+ * `stage` / `approval` 两枚入参，初值由引擎固定写入 —— 一切需求卡从「需求分析 + 未发起」起步。
+ *
+ * 与 {@link DEFAULT_FEATURE_STAGE} / {@link DEFAULT_FEATURE_APPROVAL} **刻意分常量**：后两者是
+ * 「未传 ⇒ 缺省」旧语义的落点，现只剩**读侧归一 + ctor 脏值归一**一职（存量 NULL 行仍读回
+ * 「改造方案 / 待审批」）；初值若与归一值同值耦合，将来动读侧归一会静默改掉 create 契约。
+ */
+const CREATE_INITIAL_STAGE: FeatureStage = "需求分析";
+const CREATE_INITIAL_APPROVAL: FeatureApproval = "未发起";
 
 /**
  * **节点重派**事件 kind（v0.6.1 REQ-05 §2.3 / N4）。
@@ -372,6 +408,75 @@ function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
   };
 }
 
+/**
+ * **门① version 守卫拒绝码**（v0.10.5 O4 / 引擎映射 §3 门表）。码值即契约：MCP 面与 HTTP 信封
+ * `error.code` 共用；`feature_*` 前缀照登记字段族既有码（`feature_invalid_stage` 等同族）。
+ */
+export const ERR_GROUP_VERSION_REQUIRED = "feature_group_version_required";
+
+/**
+ * **归属门（转移守卫）拒绝码**（v0.10.5 O4 / 改造文档 §2.6 + §5.3 裁定 3）。
+ *
+ * 独立成码、**不复用** `orch_project_attribution_state_locked`：后者语义是「该态**不允许写**归属」
+ * （写入口的锁），本码语义是「**缺归属而不许离开**该态」（出口的门），方向相反，复用会误导读面。
+ * 故本码属 **MCP Feature 工具面**（`feature_*` 前缀，与 `feature_approval_required` /
+ * `feature_group_version_required` 同族），**不属版本面写口码族**（`orch_*`）。
+ */
+export const ERR_FEATURE_ATTRIBUTION_REQUIRED = "feature_attribution_required";
+
+/**
+ * **门① 第二前提（《需求确认单》已登记）拒绝码**（增补 `bbc7ea28` O3 / 引擎映射 §3 门表 案 (a)）。
+ * 与 {@link ERR_GROUP_VERSION_REQUIRED} 同族、**独立成码** —— 门① 的两前提「缺哪报哪」，
+ * 不合并成一个错误（version 缺失与确认单未登记是两笔不同的善后动作）。
+ */
+export const ERR_CONFIRMATION_DOC_REQUIRED = "feature_confirmation_doc_required";
+
+/**
+ * **门②（改造文档确认）条件 ⑤ 拒绝码**（增补 `ec93e1bd` / 引擎映射 §3 门②行「过门判据 = 六条」）。
+ * 语义 = 「该卡**没过门①**，却想直接过门②」。判据 = `stage` 仍「需求分析」，与
+ * {@link derivePendingItems} 的 `"stage"` 欠项**同判据单源** ⇒ 观测面与执法面共用一件事，不造第二套。
+ * 与 {@link ERR_GROUP_VERSION_REQUIRED} / {@link ERR_CONFIRMATION_DOC_REQUIRED} 同族、**独立成码**
+ * （六条「缺哪报哪」，各档的善后动作是四件不同的事，合并会让读账方分不清该补哪一笔）；
+ * **码名刻意避开**改造文档 §C.2 点名的那枚被根回归反锚禁用的字面。
+ */
+export const ERR_REQUIREMENT_GATE_NOT_PASSED = "feature_requirement_gate_not_passed";
+
+/**
+ * **门②（改造文档确认）条件 ⑥ 拒绝码**（增补 `ec93e1bd` / 引擎映射 §3 门②行「过门判据 = 六条」）。
+ * 语义 = 「门② 自己的产出物《改造文档》未登记在册」。判据用同一 {@link docRegistered} +
+ * {@link DESIGN_DOC_MARKER}（**无第二套判据**）；与 ④ 的 {@link ERR_CONFIRMATION_DOC_REQUIRED}
+ * **各自独立成码**（照门① 两前提先例），两枚档名**须同时在册**。
+ */
+export const ERR_DESIGN_DOC_REQUIRED = "feature_design_doc_required";
+
+/**
+ * 《需求确认单》档名在 `decisions` 串里的查找子串（增补 `bbc7ea28` O3）。
+ * 取命名规范 `{topic}-需求确认单.md`（`需求流程.md` §4）的**固定尾段** —— 严格式令裸文件名
+ * `需求确认单.md`（§4 明令禁止的无 topic 前缀形态）不构成命中。
+ */
+const CONFIRMATION_DOC_MARKER = "-需求确认单.md";
+
+/**
+ * 《改造文档》档名在 `decisions` 串里的查找子串（增补 `6cc46dd2` N1）。
+ * 与 {@link CONFIRMATION_DOC_MARKER} 同族同式：取命名规范 `{topic}-改造文档.md`（`需求流程.md` §4）
+ * 的**固定尾段**，**前导连字符不可省** —— 省了裸文件名 `改造文档.md` 也构成命中。
+ */
+export const DESIGN_DOC_MARKER = "-改造文档.md";
+
+/**
+ * `decisions` 里是否登记了某类文档 = **已落库 Feature Context ∪ 本单同写**（增补 `bbc7ea28` O3，
+ * 原 `confirmationDocRegistered`；增补 `6cc46dd2` N1 泛化为按 `marker` 查找）。
+ * 并集**不可省**：宿主在**同一单**里「先登记文档路径、再抬 `stage`」是既有合法用法
+ * （登记写 = `to` = 当前态特例，先于本守卫的落笔发生在同一调用内），只看已落库值会打死该用法。
+ */
+export function docRegistered(
+  persisted: string | null,
+  pending: string | undefined,
+  marker: string,
+): boolean {
+  return (persisted ?? "").includes(marker) || (pending ?? "").includes(marker);
+}
+
 // ---------------------------------------------------------------------------
 // 归属校验（v0.8.6 §2.3 / REQ-v0.8.6-2026-09-21-01 · N4）
 // ---------------------------------------------------------------------------
@@ -422,7 +527,10 @@ export function ownershipFailure(
 // 登记字段（v0.9.0 B1″ / B2″）：闭集校验 + 写口收敛
 // ---------------------------------------------------------------------------
 
-/** 入参里可能携带登记字段的三个动作（`create` / `advance` 共用同一份校验） */
+/**
+ * 入参里可能携带登记字段的动作（v0.10.5 O4 起只剩 `advance` —— create 摘 `stage`/`approval`
+ * 两入参、`version` 走 {@link parseVersionInput}；本接口仍与 `FeatureAdvanceArgs` 共用同一校验）
+ */
 interface RegistrationInput {
   stage?: string;
   version?: string;
@@ -435,6 +543,11 @@ interface RegistrationInput {
  * - 只回传**已提供**的字段（undefined = 本次不写该列，交 `updateFeatureRegistration` 保留原值）；
  * - 非法值 ⇒ 结构化拒绝（`feature_invalid_stage` / `feature_invalid_approval`），**零写入**；
  * - **不校验序、不校验回退**（B5″：`stage` 序校验 / 回退限制都不做）。
+ *
+ * **v0.10.5 O4 契约注**：调用方只剩 `handleFeatureAdvance`（create 已摘 `stage`/`approval` 两入参、
+ * 改走 {@link parseVersionInput}）⇒ `feature_invalid_stage` / `feature_invalid_approval` 两码在
+ * **create 侧不可达**、advance 侧照常可达。**本函数本体不动**（这两码不是死码 —— 闭集校验是
+ * 唯一判据，收 advance 与未来第二驱动口共用；「不可达」只是当前接线的事实，不得删代码）。
  *
  * **v0.10.0 O5 · `version` 写口格式校验（改造文档 §2.1(4)）**：
  * - **不校验** `undefined`（未提供 = 不写，保留原值）；
@@ -763,7 +876,8 @@ export function checkFeatureAttributionWrites(
     return fail(
       ERR_ATTRIBUTION_STATE_LOCKED,
       `归属写锁：Feature ${feature.featureId} approval=${feature.approval}（非「已通过」）⇒ 未过门不落归属；` +
-        `归属写点 = approve 过门之后（判据看 approval、不看 stage，改造文档 C-3）`,
+        `归属写点 = approve 过门之后（**本锁**判据看 approval、不看 stage，改造文档 C-3；` +
+        `门② 自身的过门条件自增补 \`ec93e1bd\` 起含 stage 一枚，与本锁判据分属两事、不得互相外推）`,
     );
   }
   if (feature.state === "cancelled") {
@@ -988,20 +1102,36 @@ export function evaluateProjectReleaseGate(input: ProjectReleaseGateInput): Proj
 // create
 // ---------------------------------------------------------------------------
 
-export interface FeatureCreateArgs extends RegistrationInput {
+export interface FeatureCreateArgs {
   title: string;
   requirement?: string;
   /** Feature 级会话上下文（落 `features.context_id`，跨任务 / 跨 worker 启停复用） */
   contextId?: string;
+  /**
+   * 版本登记（**排期语义**，v0.10.5 O4 起为 create 唯一保留的登记字段入参）：
+   * 未传 ⇒ 空串（未排期停靠 / 撤排期）；非空 ⇒ trim 后须命中 semver 形状、且经台账存在性与
+   * `released` 锁执法（见 {@link parseVersionInput} / {@link checkVersionLedger}）。
+   */
+  version?: string;
   /**
    * **父需求登记**（v0.9.3 O1）：增补轨挂主需求的单值父引用（落 `features.parent_feature_id`）。
    * 存在性 + 可见性校验 fail-closed（不可见 ⇒ 与不存在同一拒绝码，不泄漏他组存在性）；
    * 父链**只存不解析**（不递归、不判环）。
    */
   parentFeatureId?: string;
+  // v0.10.5 O4：入参**不再含 `stage` / `approval`**（初值恒定，由本 handler 硬编码写入）。
+  // 本接口**不 extends RegistrationInput** —— 摘键必须做成**类型级**事实：旧调用静态传这两枚
+  // 时在编译期出声（测试面靠 cast 显式表达「旧参静默丢弃」锚，见验收判据 2）。
 }
 
-export interface FeatureCreateSuccess {
+/**
+ * `create` 成功出参（**additive** · 增补 `6cc46dd2` N4 起带本阶段明细）。
+ *
+ * 明细七枚**平铺在顶层**（{@link FeatureStageDetail} 的 `stage`/`approval`/`version` 三枚与本接口
+ * 既有的登记字段回显**同一对键、同一来源** ⇒ 不构成第二份回显；`pending`/`gate`/`actor`/`action`
+ * 四枚由出口 {@link deriveStageDetail} 装配）。必带性 = 下面出口字面量的类型标注 ⇒ 漏装即编译报错。
+ */
+export interface FeatureCreateSuccess extends FeatureStageDetail {
   ok: true;
   featureId: string;
   state: FeatureState;
@@ -1010,10 +1140,37 @@ export interface FeatureCreateSuccess {
   contextId?: string;
   /** 回显父需求（v0.9.3 O1：仅带父创建时出现，同 contextId 回显口径） */
   parentFeatureId?: string;
-  /** 登记字段回显（v0.9.0 B1″：恒有值 —— 未传即缺省，见 {@link DEFAULT_FEATURE_STAGE}） */
+  /**
+   * 登记字段回显（v0.9.0 B1″ 起**恒有值**；v0.10.5 O4 起 `stage` / `approval` 两枚是
+   * **硬编码初值**「需求分析 / 未发起」，不再是入参回显；`version` 未传 ⇒ 空串）。
+   * 三枚同时是 {@link FeatureStageDetail} 的**回显三枚**（增补 `6cc46dd2` N4 · 键与类型逐字相同）。
+   */
   stage: FeatureStage;
   version: string;
   approval: FeatureApproval;
+}
+
+/**
+ * `version` 入参的**单点校验**（shape + trim）—— {@link parseRegistration} 与 create 契约共用
+ * 同一判据（v0.10.5 O4：create 摘 `stage`/`approval` 后不再走整包 `parseRegistration`，
+ * 但 `version` 的 shape 挡门不得分叉）。
+ */
+type VersionParse = { ok: true; version: string } | { ok: false; code: string; error: string };
+
+function parseVersionInput(version: string | undefined): VersionParse {
+  if (version === undefined) return { ok: true, version: "" };
+  const trimmed = version.trim();
+  if (trimmed !== "" && !isVersionShapeValid(trimmed)) {
+    return {
+      ok: false,
+      code: "feature_invalid_version_shape",
+      error:
+        `非法 version "${version}"：期望 semver 形状 vX.Y.Z（可省 v、可带 -prerelease/+build）；` +
+        `空串表示撤排期（回未登记桶）`,
+    };
+  }
+  // 归一为 trim 后值落库，避免 `" v0.10.0 "` 与 `"v0.10.0"` 在台账 PK 上分裂
+  return { ok: true, version: trimmed };
 }
 
 export function handleFeatureCreate(
@@ -1025,18 +1182,20 @@ export function handleFeatureCreate(
   if (title.length === 0) {
     return { ok: false, code: "feature_invalid_args", error: "title 不能为空" };
   }
-  // 登记字段：先校验（非法 ⇒ 零写入），再施加缺省
-  // ⇒ **不传三参数的既有调用行为逐字不变**（缺省恰为「改造方案 + 待审批」= 既有语义）
-  const reg = parseRegistration(args);
-  if (reg.ok === false) return reg;
+  // v0.10.5 O4「初值恒定」：`stage` / `approval` **不是入参**（zod 默认 strip ⇒ schema 不声明的
+  // 旧调用多传键被**静默丢弃**；本 handler 硬编码写入，**不存在**「未传 ⇒ 改造方案 + 待审批」
+  // 的旧缺省路径）。`version` 仍是入参（未排期停靠 / 撤排期 / released 锁 / 板拖拽建卡都依赖它）。
+  // v0.10.0 O5：shape 校验（与 advance 同一判据，见 {@link parseVersionInput}）
+  const ver = parseVersionInput(args.version);
+  if (ver.ok === false) return { ok: false, code: ver.code, error: ver.error };
   // v0.10.0 O5：shape 过关后做**存在性校验**（∈ O1 台账；台账未落地 ⇒ 过渡放行，见 {@link checkVersionLedger}）
-  const ledgerFailure = checkVersionLedger(identity, reg.patch.version);
+  const ledgerFailure = checkVersionLedger(identity, ver.version);
   if (ledgerFailure !== null) return ledgerFailure;
   // v0.10.0 O4：create 只施 `released` 锁（无「先前态」可挡排期 ⇒ 不施排期写状态锁，见 {@link checkVersionWriteLocks}）
   const writeLockFailure = checkVersionWriteLocks(
-    { stage: reg.patch.stage ?? DEFAULT_FEATURE_STAGE, approval: reg.patch.approval ?? DEFAULT_FEATURE_APPROVAL },
+    { stage: CREATE_INITIAL_STAGE, approval: CREATE_INITIAL_APPROVAL },
     identity,
-    reg.patch.version,
+    ver.version,
     { applyStateLock: false },
   );
   if (writeLockFailure !== null) return writeLockFailure;
@@ -1067,21 +1226,24 @@ export function handleFeatureCreate(
     // 主链起点 = 审批门停靠点（REQ-v0.4.1-2026-09-16-01 §2.3）：引擎只做需求实现，
     // 前段讨论 / 方案（Step 0/1）不走引擎；`waiting_approval → executing` 只能经 `a2a_feature_approve`
     state: "waiting_approval",
+    // v0.10.5 O4 初值恒定：`stage` / `approval` 由引擎硬编码（不再收两枚入参、无兼容分叉）
+    stage: CREATE_INITIAL_STAGE,
     // v0.9.0 登记字段：`version` 未传 ⇒ NULL（读回归一为空串，不落 "null" 字面量）
-    // v0.10.0 O5：经 parseRegistration trim 后取（既有非空原样、脏值走 shape 挡门；NULL ⇒ 未登记）
-    stage: reg.patch.stage ?? DEFAULT_FEATURE_STAGE,
-    version: reg.patch.version ?? null,
-    approval: reg.patch.approval ?? DEFAULT_FEATURE_APPROVAL,
+    // v0.10.0 O5 / v0.10.5 O4：经 parseVersionInput trim 后取（脏形状已在前一步挡门）
+    version: ver.version === "" ? null : ver.version,
+    approval: CREATE_INITIAL_APPROVAL,
   });
   const success: FeatureCreateSuccess = {
     ok: true,
     featureId: rec.featureId,
     state: rec.state,
     title: rec.title,
-    // 回显**落库后读回**的值（读侧已归一 ⇒ 恒非空，与后续 `status` 出参同源）
-    stage: rec.stage,
-    version: rec.version,
-    approval: rec.approval,
+    // 明细七枚（增补 `6cc46dd2` N4 · 平铺在顶层）= **按新行算**：`rec` 就是本次写入后读回的那一行
+    // （读侧已归一 ⇒ `version` 恒非空，与后续 `status` 出参同源），`create` 没有「写前快照」问题，
+    // 故不必绕 {@link stageDetailAfterWrite} 再读一次。
+    // 其中**回显三枚**（`stage`/`approval`/`version`）此前是逐字段显式回显，现由本 spread 单源带入 ——
+    // {@link deriveStageDetail} 对这三枚是**原样回显**（不翻译、不重新推导）⇒ 同源同值，非语义变化。
+    ...deriveStageDetail(rec),
   };
   if (rec.contextId !== null) success.contextId = rec.contextId;
   // v0.9.3 O1：回显**落库后读回**的父需求（仅带父创建时出现，同 contextId 口径）
@@ -1142,7 +1304,16 @@ export interface FeatureAcceptance {
   stateCounts: Partial<Record<TaskState, number>>;
 }
 
-export interface FeatureStatusSuccess {
+/**
+ * `a2a_feature_status` 出参（**单查 / 列表两分支共用的兼容形**，所有键可选 ⇒ 两分支各取所需）。
+ *
+ * **本阶段明细七枚**（增补 `6cc46dd2` N5 · 由 {@link FeatureStageDetail} 以 `Partial` 带入）：
+ * 与 {@link FeatureStateChangeSuccess}（`approve` / `cancel` 共用基形）同款分工：本接口是**两分支
+ * 共用的兼容形**，故七枚在其上是**可选**的（列表分支恒不带 ⇒ 必填会连列表出口一起编译不过）；
+ * **单查分支的「必带」由 {@link FeatureStatusSingleSuccess} 执法**。
+ * 可见性口径：**仅单 Feature 查询返回**（列表分支出参逐字不变，含 MCP / HTTP 两个面）。
+ */
+export interface FeatureStatusSuccess extends Partial<FeatureStageDetail> {
   ok: true;
   feature?: FeatureRecord;
   tasks?: FeatureTaskSummary[];
@@ -1176,6 +1347,17 @@ export interface FeatureStatusSuccess {
    */
   attributionsByFeature?: Record<string, FeatureProjectAttributionItem[]>;
 }
+
+/**
+ * **单查分支**的出参形（增补 `6cc46dd2` N5 · C.1 的「单查必带、列表不带」执行面）=
+ * 共用兼容形 {@link FeatureStatusSuccess} ∧ {@link FeatureStageDetail} 七枚**平级必填**
+ * （**平铺**在顶层，与 `feature`/`tasks`/`acceptance` 同级，无包装对象）。
+ *
+ * 执法点 = {@link handleFeatureStatus} 单查分支的出口字面量以本形标注 ⇒ **漏装任一枚即编译报错**
+ * （照 {@link FeatureAdvanceExit} / {@link FeatureApproveSuccess} 先例）。
+ * 列表分支**不套本形**（仍按共用兼容形构造）⇒ 七枚在列表出参上恒缺，由测试锚 G11 负向把门。
+ */
+export type FeatureStatusSingleSuccess = FeatureStatusSuccess & FeatureStageDetail;
 
 /**
  * 归属只读面的**单条形状**（v0.10.1 O7 / C-19）。
@@ -1257,7 +1439,11 @@ export function handleFeatureStatus(
     if (denied !== null) return denied;
     const tasks = listFeatureTasks(feature.featureId, { limit: 1000 }).map(summarizeTask);
     const artifacts = listArtifactsByFeature(feature.featureId, 1000);
-    return {
+    // 明细七枚（增补 `6cc46dd2` N5 · 平铺在顶层）= 由**本次读到的那一行**派生。
+    // 单查是**纯读**（此前无任何写入）⇒ 不需要 {@link stageDetailAfterWrite} 的写后重读，
+    // 直接用 `feature` 即「当下那一行」；**回显三枚与同层 `feature.*` 逐字同值**（同一对象、
+    // 同一读口，不存在两份事实源），派生四枚 = {@link deriveStageDetail} 单源值。
+    const success: FeatureStatusSingleSuccess = {
       ok: true,
       feature,
       tasks,
@@ -1266,7 +1452,9 @@ export function handleFeatureStatus(
       // v0.10.1 O7 / C-19：归属按 feature_id 单查（详情路径只有一个 Feature，无 1+N 之虞）；
       // 可见性已由上面的 ownershipFailure 把关 ⇒ store 读口不必再带组过滤。无归属 ⇒ 空数组。
       projects: toAttributionView(featureProjectListByFeature(feature.featureId)),
+      ...deriveStageDetail(feature),
     };
+    return success;
   }
   // 列表路径：配组 ⇒ 只列本组 Feature（`owner_group = identity`，NULL 无归属被排除 = fail-closed）；
   // 无身份 ⇒ 全量（未配组 / web 运维视图）。
@@ -1309,7 +1497,10 @@ export function handleFeatureStatus(
  * - `to` **等于当前态** ∧ 带任一登记字段 ⇒ 走**显式特例**（同 `retryTaskIds` 先例：跳过
  *   `canTransition`，转移表**零改动**、不出现自环），**只写登记、不动主链**；
  * - 特例**不加终态守卫**（否则 `completed` 后永远写不进 `发版`）；
- * - 非法值 ⇒ `feature_invalid_stage` / `feature_invalid_approval`（**在任何写入之前**拒绝）。
+ * - 非法值 ⇒ `feature_invalid_stage` / `feature_invalid_approval`（**在任何写入之前**拒绝）；
+ * - **门① `version` 守卫（v0.10.5 O4）**：`stage` 由「需求分析」外迁时 `features.version` 非空是
+ *   **前提** —— 未排期 ⇒ `feature_group_version_required`，整单拒绝、零写入（判据见
+ *   {@link handleFeatureAdvance} 内的守卫条）。
  */
 export interface FeatureAdvanceArgs extends RegistrationInput {
   featureId: string;
@@ -1394,6 +1585,263 @@ function writeAttribution<T extends FeatureAdvanceSuccess>(
   return success;
 }
 
+// ---------------------------------------------------------------------------
+// **本阶段明细**（增补 `6cc46dd2` N2 · 派生单源）
+//
+// 本块只是「派生单源」：类型 + 文案表 + 纯函数。**接线归 N3/N4/N5** —— 各成功出口
+// （`advance` 四出口 / `create` / `approve` / `feature_status` 单查）在此之后才装配这七枚，
+// `FeatureStateChangeSuccess`（`cancel` 共用）逐字不动。
+// ---------------------------------------------------------------------------
+
+/**
+ * 「本阶段还差哪件**登记欠账**」的枚名（增补 `6cc46dd2` N2；推导输入五维 = `state`·`stage`·
+ * `approval`·`version`·**`decisions`**）。
+ *
+ * 五枚分两族（归向按枚点名，见 {@link PENDING_HOST_SIDE_ITEMS} / {@link PENDING_USER_CREDENTIAL_ITEMS}）：
+ * 新增枚名**必须**同轮归入这两族之一，否则 `actor` 归向静默落错。
+ */
+export type FeaturePendingItem =
+  "requirement-doc" | "version" | "stage" | "design-doc" | "approval";
+
+/**
+ * 两道用户门的机器名（增补 `6cc46dd2` N2）：`gate1` = **需求确认门**（「我理解你要解决的是不是
+ * 这个问题」）· `gate2` = **改造文档确认门**（`approve` 唯一准入）。
+ */
+export type FeatureGateId = "gate1" | "gate2";
+
+/**
+ * **本阶段（推进后）的推动方 / 执行方**（增补 `6cc46dd2` N2 · **★确认单 v22 用户更正**：
+ * 旧措辞「当前卡在谁那儿 / 等谁」**作废**；取值枚举与推导式不变）。
+ *
+ * 三值对应 flow `引擎映射.md` §2 表「驱动方」列的 宿主 / 用户 / 引擎 ⇒ `actor` 是该列的**同源投影**，
+ * **不新增语义**；但它是**单值投影**（§2 表存在复合值「宿主（+ 用户确认）」与「主链不推进」行）
+ * ⇒ **投影有损，不得当该表的等价替身读**。
+ *
+ * ⚠ **护栏**：`actor` **不得被用作「谁卡住了」的凭据** —— 静止与失败由 `tasks[]` /
+ * {@link handleFeatureTrace} 承载（`executing` 格的 `engine` 不表示「现在有在跑」）。
+ */
+export type FeatureStageActor = "host" | "user" | "engine";
+
+/**
+ * **本阶段明细**（增补 `6cc46dd2` N2 / 确认单 v15 扁平版）——「回显三枚 + 派生四枚」的
+ * **平级七键**结构，**不是**嵌套对象：出口出参 `extends` 本类型 ⇒ 七枚都落在顶层
+ * （与既有 `state`/`note` 等同层，无 `next` 包装、无 `next.state`）。
+ *
+ * - **回显三枚**（`stage`/`approval`/`version`）= 引擎已存的登记字段**原样回显**，
+ *   **恒等、不重新推导、不翻译**（`stage` 的中文值必须逐字）；
+ * - **派生四枚**（`pending`/`gate`/`actor`/`action`）= 由五维输入的**纯函数**（{@link deriveStageDetail}）。
+ */
+export interface FeatureStageDetail {
+  /** 回显登记字段 `features.stage`（**原样**，见本类型「回显三枚」条） */
+  stage: FeatureStage;
+  /** 回显登记字段 `features.approval`（原样） */
+  approval: FeatureApproval;
+  /** 回显登记字段 `features.version`（原样；未排期 = 空串） */
+  version: string;
+  /**
+   * 本阶段还差的**登记欠账全清单**（**恒为数组**，0–n 枚；终态/异常态取 `[]`）。
+   *
+   * 语义 = **登记事实**：只答「`decisions` 里有没有登记过那个档名」，**不证文件存在**
+   * （`decisions` 是宿主自报的自由文本、且整值替换 ⇒ 漏重发会让明细倒退，这是**正常后果**）。
+   */
+  pending: FeaturePendingItem[];
+  /** 本阶段卡在 / 奔向哪道用户门（非 `waiting_approval` ⇒ `null`） */
+  gate: FeatureGateId | null;
+  /** 本阶段推动方 / 执行方（**终态 ⇒ `null`** = 本阶段无推动方，**不得读成「卡住」**） */
+  actor: FeatureStageActor | null;
+  /** 本阶段该做什么（**能力陈述式**英文一句，单源 = {@link STAGE_DETAIL_ACTIONS} 旁的文案表） */
+  action: string;
+}
+
+/** 宿主自办登记的欠账枚（⇒ `actor = "host"`）：三份产出物 / 排期写 */
+export const PENDING_HOST_SIDE_ITEMS: readonly FeaturePendingItem[] = [
+  "requirement-doc",
+  "version",
+  "design-doc",
+];
+
+/** 人的确认凭据的欠账枚（⇒ `actor = "user"`）：门① 抬位 · 门② 放行（宿主只是记录者） */
+export const PENDING_USER_CREDENTIAL_ITEMS: readonly FeaturePendingItem[] = ["stage", "approval"];
+
+/**
+ * **`action` 文案表 · 非 `waiting_approval` 各格**（增补 `6cc46dd2` N2 · 单源在此，改造文档 §6 只登记指针）。
+ *
+ * **写法约束**（C.1#9，flow D4'）：只写「此处**可执行的操作**」（**能力陈述**），
+ * **不得**写成「应当推进 / 前置已满足」；**流程判断**（判据清单是否满足 / 三档定性 / 名额是否空 /
+ * 载体是否旧码）**一个字都不进 `action`** —— 那些归 flow 与人判。
+ *
+ * 键型逐态穷举（照 {@link STAGE_DERIVATION} 先例）：引擎加态 ⇒ 本表编译期报错，不会静默缺文案。
+ * `waiting_approval` 不在此表（该态的文案按 `pending` 分格，见 {@link WAITING_APPROVAL_ACTIONS}）。
+ */
+export const STAGE_DETAIL_ACTIONS: Record<Exclude<FeatureState, "waiting_approval">, string> = {
+  version_planning:
+    "Run the PjM procedure (each project's project_manager) and write the attribution, then advance to decomposing.",
+  decomposing:
+    "Dispatch each project's dev_manager for its node list, register the DAG, then advance to executing.",
+  // ★用户 2026-10-13 亲自点名的字面（宿主已裁本卡保留；改口代价 = 本行文案 + 一条锚字面）
+  executing: "Hook `watch-feature.mjs` to monitor the feature.",
+  integrating: "Advance to testing.",
+  testing: "Run the on-box acceptance, then advance to reviewing.",
+  reviewing: "Wait for the user's acceptance verdict, then advance to completed.",
+  completed: "Wait for the release order (§8).",
+  needs_input: 'Answer the clarification: advance(to="executing", answer=…).',
+  failed: "Cancel the feature to archive it (a2a_feature_cancel).",
+  cancelled: "Nothing left to run — this track is cancelled.",
+};
+
+/**
+ * **`action` 文案表 · `waiting_approval` 段按欠账分格**（增补 `6cc46dd2` N2）。
+ *
+ * 键 = 该段的 `pending` 首枚（无欠账 ⇒ `"settled"` = 两道门之间的停靠格，等用户过门②）。
+ * `settled` 之外另两格（`approval` / `integrating`）的文案**不在确认单逐行草案内**
+ * （草案表把它们折进了相邻行），落地时按同款**能力陈述**式补齐，不引入流程判断。
+ */
+export const WAITING_APPROVAL_ACTIONS: Record<FeaturePendingItem | "settled", string> = {
+  "requirement-doc":
+    "Dispatch each project's product_manager for the requirements analysis (Step 0), and land the 需求确认单.",
+  version: "Schedule a version first, then get the user to confirm the problem (gate 1).",
+  stage: "Get the user to confirm the problem, then migrate stage (gate 1).",
+  "design-doc":
+    "Dispatch each project's dev_manager for its side-plan and the boundary round, and land the 改造文档.",
+  approval: "Set approval to 待审批, then wait for the user's approval (gate 2).",
+  settled: "Wait for the user's approval, then call approve (gate 2).",
+};
+
+/**
+ * `actor` 逐态归向（增补 `6cc46dd2` N2 · ★v22 语义 = 本阶段推动方 / 执行方）。
+ *
+ * `"by-pending"` = 该态按 {@link PENDING_HOST_SIDE_ITEMS} 判交（含宿主自办项 ⇒ `host`，否则 ⇒ `user`）
+ * —— 只有 `waiting_approval` 用这一格：**不逐枚点名**则该态会一律报错方，与确认单逐格表冲突。
+ * `executing` ⇒ `engine` **无条件**，不因「失败静止」改写（静止不属本表判据，见 {@link FeatureStageActor} 护栏）。
+ */
+const ACTOR_BY_STATE: Record<FeatureState, FeatureStageActor | null | "by-pending"> = {
+  waiting_approval: "by-pending",
+  version_planning: "host",
+  decomposing: "host",
+  executing: "engine",
+  integrating: "host",
+  testing: "host",
+  reviewing: "user",
+  completed: null,
+  needs_input: "host",
+  failed: null,
+  cancelled: null,
+};
+
+/**
+ * `pending` 扫描开关（增补 `6cc46dd2` N2）：`true` = **终态 / 异常态 ⇒ 恒取 `[]`**（四格不携带登记欠账）。
+ *
+ * 逐态穷举同 {@link ACTOR_BY_STATE}；`needs_input` 是**异常态但非终态**，仍在本列内（澄清走
+ * `answer`，不是登记欠账）。
+ */
+const PENDING_NOT_TRACKED: Record<FeatureState, boolean> = {
+  waiting_approval: false,
+  version_planning: false,
+  decomposing: false,
+  executing: false,
+  integrating: false,
+  testing: false,
+  reviewing: false,
+  completed: true,
+  needs_input: true,
+  failed: true,
+  cancelled: true,
+};
+
+/**
+ * 登记欠账**全清单**（增补 `6cc46dd2` N2）—— 固定序逐项查五枚欠账，报**首个未清项**；
+ * **不按当前格过滤**（本函数内不引入第二套判据：欠账的有无只由登记字段与 `decisions` 决定）。
+ *
+ * 顺序 = 流程的实际前置：确认单 → 排期 → 门① 抬 `stage` → 改造文档 → `approval` 置待审批。
+ * 数组形态保留（当前各行至多 1 枚，将来「两件事同时等」不必改形状）。
+ */
+function derivePendingItems(
+  state: FeatureState,
+  stage: FeatureStage,
+  version: string,
+  approval: FeatureApproval,
+  decisions: string | null,
+): FeaturePendingItem[] {
+  if (PENDING_NOT_TRACKED[state]) return [];
+  if (!docRegistered(decisions, undefined, CONFIRMATION_DOC_MARKER)) return ["requirement-doc"];
+  if (version === "") return ["version"];
+  if (stage === "需求分析") return ["stage"];
+  if (!docRegistered(decisions, undefined, DESIGN_DOC_MARKER)) return ["design-doc"];
+  if (approval === "未发起") return ["approval"];
+  return [];
+}
+
+/**
+ * 用户门归属（增补 `6cc46dd2` N2 · 三段式）：`waiting_approval ∧ stage=需求分析 ⇒ gate1`；
+ * `waiting_approval ∧ 否则 ⇒ gate2`（门① 已过 ⇒ 前方是门②）；其余态 ⇒ `null`（不在用户门上）。
+ */
+function deriveGate(state: FeatureState, stage: FeatureStage): FeatureGateId | null {
+  if (state !== "waiting_approval") return null;
+  return stage === "需求分析" ? "gate1" : "gate2";
+}
+
+/**
+ * **本阶段明细的派生单源**（增补 `6cc46dd2` N2）—— 纯函数、零写入、零查询、零副作用。
+ *
+ * **入参 = 按 `featureId` 写后重读的那一行**（**语义要求**，非实现细节）：`actor` 报的是
+ * **本阶段**（推进后）的推动方，出口若拿**写前快照**就会报「**被离开的那一格**」的人、
+ * 明细也系统性落后一帧（典型：门① 刚抬完 `stage` 仍报 `pending:["stage"]`）。
+ * 出口非事务（写与重读同函数不同语句，**不追求**快照一致性）。
+ *
+ * 三条语义限定（读账方须知，改造文档 §6 同步登记）：
+ * 1. **`pending` = 登记事实**，**不证文件存在**；`decisions` 是宿主自报自由文本且**整值替换**
+ *    ⇒ 漏重发 ⇒ 明细倒退属正常后果；
+ * 2. **护栏**：`actor` **不得被用作「谁卡住了」的凭据** —— 静止 / 失败由 `tasks[]` 与
+ *    {@link handleFeatureTrace} 承载；
+ * 3. **`actor` 语义 = 本阶段（推进后）推动方 / 执行方**（★确认单 v22），是 flow
+ *    `引擎映射.md` §2 表「驱动方」列的**同源投影**、**不得当该表等价替身读**（该列有复合值）。
+ *
+ * 异常 / 终态四格（`needs_input` / `completed` / `failed` / `cancelled`）的 `stage` **保持当时值、
+ * 不参与推导** ⇒ 本函数**照读不臆造**、也**不另存第五枚**去标记「陈旧 `stage`」。
+ */
+export function deriveStageDetail(feature: FeatureRecord): FeatureStageDetail {
+  const pending = derivePendingItems(
+    feature.state,
+    feature.stage,
+    feature.version,
+    feature.approval,
+    feature.decisions,
+  );
+  const actorKind = ACTOR_BY_STATE[feature.state];
+  return {
+    stage: feature.stage,
+    approval: feature.approval,
+    version: feature.version,
+    pending,
+    gate: deriveGate(feature.state, feature.stage),
+    actor:
+      actorKind === "by-pending"
+        ? pending.some((item) => PENDING_HOST_SIDE_ITEMS.includes(item))
+          ? "host"
+          : "user"
+        : actorKind,
+    action:
+      feature.state === "waiting_approval"
+        ? WAITING_APPROVAL_ACTIONS[pending[0] ?? "settled"]
+        : STAGE_DETAIL_ACTIONS[feature.state],
+  };
+}
+
+/**
+ * **出口装配的唯一读口**（增补 `6cc46dd2` N3）—— **写后重读**：按 `featureId` 取回本单全部写入
+ * 落定后的那一行，再交 {@link deriveStageDetail}。
+ *
+ * ⚠ 语义要求（非实现细节，改造文档 C.1#2 / R3）：`actor` 报的是**本阶段（推进后）**的推动方，
+ * 出口若吃 `handleFeatureAdvance` 开头那份**写前快照**，报的就是「**被离开的那一格**」的人，
+ * 明细也系统性落后一帧（典型：门① 刚抬完 `stage` 仍报 `pending:["stage"]`）。
+ * 出口**非事务**（R7）：重读与写同函数不同语句，不追求快照一致性。
+ *
+ * `fallback` 只兜「重读落空」这一不可达形态（行刚被本单写过 ⇒ 必在）；不为它另设错误码。
+ */
+function stageDetailAfterWrite(featureId: string, fallback: FeatureRecord): FeatureStageDetail {
+  return deriveStageDetail(getFeature(featureId) ?? fallback);
+}
+
 export interface FeatureStateChangeSuccess {
   ok: true;
   featureId: string;
@@ -1403,10 +1851,33 @@ export interface FeatureStateChangeSuccess {
 }
 
 /**
+ * **`approve` 成功出参**（增补 `6cc46dd2` N4 · 本增补域含 `create` 与 `approve`，不含 `cancel`）。
+ *
+ * 为什么要新类型、而不是给共用的 {@link FeatureStateChangeSuccess} 加字段：`approve` 与 `cancel`
+ * 历史上**共用**这一枚基类型，而本增补只让 `approve` 带明细 ⇒ 明细必须挂在 `approve` 自己的出口形上。
+ * **基类型逐字不动**（它是「`cancel` 不受染」的判据 —— 宽化基类型 = 连带改 `cancel` 出参）。
+ *
+ * - 本形 = 基形 ∧ {@link FeatureStageDetail} 七枚**平级必填**（平铺在顶层，与 `ok`/`featureId`/
+ *   `from`/`state` 同级，无包装对象）；本接口无自有键，全部键由两枚父形带入；
+ * - **必带性由 TS 穷举执法**：{@link handleFeatureApprove} 的出口字面量以本形标注 ⇒ 漏装任一枚即编译报错；
+ * - **入参面零改动**（`FeatureApproveArgs` 不动）：本节点只动出参。
+ */
+export interface FeatureApproveSuccess
+  extends FeatureStateChangeSuccess,
+    FeatureStageDetail {}
+
+/**
  * `advance` 成功出参（**additive**）。
  *
  * `retryTaskIds` 路径额外回显本次动作面（便于宿主 / 测试核对**实际生效**的节点集）；
  * 非该路径不设这两个字段（出参形状与既有调用方兼容）。
+ *
+ * ⚠ **明细七枚不在本接口上声明**（增补 `6cc46dd2` N3 · 与 C.1#2 的偏离已回传宿主）：本接口是
+ * `BridgeCore.featureAdvance` 的**对外兼容形**，既有套件（`test/v0101-o3-advance-attribution.test.ts`
+ * 的 Proxy 假出参 `satisfies FeatureAdvanceSuccess`，C.1#7「既有套件一条不改」范围内）在此接口上
+ * 声明七枚**必填**即编译不过 ⇒ 必带性改由 {@link FeatureAdvanceExit} 执法：{@link handleFeatureAdvance}
+ * 与其内部四条出口字面量**均以本形为出参**（C.1#2 的目的 =「四个出口任一漏装即编译报错」，
+ * 在该形下**全额达成**；消费侧从 handler 拿到的静态类型即含七枚）。
  */
 export interface FeatureAdvanceSuccess extends FeatureStateChangeSuccess {
   /** 本次**实际重派**（`rearmForRetry` CAS 命中）的节点 id */
@@ -1420,10 +1891,54 @@ export interface FeatureAdvanceSuccess extends FeatureStateChangeSuccess {
   attribution?: { created: number; updated: number; noop: number };
 }
 
+/**
+ * `advance` **四条成功出口**的装配形（增补 `6cc46dd2` N3 · C.1#2 的执行面）= 对外兼容形 ∧
+ * {@link FeatureStageDetail} 七枚**平级必填**（**平铺**在顶层，与 `state`/`note` 同级，无包装对象）。
+ *
+ * 执法点 = {@link handleFeatureAdvance} 的**出参声明**与其四条出口字面量：登记特例 / 只补归属 /
+ * 合法流转 / `retryTaskIds` 重派四条各以本形构造，**任一漏装即编译报错**
+ * （`writeAttribution` 的泛型 `T extends FeatureAdvanceSuccess` 逐字不动，在本形下透传 `T` ⇒ 明细不丢）。
+ *
+ * 与兼容形的分工见 {@link FeatureAdvanceSuccess} 的 ⚠ 条（既有套件假出参不改一行）。
+ */
+export type FeatureAdvanceExit = FeatureAdvanceSuccess & FeatureStageDetail;
+
+/**
+ * **`stage` 半派生映射表**（v0.10.5 O2 / 改造文档 §2.2「半派生映射表（定稿 6 格，全态覆盖）」）：
+ * 引擎随 `state` 迁移**同轮**派生写 `stage` 的**唯一表单源**（flow 不重述、board 不硬编码）。
+ *
+ * `null` = **不派生**（保持当时值），三处语义各不相同：
+ * - `waiting_approval` —— `需求分析` / `改造方案` 两值**由宿主经门①写**，state 决定不了哪一格；
+ * - `completed` —— 保持上一格（`验收`）；发版后的 `发版` 由宿主经登记特例写（`to` = 当前态），
+ *   本态若派生会把那枚显式写覆盖掉；
+ * - `needs_input` / `failed` / `cancelled` —— 异常/终态**保留当时值**（不是主链格，不携带段语义）。
+ *
+ * 键型取 `Record<FeatureState, …>` **逐态穷举**：引擎再加态 ⇒ 本表编译期报错，
+ * 不会出现「新态静默不派生、stage 永久滞后」这种无声缺口。
+ */
+const STAGE_DERIVATION: Record<FeatureState, FeatureStage | null> = {
+  waiting_approval: null,
+  version_planning: "改造方案",
+  decomposing: "改造方案",
+  executing: "改造",
+  integrating: "回归",
+  testing: "回归",
+  reviewing: "验收",
+  completed: null,
+  needs_input: null,
+  failed: null,
+  cancelled: null,
+};
+
+/** 目标态 → 应派生的 `stage`（`null` = 该态不派生）；唯一调用点见 {@link handleFeatureAdvance} */
+function deriveStageForState(state: FeatureState): FeatureStage | null {
+  return STAGE_DERIVATION[state];
+}
+
 export function handleFeatureAdvance(
   args: FeatureAdvanceArgs,
   identity: string | null = null,
-): FeatureAdvanceSuccess | FeatureToolFailure {
+): FeatureAdvanceExit | FeatureToolFailure {
   const feature = getFeature(args.featureId);
   if (feature === null) {
     return { ok: false, code: "feature_not_found", error: `未知 Feature ${args.featureId}` };
@@ -1449,6 +1964,60 @@ export function handleFeatureAdvance(
     { applyStateLock: true },
   );
   if (writeLockFailure !== null) return writeLockFailure;
+
+  // ---- 门①（需求确认）`version` 守卫（v0.10.5 O4 / 引擎映射 §3 门表）----------------------------
+  // 触发判据四条件**逐字** = 「本次携带 `stage` 写」∧「写的目标值 ≠ 需求分析」∧「当前 stage = 需求分析」
+  // ∧「当前 features.version 为空」。任一不过 ⇒ **整单拒绝、零写入**（state / stage / approval /
+  // version 全不动、零事件）—— 未排期的卡不得过需求确认门。
+  // 位置在 `retryTaskIds` / 登记特例 / 只补归属三条分叉**之前** ⇒ 三条路径同受此守卫。
+  // 拒绝**不改 stage** ⇒ 拒后卡仍 `需求分析 ∧ 未发起` ⇒ 排期写状态锁仍开，补写 version 后可重试同一迁移。
+  // 守卫**不判 `state`、不校验 stage 迁移序**（与 `version` 守卫同款的最小判据面）。
+  if (
+    reg.patch.stage !== undefined &&
+    reg.patch.stage !== "需求分析" &&
+    feature.stage === "需求分析" &&
+    (feature.version ?? "") === ""
+  ) {
+    return {
+      ok: false,
+      code: ERR_GROUP_VERSION_REQUIRED,
+      error:
+        `门①（需求确认）version 守卫：Feature ${feature.featureId} 的 features.version 为空（未排期）⇒ 不得把 stage 由「需求分析」迁往 "${reg.patch.stage}"；` +
+        "整单拒绝、零写入（state / stage / approval / version 全不动）。" +
+        "先经引擎排期写口写定 version（advance 的「to = 当前态 ∧ 带 version」特例 —— 拒后卡仍「需求分析 ∧ 未发起」⇒ 排期锁开着），再重试本迁移",
+    };
+  }
+
+  // ---- 门①（需求确认）《需求确认单》已登记守卫（增补 bbc7ea28 O3 / 引擎映射 §3 门表 案 (a)）------
+  // **第二前提**，叠在同一条 version 守卫的判据面上：前三条件逐字相同（「本次携带 `stage` 写」∧
+  // 「写的目标值 ≠ 需求分析」∧「当前 stage = 需求分析」），第四条件换为「可见 `decisions` 含确认单档名」。
+  // 判据 = {@link docRegistered}（已落库 ∪ 本单同写，**并集不可省**；增补 6cc46dd2 N1 由
+  // confirmationDocRegistered 泛化而来，本调用点固定传 CONFIRMATION_DOC_MARKER ⇒ 行为逐字不变）；
+  // 引擎唯一能看到的
+  // 「文档存在」信号就是 `decisions`（产物登记，由调用方自报）—— 确认**内容**仍是文件事实源，
+  // 本前提只堵「登记特例直写 `stage`」这条把门① 变成一次纯记账动作的旁路。
+  // **两前提顺序 = version 在前、本前提在后**（缺哪报哪，不合并成一个错误码）。
+  // 位置同样在三条分叉**之前** ⇒ 登记特例 / 合法流转两路同受；**唯一豁免 = `retryTaskIds` 重派路径**
+  // （那是派发语义操作、不是过门，携 `stage` 写的行为逐字不变）—— 与 version 守卫的「三路同受」不同。
+  // 拒绝**不改任何值** ⇒ 拒后卡仍 `需求分析`，排期锁与本前提均可善后后重试同一迁移。
+  if (
+    args.retryTaskIds === undefined &&
+    reg.patch.stage !== undefined &&
+    reg.patch.stage !== "需求分析" &&
+    feature.stage === "需求分析" &&
+    !docRegistered(feature.decisions, args.decisions, CONFIRMATION_DOC_MARKER)
+  ) {
+    return {
+      ok: false,
+      code: ERR_CONFIRMATION_DOC_REQUIRED,
+      error:
+        `门①（需求确认）第二前提：Feature ${feature.featureId} 的 decisions 未登记本需求的《需求确认单》路径` +
+        `（已落库与本单同写的并集内无 "${CONFIRMATION_DOC_MARKER}" 档名）⇒ 不得把 stage 由「需求分析」迁往 "${reg.patch.stage}"；` +
+        "整单拒绝、零写入（state / stage / approval / version 全不动）。" +
+        "先把 doc/{版本}/{topic}-需求确认单.md 经同一 advance 的 decisions 登记（「to = 当前态」登记写，不属迁移），再重试本迁移",
+    };
+  }
+
   const hasRegistration =
     reg.patch.stage !== undefined ||
     reg.patch.approval !== undefined ||
@@ -1466,6 +2035,12 @@ export function handleFeatureAdvance(
           source: "mcp_advance",
         }
       : null;
+  /**
+   * 归属**校验计划**（同单非空归属入参时才有）—— 既作 ★N-8 的「校验先于写入」凭据，也作
+   * {@link handleFeatureAdvance} 下方**归属门双挂**的「本单即将落入 N 条」计数（v0.10.5 O4）。
+   * 不另写第二套判据：计数取自 O2 的同一函数返回。
+   */
+  let attributionPlan: { entries: AttributionPlanEntry[] } | null = null;
   if (attributionArgs !== null) {
     const plan = checkFeatureAttributionWrites(
       feature,
@@ -1473,6 +2048,7 @@ export function handleFeatureAdvance(
       attributionArgs.source,
     );
     if (plan.ok === false) return plan;
+    attributionPlan = plan;
   }
 
   // ---- 重派与解冻（§2.3 / N4）：**显式特例**，不得给 `TRANSITIONS` 加自环 ----------------------
@@ -1480,6 +2056,8 @@ export function handleFeatureAdvance(
   // ⇒ 跳过 `canTransition`（转移表保持单一事实源、不出现 `executing → executing` 自环）；
   // `to` 必须**显式** `"executing"`，以防借本参数做状态流转。
   if (args.retryTaskIds !== undefined) {
+    // ⚠ **不派生 `stage`**（v0.10.5 O2）：本路径无状态流转（Feature 态逐字不变）⇒ 派生无目标态可推；
+    // 同单显式登记的 `stage` 照原样落笔，不被任何派生覆盖。
     const resume = handleRetryResume(feature, { ...args, retryTaskIds: args.retryTaskIds }, reg.patch);
     if (resume.ok === false || attributionArgs === null) return resume;
     // 重派校验全过 ⇒ 同单归属写才落笔（归属 + 重派任一不过，都不留半摊）
@@ -1492,13 +2070,17 @@ export function handleFeatureAdvance(
   // 加了守卫就永远写不进去。主链态在此路径**逐字不变**（`from === state`）。
   // F2（v0.9.0 O4 门禁报告）：早退**不得**丢弃同单 Feature Context —— 与合法流转同一出口落库。
   if (hasRegistration && args.to === feature.state) {
+    // ⚠ **不派生 stage**（v0.10.5 O2）：本路径无状态迁移 ⇒ 无派生目标态；此处的 `stage` 是
+    // **宿主显式登记写**（门①抬「改造方案」、发版流程写「发版」都走这一格），派生若介入即覆盖显式写。
     applyFeatureContext(feature.featureId, args);
     updateFeatureRegistration(feature.featureId, reg.patch);
-    const success: FeatureAdvanceSuccess = {
+    const success: FeatureAdvanceExit = {
       ok: true,
       featureId: feature.featureId,
       from: feature.state,
       state: feature.state,
+      // 明细装配 = **写后重读**（登记写已落笔；本档不派生 `stage`，显式写即最终值）
+      ...stageDetailAfterWrite(feature.featureId, feature),
     };
     if (args.note !== undefined) success.note = args.note;
     if (attributionArgs === null) return success;
@@ -1509,12 +2091,15 @@ export function handleFeatureAdvance(
   // 不携带登记字段时，`to = 当前态` 在主链上**没有路径**（`canTransition` 会拒）⇒ 本分支替它跳过
   // 状态机校验；`state` 逐字不变、不发状态事件、不写登记（转移表仍零改动、无自环）。
   if (attributionArgs !== null && args.to === feature.state) {
+    // ⚠ **不派生 stage**（v0.10.5 O2）：只补归属档同样无状态迁移（`state` 逐字不变、不发状态事件）。
     applyFeatureContext(feature.featureId, args);
-    const success: FeatureAdvanceSuccess = {
+    const success: FeatureAdvanceExit = {
       ok: true,
       featureId: feature.featureId,
       from: feature.state,
       state: feature.state,
+      // 明细装配 = **写后重读**（本档只落 Context；`decisions` 参与 `pending` 推导，故必须读回写后的行）
+      ...stageDetailAfterWrite(feature.featureId, feature),
     };
     if (args.note !== undefined) success.note = args.note;
     return writeAttribution(success, attributionArgs, identity);
@@ -1535,19 +2120,57 @@ export function handleFeatureAdvance(
     };
   }
 
-  // 唯一准入门（REQ-v0.4.1-2026-09-16-01 §2.4）：`approve` 是进入 `executing` 的唯一通道。
-  // 位置在 `canTransition` **之后** ⇒ `waiting_approval → analyzing` 之类非法目标仍报
-  // `feature_transition_invalid`（错误区分），只有"合法但须审批"的这一步改为 `feature_approval_required`。
-  // ⚠️ 条件严格限定这两态：**不得**误伤 `needs_input → executing`（人工澄清续推，属设计内）。
+  // 唯一准入门（REQ-v0.4.1-2026-09-16-01 §2.4）：`approve` 是**离开 `waiting_approval` 的唯一通道**。
+  // 判据 = **行前提**三条件合取：`feature.state` 为 `waiting_approval` ∧ 目标是该态的**转移表出边**
+  // ∧ 目标在**主链上后于**本态 ⇒ 拒。**不按 `to` 取值点名**：「转移表出边」分量令事实源 = 转移表本身
+  // （将来给本态再加任何前进边即自动被本守卫覆盖、不复现旁路）；「主链行序」分量令
+  // `cancelled` / `failed` **天然放行**（非主链态 ⇒ `indexOf` 为 `-1`，不大于本态索引）—— 归档边被拒
+  // 会误伤 §8 收口归档路径，故此处**不得**写成 `|| 转移表出边`。
+  // 位置在 `canTransition` **之后** ⇒ `waiting_approval → integrating` 之类非法目标仍报
+  // `feature_transition_invalid`（错误区分），只有"合法但须审批"的这几步改为 `feature_approval_required`。
+  // ⚠️ 第一条件严格限定 `feature.state`：**不得**误伤 `needs_input → executing`（人工澄清续推，属设计内）。
   // 注：状态机层保留 `waiting_approval → executing` 边（转移表 = 单一事实源；approve 自身不经 canTransition）。
-  if (feature.state === "waiting_approval" && args.to === "executing") {
+  if (
+    feature.state === "waiting_approval" &&
+    canTransition(feature.state, args.to) &&
+    FEATURE_MAIN_CHAIN.indexOf(args.to) > FEATURE_MAIN_CHAIN.indexOf(feature.state)
+  ) {
     return {
       ok: false,
       code: "feature_approval_required",
       error:
-        "非法状态流转：waiting_approval → executing 须经审批门（请用 a2a_feature_approve；" +
+        `非法状态流转：${feature.state} → ${args.to} 须经审批门（请用 a2a_feature_approve；` +
         "该操作 = 记录用户已给的方案确认，一对一映射，不可预领 / 不可补领）",
     };
+  }
+
+  // ---- 归属门双挂（v0.10.5 O4 / 改造文档 §2.6）：出工序格的「归属非空」转移守卫 --------------------
+  // 两枚转移 = `version_planning → decomposing`（主轨出 PjM 工序格）与
+  // `decomposing → executing`（兜**增补 / 承接轨** —— 它们跳过了前一格，归属在这格补齐）。
+  // 判据 = **本需求归属清单非空**，两笔来源相加：已落库的行（`featureProjectListByFeature`，
+  // 与 `checkFeatureAttributionWrites` 内部读的是同一个函数 ⇒ 不另写第二套归属判据）+ 本单即将写入的行
+  // （上面那份已通过校验的 plan）。
+  // 位置在 `canTransition` 与 `feature_approval_required` **之后**、任何写入（Context / 登记 /
+  // 归属 / 主链）**之前** ⇒ 拒绝时主链**零迁移**（★N-8 同款）。
+  // 错误码用**新增独立码** `feature_attribution_required`，**不复用** `orch_project_attribution_state_locked`
+  // —— 后者语义 =「该态**不允许写**归属」，与本判据「**缺归属而不许离开**该态」方向相反（宿主裁定）。
+  const crossesAttributionGate =
+    (feature.state === "version_planning" && args.to === "decomposing") ||
+    (feature.state === "decomposing" && args.to === "executing");
+  if (crossesAttributionGate) {
+    const settled = featureProjectListByFeature(feature.featureId).length;
+    const planned = attributionPlan?.entries.length ?? 0;
+    if (settled + planned === 0) {
+      return {
+        ok: false,
+        code: ERR_FEATURE_ATTRIBUTION_REQUIRED,
+        error:
+          `归属门：Feature ${feature.featureId} 无归属记录（承诺集为空）⇒ 不得离开 ${feature.state}` +
+          `（本单也未携带 projectVersions 写入）；整单拒绝、主链零迁移。` +
+          `顺序 = 先经 project 台账建版、再经 advance 的 projectVersions 写归属，然后重试本迁移` +
+          `（工序格内不派发任何节点，归属是出格的凭据）`,
+      };
+    }
   }
 
   // needs_input → executing：以同 contextId 续接待澄清任务（补齐 answer 后续推）
@@ -1580,13 +2203,26 @@ export function handleFeatureAdvance(
     attributionCounts = { created: written.created, updated: written.updated, noop: written.noop };
   }
 
+  // ---- `stage` 半派生（v0.10.5 O2 / 改造文档 §2.2）：本行是 `deriveStageForState` 的**唯一调用点** ----
+  // 位置钉在「主链迁移**之前**、登记显式写**之后**」：显式 `stage` 先落、派生随后按 `state` 为准回写
+  // （`引擎映射.md` §3.5 一致性判据「state 与 stage 不一致 ⇒ 以 state 为准并回写 stage」）。
+  // patch **仅 `stage` 一键** ⇒ 同单的 `approval` / `version` 不被派生动到（不扩观测面写集）；
+  // 同值重放由 store 的真变化守卫归零事件（`updateFeatureRegistration` 的 diff 在读侧归一之后做）。
+  // 三条分叉（`retryTaskIds` / 登记特例 `to` = 当前态 / 只补归属）**不派生** —— 见各分支内注释钉。
+  const derivedStage = deriveStageForState(args.to);
+  if (derivedStage !== null) {
+    updateFeatureRegistration(feature.featureId, { stage: derivedStage });
+  }
+
   const updated = updateFeatureState(feature.featureId, args.to);
   const state = updated === null ? args.to : updated.state;
-  const success: FeatureAdvanceSuccess = {
+  const success: FeatureAdvanceExit = {
     ok: true,
     featureId: feature.featureId,
     from: feature.state,
     state,
+    // 明细装配 = **写后重读**（Context / 登记 / 派生 `stage` / 主链四写均已落笔 ⇒ 明细报的是**迁入的那一格**）
+    ...stageDetailAfterWrite(feature.featureId, updated ?? feature),
   };
   if (args.note !== undefined) success.note = args.note;
   if (attributionCounts !== null) success.attribution = attributionCounts;
@@ -1630,7 +2266,7 @@ function handleRetryResume(
   args: FeatureAdvanceArgs & { retryTaskIds: string[] },
   /** 已校验的登记字段（v0.9.0）；**在所有重派校验通过之后**才落笔，避免半生效 */
   registration: FeatureRegistrationPatch,
-): FeatureAdvanceSuccess | FeatureToolFailure {
+): FeatureAdvanceExit | FeatureToolFailure {
   // 互斥：`answer` 仅承载 needs_input 澄清（走 needs_input→executing 常规路径），不得与重派同传
   if (args.answer !== undefined) {
     return {
@@ -1723,6 +2359,8 @@ function handleRetryResume(
     state: feature.state,
     rearmed,
     unfrozen,
+    // 明细装配 = **写后重读**（节点重派/解冻不改 features 行，但同单的 Context 与登记字段改 ⇒ 须读回）
+    ...stageDetailAfterWrite(feature.featureId, feature),
   };
 }
 
@@ -1737,7 +2375,7 @@ export interface FeatureApproveArgs {
 export function handleFeatureApprove(
   args: FeatureApproveArgs,
   identity: string | null = null,
-): FeatureStateChangeSuccess | FeatureToolFailure {
+): FeatureApproveSuccess | FeatureToolFailure {
   const feature = getFeature(args.featureId);
   if (feature === null) {
     return { ok: false, code: "feature_not_found", error: `未知 Feature ${args.featureId}` };
@@ -1752,9 +2390,13 @@ export function handleFeatureApprove(
       error: `审批门仅适用于 waiting_approval（当前 ${feature.state}）`,
     };
   }
-  // **门看 `approval`，不看 `stage`**（v0.9.0 B2″ / 引擎映射 §3）：两维正交，`stage` 只登记段、
-  // 不代表已确认。不满足 ⇒ 结构化拒绝，**不放行、不改状态、不落 `approval = 已通过`**。
-  // 既有调用方零红：`create` 缺省即 `待审批`（见 {@link DEFAULT_FEATURE_APPROVAL}）。
+  // **①② = 门看 `state` 与 `approval`**（v0.9.0 B2″）：这两条各自只查当场值，**不查 `stage`**。
+  // ⚠ **口径变更（增补 `ec93e1bd` / 引擎映射 §3 门②行「过门判据 = 六条」）**：原句「门看 approval、
+  // 不看 stage」自本卡起只剩「**①② 这两条不查 stage**」这一半为真 —— `stage` 已进入过门条件（下方 ⑤），
+  // 但**仍不校验 `stage` 迁移序**（⑤ 只读当场值、不追问它经由哪条迁移抵达），正交的原句在这半句上照旧。
+  // 不满足 ⇒ 结构化拒绝，**不放行、不改状态、不落 `approval = 已通过`**。
+  // ⚠ v0.10.5 O4 起 `create` 初值恒定 `未发起`（原「create 缺省即待审批 ⇒ 既有调用零红」句作废）：
+  // 过审前必须由宿主经 advance 写 `approval = 待审批`（改造文档落文件之时，规范 §3.5 的既定顺序）。
   if (feature.approval !== "待审批") {
     return {
       ok: false,
@@ -1765,19 +2407,88 @@ export function handleFeatureApprove(
         `（经 a2a_feature_advance 写登记字段）。`,
     };
   }
-  const updated = updateFeatureState(feature.featureId, "executing");
+  // ---- 门②（改造文档确认）过门条件 ③④⑤⑥（增补 `ec93e1bd` / 引擎映射 §3 门②行六条）------------
+  // **位置硬约束**：本串必须早于下面**三笔写** —— `updateFeatureState`（主链迁 `target`）/
+  // `updateFeatureRegistration{ approval: "已通过" }` / `activateVersionForFeature`（版本 `notstart→active`）。
+  // **后人不得把任何判据插进这三笔之间**：`feature` 是写前快照、三笔写非事务，中途回头返工会留下
+  // 「态已迁、门没过」的**不可回滚半态**（`approval` 已单向落「已通过」，无回边可撤）。
+  // **序 = ③ → ④ → ⑤ → ⑥**（与门① 两前提同序）⇒ ①② 的既有负锚逐字不翻；**缺哪报哪、不合并**。
+  // ③④ **照抄门① 的两条前提**（同一批码、同一 {@link docRegistered}，不造第二套判据）：本串堵的洞是
+  // 「**登记写 `approval = 待审批` 不要求先过门①**」⇒ 只做门②、省略门① 的卡此前能直行至此并放行。
+  if ((feature.version ?? "") === "") {
+    return {
+      ok: false,
+      code: ERR_GROUP_VERSION_REQUIRED,
+      error:
+        `门②（改造文档确认）条件 ③：Feature ${feature.featureId} 的 features.version 为空（未排期）⇒ 不得过 approve；` +
+        "零迁移（state / approval 逐字不动）。" +
+        "先经引擎排期写口写定 version（advance 的「to = 当前态 ∧ 带 version」特例），再重试过门",
+    };
+  }
+  // **第二入参恒传 `undefined`**：{@link docRegistered} 的并集豁免是为门① 服务的（宿主「同一单先登记
+  // 路径、再抬 `stage`」是既有合法用法）；**approve 无 `decisions` 入参 ⇒ 并集豁免在本侧不存在**，
+  // 本串只看已落库的那一行（改造文档 §C.2「当场查」）。
+  if (!docRegistered(feature.decisions, undefined, CONFIRMATION_DOC_MARKER)) {
+    return {
+      ok: false,
+      code: ERR_CONFIRMATION_DOC_REQUIRED,
+      error:
+        `门②（改造文档确认）条件 ④：Feature ${feature.featureId} 的 decisions 未登记本需求的《需求确认单》档名` +
+        `（已落库值内无 "${CONFIRMATION_DOC_MARKER}"）⇒ 不得过 approve；零迁移（state / approval 逐字不动）。` +
+        "门② 的 ③④ 照抄门① 两条前提 ⇒ 未过门① 的卡不得直接过门②；先用 advance 的登记写把确认单路径登记进去",
+    };
+  }
+  if (feature.stage === "需求分析") {
+    return {
+      ok: false,
+      code: ERR_REQUIREMENT_GATE_NOT_PASSED,
+      error:
+        `门②（改造文档确认）条件 ⑤：Feature ${feature.featureId} 的 stage 仍为「需求分析」⇒ 需求确认门（门①）未过，` +
+        "不得过 approve；零迁移（state / approval 逐字不动）。" +
+        "判据 = derivePendingItems 的 stage 欠项同款（只查当场值、不校验迁移序）；先经 advance 把 stage 迁往「改造方案」（该单同受门① 两前提执法）",
+    };
+  }
+  if (!docRegistered(feature.decisions, undefined, DESIGN_DOC_MARKER)) {
+    return {
+      ok: false,
+      code: ERR_DESIGN_DOC_REQUIRED,
+      error:
+        `门②（改造文档确认）条件 ⑥：Feature ${feature.featureId} 的 decisions 未登记《改造文档》档名` +
+        `（已落库值内无 "${DESIGN_DOC_MARKER}"）⇒ 不得过 approve；零迁移（state / approval 逐字不动）。` +
+        "⚠ 两枚档名（《需求确认单》与《改造文档》）**须同时在册** —— " +
+        "decisions 是**整值替换**，补登记时须**重发全量两枚**（只发新枚会把条件 ④ 打回）。",
+    };
+  }
+  /**
+   * **目标态按父链分流（v0.10.5 O4 / 改造文档 §2.6）** —— 判据 = `parentFeatureId !== null`：
+   * - **无父（主轨）** ⇒ `waiting_approval → version_planning`：PjM 版本规划工序自占一格；
+   * - **有父（增补轨 / 承接轨）** ⇒ 直接 `→ decomposing`：**跳过** `version_planning`，
+   *   因两者均不重走 PjM 工序（版本规划已随主轨落定，规范 §2 Step 3「增补轨」条）。
+   *
+   * **不为此在转移表加 `waiting_approval → decomposing` 边**：`approve` 是本格的**唯一准入**，
+   * 走的是上面的直写路径（不经 `canTransition`）；一旦加边，`advance(to="decomposing")` 在
+   * `waiting_approval` 也会合法 ⇒ 等于开了绕过 `approve` 的第二道门。边留在表上只服务 `advance`，
+   * 而 `advance` 已被 `feature_approval_required` 守卫挡死。
+   */
+  const target: FeatureState = feature.parentFeatureId === null ? "version_planning" : "decomposing";
+  const updated = updateFeatureState(feature.featureId, target);
   // 过审即把门状态落定（**单向、无回边**）：同一张单不得被重复过审解释
   updateFeatureRegistration(feature.featureId, { approval: "已通过" });
   // v0.10.0 O2c：`approve` 放行 = 版本「notstart → active」自动转换的触发点之一
   // （引擎内部 · 幂等 · 不阻断；事件 `version.activated` 由 store 写口同事务落）。
   // 版本面故障绝不拖垮过审：`activateVersionForFeature` 自带 try/catch 护栏（见 versions-activation.ts）。
   activateVersionForFeature(feature);
-  return {
+  const success: FeatureApproveSuccess = {
     ok: true,
     featureId: feature.featureId,
     from: feature.state,
-    state: updated === null ? "executing" : updated.state,
+    state: updated === null ? target : updated.state,
+    // 明细装配（增补 `6cc46dd2` N4）= **写后重读**：本格两条写笔（主链迁 `target`、`approval` 落
+    // 「已通过」）都在 `feature` 这份**写前快照**之后 ⇒ 直接用快照会报「被离开的那一格」（`waiting_approval`
+    // 的 `gate` / `pending`）且 `approval` 回显成「待审批」。`fallback` 只兜重读落空（行刚被本单写过）。
+    ...stageDetailAfterWrite(feature.featureId, feature),
   };
+  return success;
 }
 
 // ---------------------------------------------------------------------------

@@ -1459,8 +1459,17 @@ export function renderPage(params: PageParams): string {
   .pipe { border: 1px solid var(--b-line); border-radius: var(--b-r-6); margin-bottom: var(--b-sp-8); background: var(--b-surface-2); }
   .pipe > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: var(--b-sp-8); padding: var(--b-sp-6) var(--b-sp-12); font-size: var(--b-fs-13); font-weight: 600; color: var(--b-text); }
   .pipe > summary::-webkit-details-marker { display: none; }
-  .pipe-body { display: flex; align-items: center; flex-wrap: wrap; gap: 0; padding: var(--b-sp-8) var(--b-sp-12) var(--b-sp-12); overflow-x: auto; }
-  .dg-chip { display: inline-flex; align-items: center; gap: var(--b-sp-4); border: 1px solid var(--b-line); border-radius: var(--b-r-8); padding: 2px var(--b-sp-8); font-size: var(--b-fs-12); background: var(--b-surface); color: var(--b-text); white-space: nowrap; }
+  .pipe-body { display: flex; align-items: center; flex-wrap: wrap; gap: 0; padding: var(--b-sp-8) var(--b-sp-12) var(--b-sp-12); overflow-x: auto; position: relative; }
+  /* v0.10.5 G6 依赖图按真依赖边绘制（形态 α = 固定网格 + 通道走线 + 内联 SVG · 样式同源）：
+     几何唯一下发面 = 每管道一枚 .dg-grid 的 inline 变量 --dg-nw / --dg-nh / --dg-bh 与盒模 width / height
+     ⇒ 本区间不写 chip / 角标带的任何宽高数字（chip 盒与 graph-view 的 DG_NODE_W / DG_NODE_H 同源，
+     角标带高与 DG_BADGE_H 同源；坐标原点 = .dg-grid，cell 的 left / top 出自网格函数）。 */
+  .dg-grid { position: relative; flex: none; }
+  .dg-links { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; pointer-events: none; }
+  .dg-links path { fill: none; stroke: var(--b-line); stroke-width: 1.5px; }
+  .dg-cell { position: absolute; z-index: 2; display: flex; flex-direction: column; align-items: flex-start; }
+  .dg-deps { order: -1; height: var(--dg-bh); line-height: var(--dg-bh); }
+  .dg-chip { display: inline-flex; align-items: center; gap: var(--b-sp-4); border: 1px solid var(--b-line); border-radius: var(--b-r-8); padding: 2px var(--b-sp-8); font-size: var(--b-fs-12); background: var(--b-surface); color: var(--b-text); white-space: nowrap; box-sizing: border-box; width: var(--dg-nw); height: var(--dg-nh); justify-content: center; }
   /* v0.10.3 增补 A1 chip 六态着色补齐：上条基础规则只给中性 border/background ⇒ 状态类是空钩子。
      本组七条 = dg-<NodeState key> 闭集（done/running/queued/failed/frozen/ask/unknown，与 graph-view
      NODE_STATE_ORDER 同序）；色值逐字复用图例在用的同一事实源 graph-view NODE_STATE_COLORS
@@ -1473,7 +1482,6 @@ export function renderPage(params: PageParams): string {
   .dg-chip.dg-frozen { border-color: #f3e5d0; background: #f3e5d0; }    /* ← TASK_STATE_COLORS.blocked */
   .dg-chip.dg-ask { border-color: #ece2fb; background: #ece2fb; }       /* ← NODE_STATE_COLORS.ask（图例在用的既有色） */
   .dg-chip.dg-unknown { border-color: #f2f3f5; background: #f2f3f5; }   /* ← NEUTRAL_TASK_COLOR（不可辨，不表具体态） */
-  .dg-arrow { color: var(--b-text-4); padding: 0 var(--b-sp-6); font-size: var(--b-fs-13); }
   .dg-dep { font-size: var(--b-fs-11); color: var(--b-text-3); border: 1px solid var(--b-line); border-radius: var(--b-r-8); padding: 0 var(--b-sp-4); margin-left: 2px; }
   .dg-edges { margin-top: var(--b-sp-4); font-size: var(--b-fs-12); color: var(--b-text-3); }
   .dg-legend { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; font-size: 12px; color: #667; }
@@ -1614,7 +1622,7 @@ export function renderPage(params: PageParams): string {
   .b-tabs a.fl { display: inline-block; margin: 0 var(--b-sp-4); padding: var(--b-sp-4) var(--b-sp-12); border-radius: var(--b-r-4) var(--b-r-4) 0 0; border-bottom: 2px solid transparent; color: var(--b-text-2); text-decoration: none; }
   .b-tabs a.fl:hover { color: var(--b-brand-ink); background: var(--b-surface-2); }
   .b-tabs a.fl.on { background: var(--b-brand-soft); border-bottom-color: var(--b-brand); color: var(--b-brand-ink); }
-  /* 阶段步条：五段圆点 + 连线（完成段打勾、当前段实底），替代元数据表的阶段双行 */
+  /* 阶段步条：六段圆点 + 连线（完成段打勾、当前段实底），替代元数据表的阶段双行 */
   .b-steps { display: flex; flex-wrap: wrap; align-items: center; gap: var(--b-sp-4); margin: 0 0 var(--b-sp-16); padding: var(--b-sp-8) var(--b-sp-12); border: 1px solid var(--b-line); border-radius: var(--b-r-8); background: var(--b-surface); box-shadow: var(--b-shadow-1); font-size: var(--b-fs-12); }
   .b-step { display: inline-flex; align-items: center; gap: var(--b-sp-4); color: var(--b-text-3); white-space: nowrap; }
   .b-step-dot { display: inline-flex; align-items: center; justify-content: center; width: 16px; height: 16px; border: 1px solid var(--b-line); border-radius: 50%; background: var(--b-surface-2); color: var(--b-ok); font-size: var(--b-fs-11); font-style: normal; }

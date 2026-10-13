@@ -27,7 +27,9 @@ import { Client } from "@modelcontextprotocol/sdk/client/index.js";
 import { InMemoryTransport } from "@modelcontextprotocol/sdk/inMemory.js";
 import {
   ERR_PROJECT_VERSION_UNKNOWN,
+  featureProjectDelete,
   featureProjectListByFeature,
+  featureProjectUpsert,
   getFeature,
   projectVersionCreate,
   versionLedgerCreate,
@@ -74,17 +76,64 @@ function nextTitle(tag: string): string {
   return `o3-${tag}-${seq}`;
 }
 
-/** 一张已过门（`executing` + `已通过`）的卡 */
+/** 跳板归属的身份（只服务过格 ⇒ 落库后立即经 store 数据面删除，不出现在任何归属计数里） */
+const GATE_PROJECT = "o5-gate";
+const GATE_PROJECT_VERSION = "9.9.9";
+
+/**
+ * 抬 `stage` 那一单携带的产出物登记夹具 —— 门① 第二前提（增补 `bbc7ea28` O3）要《需求确认单》、
+ * 门② 的 ⑥（增补 `ec93e1bd`）要《改造文档》。两枚必须**同单在册**：`decisions` 是整值替换，
+ * 过门时按当场值逐枚查 ⇒ 只登记其一不放行。
+ */
+const CONFIRMATION_DECISIONS = '["doc/v0.10.1/夹具-需求确认单.md","doc/v0.10.1/夹具-改造文档.md"]';
+
+/**
+ * 一张已过门（`executing` + `已通过`）的卡。
+ *
+ * **v0.10.5 O5 过门序列（新契约定稿，写死照用）**：`create`（**不传** `stage` / `approval` ⇒ 初值恒定
+ * `需求分析` / `未发起`）→ `advance(to=当前态, version=<非空>)` →
+ * `advance(to=当前态, stage="改造方案", approval="待审批")` → `approve` ⇒ `version_planning`。
+ * 再跨 O4 的**归属门双挂**两格出口落到 `executing`：门判据 = 本需求归属非空，而本文件的用例要的正是
+ * 「归属集为空、由用例自己写」⇒ 借一枚跳板归属过 `version_planning → decomposing → executing`，
+ * 过完即删（走 store 数据面写口，不经本文件的执法面）。
+ */
 function approvedFeature(version: string, tag = "main"): string {
   const created = mustOk(handleFeatureCreate({ title: nextTitle(tag), version }, GROUP));
-  mustOk(handleFeatureApprove({ featureId: created.featureId }, GROUP));
-  return created.featureId;
+  const featureId = created.featureId;
+  mustOk(handleFeatureAdvance({ featureId, to: "waiting_approval", version }, GROUP));
+  mustOk(
+    handleFeatureAdvance(
+      {
+        featureId,
+        to: "waiting_approval",
+        stage: "改造方案",
+        approval: "待审批",
+        decisions: CONFIRMATION_DECISIONS,
+      },
+      GROUP,
+    ),
+  );
+  mustOk(handleFeatureApprove({ featureId }, GROUP));
+  mustOk(
+    featureProjectUpsert({
+      ownerGroup: GROUP,
+      featureId,
+      projectId: GATE_PROJECT,
+      projectVersion: GATE_PROJECT_VERSION,
+      groupVersion: version,
+      source: "o5-gate",
+    }),
+  );
+  mustOk(handleFeatureAdvance({ featureId, to: "decomposing" }, GROUP));
+  mustOk(handleFeatureAdvance({ featureId, to: "executing" }, GROUP));
+  assert.equal(featureProjectDelete(GROUP, featureId, GATE_PROJECT).deleted, true);
+  return featureId;
 }
 
 /** 一张未过门的卡（`waiting_approval` + `未发起`） */
 function unapprovedFeature(version: string, tag = "pending"): string {
   const created = mustOk(
-    handleFeatureCreate({ title: nextTitle(tag), version, stage: "需求分析", approval: "未发起" }, GROUP),
+    handleFeatureCreate({ title: nextTitle(tag), version }, GROUP),
   );
   return created.featureId;
 }

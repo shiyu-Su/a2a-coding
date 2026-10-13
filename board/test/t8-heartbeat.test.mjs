@@ -119,6 +119,14 @@ test("T8-② evaluateWake：引擎终态 / 离开执行中 ⇒ dag-terminal（�
   assert.equal(needs.hit, true, "needs_input 亦属离开执行中");
   assert.equal(needs.key, "state:needs_input");
 
+  // v0.10.5 主链 6→8：PjM 定版 / 拆任务两态非 executing ⇒ 同归「离开执行中」档
+  for (const st of ["version_planning", "decomposing"]) {
+    const d = evalAt(st);
+    assert.equal(d.hit, true, `${st} 必须唤宿主`);
+    assert.equal(d.kind, "dag-terminal", `${st} 必须落 dag-terminal，不得吸进 executing 档`);
+    assert.equal(d.key, `state:${st}`);
+  }
+
   // 引擎读面失败 ⇒ 保守不点火
   const unknown = evalAt(null);
   assert.equal(unknown.hit, false);
