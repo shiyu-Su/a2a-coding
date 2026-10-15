@@ -14,6 +14,13 @@
  *    —— 模板字符串会吃掉正则里的单反斜杠，parse 不过则整枚免手刷在真机上静默死）/
  *    **N-1…N-6（v0.10.4 · REQ-2026-10-11-06 T3）** 焦点收窄、撤让位、结构性兜底、timer 单槽、死钟 CSS、
  *    跨枚 helper 逐字一致；
+ *    **L-1 / L-2（v0.10.6 · REQ-2026-10-12-05 (c) 配对同跳）** `holdAnchor` 第三路的脚本面单点钉
+ *    （`data-live-lock` + 整篇展开态，含「不收窄 `closest("main")`」与件B 零耦合两条反向钉）与
+ *    SSR 面的属性恰 1 处钉（只落 graph 锚开标签 · 详情页其余四枚逐枚点名不带 · 排期页与任务页零命中）；
+ *  · **D. 跨面字面钉（v0.10.6 · REQ-2026-10-12-06 n12）** —— **D-③** 一枚：第八枚体内零
+ *    `.dg-canvas` / 零 `.dg-frame`（豁免类闭集不因依赖图换容器而扩集）+ 既有两处
+ *    `details[open]:not(.pipe)` 字面逐字不变（判据本身零改动）+ 渲染面全部 `<path>` 只带
+ *    `class` 与 `d`（禁 `data-*` 第五枚属性）；
  *  · **C. 自证** —— 扫描器不许空转（0 命中 = 扫描失效，不是通过）。
  *
  * **字样级负钉（v0.10.4 · REQ-2026-10-11-06 T3 翻新注-a）**：本档旧文写的是「不给第八枚加不含
@@ -28,12 +35,21 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 
 import { FEATURE_DETAIL_OVERLAY_SCRIPT, PAGE_LIVE_SCRIPT, renderPage } from "../dist/web/layout.js";
+import { renderDependencyGraphSection } from "../dist/graph-view.js";
 import { createBoardServer } from "../dist/server.js";
 import { LIVE_INTERVALS, renderLiveBar, renderTurnOutcome } from "../dist/web/views.js";
 import { engineNoLockFetcher } from "./engine-versions-fixture.mjs";
 
+/**
+ * 边线 path 的**整标签形状钉**单源（n2 取数面单源化，与 `graph-view.test.mjs` 的 `EDGE_PATH_RE`
+ * 同源）。保留旧内联正则的「逐字整标签 `^<path … d="…" />$`」语义（D-③ path 属性闭集：只带
+ * class 与 d 两枚属性）；可选后缀 `(?: dg-edge-cross)?` 为追加件（n9）跨框边换 class 预留 ——
+ * 旧码上该后缀不出现 ⇒ 匹配结果与旧内联正则完全一致（等价改写）。
+ */
+const EDGE_PATH_TAG_EXACT_RE = /^<path class="dg-edge(?: dg-edge-cross)?" d="[^"]*"\/>$/;
+
 /** 本文件声明的锚条数（C2 自证钉：`test()` 实数必须等于它，防「写了不跑 / 写了不报」。） */
-const DECLARED_ANCHOR_TESTS = 23;
+const DECLARED_ANCHOR_TESTS = 26;
 
 const NOW = Date.parse("2026-10-11T12:00:00Z");
 const FEATURE_VERSION = "v1.2.3";
@@ -428,6 +444,10 @@ test("B2（换块协议 + 容器不可替换红线）只换锚的子节点：fir
 test("B3（跳拍判据四条 · 锚级 + 整拍级）输入面焦点 / details[open]:not(.pipe) / dragstart·dragend 标记 / document.hidden + visibilitychange", () => {
   assert.match(PAGE_LIVE_SCRIPT, /ae !== null && isInputFace\(ae\) && el\.contains\(ae\)/, "判据①（T3 收窄）：焦点须**同时**是输入面且在本锚子树内 ⇒ 该锚该拍跳过（不打断输入）");
   assert.match(PAGE_LIVE_SCRIPT, /el\.querySelector\("details\[open\]:not\(\.pipe\)"\) !== null/, "判据②：锚内含非 pipe 的已展开折叠 ⇒ 该锚该拍跳过（用户正在看；`pipe` = 依赖图管道默认 open，唯一豁免，否则 graph 锚永不刷新）");
+  assert.ok(
+    PAGE_LIVE_SCRIPT.includes('el.hasAttribute("data-live-lock") && document.querySelector("details[open]:not(.pipe)") !== null'),
+    "判据② 的第三路（REQ-2026-10-12-05 (c) 配对同跳）：本锚带 data-live-lock ∧ **整篇**有非 pipe 已展开折叠 ⇒ 该锚该拍跳过（图跟着表一起停）。判据② 那一枚正钉**逐字未翻案** ⇒ 第三路是**追加**、不是替换",
+  );
   assert.doesNotMatch(PAGE_LIVE_SCRIPT, /querySelector\("details\[open\]"\)/, "负钉：判据②不得回退裸形 details[open]（回退 = graph 锚冻结复发）");
   assert.doesNotMatch(PAGE_LIVE_SCRIPT, /el\.contains\(document\.activeElement\)/, "反向钉（翻-2）：旧裸形「锚子树含 activeElement」已撤 —— 链接 / 按钮的焦点不得再算在填（整板无声永停的根因）");
   assert.doesNotMatch(PAGE_LIVE_SCRIPT, /if \(el\.contains\(document\.activeElement\)\) return true;/, "反向钉（翻-2）：旧正钉那一行逐字不得复活（焦点判据必须走 isInputFace）");
@@ -520,7 +540,7 @@ test("B8（离线可执行性钉 · 本档补强）第八枚脚本体必须能�
 // B'. N-1…N-6（v0.10.4 · REQ-2026-10-11-06 T3 焦点收窄 / 撤让位 / 结构性兜底 / 死钟 / 跨枚一致）
 // ---------------------------------------------------------------------------
 
-test("N-1（T3 焦点收窄 · 正反钉）isInputFace 白名单四值齐在 + 负钉不含 closest(form) + holdAnchor 双条件逐字", () => {
+test("N-1（T3 焦点收窄 · 正反钉）isInputFace 白名单四值齐在 + 负钉不含 closest(form) + holdAnchor 三路逐字", () => {
   const face = /function isInputFace\(node\) \{[^\n]*\}/.exec(PAGE_LIVE_SCRIPT);
   assert.ok(face !== null, "摘不到 isInputFace（本钉空转 ⇒ 判红）");
   for (const piece of [
@@ -537,8 +557,8 @@ test("N-1（T3 焦点收窄 · 正反钉）isInputFace 白名单四值齐在 + �
   assert.doesNotMatch(PAGE_LIVE_SCRIPT, /closest\(["']form["']\)/, "反向钉：白名单不得纳入 closest(\"form\") —— 纳入 ⇒ 列头删除钮拿到焦点 = 整板再次无声永停（根因复发）");
   assert.match(
     PAGE_LIVE_SCRIPT,
-    /function holdAnchor\(el\) \{ var ae = document\.activeElement; if \(ae !== null && isInputFace\(ae\) && el\.contains\(ae\)\) return true; return el\.querySelector\("details\[open\]:not\(\.pipe\)"\) !== null; \}/,
-    "锚级两路同体（逐字）：① 输入面焦点在本锚内 ② 锚内含非 pipe 已展开折叠",
+    /function holdAnchor\(el\) \{ var ae = document\.activeElement; if \(ae !== null && isInputFace\(ae\) && el\.contains\(ae\)\) return true; if \(el\.querySelector\("details\[open\]:not\(\.pipe\)"\) !== null\) return true; return el\.hasAttribute\("data-live-lock"\) && document\.querySelector\("details\[open\]:not\(\.pipe\)"\) !== null; \}/,
+    "锚级三路同体（逐字 · REQ-2026-10-12-05 (c) 配对同跳后）：① 输入面焦点在本锚内 ② 锚内含非 pipe 已展开折叠 ③ 带 data-live-lock 的锚继承整页展开态 —— ①② 两路**逐字未动**（本钉即「零翻案」的执法面）",
   );
   assert.equal(countAll(PAGE_LIVE_SCRIPT, "isInputFace(ae)"), 1, "本枚一路调用恰 1 处（不在别处另加判据）");
 });
@@ -587,6 +607,126 @@ test("N-6（跨枚 helper 逐字一致 · 双份同体）两枚各恰 1 处 isIn
   assert.match(PAGE_LIVE_SCRIPT, /if \(ae !== null && isInputFace\(ae\) && el\.contains\(ae\)\) return true;/, "第八枚一路调用形 = 本锚子树（el）");
   assert.match(FEATURE_DETAIL_OVERLAY_SCRIPT, /if \(ae !== null && isInputFace\(ae\) && body\.contains\(ae\)\) return true;/, "件B 一路调用形 = 本编辑区（body），未被本卡顺手改动");
   assert.match(FEATURE_DETAIL_OVERLAY_SCRIPT, /var f = body\.querySelectorAll\("textarea, input"\);/, "件B 二路（已填失焦也挡）逐字未改 ⇒ 两枚零耦合两钉不破");
+});
+
+// ---------------------------------------------------------------------------
+// L. L-1 / L-2（v0.10.6 · REQ-2026-10-12-05 (c) 配对同跳 —— 图与表止住发散）
+// ---------------------------------------------------------------------------
+
+test("L-1（配对同跳 · 脚本面单点与跨枚零耦合）hasAttribute 恰 1 处 · document 侧 querySelector 恰 1 处 · 负钉不收窄 closest(\"main\") · 件B 零 data-live-lock", () => {
+  assert.equal(
+    countAll(PAGE_LIVE_SCRIPT, 'el.hasAttribute("data-live-lock")'),
+    1,
+    "第三路在本枚恰 1 处（不在别处另加 lock 判据 ⇒ 一条判据一个调用点）",
+  );
+  assert.equal(
+    countAll(PAGE_LIVE_SCRIPT, 'document.querySelector("details[open]:not(.pipe)")'),
+    1,
+    "整篇展开态读取恰 1 处（只落第三路；.pipe 豁免同排它 ⇒ graph 锚不因自家默认展开自冻）",
+  );
+  assert.doesNotMatch(
+    PAGE_LIVE_SCRIPT,
+    /closest\(["']main["']\)/,
+    "反向钉：不得收窄成 closest(\"main\") —— 备选 c-scope 已被否决（更复杂且对浮层内零增益）；跨浮层泄漏是 §2.3 **如实登记的代价**，不得当缺陷修",
+  );
+  assert.equal(
+    countAll(FEATURE_DETAIL_OVERLAY_SCRIPT, "data-live-lock"),
+    0,
+    "件B 零耦合：浮层脚本不读 lock 属性（浮层内图与表本就由件B 原子换整份 main ⇒ 天然同快照，本卡不在浮层内立第二道保证）",
+  );
+});
+
+test("L-2（属性恰 1 处 · SSR 面）详情页 data-live-lock 恰 1 枚且只落 graph 锚开标签；exec / steps / turn / turn-prog 逐枚不带；排期页与任务页零命中", async () => {
+  await withPages((pages) => {
+    assert.equal(
+      countAll(pages.detail.html, "data-live-lock"),
+      1,
+      "详情页标记面 data-live-lock 恰 1 处（多一枚 = lock 扩散到别的锚，摘掉 = 配对同跳在运行态打不通）",
+    );
+    const graph = anchorFragment(pages.detail.html, "graph");
+    assert.ok(graph !== null, "摘不到 graph 锚（本钉空转 ⇒ 判红）");
+    assert.ok(
+      graph.slice(0, graph.indexOf(">") + 1).includes(' data-live="graph" data-live-lock>'),
+      "那一枚就落在 graph 锚开标签上（属性无值形态、紧随 data-live ⇒ 与 holdAnchor 第三路 hasAttribute 同一读法）",
+    );
+    for (const key of ["exec", "steps", "turn", "turn-prog"]) {
+      const frag = anchorFragment(pages.detail.html, key);
+      assert.ok(frag !== null, `${pages.detail.path} 摘不到锚「${key}」（摘不到 ⇒ 判红，不得当「无该锚」放过）`);
+      assert.equal(
+        countAll(frag.slice(0, frag.indexOf(">") + 1), "data-live-lock"),
+        0,
+        `锚「${key}」开标签不得带 data-live-lock（§3「不做什么」逐枚点名：只有 graph 加，其余照常刷）`,
+      );
+    }
+    for (const key of ["schedule", "tasksPick", "tasksDeep"]) {
+      assert.equal(
+        countAll(pages[key].html, "data-live-lock"),
+        0,
+        `${pages[key].path} 零 data-live-lock（lock 只服务详情页图/表配对，不外溢到排期页与任务页）`,
+      );
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// D. D-③（v0.10.6 · REQ-2026-10-12-06 n12 跨面字面钉 —— 改造文档 §4.4「新增 3 条」第 3 条）
+// ---------------------------------------------------------------------------
+
+/** 渲染面取数：三 project 链（两枚跨框边）+ 同框一枚边 ⇒ 框内与跨框 path 各有载体。 */
+function graphHtmlForCrossFace() {
+  const t = (taskId, projectId, dependencies, createdAt) => ({
+    taskId,
+    projectId,
+    state: "completed",
+    lane: "write",
+    failureKind: null,
+    retryCount: null,
+    dependencies,
+    prompt: null,
+    createdAt,
+    startedAt: null,
+    finishedAt: null,
+    queueState: null,
+    queuedAt: null,
+    claimedAt: null,
+    claimedBy: null,
+    taskType: null,
+  });
+  return renderDependencyGraphSection([
+    t("s1", "src", [], "2026-10-12T00:00:01Z"),
+    t("s2", "src", ["s1"], "2026-10-12T00:00:02Z"),
+    t("o1", "orch", ["s2"], "2026-10-12T00:00:03Z"),
+    t("f1", "flow", ["o1"], "2026-10-12T00:00:04Z"),
+  ]).html;
+}
+
+test("D-③（v0.10.6 跨面字面钉）第八枚体内零 .dg-canvas / 零 .dg-frame · not(.pipe) 两处字面逐字不变 · 全部 path 只带 class 与 d（禁 data-*）", () => {
+  // ① 豁免类闭集不随新类名扩集：免手刷那枚脚本体不认识依赖图的新容器类
+  assert.equal(PAGE_LIVE_SCRIPT.includes(".dg-canvas"), false, "第八枚体内不得出现 .dg-canvas（跳拍判据不认新类）");
+  assert.equal(PAGE_LIVE_SCRIPT.includes(".dg-frame"), false, "第八枚体内不得出现 .dg-frame（该类本卡不引入 ⇒ 更不得进判据）");
+  assert.equal(PAGE_LIVE_SCRIPT.includes("dg-canvas"), false, "去点形态一并负钉：判据里不存画布类名");
+  assert.equal(PAGE_LIVE_SCRIPT.includes("dg-frame"), false, "同上不认 dg-frame");
+  // ② 既有两处 not(.pipe) 字面逐字不变（判据本身零改动 ⇒ 本钉只追加、不翻案 B3 / L-1）
+  assert.ok(
+    PAGE_LIVE_SCRIPT.includes('el.querySelector("details[open]:not(.pipe)") !== null'),
+    "判据② 那一处（锚级）字面逐字不变",
+  );
+  assert.ok(
+    PAGE_LIVE_SCRIPT.includes('el.hasAttribute("data-live-lock") && document.querySelector("details[open]:not(.pipe)") !== null'),
+    "第三路（REQ-2026-10-12-05 (c)）那一处字面逐字不变",
+  );
+  assert.equal(
+    countAll(PAGE_LIVE_SCRIPT, "details[open]:not(.pipe)"),
+    2,
+    "该谓词在本枚恰 2 处 ⇒ 豁免类闭集仍是单元素 .pipe（框默认 open 不自冻）；扩集或回退裸形一律判红",
+  );
+  // ③ path 属性闭集：折叠留悬空线是已裁代价（§2.5-5.2），唯一救法是给 path 标 data-* ⇒ 必须钉死为不可
+  const paths = graphHtmlForCrossFace().match(/<path[^>]*>/g) ?? [];
+  assert.ok(paths.length >= 2, `空转守卫：确有 >=2 枚 path（实得 ${String(paths.length)} 枚 ⇒ 取数落空即本钉空转）`);
+  for (const p of paths) {
+    assert.match(p, EDGE_PATH_TAG_EXACT_RE, `path 只带 class 与 d 两枚属性：${p}`);
+  }
+  assert.equal(/<path[^>]*\sdata-/.test(graphHtmlForCrossFace()), false, "零 data-* 第五枚属性（G8-svg负钉② 的四元闭集不因本卡破）");
 });
 
 // ---------------------------------------------------------------------------

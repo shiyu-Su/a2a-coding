@@ -169,7 +169,7 @@ test("剥壳-⑥ 端到端 6 任务样本 ⇒ 「要点」列 = 剥壳标签 / �
   assert.ok(loose.endsWith("…"), "回落内容仍按既有预算截断");
   assert.equal(loose.replace(/<br\/>/g, "").length, 40, "预算 40 字（含省略号，`<br/>` 只是换行载体不计字）");
 
-  assert.equal(rowCells(html, "task-01")[0], "<td>1", "首列编号 = taskOrdinalMap 序（queuedAt 升序）");
+  assert.equal(rowCells(html, "task-01")[0], "<td>1", "首列编号 = taskOrdinalMap 序（createdAt 升序；本夹具不带 createdAt ⇒ 由 taskId 兜稳支成同一序）");
   assert.equal(rowCells(html, "task-06")[0], "<td>6");
 });
 

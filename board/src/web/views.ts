@@ -726,8 +726,8 @@ const EXECUTION_COLUMNS: readonly string[] = [
 ] as const;
 
 /**
- * 执行明细单表的行（v0.10.3 N3）：一行一任务，**按 `taskOrdinalMap` 升序**（与图上 chip 同一张编号表，
- * 不在本处第二处派生）；`taskId` 去重口径同 {@link taskOrdinalMap}（首见即留）。
+ * 执行明细单表的行（v0.10.3 N3）：一行一任务，**按 `taskOrdinalMap` 升序**（与图上 chip 同一张编号表 ——
+ * 键 = `createdAt` 登记时刻，不在本处第二处派生）；`taskId` 去重口径同 {@link taskOrdinalMap}（首见即留）。
  * trace 命中 ⇒ 填「为什么没跑」，终态 / 无 trace ⇒ `—`；在飞不做「至 now」推算（两时长函数照用）。
  */
 function renderExecutionRows(
@@ -803,7 +803,7 @@ export function renderFeatureDetail(
   const head = `<h2>${escapeHtml(f.title === "" ? f.featureId : f.title)} <span class="muted mono" title="${escapeHtml(f.featureId)}">${escapeHtml(f.featureId)}</span>${renderParentFeatureBadge(f.parentFeatureId)} <a class="fd-fullpage" href="/features/${escapeHtml(f.featureId)}" target="_blank" rel="noopener">整页打开</a></h2>\n<div class="live-slot" data-live="steps" data-live-interval="${String(LIVE_INTERVALS.feature)}">${renderStageStepBar(d)}</div>`;
 
   // v0.10.3 N3：任务表与「进展三面」表**并为一张 12 列单表**（三面表退役）。
-  // 行的事实源 = `detail.tasks` 全集，序 = `taskOrdinalMap` 升序（编号与图上 chip 同一张表）；
+  // 行的事实源 = `detail.tasks` 全集，序 = `taskOrdinalMap` 升序（编号与图上 chip 同一张表，键 = `createdAt` 登记时刻）；
   // trace 只按 taskId 命中后填「为什么没跑」一列，终态 / 无 trace ⇒ `—`。
   const rows = renderExecutionRows(detail.tasks, trace, nowMs);
   const executionTable =
@@ -824,7 +824,7 @@ export function renderFeatureDetail(
   // 件2 → v0.10.3 N2c：依赖图先移出「执行明细」折叠（独立卡），本节点再**从侧栏上移主栏**
   // （管道制要宽度）；外壳函数与 `feat-graph` 类名一律保留（「无任务 ⇒ 图卡不渲」的锚读的就是类名）。
   // 件N1 锚 4/5 `graph` / 锚 5/5 `exec`：恒在壳包住图卡与执行明细折叠（空正文 ⇒ 壳在场、内容空）。
-  const graphCard = `<div class="live-slot" data-live="graph">${featCard(extras.graphHtml ?? "", "feat-graph")}</div>`;
+  const graphCard = `<div class="live-slot" data-live="graph" data-live-lock>${featCard(extras.graphHtml ?? "", "feat-graph")}</div>`;
   const execution = `<div class="live-slot" data-live="exec">${
     executionBody === "" ? "" : foldSection("执行明细（任务 / 为什么没跑）", executionBody)
   }</div>`;

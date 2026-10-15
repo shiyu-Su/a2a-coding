@@ -740,8 +740,9 @@ export const NEW_REQUIREMENT_DIALOG_SCRIPT = `<script>
  * 执法永远在服务端（本脚本只是体验层）：闸锁卡片服务端渲染为**无 `draggable` 属性**
  * （`views.ts` 的 `deriveScheduleGateOpen` 判据），拖不动即拖不了；
  * 目标列与卡片现版本相同 ⇒ 不发请求（同版重提本为幂等，省一跳）。
- * `dragover` 需 `preventDefault()` 才能落地；版本列与池列都带 `data-version`，
- * 以属性存在而非 class 判定，避免与列头徽标样式耦合。
+ * `dragover` 需 `preventDefault()` 才能落地；落点单点 = `.kcol` 类（版本列与池列同 class），
+ * 以 class 而非 `data-version` 属性判定 —— 卡片自身也带 `data-version`，按属性判定会把落点
+ * 误认成卡片；列头徽标等非列节点不参与命中判定。同一时刻至多一列挂高亮（`over` 单列跟踪）。
  *
  * **v0.9.4 增补十一 E1（§9.6）**：尾列「新版本」虚列的 drop-建版本分支（含 `window.prompt()`
  * 输入路径）已随虚列一并撤除 —— 创建版本的唯一入口 = 页头「＋ 新版本」按钮 + 弹窗
@@ -755,10 +756,11 @@ export const DRAG_SCHEDULE_SCRIPT = `<script>
 (function () {
   var board = document.getElementById("schedule-board");
   if (board === null || typeof fetch !== "function" || typeof DragEvent !== "function") return;
+  var over = null;
   function colOf(node) {
     var el = node;
     while (el !== null && el !== board) {
-      if (el.nodeType === 1 && typeof el.getAttribute === "function" && el.getAttribute("data-version") !== null) return el;
+      if (el.nodeType === 1 && el.classList && el.classList.contains("kcol")) return el;
       el = el.parentNode;
     }
     return null;
@@ -806,17 +808,24 @@ export const DRAG_SCHEDULE_SCRIPT = `<script>
     if (col === null) return;
     e.preventDefault();
     e.dataTransfer.dropEffect = "move";
+    if (over !== col) {
+      if (over !== null) over.classList.remove("dragover");
+      over = col;
+    }
     col.classList.add("dragover");
   });
   document.addEventListener("dragleave", function (e) {
     var col = colOf(e.target);
-    if (col !== null) col.classList.remove("dragover");
+    if (col === null) return;
+    if (colOf(e.relatedTarget) === col) return;
+    col.classList.remove("dragover");
   });
   document.addEventListener("drop", function (e) {
     var col = colOf(e.target);
     if (col === null) return;
     e.preventDefault();
     col.classList.remove("dragover");
+    over = null;
     var id = e.dataTransfer.getData("text/plain");
     if (id === "") return;
     var card = document.querySelector('.kcard[data-feature="' + id + '"]');
@@ -829,6 +838,7 @@ export const DRAG_SCHEDULE_SCRIPT = `<script>
     if (e.target !== null && typeof e.target.closest === "function" && e.target.closest(".kcard[draggable=true]") !== null) {
       var cols = board.querySelectorAll(".kcol.dragover");
       for (var i = 0; i < cols.length; i += 1) cols[i].classList.remove("dragover");
+      over = null;
     }
   });
 })();
@@ -1013,10 +1023,17 @@ export const PAGE_LIVE_SCRIPT = `<script>
   // ⚠ 本 helper 与件B（详情浮层）常量内**同名同体**（两枚独立 IIFE 无法函数级共享 ⇒ 双份同体，
   // 件B chip 串双写先例同形）；逐字一致由跨枚钉 live-refresh N-6 钉死 —— **勿合并、勿全局化、勿单改**。
   function isInputFace(node) { if (node === null || node === undefined) return false; var tag = node.tagName; if (tag === "INPUT" || tag === "TEXTAREA" || tag === "SELECT") return true; return node.isContentEditable === true; }
-  // 跳拍判据（锚级）：① 焦点落在**本锚子树内的输入面** = 用户正在填；② 本锚含已展开折叠 = 用户正在看。
-  // 豁免类只有 pipe（依赖图管道，src/graph-view.ts:471 渲为默认 open）——不豁免则 graph 锚
-  // 被自家默认展开态永久冻结、永不刷新。
-  function holdAnchor(el) { var ae = document.activeElement; if (ae !== null && isInputFace(ae) && el.contains(ae)) return true; return el.querySelector("details[open]:not(.pipe)") !== null; }
+  // 跳拍判据（锚级）：① 焦点落在**本锚子树内的输入面** = 用户正在填；② 本锚含已展开折叠 = 用户正在看；
+  // ③ 带 data-live-lock 的锚**继承整页展开态** —— 页面上任一非 pipe 折叠开着 ⇒ 本锚该拍跳过
+  //（图与表分两枚锚、各自刷新 ⇒ 不同快照；本路让带标记的锚跟着整页展开态一起停）。
+  // 豁免类只有 pipe（依赖图管道，src/graph-view.ts:471 渲为默认 open）**保留**，且 ②③ 同排它
+  // ⇒ graph 锚不因自家默认展开态自冻（自冻 = 永不刷新）。
+  // ⚠ 跨浮层语义（如实登记 · 不得当缺陷修）：③ 是**整篇作用域**的判据，而详情浮层（件B）把回包整份
+  // main 的子节点搬进 .fd-body，那份 graph 锚**同样带**本属性 ⇒ 浮层内展开折叠会牵住页面级 lock 锚，
+  // 反向同理。判定 = 可接受：① 浮层是模态、背后不可见，关掉即恢复；② 浮层内的图与表本就由件B **原子换
+  // 整份 main** ⇒ 天然同快照，本路在浮层内不构成第二道保证、也不制造新错位。收窄备选（把整页判据限定到
+  // 页面级 main 内）不采用：更复杂且对浮层内零增益。
+  function holdAnchor(el) { var ae = document.activeElement; if (ae !== null && isInputFace(ae) && el.contains(ae)) return true; if (el.querySelector("details[open]:not(.pipe)") !== null) return true; return el.hasAttribute("data-live-lock") && document.querySelector("details[open]:not(.pipe)") !== null; }
   function keyOf(el) { return el.getAttribute("data-live") || ""; }
   function findAnchor(doc, key) {
     var list = doc.querySelectorAll("[data-live]");
@@ -1453,28 +1470,42 @@ export function renderPage(params: PageParams): string {
   .md .mermaid-block[data-rendered="1"] pre.mermaid-src { display: none; }
   .md .mermaid-block[data-rendered="1"] .mermaid-svg:empty { display: none; }
   .md .mermaid-block svg { max-width: 100%; height: auto; }
-  /* v0.10.3 N2c 依赖图管道制（自绘 DOM/CSS · 零脚本）：管道 = 每 project 一枚原生 details，
-     体内只有 chip 与箭头（零连线坐标层）；横滚职责由原 .dep-graph .mermaid-block 迁到 .pipe-body。
+  /* v0.10.3 N2c 依赖图管道制（自绘 DOM/CSS · 零脚本）：管道 = 每 project 一枚原生 details。
+     v0.10.6 C7 单画布（改造文档 §2.2.2 · 形态 S1）· 件二订正：横滚最终落外层 .dep-graph；
+     .dg-canvas 只当坐标系承载者（position:relative，零 overflow）—— 它是绝对定位框的包含块，不再兼作 scroll 面。
+     框与框内网格的定位只由画布级后代选择器给（inline style 零 position 声明），框级不新增元素类。
+     堆叠纪律：框层三选择器（.pipe / .pipe-body / .dg-grid）**零 z-index / transform / opacity** ——
+     任一被设即自成堆叠上下文 ⇒ 画布 svg 的 z-index:1 与 .dg-cell 的 z-index:2 比序失效（线盖在 chip 上）。
      取色只引既有 --b-* token —— 状态色的事实源仍是 graph-view 的 TASK_STATE_COLORS（图例 inline style）。 */
-  .pipe { border: 1px solid var(--b-line); border-radius: var(--b-r-6); margin-bottom: var(--b-sp-8); background: var(--b-surface-2); }
-  .pipe > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: var(--b-sp-8); padding: var(--b-sp-6) var(--b-sp-12); font-size: var(--b-fs-13); font-weight: 600; color: var(--b-text); }
+  .dg-canvas { position: relative; }
+  .dep-graph { overflow-x: auto; }
+  .pipe { border: var(--dg-fb) solid var(--b-line); border-radius: var(--b-r-6); background: var(--b-surface-2); }
+  .dg-canvas .pipe { position: absolute; box-sizing: border-box; }
+  .pipe > summary { cursor: pointer; list-style: none; display: flex; align-items: center; gap: var(--b-sp-8); padding: var(--b-sp-6) var(--b-sp-12); font-size: var(--b-fs-13); font-weight: 600; color: var(--b-text); height: var(--dg-fth); box-sizing: border-box; }
   .pipe > summary::-webkit-details-marker { display: none; }
-  .pipe-body { display: flex; align-items: center; flex-wrap: wrap; gap: 0; padding: var(--b-sp-8) var(--b-sp-12) var(--b-sp-12); overflow-x: auto; position: relative; }
+  .pipe-body { display: flex; align-items: center; flex-wrap: wrap; gap: 0; padding: var(--b-sp-8) var(--b-sp-12) var(--b-sp-12); position: relative; }
+  /* 框内 origin = border + title + pad 三级加数全部是 JS 常量（DG_FRAME_BORDER / DG_FRAME_TITLE_H /
+     DG_FRAME_PAD → 经 --dg-fb / --dg-fth / --dg-fp 下发）⇒ 本条不得留 --b-sp-* 作加数。 */
+  .dg-canvas .pipe-body { position: absolute; left: var(--dg-fp); top: var(--dg-fth); padding: 0; overflow: visible; }
   /* v0.10.5 G6 依赖图按真依赖边绘制（形态 α = 固定网格 + 通道走线 + 内联 SVG · 样式同源）：
-     几何唯一下发面 = 每管道一枚 .dg-grid 的 inline 变量 --dg-nw / --dg-nh / --dg-bh 与盒模 width / height
+     几何唯一下发面 = 画布一枚 inline 变量 --dg-nw / --dg-nh / --dg-bh 与盒模 width / height
      ⇒ 本区间不写 chip / 角标带的任何宽高数字（chip 盒与 graph-view 的 DG_NODE_W / DG_NODE_H 同源，
      角标带高与 DG_BADGE_H 同源；坐标原点 = .dg-grid，cell 的 left / top 出自网格函数）。 */
-  .dg-grid { position: relative; flex: none; }
+  .dg-grid { position: relative; }
   .dg-links { position: absolute; inset: 0; width: 100%; height: 100%; z-index: 1; pointer-events: none; }
   .dg-links path { fill: none; stroke: var(--b-line); stroke-width: 1.5px; }
-  .dg-cell { position: absolute; z-index: 2; display: flex; flex-direction: column; align-items: flex-start; }
-  .dg-deps { order: -1; height: var(--dg-bh); line-height: var(--dg-bh); }
+  /* v0.10.6 追加件 n9（REQ-2026-10-14-02）：跨管道连线单独配色 —— 只叠 stroke、零几何声明；
+     跨框 path 的 class 首 token 仍是 dg-edge ⇒ 上面基础规则照命中，取色引既有 token。 */
+  .dg-links path.dg-edge-cross { stroke: var(--b-brand); }
+  .dg-cell { position: absolute; z-index: 2; display: flex; flex-direction: column; align-items: flex-start; padding-top: var(--dg-bh); }
   .dg-chip { display: inline-flex; align-items: center; gap: var(--b-sp-4); border: 1px solid var(--b-line); border-radius: var(--b-r-8); padding: 2px var(--b-sp-8); font-size: var(--b-fs-12); background: var(--b-surface); color: var(--b-text); white-space: nowrap; box-sizing: border-box; width: var(--dg-nw); height: var(--dg-nh); justify-content: center; }
-  /* v0.10.3 增补 A1 chip 六态着色补齐：上条基础规则只给中性 border/background ⇒ 状态类是空钩子。
+  /* v0.10.3 增补 A1 chip 七态着色补齐：上条基础规则只给中性 border/background ⇒ 状态类是空钩子。
      本组七条 = dg-<NodeState key> 闭集（done/running/queued/failed/frozen/ask/unknown，与 graph-view
      NODE_STATE_ORDER 同序）；色值逐字复用图例在用的同一事实源 graph-view NODE_STATE_COLORS
      （其值 = TASK_STATE_COLORS 的重新指派 + ask 既有色 + 回落 NEUTRAL_TASK_COLOR），CSS 侧不新造色值。
-     chip 可见文字仍恒为 #编号（不加 ●◐○ 状态符，状态由本组配色与 title 承载）。 */
+     chip 可见文字仍恒为 #编号（不加 ●◐○ 状态符，状态由本组配色与 title 承载）。
+     v0.10.6 C5 角标族退役：原角标带的两条规则随之整条摘除
+     （行距改由 dg-cell 的 padding-top: var(--dg-bh) 承接，数值只从画布 inline 下发）。 */
   .dg-chip.dg-done { border-color: #dafbe1; background: #dafbe1; }      /* ← TASK_STATE_COLORS.completed */
   .dg-chip.dg-running { border-color: #e3eef7; background: #e3eef7; }   /* ← TASK_STATE_COLORS.working */
   .dg-chip.dg-queued { border-color: #fff4ce; background: #fff4ce; }    /* ← TASK_STATE_COLORS 的 input-required 档（图例同档转派） */
@@ -1482,7 +1513,6 @@ export function renderPage(params: PageParams): string {
   .dg-chip.dg-frozen { border-color: #f3e5d0; background: #f3e5d0; }    /* ← TASK_STATE_COLORS.blocked */
   .dg-chip.dg-ask { border-color: #ece2fb; background: #ece2fb; }       /* ← NODE_STATE_COLORS.ask（图例在用的既有色） */
   .dg-chip.dg-unknown { border-color: #f2f3f5; background: #f2f3f5; }   /* ← NEUTRAL_TASK_COLOR（不可辨，不表具体态） */
-  .dg-dep { font-size: var(--b-fs-11); color: var(--b-text-3); border: 1px solid var(--b-line); border-radius: var(--b-r-8); padding: 0 var(--b-sp-4); margin-left: 2px; }
   .dg-edges { margin-top: var(--b-sp-4); font-size: var(--b-fs-12); color: var(--b-text-3); }
   .dg-legend { display: inline-flex; align-items: center; gap: 4px; margin-right: 10px; font-size: 12px; color: #667; }
   .dg-legend i { display: inline-block; width: 12px; height: 12px; border: 1px solid #8886; border-radius: 3px; }
@@ -1507,7 +1537,9 @@ export function renderPage(params: PageParams): string {
   /* 件3 列头 sticky 的滚动面：.kanban 的 overflow-x:auto 使它成为滚动祖先，而它纵向永不滚 ⇒ 列内 sticky 悬不住。
      故把纵向滚动收到列上（max-height + overflow-y），列头随列内滚动常驻。
      选择器锁 #schedule-board ⇒ 组织门户（#org-portal）版式零影响。 */
-  #schedule-board > .kcol { max-height: calc(100vh - 120px); overflow-y: auto; padding-top: 0; }
+  /* REQ-2026-10-13-04 件B：min-height 只抬**列**的下界（空列/短列也有可命中高度的拖拽落点），
+     **不改** .kanban 的 align-items（仍 flex-start）⇒ 各列按内容各自高、列高仍不齐，是预期形态。 */
+  #schedule-board > .kcol { max-height: calc(100vh - 120px); overflow-y: auto; padding-top: 0; min-height: 160px; }
   #schedule-board > .kcol > h3 { margin-top: 0; padding-top: 6px; }
   .kcard { border: 1px solid #8884; border-radius: 6px; background: Canvas; padding: 6px 8px; margin: 0 0 6px; font-size: 12px; }
   .kcard > .khd { display: flex; flex-wrap: wrap; align-items: baseline; gap: 2px 6px; }
@@ -1662,7 +1694,7 @@ export function renderPage(params: PageParams): string {
   .b-meta-row { display: grid; grid-template-columns: 96px minmax(0, 1fr); gap: var(--b-sp-8); }
   .b-meta-row dt { color: var(--b-text-3); }
   .b-meta-row dd { margin: 0; font-family: ui-monospace, Consolas, monospace; word-break: break-word; }
-  /* 侧栏定宽里的表：不撑破卡（依赖图已上移主栏，横滚归 .pipe-body） */
+  /* 侧栏定宽里的表：不撑破卡（依赖图已上移主栏，横滚归 .dep-graph） */
   .feat-side table { font-size: var(--b-fs-11); }
 </style>
 </head>
