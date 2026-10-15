@@ -175,6 +175,23 @@ test("REQ-04 节点①（负向锚）CSS 内零深色口径 —— 无 `light da
   assert.doesNotMatch(css, /prefers-color-scheme/, "本轮不留深色档入口");
 });
 
+// --- REQ-2026-10-13-04 件B：排期页拖拽落点的 CSS 面（列高下界 + 高亮单点归列）----
+
+test("REQ-2026-10-13-04（正向锚）排期列有下界 · 高亮单点 = 既有 .kcol.dragover · 未被触达的规则原样在场", () => {
+  const css = pageCss(renderPage({ title: "t", active: "schedule", bodyHtml: "<p>b</p>" }));
+  assert.match(css, /#schedule-board > \.kcol\s*\{[^}]*min-height:/, "版本列 / 池列有下界 ⇒ 短列与空列也被撑出可命中的落点框");
+  assert.match(css, /\.kcol\.dragover\s*\{[^}]*outline: 2px dashed/, "高亮单点 = 既有 .kcol.dragover（规则本体零改动，列被撑高后虚线自动覆盖整框）");
+  // 作用域负钉（以在场形式写）：改动只锁 #schedule-board 域，两族未被改的规则逐字仍在原处
+  assert.match(css, /\.kanban\s*\{[^}]*align-items: flex-start/, "全局 .kanban 基元仍是 flex-start（组织门户版式不受牵连）");
+  assert.match(css, /\.m-pool\s*\{[^}]*align-items: flex-start/, "管理页两栏族零改动");
+});
+
+test("REQ-2026-10-13-04（负向锚）不留卡片级高亮 · #schedule-board 域内不出 stretch（档 B 锁 = 各列等高已被否决）", () => {
+  const css = pageCss(renderPage({ title: "t", active: "schedule", bodyHtml: "<p>b</p>" }));
+  assert.equal(/^\s*\.kcard\.dragover\b/m.test(css), false, "不得新增 .kcard.dragover 规则（高亮单点归列 ⇒ 指针在卡上时整列不闪断）");
+  assert.doesNotMatch(css, /#schedule-board[^{}]*\{[^}]*align-items:\s*stretch/, "档 B 锁：#schedule-board 域内不引入 stretch（列高保持不齐 = 用户裁决）");
+});
+
 // --- BD17：Referrer-Policy 不得掐掉写面表单档的同源 Referer 兜底 -----------
 
 test("BD17-①（正例）BOARD_REFERRER_POLICY = same-origin；页面 meta 与响应头常量同源单点", () => {
@@ -1167,13 +1184,16 @@ test("N3 遮挡治理分工：.fold-body 横滚 = 承重墙，@container 回落�
 });
 
 test("N3 编号单点：图上 chip 的 #n == 单表首列 #n（同 taskId ⇒ 同编号，同一张 taskOrdinalMap）", () => {
+  // v0.10.6 F1：编号键 = `createdAt`（登记时刻），本用例**不走**夹具同名缺省值 —— 三枚 `createdAt`
+  // 显式给全、互不相同，且序与 `queuedAt` 旧键**相反**（aa1 最早登记却最晚入队）⇒ 改回以 `queuedAt`
+  // 为键即翻红。`queuedAt` 不删 = 「时长键与号键并存」（排队时长列仍以 `queuedAt` 为键）。
   const tasks = [
-    { ...timingsTask, taskId: "aa1", queuedAt: "2026-09-26T00:03:00Z" },
-    { ...timingsTask, taskId: "aa2", queuedAt: "2026-09-26T00:01:00Z", dependencies: ["aa1"] },
-    { ...timingsTask, taskId: "aa3", queuedAt: null, dependencies: ["aa2"] },
+    { ...timingsTask, taskId: "aa1", createdAt: "2026-09-26T00:01:00Z", queuedAt: "2026-09-26T00:03:00Z" },
+    { ...timingsTask, taskId: "aa2", createdAt: "2026-09-26T00:02:00Z", queuedAt: "2026-09-26T00:01:00Z", dependencies: ["aa1"] },
+    { ...timingsTask, taskId: "aa3", createdAt: "2026-09-26T00:03:00Z", queuedAt: null, dependencies: ["aa2"] },
   ];
   const ordinals = taskOrdinalMap(tasks);
-  assert.deepEqual([...ordinals.entries()], [["aa2", 1], ["aa1", 2], ["aa3", 3]], "queuedAt 升序、null 沉底（单点口径）");
+  assert.deepEqual([...ordinals.entries()], [["aa1", 1], ["aa2", 2], ["aa3", 3]], "createdAt 升序、queuedAt 旧键不参与定序（单点口径）");
 
   const graph = renderDependencyGraphSection(tasks, 1);
   const html = renderFeatureDetail({ ...detailFixture, tasks }, null, "trace 关闭", NOW, false, [], {

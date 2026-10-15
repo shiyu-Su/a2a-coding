@@ -78,14 +78,14 @@ test("W6-①b（E1 改版）空看板同样不出虚列壳（列只剩需求池�
 // ② （E1 撤除）拖拽脚本：哨兵列识别与 prompt 建版本分支已删 —— 负向锚 + 既有拖拽行为保留
 // ---------------------------------------------------------------------------
 
-test("W6-②（E1 改版）DRAG_SCHEDULE_SCRIPT：colOf 只认 data-version · drop-建版本分支与 prompt 已删 · 改排期通路与零新端点保留", () => {
+test("W6-②（E1 改版）DRAG_SCHEDULE_SCRIPT：colOf 认 .kcol 类 · drop-建版本分支与 prompt 已删 · 改排期通路与零新端点保留", () => {
   const s = DRAG_SCHEDULE_SCRIPT;
   // 负向：哨兵属性与 prompt 建版本路径整段撤除
   assert.doesNotMatch(s, /data-newversion/, "colOf / drop 分支不再出现哨兵属性");
   assert.doesNotMatch(s, /window\.prompt|prompt\(/, "prompt 输入新版本号路径已删（按钮弹窗为唯一入口）");
   assert.doesNotMatch(s, /submitDrag\(id, fresh\)|typed|var fresh/, "输入归一 + 复用分支的中间变量已随分支撤除");
-  // colOf 只按 data-version 判定（属性存在判定，不依赖 class）
-  assert.match(s, /el\.getAttribute\("data-version"\) !== null\)/, "colOf 落点判定 = data-version 属性存在");
+  // colOf 按 .kcol 类判定（REQ-2026-10-13-04 起不认属性 —— 卡片自身也带 data-version，认属性会把卡误当落点）
+  assert.match(s, /el\.classList\.contains\("kcol"\)/, "colOf 落点判定 = .kcol 类在场");
   // 保留面：改排期通路逐条不变
   assert.match(s, /var target = col\.getAttribute\("data-version"\);/, "目标版本自列属性读取");
   assert.match(s, /if \(\(card\.getAttribute\("data-version"\) \|\| ""\) === \(target \|\| ""\)\) return;/, "同版早退保留");

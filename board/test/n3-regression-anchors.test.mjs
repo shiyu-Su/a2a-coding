@@ -469,6 +469,12 @@ test("N3-⑥c（B-T5）DRAG_SCHEDULE_SCRIPT 行为锚：POST 复用 /features/:i
   assert.match(s, /e\.preventDefault\(\);\s*\n\s*e\.dataTransfer\.dropEffect = "move";/, "dragover 需 preventDefault 才能落地");
   // 载荷只带 version —— 不得夹带 stage/approval（登记字段不进写面）
   assert.doesNotMatch(s, /stage|approval/, "拖拽载荷仍仅 version（stage/approval 只作服务端读判）");
+  // —— REQ-2026-10-13-04 件B：落点单点归列（认 .kcol 类，不再认属性）· 高亮同列内不摘 · over 双复位 ——
+  assert.match(s, /classList\.contains\("kcol"\)/, "colOf 认列谓词 = .kcol 类（卡片也带 data-version ⇒ 认属性会把卡误当落点 = 卡上不可落）");
+  assert.doesNotMatch(s, /getAttribute\("data-version"\) !== null/, "负锚：colOf 不得回退成认 data-version 属性（回退即根因① 复发）");
+  assert.match(s, /colOf\(e\.relatedTarget\) === col/, "dragleave 同列内守卫：进子元素 ⇒ 不摘高亮（relatedTarget 取不到 ⇒ 视为离列照摘，兜底方向不得反写）");
+  // 计数钉（R2-新1）：绑赋值语句字面（^\s*over = null;），不绑 var 声明与读侧 —— 少一枚 ⇒ 第二次同列拖拽虚线无声不出
+  assert.equal((s.match(/^\s*over = null;/gm) ?? []).length, 2, "drop / dragend 双复位 ⇒ over 复位语句恰 2 处");
 });
 
 // v0.9.8 REQ-2026-10-03-02：第七枚常量 MEMBER_DRAG_SCRIPT 的行为锚（提交 = 既有成员写路由、载荷三参数闭集；

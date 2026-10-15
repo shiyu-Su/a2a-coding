@@ -1,0 +1,208 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+<meta charset="utf-8">
+<title>依赖图跨框走线 · 修复形原型对照（eb86d5e8 真实数据）</title>
+<style>
+  :root { --ink:#1f2933; --muted:#66707a; --line:#d8dee4; --done:#dafbe1; --frame:#8b98a5; --surface:#fbfcfd; }
+  * { box-sizing: border-box; }
+  body { margin:0; padding:20px 24px 48px; font:13.5px/1.6 system-ui,-apple-system,"Segoe UI","Microsoft YaHei",sans-serif; color:var(--ink); background:#f6f8fa; }
+  h1 { font-size:18px; margin:0 0 6px; }
+  .lede { color:var(--muted); margin:0 0 14px; max-width:1100px; }
+  .panel { background:#fff; border:1px solid var(--line); border-radius:10px; padding:12px 16px 16px; margin:0 0 18px; }
+  .panel h2 { font-size:14.5px; margin:0 0 4px; display:flex; align-items:baseline; gap:8px; }
+  .tag { font-size:11px; font-weight:600; color:#fff; border-radius:999px; padding:1px 8px; background:#b42318; }
+  .tag.ok { background:#0b7285; }
+  .cap { color:var(--muted); margin:0 0 10px; font-size:12.5px; max-width:1100px; }
+  .counts { display:flex; gap:18px; flex-wrap:wrap; font-size:12.5px; margin:0 0 10px; }
+  .counts b { font-size:15px; }
+  .bad { color:#b42318; } .good { color:#0b7285; }
+  .scroll { overflow-x:auto; border:1px solid #e3e8ee; border-radius:8px; background:var(--surface); }
+  svg { display:block; }
+  .frameBox { fill:rgba(139,152,165,.06); stroke:var(--frame); stroke-width:1.5; stroke-dasharray:6 4; rx:10; }
+  .frameTitle { font-size:12.5px; font-weight:700; fill:#3e4c59; }
+  .chip { fill:var(--done); stroke:rgba(0,0,0,.30); stroke-width:1; rx:6; }
+  .chipLabel { font-size:11px; font-weight:700; fill:#1f2933; text-anchor:middle; dominant-baseline:middle; }
+  svg path { fill: none; }
+  path.edge { stroke:#9aa5b1; stroke-width:1.2; }
+  path.crossNow { stroke:#b42318; stroke-width:1.6; }
+  path.crossNew { stroke:#0b7285; stroke-width:1.6; }
+  .band { fill:rgba(11,114,133,.05); }
+  .margin { fill:rgba(154,103,0,.07); }
+  .note { color:var(--muted); font-size:12.5px; max-width:1100px; margin-top:6px; }
+</style>
+</head>
+<body>
+<h1>依赖图跨框走线 · 修复形原型对照稿（样本：需求 <code>eb86d5e8</code> 真实数据）</h1>
+<p class="lede">本页是**定形用草稿**（非实现验收）。数据 = 真板 <code>:3400</code> 上 <code>eb86d5e8</code> 详情页的 DOM 实读（3 框 / 28 chip / 31 边，**零合成**）。两块共用同一批框与 chip，**只有跨框边走线不同**：红线=现状（3 段形）、青线=修复后（走廊序列：k=1 → 5 段 / k=2 → 7 段）。框内边（28 条灰线）两版**一字不动**。</p>
+
+<div class="panel">
+  <h2><span class="tag">现状</span>当前线上形态（弧 1 贴源行横扫 ⇒ 穿中间框）</h2>
+  <p class="cap">跨框边只有 3 段：`弧（出源点，y 全 = 源行 ⇒ 贴行横扫）→ 竖（画布外缘）→ 弧（入目标）`。红线即 3 条跨框边 —— 它们的第一段把整段水平位移压在**源节点那一行**上扫完，于是**横穿中间框的 chip 行**。</p>
+  <div class="counts" id="cnt-now">计算中…</div>
+  <div class="scroll"><svg id="svg-now" viewBox="0 0 1224 942" width="1224" height="942"></svg></div>
+</div>
+
+<div class="panel">
+  <h2><span class="tag ok">修复后</span>走廊序列（长横走框间带 · 长竖走通道/外缘）</h2>
+  <p class="cap">每条跨框边按 **2k+3 段**（k = 跨框档数）走：`出源右缘 → 源框列通道 → 源侧框间带 → （k≥2 时：外缘竖跨中间框 → 目标侧框间带）→ 目标框列通道 → 入目标左缘`。**长横全在框间带、长竖全在列通道或画布外缘** —— 这两类地方结构上没有节点。淡蓝底=框间带，淡黄底=所用画布外缘。</p>
+  <div class="counts" id="cnt-new">计算中…</div>
+  <div class="scroll"><svg id="svg-new" viewBox="0 0 1224 942" width="1224" height="942"></svg></div>
+</div>
+
+<p class="note" id="diag"></p>
+<p class="note"><b>未覆盖（如实登记）</b>：本页只画「框内密列 / 框标题 / 跨框走线」三面；六态配色在本样本上近乎全 <code>done</code>（页脚配色未覆盖 queued/failed/frozen/ask/unknown）；不含 A4 的不动点回灌与 A5 的容量不等式（留实现节点）；真板形态的逐字复现依赖探针脚本补 `DG_GRID_ORIGIN_X/Y`（见 Step 1 回执 A7）。</p>
+
+<script>
+// ── 真板 eb86d5e8 直读几何（DOM 实读，零合成）──────────────────────────────
+const GEO = {"canvas":[1224,942],"chips":[{"cls":"dg-done","f":0,"rect":[45,55,74,28],"t":"#4"},{"cls":"dg-done","f":0,"rect":[45,101,74,28],"t":"#5"},{"cls":"dg-done","f":0,"rect":[45,147,74,28],"t":"#6"},{"cls":"dg-done","f":0,"rect":[45,193,74,28],"t":"#7"},{"cls":"dg-done","f":0,"rect":[45,239,74,28],"t":"#8"},{"cls":"dg-done","f":0,"rect":[45,285,74,28],"t":"#9"},{"cls":"dg-done","f":0,"rect":[45,331,74,28],"t":"#10"},{"cls":"dg-done","f":0,"rect":[261,55,74,28],"t":"#14"},{"cls":"dg-done","f":0,"rect":[477,55,74,28],"t":"#28"},{"cls":"dg-done","f":1,"rect":[45,555,74,28],"t":"#3"},{"cls":"dg-done","f":1,"rect":[175,555,74,28],"t":"#13"},{"cls":"dg-done","f":1,"rect":[305,555,74,28],"t":"#16"},{"cls":"dg-done","f":1,"rect":[305,601,74,28],"t":"#17"},{"cls":"dg-done","f":1,"rect":[437,555,74,28],"t":"#19"},{"cls":"dg-done","f":1,"rect":[567,555,74,28],"t":"#21"},{"cls":"dg-done","f":1,"rect":[567,601,74,28],"t":"#22"},{"cls":"dg-done","f":1,"rect":[567,647,74,28],"t":"#23"},{"cls":"dg-done","f":1,"rect":[699,555,74,28],"t":"#24"},{"cls":"dg-done","f":1,"rect":[829,555,74,28],"t":"#25"},{"cls":"dg-done","f":1,"rect":[959,555,74,28],"t":"#26"},{"cls":"dg-done","f":1,"rect":[1105,555,74,28],"t":"#27"},{"cls":"dg-done","f":2,"rect":[45,811,74,28],"t":"#1"},{"cls":"dg-done","f":2,"rect":[45,857,74,28],"t":"#2"},{"cls":"dg-done","f":2,"rect":[177,811,74,28],"t":"#11"},{"cls":"dg-done","f":2,"rect":[177,857,74,28],"t":"#12"},{"cls":"dg-done","f":2,"rect":[323,811,74,28],"t":"#15"},{"cls":"dg-done","f":2,"rect":[453,811,74,28],"t":"#18"},{"cls":"dg-done","f":2,"rect":[585,811,74,28],"t":"#20"}],"frames":[{"label":"管道 board（9）","rect":[24,8,548,460]},{"label":"管道 flow（12）","rect":[24,508,1176,216]},{"label":"管道 orch（7）","rect":[24,764,656,170]}],"paths":["M119,69 C126,69 134,369 141,369 L455,369 C462,369 470,69 477,69","M119,115 C131,115 143,381 155,381 L441,381 C453,381 465,69 477,69","M119,161 C136,161 152,393 169,393 L427,393 C444,393 460,69 477,69","M119,207 C140,207 162,405 183,405 L413,405 C434,405 456,69 477,69","M119,253 C145,253 171,417 197,417 L399,417 C425,417 451,69 477,69","M119,299 C150,299 180,429 211,429 L385,429 C416,429 446,69 477,69","M119,345 C153,345 191,441 225,441 L371,441 C405,441 443,69 477,69","M335,69 C369,69 443,69 477,69","M119,569 C138,569 156,569 175,569","M249,569 C268,569 286,569 305,569","M249,569 C268,569 286,615 305,615","M379,569 C386,569 394,685 401,685 L1083,685 C1090,685 1098,569 1105,569","M379,615 C398,615 418,569 437,569","M511,569 C530,569 548,569 567,569","M511,569 C530,569 548,615 567,615","M511,569 C530,569 548,661 567,661","M641,615 C660,615 680,569 699,569","M641,661 C648,661 656,697 663,697 L1069,697 C1081,697 1093,569 1105,569","M773,569 C792,569 810,569 829,569","M903,569 C922,569 940,569 959,569","M1033,569 C1057,569 1081,569 1105,569","M119,825 C138,825 158,825 177,825","M119,825 C138,825 158,871 177,871","M119,871 C126,871 134,895 141,895 L301,895 C308,895 316,825 323,825","M251,825 C258,825 266,907 273,907 L563,907 C570,907 578,825 585,825","M251,871 C275,871 299,825 323,825","M397,825 C416,825 434,825 453,825","M527,825 C546,825 566,825 585,825","M1179,569 C1145,569 8,569 8,535 L8,488 C8,488 8,488 42,488 L443,488 C477,488 443,69 477,69","M119,871 C85,871 8,871 8,837 L8,744 C8,744 8,744 42,744 L227,744 C261,744 227,69 261,69","M659,825 C625,825 22,825 22,791 L22,744 C22,744 22,744 56,744 L443,744 C477,744 443,69 477,69"]};
+
+const W = GEO.canvas[0], H = GEO.canvas[1];
+const frames = GEO.frames.map(f => ({ label: f.label, x: f.rect[0], y: f.rect[1], w: f.rect[2], h: f.rect[3] }));
+const chips  = GEO.chips.map(c => ({ t: c.t, f: c.f, x: c.rect[0], y: c.rect[1], w: c.rect[2], h: c.rect[3] }));
+const realPaths = GEO.paths;
+
+// 每框的列（distinct chip x）
+const colsOf = frames.map((_, i) => [...new Set(chips.filter(c => c.f === i).map(c => c.x))].sort((a, b) => a - b));
+// 框间带 y（相邻两框之间的空隙中线）
+const bandY = (a, b) => { const lo = frames[Math.min(a, b)], hi = frames[Math.max(a, b)]; return (lo.y + lo.h + hi.y) / 2; };
+
+// ── 几何工具 ───────────────────────────────────────────────────────────────
+const svgNS = "http://www.w3.org/2000/svg";
+function el(tag, attrs, parent) { const n = document.createElementNS(svgNS, tag); for (const k in attrs) n.setAttribute(k, attrs[k]); if (parent) parent.appendChild(n); return n; }
+function drawBase(svg) {
+  // 框间带底纹
+  for (let i = 0; i + 1 < frames.length; i++) { const lo = frames[i], hi = frames[i + 1]; el("rect", { class: "band", x: 0, y: lo.y + lo.h, width: W, height: hi.y - (lo.y + lo.h) }, svg); }
+  // 外缘底纹
+  el("rect", { class: "margin", x: 0, y: 0, width: 24, height: H }, svg);
+  frames.forEach((f, i) => { el("rect", { class: "frameBox", x: f.x, y: f.y, width: f.w, height: f.h }, svg); const t = el("text", { class: "frameTitle", x: f.x + 12, y: f.y + 16 }, svg); t.textContent = f.label; });
+  chips.forEach(c => { el("rect", { class: "chip", x: c.x, y: c.y, width: c.w, height: c.h }, svg); const t = el("text", { class: "chipLabel", x: c.x + c.w / 2, y: c.y + c.h / 2 }, svg); t.textContent = c.t; });
+}
+function roundPath(pts, r) {
+  pts = pts.filter((p, i, a) => i === 0 || Math.hypot(p[0] - a[i - 1][0], p[1] - a[i - 1][1]) > 0.6);
+  if (pts.length < 2) return "";
+  let d = `M${pts[0][0]},${pts[0][1]}`;
+  for (let i = 1; i < pts.length - 1; i++) {
+    const p0 = pts[i - 1], p1 = pts[i], p2 = pts[i + 1];
+    const v1 = [p1[0] - p0[0], p1[1] - p0[1]], v2 = [p2[0] - p1[0], p2[1] - p1[1]];
+    const l1 = Math.hypot(v1[0], v1[1]) || 1, l2 = Math.hypot(v2[0], v2[1]) || 1;
+    const rr = Math.min(r, l1 / 2, l2 / 2);
+    const a = [p1[0] - v1[0] / l1 * rr, p1[1] - v1[1] / l1 * rr];
+    const b = [p1[0] + v2[0] / l2 * rr, p1[1] + v2[1] / l2 * rr];
+    d += ` L${a[0]},${a[1]} Q${p1[0]},${p1[1]} ${b[0]},${b[1]}`;
+  }
+  const L = pts[pts.length - 1]; d += ` L${L[0]},${L[1]}`; return d;
+}
+// 源 chip 右侧的列通道；末列则退到框右内缘
+function exitChannel(s) {
+  const cols = colsOf[s.f], c = cols.indexOf(s.x);
+  if (c >= 0 && c + 1 < cols.length) return (s.x + s.w + cols[c + 1]) / 2;
+  return frames[s.f].x + frames[s.f].w - 11;
+}
+// 目标 chip 左侧的列通道；首列则退到框左内缘
+function entryChannel(t) {
+  const cols = colsOf[t.f], c = cols.indexOf(t.x);
+  if (c > 0) return (cols[c - 1] + 74 + t.x) / 2;
+  return frames[t.f].x + 11;
+}
+
+// ── 跨框边走线（走廊序列草稿：k=1 → 5 段；k≥2 → 2k+3 段）────────────────
+function routeCross(s, t, opts) {
+  const sf = s.f, tf = t.f, dir = tf < sf ? -1 : 1, k = Math.abs(tf - sf);
+  const sRight = s.x + s.w, sMid = s.y + s.h / 2, tLeft = t.x, tMid = t.y + t.h / 2;
+  const ex = exitChannel(s), en = entryChannel(t) - (opts.entryOff || 0);
+  const exitBand = bandY(sf, sf + dir);
+  const entryBand = bandY(tf - dir, tf);
+  const marginX = opts.marginX;
+  const ebandY = exitBand + opts.bandOffset, nbandY = entryBand + opts.bandOffset;
+  const pts = [[sRight, sMid], [ex, sMid], [ex, ebandY]];
+  if (k === 1) pts.push([en, ebandY]);
+  else { pts.push([marginX, ebandY], [marginX, nbandY], [en, nbandY]); }
+  pts.push([en, tMid], [tLeft, tMid]);
+  return { pts, k };
+}
+
+// ── 把真实 d 解析成端点（借 SVG 量）─────────────────────────────────────────
+const meas = el("path", {}, document.createElementNS(svgNS, "svg"));
+function endpoints(d) {
+  meas.setAttribute("d", d);
+  const L = meas.getTotalLength();
+  const a = meas.getPointAtLength(0), b = meas.getPointAtLength(L);
+  return [[a.x, a.y], [b.x, b.y]];
+}
+const nearestByRight = p => chips.map(c => ({ c, d: Math.hypot((c.x + c.w) - p[0], (c.y + c.h / 2) - p[1]) })).sort((x, y) => x.d - y.d)[0];
+const nearestByLeft  = p => chips.map(c => ({ c, d: Math.hypot(c.x - p[0], (c.y + c.h / 2) - p[1]) })).sort((x, y) => x.d - y.d)[0];
+
+const edges = realPaths.map((d, i) => {
+  const [a, b] = endpoints(d);
+  const s = nearestByRight(a).c, t = nearestByLeft(b).c;
+  return { i, d, s, t, cross: s.f !== t.f };
+});
+
+// ── 画两块 ─────────────────────────────────────────────────────────────────
+const svgNow = document.getElementById("svg-now"), svgNew = document.getElementById("svg-new");
+drawBase(svgNow); drawBase(svgNew);
+
+const crossEdges = edges.filter(e => e.cross);
+// 外缘/带 分道：回流（向上）用左外缘 8 / 22 两席
+const routed = crossEdges.map((e, idx) => {
+  const lane = idx % 2;
+  const r = routeCross(e.s, e.t, { marginX: 8 + lane * 14, bandOffset: lane * 12, entryOff: idx * 14 });
+  return { ...e, ...r };
+});
+
+edges.forEach(e => { if (!e.cross) { el("path", { class: "edge", d: e.d }, svgNow); el("path", { class: "edge", d: e.d }, svgNew); } });
+crossEdges.forEach(e => el("path", { class: "crossNow", d: e.d }, svgNow));
+routed.forEach(r => el("path", { class: "crossNew", d: roundPath(r.pts, 10) }, svgNew));
+
+// ── 两条机器计数（采样判据，非目测）────────────────────────────────────────
+function countPenetration(paths) {
+  const hitChips = new Set(); let hitPaths = 0;
+  paths.forEach(p => {
+    const L = p.getTotalLength(); const N = Math.max(80, Math.ceil(L / 3));
+    const inside = new Set();
+    for (let i = 0; i <= N; i++) { const q = p.getPointAtLength((L * i) / N);
+      for (const c of chips) if (q.x > c.x + 1.5 && q.x < c.x + c.w - 1.5 && q.y > c.y + 1.5 && q.y < c.y + c.h - 1.5) inside.add(c.t); }
+    if (inside.size) { hitPaths++; inside.forEach(x => hitChips.add(x)); }
+  });
+  return { hitPaths, hitChips: hitChips.size, list: [...hitChips] };
+}
+function countOverlap(paths) {
+  const pts = paths.map(p => { const L = p.getTotalLength(); const N = Math.max(60, Math.ceil(L / 3)); const a = []; for (let i = 0; i <= N; i++) a.push(p.getPointAtLength((L * i) / N)); return a; });
+  const EX = 24; let pairs = 0; const detail = [];
+  for (let a = 0; a < pts.length; a++) for (let b = a + 1; b < pts.length; b++) {
+    const A = pts[a], B = pts[b]; let run = 0, maxRun = 0;
+    for (let i = 0; i < A.length; i++) {
+      const pa = A[i], endA = (i < EX / 3 || i > A.length - 1 - EX / 3);
+      let near = false;
+      for (let j = 0; j < B.length; j++) { const pb = B[j], endB = (j < EX / 3 || j > B.length - 1 - EX / 3);
+        if (Math.abs(pb.x - pa.x) < 1.2 && Math.abs(pb.y - pa.y) < 1.2 && !(endA && endB)) { near = true; break; } }
+      if (near) { run++; if (run > maxRun) maxRun = run; } else run = 0;
+    }
+    if (maxRun >= 6) { pairs++; detail.push([a, b, maxRun]); }
+  }
+  return { pairs, detail: detail.sort((x, y) => y[2] - x[2]).slice(0, 8) };
+}
+function forCounts(svg) { return Array.from(svg.querySelectorAll("path")).filter(p => p.getAttribute("d")); }
+const pn = countPenetration(forCounts(svgNow)), pn2 = countPenetration(forCounts(svgNew));
+const ov = countOverlap(forCounts(svgNow)), ov2 = countOverlap(forCounts(svgNew));
+
+document.getElementById("cnt-now").innerHTML =
+  `<span>穿节点：<b class="bad">${pn.hitPaths}</b> 条边 / <b class="bad">${pn.hitChips}</b> 枚 chip</span>` +
+  `<span>叠线：<b class="bad">${ov.pairs}</b> 对路径</span>` +
+  `<span style="color:var(--muted)">（命中 chip：${pn.list.join(" ") || "—"}）</span>`;
+document.getElementById("cnt-new").innerHTML =
+  `<span>穿节点：<b class="good">${pn2.hitPaths}</b> 条边 / <b class="good">${pn2.hitChips}</b> 枚 chip</span>` +
+  `<span>叠线：<b class="good">${ov2.pairs}</b> 对路径</span>` +
+  `<span style="color:var(--muted)">（含合法共端点豁免 24px）</span>`;
+
+document.getElementById("diag").innerHTML =
+  `<b>诊断（不参与定形投票）</b>：跨框边 ${crossEdges.length} 条 —— ` +
+  routed.map(r => `${r.s.t}→${r.t.t}（k=${r.k} ⇒ ${r.k === 1 ? 5 : 2 * r.k + 3} 段）`).join(" · ") +
+  `。走廊标签：CH=列间通道 · BD=框间带 · ML=左外缘。<br>现存叠线明细（对 / 最长共段采样数）：` +
+  (ov.detail.map(x => `${x[0]}-${x[1]}(${x[2]})`).join(" ") || "—") +
+  `　｜　修复后残留叠线：` + (ov2.detail.map(x => `${x[0]}-${x[1]}(${x[2]})`).join(" ") || "—") +
+  `（草稿级未含 A5 容量不等式，残留属预期）。`;
+</script>
+</body>
+</html>
