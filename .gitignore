@@ -29,6 +29,8 @@ board/config/config.json.bak-*
 /planlog.md.template
 /doc/
 /.omo/skills/
+# 文档镜像（原 = /doc/ 的入库镜像，充当仓库文档通道）；2026-10-16 用户裁定「也不上传」⇒ 本机保留、不入索引
+/instruction-doc/
 
 # ZCode 工作区配置（本机：编排宿主路径守卫 hook）
 /.zcode/
