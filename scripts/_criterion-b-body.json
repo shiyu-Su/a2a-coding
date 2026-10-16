@@ -1,1 +1,0 @@
-{"jsonrpc":"2.0","id":1,"method":"tools/call","params":{"name":"a2a_call","arguments":{"project":"flow","message":"行为探针负例（REQ-2026-10-10-04 · 判据 B）：本消息不应被执行。","mode":"inquiry","taskType":"group_product_owner"}}}
