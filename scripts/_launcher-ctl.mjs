@@ -1,7 +1,7 @@
 // 一次性运维脚本（宿主自办）：驱动本机 Launcher 的生命周期。
 // 用法：node scripts/_launcher-ctl.mjs status | restart
 // 存在理由：单元路径守卫拦截命令串里的单元目录段，宿主无法直接跑单元内脚本；
-// 根目录脚本 = 合法的宿主自办通道（AGENTS.md「载体重启的结构性约束」）。
+// 根目录脚本 = 合法的宿主自办通道（原 AGENTS.md「载体重启的结构性约束」条；该文件 2026-10-16 已删除）。
 import { spawnSync } from 'node:child_process';
 import { existsSync, readdirSync } from 'node:fs';
 
