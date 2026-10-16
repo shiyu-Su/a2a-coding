@@ -673,7 +673,7 @@ test("L-2（属性恰 1 处 · SSR 面）详情页 data-live-lock 恰 1 枚且�
 // ---------------------------------------------------------------------------
 
 /** 渲染面取数：三 project 链（两枚跨框边）+ 同框一枚边 ⇒ 框内与跨框 path 各有载体。 */
-function graphHtmlForCrossFace() {
+async function graphHtmlForCrossFace() {
   const t = (taskId, projectId, dependencies, createdAt) => ({
     taskId,
     projectId,
@@ -692,15 +692,15 @@ function graphHtmlForCrossFace() {
     claimedBy: null,
     taskType: null,
   });
-  return renderDependencyGraphSection([
+  return (await renderDependencyGraphSection([
     t("s1", "src", [], "2026-10-12T00:00:01Z"),
     t("s2", "src", ["s1"], "2026-10-12T00:00:02Z"),
     t("o1", "orch", ["s2"], "2026-10-12T00:00:03Z"),
     t("f1", "flow", ["o1"], "2026-10-12T00:00:04Z"),
-  ]).html;
+  ])).html;
 }
 
-test("D-③（v0.10.6 跨面字面钉）第八枚体内零 .dg-canvas / 零 .dg-frame · not(.pipe) 两处字面逐字不变 · 全部 path 只带 class 与 d（禁 data-*）", () => {
+test("D-③（v0.10.6 跨面字面钉）第八枚体内零 .dg-canvas / 零 .dg-frame · not(.pipe) 两处字面逐字不变 · 全部 path 只带 class 与 d（禁 data-*）", async () => {
   // ① 豁免类闭集不随新类名扩集：免手刷那枚脚本体不认识依赖图的新容器类
   assert.equal(PAGE_LIVE_SCRIPT.includes(".dg-canvas"), false, "第八枚体内不得出现 .dg-canvas（跳拍判据不认新类）");
   assert.equal(PAGE_LIVE_SCRIPT.includes(".dg-frame"), false, "第八枚体内不得出现 .dg-frame（该类本卡不引入 ⇒ 更不得进判据）");
@@ -721,12 +721,12 @@ test("D-③（v0.10.6 跨面字面钉）第八枚体内零 .dg-canvas / 零 .dg-
     "该谓词在本枚恰 2 处 ⇒ 豁免类闭集仍是单元素 .pipe（框默认 open 不自冻）；扩集或回退裸形一律判红",
   );
   // ③ path 属性闭集：折叠留悬空线是已裁代价（§2.5-5.2），唯一救法是给 path 标 data-* ⇒ 必须钉死为不可
-  const paths = graphHtmlForCrossFace().match(/<path[^>]*>/g) ?? [];
+  const paths = (await graphHtmlForCrossFace()).match(/<path[^>]*>/g) ?? [];
   assert.ok(paths.length >= 2, `空转守卫：确有 >=2 枚 path（实得 ${String(paths.length)} 枚 ⇒ 取数落空即本钉空转）`);
   for (const p of paths) {
     assert.match(p, EDGE_PATH_TAG_EXACT_RE, `path 只带 class 与 d 两枚属性：${p}`);
   }
-  assert.equal(/<path[^>]*\sdata-/.test(graphHtmlForCrossFace()), false, "零 data-* 第五枚属性（G8-svg负钉② 的四元闭集不因本卡破）");
+  assert.equal(/<path[^>]*\sdata-/.test(await graphHtmlForCrossFace()), false, "零 data-* 第五枚属性（G8-svg负钉② 的四元闭集不因本卡破）");
 });
 
 // ---------------------------------------------------------------------------

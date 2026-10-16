@@ -157,7 +157,7 @@ test("剥壳-⑥ 端到端 6 任务样本 ⇒ 「要点」列 = 剥壳标签 / �
   ];
   const html = renderDetail(tasks);
 
-  assert.equal((html.slice(html.indexOf("<thead>"), html.indexOf("</thead>")).match(/<th>/g) ?? []).length, 12);
+  assert.equal((html.slice(html.indexOf("<thead>"), html.indexOf("</thead>")).match(/<th>/g) ?? []).length, 11);
   assert.equal(cellText(rowCells(html, "task-01")[5]), "执行明细单表与剥壳", "命中壳 ⇒ 要点 = 节点标签（工单验收判据）");
   assert.equal(cellText(rowCells(html, "task-03")[5]), "只读核实");
   assert.equal(cellText(rowCells(html, "task-04")[5]), "用户测试", "Step 后段位数为变项 ⇒ Step 3 同样命中");

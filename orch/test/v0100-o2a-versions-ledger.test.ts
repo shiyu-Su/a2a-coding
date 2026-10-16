@@ -7,8 +7,9 @@
  *    建起 ⇒ 依赖它们的 O4/O5/O7 读口自动激活；快照表**无 status / 无 updated_at**（不可变的 schema 表达）；
  * 2. **建版判据**（O2a）：shape 不过 ⇒ 400 · `released` 不可建 ⇒ 400 · 重复 ⇒ **409 且不产生第二行**
  *    （幂等：PK 含可空列 ⇒ 判重走 get-then-insert，`NULL` 档不得被唯一约束漏掉）；
- * 3. **删版判据**（O2a）：未知 ⇒ 404 · `released` ⇒ 409（发版事实不可撤销）· 名下有未收口卡 ⇒ 409
- *    （`failed` **不算收口**）· 成功 ⇒ 只删台账行、**不碰快照**；
+ * 3. **删版判据**（O2a · v0.10.7 n2 重写）：未知 ⇒ 404 · 白名单外（`released` / 脏值 / 无行）⇒ 409 / 404
+ *    · **名下存在挡删卡 ⇒ 409**（挡删集 = `completed` ∪ 「未收口 ∧ 非可回池档」；`failed` 不算收口）
+ *    · 放行 ⇒ 同事务清卡 + 只删台账行、**不碰快照**；
  * 4. **归属分档**：`(owner_group, version)` 是键 ⇒ 同名版号在各组独立（建 / 删 / 计数互不串味）；
  * 5. **HTTP 面**（O2a）：8787 委托路由 —— 统一信封 `{ok, error:{code,message}}`、`201` / `204`、
  *    方法门 ⇒ 405、**O2c 的 `…/status` 不认领 ⇒ 404**（不预占别人路由）、follower ⇒ 写路 503 而读路放行；
@@ -44,7 +45,7 @@ import {
   versionsLedgerMigrationDone,
 } from "../session/store.js";
 import type { VersionLedgerWriteResult } from "../session/store.js";
-import type { FeatureState } from "../types.js";
+import type { FeatureApproval, FeatureStage, FeatureState } from "../types.js";
 import { startHttpTransport } from "../bridge/transports/http.js";
 import type { HttpTransportHandle } from "../bridge/transports/http.js";
 import {
@@ -226,6 +227,13 @@ function seedCard(
     ownerGroup: string | null;
     version: string;
     state?: FeatureState;
+    /**
+     * v0.10.7 n5：删版分档读的是这两枚登记字段（可回池档 = `需求分析 ∧ 未发起`）。
+     * 不传 ⇒ 落 NULL ⇒ 读侧归一 `改造方案` / `待审批` ⇒ **不在**可回池档（fail-closed）。
+     * 需要「未过门①」形态的锚显式传两枚。
+     */
+    stage?: FeatureStage;
+    approval?: FeatureApproval;
     createdAt?: string;
   },
 ): void {
@@ -234,6 +242,8 @@ function seedCard(
     title: `卡 ${input.featureId}`,
     ownerGroup: input.ownerGroup,
     version: input.version,
+    ...(input.stage === undefined ? {} : { stage: input.stage }),
+    ...(input.approval === undefined ? {} : { approval: input.approval }),
     ...(input.createdAt === undefined ? {} : { createdAt: input.createdAt, updatedAt: input.createdAt }),
   });
   if (input.state !== undefined) store.updateFeatureState(input.featureId, input.state);
@@ -376,12 +386,26 @@ test("O2a 删版：未知 404 · released 409 · 未收口卡 409（failed 不�
     assert.equal(store.versionLedgerGet("g1", "5.0.0")?.status, "released", "被挡 ⇒ 行仍在");
 
     mustOk(store.versionLedgerCreate({ ownerGroup: "g1", version: "6.0.0" }));
-    seedCard(store, { featureId: "f-open", ownerGroup: "g1", version: "6.0.0", state: "executing" });
+    seedCard(store, {
+      featureId: "f-open",
+      ownerGroup: "g1",
+      version: "6.0.0",
+      state: "executing",
+      stage: "改造方案",
+      approval: "待审批",
+    });
     assert.equal(
       mustFail(store.versionLedgerDelete("g1", "6.0.0")).code,
       ERR_VERSION_OPEN_CARDS,
     );
-    seedCard(store, { featureId: "f-failed", ownerGroup: "g1", version: "6.0.0", state: "failed" });
+    seedCard(store, {
+      featureId: "f-failed",
+      ownerGroup: "g1",
+      version: "6.0.0",
+      state: "failed",
+      stage: "改造方案",
+      approval: "待审批",
+    });
     assert.equal(
       mustFail(store.versionLedgerDelete("g1", "6.0.0")).code,
       ERR_VERSION_OPEN_CARDS,
@@ -389,6 +413,24 @@ test("O2a 删版：未知 404 · released 409 · 未收口卡 409（failed 不�
     );
     store.updateFeatureState("f-open", "completed");
     store.updateFeatureState("f-failed", "cancelled");
+    // v0.10.7 n5 翻案点：`completed` 入挡删集（§7「版本删除纪律」判据 2 明示）⇒ 原「全部收口
+    // ⇒ 放行」在新判据下不再成立。成功路径改由「甲档 cancelled 清卡」承载；completed 卡须先撤出
+    // 该版（清 version = 既有撤排期语义），故此处多一步。
+    // v0.10.7 n8 补极性：上面那句「不再成立」此前只落在注释、没落断言 ⇒ 这里把它翻成**拒删**锚。
+    // 混合集（`completed` 挡 + 甲档 `cancelled` 不挡）⇒ 结果仍是拒删；拒因必须**分档点名** completed
+    // 卡（只断「失败」不断档 = 没锁住 B-3）。
+    const settled = mustFail(store.versionLedgerDelete("g1", "6.0.0"));
+    assert.equal(settled.code, ERR_VERSION_OPEN_CARDS, "completed 卡挡删（B-3）");
+    assert.equal(settled.status, 409);
+    assert.match(
+      settled.message,
+      /completed\[1\]=\[f-open\]（已交付，清 version 会断交付账）/,
+      "拒因须点名 completed 档与其卡 id",
+    );
+    assert.match(settled.message, /未收口且不可回池\[0\]=\[\]/, "甲档 cancelled 不入挡删集");
+    assert.notEqual(store.versionLedgerGet("g1", "6.0.0"), null, "拒删 ⇒ 零写入（台账行仍在）");
+    assert.equal(store.getFeature("f-open")?.version, "6.0.0", "拒删 ⇒ 不清卡");
+    store.updateFeatureRegistration("f-open", { version: "" });
     mustOk(store.versionLedgerDelete("g1", "6.0.0"));
     assert.equal(store.versionLedgerGet("g1", "6.0.0"), null);
 
@@ -537,7 +579,14 @@ test("O2a HTTP 入参判据：released 400 · 缺 version 400 · 类型错 400 �
 
   // 端点与 store 同进程同实例 ⇒ 经默认存储面建卡制造「未收口」
   await request(port, "POST", VERSIONS_COLLECTION_PATH, { ownerGroup: "g1", version: "3.0.0" });
-  createFeature({ featureId: "f-http-open", title: "在飞", ownerGroup: "g1", version: "3.0.0" });
+  createFeature({
+    featureId: "f-http-open",
+    title: "在飞",
+    ownerGroup: "g1",
+    version: "3.0.0",
+    stage: "改造方案",
+    approval: "待审批",
+  });
   const blocked = await request(port, "DELETE", `${VERSIONS_COLLECTION_PATH}/3.0.0?owner_group=g1`);
   assert.equal(blocked.status, 409);
   assertFailureEnvelope(blocked, ERR_VERSION_OPEN_CARDS);

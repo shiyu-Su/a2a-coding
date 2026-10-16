@@ -2,6 +2,39 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.10.7] - 2026-10-16
+
+> 主题：**版本删除（板 `×` 入口换源 + 删版放行判据 + 激活时点前移门① + 文档落 `doc/pool/`）**，附：执行明细去「排队时长」列、依赖图绘制重构（改用 ELK 原生布局）。主需求 `102c0102`（22 节点）· `0f4f4655`（5 节点）· `f55d46af`（依赖图绘制重构主轨，`cancelled` 归档 ⇒ 交付由承接轨 `c1cd26a1`〔13 节点〕+ 增补 `15474705`〔2 节点〕承担）；`2bbc0f0f` / `51ff9983` 两条池卡 `cancelled`（零交付）。**触达面 = board / orch / flow 三侧同列车**（machine 零触达、不抬号）；**停同升分组第八次实操**：board `0.12.1 → 0.13.0` · orch `0.11.0 → 0.12.0` · flow 四戳 `v0.10.5 → v0.10.7`；**协议 2.3 不动**（本列车无协议对端变更）。根回归见 reports/v0.10.7/。tag `board/v0.13.0` + `orch/v0.12.0` + `flow/v0.10.7` + 组列车 tag `v0.10.7`。
+
+### Added
+
+- **版本删除纪律**（`flow/spec/需求流程.md` §7 新增条）——Group Version 的删除 = **引擎版本台账行的删除**与**名下卡 `version` 清空**的**同一事务**（分步即幽灵版号链）。放行判据三条：① 台账行存在 ∧ `status ∈ {未开始, 进行中}`（表未就绪 / 无行 / 非法值 ⇒ 拒，**只紧不松**）；② 名下**每一张卡**属**甲档**（`state = cancelled`）或**乙档**（**未收口 ∧ `stage = 需求分析` ∧ `approval = 未发起`**）；③ **不查归属行**（归属记录不随删版删除、不回写，成为只读历史引用）。**`completed` 卡挡删**为明示判据（清其 `version` 会使已交付卡落入无清单读面档、交付账断链）。
+- **`doc/pool/` 未排期停靠落点**（`flow/spec/需求流程.md` §4）——池内卡两档文档落 `doc/pool/{topic}-…md`；`doc/pool/` 是唯一非版本目录；卡片开始 Step 0 即写入，排期 ⇒ `mv` 至 `doc/{新版本}/`，撤排期回池 / 所属版本被删 ⇒ `mv` 回 `doc/pool/`。
+- **板文档口改按「登记里该文档的末条路径」解析目录** —— 新增纯函数 `resolveDocDirFromRegistrations(decisions, file)`（**复用**既有 `extractRegisteredDocPath` 单点，不新写第二处路径正则），未命中回落 `feature.version`；`doc/pool/` 进**独立**允许集 `isAllowedDocDirSegment`（`DOC_VERSION_PATTERN` 逐字不动，守住与改版善后判据的分立）。
+- **板排期页 `×` 删除入口与引擎判据同构** —— `status ∈ {notstart, active}` ∧ 名下每张卡满足 `state === "cancelled" ∨ deriveScheduleGateOpen(stage, approval)`；判据**直接调用**单点函数、不在视图层复制字面量。
+- **门① 成为 `notstart → active` 的激活触发点**（该版本名下首卡过需求确认门时内部幂等触发）；`approve` 放行与首个 DAG 节点派发保留为**幂等兜底**。`version.activated` 事件扩键 `trigger ∈ {gate1|approve|dispatch}`。
+- **`version.ledger_deleted` 事件扩键** `returnedToPool`（仅计可回池档）+ `cleared[]`（逐卡 `cardClass: "pool"|"cancelled"`）。
+- **依赖图改用 ELK 原生布局**（新模块 `board/src/graph-elk.ts`，运行时依赖 `elkjs ^0.12.0`）——手写走线几何栈整族退休；容器形状 / 排布 / 顺序交 ELK。
+
+### Changed
+
+- 根列车号 `v0.10.6 → v0.10.7`；**board Project Version `0.12.1 → 0.13.0`** · **orch `0.11.0 → 0.12.0`** · **flow 四戳 `v0.10.5 → v0.10.7`**（flow 无 `package.json`，载体 = 规范版本戳）；**machine 保持 `0.10.2`**（本列车零触达）；**协议保持 2.3**。
+- 板「执行明细」单表 **12 → 11 列**（删恒 `0s` 的「排队时长」列；`TRACE_READ_NOTE` 去该列指称）。
+- 依赖图布局改横向平铺后的折点数：`eb86d5e8` **100 → 38**、`f55d46af` **28 → 4**。
+- 板载体更新（`npm run build` + `boardctl restart`，pid **68488**，`/health` = `0.13.0`）；orch 桥载体更新（`/health` = `0.12.0`）；flow 无进程载体、靠四戳随版。
+
+### Fixed
+
+- **板上删不掉任何版本**（症状活过 8 个版本）——`×` 的可见性判据查了一份**已退役的事实源**：`views.ts` 用 `findVersionRecord(ledger, …)` 判「台账有无该版」，而 `ledger` 取自板本地 `.data/versions.json`（已冻结：10 条、最大 `v0.9.8`）⇒ 对 v0.10.0 之后创建的**每一个**版本都不渲染（**v0.10.0 B2「写面下沉」漏换的最后一个消费点**）。修法 = 页级 `ledger` 改「**引擎投影优先、仅在从未读到过投影时退本地读缓存**」，并另开「**可删版号集合**」通路（两条数据通路分家，显示面照旧）。**真机凭据**：排期页 `class="inline vdel"` **由 0 变 2**（恰两个零卡未开始版本 `v0.10.8` / `v0.11.0`）。
+- **依赖图折点过多 / 连线穿节点 / 交叉**——折点多之根因 = `graph-elk.ts` 的 `direction = DOWN` 与「右出 / 左进」端口约束**互相矛盾**（非 ELK 算法问题）；改 `direction = RIGHT` 实测 `f55d46af` **28 → 4** 折、`eb86d5e8` **100 → 38** 折。
+- **桥不可达时排期页无原因说明**——整页无 `×`（fail-closed 正确一侧）之外，页头补一行原因短条。
+
+### Notes
+
+- **根回归补齐「四戳同值」机器锚**：§7 第 4 款要求 flow 四戳每版齐翻，此前回归只锚住四枚中的 1 枚（`文档模板.md`）⇒ 本版起四枚一并断言（见 `tests/test-v0.10.7-version-delete.js`）。发版门实测：**根回归 1423/1423 全绿**（首跑 1 红 = `orch 版本三处自洽`〔单元侧载体升级漏对齐 `package-lock` 两处版本镜像〕，发版轮补对齐后全绿）。
+- **同版串行纪律**下本列车三条需求顺序推进（`0f4f4655` 收口后 `102c0102` 才过门②）；依赖图重构走「主轨 `cancel` 归档 + 承接轨接管」形态（带 `failed` 节点的主轨结构上到不了 `completed` ⇒ 已登记为流程观察，属后续引擎形态议题）。
+- 单元自测：board 全量 `npm test` **1688/1688**；orch `npm test` 全绿（含新增 `v0107-*` 三份锚）；flow 无代码 ⇒ 走 spec 一致性自检。
+
 ## [v0.10.6] - 2026-10-15
 
 > 主题：**依赖图读面重构（合并为单画布 + 管道框，真连线替代 `⇠#k` 角标 + 走线分道 + 编号稳定）**。主需求 `4bb23554`（15 节点）+ 增补 `a0682281`（连线两端接点错位 + 框宽溢出无横滚，final）+ 承接轨 `65766f95`（跨框边走线穿节点与线重叠修复 + 跨管道连线单独配色 + 连线接点硬约束，final；经 `435b8695`〔cancelled / 交付转承〕→ `e4e18e6f`〔cancelled〕→ `d401b379`〔cancelled〕→ `65766f95` 交接收尾〕）+ `9b51af16`（依赖图编号漂移改为登记序）+ `c53c09fd`（排期页拖拽落点修复）。**触达面 = board 单侧**（orch / machine 本列车零触达、不抬号；flow 零触达、四戳不翻）；**停同升分组第七次实操**：board `0.11.0 → 0.12.1`（Project Version 既有 open 版继承，不新建）。根回归见 reports/v0.10.6/。tag `board/v0.12.1` + 根 `v0.10.6`。

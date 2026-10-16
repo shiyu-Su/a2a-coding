@@ -1,6 +1,6 @@
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { mkdtempSync, mkdirSync, rmSync, writeFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 
@@ -145,38 +145,59 @@ function okEnvelope(payload) {
 }
 
 // ---------------------------------------------------------------------------
-// M6 改版失联警示（HTTP 面）：排期表单 GET 页 = 需求详情页；decisions 有旧版文档登记 ⇒ 警示行
+// M6 失联警示（HTTP 面）：排期表单 GET 页 = 需求详情页；
+// 判据自 REQ-2026-10-15-05 N6 起 = **登记路径在盘上是否存在**（不再看版本差异）
 // ---------------------------------------------------------------------------
 
-test("M6 GET /features/F1：decisions 登记旧版文档且已改版 ⇒ 失联警示行可见；无登记 ⇒ 无警示行", async () => {
+test("M6 GET /features/F1：登记的文档盘上缺失 ⇒ 失联警示行可见；盘上有 ⇒ 不警示且打得开；无登记 ⇒ 无警示", async () => {
+  const disk = mkdtempSync(join(tmpdir(), "board-m6-face-"));
+  const docs = { docs: { repoRoot: disk, orgsDir: null } };
   const staleClient = fakeClient({
     version: "v0.9.2",
     decisions: JSON.stringify(["doc/v0.9.1/甲-改造文档.md 用户确认"]),
   });
-  await withServer(
-    async (base) => {
-      const text = await (await fetch(`${base}/features/F1`)).text();
-      assert.match(text, /action="\/features\/F1\/schedule"/, "排期表单 GET 面 = 详情页");
-      assert.match(text, /name="version" value="v0\.9\.2"/, "当前版本回填");
-      assert.match(text, /文档读锚将随版本切换/, "警示行可见");
-      assert.match(text, /v0\.9\.1/, "点名失联的旧版本");
-      assert.match(text, /不搬文档目录/);
-    },
-    {},
-    staleClient.client,
-  );
-  const cleanClient = fakeClient({
-    version: "v0.9.2",
-    decisions: JSON.stringify(["doc/v0.9.2/甲-改造文档.md"]),
-  });
-  await withServer(
-    async (base) => {
-      const text = await (await fetch(`${base}/features/F1`)).text();
-      assert.doesNotMatch(text, /文档读锚将随版本切换/, "登记版本 == 当前版本 ⇒ 不警示");
-    },
-    {},
-    cleanClient.client,
-  );
+  try {
+    // 档一：登记路径 doc/v0.9.1/甲-改造文档.md 在盘上没有 ⇒ 点名失联
+    await withServer(
+      async (base) => {
+        const text = await (await fetch(`${base}/features/F1`)).text();
+        assert.match(text, /action="\/features\/F1\/schedule"/, "排期表单 GET 面 = 详情页");
+        assert.match(text, /name="version" value="v0\.9\.2"/, "当前版本回填");
+        assert.match(text, /在盘上未找到/, "警示行可见（判据 = 盘上存在性）");
+        assert.match(text, /甲-改造文档\.md/, "点名失联的那份文档");
+        assert.match(text, /读锚按登记路径定位/);
+        assert.doesNotMatch(text, /将随版本切换/, "旧「版本切换 ⇒ 打不开」文案已退场");
+      },
+      docs,
+      staleClient.client,
+    );
+    // 档二：同一条登记、盘上有该文件 ⇒ 不警示 + 点开可读（改版不搬文档 = 正常形态）
+    mkdirSync(join(disk, "doc", "v0.9.1"), { recursive: true });
+    writeFileSync(join(disk, "doc", "v0.9.1", "甲-改造文档.md"), "# 旧版本档\n", "utf8");
+    await withServer(
+      async (base) => {
+        const text = await (await fetch(`${base}/features/F1`)).text();
+        assert.doesNotMatch(text, /在盘上未找到/, "盘上有这份登记文档 ⇒ 不警示（登记版本 ≠ 当前版本不再等价失联）");
+        const doc = await fetch(`${base}/features/F1/docs?file=${encodeURIComponent("甲-改造文档.md")}`);
+        assert.equal(doc.status, 200, "读锚按登记路径 ⇒ 旧版本目录里的这份文档打得开");
+        assert.equal(await doc.text(), "# 旧版本档\n");
+      },
+      docs,
+      staleClient.client,
+    );
+    // 档三：无任何文档登记 ⇒ 无警示行
+    const blankClient = fakeClient({ version: "v0.9.2", decisions: null });
+    await withServer(
+      async (base) => {
+        const text = await (await fetch(`${base}/features/F1`)).text();
+        assert.doesNotMatch(text, /在盘上未找到/, "无登记 ⇒ 无可失联项");
+      },
+      docs,
+      blankClient.client,
+    );
+  } finally {
+    rmSync(disk, { recursive: true, force: true });
+  }
 });
 
 // ---------------------------------------------------------------------------

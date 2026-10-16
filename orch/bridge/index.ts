@@ -1360,9 +1360,10 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
     return { ok: false, error: `任务 ${node.taskId} 无 Feature 归属` };
   }
   const feature = getFeature(featureId);
-  // v0.10.0 O2c：首个节点派发 = 版本「notstart → active」自动转换的触发点之一
-  // （引擎内部 · 幂等 · 节流 · 不阻断；`approve` 为另一触发点）。无 Feature / 无版号 ⇒ no-op。
-  if (feature !== null) activateVersionForFeature(feature);
+  // v0.10.0 O2c：首个节点派发 = 版本「notstart → active」的触发点之一；v0.10.7 n3 起该点**前移门①**，
+  // 本格降级为**幂等兜底**（`trigger = "dispatch"`）。
+  // （引擎内部 · 幂等 · 节流 · 不阻断；`approve` 为另一兜底触发点）。无 Feature / 无版号 ⇒ no-op。
+  if (feature !== null) activateVersionForFeature(feature, "dispatch");
   const message = buildNodeDispatchMessage(node, feature);
   // v0.8.9 O2：渲染结果只写 `dispatchRendered`（本轮下发快照，Runner 领取即用）；
   // `dispatchMessage` 原样回写 = 未渲染 base 保持不变（防「反复派发 ⇒ 外壳叠加」）

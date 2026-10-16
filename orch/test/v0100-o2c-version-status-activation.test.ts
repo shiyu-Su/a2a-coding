@@ -361,17 +361,17 @@ test("O2c 护栏·节流：同键窗口内至多一次；窗口过后放行", ()
     now: () => nowMs,
   });
 
-  assert.equal(activator.activate("g1", "1.0.0").throttled, false);
-  const second = activator.activate("g1", "1.0.0");
+  assert.equal(activator.activate("g1", "1.0.0", "dispatch").throttled, false);
+  const second = activator.activate("g1", "1.0.0", "dispatch");
   assert.equal(second.throttled, true, "窗口内第二次应节流");
   assert.equal(calls, 1, "节流跳过者不得触达写口");
 
   nowMs += 5_001;
-  assert.equal(activator.activate("g1", "1.0.0").throttled, false);
+  assert.equal(activator.activate("g1", "1.0.0", "dispatch").throttled, false);
   assert.equal(calls, 2, "窗口过后放行");
 
   // 不同键互不影响
-  assert.equal(activator.activate("g2", "1.0.0").throttled, false);
+  assert.equal(activator.activate("g2", "1.0.0", "dispatch").throttled, false);
   assert.equal(calls, 3);
 });
 
@@ -385,7 +385,7 @@ test("O2c 护栏·不阻断：写口抛错时触发不抛出，返回 activated=
     throttleMs: 0,
   });
   // 写口抛错 ⇒ 护栏吞掉并返回（若抛则本行整体失败 ⇒ 即「不阻断」反证）
-  const outcome = activator.activate("g1", "1.0.0");
+  const outcome = activator.activate("g1", "1.0.0", "dispatch");
   assert.equal(outcome.activated, false);
   assert.equal(outcome.throttled, false);
 });
@@ -403,8 +403,8 @@ test("O2c 护栏·命中即解除节流：激活成功后重复触发走写口�
     },
     throttleMs: 60_000,
   });
-  assert.equal(activator.activate("g1", "1.0.0").activated, true);
-  const again = activator.activate("g1", "1.0.0");
+  assert.equal(activator.activate("g1", "1.0.0", "dispatch").activated, true);
+  const again = activator.activate("g1", "1.0.0", "dispatch");
   assert.equal(again.throttled, false, "命中后解除节流 ⇒ 第二次仍触达写口（幂等 no-op）");
   assert.equal(calls, 2);
 });

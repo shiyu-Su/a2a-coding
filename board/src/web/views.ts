@@ -184,7 +184,8 @@ export function extractDocPath(text: string): { version: string; file: string } 
 
 /**
  * 从 decisions 文本提取**本需求登记**的文档路径，仅认 `doc/…/*.md` 形态：
- * `doc/{version}/{file}.md` ⇒ 两段；`doc/{file}.md` ⇒ version 段为空（打开仍按当前版本定位）。
+ * `doc/{version}/{file}.md` ⇒ 两段（目录段可以是版号或 `pool`）；`doc/{file}.md` ⇒ 目录段为空
+ * （该条不构成读锚 ⇒ {@link resolveDocDirFromRegistrations} 无命中、打开回落 `feature.version`）。
  * 裸 `{version}/x.md`（无 `doc/` 前缀）不算登记产出。
  */
 export function extractRegisteredDocPath(text: string): { version: string; file: string } | null {
@@ -198,8 +199,9 @@ export function extractRegisteredDocPath(text: string): { version: string; file:
 }
 
 /**
- * 单文档打开链接（src 缺省 = 源 A 主仓根）。**版本不进链接** —— 服务端从桥侧详情取，
- * 不接受调用方传版本（否则等于把白名单交给请求方）。
+ * 单文档打开链接（src 缺省 = 源 A 主仓根）。**目录段不进链接**（N5：链接只带 `file`，
+ * 读锚目录段由服务端从本需求 `decisions` 解析、未命中回落 `feature.version`）——
+ * 版本也不进链接，一律不接受调用方传（否则等于把白名单交给请求方）。
  */
 function docHref(featureId: string, file: string, src: DocsSource | null): string {
   const qs = new URLSearchParams({ file });
@@ -230,16 +232,46 @@ export function parseDecisionItems(decisions: string | null | undefined): string
 }
 
 /**
- * decisions 登记里的文档版本集合（保序去重）：只收 `extractRegisteredDocPath` 命中且 version 段非空的条目。
- * 改版失联警示的判据源（不校验白名单 —— 不合白名单的登记本来就打不开，警示口径与其一致）。
+ * 「阶段产出」登记文档的**读锚引用**（REQ-2026-10-15-05 N5 · 改造文档 §2.2 N5）：
+ * 一条登记文档 = 文件名段 + 该 `file` 的**末条登记**所带的目录段（`dir === null` ⇒ 该 file 的
+ * 登记里没有一条带目录段，读锚由调用方回落 `feature.version`）。
+ *
+ * 本清单是登记路径解析的**单点**（只经 {@link extractRegisteredDocPath}，不另存第二处正则）：
+ * 读端点（`resolveDocDirFromRegistrations`）与失联警示（`missingRegisteredDecisionDocFiles`）
+ * 都从这里取数，二者不会各算一份目录段。序 = 各 file **首次出现**序；`decisions` 读出序 =
+ * 登记序（引擎对 `decisions` 是整值替换、不重排）。
  */
-export function registeredDecisionDocVersions(decisions: string | null | undefined): string[] {
-  const seen = new Set<string>();
+export interface RegisteredDocRef {
+  readonly file: string;
+  readonly dir: string | null;
+}
+
+export function registeredDecisionDocRefs(decisions: string | null | undefined): RegisteredDocRef[] {
+  const order: string[] = [];
+  const dirByFile = new Map<string, string | null>();
   for (const item of parseDecisionItems(decisions)) {
     const hit = extractRegisteredDocPath(item);
-    if (hit !== null && hit.version !== "") seen.add(hit.version);
+    if (hit === null || hit.file === "") continue;
+    if (!dirByFile.has(hit.file)) {
+      order.push(hit.file);
+      dirByFile.set(hit.file, hit.version === "" ? null : hit.version);
+    } else if (hit.version !== "") {
+      dirByFile.set(hit.file, hit.version);
+    }
   }
-  return [...seen];
+  return order.map((file) => ({ file, dir: dirByFile.get(file) ?? null }));
+}
+
+/**
+ * 文档读锚的目录段解析（N5 唯一入口）：同一 `decisions` 里**该 `file` 的末条带目录段的登记**；
+ * 无命中 ⇒ `null`（调用方回落 `feature.version`，回落值也为空 ⇒ 结构化拒读、不猜目录）。
+ */
+export function resolveDocDirFromRegistrations(
+  decisions: string | null | undefined,
+  file: string,
+): string | null {
+  if (file === "") return null;
+  return registeredDecisionDocRefs(decisions).find((ref) => ref.file === file)?.dir ?? null;
 }
 
 /**
@@ -256,19 +288,42 @@ export function registeredDecisionDocFiles(decisions: string | null | undefined)
 }
 
 /**
- * M6 改版失联警示行（纯文案警示 ⇒ 不新增页面脚本，白名单内联字面量常量闭集（N3 纪律钉）不动）：
- * 「阶段产出」里存在版本段 ≠ 当前版本的文档登记 ⇒ 该文档的读锚 `doc/{旧版本}/` 已随改版失联
- * （打开端点按当前版本定位，改版不搬文档 = 板零本地写 ⇒ 点开 404，失联为已知语义）。
- * 未登记文档、或登记版本与当前版本一致 ⇒ 空串（不渲染）。
+ * 登记文档的**盘上存在性**（REQ-2026-10-15-05 N6 · 失联警示的判据入参）：
+ * 键 = {@link registeredDecisionDocRefs} 的文件名段，值 = 该登记路径（读锚目录段，未带段时
+ * 回落 `feature.version`）在盘上是否真有这份文件。
+ * **由 server 侧逐条 `docs-read.docExistsOnDisk` 预算后喂入** —— 视图层保持无 `node:fs`。
+ * `undefined` = 调用方未预算 ⇒ 不警示（视图不猜盘上事实）。
  */
-export function renderVersionSwitchWarningLine(
+export type RegisteredDocExists = ReadonlyMap<string, boolean>;
+
+/**
+ * 「阶段产出」里**盘上失联**的登记文档（保序，N6 失联警示的判据源）：只吃 server 预算好的
+ * 存在性布尔，`false` 才算失联；未预算 / 无登记 ⇒ 空数组。
+ */
+export function missingRegisteredDecisionDocFiles(
   decisions: string | null | undefined,
-  currentVersion: string | null,
+  exists: RegisteredDocExists | undefined,
+): string[] {
+  if (exists === undefined) return [];
+  return registeredDecisionDocRefs(decisions)
+    .filter((ref) => exists.get(ref.file) === false)
+    .map((ref) => ref.file);
+}
+
+/**
+ * M6 失联警示行（纯文案警示 ⇒ 不新增页面脚本，白名单内联字面量常量闭集（N3 纪律钉）不动）：
+ * **判据 = 登记路径在盘上是否存在**（REQ-2026-10-15-05 N6 起；旧判据「登记版本段 ≠ 当前版本」
+ * 已随 N5 作废 —— 读锚改由登记解析给出，改版不搬文档 ⇒ 旧版本文档**照样打得开**，
+ * 按版本差异警示会给出假警示）。
+ * 盘上确实没有这份文件（人工删档 / 登记路径写错）⇒ 点名该文档；无失联 ⇒ 空串（不渲染）。
+ */
+export function renderDocMissingWarningLine(
+  decisions: string | null | undefined,
+  exists: RegisteredDocExists | undefined,
 ): string {
-  const current = (currentVersion ?? "").trim();
-  const stale = registeredDecisionDocVersions(decisions).filter((v) => v !== current);
-  if (stale.length === 0) return "";
-  return `<p class="hint warn">文档读锚将随版本切换：已登记的 <code>${escapeHtml(stale.join(" · "))}</code> 文档与当前版本（<code>${escapeHtml(current === "" ? "未排期" : current)}</code>）不一致 ⇒ 打开按当前版本定位，旧版本文档在板上打不开（板零本地写，不搬文档目录）。</p>`;
+  const missing = missingRegisteredDecisionDocFiles(decisions, exists);
+  if (missing.length === 0) return "";
+  return `<p class="hint warn">以下登记的文档在盘上未找到（<code>${escapeHtml(missing.join(" · "))}</code>）⇒ 打开会失败：读锚按登记路径定位（未登记的回落当前版本），板不搬文档、不回写登记，盘上没有即是没有。</p>`;
 }
 
 /**
@@ -284,16 +339,17 @@ function foldSection(summary: string, content: string): string {
 /**
  * 详情页「阶段产出」区（REQ-v0.9.2 按需求归约：与旧「产出登记」合并为单区）：
  * 数据源 = 本需求 `decisions` 逐条 —— 含 `doc/…/*.md` 路径的条目即产出条目（**单链接、链接文字 = 剥去
- * `doc/{版本}/` 后的文件名**，复用 `GET /features/:id/docs` 守卫端点；版本取当前值，登记路径不进链接）；
+ * `doc/{版本}/` 后的文件名**，复用 `GET /features/:id/docs` 守卫端点；**`href` 只带 `file`、
+ * 目录段不进链接**（读锚由服务端从登记解析，见 {@link resolveDocDirFromRegistrations}））；
  * 其余条目原样保留（登记即产出记录，不再两处重复）。
  * 无含 doc 路径的条目 ⇒ 「无（本需求未登记产出）」+ 口径一句；不回落版本目录清单（用户裁决）。
- * `currentVersion` 传入时（排期表单在本页渲染）区首追加 M6 改版失联警示行，不传 ⇒ 行为不变。
+ * `docExists`（N6）传入时（详情页 / 排期表单在本页渲染）区首追加失联警示行，不传 ⇒ 无警示。
  * v0.9.5 C3：本区整体在折叠层内（{@link foldSection}）。
  */
 function renderStageOutputs(
   featureId: string,
   decisions: string | null | undefined,
-  currentVersion?: string | null,
+  docExists?: RegisteredDocExists,
 ): string {
   const items = parseDecisionItems(decisions);
   const docCount = items.filter((item) => extractRegisteredDocPath(item) !== null).length;
@@ -306,8 +362,7 @@ function renderStageOutputs(
     docCount === 0
       ? `<p class="hint">无（本需求未登记产出）—— 产出登记由宿主 / agent 经 <code>advance</code> 的 <code>decisions</code> 逐轮 append 承载，板不回落版本目录清单。</p>`
       : `<ul class="docs">${rows.join("")}</ul>`;
-  const warning =
-    currentVersion === undefined ? "" : renderVersionSwitchWarningLine(decisions, currentVersion);
+  const warning = renderDocMissingWarningLine(decisions, docExists);
   return `<h2>阶段产出</h2>
 ${warning}${body}`;
 }
@@ -564,6 +619,11 @@ export interface FeatureDetailExtras {
   graphHtml?: string;
   /** 验收轨迹（`renderAcceptanceSection` 产出；单段零失败 ⇒ 空串，C2） */
   acceptanceHtml?: string;
+  /**
+   * 「阶段产出」失联警示的判据（REQ-2026-10-15-05 N6）：**server 侧预算**的登记文档盘上存在性
+   * （键 = 文件名段）；缺省不传 ⇒ 不警示（视图层不碰 `node:fs`）。
+   */
+  docExists?: RegisteredDocExists;
 }
 
 /**
@@ -721,14 +781,13 @@ const EXECUTION_COLUMNS: readonly string[] = [
   "失败类",
   "重派",
   "依赖",
-  "排队时长",
   "执行时长",
 ] as const;
 
 /**
  * 执行明细单表的行（v0.10.3 N3）：一行一任务，**按 `taskOrdinalMap` 升序**（与图上 chip 同一张编号表 ——
  * 键 = `createdAt` 登记时刻，不在本处第二处派生）；`taskId` 去重口径同 {@link taskOrdinalMap}（首见即留）。
- * trace 命中 ⇒ 填「为什么没跑」，终态 / 无 trace ⇒ `—`；在飞不做「至 now」推算（两时长函数照用）。
+ * trace 命中 ⇒ 填「为什么没跑」，终态 / 无 trace ⇒ `—`；在飞不做「至 now」推算（时长函数照用）。
  */
 function renderExecutionRows(
   tasks: readonly FeatureTaskItem[],
@@ -778,7 +837,6 @@ function renderExecutionRows(
       `<td>${escapeHtml(t.failureKind ?? "—")}</td>` +
       `<td>${t.retryCount === null ? "—" : String(t.retryCount)}</td>` +
       `<td>${escapeHtml(deps.length === 0 ? "—" : deps.join("、"))}</td>` +
-      `<td>${escapeHtml(formatDurationBetween(t.queuedAt, t.claimedAt))}</td>` +
       `<td>${escapeHtml(formatDurationBetween(t.startedAt, t.finishedAt))}</td>` +
       "</tr>"
     );
@@ -802,7 +860,7 @@ export function renderFeatureDetail(
   // ⇒ 第八枚永不替换它。
   const head = `<h2>${escapeHtml(f.title === "" ? f.featureId : f.title)} <span class="muted mono" title="${escapeHtml(f.featureId)}">${escapeHtml(f.featureId)}</span>${renderParentFeatureBadge(f.parentFeatureId)} <a class="fd-fullpage" href="/features/${escapeHtml(f.featureId)}" target="_blank" rel="noopener">整页打开</a></h2>\n<div class="live-slot" data-live="steps" data-live-interval="${String(LIVE_INTERVALS.feature)}">${renderStageStepBar(d)}</div>`;
 
-  // v0.10.3 N3：任务表与「进展三面」表**并为一张 12 列单表**（三面表退役）。
+  // v0.10.3 N3：任务表与「进展三面」表**并为一张 11 列单表**（三面表退役）。
   // 行的事实源 = `detail.tasks` 全集，序 = `taskOrdinalMap` 升序（编号与图上 chip 同一张表，键 = `createdAt` 登记时刻）；
   // trace 只按 taskId 命中后填「为什么没跑」一列，终态 / 无 trace ⇒ `—`。
   const rows = renderExecutionRows(detail.tasks, trace, nowMs);
@@ -828,7 +886,7 @@ export function renderFeatureDetail(
   const execution = `<div class="live-slot" data-live="exec">${
     executionBody === "" ? "" : foldSection("执行明细（任务 / 为什么没跑）", executionBody)
   }</div>`;
-  const stageOutputsSection = renderStageOutputs(f.featureId, f.decisions, f.version ?? null);
+  const stageOutputsSection = renderStageOutputs(f.featureId, f.decisions, extras.docExists);
   // M6：排期表单上详情页（GET 面）；缺省不渲染 ⇒ 未接线的调用方保持旧行为。
   const scheduleForm = withScheduleForm ? renderScheduleForm(f.featureId, f.version, releasedVersions) : "";
   // C5 终态墓碑：终态需求**不出动作区与回答框**（调用方误传也不渲染）—— 一行结论摘要 = 引导行 +
@@ -2085,6 +2143,11 @@ export function projectionVersionNames(
  * - `status` 非闭集（含 `null` ⇒ 老桥缺键）⇒ 落 `notstart`：**既不当已发版、也不当进行中**，
  *   仅占「台账已登记该 `(org, version)`」一位（口径与本地台账的 notstart 条目一致）；
  * - 时刻字段以本次投影的 `capturedAt` 如实标注（投影不带逐条 createdAt）；`note` 不出投影面 ⇒ `null`。
+ *
+ * **★硬钉（REQ-2026-10-15-05 N1 · 改造文档 §2.2 N8）：本折叠只供显示面（版本列 / 列头徽标 / 门户摘要），
+ * 删除入口（`×`）的判据不得经本函数取数** —— 上条「非闭集 ⇒ 落 `notstart`」的归一对显示面无害，
+ * 拿它判删除就会把**状态未知**的版本染成可删（只松不紧）。删除判据另吃 `server.ts` 的
+ * `deletableVersionSetOf`（吃**原始** `entries`、白名单严格判等），两条通路**不得合并**。
  * 纯读、零写。
  */
 export function projectionLedgerOf(projection: EngineVersionsProjection): VersionsLedger {
@@ -2207,7 +2270,7 @@ export function selectRequirementPool(features: readonly FeatureListItem[]): Fea
  * （灰 / 蓝 / 棕），`note` 作 tooltip。
  */
 const LEDGER_BADGE: Readonly<Record<VersionLedgerStatus, { text: string; variant: string; note: string }>> = {
-  notstart: { text: "未开始", variant: "notstart", note: "版本台账状态：未开始。" },
+  notstart: { text: "未开始", variant: "notstart", note: "版本台账状态：未开始 = 名下无已过需求确认门的卡。" },
   active: { text: "进行中", variant: "wip", note: "版本台账状态：进行中。" },
   released: { text: "🔒 已发版", variant: "locked", note: "版本台账状态：已发版。" },
 };
@@ -2232,7 +2295,7 @@ const DERIVED_STAGE_BADGE: Readonly<Record<"active" | "notstart", { text: string
   notstart: {
     text: "未开始",
     variant: "notstart",
-    note: "台账未登记该版，徽标由卡片阶段派生：名下全是想法卡（stage = 需求分析）或无卡 ⇒ 未开始。",
+    note: "台账未登记该版，徽标由卡片阶段派生：名下全是想法卡（未过需求确认门）或无卡 ⇒ 未开始 = 名下无已过需求确认门的卡。",
   },
 };
 
@@ -2279,33 +2342,35 @@ export function renderVersionBadge(
  * `POST /versions`（隐藏字段 `action=remove`），`data-ov="1"` 沿用「fetch 提交 +
  * `.err-ov-card` 浮层报错」口径（无 JS = 原生 PRG 整页回显）。
  *
- * 可见性 = **仅未开始的版本**：判据与「首卡过确认门才转 active」同源 ——
- * 名下**没有任何已过 Step 0 确认门的卡**（`isConfirmedCard(stage)` 全假）。
- * 由此前台 × 的出现与服务端可删闸（released + 有已确认卡 ⇒ 拒）一一对应，不出必 409 的死按钮。
- *
- * 台账无该版（历史脏列 = 只由卡片派生）⇒ 不出 ×（台账里没有可删的条目）；
- * `released` 条目 ⇒ 不出 ×（已发版为终态、服务端不可删，同增补十的纯只读口径）。
+ * **REQ-2026-10-15-05 B-N2 显示谓词（与引擎删版放行判据**逐字同构**）**：
+ * `version ∈ deletableVersions` ∧ 名下**每张卡**满足「`state = cancelled` ∨ 排期闸开」——
+ * 卡条件**直接调用** `derive.ts` 的 {@link deriveScheduleGateOpen} 单一规则源，
+ * 视图层**不复制**登记字段字面量（复制出的第二份判据会与引擎判据各自漂移）。
+ * 引擎放行判据的正式文本在规范 §7「版本删除纪律」，本处只回指、不抄原文；
+ * `deletableVersions` 由 `server.ts` 的 `deletableVersionSetOf` 从投影**原始** `entries`
+ * 按白名单严格判等裁出（**与 {@link projectionLedgerOf} 的显示面折叠分家** —— 经折叠取数会把
+ * 状态未知的版本染成可删，只松不紧）。
+ * **本集合只裁显示、不是写闸**：服务端拒因仍由引擎判（板不重算、不代判）。
+ * 空集合（含拿不到投影的降级档）⇒ 一个 `×` 都不出（fail-closed）。
  * 删除类操作不走脚本二次确认（内联脚本闭集枚数不扩），由 `title` + `data-submit` 明确文案承担。
- * **v0.9.6 B3**：条目按 `(org, version)` 取（`org` 省略 = 不限组织）—— 他组织的同版号条目不得
- * 决定本列的 × 出现，也不得被本列的 × 删掉。
- * **v0.9.6 B4**：`org` 非空（空间档）⇒ 表单 `action` 同带空间前缀（口径 4 的同一条通路）——
- * 服务端只从**路径**认组织（表单零 org 字段），前缀缺失会让删除落回「不限组织」取首个命中，
- * 从而可能删掉**他组织**的同版号条目；全局档（`org` 省略）action 仍 `/versions` 逐字节不变。
+ * **v0.9.6 B3**：`org` 只作表单 action 的空间前缀（口径 4 的同一条通路）—— 前缀缺失会让删除落回
+ * 「不限组织」取首个命中，从而可能删掉**他组织**的同版号条目；全局档（`org` 省略）action 仍
+ * `/versions` 逐字节不变。组织切片已在 `deletableVersions` 的裁出处完成，本函数不再判组织。
  */
 function renderVersionDelete(
   version: string,
   features: readonly FeatureListItem[],
-  ledger: VersionsLedger | null,
+  deletableVersions: ReadonlySet<string>,
   org?: VersionOrgFilter,
 ): string {
-  const rec = ledger === null ? null : findVersionRecord(ledger, normalizeVersion(version), org);
-  if (rec === null || rec.status === "released") return "";
-  if (features.some((f) => isConfirmedCard(f.stage))) return "";
+  const v = normalizeVersion(version);
+  if (!deletableVersions.has(v)) return "";
+  if (features.some((f) => f.state !== "cancelled" && !deriveScheduleGateOpen(f.stage, f.approval))) return "";
   const action = typeof org === "string" && org !== "" ? orgSpaceLink(org) + "versions" : "/versions";
-  return `<form method="post" action="${escapeHtml(action)}" class="inline vdel" data-submit="已提交，删除版本中…" data-ov="1" title="删除 ${escapeHtml(rec.version)}（仅未开始的版本可删；名下想法卡自动回需求池，已确认需求存在则服务端拒绝）">
+  return `<form method="post" action="${escapeHtml(action)}" class="inline vdel" data-submit="已提交，删除版本中…" data-ov="1" title="删除 ${escapeHtml(v)}（名下想法卡退回需求池；已取消卡随本版清除版本归属）">
 <input type="hidden" name="action" value="${escapeHtml(VERSION_ACTION_REMOVE)}">
-<input type="hidden" name="version" value="${escapeHtml(rec.version)}">
-<button type="submit" aria-label="删除版本 ${escapeHtml(rec.version)}">×</button>
+<input type="hidden" name="version" value="${escapeHtml(v)}">
+<button type="submit" aria-label="删除版本 ${escapeHtml(v)}">×</button>
 </form>`;
 }
 
@@ -2319,12 +2384,17 @@ function renderVersionDelete(
  * **增补三 件B（REQ-2026-10-02-03）**：件3 的顶部 `<details>` 长说明（数据口径 / 拖拽纪律）已整块撤除 ——
  * 本页为纯看板，口径由列头徽标与删除 × 的 `title` 就地承载。
  * `columns` 由 {@link groupFeaturesByVersion} 给出（已含台账 ∪ 卡派生并集），`ledger` 供列头徽标取态。
- * **v0.9.6 B3**：`org` = 本面的组织切片档（调用方给定）—— 列头徽标与删除 × 的台账取条目按
- * `(org, version)`；`undefined` = 不限组织（全局页并集，B5a 退役前保持既有形态）。
+ * **v0.9.6 B3**：`org` = 本面的组织切片档（调用方给定）—— 列头徽标的台账取条目按 `(org, version)`；
+ * 删除 × 的组织切片已在 `deletableVersions` 的裁出处按同一 `org` 完成，`org` 在本面另只贡献
+ * 表单 action 的空间前缀；`undefined` = 不限组织（跨组织并集档自 B5a 全局页退役起不再有
+ * 页级调用方，仅留作口径完整）。
  * **v0.9.4 增补十一 E1（§9.6）**：看板尾「新版本」拖拽**虚列已撤**（§2.6 形态作废）⇒ 创建版本
  * 的唯一入口 = 排期页页头「＋ 新版本」按钮 + `#new-version-dialog` 弹窗。
  * **v0.9.4 增补十一 E2（§9.6）**：删除入口由操作行的「删除版本」按钮**上框**为列头右上角
- * {@link renderVersionDelete} 的 ×（仅未开始版本出现）。
+ * {@link renderVersionDelete} 的 ×。
+ * **REQ-2026-10-15-05 B-N2**：× 的可见性改吃调用方喂入的 `deletableVersions`（页级从投影**原始**
+ * `entries` 裁出的可删版号集合）—— 与列头徽标用的 `ledger`（投影-或-本地读缓存的显示折叠）
+ * **两条数据通路分家**，本函数只把集合原样透传给 {@link renderVersionDelete}，不在此重算判据。
  * **v0.9.4 增补十一 E3（§9.6）**：列头**操作行整体撤除**（含「标记已发版」，其原属增补七 b 形态）
  * ⇒ 前台不再渲染任何 `setStatus` 入口；版本状态维护只留后台 `POST /versions` `setStatus` 直投
  * （数据纠错通道，**写口与迁移矩阵闸零改动**），真发版动作待「发版」按钮（另立需求 · 归 v0.9.5）。
@@ -2340,12 +2410,13 @@ export function renderSchedule(
   releasedVersions: readonly string[] = [],
   ledger: VersionsLedger | null = null,
   org?: VersionOrgFilter,
+  deletableVersions: ReadonlySet<string> = new Set<string>(),
 ): string {
   const cols = [...columns]
     .sort((a, b) => compareVersionOrder(b.version, a.version))
     .map(
       (c) => `<div class="kcol" data-version="${escapeHtml(c.version)}">
-<h3>${escapeHtml(c.version)}${renderVersionBadge(c.version, c.features, releasedVersions, ledger, org)} <span class="muted">(${String(c.features.length)})</span>${renderVersionDelete(c.version, c.features, ledger, org)}</h3>
+<h3>${escapeHtml(c.version)}${renderVersionBadge(c.version, c.features, releasedVersions, ledger, org)} <span class="muted">(${String(c.features.length)})</span>${renderVersionDelete(c.version, c.features, deletableVersions, org)}</h3>
 ${sortFeatureCards(c.features).map((f) => renderScheduleCard(f)).join("\n")}
 </div>`,
     );

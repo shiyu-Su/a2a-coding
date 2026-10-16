@@ -1,7 +1,8 @@
 /**
  * **版本自动转 `active`**（v0.10.0 O2c · 改造文档 §2.1(2)）—— 引擎内部触发点，**三护栏**落点。
  *
- * 触发方 = 引擎自身（**首个节点派发 / `approve` 放行**），**不开放板写口** —— 板只读结果。
+ * 触发方 = 引擎自身（**三处**：门① 的 `stage` 登记写〔首触发点，v0.10.7 n3〕/ `approve` 放行 /
+ * 首个节点派发；经 `trigger` 记入事件 payload），**不开放板写口** —— 板只读结果。
  * 真实写口在 `session/store.ts` 的 {@link versionLedgerActivate}（幂等 + 事件同事务）；本模块把它
  * 包成「调用方永不被拖垮」的护栏层：
  *
@@ -20,6 +21,7 @@ import type { VersionLedgerStatus } from "../types.js";
 import {
   versionLedgerActivate,
   type VersionActivationResult,
+  type VersionActivationTrigger,
 } from "../session/store.js";
 import { bridgeLog } from "./bridge-log.js";
 
@@ -28,7 +30,15 @@ export const VERSION_ACTIVATION_THROTTLE_MS = 30_000;
 
 /** 自动转换所需的**最小存储面**（单测可注入假 store；缺省走 `session/store.ts` 默认存储）。 */
 export interface VersionActivationPort {
-  activate(ownerGroup: string | null, version: string): VersionActivationResult;
+  /**
+   * `trigger` 本层**必填**（v0.10.7 n3）—— 逐处显式声明是哪一道触发点，随事件 payload 落账。
+   * 注入的假 port 写成 `(ownerGroup, version) => …`（少一个形参）在 TS 里仍然合法 ⇒ 既有假 port 不翻案。
+   */
+  activate(
+    ownerGroup: string | null,
+    version: string,
+    trigger: VersionActivationTrigger,
+  ): VersionActivationResult;
 }
 
 /** 一次触发的结果（三护栏可读面）。 */
@@ -76,10 +86,12 @@ export class VersionActivator {
   /**
    * 触发一次「`notstart → active`」。**绝不抛出**（护栏 2）。
    * 空版本串 ⇒ 直接 no-op（未排期卡不针对任何版号）。
+   * `trigger` **必填**（v0.10.7 n3）⇒ 三处触发点各自显式声明（`gate1` / `approve` / `dispatch`）。
    */
   activate(
     ownerGroup: string | null,
     version: string | null | undefined,
+    trigger: VersionActivationTrigger,
   ): VersionActivationOutcome {
     const v = (version ?? "").trim();
     if (v.length === 0) {
@@ -93,7 +105,7 @@ export class VersionActivator {
     }
     this.throttle.set(key, nowMs);
     try {
-      const result = this.port.activate(ownerGroup, v);
+      const result = this.port.activate(ownerGroup, v, trigger);
       if (result.activated) this.throttle.delete(key);
       return { ...result, throttled: false };
     } catch (err) {
@@ -104,25 +116,41 @@ export class VersionActivator {
       return { activated: false, status: null, ledgerReady: true, throttled: false };
     }
   }
+
+  /**
+   * 清空**进程内节流表**（仅测试夹具用：单测以 `freshDb()` 重置台账 ⇒ 表里残留的「已 `active` 键」
+   * 会把新库同一 `(ownerGroup, version)` 的激活尝试挡在窗口外。生产路径不调，节流语义不变）。
+   */
+  clearThrottle(): void {
+    this.throttle.clear();
+  }
 }
 
 /** 进程内单例（桥进程生命周期；节流表随桥常驻）。 */
 export const versionActivator = new VersionActivator();
 
-/** 便捷函数：触发 `(ownerGroup, version)` 的自动转 active。 */
+/** 便捷函数：触发 `(ownerGroup, version)` 的自动转 active（`trigger` 必填，见 {@link VersionActivationTrigger}）。 */
 export function activateVersion(
   ownerGroup: string | null,
   version: string | null | undefined,
+  trigger: VersionActivationTrigger,
 ): VersionActivationOutcome {
-  return versionActivator.activate(ownerGroup, version);
+  return versionActivator.activate(ownerGroup, version, trigger);
 }
 
-/** 便捷函数：按 Feature 的归属组 + 版号触发（`approve` / 派发钩子用）。 */
-export function activateVersionForFeature(feature: {
-  ownerGroup: string | null;
-  version: string | null | undefined;
-}): VersionActivationOutcome {
-  return versionActivator.activate(feature.ownerGroup, feature.version);
+/**
+ * 便捷函数：按 Feature 的归属组 + **写前快照**版号触发（`approve` / 首派发两处兜底用）。
+ * ⚠ **门① 不得套本函数** —— 它吃 `feature.version`，而门① 允许同单写 `version` + 抬 `stage`，
+ * 套用会激活**旧**版号；门① 处显式传 `reg.patch.version ?? feature.version`（v0.10.7 n3）。
+ */
+export function activateVersionForFeature(
+  feature: {
+    ownerGroup: string | null;
+    version: string | null | undefined;
+  },
+  trigger: VersionActivationTrigger,
+): VersionActivationOutcome {
+  return versionActivator.activate(feature.ownerGroup, feature.version, trigger);
 }
 
 function toMessage(err: unknown): string {

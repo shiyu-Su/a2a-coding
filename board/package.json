@@ -1,6 +1,6 @@
 {
   "name": "@a2a-coding/board",
-  "version": "0.12.1",
+  "version": "0.13.0",
   "private": true,
   "type": "module",
   "engines": {
@@ -16,6 +16,9 @@
     "logs": "node scripts/boardctl.mjs logs",
     "start:foreground": "node dist/index.js",
     "test": "npm run build && node --test \"test/*.test.mjs\""
+  },
+  "dependencies": {
+    "elkjs": "^0.12.0"
   },
   "devDependencies": {
     "@types/node": "^22.10.0",

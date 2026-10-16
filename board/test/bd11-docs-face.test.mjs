@@ -5,7 +5,9 @@
  * 覆盖：
  * ① 详情页「阶段产出」区 = **decisions 驱动**（与旧「产出登记」合并为单区）：登记条目逐条渲染、
  *    含 `doc/…/*.md` 路径者成可点条目、非 doc 路径条目原样、版本目录 flat 清单已作废；
- * ② 未登记降级 ⇒ 「无（本需求未登记产出）」；登记版本 ≠ 当前版本 ⇒ 失联警示行与清单共存；
+ * ② 未登记降级 ⇒ 「无（本需求未登记产出）」；**登记路径在盘上缺失** ⇒ 失联警示行与清单共存
+ *    （REQ-2026-10-15-05 N5/N6 起失联判据 = 盘上存在性 —— 读锚按登记路径定位，改版不搬文档 ⇒
+ *    旧版本文档照样打得开，「登记版本 ≠ 当前版本」不再等价于失联）；
  * ③ `GET /features/:id/docs?file=` = `text/plain; charset=utf-8` + `no-store`、超限截断提示、
  *    `Accept: text/html` ⇒ `<pre>` 转义整页；越界名 / 缺失 ⇒ 4xx **不泄根路径**（判据 1 的 HTTP 档）；
  * ④ 读面恒 GET（非 GET ⇒ 405）、不过 CSRF；`parseFeatureDetail` 补解析 decisions/contracts（容错 null）。
@@ -164,7 +166,7 @@ test("阶段产出：旧「产出登记」区已合并 —— 全页只有一个
 });
 
 // ---------------------------------------------------------------------------
-// ② 未登记降级 + 改版失联警示共存
+// ② 未登记降级 + 盘上失联警示共存（REQ-2026-10-15-05 N6：判据 = 登记路径在盘上是否存在）
 // ---------------------------------------------------------------------------
 
 test("未登记降级：无 decisions / 仅非 doc 条目 ⇒ 「无（本需求未登记产出）」+ 口径，不回落目录", async () => {
@@ -182,16 +184,61 @@ test("未登记降级：无 decisions / 仅非 doc 条目 ⇒ 「无（本需求
   }
 });
 
-test("登记版本 ≠ 当前版本 ⇒ 失联警示行与产出清单共存，链接仍按现行端点规则", async () => {
+test("登记路径在盘上缺失 ⇒ 失联警示行点名该文档、与产出清单共存，链接仍按现行端点规则", async () => {
   const decisions = JSON.stringify(["产出：doc/v0.9.1/上板-改造文档.md"]);
   await withServer(
     async (base) => {
       const res = await fetchText(base, "/features/F1");
-      assert.match(res.text, /class="hint warn"[\s\S]*文档读锚将随版本切换/);
+      assert.match(res.text, /class="hint warn"[\s\S]*在盘上未找到[\s\S]*上板-改造文档\.md/);
+      assert.match(res.text, /读锚按登记路径定位/);
+      assert.doesNotMatch(res.text, /将随版本切换/, "旧「随版本切换失联」文案已退场");
       assert.match(res.text, />上板-改造文档\.md<\/a>/, "警示不吞条目：链接仍在，点开 404 属已知语义");
     },
     { featureOver: { decisions, version: "v0.9.2" }, docs: { repoRoot: join(tmpdir(), "board-bd11-不存在"), orgsDir: null } },
   );
+});
+
+test("登记版本 ≠ 当前版本 ∧ 盘上有该文档 ⇒ 不警示、点开可读（旧「旧版本文档打不开」语义已翻）", async () => {
+  const disk = tmpDisk();
+  try {
+    put(disk, "A", "v0.9.1", "上板-改造文档.md", "# 旧版本档正文\n");
+    const decisions = JSON.stringify(["产出：doc/v0.9.1/上板-改造文档.md"]);
+    await withServer(
+      async (base) => {
+        const res = await fetchText(base, "/features/F1");
+        assert.doesNotMatch(res.text, /在盘上未找到/, "盘上有这份文件 ⇒ 区首不出失联警示");
+        const doc = await fetchText(base, `/features/F1/docs?file=${encodeURIComponent("上板-改造文档.md")}`);
+        assert.equal(doc.status, 200, "读锚走登记的目录段，与当前版本无关");
+        assert.equal(doc.text, "# 旧版本档正文\n");
+      },
+      { featureOver: { decisions, version: "v0.9.2" }, docs: { repoRoot: disk, orgsDir: null } },
+    );
+  } finally {
+    rmSync(disk, { recursive: true, force: true });
+  }
+});
+
+test("改版善后搬完并回填登记 ⇒ 读锚跟着末条登记（警示消失、点开读到新档）", async () => {
+  const disk = tmpDisk();
+  try {
+    put(disk, "A", "v0.9.2", "上板-改造文档.md", "# 搬版后的档\n");
+    const decisions = JSON.stringify([
+      "产出：doc/v0.9.1/上板-改造文档.md",
+      "改版善后：doc/v0.9.2/上板-改造文档.md",
+    ]);
+    await withServer(
+      async (base) => {
+        const res = await fetchText(base, "/features/F1");
+        assert.doesNotMatch(res.text, /在盘上未找到/, "末条登记的路径在盘上 ⇒ 不失联");
+        const doc = await fetchText(base, `/features/F1/docs?file=${encodeURIComponent("上板-改造文档.md")}`);
+        assert.equal(doc.status, 200);
+        assert.equal(doc.text, "# 搬版后的档\n", "同一 file 的末条带段登记 = 读锚");
+      },
+      { featureOver: { decisions, version: "v0.9.2" }, docs: { repoRoot: disk, orgsDir: null } },
+    );
+  } finally {
+    rmSync(disk, { recursive: true, force: true });
+  }
 });
 
 test("阶段产出纯函数：JSON 数组逐元素 · 非 JSON 整段一条 · 空为 []；登记路径只认 doc/ 前缀", () => {

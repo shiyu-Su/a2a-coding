@@ -712,4 +712,4 @@ export const AGENT_VIEW_CALIBRATION_NOTE =
 
 /** trace / 等待面读账口径（原 B13 脚注第 3 条，收敛为单点常量）。 */
 export const TRACE_READ_NOTE =
-  "projectBusy 只反映写门；写门未挡却没开工时以 readOccupants[]（读档占位）为准；waitReason 原样显示（八值闭集，不自造中文词）；行序 = 登记序（createdAt），而「排队时长」列与 trace 位次仍以入队时刻（queuedAt）为键 ⇒ 二者不同序。";
+  "projectBusy 只反映写门；写门未挡却没开工时以 readOccupants[]（读档占位）为准；waitReason 原样显示（八值闭集，不自造中文词）；行序 = 登记序（createdAt），而 trace 位次仍以入队时刻（queuedAt）为键 ⇒ 二者不同序。";

@@ -170,7 +170,8 @@ export const EVENT_VERSION_LEDGER_DELETED = "version.ledger_deleted";
  * {@link SessionStore.versionLedgerActivate} 在「`versions.status` 由 `notstart` 迁 `active`」的
  * **同一事务内**发出（`feature_id` / `task_id` 均 `NULL`：版本台账不属任何 Feature）。
  *
- * 触发方 = **引擎内部**（首个节点派发 / `approve` 放行），**不开放板写口** —— 板只读结果。
+ * 触发方 = **引擎内部**（门① 的 `stage` 登记写 / `approve` 放行 / 首个节点派发；`payload.trigger`
+ * 记哪一处，见 {@link VersionActivationTrigger}），**不开放板写口** —— 板只读结果。
  * `payload.from = "notstart"` / `payload.to = "active"`；幂等（非 `notstart` ⇒ 零写入、零事件）。
  */
 export const EVENT_VERSION_ACTIVATED = "version.activated";
@@ -625,6 +626,18 @@ export interface VersionLedgerSetStatusInput {
 }
 
 /**
+ * 版本自动转 `active` 的**触发点**（v0.10.7 n3 · 改造文档 §2.1 n3）—— 闭集三值，进
+ * {@link EVENT_VERSION_ACTIVATED} 的 `payload.trigger`：
+ * - `gate1` = 门①（需求确认）的 `stage` 登记写落库成功（**首触发点**，v0.10.7 起）；
+ * - `approve` = 门② 放行；
+ * - `dispatch` = 首个节点派发。
+ *
+ * 后两者自 v0.10.7 起**降级为幂等兜底**（`gate1` 已先把版号抬起 ⇒ 到它们时恒 `activated = false`）。
+ * 三处都不判 `active` 作执法依据（`active` 只是观测面读数）。
+ */
+export type VersionActivationTrigger = "gate1" | "approve" | "dispatch";
+
+/**
  * `versionLedgerActivate` 出参（v0.10.0 O2c）—— 三护栏的**幂等**判据面：
  * - `activated = true` ⇒ 本次真的把 `notstart` 迁成 `active`（且发了一条 {@link EVENT_VERSION_ACTIVATED}）；
  * - `activated = false` ⇒ 无需动作（非 `notstart` / 行不存在 / 台账未就绪）。
@@ -653,6 +666,40 @@ export interface VersionCardCounts {
   cancelled: number;
   /** 未收口 = 其余全部态（含 `failed` —— `failed` 不算收口，见 `需求流程.md` §8） */
   open: number;
+}
+
+/**
+ * 删版分档用的单张卡账面（v0.10.7 n1 · 改造文档 §2.1 n1）。
+ *
+ * `state` 取**列原值**（不收窄成 `FeatureState`、不 fail-fast）—— 态闭集外的脏值不得让
+ * 分档抛出去，也不得静默消失在四桶之外；它按「非 `completed` / `cancelled`」落入未收口两桶。
+ * `stage` / `approval` 走既有读侧归一（NULL / 脏值 ⇒ 缺省），缺省值恒不等于「需求分析 / 未发起」
+ * ⇒ 归一本身即 fail-closed，与 §2.0 伪码「任一字段 null ⇒ 不满足」同侧。
+ */
+export interface VersionDeleteCard {
+  featureId: string;
+  state: string;
+  stage: FeatureStage;
+  approval: FeatureApproval;
+  decisions: string | null;
+}
+
+/**
+ * 删版分档出参（v0.10.7 n1）—— 四桶**互斥且并集 = 名下全部卡**，故
+ * `total = 四桶长度之和`（不得相加当两批卡：`clearPool ⊆ 清卡集`、`blockedOpen ⊆ 挡删集`）。
+ *
+ * - **挡删集** = `blockedCompleted` ∪ `blockedOpen`（任一非空 ⇒ 拒删）；
+ * - **清卡集** = `clearPool` ∪ `clearCancelled`（删版事务内逐卡清 `version`）。
+ */
+export interface VersionDeleteClassification {
+  /** 挡删 B-3：`state === "completed"`（清其 version 会断交付账） */
+  blockedCompleted: VersionDeleteCard[];
+  /** 挡删 B-2：未收口 ∧ ¬可回池档 */
+  blockedOpen: VersionDeleteCard[];
+  /** 清卡 B-4 乙档：未收口 ∧ 可回池档 ⇒ 退回需求池 */
+  clearPool: VersionDeleteCard[];
+  /** 清卡 B-4 甲档：`state === "cancelled"` ⇒ 随本版清除版本归属 */
+  clearCancelled: VersionDeleteCard[];
 }
 
 /**
@@ -1316,6 +1363,25 @@ function readStage(row: Record<string, unknown>): FeatureStage {
 function readApproval(row: Record<string, unknown>): FeatureApproval {
   const raw = readNullableString(row, "approval");
   return raw !== null && isFeatureApproval(raw) ? raw : DEFAULT_FEATURE_APPROVAL;
+}
+
+/**
+ * **可回池档**（v0.10.7 n1 · 改造文档 §2.0 伪码的引擎侧投影）= 删版时该卡可退回需求池的唯一判据。
+ *
+ * 正向严格合取：两枚登记字段**都是**那枚字面取值才成立。`stage` / `approval` 是**两次独立写、
+ * 不保证同序** ⇒ 不得以 `stage` 单枚代判；经 {@link readStage} / {@link readApproval} 归一后，
+ * NULL / 脏值落到的缺省值（`改造方案` / `待审批`）恒不等于这两枚 ⇒ **归一即 fail-closed**，
+ * 与伪码「任一字段 null / 非两枚字面取值 ⇒ 不满足」同侧。
+ *
+ * 板侧同构实现 = `deriveScheduleGateOpen`（两侧不做代码级共享，同源由伪码单点 + 恒等锚承载）。
+ */
+function isVersionCardBackToPool(card: VersionDeleteCard): boolean {
+  return card.stage === "需求分析" && card.approval === "未发起";
+}
+
+/** 拒因 message 用的卡 id 清单（空桶 ⇒ `[]`，不省键，便于逐档点数） */
+function idList(cards: VersionDeleteCard[]): string {
+  return `[${cards.map((card) => card.featureId).join(", ")}]`;
 }
 
 function rowToFeature(row: Record<string, unknown>): FeatureRecord {
@@ -3731,58 +3797,123 @@ export class SessionStore {
   }
 
   /**
-   * **删版（台账删行）**（v0.10.0 O2a）—— `DELETE /api/versions/{version}` 的写口。
+   * **删版（台账删行 + 名下卡同事务清 `version`）**（v0.10.0 O2a · v0.10.7 n2 重写）——
+   * `DELETE /api/versions/{version}` 的写口。
    *
-   * 三道判据，**任一命中 ⇒ 不删**（结构化失败，零副作用）：
-   * 1. 台账无此行 ⇒ 404 {@link ERR_VERSION_UNKNOWN}；
-   * 2. `status = released` ⇒ 409 {@link ERR_VERSION_RELEASED_LOCKED} —— **发版事实不可撤销**
-   *    （`released` 锁的事实在台账行本身，删了就没有「已发版」的读投影，板 §2.3(1) 的
-   *    「锁只紧不松」失去依据）；
-   * 3. 名下有未收口卡 ⇒ 409 {@link ERR_VERSION_OPEN_CARDS} —— 删台账会把在飞需求变成
-   *    「排期指向不存在的版号」。收口口径 = `completed` / `cancelled`（与 O3 三桶、
-   *    `需求流程.md` §8 发版收口集合逐字一致；`failed` **不算收口**）。
+   * 两道判据，**任一命中 ⇒ 不删**（结构化失败，零写入、零事件）：
+   * 1. **白名单**：`versionLedgerStatus(...).status ∈ {notstart, active}` 才放行 —— `released`
+   *    ⇒ 409 {@link ERR_VERSION_RELEASED_LOCKED}（**发版事实不可撤销**：删了就没有「已发版」的读
+   *    投影，板 §2.3(1) 的「锁只紧不松」失去依据）；无行 / 表未就绪 / 脏值折叠成 `null`
+   *    ⇒ 404 {@link ERR_VERSION_UNKNOWN}（**只紧不松** —— 读不到即挡，不得当作可删放行）。
+   *    判据面**只读 {@link SessionStore.versionLedgerStatus}**，不读 {@link SessionStore.versionLedgerGet}：
+   *    后者对脏 `status` / 无表 **throw**，会把「表未就绪」变成 500 而不是拒删。
+   * 2. **名下不存在挡删卡**（四桶判据 = {@link SessionStore.classifyVersionCardsForDelete}，
+   *    单源在 n1，本口不回述条件）：`blockedCompleted` ∪ `blockedOpen` 任一非空 ⇒ 409
+   *    {@link ERR_VERSION_OPEN_CARDS}，message 内**分档并带卡 id 清单**。
+   *    **码名不改** —— `completed` 入挡删集后，该码的 `open` 语义扩为「**不可清**」（README 由 n4 登记）。
    *
-   * **只删 `versions` 行，不碰 `releases`**：快照只在标记 released 时产生，而 released 已在
-   * 判据 2 挡住 ⇒ 可达此处的行必然无快照，无需级联。
+   * **清卡 + 删行 + 事件 = 同一事务**（`BEGIN IMMEDIATE`）：分步写会留下「卡仍指向已消解版号」的
+   * 幽灵版号链。逐卡清 `version` 复用 {@link SessionStore.updateFeatureRegistration}（空串 = 既有
+   * 撤排期语义，不另立专用口）⇒ 每卡自带一条 {@link EVENT_FEATURE_STAGE} diff 事件。
+   * ⚠ 事务体内**不得**调 {@link SessionStore.versionLedgerActivate}（它自开 `BEGIN IMMEDIATE`
+   * ⇒ better-sqlite3 嵌套事务报错）。
+   *
+   * **只删 `versions` 行**：不碰 `feature_projects` / `project_versions` / `releases`（乙案 = 零新写面；
+   * 归属行成为**只读历史引用**，见 `需求流程.md` §7「版本删除纪律」判据 3），也不回写 `approval`
+   * （单向无回边）。快照只在标记 `released` 时产生，而 `released` 已被判据 1 挡住 ⇒ 可达此处的行必然无快照。
    */
   versionLedgerDelete(ownerGroup: string | null, version: string): VersionLedgerWriteResult {
-    const row = this.versionLedgerGet(ownerGroup, version);
-    if (row === null) {
-      return {
-        ok: false,
-        code: ERR_VERSION_UNKNOWN,
-        message: `台账无此行（owner_group=${ownerGroup === null ? "NULL" : `"${ownerGroup}"`} · version=${version}）`,
-        status: 404,
-      };
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const probe = this.versionLedgerStatus(ownerGroup, version);
+      if (!probe.ledgerReady) {
+        this.db.exec("ROLLBACK");
+        return {
+          ok: false,
+          code: ERR_VERSION_UNKNOWN,
+          message: `台账表未就绪（versions 表不存在）⇒ 白名单不放行（只紧不松；version=${version}）`,
+          status: 404,
+        };
+      }
+      if (probe.status === "released") {
+        this.db.exec("ROLLBACK");
+        return {
+          ok: false,
+          code: ERR_VERSION_RELEASED_LOCKED,
+          message: `已发版版本不可删除（version=${version} 处于 released 终态；发版事实归 releases 快照与 git tag）`,
+          status: 409,
+        };
+      }
+      if (probe.status !== "notstart" && probe.status !== "active") {
+        this.db.exec("ROLLBACK");
+        return {
+          ok: false,
+          code: ERR_VERSION_UNKNOWN,
+          message: `台账无此行或 status 不可读（version=${version} · status=${String(probe.status)}：脏值折叠成 null 同拒）⇒ 白名单只放行 notstart / active`,
+          status: 404,
+        };
+      }
+      const buckets = this.classifyVersionCardsForDelete(ownerGroup, version);
+      if (buckets.blockedCompleted.length > 0 || buckets.blockedOpen.length > 0) {
+        this.db.exec("ROLLBACK");
+        return {
+          ok: false,
+          code: ERR_VERSION_OPEN_CARDS,
+          message:
+            `名下有不可清卡，须先收口或撤排期回池再删版（version=${version}）：` +
+            `completed[${buckets.blockedCompleted.length}]=${idList(buckets.blockedCompleted)}（已交付，清 version 会断交付账）` +
+            ` / 未收口且不可回池[${buckets.blockedOpen.length}]=${idList(buckets.blockedOpen)}（不满足「需求分析 ∧ 未发起」）`,
+          status: 409,
+        };
+      }
+      const record = this.versionLedgerGet(ownerGroup, version);
+      if (record === null) {
+        throw new Error(
+          `[session-store] versionLedgerDelete 白名单通过后未能读回台账行：version=${version}`,
+        );
+      }
+      const clearPlan = [
+        ...buckets.clearPool.map((card) => ({ card, cardClass: "pool" as const })),
+        ...buckets.clearCancelled.map((card) => ({ card, cardClass: "cancelled" as const })),
+      ].sort((a, b) => (a.card.featureId < b.card.featureId ? -1 : 1));
+      const cleared = clearPlan.map(({ card, cardClass }) => {
+        this.updateFeatureRegistration(card.featureId, { version: "" });
+        return {
+          featureId: card.featureId,
+          cardClass,
+          state: card.state,
+          stage: card.stage,
+          approval: card.approval,
+          decisions: card.decisions,
+        };
+      });
+      this.db
+        .prepare("DELETE FROM versions WHERE owner_group IS ? AND version = ?")
+        .run(ownerGroup, version);
+      this.appendEvent({
+        featureId: null,
+        taskId: null,
+        kind: EVENT_VERSION_LEDGER_DELETED,
+        state: null,
+        payload: JSON.stringify({
+          ownerGroup,
+          version,
+          status: record.status,
+          // v0.10.7 n2 扩键（★只增键）：returnedToPool ⊆ cleared[]（仅计可回池档，两个长度不得相加当两批卡）
+          returnedToPool: buckets.clearPool.length,
+          cleared,
+        }),
+      });
+      this.db.exec("COMMIT");
+      return { ok: true, record };
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // 事务已不在活动态：保留原始错误，不掩盖
+      }
+      throw err;
     }
-    if (row.status === "released") {
-      return {
-        ok: false,
-        code: ERR_VERSION_RELEASED_LOCKED,
-        message: `已发版版本不可删除（version=${version} 处于 released 终态；发版事实归 releases 快照与 git tag）`,
-        status: 409,
-      };
-    }
-    const counts = this.countVersionCards(ownerGroup, version);
-    if (counts.open > 0) {
-      return {
-        ok: false,
-        code: ERR_VERSION_OPEN_CARDS,
-        message: `名下有 ${counts.open} 张未收口卡（total=${counts.total} completed=${counts.completed} cancelled=${counts.cancelled}），须先收口再删版`,
-        status: 409,
-      };
-    }
-    this.db
-      .prepare("DELETE FROM versions WHERE owner_group IS ? AND version = ?")
-      .run(ownerGroup, version);
-    this.appendEvent({
-      featureId: null,
-      taskId: null,
-      kind: EVENT_VERSION_LEDGER_DELETED,
-      state: null,
-      payload: JSON.stringify({ ownerGroup, version, status: row.status }),
-    });
-    return { ok: true, record: row };
   }
 
   /**
@@ -3876,8 +4007,8 @@ export class SessionStore {
   }
 
   /**
-   * **自动转 `active`（引擎内部 · 幂等）**（v0.10.0 O2c · 改造文档 §2.1(2)）——
-   * 「首个节点派发 / `approve` 放行」触发的 `notstart → active`，**不开放板写口**。
+   * **自动转 `active`（引擎内部 · 幂等）**（v0.10.0 O2c · 改造文档 §2.1(2) · v0.10.7 n3 扩 `trigger`）——
+   * 「门① 的 `stage` 登记写 / `approve` 放行 / 首个节点派发」触发的 `notstart → active`，**不开放板写口**。
    *
    * 语义（三护栏的**幂等**落点）：
    * - 行不存在 / 台账未就绪 ⇒ **不建行**、`activated = false`（自动转换只翻**已登记**版号，
@@ -3888,8 +4019,15 @@ export class SessionStore {
    *
    * 并发：`BEGIN IMMEDIATE` 内**重读**再判（与 {@link SessionStore.versionLedgerMarkReleased}
    * 同口径）⇒ 同进程并发触发也不会出现双事件 / 双写。
+   *
+   * `trigger`（v0.10.7 n3）**本层给缺省 `"dispatch"`**、只进事件 payload、不参与任何判定 ——
+   * 三处触发点里两处的既有两参直调因此不必改写；护栏层（activator）必填、逐处显式传。
    */
-  versionLedgerActivate(ownerGroup: string | null, version: string): VersionActivationResult {
+  versionLedgerActivate(
+    ownerGroup: string | null,
+    version: string,
+    trigger: VersionActivationTrigger = "dispatch",
+  ): VersionActivationResult {
     const v = version.trim();
     if (v.length === 0) return { activated: false, status: null, ledgerReady: true };
     const probe = this.versionLedgerStatus(ownerGroup, v);
@@ -3911,7 +4049,7 @@ export class SessionStore {
         taskId: null,
         kind: EVENT_VERSION_ACTIVATED,
         state: null,
-        payload: JSON.stringify({ ownerGroup, version: v, from: "notstart", to: "active" }),
+        payload: JSON.stringify({ ownerGroup, version: v, from: "notstart", to: "active", trigger }),
       });
       this.db.exec("COMMIT");
       return { activated: true, status: "active", ledgerReady: true };
@@ -3926,26 +4064,68 @@ export class SessionStore {
   }
 
   /**
-   * 版号名下卡的收口计数（{@link versionLedgerDelete} 判据 3 专用）。
+   * 版号名下卡的**分档账面读取**（v0.10.7 n1）—— {@link SessionStore.classifyVersionCardsForDelete}
+   * 的唯一读取面（扩列后单点，判据不再分两份 SELECT 各写一条）。
    *
    * **刻意不复用 {@link SessionStore.aggregateFeaturesByVersion}**：聚合面的 `ownerGroup`
-   * 语义是「`undefined` ⇒ 全量」，而本判据要的是**台账键的精确一档**（`null` ⇒ 仅匿名档）。
-   * 拿全量计数当精确档会把**别组的同名版号卡**算进来 ⇒ 误挡删版（fail-closed 方向，
+   * 语义是「`undefined` ⇒ 全量」，而删版判据要的是**台账键的精确一档**（`null` ⇒ 仅匿名档）。
+   * 拿全量当精确档会把**别组的同名版号卡**算进来 ⇒ 误挡删版（fail-closed 方向，
    * 但会把合法操作挡死）。归属匹配用 NULL-safe `IS`，与 {@link versionLedgerGet} 同键口径。
-   * 三桶判据本身与 O3 一致（completed / cancelled = 收口，其余含 failed = open）。
+   *
+   * 排序 = `feature_id` 升序（分桶后各桶内序确定 ⇒ n2 事件 payload 的 `cleared[]` 可比对）。
    */
-  private countVersionCards(ownerGroup: string | null, version: string): VersionCardCounts {
+  private readVersionCardsForDelete(
+    ownerGroup: string | null,
+    version: string,
+  ): VersionDeleteCard[] {
     const rows = this.db
-      .prepare("SELECT state FROM features WHERE owner_group IS ? AND version = ?")
+      .prepare(
+        `SELECT feature_id, state, stage, approval, decisions
+         FROM features WHERE owner_group IS ? AND version = ?
+         ORDER BY feature_id`,
+      )
       .all(ownerGroup, version) as Array<Record<string, unknown>>;
-    const counts: VersionCardCounts = { total: rows.length, completed: 0, cancelled: 0, open: 0 };
-    for (const row of rows) {
-      const state = readString(row, "state");
-      if (state === "completed") counts.completed += 1;
-      else if (state === "cancelled") counts.cancelled += 1;
-      else counts.open += 1;
+    return rows.map((row) => ({
+      featureId: readString(row, "feature_id"),
+      state: readString(row, "state"),
+      stage: readStage(row),
+      approval: readApproval(row),
+      decisions: readNullableString(row, "decisions"),
+    }));
+  }
+
+  /**
+   * **删版分档（纯读，零副作用）**（v0.10.7 n1 · 改造文档 §2.1 n1）—— 把「可回池档」伪码
+   * （§2.0，与板侧 `deriveScheduleGateOpen` 逐字同构）落成四桶，供 {@link versionLedgerDelete}
+   * 的拒因分档与清卡事务接线。
+   *
+   * 判据（唯一措辞源 = 改造文档 §2.1 n1 伪码，照抄）：
+   * - **挡删集** = `{state === "completed"}` ∪ `{state ∉ {"completed","cancelled"} ∧ ¬可回池档}`
+   * - **清卡集** = `{state === "cancelled"}` ∪ `{state ∉ {"completed","cancelled"} ∧ 可回池档}`
+   *
+   * 其中**可回池档** = `stage === "需求分析" ∧ approval === "未发起"`（正向严格合取；两枚登记字段
+   * 是两次独立写、不保证同序 ⇒ **不得以 `stage` 单枚代判**）。四桶互斥且并集 = 名下全部卡。
+   *
+   * ⚠ 本函数**只是分档**，不是放行判据的全体：台账行存在性 / `status` 白名单仍归
+   * {@link versionLedgerDelete}（可删集判据**只允许存在于一处**，读面不得另算一份）。
+   */
+  classifyVersionCardsForDelete(
+    ownerGroup: string | null,
+    version: string,
+  ): VersionDeleteClassification {
+    const buckets: VersionDeleteClassification = {
+      blockedCompleted: [],
+      blockedOpen: [],
+      clearPool: [],
+      clearCancelled: [],
+    };
+    for (const card of this.readVersionCardsForDelete(ownerGroup, version)) {
+      if (card.state === "completed") buckets.blockedCompleted.push(card);
+      else if (card.state === "cancelled") buckets.clearCancelled.push(card);
+      else if (isVersionCardBackToPool(card)) buckets.clearPool.push(card);
+      else buckets.blockedOpen.push(card);
     }
-    return counts;
+    return buckets;
   }
 
   // ------------------------------------------------------------------
@@ -5348,14 +5528,17 @@ export function versionLedgerSetStatus(
 
 /**
  * 版本台账**自动转 active**（默认存储；v0.10.0 O2c）—— 见
- * {@link SessionStore.versionLedgerActivate}。引擎内部触发（首个节点派发 / `approve` 放行），
+ * {@link SessionStore.versionLedgerActivate}。引擎内部触发（门① 的 `stage` 登记写 /
+ * `approve` 放行 / 首个节点派发，`trigger` 随 v0.10.7 n3 进事件 payload），
  * 幂等；调用方的节流 / 不阻断护栏见 `bridge/versions-activation.ts`。
+ * 本层 `trigger` **给缺省 `"dispatch"`**（护栏层必填、逐处显式传）。
  */
 export function versionLedgerActivate(
   ownerGroup: string | null,
   version: string,
+  trigger: VersionActivationTrigger = "dispatch",
 ): VersionActivationResult {
-  return getDefaultStore().versionLedgerActivate(ownerGroup, version);
+  return getDefaultStore().versionLedgerActivate(ownerGroup, version, trigger);
 }
 
 /**

@@ -20,14 +20,20 @@
  * |---|---|---|
  * | `/api/versions` | `GET` | `200` + 清单 |
  * | `/api/versions` | `POST` | `201` + 单行 |
- * | `/api/versions/{version}` | `DELETE` | `204`（无体） |
+ * | `/api/versions/{version}` | `DELETE` | `204`（无体 · **v0.10.7 n4 明示**：成功仍 `204` 无体，**被清卡清单不进回执体**，经事件 `version.ledger_deleted` 的 `cleared[]` / `returnedToPool` 承载） |
  * | `/api/versions/{version}/status` | `PATCH` | `200` + 单行（**v0.10.0 O2c**） |
+ *
+ * **`DELETE` 的判据全在 store 写口**（v0.10.7 n1/n2 重写，见 `session/store.ts` 的
+ * {@link versionLedgerDelete}：白名单 `status ∈ {notstart, active}` + 名下无挡删卡 ⇒
+ * **同一事务**删台账行并清名下可清卡的 `version`）。本层**零判据、零行为改动** ——
+ * 只把写口结果映射成传输层形状（拒删 ⇒ `404` / `409` 信封，放行 ⇒ `204`）。
  *
  * **`PATCH …/status`（O2c）**：`{status}` ∈ 三态闭集。`released` ⇒ 转
  * {@link markVersionReleased}（发版闸 O4 + 快照同事务 O7）；`released` 是**终态、不可回退**
  * （现态 `released` 再改态 ⇒ 409 `orch_version_released_locked`）。`notstart ↔ active` ⇒
- * store 的 `versionLedgerSetStatus`。**自动转换不经本口**（引擎内部在首个节点派发 / `approve`
- * 时触发，见 `bridge/versions-activation.ts`）；本口仅承载**人工**设状态意图。
+ * store 的 `versionLedgerSetStatus`。**自动转换不经本口**（引擎内部**三处**触发，经事件 payload
+ * 键 `trigger` 记档：门① 的 `stage` 登记写 = 首触发点（`gate1`）/ `approve` 与首个节点派发
+ * = 幂等兜底（`approve` / `dispatch`），见 `bridge/versions-activation.ts`）；本口仅承载**人工**设状态意图。
  *
  * ## 信封（统一，改造文档 §2.1(2)）
  * 成功：`{ ok: true, … }`；失败：`{ ok: false, error: { code, message } }`。
@@ -454,6 +460,11 @@ class VersionsEndpoints implements VersionsEndpointHandle {
    * **删版**（§2.1(2)）：成功 ⇒ **`204` 无体**（幂等语义由判据保证：重复发第二次落 `404`
    * `orch_version_unknown`，**不是** 500、也不会级联删 `releases`）。
    * 归属走**查询参数** `?owner_group=`（缺省 ⇒ 匿名档 `NULL`）—— 版号本身含 `.` 不宜再拼路径段。
+   *
+   * **v0.10.7 n4 回执裁定（乙案）**：`204` **不改**、被清卡清单**不进回执体** —— 清单 = 事件
+   * `version.ledger_deleted` 的 `cleared[]`（逐卡 `{featureId, cardClass, state, stage, approval, decisions}`）
+   * + `returnedToPool`，由宿主 / 板经事件面读取。判据（白名单 + 挡删卡）与同事务清卡**全在 store 写口**，
+   * 本方法只做「传输层形状 + owner 门闩 + 状态码映射」。
    */
   private handleDelete(req: IncomingMessage, res: ServerResponse, version: string): void {
     if (!this.ownerGate(res)) return;

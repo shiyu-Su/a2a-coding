@@ -57,10 +57,20 @@ async function freePort() {
   return port;
 }
 
-/** 把真 `dist/` + `package.json` 复制到临时板根 ⇒ pidfile / fatal / 台账全落临时目录，不碰现场。 */
+/**
+ * 把真 `dist/` + `package.json` + **运行时依赖** 复制到临时板根 ⇒ pidfile / fatal / 台账全落临时目录，不碰现场。
+ *
+ * 依赖必须一起搬：`dist/index.js` 的模块图里有运行时依赖（v0.10.7 N4 起含 `elkjs`），副本缺
+ * `node_modules` ⇒ 子进程在**模块解析期**就 `ERR_MODULE_NOT_FOUND` 退 1 —— 那早于钩子装载，
+ * `board.fatal.log` 根本不会生成，本文件 ②/③ 的真机用例遂全部拿到空串。
+ */
 function copyBoardRoot(targetRoot, mutate) {
   cpSync(join(BOARD_ROOT, "dist"), join(targetRoot, "dist"), { recursive: true });
   cpSync(join(BOARD_ROOT, "package.json"), join(targetRoot, "package.json"));
+  const deps = JSON.parse(readFileSync(join(BOARD_ROOT, "package.json"), "utf8")).dependencies ?? {};
+  for (const dep of Object.keys(deps)) {
+    cpSync(join(BOARD_ROOT, "node_modules", dep), join(targetRoot, "node_modules", dep), { recursive: true });
+  }
   mutate?.(targetRoot);
   return targetRoot;
 }

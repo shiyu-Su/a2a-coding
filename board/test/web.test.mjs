@@ -11,8 +11,10 @@ import {
   renderChainStateLine,
   renderRequirementForm,
   renderScheduleForm,
-  renderVersionSwitchWarningLine,
-  registeredDecisionDocVersions,
+  renderDocMissingWarningLine,
+  missingRegisteredDecisionDocFiles,
+  registeredDecisionDocRefs,
+  resolveDocDirFromRegistrations,
   renderActionArea,
   renderTurnProgress,
   renderTurnOutcome,
@@ -1054,7 +1056,7 @@ test("N4 renderTurnTrace：无 receipt（null / 键缺席 / agent 漏遵）⇒ �
   assert.equal(legacy.includes("receipt-card"), false, "现状渲染不得带出回执卡痕迹");
 });
 
-// --- B-T4（3300 收编补差）：详情页任务行「三时刻 + 排队/执行时长」 --------------------------
+// --- B-T4（3300 收编补差）：详情页任务行「三时刻 + 执行时长」 --------------------------
 
 const timingsTask = {
   taskId: "t9",
@@ -1073,7 +1075,7 @@ const timingsTask = {
   claimedBy: "m1",
 };
 
-test("renderFeatureDetail: N3 单表 12 列 = # / taskId / 项目 / 职责位 / 状态 / 要点 / 为什么没跑 / 失败类 / 重派 / 依赖 / 排队时长 / 执行时长", () => {
+test("renderFeatureDetail: N3 单表 11 列 = # / taskId / 项目 / 职责位 / 状态 / 要点 / 为什么没跑 / 失败类 / 重派 / 依赖 / 执行时长", () => {
   const html = renderFeatureDetail(
     { ...detailFixture, tasks: [timingsTask] },
     null,
@@ -1082,14 +1084,14 @@ test("renderFeatureDetail: N3 单表 12 列 = # / taskId / 项目 / 职责位 / 
   );
   assert.match(
     html,
-    /<th>#<\/th><th>taskId<\/th><th>项目<\/th><th>职责位<\/th><th>状态<\/th><th>要点<\/th><th>为什么没跑<\/th><th>失败类<\/th><th>重派<\/th><th>依赖<\/th><th>排队时长<\/th><th>执行时长<\/th>/,
+    /<th>#<\/th><th>taskId<\/th><th>项目<\/th><th>职责位<\/th><th>状态<\/th><th>要点<\/th><th>为什么没跑<\/th><th>失败类<\/th><th>重派<\/th><th>依赖<\/th><th>执行时长<\/th>/,
   );
   assert.equal(html.includes("2026-09-26T00:01:30Z"), false, "三时刻原值不再上表（时长列仍在，时刻走 /tasks 面追溯）");
-  assert.match(html, /<td>1m 0s<\/td>/); // 排队时长 queuedAt→claimedAt = 60s
   assert.match(html, /<td>5m 0s<\/td>/); // 执行时长 startedAt→finishedAt = 300s
   const thead = html.slice(html.indexOf("<thead>"), html.indexOf("</thead>"));
-  assert.equal((thead.match(/<th>/g) ?? []).length, 12, "表头单元格计数 === 12");
+  assert.equal((thead.match(/<th>/g) ?? []).length, 11, "表头单元格计数 === 11");
   assert.equal((thead.match(/创建/g) ?? []).length, 0, "「创建」列头退役（grep 判据 = 0）");
+  assert.equal((thead.match(/排队/g) ?? []).length, 0, "「排队」列头退役（grep 判据 = 0）");
 });
 
 test("REQ-04同源复色：执行明细状态列与图 chip 同用 nodeStateOf ⇒ working∧claimed 出 dg-running 类", () => {
@@ -1183,10 +1185,10 @@ test("N3 遮挡治理分工：.fold-body 横滚 = 承重墙，@container 回落�
   assert.equal(body.indexOf("<table>") > 0, true, "表格在 .fold-body 之内（不在其外）");
 });
 
-test("N3 编号单点：图上 chip 的 #n == 单表首列 #n（同 taskId ⇒ 同编号，同一张 taskOrdinalMap）", () => {
+test("N3 编号单点：图上 chip 的 #n == 单表首列 #n（同 taskId ⇒ 同编号，同一张 taskOrdinalMap）", async () => {
   // v0.10.6 F1：编号键 = `createdAt`（登记时刻），本用例**不走**夹具同名缺省值 —— 三枚 `createdAt`
   // 显式给全、互不相同，且序与 `queuedAt` 旧键**相反**（aa1 最早登记却最晚入队）⇒ 改回以 `queuedAt`
-  // 为键即翻红。`queuedAt` 不删 = 「时长键与号键并存」（排队时长列仍以 `queuedAt` 为键）。
+  // 为键即翻红。`queuedAt` 不删 = 投影仍带该字段，板侧执行明细已无消费方（v0.10.7 该时长列退役）。
   const tasks = [
     { ...timingsTask, taskId: "aa1", createdAt: "2026-09-26T00:01:00Z", queuedAt: "2026-09-26T00:03:00Z" },
     { ...timingsTask, taskId: "aa2", createdAt: "2026-09-26T00:02:00Z", queuedAt: "2026-09-26T00:01:00Z", dependencies: ["aa1"] },
@@ -1195,7 +1197,7 @@ test("N3 编号单点：图上 chip 的 #n == 单表首列 #n（同 taskId ⇒ �
   const ordinals = taskOrdinalMap(tasks);
   assert.deepEqual([...ordinals.entries()], [["aa1", 1], ["aa2", 2], ["aa3", 3]], "createdAt 升序、queuedAt 旧键不参与定序（单点口径）");
 
-  const graph = renderDependencyGraphSection(tasks, 1);
+  const graph = await renderDependencyGraphSection(tasks, 1);
   const html = renderFeatureDetail({ ...detailFixture, tasks }, null, "trace 关闭", NOW, false, [], {
     graphHtml: graph.html,
   });
@@ -1216,17 +1218,17 @@ test("N3 编号单点：图上 chip 的 #n == 单表首列 #n（同 taskId ⇒ �
   }
 });
 
-test("renderFeatureDetail: 单表行 12 列 + 老桥缺字段逐格容错为 —（不炸页、不推算）", () => {
+test("renderFeatureDetail: 单表行 11 列 + 老桥缺字段逐格容错为 —（不炸页、不推算）", () => {
   const html = renderFeatureDetail(detailFixture, null, "trace 关闭", NOW);
   const start = html.indexOf('<tr><td>1</td><td class="mono" title="t1">t1</td>');
   const end = html.indexOf("</tr>", start);
   const row = html.slice(start, end);
   const cells = row.slice("<tr>".length).split("</td>").slice(0, -1);
-  assert.equal(cells.length, 12, "任务行固定 12 列（N3 列序：# / taskId / 项目 / 职责位 / 状态 / 要点 / 为什么没跑 / 失败类 / 重派 / 依赖 / 排队时长 / 执行时长）");
+  assert.equal(cells.length, 11, "任务行固定 11 列（N3 列序：# / taskId / 项目 / 职责位 / 状态 / 要点 / 为什么没跑 / 失败类 / 重派 / 依赖 / 执行时长）");
   assert.deepEqual(
-    cells.slice(-5),
-    ["<td>timeout", "<td>1", "<td>t0", "<td>—", "<td>—"],
-    "末 5 列换人（旧=创建/开始/结束/排队/执行 ⇒ 新=失败类/重派/依赖/排队/执行）；老桥缺时长字段 ⇒ 末两列 —；依赖 t0 不在本需求任务集 ⇒ 无编号可引，回落短标不吞",
+    cells.slice(-4),
+    ["<td>timeout", "<td>1", "<td>t0", "<td>—"],
+    "末 4 列 = 失败类 / 重派 / 依赖 / 执行时长；老桥缺时长字段 ⇒ 末列 —；依赖 t0 不在本需求任务集 ⇒ 无编号可引，回落短标不吞",
   );
   assert.deepEqual(
     [cells[3], cells[5], cells[6]],
@@ -1243,7 +1245,6 @@ test("renderFeatureDetail: 在飞任务（有 startedAt 无 finishedAt）执行�
     NOW,
   );
   assert.doesNotMatch(html, /<td>5m 0s<\/td>/);
-  assert.match(html, /<td>1m 0s<\/td>/); // 排队时长 queuedAt→claimedAt 不受在飞影响
   assert.ok(html.includes("<td>—</td></tr>"), "末列执行时长 = —");
 });
 
@@ -1331,7 +1332,8 @@ test("BD11 renderRequirementForm：未配默认组织 ⇒ group 必填 + 首次�
 });
 
 // ---------------------------------------------------------------------------
-// v0.9.2 M6：提需求 version 去必填 + 排期表单 GET 面 + 改版失联警示行
+// v0.9.2 M6：提需求 version 去必填 + 排期表单 GET 面 + 失联警示行
+// （失联判据自 REQ-2026-10-15-05 N6 起 = **登记路径在盘上是否存在**，不再是「登记版本 ≠ 当前版本」）
 // ---------------------------------------------------------------------------
 
 test("M6 renderRequirementForm：version 去必填（无 required、label 无 *），placeholder 提示「留空 = 未排期」", () => {
@@ -1350,28 +1352,59 @@ test("M6 renderScheduleForm：单输入 + version 键恒携带 + 当前值回填
   assert.match(renderScheduleForm("F1", null), /name="version" value=""/, "未排期 ⇒ 空值回填（键仍恒在）");
 });
 
-test("M6 registeredDecisionDocVersions：取 decisions 里的文档版本段（去重、无 .md ⇒ 空）", () => {
+test("N5 registeredDecisionDocRefs / resolveDocDirFromRegistrations：读锚目录段 = 该 file 的末条带段登记（保首次出现序、无 .md ⇒ 空）", () => {
   const decisions = JSON.stringify([
     "doc/v0.9.1/甲-改造文档.md 已确认",
     "doc/v0.9.1/甲-需求确认单.md",
     "doc/v0.9.2/乙-改造文档.md",
     "无路径的一条 note",
+    "改版善后回填：doc/v0.9.3/甲-改造文档.md",
   ]);
-  assert.deepEqual(registeredDecisionDocVersions(decisions), ["v0.9.1", "v0.9.2"]);
-  assert.deepEqual(registeredDecisionDocVersions(null), []);
+  assert.deepEqual(registeredDecisionDocRefs(decisions), [
+    { file: "甲-改造文档.md", dir: "v0.9.3" },
+    { file: "甲-需求确认单.md", dir: "v0.9.1" },
+    { file: "乙-改造文档.md", dir: "v0.9.2" },
+  ], "序 = 各 file 首次出现序；同一 file 的目录段取末条带段登记");
+  assert.equal(resolveDocDirFromRegistrations(decisions, "甲-改造文档.md"), "v0.9.3", "末条带段登记 ⇒ 读锚跟着走");
+  assert.equal(resolveDocDirFromRegistrations(decisions, "丙-未登记.md"), null, "未命中 ⇒ null（调用方回落 version）");
+  assert.equal(resolveDocDirFromRegistrations(decisions, ""), null, "空 file 不解析");
+  assert.deepEqual(registeredDecisionDocRefs(null), []);
 });
 
-test("M6 renderVersionSwitchWarningLine：登记版本 ≠ 当前版本 ⇒ 警示行；一致 / 无登记 ⇒ 空串", () => {
+test("N5 registeredDecisionDocRefs：无目录段的登记 ⇒ dir=null（回落由调用方承载），且不覆盖既有带段登记", () => {
+  const bare = JSON.stringify(["doc/甲-需求确认单.md"]);
+  assert.deepEqual(registeredDecisionDocRefs(bare), [{ file: "甲-需求确认单.md", dir: null }], "单段登记 ⇒ dir=null，不臆造目录");
+  const later = JSON.stringify(["doc/v0.9.3/甲-改造文档.md", "裸引用 doc/甲-改造文档.md"]);
+  assert.equal(resolveDocDirFromRegistrations(later, "甲-改造文档.md"), "v0.9.3", "末条无段 ⇒ 既有的带段登记不被打没");
+});
+
+test("M6 N6 renderDocMissingWarningLine：判据 = 登记路径盘上缺失 ⇒ 警示行点名该文档；在盘上 / 未预算 / 无登记 ⇒ 空串", () => {
   const decisions = JSON.stringify(["doc/v0.9.1/甲-改造文档.md"]);
-  const warn = renderVersionSwitchWarningLine(decisions, "v0.9.2");
-  assert.match(warn, /文档读锚将随版本切换/);
+  const warn = renderDocMissingWarningLine(decisions, new Map([["甲-改造文档.md", false]]));
   assert.match(warn, /class="hint warn"/);
-  assert.match(warn, /v0\.9\.1/, "点名失联的旧版本");
-  assert.match(warn, /不搬文档目录/);
-  assert.equal(renderVersionSwitchWarningLine(decisions, "v0.9.1"), "", "版本一致 ⇒ 不警示");
-  assert.equal(renderVersionSwitchWarningLine(null, "v0.9.2"), "", "无文档登记 ⇒ 不警示");
-  assert.equal(renderVersionSwitchWarningLine(JSON.stringify(["纯 note，无文档"]), "v0.9.2"), "");
-  assert.match(renderVersionSwitchWarningLine(decisions, ""), /当前版本（<code>未排期<\/code>）/, "改到未排期也如实点名");
+  assert.match(warn, /在盘上未找到/);
+  assert.match(warn, /甲-改造文档\.md/, "点名失联的是那份文档，不是「版本」");
+  assert.match(warn, /读锚按登记路径定位/);
+  assert.match(warn, /盘上没有即是没有/);
+  assert.equal(
+    renderDocMissingWarningLine(decisions, new Map([["甲-改造文档.md", true]])),
+    "",
+    "登记版本 ≠ 当前版本但盘上有该文档 ⇒ 不警示（旧「打不开」语义已翻）",
+  );
+  assert.equal(renderDocMissingWarningLine(decisions, undefined), "", "调用方未预算 ⇒ 视图不猜盘上事实");
+  assert.equal(renderDocMissingWarningLine(null, new Map([["甲-改造文档.md", false]])), "", "无文档登记 ⇒ 不警示");
+  assert.equal(renderDocMissingWarningLine(JSON.stringify(["纯 note，无文档"]), new Map([["x.md", false]])), "");
+});
+
+test("N6 missingRegisteredDecisionDocFiles：只把预算为 false 的登记项算失联（保序）；true / 缺席 ⇒ 不算", () => {
+  const decisions = JSON.stringify(["doc/v0.9.1/甲-改造文档.md", "doc/v0.9.1/乙-需求确认单.md", "doc/pool/丙-改造文档.md"]);
+  assert.deepEqual(
+    missingRegisteredDecisionDocFiles(decisions, new Map([["乙-需求确认单.md", false], ["丙-改造文档.md", false]])),
+    ["乙-需求确认单.md", "丙-改造文档.md"],
+    "失联清单按登记序、只含 false 项",
+  );
+  assert.deepEqual(missingRegisteredDecisionDocFiles(decisions, new Map([["甲-改造文档.md", true]])), []);
+  assert.deepEqual(missingRegisteredDecisionDocFiles(decisions, new Map()), [], "未预算任何一条 ⇒ 不警示（fail-open 到「没有事实就不说」）");
 });
 
 test("renderFeatureDetail 阶段产出（按需求归约）：警示行 + 清单 + note 条目三区共存", () => {
@@ -1381,18 +1414,28 @@ test("renderFeatureDetail 阶段产出（按需求归约）：警示行 + 清单
     "本轮裁决：数据源改 decisions 驱动",
     "产出：doc/v0.9.1/甲-改造文档.md",
   ]);
-  const html = renderFeatureDetail(detail, null, null, NOW);
+  const html = renderFeatureDetail(detail, null, null, NOW, false, [], {
+    docExists: new Map([["甲-改造文档.md", false]]),
+  });
   assert.match(html, /<h2>阶段产出<\/h2>/);
-  assert.match(html, /class="hint warn"[\s\S]*文档读锚将随版本切换/, "失联警示在区内");
+  assert.match(html, /class="hint warn"[\s\S]*在盘上未找到/, "失联警示在区内（判据 = 盘上缺失）");
   assert.match(html, />甲-改造文档\.md<\/a>/, "警示不吞条目");
   assert.match(html, /本轮裁决：数据源改 decisions 驱动/, "非 doc 条目同区保留");
   assert.doesNotMatch(html, /产出登记（decisions）/, "旧第二区已合并消失");
+  const clean = renderFeatureDetail(detail, null, null, NOW, false, [], {
+    docExists: new Map([["甲-改造文档.md", true]]),
+  });
+  assert.doesNotMatch(clean, /class="hint warn"[\s\S]*在盘上未找到/, "盘上有该文档 ⇒ 无警示行（改版不搬文档 = 正常形态）");
 });
 
-test("registeredDecisionDocVersions 只认 doc/ 前缀登记：裸版本目录形态与提及 README 不计警示", () => {
+test("registeredDecisionDocRefs 只认 doc/ 前缀登记：裸版本目录形态与提及 README 不进清单", () => {
   const decisions = JSON.stringify(["参照 v0.9.1/乙-改造文档.md（他需求路径，非本需求登记）", "口径见 README.md", "doc/v0.9.1/甲-需求确认单.md"]);
-  assert.deepEqual(registeredDecisionDocVersions(decisions), ["v0.9.1"]);
-  assert.equal(registeredDecisionDocVersions(JSON.stringify(["doc/甲-需求确认单.md"])).length, 0, "单段无版本 ⇒ 不产警示版本段");
+  assert.deepEqual(registeredDecisionDocRefs(decisions), [{ file: "甲-需求确认单.md", dir: "v0.9.1" }]);
+  assert.deepEqual(
+    registeredDecisionDocRefs(JSON.stringify(["doc/甲-需求确认单.md"])).filter((ref) => ref.dir !== null).length,
+    0,
+    "单段无目录 ⇒ 不产目录段（读锚回落当前版本）",
+  );
 });
 
 test("M6 renderFeatureDetail：withScheduleForm=true ⇒ 排期表单在本页（GET 面）；缺省不渲染（向后兼容）", () => {

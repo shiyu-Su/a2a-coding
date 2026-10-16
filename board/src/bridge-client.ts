@@ -308,7 +308,10 @@ export interface EngineVersionEntry {
   version: string;
   /**
    * 版本状态（三态 `notstart / active / released`）。值域**不归一、不校验、不回落** —— 非字符串 ⇒
-   * `null`，由消费侧按「非 `released`」处理（缺状态绝不当作已发版）。
+   * `null`，由消费侧按**白名单** `{notstart, active}` 处理（REQ-2026-10-15-05 N1 / N8）：
+   * **脏值 / `null` ⇒ 拒删侧**（可删版号集合只认两枚字面取值，未知状态一律不入集 —— 只紧不松）。
+   * 旧句式「按非 `released` 处理」**已作废** —— 黑名单会把缺键 / 脏值当成可删。
+   * 判据单点见 `server.ts` 的 `deletableVersionSetOf`（**显示判据**，不是引擎写闸）。
    */
   status: string | null;
 }

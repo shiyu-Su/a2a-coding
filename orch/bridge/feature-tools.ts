@@ -98,7 +98,7 @@ import {
   versionLedgerStatus,
 } from "../session/store.js";
 import { EVENT_FAILURE_REPORT, planResume } from "./scheduler.js";
-import { activateVersionForFeature } from "./versions-activation.js";
+import { activateVersionForFeature, versionActivator } from "./versions-activation.js";
 import type {
   FeatureContextPatch,
   FeatureProjectRecord,
@@ -2074,6 +2074,26 @@ export function handleFeatureAdvance(
     // **宿主显式登记写**（门①抬「改造方案」、发版流程写「发版」都走这一格），派生若介入即覆盖显式写。
     applyFeatureContext(feature.featureId, args);
     updateFeatureRegistration(feature.featureId, reg.patch);
+    // ---- 门①（需求确认）= 版本 `notstart → active` 的**首触发点**（v0.10.7 n3 / 引擎映射 §3.5）----
+    // 判据逐字 = 门① 两守卫的前三条件（「本次携带 `stage` 写」∧「目标值 ≠ 需求分析」∧「当前 stage =
+    // 需求分析」）⇒ 由「需求分析迁入」才算过门。**位置硬约束**：必须在 `updateFeatureRegistration`
+    // **成功之后** —— 上面两处门① 守卫的拒因 `return` 都发生在本行之前 ⇒ 守卫未过永不触发，
+    // 否则等于开出「没过门也抬版」的第二条旁路。**禁挂 store 层 `updateFeatureRegistration`**
+    // （五条路径共用同一写口，挂在那里语义即崩）。
+    // ⚠ 版号显式传**生效值** `reg.patch.version ?? feature.version`：门① 允许同单写 `version` + 抬
+    // `stage`，套 `activateVersionForFeature(feature)` 吃的是写前快照 ⇒ 会激活**旧**版号。
+    // 三护栏（幂等 / 不阻断 / 节流）照旧，`approve` 与首派发两处保留作幂等兜底。
+    if (
+      reg.patch.stage !== undefined &&
+      reg.patch.stage !== "需求分析" &&
+      feature.stage === "需求分析"
+    ) {
+      versionActivator.activate(
+        feature.ownerGroup,
+        reg.patch.version ?? feature.version,
+        "gate1",
+      );
+    }
     const success: FeatureAdvanceExit = {
       ok: true,
       featureId: feature.featureId,
@@ -2474,10 +2494,11 @@ export function handleFeatureApprove(
   const updated = updateFeatureState(feature.featureId, target);
   // 过审即把门状态落定（**单向、无回边**）：同一张单不得被重复过审解释
   updateFeatureRegistration(feature.featureId, { approval: "已通过" });
-  // v0.10.0 O2c：`approve` 放行 = 版本「notstart → active」自动转换的触发点之一
-  // （引擎内部 · 幂等 · 不阻断；事件 `version.activated` 由 store 写口同事务落）。
+  // v0.10.0 O2c：`approve` 放行 = 版本「notstart → active」的触发点之一；v0.10.7 n3 起该点**前移门①**，
+  // 本格降级为**幂等兜底**（门① 已抬版 ⇒ 此处恒 `activated = false`、零事件）。
+  // （引擎内部 · 幂等 · 不阻断；事件 `version.activated` 由 store 写口同事务落，`trigger = "approve"`）。
   // 版本面故障绝不拖垮过审：`activateVersionForFeature` 自带 try/catch 护栏（见 versions-activation.ts）。
-  activateVersionForFeature(feature);
+  activateVersionForFeature(feature, "approve");
   const success: FeatureApproveSuccess = {
     ok: true,
     featureId: feature.featureId,

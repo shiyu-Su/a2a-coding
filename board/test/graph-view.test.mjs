@@ -26,53 +26,16 @@ import {
   buildGraphWithPipelines,
   nodeStateOf,
   renderDependencyGraphSection,
-  layerOfGraph,
-  compressPipeLayers,
-  pipeGridLayout,
-  routeIntraEdges,
-  arcPath,
-  busPath,
-  crossPath,
   DG_EDGE_CLS,
   DG_EDGE_CROSS_CLS,
   DG_NODE_W,
   DG_NODE_H,
   DG_BADGE_H,
-  DG_ROW_GAP,
-  DG_COL_GAP_MIN,
-  DG_LANE_PITCH,
-  DG_LANE_MIN,
-  DG_ARC_K_MAX,
-  DG_BUS_PITCH,
-  DG_PAD_L,
-  DG_PAD_T,
-  DG_PAD_B,
-  DG_PAD_R,
   DG_FRAME_BORDER,
   DG_FRAME_TITLE_H,
   DG_FRAME_PAD,
   DG_GRID_ORIGIN_X,
   DG_GRID_ORIGIN_Y,
-  DG_CANVAS_GUTTER,
-  DG_CANVAS_PAD,
-  canvasLayout,
-  planCanvas,
-  DG_BAND_MAX_PASSES,
-  DG_FRAME_GAP_MIN,
-  DG_CROSS_MIN,
-  shiftPipeGrid,
-  routeCrossFrameEdges,
-  pickCrossCorridors,
-  corridorPath,
-  DG_CORRIDOR_MIN_RUN,
-  DG_CORRIDOR_BULGE_MAX,
-  DG_CORRIDOR_MARGIN_STEP,
-  DG_OUTER_MARGIN_SEATS,
-  DG_PAD_STRIP_SEATS,
-  layerCrossApproach,
-  DG_APPROACH_SEAT_PITCH,
-  DG_APPROACH_MAX_OFF,
-  DG_APPROACH_LEAD,
   NODE_STATE_ORDER,
   NODE_STATE_LEGEND_LABELS,
   NODE_STATE_GLYPHS,
@@ -83,6 +46,8 @@ import {
   QUEUE_STATE_RUNNING,
   QUEUE_STATE_QUEUED,
 } from "../dist/graph-view.js";
+import { layoutGraphGuarded } from "../dist/graph-elk.js";
+import { devOf, overlap, penCount } from "./helpers/geom-assert.mjs";
 
 const task = (taskId, state = "completed", dependencies = [], extra = {}) => ({
   taskId,
@@ -125,10 +90,106 @@ const edgePaths = (html) => [...html.matchAll(EDGE_PATH_RE)].map((m) => ({ cls: 
 const crossClsCount = (paths) => paths.filter((e) => e.cls === DG_EDGE_CROSS_CLS).length;
 
 // ---------------------------------------------------------------------------
+// v0.10.7 承接轨 N6：**行为级取数面**（改造文档 §4「行为级四把尺」的喂数侧）
+//
+// 本面对象 = **渲染出参 HTML / SVG**，不碰任何布局函数或路由原语。几何尺度只从 `.dg-canvas`
+// 的 style 里那六枚 CSS 变量反解（`--dg-nw/--dg-nh/--dg-bh/--dg-fb/--dg-fth/--dg-fp`）——
+// 渲染层下发它们正是为了让 CSS 与 JS 同源，测试面据此同源 ⇒ §2.3 的退休清单落地、`DG_*` 常量
+// 从导出面消失之后，本面照跑（这是「降级为行为级」的实际含义，不只是把断言换成人话）。
+// ---------------------------------------------------------------------------
+
+/** 画布 style 里的六枚几何 CSS 变量（缺任一枚即红 —— 本面唯一的尺度源不得静默兜底）。 */
+function canvasVarsOf(html) {
+  const m = /<div class="dg-canvas" style="([^"]*)">/.exec(html);
+  assert.ok(m !== null, "画布层在场且带 style（行为级取数面的入口）");
+  const vars = {};
+  for (const kv of m[1].split(";")) {
+    const i = kv.indexOf(":");
+    if (i < 0) continue;
+    const key = kv.slice(0, i).trim();
+    if (key.startsWith("--dg-")) vars[key] = parseFloat(kv.slice(i + 1));
+  }
+  for (const key of ["--dg-nw", "--dg-nh", "--dg-bh", "--dg-fb", "--dg-fth", "--dg-fp"])
+    assert.ok(Number.isFinite(vars[key]), `画布下发几何变量 ${key}（本面唯一尺度源，缺即判红不兜底）`);
+  return vars;
+}
+
+/**
+ * 渲染出参 HTML → 行为级场景 `{ vars, originX, originY, frames, chips, paths }`（全部**画布坐标**）。
+ *
+ * - `frames` = 每枚 `details.pipe` 的外缘固定盒；`cells` = 该框子树内的**局部** cell（复用 `renderedCells`）。
+ * - `chips` = cell 局部值 → 画布盒：`x = 框 left + originX + cell.left`、`y = 框 top + originY + 角标带 + cell.top`，
+ *   宽高取 CSS 变量 —— 与渲染层同一换算，但加数全部来自出参。
+ * - `titleBand` = 该框的标题带盒（外缘起、到网格原点止）；「容器标题不被节点压住」（真机验收清单 #4）
+ *   在 DOM 侧就是 chip 盒与它的零交。
+ */
+function behaviorSceneOf(html) {
+  const vars = canvasVarsOf(html);
+  const originX = vars["--dg-fb"] + vars["--dg-fp"];
+  const originY = vars["--dg-fb"] + vars["--dg-fth"];
+  const box = /<div class="dg-canvas" style="width:(-?\d+(?:\.\d+)?)px;height:(-?\d+(?:\.\d+)?)px/.exec(html);
+  assert.ok(box !== null, "画布固定盒声明 width / height（零出血判据的容器）");
+  const canvas = /<div class="dg-canvas"[^>]*>\s*<svg class="dg-links">([\s\S]*?)<\/svg>/.exec(html);
+  assert.ok(canvas !== null, "画布级边线层恰一枚 svg.dg-links（全部 path 同池）");
+  const paths = edgePaths(canvas[1]);
+  const frames = [];
+  for (const chunk of html.split('<details class="pipe" open style="').slice(1)) {
+    const body = chunk.slice(0, chunk.indexOf("</details>"));
+    const m = /^left:(-?\d+(?:\.\d+)?)px;top:(-?\d+(?:\.\d+)?)px;width:(-?\d+(?:\.\d+)?)px;height:(-?\d+(?:\.\d+)?)px">\s*<summary>管道 ([^（]+)（/.exec(
+      body,
+    );
+    assert.ok(m !== undefined, `框 = 固定盒四枚几何字面（left/top/width/height）+ summary（实得 ${body.slice(0, 80)}…）`);
+    frames.push({ projectId: m[5], box: { x: Number(m[1]), y: Number(m[2]), w: Number(m[3]), h: Number(m[4]) }, cells: renderedCells(body) });
+  }
+  const chips = [];
+  for (const f of frames) {
+    for (const [taskId, c] of f.cells) {
+      chips.push({
+        taskId,
+        projectId: f.projectId,
+        box: { x: f.box.x + originX + c.left, y: f.box.y + originY + vars["--dg-bh"] + c.top, w: vars["--dg-nw"], h: vars["--dg-nh"] },
+        titleBand: { x: f.box.x, y: f.box.y, w: f.box.w, h: originY },
+        frame: f.box,
+      });
+    }
+  }
+  return {
+    vars,
+    originX,
+    originY,
+    canvas: { w: Number(box[1]), h: Number(box[2]) },
+    frames,
+    chips,
+    paths,
+  };
+}
+
+/** 行为级场景里的 taskId → chip 盒（`undefined` = 该 id 不在任何框内，调用侧断言存在）。 */
+const chipOf = (scene, taskId) => scene.chips.find((c) => c.taskId === taskId);
+
+/**
+ * 折线首末点 → 两端 chip（**几何反查**，不读 `d` 里的 id 也不读模型）：
+ * 首点须贴在某盒的右缘中点、末点贴在某盒的左缘中点（容差 0.6px = 出参两位小数收拢的余量）。
+ * 找不到 ⇒ null（调用侧判红，不得静默跳过）。
+ */
+function chipByEndpoint(scene, p, side) {
+  return (
+    scene.chips.find((c) => {
+      const x = side === "from" ? c.box.x + c.box.w : c.box.x;
+      return Math.abs(p[0] - x) < 0.6 && Math.abs(p[1] - (c.box.y + c.box.h / 2)) < 0.6;
+    }) ?? null
+  );
+}
+
+/** 全部折线段是否**轴对齐**（ELK ORTHOGONAL 的行为级读面：无斜段 = 无「不直」）。 */
+const allAxisAligned = (pts) =>
+  pts.every((p, i) => i === 0 || Math.abs(p[0] - pts[i - 1][0]) < 0.01 || Math.abs(p[1] - pts[i - 1][1]) < 0.01);
+
+// ---------------------------------------------------------------------------
 // ① 构图 · 多节点（N2c 起：边方向钉构图面，形态钉自绘面）
 // ---------------------------------------------------------------------------
 
-test("T2-①多节点：3 任务链 a→b→c 的边方向 = 依赖项→依赖者，全节点入图", () => {
+test("T2-①多节点：3 任务链 a→b→c 的边方向 = 依赖项→依赖者，全节点入图", async () => {
   const tasks = [
     task("task-aaaaaaaa", "completed", []),
     task("task-bbbbbbbb", "completed", ["task-aaaaaaaa"]),
@@ -142,7 +203,7 @@ test("T2-①多节点：3 任务链 a→b→c 的边方向 = 依赖项→依赖�
   );
   assert.deepEqual(g.cycleEdges, []);
   assert.deepEqual(g.dangling, []);
-  const s = renderDependencyGraphSection(tasks);
+  const s = (await renderDependencyGraphSection(tasks));
   assert.match(s.html, /<h2>依赖图（3 任务 · 1 管道 · 声明 2 边（本质 2 · 传递省略 0））<\/h2>/, "同 project ⇒ 单条管道");
   assert.equal(
     (s.html.match(/<span class="dg-arrow">→<\/span>/g) ?? []).length,
@@ -164,7 +225,7 @@ test("T2-①多节点：3 任务链 a→b→c 的边方向 = 依赖项→依赖�
     s.html.includes('title="task-cccccccc · #3 · 执行中（不可辨） · 依赖：task-bbbbbbbb">#3</span>'),
     "末节点状态中文按六态档（working 无 queueState ⇒ 回落档）",
   );
-  const isolated = renderDependencyGraphSection([task("task-dddddddd", "weird-state")]);
+  const isolated = (await renderDependencyGraphSection([task("task-dddddddd", "weird-state")]));
   assert.ok(
     isolated.html.includes('<span class="dg-chip dg-unknown" title="task-dddddddd · #1 · weird-state · 依赖：无">'),
     "未知态回落 unknown 档",
@@ -172,19 +233,19 @@ test("T2-①多节点：3 任务链 a→b→c 的边方向 = 依赖项→依赖�
   assert.ok(isolated.html.includes("weird-state"), "原样态名，不吞不猜");
 });
 
-test("T2-①空依赖：全无依赖 ⇒ 全孤立节点、零边、出图不为空", () => {
+test("T2-①空依赖：全无依赖 ⇒ 全孤立节点、零边、出图不为空", async () => {
   const g = buildTaskGraph([task("task-11111111"), task("task-22222222", "working", null)]);
   assert.deepEqual(g.edges, []);
   assert.deepEqual(g.dangling, []);
-  const s = renderDependencyGraphSection(g.nodes);
+  const s = (await renderDependencyGraphSection(g.nodes));
   assert.notEqual(s.html, "", "有任务 ⇒ 区块不为空（原「源不为 null」的自绘等价）");
   assert.match(s.html, /<h2>依赖图（2 任务 · 1 管道 · 声明 0 边（本质 0 · 传递省略 0））<\/h2>/, "零边进标题计数（原「源内无 -->」的自绘等价；N2 起边数恒出「声明 / 本质 / 省略」三数）");
   assert.equal(s.html.includes("dg-edges"), false, "无跨管道边 ⇒ 边清单整行不渲");
   assert.ok(s.html.includes('title="task-11111111 · #1 · 已完成 · 依赖：无"'), "孤立节点仍入图（不吞）");
 });
 
-test("T2-①空任务集（v0.9.5 C2 短路③）⇒ 依赖图整节不渲染", () => {
-  const s = renderDependencyGraphSection([]);
+test("T2-①空任务集（v0.9.5 C2 短路③）⇒ 依赖图整节不渲染", async () => {
+  const s = (await renderDependencyGraphSection([]));
   assert.equal(s.html, "", "空图连「（无任务，暂无依赖图）」的提示行都不出（Step 0 卡零信息量）");
 });
 
@@ -192,7 +253,7 @@ test("T2-①空任务集（v0.9.5 C2 短路③）⇒ 依赖图整节不渲染", 
 // ② 环防御
 // ---------------------------------------------------------------------------
 
-test("T2-②环防御：a⇄b 互依赖 ⇒ 成环边不画 + cycleEdges 登记，其余节点照画", () => {
+test("T2-②环防御：a⇄b 互依赖 ⇒ 成环边不画 + cycleEdges 登记，其余节点照画", async () => {
   const g = buildTaskGraph([
     task("task-aaaaaaaa", "completed", ["task-bbbbbbbb"]),
     task("task-bbbbbbbb", "failed", ["task-aaaaaaaa"]),
@@ -204,20 +265,20 @@ test("T2-②环防御：a⇄b 互依赖 ⇒ 成环边不画 + cycleEdges 登记�
   assert.ok(g.nodes.length === 3);
 });
 
-test("T2-②自依赖也算环边（防御性），不产出自环画法", () => {
+test("T2-②自依赖也算环边（防御性），不产出自环画法", async () => {
   const g = buildTaskGraph([task("task-aaaaaaaa", "working", ["task-aaaaaaaa"])]);
   assert.deepEqual(g.cycleEdges, [{ from: "task-aaaaaaaa", to: "task-aaaaaaaa" }]);
   assert.deepEqual(g.edges, []);
 });
 
-test("T2-②悬空依赖（跨需求/未登记 id）⇒ 不画边 + dangling 登记", () => {
+test("T2-②悬空依赖（跨需求/未登记 id）⇒ 不画边 + dangling 登记", async () => {
   const g = buildTaskGraph([
     task("task-aaaaaaaa", "completed", ["task-external0"]),
     task("task-bbbbbbbb", "completed", ["task-aaaaaaaa"]),
   ]);
   assert.deepEqual(g.dangling, [{ from: "task-aaaaaaaa", dep: "task-external0" }]);
   assert.deepEqual(g.edges.map((e) => `${e.from}->${e.to}`), ["task-aaaaaaaa->task-bbbbbbbb"]);
-  const s = renderDependencyGraphSection(g.nodes.map((n) => ({ ...n })));
+  const s = (await renderDependencyGraphSection(g.nodes.map((n) => ({ ...n }))));
   assert.match(s.html, /class="hint warn"/);
   assert.ok(s.html.includes(`${short("task-aaaaaaaa")} ⇢ ${short("task-external0")}`));
 });
@@ -226,11 +287,11 @@ test("T2-②悬空依赖（跨需求/未登记 id）⇒ 不画边 + dangling 登
 // ③ application/json 数据通道（不入闭集、源文本不拼 HTML）
 // ---------------------------------------------------------------------------
 
-test("T2-③零 script 面（N2b 自绘取代数据通道）：区块不出任何 script 标签，脏字符入 title 落实体形态", () => {
-  const s = renderDependencyGraphSection([
+test("T2-③零 script 面（N2b 自绘取代数据通道）：区块不出任何 script 标签，脏字符入 title 落实体形态", async () => {
+  const s = (await renderDependencyGraphSection([
     task("task-aaaaaaaa", "completed", []),
     task('x"b<c', "working", ["task-aaaaaaaa"]),
-  ]);
+  ]));
   assert.equal(s.html.includes("<script"), false, "零 script 标签（含 application/json 数据通道形态）");
   assert.equal(s.html.includes("mermaid-block"), false, "不再出 mermaid 块容器");
   assert.equal(s.html.includes("dg-edges"), false, "同管道 ⇒ 无跨管道边 ⇒ 边清单整行不渲");
@@ -242,8 +303,8 @@ test("T2-③零 script 面（N2b 自绘取代数据通道）：区块不出任�
   assert.equal(s.html.includes('"b<c'), false, "title 内不得出现未转义的裸引号 / 尖括号");
 });
 
-test("T2-③区块结构（N2b 自绘）：标题计数 + 六态图例 + 原生管道 details + chip，零 mermaid 块", () => {
-  const s = renderDependencyGraphSection([task("task-aaaaaaaa", "blocked")]);
+test("T2-③区块结构（N2b 自绘）：标题计数 + 六态图例 + 原生管道 details + chip，零 mermaid 块", async () => {
+  const s = (await renderDependencyGraphSection([task("task-aaaaaaaa", "blocked")]));
   assert.match(s.html, /<h2>依赖图（1 任务 · 1 管道 · 声明 0 边（本质 0 · 传递省略 0））<\/h2>/, "标题计数 = 任务 / 管道 + 边三数（声明 / 本质 / 省略，v0.10.5 N2 恒全形）");
   assert.match(s.html, /class="hint dg-legend-row"/);
   assert.equal(
@@ -260,8 +321,8 @@ test("T2-③区块结构（N2b 自绘）：标题计数 + 六态图例 + 原生�
   assert.match(s.html, /<summary>管道 proj-a（1）<span class="dg-pipe-states">▨<\/span><\/summary>/);
   assert.match(
     s.html,
-    /<div class="dep-graph">\n<div class="dg-canvas" style="[^"]*">\n<svg class="dg-links"><\/svg>\n<details class="pipe" open style="[^"]*">\n<summary>管道 proj-a（1）<span class="dg-pipe-states">▨<\/span><\/summary>\n<div class="pipe-body"><div class="dg-grid" style="[^"]*"><span class="dg-cell" style="left:12px;top:12px"><span class="dg-chip dg-frozen"[^>]*>#1<\/span><\/span><\/div><\/div>\n<\/details>\n<\/div>\n<\/div>/,
-    "G10 翻案（⑦(ii) 合并单画布 S1 · 改造文档 §2.2.1 / §4.4，承原 G5 翻案（②）+ 件一翻案（增补 §6.1）原地重指向）：结构 = dep-graph › dg-canvas ›【画布级 svg.dg-links —— **已从框内搬出**、零边时空 svg 照出】› details.pipe（固定盒）› summary + pipe-body › dg-grid › dg-cell › chip；cell 的 left/top 局部值逐字不变；`.dg-deps` 角标带外壳随 C5 退役（14px 行距改由 `.dg-cell` 的 `padding-top` 承接，见件一① 翻案）",
+    /<div class="dep-graph">\n<div class="dg-canvas" style="[^"]*">\n<svg class="dg-links"><\/svg>\n<details class="pipe" open style="[^"]*">\n<summary>管道 proj-a（1）<span class="dg-pipe-states">▨<\/span><\/summary>\n<div class="pipe-body"><div class="dg-grid" style="[^"]*"><span class="dg-cell" style="[^"]*"><span class="dg-chip dg-frozen"[^>]*>#1<\/span><\/span><\/div><\/div>\n<\/details>\n<\/div>\n<\/div>/,
+    "G10 翻案（⑦(ii) 合并单画布 S1 · 改造文档 §2.2.1 / §4.4，承原 G5 翻案（②）+ 件一翻案（增补 §6.1）原地重指向）：结构 = dep-graph › dg-canvas ›【画布级 svg.dg-links —— **已从框内搬出**、零边时空 svg 照出】› details.pipe（固定盒）› summary + pipe-body › dg-grid › dg-cell › chip；cell 的 left/top 局部值随坐标源（v0.10.7 N5 起 = ELK 出参，本枚只钉结构不钉字面）；`.dg-deps` 角标带外壳随 C5 退役（14px 行距改由 `.dg-cell` 的 `padding-top` 承接，见件一① 翻案）",
   );
   assert.equal(s.html.includes("mermaid-block"), false);
   assert.equal(s.html.includes("data-src"), false);
@@ -291,7 +352,7 @@ test("T2-③区块结构（N2b 自绘）：标题计数 + 六态图例 + 原生�
 // ④ 确定性（同输入同输出，供快照式断言与测试稳定）
 // ---------------------------------------------------------------------------
 
-test("T2-④构图与渲染对乱序输入确定性一致", () => {
+test("T2-④构图与渲染对乱序输入确定性一致", async () => {
   const tasks = [
     task("task-cccccccc", "completed", ["task-bbbbbbbb"]),
     task("task-aaaaaaaa", "completed", []),
@@ -299,7 +360,7 @@ test("T2-④构图与渲染对乱序输入确定性一致", () => {
   ];
   const shuffled = [...tasks].reverse();
   assert.deepEqual(buildTaskGraph(shuffled).edges, buildTaskGraph(tasks).edges, "构图面：边定序不依赖入参序");
-  assert.equal(renderDependencyGraphSection(shuffled).html, renderDependencyGraphSection(tasks).html);
+  assert.equal((await renderDependencyGraphSection(shuffled)).html, (await renderDependencyGraphSection(tasks)).html);
 });
 
 // ---------------------------------------------------------------------------
@@ -316,11 +377,11 @@ test("T2-④构图与渲染对乱序输入确定性一致", () => {
  *  `aria-hidden` 一律**不进**白名单也**不出现**（svg 盒模归 CSS）。 */
 const stripAttrs = (html) => html.replace(/(?:class|title|style|d)="[^"]*"/g, "");
 
-test("二轮N1-①（DOM 面重指向）脏字符 id 不进任何语法位：引号只包属性值，可见文字恒 #编号", () => {
-  const s = renderDependencyGraphSection([
+test("二轮N1-①（DOM 面重指向）脏字符 id 不进任何语法位：引号只包属性值，可见文字恒 #编号", async () => {
+  const s = (await renderDependencyGraphSection([
     task("98c39da1-1111-2222-3333-444455556666"),
     task('a"b<c', "working", ["98c39da1-1111-2222-3333-444455556666"]),
-  ]);
+  ]));
   assert.equal(s.html.includes('a"b<c'), false, "原值不得未转义出现（会劈开 title 属性 = 原「STR 劈裂」的 DOM 等价）");
   assert.ok(s.html.includes("a&quot;b&lt;c"), "id 的引号 / 尖括号入 title 前经 escapeHtml");
   assert.equal((s.html.match(/title="[^"]*"/g) ?? []).length, 2, "每枚 chip 恰一个可数的 title 属性");
@@ -329,19 +390,19 @@ test("二轮N1-①（DOM 面重指向）脏字符 id 不进任何语法位：引
   assert.equal(s.html.includes("<script"), false, "零 script 标签（n3 内联闭集不扩）");
 });
 
-test("二轮N1-②（DOM 面重指向）保留字与脏字符 taskId：不再需要净化，原值进 title、入面先转义", () => {
-  const s = renderDependencyGraphSection([
+test("二轮N1-②（DOM 面重指向）保留字与脏字符 taskId：不再需要净化，原值进 title、入面先转义", async () => {
+  const s = (await renderDependencyGraphSection([
     task("end", "completed", [], { queuedAt: "2026-10-11T00:00:01Z" }),
     task('a"b c', "working", ["end"], { queuedAt: "2026-10-11T00:00:02Z" }),
-  ]);
+  ]));
   assert.ok(
     s.html.includes('<span class="dg-chip dg-done" title="end · #1 · 已完成 · 依赖：无">#1</span>'),
     "保留字 end 原样进 title（无解析器可撞词 ⇒ n_ 前缀净化面随源生成一并退役）",
   );
   assert.ok(s.html.includes("a&quot;b c"), "脏字符入 title 前先 escapeHtml");
-  const other = renderDependencyGraphSection([
+  const other = (await renderDependencyGraphSection([
     task("t-x", "completed", [], { projectId: 'p"x', queuedAt: "2026-10-11T00:00:01Z" }),
-  ]);
+  ]));
   assert.ok(other.html.includes("<summary>管道 p&quot;x（1）"), "projectId 入管道头同样转义");
   assert.equal(/"/.test(stripAttrs(other.html)), false, "同①：剥属性后无裸引号");
 });
@@ -353,18 +414,18 @@ test("二轮N1-②（DOM 面重指向）保留字与脏字符 taskId：不再需
 //    重指向到保留层 = `taskSummaryLines` 要点纯函数本体 + 管道头 / title 的落位与转义面。
 // ---------------------------------------------------------------------------
 
-test("三轮N1-①要点首行 + project 落位：要点 = prompt 首行（换行不拼接）；project 在管道头、全量 taskId 进 title", () => {
+test("三轮N1-①要点首行 + project 落位：要点 = prompt 首行（换行不拼接）；project 在管道头、全量 taskId 进 title", async () => {
   assert.deepEqual(
     taskSummaryLines("修复依赖图节点标签\n第二行不得入要点"),
     ["修复依赖图节点标签"],
     "要点 = prompt 首行（换行归一，不多行原文照抄）",
   );
-  const s = renderDependencyGraphSection([
+  const s = (await renderDependencyGraphSection([
     task("98c39da1-1111-2222-3333-444455556666", "completed", [], {
       projectId: "flow",
       prompt: "修复依赖图节点标签\n第二行不得入要点",
     }),
-  ]);
+  ]));
   assert.ok(s.html.includes("<summary>管道 flow（1）"), "project 标识由逐节点前缀升为管道头");
   assert.ok(
     s.html.includes('title="98c39da1-1111-2222-3333-444455556666 · #1 · 已完成 · 依赖：无"'),
@@ -377,17 +438,17 @@ test("三轮N1-①要点首行 + project 落位：要点 = prompt 首行（换�
   );
 });
 
-test("三轮N1-②prompt 缺键 / 空 / 全空白 ⇒ 要点为 null（不吞不猜），图形面对 prompt 零依赖", () => {
+test("三轮N1-②prompt 缺键 / 空 / 全空白 ⇒ 要点为 null（不吞不猜），图形面对 prompt 零依赖", async () => {
   for (const prompt of [null, undefined, "", "   \n  "]) {
     assert.equal(
       taskSummaryLines(prompt),
       null,
       `prompt=${JSON.stringify(prompt)} ⇒ 要点 null（原「回退裸 taskId」的纯函数等价）`,
     );
-    const withPrompt = renderDependencyGraphSection([task("task-aaaaaaaa", "working", [], { prompt })]);
+    const withPrompt = (await renderDependencyGraphSection([task("task-aaaaaaaa", "working", [], { prompt })]));
     assert.equal(
       withPrompt.html,
-      renderDependencyGraphSection([task("task-aaaaaaaa", "working", [], { prompt: null })]).html,
+      (await renderDependencyGraphSection([task("task-aaaaaaaa", "working", [], { prompt: null })])).html,
       `prompt=${JSON.stringify(prompt)} ⇒ 渲染与无 prompt 逐字同文`,
     );
     assert.ok(
@@ -397,7 +458,7 @@ test("三轮N1-②prompt 缺键 / 空 / 全空白 ⇒ 要点为 null（不吞不
   }
 });
 
-test("三轮N1-③长文本截断换行：按词界换行、≤2 行、总量 ≤40 字符、超出以 … 收尾", () => {
+test("三轮N1-③长文本截断换行：按词界换行、≤2 行、总量 ≤40 字符、超出以 … 收尾", async () => {
   const summary = taskSummaryLines(
     "aaaaaaaaa bbbbbbbbbbb ccccccccccc ddddddddddd eeeeeeeeeee fffffffffggg wwwwwwwwwwwww",
   );
@@ -410,10 +471,10 @@ test("三轮N1-③长文本截断换行：按词界换行、≤2 行、总量 �
   assert.ok(!cjk[1].endsWith("…"), "预算内（29 ≤ 40）不截断");
 });
 
-test("三轮N1-④title 与管道头均经转义：引号 / 尖括号 / & 不劈裂属性位", () => {
-  const s = renderDependencyGraphSection([
+test("三轮N1-④title 与管道头均经转义：引号 / 尖括号 / & 不劈裂属性位", async () => {
+  const s = (await renderDependencyGraphSection([
     task('a"b c', "working", ["d<e&f"], { projectId: 'p"1', prompt: 'say "hi" <b>&amp;</b>' }),
-  ]);
+  ]));
   assert.ok(s.html.includes("a&quot;b c"), "taskId 入 title 被 escapeHtml");
   assert.ok(s.html.includes("d&lt;e&amp;f"), "依赖原值入 title 同样转义");
   assert.ok(s.html.includes("<summary>管道 p&quot;1（1）"), "projectId 入管道头被 escapeHtml");
@@ -424,20 +485,20 @@ test("三轮N1-④title 与管道头均经转义：引号 / 尖括号 / & 不劈
   );
 });
 
-test("三轮N1-⑤容器与确定性（N2b 自绘）：.dep-graph 图区照旧、区块零 script；同入参两次渲染逐字相等、乱序入参等值", () => {
+test("三轮N1-⑤容器与确定性（N2b 自绘）：.dep-graph 图区照旧、区块零 script；同入参两次渲染逐字相等、乱序入参等值", async () => {
   const tasks = [
     task("t-1", "completed", [], { projectId: "p1", queuedAt: "2026-10-11T00:00:01Z", prompt: "依赖图节点可读化" }),
     task("t-2", "working", ["t-1"], { projectId: "p2", queuedAt: "2026-10-11T00:00:02Z" }),
   ];
-  const s = renderDependencyGraphSection(tasks);
+  const s = (await renderDependencyGraphSection(tasks));
   assert.match(s.html, /<div class="dep-graph">/, "图区容器类名不变（N2c 的 CSS 挂点）");
   assert.equal(s.html.includes("<script"), false, "不得携带可执行内联脚本，也不出数据通道");
   assert.equal(s.html.includes("依赖图节点可读化"), false, "要点不进图形 HTML（图形面零 prompt）");
-  assert.equal(renderDependencyGraphSection([...tasks].reverse()).html, s.html, "乱序入参 ⇒ 渲染逐字相等");
-  assert.equal(renderDependencyGraphSection([...tasks].sort((a, b) => (a.taskId < b.taskId ? 1 : -1))).html, s.html);
+  assert.equal((await renderDependencyGraphSection([...tasks].reverse())).html, s.html, "乱序入参 ⇒ 渲染逐字相等");
+  assert.equal((await renderDependencyGraphSection([...tasks].sort((a, b) => (a.taskId < b.taskId ? 1 : -1)))).html, s.html);
 });
 
-test("三轮N1-⑥要点纯函数：首行边界 / 行宽与预算 / 空态 ⇒ null", () => {
+test("三轮N1-⑥要点纯函数：首行边界 / 行宽与预算 / 空态 ⇒ null", async () => {
   assert.deepEqual(taskSummaryLines("甲\n乙"), ["甲"], "换行 = 消息分段边界，只取首行");
   assert.deepEqual(taskSummaryLines("  带\t制表符  与多空格  "), ["带 制表符 与多空格"], "行内空白归一");
   assert.deepEqual(taskSummaryLines("一二三四五六七八九十甲乙丙丁戊己庚辛壬癸"), ["一二三四五六七八九十甲乙丙丁戊己庚辛壬癸"], "20 字符内单行");
@@ -448,7 +509,7 @@ test("三轮N1-⑥要点纯函数：首行边界 / 行宽与预算 / 空态 ⇒ 
   assert.deepEqual(taskSummaryLines(undefined), null);
 });
 
-test("三轮N1-⑦布局与取色（N2c 重指向 · G6 再指向 · 增补件二订正）：横滚职责迁到 .dep-graph、位置性箭头规则退役、新规则零字面色值、绝对定位恰两条", () => {
+test("三轮N1-⑦布局与取色（N2c 重指向 · G6 再指向 · 增补件二订正）：横滚职责迁到 .dep-graph、位置性箭头规则退役、新规则零字面色值、绝对定位恰两条", async () => {
   const css = renderPage({ title: "t", active: "features", bodyHtml: "" });
   // v0.10.6 增补 `a0682281` 件二订正（改造文档 §2.2.2「横滚壳」行 / §4.4 `:417`）：
   // 横滚落**图区父层** `.dep-graph` —— `.dg-canvas` 按内容定宽（inline `width:{W}px`）⇒ 在其上写 `overflow-x` 恒 inert
@@ -548,7 +609,7 @@ const cssDecls = (rule) =>
     .map((s) => s.trim())
     .filter((s) => s !== "");
 
-test("G6-同源①chip 盒模 = 下发变量（width/height 逐字 var(--dg-nw)/var(--dg-nh) ⇒ CSS 侧不存第二份数字）", () => {
+test("G6-同源①chip 盒模 = 下发变量（width/height 逐字 var(--dg-nw)/var(--dg-nh) ⇒ CSS 侧不存第二份数字）", async () => {
   const block = pipeCssBlock();
   const decls = cssDecls(cssRule(block, ".dg-chip"));
   // 唯二盒模声明：值必须是下发变量本身（写成 `74px` / `28px` 或改动 box-sizing ⇒ 本条红）
@@ -568,20 +629,20 @@ test("G6-同源①chip 盒模 = 下发变量（width/height 逐字 var(--dg-nw)/
     assert.equal(block.includes(`${v}px`), false, `CSS 区间零尺寸字面（不得内嵌 ${v}px；下发面 = .dg-canvas inline）`);
   // v0.10.6 C4 / §2.2.1-2 翻案（n14 收口）：三枚几何变量从逐框 `.dg-grid` **上抬到画布一枚 `.dg-canvas`**
   // 一次下发（自定义属性天然继承）⇒ 下发面锚随之上收一层；「消费侧不翻」半句（上面两条）仍逐字成立
-  const inline = renderDependencyGraphSection([task("t-here", "completed", [])]).html.match(/<div class="dg-canvas" style="([^"]*)">/);
+  const inline = (await renderDependencyGraphSection([task("t-here", "completed", [])])).html.match(/<div class="dg-canvas" style="([^"]*)">/);
   assert.ok(inline !== null, "下发面在场（几何变量的唯一出口 = 画布那一枚 inline）");
   assert.ok(
     inline[1].includes(`--dg-nw:${DG_NODE_W}px;--dg-nh:${DG_NODE_H}px;--dg-bh:${DG_BADGE_H}px`),
     "下发三键的数值逐字取自导出常量（改常量 ⇒ 板面自动跟随，改 CSS 数字 ⇒ 本条红）",
   );
   const gridInline = /<div class="dg-grid" style="([^"]*)">/.exec(
-    renderDependencyGraphSection([task("t-here", "completed", [])]).html,
+    (await renderDependencyGraphSection([task("t-here", "completed", [])])).html,
   );
   assert.ok(gridInline !== null, "框内网格仍在场（S1 下每框恰一枚 .dg-grid）");
   assert.equal(/--dg-/.test(gridInline[1]), false, "逐框不再重复下发变量（第二份下发面 = 双事实源，§2.2.1-2 只许画布一枚）");
 });
 
-test("G6-同源②新规则零盒模字面 + 消费键 ⊆ / = 下发键；z-index 分野与坐标原点在 .dg-grid", () => {
+test("G6-同源②新规则零盒模字面 + 消费键 ⊆ / = 下发键；z-index 分野与坐标原点在 .dg-grid", async () => {
   const block = pipeCssBlock();
   // ① 新规则的 width / height 声明只许两种形态：下发变量 或 100%（父盒 = .dg-grid 自身）
   // v0.10.6 C5 / §2.2.2 翻案（n14 收口）：`.dg-deps` 角标带外壳随 C5 整条摘除 ⇒ 从盒模声明表里删该枚
@@ -603,7 +664,7 @@ test("G6-同源②新规则零盒模字面 + 消费键 ⊆ / = 下发键；z-ind
   // ⇒ 消费闭集随之下移一行；键名集合以**画布那一枚 inline** 为对照（下发面 ⇄ 消费面同源，两处不得差一枚）
   const consumed = [...new Set([...block.matchAll(/var\(--dg-(\w+)\)/g)].map((m) => m[1]))].sort();
   const canvasInline = /<div class="dg-canvas" style="([^"]*)">/.exec(
-    renderDependencyGraphSection([task("t-here", "completed", [])]).html,
+    (await renderDependencyGraphSection([task("t-here", "completed", [])])).html,
   );
   assert.ok(canvasInline !== null, "画布下发面在场（消费键闭集的对照组）");
   const downlinked = [...new Set([...canvasInline[1].matchAll(/--dg-(\w+):/g)].map((m) => m[1]))].sort();
@@ -643,7 +704,7 @@ test("G6-同源②新规则零盒模字面 + 消费键 ⊆ / = 下发键；z-ind
 // 语义：画布线 svg.dg-links(z-index:1) 与 .dg-cell(z-index:2) 的比序，只在二者**同处一个堆叠上下文**时成立；
 // 框层任一选择器（.pipe / .pipe-body / .dg-grid，含 `.dg-canvas …` 覆盖形）落了 z-index / transform / opacity
 // ⇒ 该框自成上下文 ⇒ 线被关在框下、真机上压在 chip 上（浏览器才看得见的那一半，本条先把「谁改的」当场判红）。
-test("R8 框层堆叠纪律（n14 收口新增）：.pipe / .pipe-body / .dg-grid 全部规则体零 z-index / transform / opacity", () => {
+test("R8 框层堆叠纪律（n14 收口新增）：.pipe / .pipe-body / .dg-grid 全部规则体零 z-index / transform / opacity", async () => {
   const css = renderPage({ title: "t", active: "features", bodyHtml: "" });
   const FRAME_LAYER = new Set([".pipe", ".pipe-body", ".dg-grid"]);
   // 选择器**主体**（末段）落在这三枚者才算框层 ⇒ `.pipe > summary` 那类子元素规则不在本钉射程
@@ -798,7 +859,7 @@ test("三轮N1-⑧vendored mermaid 资产完好性（N2c 摘除只及详情页�
   );
 
   // 解析链退役的正面证据：区块 HTML 内已无源可解析
-  const s = renderDependencyGraphSection([task("cccc3333", "blocked", [], { prompt: "首行要点" })]);
+  const s = (await renderDependencyGraphSection([task("cccc3333", "blocked", [], { prompt: "首行要点" })]));
   for (const needle of ["<script", "mermaid", "data-src"]) {
     assert.equal(s.html.toLowerCase().includes(needle), false, `区块不得再含 ${JSON.stringify(needle)}`);
   }
@@ -812,7 +873,7 @@ test("三轮N1-⑧vendored mermaid 资产完好性（N2c 摘除只及详情页�
 // settled（排队，未派发）；running / queued 是板历史同义词，仍在白名单内。
 // ---------------------------------------------------------------------------
 
-test("N2a-N3六态映射：completed/working×queueState/failed/blocked/input-required 逐格 + 回落不吞不猜", () => {
+test("N2a-N3六态映射：completed/working×queueState/failed/blocked/input-required 逐格 + 回落不吞不猜", async () => {
   // 白名单 = 实测值 + 历史同义词（若桥侧值域漂移，本条先红）
   assert.deepEqual([...QUEUE_STATE_RUNNING].sort(), ["claimed", "running"], "「已认领」档 = 实测 claimed + 板历史同义词 running（闭合，不多不少）");
   assert.equal(QUEUE_STATE_RUNNING.size, 2, "白名单不得静默长第三枚同义词（新增须过边界轮）");
@@ -847,7 +908,7 @@ test("N2a-N3六态映射：completed/working×queueState/failed/blocked/input-re
   assert.equal(nodeStateOf(task("t1", "mystery-state"), null).label, "mystery-state", "未知 state 延续原样态名口径");
 });
 
-test("REQ-04真机值域补键：claimed/settled 映射 + 补键不误染 state 五档 + 图上不带被挡原因", () => {
+test("REQ-04真机值域补键：claimed/settled 映射 + 补键不误染 state 五档 + 图上不带被挡原因", async () => {
   // 实测在飞档 claimed ⇒ running
   assert.equal(nodeStateOf(task("t1", "working", [], { queueState: "claimed" }), null).key, "running", "claimed = 实测在飞档");
   assert.equal(nodeStateOf(task("t1", "working", [], { queueState: "claimed" }), null).label, "执行中·已认领", "claimed 走既有 running 展示词");
@@ -889,7 +950,7 @@ test("REQ-04真机值域补键：claimed/settled 映射 + 补键不误染 state 
   );
 });
 
-test("N2a-N4管道分组与编号一致性：6 任务 / 3 project ⇒ 3 条管道 projectId 升序、组内序 = taskOrdinalMap 号序、节点集不丢不重", () => {
+test("N2a-N4管道分组与编号一致性：6 任务 / 3 project ⇒ 3 条管道 projectId 升序、组内序 = taskOrdinalMap 号序、节点集不丢不重", async () => {
   const tasks = [
     task("t-f1", "completed", [], { projectId: "flow", queuedAt: "2026-10-11T00:03:00Z" }),
     task("t-b1", "working", [], { projectId: "board", queuedAt: "2026-10-11T00:01:00Z" }),
@@ -934,7 +995,7 @@ test("N2a-N4管道分组与编号一致性：6 任务 / 3 project ⇒ 3 条管�
   assert.ok(g.pipelines[0].nodes[0] === g.nodes.find((n) => n.taskId === "t-b1"), "节点对象原样引用");
 });
 
-test("N2a-N5排序键确定性：createdAt 升序 / null 沉底 / 同值按 taskId 兜稳；乱序入参全等；本体未动（环边同值）", () => {
+test("N2a-N5排序键确定性：createdAt 升序 / null 沉底 / 同值按 taskId 兜稳；乱序入参全等；本体未动（环边同值）", async () => {
   const mk = (id, q) => task(id, "completed", [], { projectId: "p", queuedAt: q });
   const tasks = [
     mk("t3", "2026-10-11T00:00:10Z"),
@@ -993,8 +1054,8 @@ const pipe6Tasks = () => [
   }),
 ];
 
-test("N2b-N1管道制：6 任务 / 3 project ⇒ 3 枚原生 details.pipe，管道头 = 名称 + 计数 + 状态摘要串", () => {
-  const s = renderDependencyGraphSection(pipe6Tasks());
+test("N2b-N1管道制：6 任务 / 3 project ⇒ 3 枚原生 details.pipe，管道头 = 名称 + 计数 + 状态摘要串", async () => {
+  const s = (await renderDependencyGraphSection(pipe6Tasks()));
   assert.match(s.html, /<h2>依赖图（6 任务 · 3 管道 · 声明 5 边（本质 5 · 传递省略 0））<\/h2>/);
   assert.equal(
     (s.html.match(/<details class="pipe" open style="[^"]*">/g) ?? []).length,
@@ -1053,7 +1114,7 @@ test("N2b-N1管道制：6 任务 / 3 project ⇒ 3 枚原生 details.pipe，管�
   );
 });
 
-test("N2b-N2负向钉：图形 HTML 内不得出现任何 prompt 文本子串（反斜杠 / 控制字符 / 【】壳 / script 字面全不含）", () => {
+test("N2b-N2负向钉：图形 HTML 内不得出现任何 prompt 文本子串（反斜杠 / 控制字符 / 【】壳 / script 字面全不含）", async () => {
   const hostile = [
     "依赖图修复",
     "\\\\ 含裸反斜杠",
@@ -1066,7 +1127,7 @@ test("N2b-N2负向钉：图形 HTML 内不得出现任何 prompt 文本子串（
     task("p-1", "completed", [], { projectId: "proj-a", queuedAt: "2026-10-11T00:00:01Z", prompt: hostile }),
     task("p-2", "working", ["p-1"], { projectId: "proj-b", queuedAt: "2026-10-11T00:00:02Z", prompt: hostile }),
   ];
-  const s = renderDependencyGraphSection(tasks);
+  const s = (await renderDependencyGraphSection(tasks));
   for (const t of tasks) {
     assert.equal(
       s.html.indexOf(t.prompt.slice(0, 6)),
@@ -1078,14 +1139,14 @@ test("N2b-N2负向钉：图形 HTML 内不得出现任何 prompt 文本子串（
     assert.equal(s.html.includes(needle), false, `图形 HTML 不得出现 ${JSON.stringify(needle)}`);
   }
   // 最强的正向证明：同一夹具把 prompt 全置 null ⇒ 渲染逐字相等（图形面对 prompt 零依赖）
-  const noPrompt = renderDependencyGraphSection(tasks.map((t) => ({ ...t, prompt: null })));
+  const noPrompt = (await renderDependencyGraphSection(tasks.map((t) => ({ ...t, prompt: null }))));
   assert.equal(noPrompt.html, s.html, "要点完全不进图形 HTML ⇒ 有无 prompt 渲染同文");
   assert.equal(s.html.includes("#1"), true, "自绘形态本身在场（负向钉不许空转）");
   assert.equal(s.html.includes("dg-edges"), true, "两条任务分属两 project ⇒ 跨管道边清单行在场（钉本锚非空转）");
 });
 
-test("N2b-N6跨框边只出真走线与边清单：inline 零 position + 画布恰一枚 svg（G10·⑦(ii) 单画布），角标封顶退役 ⇒ 逐枚全落线", () => {
-  const s = renderDependencyGraphSection(pipe6Tasks());
+test("N2b-N6跨框边只出真走线与边清单：inline 零 position + 画布恰一枚 svg（G10·⑦(ii) 单画布），角标封顶退役 ⇒ 逐枚全落线", async () => {
+  const s = (await renderDependencyGraphSection(pipe6Tasks()));
   // 4 条跨框边（第 5 条 t-b1→t-b2 同框）⇒ 4 枚跨框 path + 一行边清单（角标那枚出口整体退役，见 C5）
   const face = crossFaceCounts(s.html);
   assert.deepEqual(
@@ -1114,10 +1175,10 @@ test("N2b-N6跨框边只出真走线与边清单：inline 零 position + 画布�
   );
   assert.equal(s.html.includes("<script"), false, "零 script 标签（n3 内联闭集不扩）");
   // 无跨框边 ⇒ 整行不渲
-  const noCross = renderDependencyGraphSection([task("a1"), task("a2", "completed", ["a1"])]);
+  const noCross = (await renderDependencyGraphSection([task("a1"), task("a2", "completed", ["a1"])]));
   assert.equal(noCross.html.includes("dg-edges"), false, "全无跨框边 ⇒ 边清单整行不渲");
   // 旧「角标封顶 3 枚、第 4 枚起折叠」的下界场景：5 枚跨框入边 ⇒ 逐枚全落线、零折叠形态
-  const many = renderDependencyGraphSection([
+  const many = (await renderDependencyGraphSection([
     ...[1, 2, 3, 4, 5].map((i) =>
       task(`m${i}`, "completed", [], { projectId: "src", queuedAt: `2026-10-11T00:00:0${i}Z` }),
     ),
@@ -1125,7 +1186,7 @@ test("N2b-N6跨框边只出真走线与边清单：inline 零 position + 画布�
       projectId: "dst",
       queuedAt: "2026-10-11T00:00:06Z",
     }),
-  ]);
+  ]));
   const manyFace = crossFaceCounts(many.html);
   assert.deepEqual(
     [manyFace.cross, manyFace.paths, manyFace.list],
@@ -1136,11 +1197,11 @@ test("N2b-N6跨框边只出真走线与边清单：inline 零 position + 画布�
   assert.equal(many.html.includes("⇠"), false, "负向一侧：折叠记号整族不再出现（本锚不空转，正向由上面 5 枚承担）");
 });
 
-test("N2b-提示行照旧：环 / 悬空入参 ⇒ hint warn 行在场且两个既有起头串齐（自绘不改提示面）", () => {
-  const s = renderDependencyGraphSection([
+test("N2b-提示行照旧：环 / 悬空入参 ⇒ hint warn 行在场且两个既有起头串齐（自绘不改提示面）", async () => {
+  const s = (await renderDependencyGraphSection([
     task("c-a", "completed", ["c-b"]),
     task("c-b", "completed", ["c-a", "c-external"]),
-  ]);
+  ]));
   assert.match(s.html, /class="hint warn"/);
   assert.ok(s.html.includes("环防御："), "既有起头串「环防御」保留");
   assert.ok(s.html.includes("跨需求/未登记依赖 1 条不画"), "既有起头串「跨需求/未登记依赖」保留");
@@ -1162,7 +1223,7 @@ test("N2b-提示行照旧：环 / 悬空入参 ⇒ hint warn 行在场且两个�
 // failed/frozen/ask/unknown）；派发消息的 dg-run / dg-fail 是简写，宿主 2026-10-11 裁定 A 更正。
 // ---------------------------------------------------------------------------
 
-test("增补A1-chip 七态变体规则齐：七枚全在场、border+background = 图例同一事实源（NODE_STATE_COLORS）", () => {
+test("增补A1-chip 七态变体规则齐：七枚全在场、border+background = 图例同一事实源（NODE_STATE_COLORS）", async () => {
   const css = renderPage({ title: "t", active: "features", bodyHtml: "" });
   assert.equal(NODE_STATE_ORDER.length, 7, "枚数基线 = 六态 + 回落七档闭集");
   const missing = [];
@@ -1179,151 +1240,12 @@ test("增补A1-chip 七态变体规则齐：七枚全在场、border+background 
     "基础规则原样（变体靠双类选择器更高优先级生效）",
   );
   // 图形 HTML 侧的钩子名与本锚同源（chip 类名 = dg-<key>，防两侧类名漂移）
-  const s = renderDependencyGraphSection([
+  const s = (await renderDependencyGraphSection([
     task("a1-run", "working", [], { projectId: "p", queuedAt: "2026-10-11T00:00:01Z", queueState: "running" }),
     task("a1-fail", "failed", [], { projectId: "p", queuedAt: "2026-10-11T00:00:02Z" }),
-  ]);
+  ]));
   assert.ok(s.html.includes('class="dg-chip dg-running"'), "running 档 chip 类名与 CSS 变体同名");
   assert.ok(s.html.includes('class="dg-chip dg-failed"'), "failed 档 chip 类名与 CSS 变体同名");
-});
-
-// ---------------------------------------------------------------------------
-// G1（v0.10.5 · REQ-2026-10-12-02「依赖图按真依赖边绘制」· 改造文档 §2.4-①②）：
-// 两枚分层纯函数 —— layerOfGraph（全图 Kahn + longest-path，层距吃全 edges）
-// 与 compressPipeLayers（每管道压成密列）。本组只算层号 / 列号，**不算几何、不渲染**。
-// ---------------------------------------------------------------------------
-
-/** 一次构好图（`buildGraphWithPipelines` + `taskOrdinalMap`）并把「按 project 取密列」封成可调函数。 */
-const g1Fixture = (tasks) => {
-  const graph = buildGraphWithPipelines(tasks);
-  const layers = layerOfGraph(graph.nodes, taskOrdinalMap(tasks), graph.edges);
-  const colsOf = (projectId) => {
-    const pipe = graph.pipelines.find((p) => p.projectId === projectId);
-    return pipe ? compressPipeLayers(pipe, layers) : null;
-  };
-  return { graph, layers, colsOf };
-};
-
-test("G1-①分层：同管道链 a→b→c 层号 0/1/2；无依赖的孤立节点落 0（不吞）", () => {
-  const { layers } = g1Fixture([
-    task("g1-a", "completed", [], { queuedAt: "2026-10-12T00:00:01Z" }),
-    task("g1-b", "completed", ["g1-a"], { queuedAt: "2026-10-12T00:00:02Z" }),
-    task("g1-c", "working", ["g1-b"], { queuedAt: "2026-10-12T00:00:03Z" }),
-    task("g1-z", "completed", null, { queuedAt: "2026-10-12T00:00:04Z" }),
-  ]);
-  assert.equal(layers.get("g1-a"), 0, "链首 = 0 起");
-  assert.equal(layers.get("g1-b"), 1);
-  assert.equal(layers.get("g1-c"), 2);
-  assert.equal(layers.get("g1-z"), 0, "孤立节点 ⇒ 0（层号只由 edges 决定，不由 queuedAt 决定）");
-});
-
-test("G1-②层距吃全 edges（C3 采纳口径）：只依赖他管道节点的节点，全局层号必须 > 0", () => {
-  const { graph, layers } = g1Fixture([
-    task("x-b1", "completed", [], { projectId: "board", queuedAt: "2026-10-12T00:00:01Z" }),
-    task("x-o1", "completed", ["x-b1"], { projectId: "orch", queuedAt: "2026-10-12T00:00:02Z" }),
-    task("x-b2", "working", ["x-o1"], { projectId: "board", queuedAt: "2026-10-12T00:00:03Z" }),
-  ]);
-  assert.equal(graph.pipelines.length, 2, "夹具确为两管道（否则本锚空转）");
-  assert.ok(layers.get("x-b2") > 0, "负钉：本管道内无入边 ⇒ 不得落 layer 0");
-  assert.equal(layers.get("x-o1"), 1);
-  assert.equal(layers.get("x-b2"), 2, "跨管道边照抬层 ⇒ 全图层号连续可比，跨管道前后关系以层距体现");
-});
-
-test("G1-③longest-path：汇合节点取最长前驱路径（不是最早可达、不是入度）", () => {
-  const { layers } = g1Fixture([
-    task("lp-r", "completed", [], { queuedAt: "2026-10-12T00:00:01Z" }),
-    task("lp-x", "completed", ["lp-r"], { queuedAt: "2026-10-12T00:00:02Z" }),
-    task("lp-y", "completed", ["lp-x"], { queuedAt: "2026-10-12T00:00:03Z" }),
-    task("lp-d", "working", ["lp-y", "lp-r"], { queuedAt: "2026-10-12T00:00:04Z" }),
-  ]);
-  assert.equal(layers.get("lp-y"), 2);
-  assert.equal(layers.get("lp-d"), 3, "d 依赖 y(2) 与 r(0) ⇒ 取最长 = 3，不是最早可达的 1");
-});
-
-test("G1-④确定性：入参数组序无关、重复调用逐键相等（就绪集按 taskOrdinalMap 号序取）", () => {
-  const graph = buildGraphWithPipelines(pipe6Tasks());
-  const ordinals = taskOrdinalMap(pipe6Tasks());
-  const once = layerOfGraph(graph.nodes, ordinals, graph.edges);
-  const shuffled = layerOfGraph([...graph.nodes].reverse(), ordinals, [...graph.edges].reverse());
-  assert.deepEqual(shuffled, once, "打乱 nodes / edges 数组序 ⇒ 层号逐键相等");
-  assert.deepEqual([...layerOfGraph(graph.nodes, ordinals, graph.edges).keys()], [...once.keys()], "重复调用出参键序亦相等");
-  assert.deepEqual([...once.keys()], graph.nodes.map((n) => n.taskId), "出参键序 = 入参 nodes 序（调用方可直接遍历）");
-});
-
-test("G1-⑤净化归构图层：layerOfGraph 不自检环、不丢边 —— 脏入参不死循环且不吞键；经 buildTaskGraph 后恒为 DAG", () => {
-  const dirtyNodes = [task("cy-a"), task("cy-b"), task("cy-c", "completed", ["cy-a"])];
-  const cyclicEdges = [
-    { from: "cy-a", to: "cy-b" },
-    { from: "cy-b", to: "cy-a" },
-    { from: "cy-a", to: "cy-c" },
-  ];
-  const raw = layerOfGraph(dirtyNodes, taskOrdinalMap(dirtyNodes), cyclicEdges);
-  assert.deepEqual([...raw.keys()], ["cy-a", "cy-b", "cy-c"], "残留环也不吞键（出参恒覆盖 nodes 全集）");
-  const dirtyTasks = [
-    task("cy-a", "completed", ["cy-b"]),
-    task("cy-b", "completed", ["cy-a"]),
-    task("cy-c", "completed", ["cy-a"]),
-  ];
-  const g = buildTaskGraph(dirtyTasks);
-  assert.deepEqual(
-    g.cycleEdges.map((e) => `${e.from}->${e.to}`),
-    ["cy-a->cy-b", "cy-b->cy-a"],
-    "环边由 buildTaskGraph 丢弃（分工所在）",
-  );
-  const clean = layerOfGraph(g.nodes, taskOrdinalMap(dirtyTasks), g.edges);
-  assert.deepEqual([...clean.entries()], [["cy-a", 0], ["cy-b", 0], ["cy-c", 1]], "滤环后的 edges 入分层 ⇒ 恒为 DAG、无残留");
-});
-
-test("G1-⑥密列压缩：该管道无节点的中间列不占位 ⇒ 列号从 0 起、连续 0..K-1、每列非空", () => {
-  const { layers, colsOf } = g1Fixture([
-    task("s-b1", "completed", [], { projectId: "board", queuedAt: "2026-10-12T00:00:01Z" }),
-    task("s-f1", "completed", ["s-b1"], { projectId: "flow", queuedAt: "2026-10-12T00:00:02Z" }),
-    task("s-b2", "completed", ["s-f1"], { projectId: "board", queuedAt: "2026-10-12T00:00:03Z" }),
-    task("s-f2", "completed", ["s-b2"], { projectId: "flow", queuedAt: "2026-10-12T00:00:04Z" }),
-    task("s-f3", "completed", ["s-f2"], { projectId: "flow", queuedAt: "2026-10-12T00:00:05Z" }),
-    task("s-b3", "working", ["s-f3"], { projectId: "board", queuedAt: "2026-10-12T00:00:06Z" }),
-  ]);
-  assert.deepEqual(
-    ["s-b1", "s-f1", "s-b2", "s-f2", "s-f3", "s-b3"].map((id) => [id, layers.get(id)]),
-    [["s-b1", 0], ["s-f1", 1], ["s-b2", 2], ["s-f2", 3], ["s-f3", 4], ["s-b3", 5]],
-    "board 独占的中间层 1/3/4 归 flow ⇒ board 全局层 = {0,2,5}",
-  );
-  const cols = colsOf("board");
-  assert.deepEqual([...cols.entries()], [["s-b1", 0], ["s-b2", 1], ["s-b3", 2]], "空列不占位 ⇒ 压成 0/1/2");
-  const k = Math.max(...cols.values()) + 1;
-  assert.equal(new Set(cols.values()).size, k, "值域连续 0..K-1");
-  for (let c = 0; c < k; c += 1) assert.ok([...cols.values()].includes(c), `第 ${c} 列非空（每列至少一节点）`);
-});
-
-test("G1-⑦密列保序：全局层升序 ⇔ 列号严格升序；同层两节点同列；出参插入序 = 列号升序", () => {
-  const { layers, colsOf } = g1Fixture([
-    task("pm-a", "completed", [], { queuedAt: "2026-10-12T00:00:01Z" }),
-    task("pm-b1", "completed", ["pm-a"], { queuedAt: "2026-10-12T00:00:02Z" }),
-    task("pm-b2", "completed", ["pm-a"], { queuedAt: "2026-10-12T00:00:03Z" }),
-    task("pm-c", "working", ["pm-b1", "pm-b2"], { queuedAt: "2026-10-12T00:00:04Z" }),
-  ]);
-  const cols = colsOf("proj-a");
-  assert.equal(layers.get("pm-b1"), 1);
-  assert.equal(cols.get("pm-b1"), cols.get("pm-b2"), "并列的两节点同列（并行节点呈并列）");
-  assert.equal(cols.get("pm-a"), 0, "列号从 0 起");
-  assert.equal(cols.get("pm-c"), 2, "单管道满层 ⇒ 列号 === 全局层号（无空列可压）");
-  assert.ok(cols.get("pm-b1") > cols.get("pm-a") && cols.get("pm-c") > cols.get("pm-b1"), "保序：层升 ⇒ 列严格升");
-  assert.deepEqual([...cols.keys()], ["pm-a", "pm-b1", "pm-b2", "pm-c"], "插入序 = 列号升序、同列按管道号序");
-});
-
-test("G1-⑧负钉实测（pipe6 夹具）：board t-b3 只依赖 flow 的 t-f1 ⇒ 压缩后列号 2（≠0）；单节点管道 ⇒ 列 0", () => {
-  const { layers, colsOf } = g1Fixture(pipe6Tasks());
-  assert.equal(layers.get("t-b1"), 0);
-  assert.equal(layers.get("t-b2"), 1);
-  assert.equal(layers.get("t-f1"), 1);
-  assert.equal(layers.get("t-o1"), 2);
-  assert.equal(layers.get("t-b3"), 2, "b3 的本管道内无入边、但有跨管道入边 ⇒ 层号 2");
-  assert.equal(layers.get("t-f2"), 3);
-  const board = colsOf("board");
-  assert.ok(board.get("t-b3") === 2 && board.get("t-b3") !== 0, "板内任务不被压回首列（负钉的列号形式：≠0）");
-  assert.deepEqual([...board.entries()], [["t-b1", 0], ["t-b2", 1], ["t-b3", 2]]);
-  assert.deepEqual([...colsOf("orch").entries()], [["t-o1", 0]], "单节点管道 ⇒ 唯一列 0（跨管道层号不残留空列）");
-  assert.deepEqual([...colsOf("flow").entries()], [["t-f1", 0], ["t-f2", 1]]);
 });
 
 // ---------------------------------------------------------------------------
@@ -1334,19 +1256,6 @@ test("G1-⑧负钉实测（pipe6 夹具）：board t-b3 只依赖 flow 的 t-f1 
 
 /** 角标单枚的**设计宽度**（改造文档 §2.3 C2：`⇠#k` 至多 4 枚 × ~32px ≤ `DG_BADGE_MAX_W`）。 */
 const BADGE_MARK_DESIGN_W = 32;
-
-/** 一次构图 + 分层 + 密列，并把「按 project 取网格几何」封成可调函数。 */
-const g2Fixture = (tasks, budget = {}) => {
-  const graph = buildGraphWithPipelines(tasks);
-  const ordinals = taskOrdinalMap(tasks);
-  const layers = layerOfGraph(graph.nodes, ordinals, graph.edges);
-  const layoutOf = (projectId) => {
-    const pipe = graph.pipelines.find((p) => p.projectId === projectId);
-    if (!pipe) return null;
-    return pipeGridLayout(pipe, compressPipeLayers(pipe, layers), ordinals, budget);
-  };
-  return { graph, ordinals, layers, layoutOf };
-};
 
 /** 需求 `076bbb84` 的真实 DAG（原型对照稿 §样本：7 节点 / 10 条真依赖边，单管道）。 */
 const sample076bbb84 = () => {
@@ -1359,215 +1268,16 @@ const sample076bbb84 = () => {
   );
 };
 
-test("G2-①确定性：同入参重复调用逐字段相等、乱序入参等值；cells 序 = 列升序 + 同列号序", () => {
-  const { graph, ordinals, layers } = g2Fixture(sample076bbb84());
-  const pipe = graph.pipelines.find((p) => p.projectId === "board");
-  const columns = compressPipeLayers(pipe, layers);
-  const once = pipeGridLayout(pipe, columns, ordinals);
-  const twice = pipeGridLayout(pipe, columns, ordinals);
-  assert.deepEqual(twice, once, "重复调用 ⇒ 出参逐字段相等");
-  const fromShuffled = pipeGridLayout({ projectId: pipe.projectId, nodes: [...pipe.nodes].reverse() }, columns, ordinals);
-  assert.deepEqual(fromShuffled, once, "管道内数组序反转 ⇒ 几何逐字段相等（列内序由号序决定，不由入参数组序决定）");
-  assert.deepEqual(
-    once.cells.map((c) => `${c.col}:${c.ordinal}`),
-    ["0:1", "1:2", "1:5", "2:3", "2:4", "3:6", "4:7"],
-    "格位序 = 列号升序、同列内号序升序",
-  );
-  assert.equal(once.cells.length, 7, "格位数 === 节点数（不丢不重）");
-});
-
-test("G2-②每列非空 + 格位两两不同：COL_X[0]=PAD_L、ROW_Y 递推式、rows=最大列容量", () => {
-  const { layoutOf } = g2Fixture(sample076bbb84());
-  const L = layoutOf("board");
-  assert.equal(L.colX[0], DG_PAD_L, "COL_X[0] = PAD_L（左内缘即首列）");
-  for (let c = 1; c < L.cols; c += 1) {
-    assert.equal(L.colX[c], L.colX[c - 1] + DG_NODE_W + L.gapW[c - 1], `colX[${c}] 由前列右缘 + 通道宽递推`);
-    assert.ok(L.gapW[c - 1] >= DG_COL_GAP_MIN, `通道 ${c - 1} 宽恒 ≥ DG_COL_GAP_MIN`);
-  }
-  assert.equal(L.rowY[0], DG_PAD_T, "ROW_Y[0] = PAD_T");
-  L.rowY.forEach((y, r) => {
-    assert.equal(y, DG_PAD_T + r * (DG_BADGE_H + DG_NODE_H + DG_ROW_GAP), `ROW_Y[${r}] 递推式`);
-  });
-  assert.equal(L.rows, 2, "rows = 最大列容量（本样本两列各 2 枚）");
-  const seen = new Set();
-  for (const cell of L.cells) {
-    const key = `${cell.col}:${cell.row}`;
-    assert.ok(!seen.has(key), `格位 ${key} 不重复`);
-    seen.add(key);
-    assert.ok(cell.col >= 0 && cell.col < L.cols, "列号在值域内");
-    assert.ok(cell.row >= 0 && cell.row < L.rows, "行号在值域内");
-    assert.equal(cell.x, L.colX[cell.col], "cell.x === COL_X[col]");
-    assert.equal(cell.y, L.rowY[cell.row], "cell.y === ROW_Y[row]");
-    assert.equal(cell.chipY, cell.y + DG_BADGE_H, "chip 顶缘 = cell 顶缘 + 角标带（角标带恒预留）");
-    assert.equal(cell.chipRight, cell.x + DG_NODE_W, "chip 右缘 = x + DG_NODE_W（定宽 ⇒ 与内容无关）");
-    assert.equal(cell.chipMidY, cell.y + DG_BADGE_H + DG_NODE_H / 2, "端点定义式纵坐标 = ROW_Y + BADGE_H + NODE_H/2");
-    for (const v of [cell.x, cell.y, cell.chipY, cell.chipRight, cell.chipMidY, cell.w, cell.h]) {
-      assert.ok(Number.isInteger(v), `全整数几何（无半像素）：${v}`);
-    }
-    assert.ok(L.cellOf.get(cell.taskId) === cell, "cellOf 取数面与 cells 同引用");
-  }
-  const byCol = new Map();
-  for (const cell of L.cells) byCol.set(cell.col, (byCol.get(cell.col) ?? 0) + 1);
-  assert.equal(byCol.size, L.cols, "每列非空（列数 === 有格位的列数）");
-  for (let c = 0; c < L.cols; c += 1) assert.ok((byCol.get(c) ?? 0) > 0, `第 ${c} 列非空`);
-});
-
-test("G2-③I4 内容包含 + 通道 lane 预算回灌：width/height 两条不等式、lane 线落在通道内", () => {
-  const budget = { gapLanes: [3, 1, 4, 2], busLaneCount: 3 };
-  const { layoutOf } = g2Fixture(sample076bbb84(), budget);
-  const L = layoutOf("board");
-  const rightmost = Math.max(...L.cells.map((c) => c.chipRight));
-  // v0.10.6 C6 翻案（改造文档 §2.2-C6 / §4.4）：角标族退役 ⇒ `width = contentRight + DG_PAD_R`
-  // —— 式形（不等式、加数为右内缘）逐字保留，只把加数从 `DG_BADGE_MAX_W` 换成 `DG_PAD_R`。
-  assert.ok(L.width >= rightmost + DG_PAD_R, `I4 宽：${L.width} ≥ 最右 chip 右缘 ${rightmost} + ${DG_PAD_R}（右内缘 = DG_PAD_R，不含角标越界加数）`);
-  const busBandBottom = L.busBandTop + L.busLanes.length * DG_BUS_PITCH;
-  assert.ok(L.height >= busBandBottom + DG_PAD_B, `I4 高：${L.height} ≥ 通道带底 ${busBandBottom} + ${DG_PAD_B}`);
-  const bottom = Math.max(...L.cells.map((c) => c.y + c.h));
-  assert.ok(L.height >= bottom + DG_PAD_B, "I4 高（无带时亦盖过最后一格底缘）");
-  for (const cell of L.cells) {
-    assert.ok(cell.x + cell.w <= L.width, "格位不越右边界（防 overflow 裁切）");
-    assert.ok(cell.y + cell.h <= L.height, "格位不越下边界");
-  }
-  assert.equal(L.gapW.length, L.cols - 1, "通道数 = 列数 - 1");
-  L.gapW.forEach((w, c) => {
-    const n = L.lanes[c].length;
-    assert.equal(w, Math.max(DG_COL_GAP_MIN, DG_LANE_MIN * 2 + n * DG_LANE_PITCH), `gapW[${c}] 公式`);
-    assert.ok(w >= DG_COL_GAP_MIN, `gapW[${c}] 恒 ≥ 下界`);
-    L.lanes[c].forEach((x, i) => {
-      assert.equal(x, L.colX[c] + DG_NODE_W + DG_LANE_MIN + i * DG_LANE_PITCH, `通道 ${c} 第 ${i} 枚 lane 的 x 线`);
-      assert.ok(x > L.colX[c] + DG_NODE_W && x < L.colX[c + 1], "lane 线落在两列 chip 之间的通道内");
-    });
-  });
-  assert.equal(L.busLanes.length, budget.busLaneCount, "带内 lane 数 = 预算回灌数");
-  L.busLanes.forEach((y, i) => {
-    assert.ok(y >= L.busBandTop && y < L.busBandTop + L.busLanes.length * DG_BUS_PITCH, `带内 lane ${i} 落在通道带里`);
-    assert.ok(Number.isInteger(y), "带内 lane 线为整数");
-    if (i > 0) assert.equal(y - L.busLanes[i - 1], DG_BUS_PITCH, `lane ${i} 间距 = DG_BUS_PITCH`);
-  });
-  const zero = g2Fixture(sample076bbb84()).layoutOf("board");
-  assert.deepEqual(zero.lanes.map((l) => l.length), [0, 0, 0, 0], "缺省预算 ⇒ 各通道 0 枚 lane（走线侧再回灌）");
-  assert.deepEqual(zero.busLanes, [], "缺省预算 ⇒ 通道带空");
-  zero.gapW.forEach((w) => assert.equal(w, DG_COL_GAP_MIN, "缺省 ⇒ 通道宽取下界"));
-});
-
-test("G2-④空管道短路：零 cell ⇒ 零列零行、宽高 0（渲染侧短路不受影响）", () => {
-  const L = pipeGridLayout({ projectId: "empty", nodes: [] }, new Map(), new Map());
-  assert.deepEqual(L.cells, [], "无格位");
-  assert.equal(L.cols, 0);
-  assert.equal(L.rows, 0);
-  assert.equal(L.width, 0);
-  assert.equal(L.height, 0);
-  assert.deepEqual([...L.cellOf.keys()], [], "取数面空且每次新建（不共享可变对象）");
-  assert.deepEqual([...L.gapW], [], "无通道");
-  assert.deepEqual([...L.lanes], [], "无 lane");
-  assert.deepEqual([...L.colX], [], "无 COL_X");
-  const still = renderDependencyGraphSection([]);
-  assert.equal(still.html, "", "tasks.length===0 的整节短路照旧（G2 未触碰渲染面）");
-});
-
-test("G2-样本076bbb84：列分布 {0:#1}{1:#2,#5}{2:#3,#4}{3:#6}{4:#7}、R=2、长边 3", () => {
-  const tasks = sample076bbb84();
-  const graph = buildGraphWithPipelines(tasks);
-  const ordinals = taskOrdinalMap(tasks);
-  const layers = layerOfGraph(graph.nodes, ordinals, graph.edges);
-  assert.equal(graph.edges.length, 10, "样本 = 10 条真依赖边（原型对照稿同数）");
-  const pipe = graph.pipelines[0];
-  const columns = compressPipeLayers(pipe, layers);
-  const L = pipeGridLayout(pipe, columns, ordinals);
-  const dist = new Map();
-  for (const cell of L.cells) dist.set(cell.col, [...(dist.get(cell.col) ?? []), `#${cell.ordinal}`]);
-  assert.deepEqual(
-    [...dist.entries()].sort((a, b) => a[0] - b[0]),
-    [[0, ["#1"]], [1, ["#2", "#5"]], [2, ["#3", "#4"]], [3, ["#6"]], [4, ["#7"]]],
-    "五列分布（#6 的 5 枚入边 = 宽 fan-in 夹具）",
-  );
-  assert.equal(L.cols, 5);
-  assert.equal(L.rows, 2, "R = 2（两列各并列两枚）");
-  const longEdges = graph.edges.filter((e) => (columns.get(e.to) ?? 0) - (columns.get(e.from) ?? 0) >= 2);
-  assert.deepEqual(
-    longEdges.map((e) => `#${ordinals.get(e.from)}→#${ordinals.get(e.to)}`),
-    ["#1→#6", "#2→#6", "#5→#6"],
-    "长边 3 条（列差 ≥2 ⇒ 走通道带；其余 7 条为相邻弧）",
-  );
-});
-
-test("G7-定宽①设计界关系式：框右缘内缘式 + 通道带宽下界 ⇒ 定宽不破、右侧留白足够", () => {
-  // v0.10.6 C5/C6 翻案：旧式「角标越界（DG_BADGE_MAX_W − DG_NODE_W）≤ 通道下界」随角标族退役而**取等式失效**
-  // （`DG_BADGE_MAX_W` 已摘除）⇒ 本条改钉两件事：① 最右 chip 右缘到**框右缘**的内缘式；② 通道带宽下界仍兜住两侧 lane。
-  const { graph, layoutOf } = g2Fixture(sample076bbb84());
-  const L = layoutOf("board");
-  const pipe = graph.pipelines.find((p) => p.projectId === "board");
-  const rightmost = Math.max(...L.cells.map((c) => c.chipRight));
-  // ① 网格右内缘：`width = contentRight + DG_PAD_R`（加数唯一 ⇒ 定宽与「本列有几枚角标」彻底脱钩）
-  assert.equal(L.width - rightmost, DG_PAD_R, "chip 右缘 → 网格右缘 = DG_PAD_R（唯一加数）");
-  // ② 框右缘内缘式（canvasLayout 的 frameW 定义式）：网格右缘 → 框右缘 = pad + border（左右各一级）
-  const frame = canvasLayout([pipe], [L]).frameOf.get("board");
-  assert.ok(frame !== undefined, "board 框在册（canvasLayout 的 frameOf 取数面）");
-  assert.equal(frame.frameW, L.width + 2 * (DG_FRAME_BORDER + DG_FRAME_PAD), "框外宽 = 网格宽 + 2·(DG_FRAME_BORDER + DG_FRAME_PAD)");
-  assert.equal(
-    frame.frameW - rightmost,
-    DG_PAD_R + 2 * (DG_FRAME_BORDER + DG_FRAME_PAD),
-    "chip 右缘 → 框右缘 = DG_PAD_R + 2·(border + pad)（框右边线不切 chip 的定义式）",
-  );
-  assert.ok(frame.frameW - rightmost > DG_FRAME_TITLE_H, "右侧留白足够（不亚于标题带高 ⇒ 框内不出现「右边比上边紧」）");
-  // ③ 列间通道：`DG_COL_GAP_MIN` **数值不动（56）**，语义重定为「2·DG_LANE_MIN + 余量」的带宽下界
-  assert.ok(DG_COL_GAP_MIN >= 2 * DG_LANE_MIN, `通道带宽下界 ${DG_COL_GAP_MIN} ≥ 两侧各一枚 lane 的下界 2×${DG_LANE_MIN}`);
-  assert.equal(DG_COL_GAP_MIN - 2 * DG_LANE_MIN, 12, "余量 = 12（抬 56 ⇒ colX 递推全体横坐标漂移 ⇒ 本版刻意不动）");
-  L.gapW.forEach((w, c) => {
-    assert.ok(w >= DG_COL_GAP_MIN, `gapW[${c}] 恒 ≥ 下界`);
-    assert.equal(L.colX[c + 1] - (L.colX[c] + DG_NODE_W), w, `通道 ${c} 的宽 = 相邻两列 chip 边的净距（与递推式同源）`);
-  });
-  assert.equal(DG_NODE_W, 74, "chip 定宽 = 74（box-sizing:border-box）");
-  assert.equal(DG_NODE_H, 28);
-  assert.equal(DG_BADGE_H, 14, "行距常量保留（§2.4「刻意不动」第二条：S1 下 cell 的 top 逐字进 DOM）");
-  assert.equal(DG_ROW_GAP, 4);
-  assert.equal(DG_COL_GAP_MIN, 56, "通道带宽下界 = 56（数值不动）");
-  assert.equal(DG_LANE_PITCH, 14);
-  assert.equal(DG_LANE_MIN, 22);
-  assert.equal(DG_ARC_K_MAX, 34);
-  assert.equal(DG_BUS_PITCH, 12);
-  assert.equal(DG_PAD_L, 12);
-  assert.equal(DG_PAD_T, 12);
-  assert.equal(DG_PAD_B, 12);
-  assert.equal(DG_PAD_R, 12, "v0.10.6 C6：96 → 12（角标族退役 ⇒ 右内缘与左内缘对称）");
-  // 件二（b2′）：对齐用户已批准原型 dep-graph-proto.html C 版 —— 列距 130 / 行距 46
-  assert.equal(DG_NODE_W + DG_COL_GAP_MIN, 130, "列距 = chip 宽 + 通道下界 = 130（原型 C）");
-  assert.equal(DG_BADGE_H + DG_NODE_H + DG_ROW_GAP, 46, "行距 = cell 盒高 + 纵距 = 46（原型 C）");
-});
-
-test("G7-定宽②位数无关：#n 由 1 位升到 3 位 ⇒ chip 盒与全部坐标零变化", () => {
-  const base = [
-    task("dw-a", "completed", [], { projectId: "board", queuedAt: "2026-10-12T00:00:01Z" }),
-    task("dw-b", "working", ["dw-a"], { projectId: "board", queuedAt: "2026-10-12T00:00:02Z" }),
-  ];
-  const geom = (tasks) => {
-    const graph = buildGraphWithPipelines(tasks);
-    const ordinals = taskOrdinalMap(tasks);
-    const layers = layerOfGraph(graph.nodes, ordinals, graph.edges);
-    const pipe = graph.pipelines[0];
-    const L = pipeGridLayout(pipe, compressPipeLayers(pipe, layers), ordinals);
-    return { ordinals: [...L.cells.map((c) => c.ordinal)], geom: L.cells.map((c) => [c.x, c.y, c.w, c.h, c.chipRight, c.chipMidY]), width: L.width, height: L.height };
-  };
-  const two = geom(base);
-  // 同一拓扑、号序不变，只把标识撑到 3 位（位数只影响可见文字，不进几何）
-  const padded = [
-    task("pad-aaaaaaaa", "completed", [], { projectId: "board", queuedAt: "2026-10-12T00:00:01Z", prompt: "1".repeat(100) }),
-    task("pad-bbbbbbbb", "working", ["pad-aaaaaaaa"], { projectId: "board", queuedAt: "2026-10-12T00:00:02Z", prompt: "2".repeat(100) }),
-  ];
-  const wide = geom(padded);
-  assert.deepEqual(wide.geom, two.geom, "格位坐标与盒模零变化（尺寸只在 JS 常量、与内容无关）");
-  assert.equal(wide.width, two.width, "网格宽不随位数变");
-  assert.equal(wide.height, two.height, "网格高不随位数变");
-  assert.deepEqual(wide.ordinals, two.ordinals, "号序不变（位数不改编号）");
-});
 // ---------------------------------------------------------------------------
 // G3（v0.10.5 · REQ-2026-10-12-02 · 改造文档 §2.4-④ / §2.5-I2 I3 / §2.6）：
-// 通道式走线纯函数 routeIntraEdges / arcPath / busPath —— 只出 path 数据与类名，
-// 不渲染、不产 HTML / CSS、不减交叉（§2.6：允许交叉、只禁共段）。
+// 原锚吃通道式走线的两枚纯函数（只出 path 数据与类名，不渲染、不产 HTML / CSS、不减交叉）。
+// ↑ v0.10.7 N10（REQ-2026-10-15-01 · 改造文档 §2.3「删」段末项）：该两枚 path 原语随走线族
+//   整族退休（折线 `d` 的唯一出面 = ELK `sections`）⇒ 本块只留 **path 读数工具**，供 N5 起的
+//   ELK 折线锚复用。
 // ---------------------------------------------------------------------------
 
-/** `d` 里的全部坐标对（按出现序）。几何全整数 ⇒ 无需处理小数。 */
-const dPoints = (d) => (d.match(/-?\d+,-?\d+/g) ?? []).map((p) => p.split(",").map(Number));
+/** `d` 里的全部坐标对（按出现序）。v0.10.7 N5 起坐标源 = ELK ⇒ 几何可为小数（`elkNum` 收 0.01px）。 */
+const dPoints = (d) => (d.match(/-?\d+(?:\.\d+)?,-?\d+(?:\.\d+)?/g) ?? []).map((p) => p.split(",").map(Number));
 /** `d` 里的全部命令字母（按出现序）。 */
 const dCmds = (d) => d.match(/[A-Za-z]/g) ?? [];
 
@@ -1580,35 +1290,6 @@ const leftMidOf = (grid, cell) => [
   grid.colX[cell.col] ?? 0,
   (grid.rowY[cell.row] ?? 0) + DG_BADGE_H + DG_NODE_H / 2,
 ];
-
-/** 样本 076bbb84 的单管道网格 + 走线（缺省预算 ⇒ 通道带尚未回灌）。 */
-const g3Sample = (budget = {}) => {
-  const { graph, ordinals, layers } = g2Fixture(sample076bbb84());
-  const pipe = graph.pipelines.find((p) => p.projectId === "board");
-  const columns = compressPipeLayers(pipe, layers);
-  const grid = pipeGridLayout(pipe, columns, ordinals, budget);
-  return { graph, grid, routes: routeIntraEdges(graph.edges, grid) };
-};
-
-test("G3-端点①（I2 逐边恒等 + 空转守卫）：每条 d 的首点 = 源右缘中点、末点 = 目标左缘中点（按 colX/rowY 重算）", () => {
-  const { graph, grid, routes } = g3Sample();
-  assert.ok(routes.length > 0, "空转守卫：出参非空（逐边断言不得空跑）");
-  assert.equal(routes.length, graph.edges.length, "样本 10 条边全在单管道内 ⇒ 全走线（零跨管道丢弃）");
-  let checked = 0;
-  for (const e of routes) {
-    const a = grid.cellOf.get(e.from);
-    const b = grid.cellOf.get(e.to);
-    assert.ok(a !== undefined && b !== undefined, `${e.from}→${e.to} 两端都在网格内`);
-    const pts = dPoints(e.d);
-    assert.ok(pts.length >= 2, `${e.from}→${e.to} 的 d 至少含首末两点`);
-    assert.deepEqual(pts[0], rightMidOf(grid, a), `${e.from}→${e.to} 首点 = 源 chip 右缘中点（重算式）`);
-    assert.deepEqual(pts[pts.length - 1], leftMidOf(grid, b), `${e.from}→${e.to} 末点 = 目标 chip 左缘中点（重算式）`);
-    assert.deepEqual(pts[0], [a.chipRight, a.chipMidY], `${e.from} 的两种右缘中点算法必须等值（几何单源）`);
-    assert.deepEqual(pts[pts.length - 1], [b.chipX, b.chipMidY], `${e.to} 的两种左缘中点算法必须等值`);
-    checked += 1;
-  }
-  assert.equal(checked, 10, "空转守卫：逐边遍历真的跑了 10 条");
-});
 
 // 件一（增补 §6.1 · 外壳恒渲）新增锚②：**模型 ↔ 渲染**端点对账。
 // 与 G3-端点① 的分野 = ① 拿几何函数的 `colX/rowY` 重算（模型自洽）；本条拿**渲染 HTML 里 cell 的
@@ -1631,7 +1312,7 @@ function renderedCells(bodyHtml) {
   const out = new Map();
   for (const chunk of bodyHtml.split('<span class="dg-cell" style="').slice(1)) {
     const m =
-      /^left:(\d+)px;top:(\d+)px"><span class="dg-chip dg-\w+" title="([^"]*)">#\d+<\/span>(<span class="dg-deps">)?/.exec(chunk);
+      /^left:(-?\d+(?:\.\d+)?)px;top:(-?\d+(?:\.\d+)?)px"><span class="dg-chip dg-\w+" title="([^"]*)">#\d+<\/span>(<span class="dg-deps">)?/.exec(chunk);
     assert.ok(m !== undefined, `cell 出参形态 = style 的 left/top 两枚几何字面 + 一枚 chip（实得 ${chunk.slice(0, 80)}…）`);
     const taskId = m[3].split(" · ")[0];
     assert.equal(out.has(taskId), false, `同一管道内 taskId 不得重复出现：${taskId}`);
@@ -1663,13 +1344,13 @@ const canvasEdgePoint = (f, c, side) => [
   renderedChipMidY(c) + f.dy + DG_GRID_ORIGIN_Y,
 ];
 
-test("件一②模型↔渲染（S1 加偏）：每条 d 的首末点 === 渲染 cell 的 chip 右缘/左缘中点 + 所属框 origin(dx/dy)", () => {
+test("件一②模型↔渲染（S1 加偏）：每条 d 的首末点 === 渲染 cell 的 chip 右缘/左缘中点 + 所属框 origin(dx/dy)", async () => {
   /** @param tasks 夹具 @param label 夹具名 @param minChecked 空转守卫下界 */
-  const reconcile = (tasks, label, minChecked) => {
+  const reconcile = async (tasks, label, minChecked) => {
     // 取数源 = 约简后 `kept`（与渲染层五消费点同源）；照吃声明原边集 ⇒ 约简一发生本条必红
     const graph = buildGraphWithPipelines(tasks);
     const edges = transitiveReduce(graph.edges).kept;
-    const { html } = renderDependencyGraphSection(tasks);
+    const { html } = (await renderDependencyGraphSection(tasks));
     // **C4 后 path 池只在画布层**（svg 从「框 › pipe-body › dg-grid」搬到 `.dg-canvas` ⇒ 每框零 svg）
     const canvas = /<div class="dg-canvas"[^>]*>\s*<svg class="dg-links">([\s\S]*?)<\/svg>/.exec(html);
     assert.ok(canvas !== null, `${label}：画布级边线层在场（框内不再取池 —— 逐框池恒为空）`);
@@ -1732,9 +1413,9 @@ test("件一②模型↔渲染（S1 加偏）：每条 d 的首末点 === 渲染
     assert.ok(checked >= minChecked, `空转守卫：${label} 逐边核对真的跑了 ${checked} 条（下界 ${minChecked}）`);
     return checked;
   };
-  assert.equal(reconcile(sample076bbb84(), "样本076bbb84", 8), 8, "单管道声明 10 边 → 本质 8 边、7 cell ⇒ 全数对账（加偏后逐点相等）");
+  assert.equal(await reconcile(sample076bbb84(), "样本076bbb84", 8), 8, "单管道声明 10 边 → 本质 8 边、7 cell ⇒ 全数对账（加偏后逐点相等）");
   assert.equal(
-    reconcile(pipe6Tasks(), "pipe6", 5),
+    await reconcile(pipe6Tasks(), "pipe6", 5),
     5,
     "副夹具多框 ⇒ 板内边 + 跨框边**同池**全数对账（跨框那几条是「加偏」的唯一硬证据：两端的 dx/dy 不同）",
   );
@@ -1744,148 +1425,6 @@ test("件一②模型↔渲染（S1 加偏）：每条 d 的首末点 === 渲染
 // 「算式里的 origin 从哪来」—— JS 常量 / 画布下发变量 / CSS 消费变量名三处必须是同一枚事实源。
 // 缺这一钉时的失败形态：有人把 `DG_GRID_ORIGIN_*` 改成硬编码 9/21（改了 pad 不跟随），或把 CSS 的
 // `left: var(--dg-fp)` 写成 `left: 8px`（DOM 内缘与走线内缘分家 ⇒ 件一② 依旧全绿而线上错位）。
-test("件一③origin 三方同源（JS 恒等式 · 画布下发键值 · CSS 消费变量名）：框内 origin 只有一个事实源", () => {
-  // —— (i) JS 侧：origin 必须是**表达式**，不得写成硬编码数字
-  assert.equal(
-    DG_GRID_ORIGIN_X,
-    DG_FRAME_BORDER + DG_FRAME_PAD,
-    `横内缘 = border(${DG_FRAME_BORDER}) + pad(${DG_FRAME_PAD})（写死 9 ⇒ 改 pad 时走线一侧不跟随）`,
-  );
-  assert.equal(
-    DG_GRID_ORIGIN_Y,
-    DG_FRAME_BORDER + DG_FRAME_TITLE_H,
-    `纵内缘 = border(${DG_FRAME_BORDER}) + 标题带(${DG_FRAME_TITLE_H})（标题带只在上 ⇒ 加数不含 pad）`,
-  );
-  // —— 下发侧：键名 ⇄ 常量的**配对**也钉住（配错了，下面的「吃 var(--dg-fp)」会指向错加数）
-  const inline = /<div class="dg-canvas" style="([^"]*)">/.exec(
-    renderDependencyGraphSection([task("t-origin", "completed", [])]).html,
-  );
-  assert.ok(inline !== null, "画布那一枚 inline 在场（几何变量的唯一下发面）");
-  for (const [key, val] of [
-    ["--dg-fb", DG_FRAME_BORDER],
-    ["--dg-fth", DG_FRAME_TITLE_H],
-    ["--dg-fp", DG_FRAME_PAD],
-  ])
-    assert.ok(
-      inline[1].includes(`${key}:${val}px`),
-      `下发键 ${key} 的值逐字 === 常量 ${val}（改常量 ⇒ 板面自动跟随；两处不同 ⇒ 本条红）`,
-    );
-  // —— (ii) CSS 侧：**抓变量名不抓值**（先例 = G6-同源① 的 `width: var(--dg-nw)` 逐字锚）
-  const block = pipeCssBlock();
-  const borderDecls = cssDecls(cssRule(block, ".pipe")).filter((d) => /^border:/.test(d));
-  assert.equal(borderDecls.length, 1, "框边框声明恰一条（多条 = 第二份线宽事实源）");
-  assert.match(
-    borderDecls[0],
-    /^border: var\(--dg-fb\) solid /,
-    "框边框线宽只引 --dg-fb（写 1px 字面 ⇒ 与 DG_FRAME_BORDER 分家：origin 加了 border、绘制侧没加）",
-  );
-  assert.deepEqual(
-    cssDecls(cssRule(block, ".dg-canvas .pipe-body")).filter((d) => /^(left|top):/.test(d)),
-    ["left: var(--dg-fp)", "top: var(--dg-fth)"],
-    "框内定位壳的 left/top 只引 --dg-fp / --dg-fth（= origin 的两枚加数，DOM 内缘与走线内缘同名同源）",
-  );
-});
-
-test("G3-端点②（长边三段 + busLane 独占 + 预算回灌落线）：样本 3 枚长边各占一枚独立 busLane", () => {
-  const { graph, grid, routes } = g3Sample();
-  const longs = routes.filter((e) => e.kind === "long");
-  assert.deepEqual(
-    longs.map((e) => `${e.from}→${e.to}`),
-    ["n1→n6", "n2→n6", "n5→n6"],
-    "长边 = 列差 ≥2 的三条（与 G2 样本锚同源）",
-  );
-  assert.deepEqual([...new Set(longs.map((e) => e.busLane))].sort(), [0, 1, 2], "三条长边的 busLane 两两不同（x 区间相交 ⇒ 不复用）");
-  for (const e of longs) {
-    assert.deepEqual(dCmds(e.d), ["M", "C", "L", "C"], `${e.from}→${e.to} 长边 = 下降弧 → 水平段 → 上升弧`);
-    const pts = dPoints(e.d);
-    assert.equal(pts.length, 8, "三段共 8 枚坐标对（P0 C1 C2 Q1 Q2 C3 C4 P1）");
-    const q1 = pts[3];
-    const q2 = pts[4];
-    assert.equal(q1[1], e.yb, "Q1 落在该边的通道带 y 线上");
-    assert.equal(q2[1], e.yb, "Q2 与 Q1 同 y ⇒ 中间段水平");
-    assert.equal(pts[2][1], e.yb, "下降弧末控制点同 y ⇒ Q1 处切线水平（C¹ 连续）");
-    assert.equal(pts[5][1], e.yb, "上升弧首控制点同 y ⇒ Q2 处切线水平（C¹ 连续）");
-    const a = grid.cellOf.get(e.from);
-    const b = grid.cellOf.get(e.to);
-    assert.equal(q1[0], a.chipRight + DG_LANE_MIN + e.lambda * DG_LANE_PITCH, "tx = x0 + LANE_MIN + λ·LANE_PITCH");
-    assert.equal(q2[0], b.chipX - DG_LANE_MIN - e.mu * DG_LANE_PITCH, "tx2 = x1 − LANE_MIN − μ·LANE_PITCH");
-    assert.ok(q1[0] < q2[0], `${e.from}→${e.to} 水平段不自交（tx < tx2）`);
-    assert.ok(q1[0] > a.chipRight && q1[0] < b.chipX, "tx 落在源右缘与目标左缘之间（通道内）");
-    assert.ok(q2[0] > a.chipRight && q2[0] < b.chipX, "tx2 落在通道内");
-    assert.equal(
-      e.yb,
-      grid.busBandTop + Math.floor(DG_BUS_PITCH / 2) + e.busLane * DG_BUS_PITCH,
-      "yb = 通道带 lane 线（与 pipeGridLayout 的 busLanes 同式）",
-    );
-  }
-  // 一次收敛：把走线要的 lane 数回灌成预算重算网格 ⇒ lane 分配不变、走线坐标落进网格 lane 线
-  const gapLanes = new Array(Math.max(0, grid.cols - 1)).fill(0);
-  for (const e of longs) {
-    gapLanes[grid.cellOf.get(e.from).col] += 1;
-    gapLanes[grid.cellOf.get(e.to).col - 1] += 1;
-  }
-  const fed = g3Sample({ gapLanes, busLaneCount: longs.length });
-  assert.deepEqual(fed.routes.map((e) => [e.busLane, e.lambda, e.mu, e.yb]), routes.map((e) => [e.busLane, e.lambda, e.mu, e.yb]), "预算回灌不改 lane 分配（一次收敛、不迭代）");
-  assert.ok(fed.grid.height > grid.height, "回灌后通道带高进高度 ⇒ height 抬升（I4 不被裁）");
-  const laneXs = new Set(fed.grid.lanes.flat());
-  for (const e of fed.routes.filter((x) => x.kind === "long")) {
-    const a = fed.grid.cellOf.get(e.from);
-    assert.ok(laneXs.has(a.chipRight + DG_LANE_MIN + e.lambda * DG_LANE_PITCH), `${e.from}→${e.to} 的 tx 命中网格 lane 线（λ 侧）`);
-    assert.ok(fed.grid.busLanes.includes(e.yb), `${e.from}→${e.to} 的 yb 命中通道带 lane 线`);
-    assert.ok(e.yb <= fed.grid.height - DG_PAD_B, "水平段落在内容包含线之内（I4）");
-  }
-  assert.equal(graph.edges.length, 10, "样本边数基线（防夹具漂移）");
-});
-
-test("G3-端点③（相邻弧切线水平 + K 公式 + 跨管道不画 + 确定性 + d 字符集与类名纪律）", () => {
-  const { graph, grid, routes } = g3Sample();
-  const adj = routes.filter((e) => e.kind === "adjacent");
-  assert.equal(adj.length, 7, "其余 7 条为相邻弧（列差 1）");
-  for (const e of adj) {
-    assert.equal(e.busLane, -1, "相邻边不占通道带 lane");
-    assert.equal(e.lambda, -1, "相邻边不占 λ lane");
-    assert.equal(e.mu, -1, "相邻边不占 μ lane");
-    assert.deepEqual(dCmds(e.d), ["M", "C"], `${e.from}→${e.to} 相邻边 = 一枚三次贝塞尔`);
-    const [p0, c1, c2, p1] = dPoints(e.d);
-    assert.equal(c1[1], p0[1], "首控制点与源端点同 y ⇒ 源侧切线水平（贴右缘中点）");
-    assert.equal(c2[1], p1[1], "末控制点与目标端点同 y ⇒ 目标侧切线水平（贴左缘中点）");
-    const k = c1[0] - p0[0];
-    const dx = p1[0] - p0[0];
-    assert.equal(c2[0], p1[0] - k, "两端控制点等长（对称弧）");
-    assert.equal(k, Math.max(6, Math.min(DG_ARC_K_MAX, Math.round(dx / 3))), "K = clamp(dx/3, 6, DG_ARC_K_MAX)");
-    assert.ok(k >= 6 && k <= DG_ARC_K_MAX, `K=${k} 在 [6, ${DG_ARC_K_MAX}] 内`);
-    assert.equal(arcPath(p0[0], p0[1], p1[0], p1[1]), e.d, "d 与 arcPath(端点) 逐字等值（走线只经该式）");
-  }
-  const fromN1 = adj.filter((e) => e.from === "n1");
-  assert.equal(fromN1.length, 2, "n1 ⇒ n2 / n5 两条相邻弧（分支可见）");
-  assert.notEqual(fromN1[0].d, fromN1[1].d, "同源两条相邻边的 d 不得相同（并列节点不叠成一条）");
-  // 跨管道边不画：pipe6 夹具只喂 board 的网格 ⇒ 他管道端点直接跳过
-  const tasks6 = pipe6Tasks();
-  const g6 = buildGraphWithPipelines(tasks6);
-  const o6 = taskOrdinalMap(tasks6);
-  const l6 = layerOfGraph(g6.nodes, o6, g6.edges);
-  const boardPipe = g6.pipelines.find((p) => p.projectId === "board");
-  const boardGrid = pipeGridLayout(boardPipe, compressPipeLayers(boardPipe, l6), o6);
-  const boardRoutes = routeIntraEdges(g6.edges, boardGrid);
-  assert.equal(g6.edges.length, 5, "pipe6 = 5 条边（1 条板内 + 4 条跨管道）");
-  assert.deepEqual(
-    boardRoutes.map((e) => `${e.from}→${e.to}`),
-    ["t-b1→t-b2"],
-    "只画板内那一条 ⇒ 跨管道边（t-b1→t-f1 / t-b2→t-o1 / t-f1→t-b3 / t-o1→t-f2）结构上不入走线",
-  );
-  // 确定性：入参边序无关 ⇒ 出参逐字段相等（走线前按（源号序, 目标号序）定序）
-  assert.deepEqual(routeIntraEdges([...graph.edges].reverse(), grid), routes, "边数组反转 ⇒ 出参逐字段相等");
-  assert.deepEqual(routeIntraEdges(graph.edges, grid), routes, "重复调用逐字段相等");
-  // 命名纪律（§2.2）：类名单数、不含子串 dg-edges；d 字符集只吃几何字符
-  assert.equal(DG_EDGE_CLS, "dg-edge", "边线类名 = dg-edge（单数）");
-  assert.equal(DG_EDGE_CLS.includes("dg-edges"), false, "类名不得含子串 dg-edges（防四条边清单负钉误判）");
-  for (const e of routes) {
-    assert.equal(e.cls, DG_EDGE_CLS, "每条出参带同一类名，供渲染侧直嵌");
-    assert.equal(/[^MLCQHAZ0-9.,\-\s]/.test(e.d), false, `d 字符集越界：${e.d}`);
-    assert.equal(e.d.includes('"'), false, "d 不出引号（带引号属性闭集纪律）");
-  }
-});
-
 // ---------------------------------------------------------------------------
 // G4 / G5（v0.10.5 · REQ-2026-10-12-02 · 改造文档 §2.5 I1/I3 / §2.6 判据 2）：
 // **机器判据面** —— 只加断言、不改算法（本组对 src/** 零行改动）。
@@ -1919,7 +1458,7 @@ const G5_PARALLEL_SIN_MAX = 0.2;
 
 /** 从 `d` 解出段序列（弧 = 4 控制点 / 直线 = 2 端点）—— 判据只吃算法真实产出的 path。 */
 const dSegments = (d) => {
-  const nums = (d.match(/-?\d+,-?\d+/g) ?? []).map((s) => s.split(",").map(Number));
+  const nums = dPoints(d);
   const cmds = dCmds(d);
   const segs = [];
   let ci = 0;
@@ -2125,29 +1664,6 @@ const findLaneCollisions = (grid, routes) => {
   return { laneCollisions, busCollisions, yPairsChecked, busPairs, reusedLanes, longCount: longs.length };
 };
 
-/** 构图 → 分层 → 网格 → 走线 → **一次预算回灌**（渲染侧真正落地的形态）。 */
-const g45Layout = (tasks, feed = true) => {
-  const graph = buildGraphWithPipelines(tasks);
-  const ordinals = taskOrdinalMap(tasks);
-  const layers = layerOfGraph(graph.nodes, ordinals, graph.edges);
-  const pipe = graph.pipelines.find((p) => p.projectId === "board");
-  assert.ok(pipe !== undefined, "夹具须含 board 管道");
-  const columns = compressPipeLayers(pipe, layers);
-  let grid = pipeGridLayout(pipe, columns, ordinals);
-  let routes = routeIntraEdges(graph.edges, grid);
-  if (feed) {
-    const gapLanes = new Array(Math.max(0, grid.cols - 1)).fill(0);
-    const longs = routes.filter((e) => e.kind === "long");
-    for (const e of longs) {
-      gapLanes[grid.cellOf.get(e.from).col] += 1;
-      gapLanes[grid.cellOf.get(e.to).col - 1] += 1;
-    }
-    grid = pipeGridLayout(pipe, columns, ordinals, { gapLanes, busLaneCount: longs.length });
-    routes = routeIntraEdges(graph.edges, grid);
-  }
-  return { grid, routes };
-};
-
 /** busLane **复用**夹具：两条长边同 lane、x 区间不相交（列区间首尾分离）。 */
 const busReuseTasks = () => [
   task("r1", "completed", [], { projectId: "board", queuedAt: "2026-10-12T00:02:01Z" }),
@@ -2180,244 +1696,6 @@ const g45StressTasks = () => {
   return rows.map(([id, ds], i) => task(id, "completed", ds, { projectId: "board", queuedAt: q(i + 1) }));
 };
 
-/** 三枚夹具（回灌后形态）统一跑判据用。 */
-const g45Fixtures = () => [
-  ["样本076bbb84", g45Layout(sample076bbb84())],
-  ["压力14节点", g45Layout(g45StressTasks())],
-  ["busReuse", g45Layout(busReuseTasks())],
-];
-
-test("G4-穿节点①段 bbox 定义式：弧取 4 控制点、水平段取 2 端点；相邻 1 段 / 长边 3 段（空转守卫在内）", () => {
-  const { routes } = g45Layout(sample076bbb84());
-  const counts = routes.map((e) => edgeBoxes(e).length);
-  const adjacent = routes.filter((e) => e.kind === "adjacent");
-  const longs = routes.filter((e) => e.kind === "long");
-  assert.equal(adjacent.length, 7, "样本相邻弧 7 条（夹具基线，防漂移）");
-  assert.equal(longs.length, 3, "样本长边 3 条");
-  assert.deepEqual(counts, routes.map((e) => (e.kind === "long" ? 3 : 1)), "相邻 = 1 段、长边 = 3 段（下降弧 / 水平段 / 上升弧）");
-  assert.equal(counts.reduce((s, n) => s + n, 0), 16, "段总数 = 16（度量对象非空）");
-  for (const e of longs) {
-    const segs = dSegments(e.d);
-    assert.deepEqual(segs.map((s) => s.kind), ["cubic", "line", "cubic"], `${e.from}→${e.to} 长边段型序列`);
-    const mid = edgeBoxes(e)[1];
-    assert.equal(mid.box[2], mid.box[3], "水平段 y0===y1 ⇒ 中段真是水平（2 端点退化 bbox）");
-    assert.ok(mid.box[1] > mid.box[0], "水平段 bbox 宽 = |tx2 − tx| > 0（非退化成点）");
-    const first = segs[0].pts;
-    assert.equal(first.length, 4, "下降弧 4 控制点");
-    assert.equal(edgeBoxes(e)[0].box[1], Math.max(first[0][0], first[1][0], first[2][0], first[3][0]), "弧 bbox 的右界 = 4 控制点最大 x（凸包包含曲线）");
-  }
-  for (const e of adjacent) {
-    const pts = dSegments(e.d)[0].pts;
-    assert.equal(pts.length, 4, "相邻弧 4 控制点");
-    const b = edgeBoxes(e)[0].box;
-    assert.deepEqual(b, boxOfPts(pts), "相邻弧 bbox 由 4 控制点定义式给出");
-  }
-});
-
-test("G4-穿节点②I1 通道包含·正向：三夹具 × 两种网格 ⇒ 段 bbox ∩ 非本边两端 chip 内部 = ∅", () => {
-  const ran = [];
-  for (const feed of [false, true]) {
-    for (const [label, tasks] of [["样本076bbb84", sample076bbb84()], ["压力14节点", g45StressTasks()], ["busReuse", busReuseTasks()]]) {
-      const { grid, routes } = g45Layout(tasks, feed);
-      const { hits, checked } = findPenetrations(routes, grid);
-      assert.ok(checked > 0, `${label}(feed=${feed}) 空转守卫：非端点 chip × 段 的比较数须 > 0，实得 ${checked}`);
-      assert.deepEqual(hits.map((h) => [h.edge, h.chip, h.kind]), [], `I1 越界项须为空 —— ${label}（回灌态=${feed ? "渲染形态" : "未回灌"}）`);
-      ran.push(checked);
-    }
-  }
-  assert.ok(ran.every((n) => n > 0) && Math.max(...ran) > 100, "度量规模：三夹具回灌态下比较数须上量级（防判据只在极少样本上空转）");
-});
-
-test("G4-穿节点③与本边两端只许边界接触：首段左界 = 源 chip 右缘、末段右界 = 目标 chip 左缘，且自身两端也不入内部", () => {
-  const { grid, routes } = g45Layout(sample076bbb84());
-  let contacts = 0;
-  for (const e of routes) {
-    const a = grid.cellOf.get(e.from);
-    const b = grid.cellOf.get(e.to);
-    const boxes = edgeBoxes(e);
-    assert.equal(boxes[0].box[0], a.chipRight, `${e.from}→${e.to} 首段左界 === 源 chip 右缘（边界接触）`);
-    assert.equal(boxes[boxes.length - 1].box[1], b.chipX, `${e.from}→${e.to} 末段右界 === 目标 chip 左缘（边界接触）`);
-    for (const { box } of boxes) {
-      assert.equal(interiorOverlap(box, chipBox(a)), false, `${e.from}→${e.to} 段 bbox 不得进入**源** chip 内部（只许边界接触）`);
-      assert.equal(interiorOverlap(box, chipBox(b)), false, `${e.from}→${e.to} 段 bbox 不得进入**目标** chip 内部`);
-    }
-    contacts += 2;
-  }
-  assert.equal(contacts, routes.length * 2, "每边两端各一次边界接触被真正检查过（非空转）");
-  // 内部判据的方向性：同一枚 chip，把 bbox 往内挪 1px 就须判为穿模（否则「只许边界接触」是空话）
-  const cell = grid.cells[0];
-  const cb = chipBox(cell);
-  assert.equal(interiorOverlap([cb[0] - 10, cb[0], cb[2], cb[3]], cb), false, "左界恰贴 chip 左缘 ⇒ 边界接触，不判穿模");
-  assert.equal(interiorOverlap([cb[0] - 10, cb[0] + 1, cb[2], cb[3]], cb), true, "越过左缘 1px ⇒ 判穿模（判据真的在管内部）");
-});
-
-test("G4-穿节点④造反例·常驻：把长边水平段抬进 chip 行 ⇒ 必抓穿模；贴边形态必放行（两头都不许空转）", () => {
-  const { grid, routes } = g45Layout(sample076bbb84());
-  const long = routes.find((e) => e.kind === "long");
-  assert.ok(long !== undefined, "夹具须含长边（否则本条退化为空转）");
-  const a = grid.cellOf.get(long.from);
-  const b = grid.cellOf.get(long.to);
-  const mid = edgeBoxes(long)[1];
-  // 反例 A（几何可达的错误形态）：水平段 y 从通道带被抬到最后一行 chip 的中线 ⇒ 必穿中间列 chip
-  const badY = grid.rowY[grid.rows - 1] + DG_BADGE_H + DG_NODE_H / 2;
-  const lifted = { box: [mid.box[0], mid.box[1], badY, badY], kind: "line" };
-  const victims = grid.cells
-    .filter((c) => c.taskId !== long.from && c.taskId !== long.to)
-    .filter((c) => interiorOverlap(lifted.box, chipBox(c)));
-  assert.ok(victims.length > 0, `抬进 chip 行的水平段必须抓到穿模（实得 ${victims.length} 枚被穿 chip）`);
-  assert.ok(victims.every((c) => c.col > a.col && c.col < b.col), "被穿的必是**中间列**的非本边两端 chip（穿节点的定义）");
-  // 反例 B（判据实现自检）：同一段若留在通道带（真实形态）⇒ 一枚都不穿
-  const kept = grid.cells
-    .filter((c) => c.taskId !== long.from && c.taskId !== long.to)
-    .filter((c) => interiorOverlap(mid.box, chipBox(c)));
-  assert.deepEqual(kept.map((c) => c.taskId), [], "同一段在未改动形态下零穿模 ⇒ 上条抓的确实是「抬 y」这件事");
-  // 反例 C（贴边必须放行，防判据过紧把合法形态也判红）：bbox 右界正好落在某中间列 chip 的左缘
-  // **必须取与 badY 同一行（末行）的中间列 chip** —— 否则 y 带根本不相干，两条断言一起空转（历轮实测踩到）
-  const midCol = grid.cells.find((c) => c.col > a.col && c.col < b.col && c.row === grid.rows - 1);
-  assert.ok(midCol !== undefined, "夹具须含**末行**的中间列 chip（贴边反例的载体，与 badY 同一 y 带）");
-  assert.ok(badY > midCol.chipY && badY < midCol.chipY + DG_NODE_H, "反例载体自检：badY 确实落在该 chip 的 y 内部（否则①②都是空话）");
-  const tangentBox = [midCol.chipX - 40, midCol.chipX, badY, badY + 1];
-  assert.equal(interiorOverlap(tangentBox, chipBox(midCol)), false, "右界 === chip 左缘 ⇒ 边界接触放行（与 I1 的「内部」措辞一致）");
-  const crossingBox = [midCol.chipX - 40, midCol.chipX + 0.5, badY, badY + 1];
-  assert.equal(interiorOverlap(crossingBox, chipBox(midCol)), true, "越缘 ⇒ 判红（同一条判据的两侧都验到）");
-});
-
-test("G5-重叠①结构面 λ/μ 单射：同通道内 y 区间相交的两条边不得共用同一枚 lane（空转正钉）", () => {
-  const seen = {};
-  for (const [label, tasks] of [["样本076bbb84", sample076bbb84()], ["压力14节点", g45StressTasks()], ["busReuse", busReuseTasks()]]) {
-    const { grid, routes } = g45Layout(tasks);
-    const r = findLaneCollisions(grid, routes);
-    assert.deepEqual(r.laneCollisions, [], `${label} λ/μ 不得与同通道内 y 区间相交的边共 lane（I3 结构面）`);
-    seen[label] = r;
-  }
-  // 空转守卫**分两面**（历轮实测）：λ/μ 单射的载重 = 「同一通道 ∧ y 区间相交」的边对数；
-  // busReuse 夹具按设计两条长边**源通道各异、x 分离** ⇒ 该项恒 0，它的结构面载重在 busLane 复用面。
-  // 拿同一把尺量三夹具会把「夹具形态」误读成「判据空转」，故各自钉各自的载重项。
-  assert.ok(seen["样本076bbb84"].yPairsChecked >= 1, `空转守卫：样本须存在「同通道 ∧ y 区间相交」的边对（实得 ${seen["样本076bbb84"].yPairsChecked}，否则单射断言是空话）`);
-  assert.ok(seen["压力14节点"].yPairsChecked >= 1, `空转守卫：压力夹具同样有被测 λ/μ 边对（实得 ${seen["压力14节点"].yPairsChecked}）`);
-  assert.ok(
-    seen["busReuse"].busPairs >= 1 && seen["busReuse"].reusedLanes >= 1,
-    `空转守卫：busReuse 的结构面载重 = busLane 复用被真正比较过（busPairs=${seen["busReuse"].busPairs} / reusedLanes=${seen["busReuse"].reusedLanes}）`,
-  );
-  // 装箱守恒的第二证：同一 λ 组内 lane 号互不相同（与 packLanes 的复用条件同义）
-  const { grid, routes } = g45Layout(sample076bbb84());
-  const bySrcCol = new Map();
-  for (const e of routes.filter((x) => x.kind === "long")) {
-    const k = grid.cellOf.get(e.from).col;
-    const list = bySrcCol.get(k) ?? [];
-    list.push(e);
-    bySrcCol.set(k, list);
-  }
-  for (const [col, list] of bySrcCol) {
-    if (list.length < 2) continue;
-    for (let i = 0; i < list.length; i += 1) {
-      for (let j = i + 1; j < list.length; j += 1) {
-        const sa = ySpanOf(grid.cellOf.get(list[i].from).chipMidY, list[i].yb);
-        const sb = ySpanOf(grid.cellOf.get(list[j].from).chipMidY, list[j].yb);
-        if (!yIntersect(sa, sb)) continue;
-        assert.notEqual(list[i].lambda, list[j].lambda, `源通道 ${col}：y 区间相交的两条边 λ 必须不同`);
-      }
-    }
-  }
-});
-
-test("G5-重叠②结构面 busLane：同一 busLane 内的 x 区间两两严格不交（含复用真的发生过）", () => {
-  const { grid, routes } = g45Layout(busReuseTasks());
-  const r = findLaneCollisions(grid, routes);
-  assert.equal(r.longCount, 2, "busReuse 夹具 = 2 条长边（列区间首尾分离）");
-  assert.ok(r.reusedLanes >= 1, `空转守卫：须有 busLane 被两条边复用（实得 ${r.reusedLanes}），否则本锚只测了单例`);
-  assert.ok(r.busPairs >= 1, "同 lane 内确有边对被比较过");
-  assert.deepEqual(r.busCollisions, [], "busLane 复用的前提 = x 区间两两不交（I3 结构面）");
-  // 两条长边确实共用 lane，且 x 区间分离（正向说明「复用」不是巧合而是装箱结果）
-  const longs = routes.filter((e) => e.kind === "long");
-  const [e1, e2] = longs;
-  assert.equal(e1.busLane, e2.busLane, "夹具的两条长边同 busLane（复用形态）");
-  const [a0, a1] = xSpanOf(grid, e1);
-  const [b0, b1] = xSpanOf(grid, e2);
-  assert.ok(a1 < b0 || b1 < a0, `同 lane 的两条边 x 区间必须严格分离：[${a0},${a1}] vs [${b0},${b1}]`);
-  for (const [label, tasks] of [["样本076bbb84", sample076bbb84()], ["压力14节点", g45StressTasks()]]) {
-    const one = findLaneCollisions(...Object.values(g45Layout(tasks)));
-    assert.deepEqual(one.busCollisions, [], `${label} busLane 内不得出现重叠 x 区间`);
-  }
-});
-
-test("G5-重叠③兜底采样面：叠点 ≥2 判红 · 且合法交叉与孤立交点必须放行（口径常驻正钉）", () => {
-  let rawOnly = 0;
-  for (const [label, { grid, routes }] of g45Fixtures().map(([n, v]) => [n, v])) {
-    void grid;
-    const { hits, rawHits, pairs } = findOverlaps(routes);
-    assert.ok(pairs > 0, `${label} 空转守卫：段对比较数须 > 0`);
-    assert.deepEqual(hits, [], `${label} 不得有共段（叠点 ≥${G5_RED_MIN} 即判红）`);
-    rawOnly += rawHits;
-    if (label === "样本076bbb84") {
-      assert.ok(rawHits >= 1, "常驻正钉：样本上确有「字面近点对 ≥2」的合法交叉段对 ⇒ 证明叠点口径的两条区分是**载重**的，不是装饰");
-      assert.ok(rawHits > hits.length, "合法交叉段对全部被放行（若相等即说明判据退化成了字面规则）");
-    }
-  }
-  assert.ok(rawOnly >= 7, `样本实测 7 对合法交叉（raw ≥2 但未判红的段对数，实得 ${rawOnly}）`);
-  // 逐字复核口径四句在实现上的落点
-  const { routes } = g45Layout(sample076bbb84());
-  const segs = routes.map((e) => dSegments(e.d).map(sampleSegment));
-  const sharedEndPair = (() => {
-    for (let i = 0; i < routes.length; i += 1) {
-      for (let j = i + 1; j < routes.length; j += 1) {
-        for (const A of segs[i]) {
-          for (const B of segs[j]) {
-            const ea = [A[0], A[A.length - 1]];
-            const eb = [B[0], B[B.length - 1]];
-            if (ea.some((p) => eb.some((q) => Math.hypot(p[0] - q[0], p[1] - q[1]) <= 0.01))) return [A, B];
-          }
-        }
-      }
-    }
-    return null;
-  })();
-  assert.ok(sharedEndPair !== null, "夹具须含共端点段对（「共端点不算重叠」的实测载体）");
-  const { raw, overlap } = countNearPairs(sharedEndPair[0], sharedEndPair[1]);
-  assert.equal(overlap < G5_RED_MIN, true, `共端点近旁 raw=${raw} 但未判红 ⇒ 「共端点不算重叠」成立`);
-});
-
-test("G5-重叠④造反例·常驻：长边 μ 改成与它边同值 ⇒ 结构面与兜底面至少各一条判红", () => {
-  const { grid, routes } = g45Layout(sample076bbb84());
-  const longs = routes.filter((e) => e.kind === "long");
-  assert.ok(longs.length >= 2, "夹具须含 ≥2 条长边（反例的载体）");
-  const A = longs[0];
-  const B = longs[longs.length - 1];
-  assert.notEqual(A.mu, B.mu, "夹具原态两条长边的 μ 本就不同（否则反例无意义）");
-  assert.deepEqual(findLaneCollisions(grid, routes).laneCollisions, [], "原态：结构面干净");
-  assert.deepEqual(findOverlaps(routes).hits, [], "原态：兜底面干净");
-
-  // 反例 ①：把 B 的 μ 强改成 A 的 μ ⇒ 同一目标通道的 lane 撞车（结构面判红）
-  const fakeB = { ...B, mu: A.mu };
-  const coll = findLaneCollisions(grid, [A, fakeB]);
-  assert.ok(coll.laneCollisions.length >= 1, `μ 同值必须被结构面抓住（实得 ${coll.laneCollisions.length} 条）`);
-
-  // 反例 ②：把 B 的 μ **与 yb** 一起改成 A 的值，再用 busPath 按同式重算出真实 path ⇒ 兜底采样面判红。
-  // **前提须写全（历轮实测）**：只改 μ 而 yb 不同时，两条上升弧只是「同一条竖直通道上的不同高度」
-  // —— 共 x 不共段，兜底面不判红是**几何正确**的（口径 = 共段才算重叠），不该拿它当兜底面的反例；
-  // 那种形态由反例 ①（结构面）负责抓。μ ∧ yb 同值 ⇒ 水平段同线、上升弧逐点重合 ⇒ 才是兜底面意义上的叠线。
-  const fakeB2 = { ...B, mu: A.mu, yb: A.yb };
-  const b = grid.cellOf.get(fakeB2.to);
-  const a = grid.cellOf.get(fakeB2.from);
-  const tx2 = b.chipX - DG_LANE_MIN - fakeB2.mu * DG_LANE_PITCH;
-  const dFake = busPath(a.chipRight, a.chipMidY, a.chipRight + DG_LANE_MIN + fakeB2.lambda * DG_LANE_PITCH, fakeB2.yb, tx2, b.chipX, b.chipMidY);
-  const fakeRoutes = [{ ...A, d: A.d }, { ...fakeB2, d: dFake }];
-  const sampled = findOverlaps(fakeRoutes);
-  assert.ok(sampled.hits.length >= 1, `μ ∧ yb 同值后水平段同线 / 上升弧重合须被兜底面抓住（实得 ${sampled.hits.length} 条）`);
-  // 同一条反例的「只改 μ」对照面：兜底面**必须放行**（证明判据只禁叠线、不把共通道当叠线）
-  const onlyMu = findOverlaps([{ ...A, d: A.d }, { ...fakeB, d: busPath(a.chipRight, a.chipMidY, a.chipRight + DG_LANE_MIN + fakeB.lambda * DG_LANE_PITCH, fakeB.yb, b.chipX - DG_LANE_MIN - fakeB.mu * DG_LANE_PITCH, b.chipX, b.chipMidY) }]);
-  assert.deepEqual(onlyMu.hits, [], "只改 μ（yb 不同）⇒ 共通道不共段 ⇒ 兜底面放行（口径负钉，防判据过紧）");
-
-  // 反例 ③：整条边重合（λ/μ/busLane 全同）⇒ 兜底面判红，且叠点数远大于阈值
-  const dup = findOverlaps([A, { ...A }]);
-  assert.ok(dup.hits.length >= 1, "完全重合的两条边必须判红");
-  assert.ok(dup.hits[0].overlap > G5_RED_MIN * 2, "重合形态的叠点数应显著超阈（判据不是擦线通过）");
-
-  // 反例 ④：busLane 强同值 ⇒ 结构面抓 x 区间
-  const fakeBus = { ...B, busLane: A.busLane };
-  assert.ok(findLaneCollisions(grid, [A, fakeBus]).busCollisions.length >= 1, "busLane 同值 ∧ x 区间相交 ⇒ 结构面判红");
-});
-
 // ---------------------------------------------------------------------------
 // G8（v0.10.5 · REQ-2026-10-12-02 · 改造文档 §2.2 两条硬命名纪律 / §2.7-⑤⑥）：
 // 渲染层属性纪律的负钉 —— ① svg 零盒模属性（不写 viewBox ⇒ 用户单位 = CSS px 1:1）；
@@ -2434,9 +1712,9 @@ const attrNamesIn = (html) => {
   return [...out].sort();
 };
 
-test("G8-svg负钉①：svg 开标签逐字唯一 = <svg class=\"dg-links\">（零 viewBox / width / height / aria-hidden ⇒ 用户单位 = CSS px 1:1）", () => {
+test("G8-svg负钉①：svg 开标签逐字唯一 = <svg class=\"dg-links\">（零 viewBox / width / height / aria-hidden ⇒ 用户单位 = CSS px 1:1）", async () => {
   for (const tasks of [pipe6Tasks(), sample076bbb84()]) {
-    const { html } = renderDependencyGraphSection(tasks);
+    const { html } = (await renderDependencyGraphSection(tasks));
     const tags = html.match(/<svg[^>]*>/g) ?? [];
     assert.ok(tags.length > 0, "空转守卫：确有 svg 层");
     assert.deepEqual(
@@ -2449,9 +1727,9 @@ test("G8-svg负钉①：svg 开标签逐字唯一 = <svg class=\"dg-links\">（�
   }
 });
 
-test("G8-svg负钉②：带引号属性闭集 = {class,title,style,d}；cell 的 style 恰 left/top 两枚几何字面、零 position 声明", () => {
+test("G8-svg负钉②：带引号属性闭集 = {class,title,style,d}；cell 的 style 恰 left/top 两枚几何字面、零 position 声明", async () => {
   for (const tasks of [pipe6Tasks(), sample076bbb84()]) {
-    const { html } = renderDependencyGraphSection(tasks);
+    const { html } = (await renderDependencyGraphSection(tasks));
     assert.deepEqual(attrNamesIn(html), ["class", "d", "style", "title"], "属性名集合 === 闭集四枚（溢出第五枚带引号属性即红）");
     assert.equal(/"/.test(stripAttrs(html)), false, "剥掉闭集属性值后零裸引号（stripAttrs 白名单加 d = 翻案 ⑨）");
     const cells = html.match(/<span class="dg-cell" style="[^"]*">/g) ?? [];
@@ -2486,12 +1764,12 @@ test("G8-svg负钉②：带引号属性闭集 = {class,title,style,d}；cell 的
   }
 });
 
-test("G8-svg负钉③：画布恰一枚 dg-links + 每框恰一枚 dg-grid；cell 枚数 === 节点枚数、每 cell 恰一枚 chip", () => {
+test("G8-svg负钉③：画布恰一枚 dg-links + 每框恰一枚 dg-grid；cell 枚数 === 节点枚数、每 cell 恰一枚 chip", async () => {
   for (const [tasks, pipes, nodes] of [
     [pipe6Tasks(), 3, 6],
     [sample076bbb84(), 1, 7],
   ]) {
-    const { html } = renderDependencyGraphSection(tasks);
+    const { html } = (await renderDependencyGraphSection(tasks));
     const bodies = html.split('<div class="pipe-body">').slice(1);
     assert.equal(bodies.length, pipes, "pipe-body 枚数 === 管道枚数");
     assert.equal((html.match(/<div class="dg-canvas"/g) ?? []).length, 1, "G10（⑦(ii)）：画布恰一枚");
@@ -2517,12 +1795,12 @@ test("G8-svg负钉③：画布恰一枚 dg-links + 每框恰一枚 dg-grid；cel
 // （外壳 / sup / 角标字形三者皆零），机制半钉「14px 由谁承接」；负向钉必须配一枚**正数**（跨框真连线枚数）
 // 才不是「什么都没画」的空负向。CSS 侧 `.dg-dep*` 的规则条目数归 G6-同源②，本条不重复。
 
-test("件一①外壳退役（负向钉）：渲染 HTML 零 .dg-deps / 零角标 + 14px 行距改由 .dg-cell 的 padding-top 承接", () => {
+test("件一①外壳退役（负向钉）：渲染 HTML 零 .dg-deps / 零角标 + 14px 行距改由 .dg-cell 的 padding-top 承接", async () => {
   for (const [tasks, label, cells, cross] of [
     [pipe6Tasks(), "pipe6（4 枚跨框边 ⇒ 改由画布真连线承载）", 6, 4],
     [sample076bbb84(), "样本076bbb84（零跨框边）", 7, 0],
   ]) {
-    const { html } = renderDependencyGraphSection(tasks);
+    const { html } = (await renderDependencyGraphSection(tasks));
     const cellCount = (html.match(/<span class="dg-cell" style="/g) ?? []).length;
     assert.ok(cellCount > 0, "空转守卫：确有 cell（零枚不得被负向钉当成通过）");
     assert.equal(cellCount, cells, `${label}：cell 枚数 === 节点枚数（外壳退役只删 chip 的兄弟节点，不删 cell）`);
@@ -2647,9 +1925,9 @@ const edgeLedgers = (tasks) => {
   return { declared, kept, dropped };
 };
 
-test("G9-完备总账①管道制夹具（6 任务 / 3 管道 / 声明 5 边 · 本质 5）：path 枚数 === kept 枚数（同框 + 跨框同一出口）", () => {
+test("G9-完备总账①管道制夹具（6 任务 / 3 管道 / 声明 5 边 · 本质 5）：path 枚数 === kept 枚数（同框 + 跨框同一出口）", async () => {
   const tasks = pipe6Tasks();
-  const { html } = renderDependencyGraphSection(tasks);
+  const { html } = (await renderDependencyGraphSection(tasks));
   const { paths, cross } = graphFaceLedger(html);
   const { declared, kept, dropped } = edgeLedgers(tasks);
   assert.deepEqual([paths, cross, kept.length], [5, 4, 5], "夹具现态 = 5 枚画布 path（其中 4 枚跨框）/ 5 条本质边");
@@ -2660,9 +1938,9 @@ test("G9-完备总账①管道制夹具（6 任务 / 3 管道 / 声明 5 边 · 
   assert.equal(dropped.length, 0, "本夹具无冗余 ⇒ 省略清单空（主账与旧口径同值，不因此空转）");
 });
 
-test("G9-完备总账②单管道夹具（sample076bbb84，7 任务 / 1 管道 / 声明 10 边 → 本质 8）：本质边全入走线、跨框边恒 0 而总账仍成立", () => {
+test("G9-完备总账②单管道夹具（sample076bbb84，7 任务 / 1 管道 / 声明 10 边 → 本质 8）：本质边全入走线、跨框边恒 0 而总账仍成立", async () => {
   const tasks = sample076bbb84();
-  const { html } = renderDependencyGraphSection(tasks);
+  const { html } = (await renderDependencyGraphSection(tasks));
   const { paths, cross } = graphFaceLedger(html);
   const { declared, kept, dropped } = edgeLedgers(tasks);
   assert.ok(kept.length > 1, "空转守卫：本夹具确有本质边");
@@ -2682,8 +1960,8 @@ test("G9-完备总账②单管道夹具（sample076bbb84，7 任务 / 1 管道 /
   }
 });
 
-test("G9-完备总账③空图短路：零任务 ⇒ 区块空串（出口 0 枚、边数 0，总账不作真而通过）", () => {
-  const { html } = renderDependencyGraphSection([]);
+test("G9-完备总账③空图短路：零任务 ⇒ 区块空串（出口 0 枚、边数 0，总账不作真而通过）", async () => {
+  const { html } = (await renderDependencyGraphSection([]));
   const { paths, cross } = graphFaceLedger(html);
   const { kept, dropped } = edgeLedgers([]);
   assert.equal(html, "", "v0.9.5 C2 短路③：无任务 ⇒ 依赖图整节不渲染");
@@ -2764,35 +2042,7 @@ const reduceFixtures = () => [
   ["样本076bbb84", sample076bbb84()],
 ];
 
-test("N1约简-①纯链：J=2 / R=0 且层号 {a:0,b:1,c:2}（双抓「方向写反」与「含自身可达性」）", () => {
-  const tasks = chainTasks();
-  const graph = buildTaskGraph(tasks);
-  const { kept, dropped } = transitiveReduce(graph.edges);
-  assert.deepEqual(edgeTexts(kept), ["a→b", "b→c"], "纯链两枚都是本质边（J=2）——判据写成「u ∈ reach(v)」的方向反版会把每边判成可推出 ⇒ R=2 在此判红");
-  assert.deepEqual(edgeTexts(dropped), [], "R=0（把本边自己一跳也算进 reach 的版本会全删 ⇒ dropped 两枚在此判红）");
-  const layers = layerOfGraph(graph.nodes, taskOrdinalMap(tasks), kept);
-  assert.deepEqual(
-    [...layers.entries()].sort((x, y) => (x[0] < y[0] ? -1 : 1)),
-    [["a", 0], ["b", 1], ["c", 2]],
-    "层号不塌（全删 ⇒ 每节点无入边 ⇒ 层号全塌 0，与 R=2 同抓）",
-  );
-});
-
-test("N1约简-②菱形长边：dropped 恰 {a→c} 一枚、层号逐键不变", () => {
-  const tasks = diamondTasks();
-  const graph = buildTaskGraph(tasks);
-  const ordinals = taskOrdinalMap(tasks);
-  const { kept, dropped } = transitiveReduce(graph.edges);
-  assert.deepEqual(edgeTexts(kept), ["a→b", "b→c"], "保留的是链上两枚本质边");
-  assert.deepEqual(edgeTexts(dropped), ["a→c"], "长边 a→c 已由 a→b→c 推出 ⇒ 恰省略一枚");
-  assert.deepEqual(
-    layerOfGraph(graph.nodes, ordinals, kept),
-    layerOfGraph(graph.nodes, ordinals, graph.edges),
-    "约简不改变 longest-path 层号",
-  );
-});
-
-test("N1约简-③多冗余并存不链式：J=3 / R=3（贪心原地删边会吞掉本质边 b→c ⇒ 在此判红）；乱序入参等值", () => {
+test("N1约简-③多冗余并存不链式：J=3 / R=3（贪心原地删边会吞掉本质边 b→c ⇒ 在此判红）；乱序入参等值", async () => {
   const tasks = multiRedundantTasks();
   const graph = buildTaskGraph(tasks);
   assert.equal(graph.edges.length, 6, "夹具现态 = 3 枚链边 + 3 枚冗余边");
@@ -2804,29 +2054,7 @@ test("N1约简-③多冗余并存不链式：J=3 / R=3（贪心原地删边会�
   assert.deepEqual(edgeTexts(fromShuffled.dropped), edgeTexts(dropped), "入参数组序反转 ⇒ dropped 逐字相等");
 });
 
-test("N1约简-④层号差分不变：layerOfGraph(全 edges) 与 (kept) 在四枚夹具上逐键相等", () => {
-  for (const [label, tasks] of [
-    ["纯链", chainTasks()],
-    ["菱形长边", diamondTasks()],
-    ["多冗余不链式", multiRedundantTasks()],
-    ["样本076bbb84", sample076bbb84()],
-  ]) {
-    const graph = buildTaskGraph(tasks);
-    const ordinals = taskOrdinalMap(tasks);
-    const { kept, dropped } = transitiveReduce(graph.edges);
-    assert.deepEqual(
-      layerOfGraph(graph.nodes, ordinals, kept),
-      layerOfGraph(graph.nodes, ordinals, graph.edges),
-      `${label}：chip 位置不变（层号逐键相等）`,
-    );
-    assert.equal(kept.length + dropped.length, graph.edges.length, `${label}：kept ∪ dropped 恰 partition 原边集（不丢不重）`);
-  }
-  const sample = buildTaskGraph(sample076bbb84());
-  const { kept, dropped } = transitiveReduce(sample.edges);
-  assert.deepEqual([sample.edges.length, kept.length, dropped.length], [10, 8, 2], "样本076bbb84 现态读数 = 声明 10 / 本质 8 / 省略 2（n1→n6、n2→n6）");
-});
-
-test("N1约简-⑤纯定序边（C1 关键）：单枚跨框边、无平行路径 ⇒ R=0、kept 含该边 ⇒ 落成一条真 path", () => {
+test("N1约简-⑤纯定序边（C1 关键）：单枚跨框边、无平行路径 ⇒ R=0、kept 含该边 ⇒ 落成一条真 path", async () => {
   const graph = buildTaskGraph(pureOrderTasks());
   assert.equal(graph.edges.length, 1, "夹具现态 = 恰一枚跨框边");
   assert.notEqual(
@@ -2839,7 +2067,7 @@ test("N1约简-⑤纯定序边（C1 关键）：单枚跨框边、无平行路�
   assert.deepEqual(edgeTexts(dropped), [], "R=0 —— 无平行可达路径 ⇒ 删边测试判不出冗余");
   // 语义重指向（v0.10.6 C5）：旧口径只要求「该边入角标清单」；单画布合并后要求「该边落成一条真 path」
   // ⇒ 判据从「报名」抬到「画线」，且由端点落框分类钉死它确实**跨**了两枚框（不是被误画成框内线）。
-  const { html } = renderDependencyGraphSection(pureOrderTasks());
+  const { html } = (await renderDependencyGraphSection(pureOrderTasks()));
   const { paths, pairs } = graphFaceLedger(html);
   assert.equal(paths, 1, "该纯定序边在画布层恰落一枚 path（R=0 且 kept 含它 ⇒ 必须看得见）");
   assert.deepEqual(
@@ -2850,7 +2078,7 @@ test("N1约简-⑤纯定序边（C1 关键）：单枚跨框边、无平行路�
   assert.equal(graphFaceLedger(html).cross, 1, "跨框档恰一枚 ⇒ 定序边不再靠角标承载、也不再「清单有线没」");
 });
 
-test("N1约简-⑥闭包恒等（不丢真实等待）：六枚夹具约简前后全对可达关系完全相同", () => {
+test("N1约简-⑥闭包恒等（不丢真实等待）：六枚夹具约简前后全对可达关系完全相同", async () => {
   for (const [label, tasks] of reduceFixtures()) {
     const { edges } = buildTaskGraph(tasks);
     const { kept } = transitiveReduce(edges);
@@ -2858,7 +2086,7 @@ test("N1约简-⑥闭包恒等（不丢真实等待）：六枚夹具约简前�
   }
 });
 
-test("N1约简-⑦不吞边：每条 dropped (u,v) 在 kept 上仍传递推出（v ∈ reach_kept(u)）", () => {
+test("N1约简-⑦不吞边：每条 dropped (u,v) 在 kept 上仍传递推出（v ∈ reach_kept(u)）", async () => {
   let pins = 0;
   for (const [label, tasks] of reduceFixtures()) {
     const { edges } = buildTaskGraph(tasks);
@@ -2872,7 +2100,7 @@ test("N1约简-⑦不吞边：每条 dropped (u,v) 在 kept 上仍传递推出�
   assert.ok(pins >= 5, `空转守卫：省略边对账确有实例（实测 ${pins} 枚）而非「dropped 恒空」蒙过`);
 });
 
-test("N1约简-⑧含环入参负钉：cycleEdges 原样、约简只在 edges 上跑（且脏边集入参不吞环、不死循环）", () => {
+test("N1约简-⑧含环入参负钉：cycleEdges 原样、约简只在 edges 上跑（且脏边集入参不吞环、不死循环）", async () => {
   const graph = buildTaskGraph(cyclicTasks());
   assert.deepEqual(edgeTexts(graph.cycleEdges), ["t-a→t-b", "t-b→t-a"], "环边由构图层丢弃、原样在场");
   const snapshot = edgeTexts(graph.cycleEdges);
@@ -2916,7 +2144,7 @@ function renderedEdges(html) {
   const frames = new Map();
   for (const chunk of html.split('<details class="pipe" open style="').slice(1)) {
     const body = chunk.slice(0, chunk.indexOf("</details>"));
-    const m = /^left:(\d+)px;top:(\d+)px;width:(\d+)px;height:(\d+)px">\s*<summary>管道 ([^（]+)（/.exec(body);
+    const m = /^left:(-?\d+(?:\.\d+)?)px;top:(-?\d+(?:\.\d+)?)px;width:(-?\d+(?:\.\d+)?)px;height:(-?\d+(?:\.\d+)?)px">\s*<summary>管道 ([^（]+)（/.exec(body);
     assert.ok(m !== undefined, `框 = 固定盒四枚几何字面（left/top/width/height）+ summary（实得 ${body.slice(0, 80)}…）`);
     frames.set(m[5], { dx: Number(m[1]), dy: Number(m[2]), cells: renderedCells(body) });
   }
@@ -2996,14 +2224,14 @@ const crossReduceTasks = () => [
   task("x-c", "working", ["x-b", "x-a"], { projectId: "flow", queuedAt: "2026-10-12T00:00:03Z" }),
 ];
 
-test("N2-h2自洽：五数从渲染 HTML 反向解析、按位取，断言 声明 === 本质 + 省略（四枚夹具，不得从约简对象直取）", () => {
+test("N2-h2自洽：五数从渲染 HTML 反向解析、按位取，断言 声明 === 本质 + 省略（四枚夹具，不得从约简对象直取）", async () => {
   for (const [label, tasks, want] of [
     ["pipe6（无冗余 ⇒ R=0 仍出全形）", pipe6Tasks(), [6, 3, 5, 5, 0]],
     ["样本076bbb84（10 → 8 · 省 2）", sample076bbb84(), [7, 1, 10, 8, 2]],
     ["折叠+约简组合（6 → 5 · 省 1）", foldReduceTasks(), [6, 2, 6, 5, 1]],
     ["跨管道同集（3 → 2 · 省 1）", crossReduceTasks(), [3, 3, 3, 2, 1]],
   ]) {
-    const { html } = renderDependencyGraphSection(tasks);
+    const { html } = (await renderDependencyGraphSection(tasks));
     const got = parseH2(html);
     assert.deepEqual([got.nodes, got.pipes, got.declared, got.essential, got.omitted], want, `${label}：h2 五数现态`);
     assert.equal(got.declared, got.essential + got.omitted, `${label}：自洽式 K === J + R（拼装侧把 K/J 写串 ⇒ 在此判红）`);
@@ -3015,52 +2243,32 @@ test("N2-h2自洽：五数从渲染 HTML 反向解析、按位取，断言 声�
   }
 });
 
-test("N2-h2全形单一形态：R=0 的夹具也出「传递省略 0」，无短形态残留（区块恰一枚 h2 且必成全形）", () => {
+test("N2-h2全形单一形态：R=0 的夹具也出「传递省略 0」，无短形态残留（区块恰一枚 h2 且必成全形）", async () => {
   for (const [label, tasks] of [
     ["pipe6", pipe6Tasks()],
     ["样本076bbb84", sample076bbb84()],
     ["零边单节点", [task("z-1")]],
   ]) {
-    const { html } = renderDependencyGraphSection(tasks);
+    const { html } = (await renderDependencyGraphSection(tasks));
     const heads = html.match(/<h2>[^<]*<\/h2>/g) ?? [];
     assert.equal(heads.length, 1, `${label}：区块恰一枚 h2`);
     assert.match(heads[0], /^<h2>依赖图（\d+ 任务 · \d+ 管道 · 声明 \d+ 边（本质 \d+ · 传递省略 \d+））<\/h2>$/, `${label}：恒全形（采短形态 ⇒ 本条红）`);
   }
   // 省略只出计数、不逐条列，也不进「画不出的边」那一行（§2.3-4）
-  const { html } = renderDependencyGraphSection(sample076bbb84());
+  const { html } = (await renderDependencyGraphSection(sample076bbb84()));
   assert.ok(html.includes("传递省略 2"), "省略数在场（计数）");
   assert.equal(/<p class="hint warn">/.test(html), false, "无悬空 / 环边 ⇒ 单管道样本不出 warn 行（dropped 不得挤进该行）");
   assert.equal(html.includes("n1→n6"), false, "省略边不逐条列（图形面既不画线也不报名）");
 });
 
-test("N2对锚①画布面长边枚数 = 1（约简把样本的 3 枚长边降到 1；取数面随 S1 上收到画布层）", () => {
-  const tasks = sample076bbb84();
-  const { html } = renderDependencyGraphSection(tasks);
-  assert.deepEqual(
-    g3Sample().routes.filter((e) => e.kind === "long").map((e) => `${e.from}→${e.to}`),
-    ["n1→n6", "n2→n6", "n5→n6"],
-    "G3/G4/G5 走线族仍吃**声明原边集** ⇒ 路由器侧长边 3 枚不变（本夹具为单管道，不涉跨框边）",
-  );
-  // v0.10.6 C4 / 形态 S1 翻案（n14 收口，改造文档 §2.2.1）：path 池只在画布层 ⇒ 「区块面」抬为「画布面」
-  const edges = renderedEdges(html);
-  assert.equal(edges.length, 8, "画布面边线枚数 === 本质边数 8（不是声明数 10）");
-  const longs = edges.filter((e) => e.isLong);
-  assert.equal(longs.length, 1, "画布面长边由 3 降到 1（约简掉的正是那两枚跨列长边）");
-  const e = longs[0];
-  const from = taskIdByEdgePoint(e.frames, e.first, "from");
-  const to = taskIdByEdgePoint(e.frames, e.last, "to");
-  assert.deepEqual([from, to], ["n5", "n6"], "幸存的长边 = n5→n6（端点反查渲染 cell **加框 origin 后**，不是从模型直取）");
-  assert.equal(edges.filter((x) => !x.isLong).length, 7, "其余 7 枚相邻弧不变 ⇒ 约简只削长边、不短化相邻边");
-});
-
-test("N2对锚②`.dg-edges` 清单枚数 === 跨框 path 枚数（文本面与几何面同源，v0.10.6 C5 角标退役后锚强度上升）", () => {
+test("N2对锚②`.dg-edges` 清单枚数 === 跨框 path 枚数（文本面与几何面同源，v0.10.6 C5 角标退役后锚强度上升）", async () => {
   for (const [label, tasks] of [
     ["pipe6（4 枚跨框边）", pipe6Tasks()],
     ["样本076bbb84（零跨框边 ⇒ 两枚出口同 0）", sample076bbb84()],
     ["约简+跨框组合（省略 1 · 跨框 4）", foldReduceTasks()],
     ["跨管道同集（省略 1 · 跨框 2）", crossReduceTasks()],
   ]) {
-    const { html } = renderDependencyGraphSection(tasks);
+    const { html } = (await renderDependencyGraphSection(tasks));
     const { list, cross, paths } = crossFaceCounts(html);
     const model = crossKeptEdges(tasks).length;
     assert.equal(list, model, `${label}：底部清单枚数 === 本质跨框边枚数（文本面 ↔ 模型面）`);
@@ -3069,15 +2277,15 @@ test("N2对锚②`.dg-edges` 清单枚数 === 跨框 path 枚数（文本面与�
     assert.ok(cross <= paths, `${label}：跨框枚数 ≤ 画布 path 总枚数（同框边共用同一出口，只许少不许多）`);
   }
   // 非空转：夹具里确有「跨框在场」与「两枚出口同零」两种形态
-  const combo = crossFaceCounts(renderDependencyGraphSection(foldReduceTasks()).html);
+  const combo = crossFaceCounts((await renderDependencyGraphSection(foldReduceTasks())).html);
   assert.deepEqual([combo.cross, combo.intra, combo.list], [4, 1, 4], "空转守卫：跨框形态真的发生过（跨框 4 / 同框 1 / 清单 4）");
-  const none = crossFaceCounts(renderDependencyGraphSection(sample076bbb84()).html);
+  const none = crossFaceCounts((await renderDependencyGraphSection(sample076bbb84())).html);
   assert.deepEqual([none.cross, none.list], [0, 0], "空转守卫的另一侧：单管道 ⇒ 两枚出口同零（不得只靠一侧零成立）");
   assert.equal(none.paths, 8, "另一侧仍有实线（同框 8 枚本质边全落 path ⇒ 同零不是「整图没画」）");
 });
 
-test("N2对锚③约简 + 跨框同时在场：被省略的 a1⇢t1 既不入清单、也不占跨框 path 位（跨框数按约简后算）", () => {
-  const { html } = renderDependencyGraphSection(foldReduceTasks());
+test("N2对锚③约简 + 跨框同时在场：被省略的 a1⇢t1 既不入清单、也不占跨框 path 位（跨框数按约简后算）", async () => {
+  const { html } = (await renderDependencyGraphSection(foldReduceTasks()));
   const ordinals = taskOrdinalMap(foldReduceTasks());
   assert.equal(ordinals.get("a1"), 1, "夹具基线：a1 = #1");
   assert.equal(html.includes("⇠"), false, "省略边的来源不再出角标（角标族整体退役 ⇒ 本面对所有边一律零）");
@@ -3089,9 +2297,9 @@ test("N2对锚③约简 + 跨框同时在场：被省略的 a1⇢t1 既不入清
   assertFramePairLedger(html, foldReduceTasks(), "③");
 });
 
-test("N2跨管道同集：约简在全图上做一次 ⇒ 跨框走线与 `.dg-edges` 清单同步减一（同框边与跨框边共用同一约简集）", () => {
+test("N2跨管道同集：约简在全图上做一次 ⇒ 跨框走线与 `.dg-edges` 清单同步减一（同框边与跨框边共用同一约简集）", async () => {
   const tasks = crossReduceTasks();
-  const { html } = renderDependencyGraphSection(tasks);
+  const { html } = (await renderDependencyGraphSection(tasks));
   const graph = buildTaskGraph(tasks);
   assert.equal(graph.edges.length, 3, "夹具现态 = 3 条声明边（全部跨框）");
   assert.deepEqual(
@@ -3135,42 +2343,6 @@ test("N2跨管道同集：约简在全图上做一次 ⇒ 跨框走线与 `.dg-e
   assert.equal(parseH2(html).omitted, 1, "h2 的省略数与两枚出口的减量同源（都来自同一份 kept）");
 });
 
-// ---------------------------------------------------------------------------
-// N3收口（v0.10.5 · REQ-2026-10-12-04 · 改造文档 §4 同源对锚④ / §5 风险②）：
-// **尺寸单调不增** —— 约简后网格的 `width` / `height` 只许 **≤** 约简前，**不钉等值**。
-// 理由 = 通道宽由 lane 预算回灌（`gapW[c] = max(DG_COL_GAP_MIN, DG_LANE_MIN*2 + n*DG_LANE_PITCH)`）
-// ⇒ 长边枚数减少**应**下降，但降幅受 `DG_COL_GAP_MIN` 地板截断 ⇒ **不是常量**，只能钉方向。
-// 走线族入参照旧（G3/G4/G5 三族仍吃**声明原边集**，见 N2对锚① 首条断言）⇒ 本锚只量渲染层。
-// ---------------------------------------------------------------------------
-
-/**
- * 渲染层 `planPipe` 的同形态驱动（构图 → 走线 → lane 数回灌 → 重算网格 → 再走线），
- * **唯一差别 = 边集由入参给定** ⇒ 可把「声明原边集」与「约简后 `kept`」灌进同一条流水线对照尺寸。
- */
-function planWithEdges(tasks, projectId, edges) {
-  const graph = buildGraphWithPipelines(tasks);
-  const ordinals = taskOrdinalMap(tasks);
-  const layers = layerOfGraph(graph.nodes, ordinals, edges);
-  const pipe = graph.pipelines.find((p) => p.projectId === projectId);
-  assert.ok(pipe !== undefined, `夹具须含 ${projectId} 管道`);
-  const columns = compressPipeLayers(pipe, layers);
-  const base = pipeGridLayout(pipe, columns, ordinals);
-  const longs = routeIntraEdges(edges, base).filter((e) => e.kind === "long");
-  const gapLanes = new Array(Math.max(0, base.cols - 1)).fill(0);
-  for (const e of longs) {
-    const a = base.cellOf.get(e.from);
-    const b = base.cellOf.get(e.to);
-    if (a === undefined || b === undefined) continue;
-    gapLanes[a.col] += 1;
-    const targetGap = b.col - 1;
-    if (targetGap >= 0 && targetGap < gapLanes.length) gapLanes[targetGap] += 1;
-  }
-  return {
-    grid: pipeGridLayout(pipe, columns, ordinals, { gapLanes, busLaneCount: longs.length }),
-    longCount: longs.length,
-  };
-}
-
 /** 区块 HTML → 各管道 `.dg-grid` 实际下发的盒模两枚（渲染侧的 width / height 字面）。 */
 function renderedGridBox(html) {
   return (html.match(/<div class="dg-grid" style="([^"]*)">/g) ?? []).map((raw) => {
@@ -3183,105 +2355,6 @@ function renderedGridBox(html) {
     return { width: num("width"), height: num("height") };
   });
 }
-
-test("N3对锚④尺寸单调不增：约简后 width / height ≤ 约简前（不等式钉 · 三夹具 + 渲染下发值同源 + 降幅非退化）", () => {
-  let strict = 0;
-  for (const [label, tasks] of [
-    ["样本076bbb84（10 → 8 · 省 2 · 长边 3 → 1）", sample076bbb84()],
-    ["busReuse（6 → 4 · 省 2）", busReuseTasks()],
-    ["压力14节点（14 枚宽 fan-in）", g45StressTasks()],
-  ]) {
-    const declared = buildGraphWithPipelines(tasks).edges;
-    const { kept, dropped } = transitiveReduce(declared);
-    assert.ok(dropped.length > 0, `${label} 空转守卫：夹具确有省略边（无省略的夹具两侧同值，不构成对本不等式的度量）`);
-    const before = planWithEdges(tasks, "board", declared);
-    const after = planWithEdges(tasks, "board", kept);
-    assert.ok(after.grid.width <= before.grid.width, `${label}：width 单调不增 —— 约简后 ${after.grid.width} ≤ 约简前 ${before.grid.width}`);
-    assert.ok(after.grid.height <= before.grid.height, `${label}：height 单调不增 —— 约简后 ${after.grid.height} ≤ 约简前 ${before.grid.height}`);
-    // 只紧不松的对照面：降的是**通道宽 / 带高**，不是列数与行距（约简不得塌层）
-    assert.equal(after.grid.cols, before.grid.cols, `${label}：列数不变（约简不塌层 ⇒ 降幅不得来自少列）`);
-    assert.equal(after.grid.rows, before.grid.rows, `${label}：行数不变`);
-    assert.deepEqual([...after.grid.rowY], [...before.grid.rowY], `${label}：行 y 线逐枚不变`);
-    assert.deepEqual(
-      after.grid.cells.map((c) => [c.taskId, c.col, c.row]),
-      before.grid.cells.map((c) => [c.taskId, c.col, c.row]),
-      `${label}：格位归属不变（同一节点仍在同一列同一行）`,
-    );
-    assert.ok(after.longCount <= before.longCount, `${label}：回灌给 lane 预算的长边枚数不增（${before.longCount} → ${after.longCount}）`);
-    after.grid.gapW.forEach((w, i) => {
-      assert.ok(w <= before.grid.gapW[i], `${label}：通道 ${i} 宽不增（${before.grid.gapW[i]} → ${w}）`);
-    });
-    assert.ok(after.grid.busLanes.length <= before.grid.busLanes.length, `${label}：通道带 lane 枚数不增`);
-    if (after.grid.width < before.grid.width || after.grid.height < before.grid.height) strict += 1;
-  }
-  assert.ok(strict >= 1, `非退化守卫：至少一枚夹具确有下降（三枚全取等号 ⇒ 本锚退化成恒等式，实得 ${strict} 枚有降幅）`);
-
-  // 渲染侧实际下发的盒模 === **kept 驱动**的那一枚网格（若渲染层被误接回声明原边集，在此分叉）
-  const tasks = sample076bbb84();
-  const { html } = renderDependencyGraphSection(tasks);
-  const decl = planWithEdges(tasks, "board", buildGraphWithPipelines(tasks).edges);
-  const red = planWithEdges(tasks, "board", transitiveReduce(buildGraphWithPipelines(tasks).edges).kept);
-  assert.ok(red.grid.width < decl.grid.width, "样本夹具确有宽降幅（否则下面那条同源断言两侧同值、测不出翻向）");
-  assert.ok(red.grid.height < decl.grid.height, "样本夹具确有高降幅");
-  assert.deepEqual(renderedGridBox(html), [{ width: red.grid.width, height: red.grid.height }], "区块盒模 = 约简后网格（五消费点同一份 kept 的几何那一枚）");
-
-  // ---- v0.10.6 C2/C4 重指向（改造文档 §2.5 R4「画布尺寸膨胀 ⇒ 尺寸单调钉 N3对锚④ 重指向」）----
-  // 自 C2 起「框高」只是画布高的**加数** ⇒ 本锚的度量面须同时抬到画布盒：
-  // 约简若真缩了框高，画布高（= Σ框高 + Σ框间带高 + 2·画布内缘）**必须同向不增**，否则降幅停在框内、画布白占位。
-  const pipes = buildGraphWithPipelines(tasks).pipelines;
-  assert.equal(pipes.length, 1, "本夹具为单框 ⇒ 画布尺寸不含框间带项（只加 gutter/内缘，可逐字取等）");
-  const beforeCanvas = canvasLayout(pipes, [decl.grid]);
-  const afterCanvas = canvasLayout(pipes, [red.grid]);
-  assert.ok(afterCanvas.height <= beforeCanvas.height, `画布高单调不增 —— 约简后 ${afterCanvas.height} ≤ 约简前 ${beforeCanvas.height}`);
-  assert.ok(afterCanvas.width <= beforeCanvas.width, `画布宽单调不增 —— 约简后 ${afterCanvas.width} ≤ 约简前 ${beforeCanvas.width}`);
-
-  // 框内缘式（§2.2-C2 出参定义）：**画布尺寸是框尺寸的机械加数**，不是第二份自由几何
-  const f = afterCanvas.frameOf.get("board");
-  assert.ok(f !== undefined, "单框画布含 board 框");
-  assert.equal(f.frameW, red.grid.width + 2 * (DG_FRAME_BORDER + DG_FRAME_PAD), `框外宽 = 网格宽 + 2·(边框 ${DG_FRAME_BORDER} + 内缘 ${DG_FRAME_PAD})`);
-  assert.equal(
-    f.frameH,
-    red.grid.height + 2 * DG_FRAME_BORDER + DG_FRAME_TITLE_H + DG_FRAME_PAD,
-    `框外高 = 网格高 + 2·边框 ${DG_FRAME_BORDER} + 标题带 ${DG_FRAME_TITLE_H} + 下内缘 ${DG_FRAME_PAD}（标题带只在上、不在下 ⇒ 非对称加数）`,
-  );
-  assert.equal(afterCanvas.width, f.frameW + 2 * DG_CANVAS_GUTTER, `画布宽 = 框宽 + 左右两枚 gutter ${DG_CANVAS_GUTTER}（回流档走的就是这两枚）`);
-  assert.equal(afterCanvas.height, f.frameH + 2 * DG_CANVAS_PAD, `画布高 = 框高 + 上下两枚画布内缘 ${DG_CANVAS_PAD}（单框 ⇒ 无框间带项）`);
-
-  // 画布级同源：渲染 HTML 里 `.dg-canvas` 的 inline width/height === **kept 驱动**的那次 canvasLayout
-  const cv = /<div class="dg-canvas" style="width:(\d+)px;height:(\d+)px;/.exec(html);
-  assert.ok(cv !== null, "画布 inline 前两枚声明 = width/height（§2.2.1 三档几何字面之首档，逐字可解析）");
-  assert.deepEqual(
-    [Number(cv[1]), Number(cv[2])],
-    [afterCanvas.width, afterCanvas.height],
-    "画布盒模 = 约简后网格经 canvasLayout 的推面值（渲染层若自算一份尺寸，在此分叉）",
-  );
-});
-
-test("N3不翻向确认：走线族三处载体仍吃声明原边集（约简只发生在 section 层，路由器入参照旧）", () => {
-  const declared = buildGraphWithPipelines(sample076bbb84()).edges;
-  const { kept } = transitiveReduce(declared);
-  assert.notEqual(kept.length, declared.length, "夹具前提：样本确有省略（否则两面同集、本条测不到分野）");
-  const grid = planWithEdges(sample076bbb84(), "board", declared).grid;
-  // 三族共用的载体读数 = 声明集长边 3 枚；约简集只有 1 枚 ⇒ 一旦有人把入参翻成 kept，此条先红
-  const longsOf = (edges) => routeIntraEdges(edges, grid).filter((e) => e.kind === "long").map((e) => `${e.from}→${e.to}`);
-  assert.deepEqual(longsOf(declared), ["n1→n6", "n2→n6", "n5→n6"], "声明原边集 = 3 枚长边（G3/G4/G5 的载体断言基线）");
-  assert.deepEqual(longsOf(kept), ["n5→n6"], "约简集 = 1 枚长边（两面读数**必须**不同 ⇒ 本条是分野钉，不是重复钉）");
-  assert.deepEqual(
-    g3Sample().routes.filter((e) => e.kind === "long").map((e) => `${e.from}→${e.to}`),
-    longsOf(declared),
-    "G3 夹具 `g3Sample()` 的入参 = `routeIntraEdges(graph.edges, …)`（声明集，未翻向）",
-  );
-  assert.deepEqual(
-    g45Layout(sample076bbb84()).routes.filter((e) => e.kind === "long").map((e) => `${e.from}→${e.to}`),
-    longsOf(declared),
-    "G4/G5 夹具 `g45Layout()` 的入参 = 声明集（未翻向 ⇒「≥2 条长边」的反例载体不缩）",
-  );
-  // 并存不冲突：画布面（渲染层，吃 kept）长边 1 枚 vs 走线族（入参面，吃声明集）长边 ≥2 枚 —— 两个面各钉各的
-  // v0.10.6 C4 / S1 措辞订正（n14 收口）：渲染层取数面已由「区块（框）面」上收为「画布面」，分野语义不变
-  const canvasFace = renderedEdges(renderDependencyGraphSection(sample076bbb84()).html);
-  assert.equal(canvasFace.filter((e) => e.isLong).length, 1, "画布面长边枚数 = 1（N2对锚① 口径，与上面两面并存）");
-  assert.ok(g45Layout(sample076bbb84()).routes.filter((e) => e.kind === "long").length >= 2, "走线族载体断言「≥2 条长边」仍在场（未被区块面的 1 枚带跑）");
-});
 
 // ---------------------------------------------------------------------------
 // F1稳定性钉（v0.10.6 · 依赖图编号漂移 · 改造文档 §4 新增锚①）：
@@ -3326,7 +2399,7 @@ function f1ChipNumbers(html) {
   return f1Numbers(out);
 }
 
-test("F1稳定性钉：createdAt 不变 ⇒ queuedAt（null→实值）与 claimedAt（再变动）三轮前后，编号逐键全等（渲染层 #n 同源）", () => {
+test("F1稳定性钉：createdAt 不变 ⇒ queuedAt（null→实值）与 claimedAt（再变动）三轮前后，编号逐键全等（渲染层 #n 同源）", async () => {
   // 三轮的入队 / 认领时刻表（逐轮显式给全四枚，缺项即 null）
   const NONE = { "t-a": null, "t-b": null, "t-c": null, "t-d": null };
   const Q_REVERSED = { "t-a": "2026-10-12T00:10:04Z", "t-b": "2026-10-12T00:10:03Z", "t-c": "2026-10-12T00:10:02Z", "t-d": "2026-10-12T00:10:01Z" };
@@ -3347,7 +2420,7 @@ test("F1稳定性钉：createdAt 不变 ⇒ queuedAt（null→实值）与 claim
   const want = ["t-a=#1", "t-b=#2", "t-c=#3", "t-d=#4"];
   for (const [label, tasks] of three) {
     assert.deepEqual(f1Numbers(taskOrdinalMap(tasks)), want, `${label}：单点 map 的号 = 登记序（queuedAt / claimedAt 不参与）`);
-    assert.deepEqual(f1ChipNumbers(renderDependencyGraphSection(tasks).html), want, `${label}：渲染层可见 #n 与单点 map 同源同值`);
+    assert.deepEqual(f1ChipNumbers((await renderDependencyGraphSection(tasks)).html), want, `${label}：渲染层可见 #n 与单点 map 同源同值`);
   }
   const ords = three.map(([, tasks]) => f1Numbers(taskOrdinalMap(tasks)));
   assert.deepEqual(ords[0], ords[1], "R1 → R2（queuedAt null → 实值）逐键全等");
@@ -3366,14 +2439,14 @@ const d2WarnAndCrossTasks = () => [
   task("d2-b", "completed", ["d2-a", "d2-external"], { projectId: "p2", queuedAt: "2026-10-12T00:00:02Z" }),
 ];
 
-test("D-①（v0.10.6 等式钉）`<details` 枚数 === `.pipe open` 枚数 === `<summary>` 枚数 === 管道枚数（任一框丢 .pipe / 画布外多出 details 立刻判红）", () => {
+test("D-①（v0.10.6 等式钉）`<details` 枚数 === `.pipe open` 枚数 === `<summary>` 枚数 === 管道枚数（任一框丢 .pipe / 画布外多出 details 立刻判红）", async () => {
   for (const [label, tasks, wantPipes] of [
     ["pipe6（3 管道 · 5 边）", pipe6Tasks(), 3],
     ["样本076bbb84（单管道 · 10 边）", sample076bbb84(), 1],
     ["跨管道同集（3 管道 · 约简 1）", crossReduceTasks(), 3],
     ["单任务（1 管道 · 零边 ⇒ 零 path 也不脱钉）", [task("task-aaaaaaaa", "blocked")], 1],
   ]) {
-    const { html } = renderDependencyGraphSection(tasks);
+    const { html } = (await renderDependencyGraphSection(tasks));
     const pipes = groupPipelines(buildTaskGraph(tasks), taskOrdinalMap(tasks)).length;
     assert.equal(pipes, wantPipes, `${label}：夹具确有 ${wantPipes} 枚管道（本钉的空转守卫，0 枚则三面同数为恒等式）`);
     const details = (html.match(/<details/g) ?? []).length;
@@ -3385,14 +2458,14 @@ test("D-①（v0.10.6 等式钉）`<details` 枚数 === `.pipe open` 枚数 === 
   }
 });
 
-test("D-②（v0.10.6 切片钉）`.dep-graph` 容器起点之外的区段零 `<details` ⇒ 框层是区块内 details 的唯一出现层", () => {
+test("D-②（v0.10.6 切片钉）`.dep-graph` 容器起点之外的区段零 `<details` ⇒ 框层是区块内 details 的唯一出现层", async () => {
   for (const [label, tasks, wantWarn, wantCross] of [
     ["pipe6（无提示行 · 有跨框边清单）", pipe6Tasks(), false, true],
     ["样本076bbb84（单管道 ⇒ 两区段皆无）", sample076bbb84(), false, false],
     ["hint warn + 跨框边清单同时在场", d2WarnAndCrossTasks(), true, true],
     ["单任务（零边 ⇒ 切片内仍有一枚框）", [task("task-aaaaaaaa", "blocked")], false, false],
   ]) {
-    const { html } = renderDependencyGraphSection(tasks);
+    const { html } = (await renderDependencyGraphSection(tasks));
     const at = html.indexOf('<div class="dep-graph">');
     assert.notEqual(at, -1, `${label}：容器起点摘不到 ⇒ 本钉空转，判红`);
     const outside = html.slice(0, at);
@@ -3425,7 +2498,7 @@ const realFixture = () => JSON.parse(readFileSync(REAL_FIXTURE, "utf8"));
 /** 真板任务集（`_meta` 是夹具自校数，不进任务集）。 */
 const realTasks = () => realFixture().tasks;
 
-test("G13-夹具①：真板集可读入且三数自洽", () => {
+test("G13-夹具①：真板集可读入且三数自洽", async () => {
   const { _meta } = realFixture();
   const tasks = realTasks();
   assert.equal(_meta.frameCount >= 3, true, "夹具必须跨框（≥3 枚管道）⇒ 否则 crossEdges 恒空，本卡作用域缺口照旧复现不出");
@@ -3500,20 +2573,6 @@ function canvasFrameLedger(tasks) {
 /** 边 → 可读字面（`from:源框→to:目标框`），供逐条对账。 */
 const crossEdgeTexts = (edges) => edges.map((e) => `${e.from}:${e.sIdx}→${e.to}:${e.tIdx}`);
 
-/**
- * 一枚框在画布里的**列账**（与渲染层同一条驱动：构图 → kept 层号 → 压列 → 网格）。
- * 本块只读 `cols` / `gapW` 两枚（= g 档「腿有没有列间通道可用」的结构前提），不读任何坐标。
- */
-function canvasPipeColumns(tasks, projectId) {
-  const graph = buildGraphWithPipelines(tasks);
-  const { kept } = transitiveReduce(graph.edges);
-  const ordinals = taskOrdinalMap(tasks);
-  const layers = layerOfGraph(graph.nodes, ordinals, kept);
-  const pipe = graph.pipelines.find((p) => p.projectId === projectId);
-  assert.ok(pipe !== undefined, `夹具须含 ${projectId} 管道`);
-  return pipeGridLayout(pipe, compressPipeLayers(pipe, layers), ordinals);
-}
-
 /** F1 相邻正向（场景表 b · k=1 ⇒ 2k+3 = 5 段）：board → flow → orch 逐框向前。 */
 const f1AdjacentForward = () => [["f1a", "board", []], ["f1b", "flow", ["f1a"]], ["f1c", "orch", ["f1b"]]].map(canvasRow);
 
@@ -3586,7 +2645,7 @@ const canvasFixtures = () => [
   },
 ];
 
-test("G11-夹具①五形结构钉：frames 枚数 / crossEdges 枚数 / 同框归属 / 框序 = projectId 升序 / 跨度逐枚对账（本枚零几何）", () => {
+test("G11-夹具①五形结构钉：frames 枚数 / crossEdges 枚数 / 同框归属 / 框序 = projectId 升序 / 跨度逐枚对账（本枚零几何）", async () => {
   const shapes = canvasFixtures();
   assert.equal(shapes.length, 6, "五形 = 六枚条目（F1..F4 各一形 + F5 两形〔超载 / 单列框〕）");
   let fanOutCarriers = 0;
@@ -3646,7 +2705,7 @@ test("G11-夹具①五形结构钉：frames 枚数 / crossEdges 枚数 / 同框�
       assert.ok(fan[0][1].every((to) => to !== fan[0][0]), `${label}：共端点合法（源 ≠ 各目标）`);
     }
     // 框序在渲染层同源：区块 HTML 的 `<summary>管道 X（` 出现序 === frames 升序（只钉序与枚数，不钉坐标）
-    const rendered = [...renderDependencyGraphSection(tasks).html.matchAll(/<summary>管道 ([^（]+)（/g)].map((m) => m[1].trim());
+    const rendered = [...(await renderDependencyGraphSection(tasks)).html.matchAll(/<summary>管道 ([^（]+)（/g)].map((m) => m[1].trim());
     assert.deepEqual(rendered, frames, `${label}：渲染层框序（summary 出现序）=== 模型侧 frames`);
   }
   // 判据①的另一侧 + 空转守卫
@@ -3661,75 +2720,6 @@ test("G11-夹具①五形结构钉：frames 枚数 / crossEdges 枚数 / 同框�
   }
   assert.ok(intraCarriers >= 1, "空转正钉：至少一形含同框边 ⇒「同框边不入 crossEdges」不是恒空断言");
   assert.ok(fanOutCarriers >= 1, "空转正钉：至少一形含同源扇出 ⇒ i4「合法共端点」有实测载体");
-});
-
-test("G11-夹具②F5 两形各自触发对应降档前提：外缘并发严格 > 4 席（i7）· 中间框列数 = 1 ⇒ 无列间通道（g 档）", () => {
-  const shapes = canvasFixtures();
-  // ---- 超载形（场景表 h）：外缘竖跨的并发需求 > 硬容量 ----
-  const over = shapes.find((s) => s.key === "F5a");
-  assert.ok(over !== undefined, "五形须含超载形（F5a）");
-  const overLed = canvasFrameLedger(over.tasks);
-  assert.equal(
-    overLed.crossEdges.length,
-    over.pins.backflow,
-    "超载形的前提 = 全部跨框边都走外缘（同一路向：目标框在源框之上 ⇒ 回流档）⇒ 并发数即跨框边数",
-  );
-  const sameFramePair = new Set(overLed.crossEdges.map((e) => `${e.fromProject}>${e.toProject}`));
-  assert.deepEqual([...sameFramePair], ["orch>board"], "超载形的回流边同一框对（同一枚外缘通道的分席键 ⇒ 并发才叠得起来）");
-  assert.equal(overLed.crossEdges.length > OUTER_LANE_CAPACITY, true, `外缘并发 ${overLed.crossEdges.length} 席 **严格 >** 硬容量 ${OUTER_LANE_CAPACITY} 席（取等不算超载，i7）`);
-  // 需求侧的规模自证：拿 4 席去量则夹具退化（本形要测的是「超出去」那一部分）
-  assert.equal(overLed.crossEdges.length - OUTER_LANE_CAPACITY, 1, "超出量 = 1 席（n8 的容量不等式与超载登记据此取证，本枚不判观感）");
-
-  // ---- 单列框形（场景表 g）：被跨越的那枚中间框只有一列 ⇒ 无 `CH` 可用 ----
-  const single = shapes.find((s) => s.key === "F5b");
-  assert.ok(single !== undefined, "五形须含单列框形（F5b）");
-  const singleLed = canvasFrameLedger(single.tasks);
-  assert.equal(singleLed.crossEdges.length, 1, "单列框形 = 一枚 k=2 边（board→orch）");
-  const { sIdx, tIdx } = singleLed.crossEdges[0];
-  assert.ok(sIdx < 1 && 1 < tIdx, `中间框（框序 1 = ${singleLed.frames[1]}）确实落在本边的两框之间（sIdx=${sIdx} < 1 < tIdx=${tIdx}）`);
-  const midCols = canvasPipeColumns(single.tasks, singleLed.frames[1]);
-  assert.equal(midCols.cells.length, 2, "空转守卫：该框确有 2 枚 cell（零 cell 的框 cols=0，不构成对「一列」的度量）");
-  assert.equal(midCols.cols, 1, "单列框形的前提 = 该框只有一列（两枚互不依赖的节点同层 ⇒ 压列后一列）");
-  assert.deepEqual([...new Set(midCols.cells.map((c) => c.col))], [0], "两枚 cell 同列（列号集合 = {0}）");
-  assert.equal(midCols.gapW.length, midCols.cols - 1, "列间通道数 === cols − 1（`pipeGridLayout` 的通道定义式）");
-  assert.equal(midCols.gapW.length, 0, "该框**无列间通道可用** ⇒ g 档降档前提（`CH → PL/PR`，兜底 9 段归 n4/n8 取证）");
-  // 对照面：同一批五形里 F3 的中间框（两枚节点成链 ⇒ 两列）确有列间通道
-  // ⇒ 「无通道」是 F5b 的特例而非常态，本形不是「所有框都只有一列」的恒真
-  const three = shapes.find((s) => s.key === "F3");
-  const threeLed = canvasFrameLedger(three.tasks);
-  const threeMid = canvasPipeColumns(three.tasks, threeLed.frames[1]);
-  assert.equal(threeMid.cells.length, 2, "对照形 F3 的中间框同样 2 枚 cell（与 F5b 只差依赖形状 ⇒ 对照是**同规模**的）");
-  assert.equal(threeMid.cols, 2, "对照：F3 中间框两列（链式两节点分层）⇒ 通道可用");
-  assert.equal(threeMid.gapW.length, 1, "对照：F3 中间框通道 1 枚 ≥ 1 ⇒ 与 F5b 的 0 枚确有分野");
-});
-
-test("G11-夹具③i6 正对照：现三夹具全单 project ⇒ crossEdges 恒 0（防新判据日后空转）", () => {
-  const legacy = [
-    ["样本076bbb84", sample076bbb84()],
-    ["压力14节点", g45StressTasks()],
-    ["busReuse", busReuseTasks()],
-  ];
-  assert.deepEqual(
-    legacy.map(([label, tasks]) => label),
-    g45Fixtures().map(([label]) => label),
-    "三夹具清单与 `g45Fixtures()` 同源（本正对照管的正是那三枚）",
-  );
-  for (const [label, tasks] of legacy) {
-    const led = canvasFrameLedger(tasks);
-    assert.deepEqual(
-      [...new Set(tasks.map((t) => t.projectId))],
-      ["board"],
-      `${label}：夹具现态 = 全单 project（board）⇒ 跨框档结构上不可达`,
-    );
-    assert.equal(led.frames.length, 1, `${label}：frames 枚数 === 1（单框 ⇒ 无框间带、无外缘走廊）`);
-    assert.deepEqual(crossEdgeTexts(led.crossEdges), [], `${label}：crossEdges 恒空（i6 正对照的期望值）`);
-    assert.ok(led.intraEdges.length >= 1, `${label}：空转正钉 —— 同框边确有 ${led.intraEdges.length} 枚 ⇒ 本条不是「无边可分」的空断言`);
-    assert.ok(led.kept > 0, `${label}：kept 边集非空（否则上面两条一起退化成恒真）`);
-  }
-  // 两面的分野：跨框枚数在「单 project 三夹具」与「五形」上必须不同，否则新判据无度量力
-  const legacyCross = legacy.reduce((sum, [, tasks]) => sum + canvasFrameLedger(tasks).crossEdges.length, 0);
-  const shapeCross = canvasFixtures().reduce((sum, s) => sum + canvasFrameLedger(s.tasks).crossEdges.length, 0);
-  assert.deepEqual([legacyCross, shapeCross], [0, 13], "正对照 = 0 枚跨框边，五形 = 13 枚 ⇒ 跨框档的度量只在新夹具上生效（旧锚面照旧不碰这一档）");
 });
 
 // ---------------------------------------------------------------------------
@@ -3761,8 +2751,8 @@ test("G11-夹具③i6 正对照：现三夹具全单 project ⇒ crossEdges 恒 
  * - chip 矩形 = 该框子树内 cell 的**局部** `left/top` 经 {@link canvasEdgePoint} 换算（**单源**，不另存算式）；
  * - path ↔ 边对账 = 首末点与两端换算后的 `from`/`to` 侧逐点相等 ⇒ **每条本质边恰命中一枚 path**（不许多也不许少）。
  */
-function canvasSceneOf(tasks) {
-  const html = renderDependencyGraphSection(tasks).html;
+async function canvasSceneOf(tasks) {
+  const html = (await renderDependencyGraphSection(tasks)).html;
   const canvas = /<div class="dg-canvas"[^>]*>\s*<svg class="dg-links">([\s\S]*?)<\/svg>/.exec(html);
   assert.ok(canvas !== null, "画布级边线层在场（跨框与框内 path 同池，框内不再取池）");
   const ds = edgePaths(canvas[1]).map((e) => e.d);
@@ -3776,7 +2766,7 @@ function canvasSceneOf(tasks) {
   for (const chunk of html.split('<details class="pipe"').slice(1)) {
     const body = chunk.slice(0, chunk.indexOf("</details>"));
     // 属性面写成 `[^>]*` 而非逐字 `open`：本判据**不读折叠状态**（i5），固定盒几何与 `open` 有无无关
-    const m = /^[^>]*style="left:(\d+)px;top:(\d+)px;width:(\d+)px;height:(\d+)px">\s*<summary>管道 ([^（]+)（/.exec(body);
+    const m = /^[^>]*style="left:(-?\d+(?:\.\d+)?)px;top:(-?\d+(?:\.\d+)?)px;width:(-?\d+(?:\.\d+)?)px;height:(-?\d+(?:\.\d+)?)px">\s*<summary>管道 ([^（]+)（/.exec(body);
     assert.ok(m !== undefined, `框 = 固定盒四枚几何字面（left/top/width/height）+ summary（实得 ${body.slice(0, 80)}…）`);
     const dx = Number(m[1]);
     const dy = Number(m[2]);
@@ -3836,8 +2826,8 @@ function canvasSceneOf(tasks) {
  * 出参每项带 `id`（`chip:` / `frame:` 前缀）⇒ 命中项可逐条打印（③ 的可读性判据）。
  * @param unbanded 仅 ① 的反例用：`true` ⇒ 照**字面「全体矩形」**（不剔本边两端所属框）
  */
-function canvasObstaclesOf(tasks, edge, unbanded = false) {
-  const scene = canvasSceneOf(tasks);
+async function canvasObstaclesOf(tasks, edge, unbanded = false) {
+  const scene = await canvasSceneOf(tasks);
   const ends = new Set([edge.from, edge.to]);
   const ownFrames = new Set(
     scene.chips.filter((c) => ends.has(c.taskId)).map((c) => c.projectId),
@@ -3883,84 +2873,15 @@ function canvasHits(pathD, obstacles) {
 /** 命中项 → 可读字面（`被穿者@段号/形`）—— ③ 的「逐条可打印」用的就是这一枚。 */
 const hitTexts = (hits) => [...new Set(hits.map((h) => `${h.obstacle}#${h.seg}${h.kind}`))].sort();
 
-test("G11-画布穿模①判据自证：手写 7 段走廊（首弧控制点 y ≠ y0）在带域障碍集上 canvasHits === 0，且不分域 / 真穿模两形都判红", () => {
-  const tasks = f3SpanTwoForward();
-  const scene = canvasSceneOf(tasks);
-  const edge = scene.cross.find((r) => r.span === 2);
-  assert.ok(edge !== undefined, "F3 确有 k=2 的跨框边（7 段档的载体）");
-  assert.deepEqual([edge.from, edge.to], ["f3a", "f3b"], "本条被测边 = f3a(board)→f3b(orch)，中间框 flow 被跨越");
-
-  const obstacles = canvasObstaclesOf(tasks, edge);
-  const ids = obstacles.map((o) => o.id);
-  // ---- 带域构成的正 / 负两面（A6 的机械凭据）----
-  assert.deepEqual(
-    ids,
-    ["chip:f3c", "chip:f3d", "frame:flow"],
-    "O1 = 全体 chip 除本边两端（f3a/f3b 不入集）∪ O2 = **仅非本边两端所属框**（board / orch 不入集、flow 入集）",
-  );
-  assert.equal(scene.chips.length, 4, "i5：chip 全集 === 节点数（SSR 全展开，判据与折叠态无关）");
-  assert.equal(
-    scene.chips.length - 2,
-    obstacles.filter((o) => o.id.startsWith("chip:")).length,
-    "O1 枚数 === 节点数 − 2（除本边两端 ⇒ 不是「全体 chip」的字面照抄）",
-  );
-
-  // ---- 手写修复形走廊：`2k+3 = 7` 段（C L C L C L C），沿「出口带 → 右 gutter → 框间带 → 左 gutter → 入口」 ----
-  // 逐段坐标即 F3 场景的几何读数：源右缘中点 (119,69) / 目标左缘中点 (45,341) / flow 框 [24,270]×[148,248] / 画布宽 294
-  const corridor =
-    "M119,69" +
-    " C155,69 290,80 290,105" + // 弧1（H→V）：**第二控制点 y=80 ≠ y0=69** = 件一根因的反面
-    " L290,264" + // 竖直腿①：右 gutter（x=290 > flow 框右缘 270 ⇒ 不进任何框矩形）
-    " C290,264 290,264 264,264" + // 弧2（V→H）
-    " L44,264" + // 水平段：flow/orch 之间的框间带（y=264 ∈ (248,280)）
-    " C20,264 20,264 20,288" + // 弧3（H→V）
-    " L20,317" + // 竖直腿②：左 gutter（x=20 < 框左缘 24）
-    " C20,341 20,341 45,341"; // 弧4（V→H）入目标 chip 左缘中点
-  const segs = dSegments(corridor);
-  assert.equal(segs.length, 7, `走廊段数 === 2k+3 = 7（k=${edge.span}）`);
-  assert.deepEqual(
-    [segs.filter((s) => s.kind === "cubic").length, segs.filter((s) => s.kind === "line").length],
-    [4, 3],
-    "7 段 = 4 弧 + 3 直（`C L C L C L C`）⇒ 相邻段间恰 6 处切线接续 = 2k+2 转角（每转角一枚 C 弧）",
-  );
-  assert.equal(segs[0].kind, "cubic", "首段 = 弧（切线水平出射，端点 = 源 chip 右缘中点）");
-  assert.equal(segs[0].pts[0][1], 69, "首弧起点 y === 源 chipMidY（I2 端点定义式，件三一行不改）");
-  assert.equal(
-    segs[0].pts.slice(1, 3).every((p) => p[1] === 69),
-    false,
-    "**首弧两控制点不得全 = y0**（现实现正是这一形 ⇒ 本走廊是「修复形」的样本，不是现码的复刻）",
-  );
-
-  // ---- ① 的正钉：正确形态在带域障碍集上 0 命中（判据不把正确形态判红）----
-  assert.deepEqual(canvasHits(corridor, obstacles), [], "手写走廊在带域障碍集上须 0 命中（否则判据过紧，n7 的新不变式无从谈起）");
-
-  // ---- ① 的两条空转守卫：判据不是恒 0，带域不是白写的 ----
-  const straightThrough = "M100,69 L100,220"; // 竖直硬穿 flow 框（y 148→248 之间长段）⇒ 必须判红
-  const throughHits = canvasHits(straightThrough, obstacles);
-  assert.ok(throughHits.length >= 1, `空转守卫：一条直穿 flow 框的硬线段必须命中（实得 ${throughHits.length}）`);
-  assert.deepEqual(
-    hitTexts(throughHits),
-    ["chip:f3c#0line", "frame:flow#0line"],
-    "命中项可读 = `被穿者#段号形`，且 **O1（兄弟 chip）与 O2（兄弟框矩形）两面同时参与判定**（只中其一即说明另一面没接线）",
-  );
-  const unbandedHits = canvasHits(corridor, canvasObstaclesOf(tasks, edge, true));
-  assert.ok(
-    unbandedHits.length > 0,
-    "A6 带域必要性：同一走廊在**字面「全体矩形」**下判红（正确形态被自己框的边框 / 标题带冤枉 ⇒ 障碍集必须带域）",
-  );
-});
-
-test("G11-画布穿模②（本枚极性 = **必为 0** · n7 与算法同轮翻转）：渲染层全部跨框边在 A6 带域障碍集上 canvasHits 恒 0", () => {
+test("G11-画布穿模②（本枚极性 = **必为 0** · n7 与算法同轮翻转）：渲染层全部跨框边在 A6 带域障碍集上 canvasHits 恒 0", async () => {
   const shapes = canvasFixtures();
   assert.ok(shapes.length >= 5, `五形都在册（F1 相邻正向 / F2 相邻回流 / F3 跨 3 框正向 / F4 跨 3 框回流 / F5 超载与单列框，实得 ${shapes.length} 形）`);
   let edges = 0;
-  let controls = 0;
-  let controlsHit = 0;
   for (const { key, label, tasks } of shapes) {
-    const scene = canvasSceneOf(tasks);
+    const scene = await canvasSceneOf(tasks);
     assert.ok(scene.cross.length >= 1, `${label}：跨框边在册（0 枚 ⇒ 本形对 I1′ 空转，回到 i6 的旧缺口）`);
     for (const r of scene.cross) {
-      const obstacles = canvasObstaclesOf(tasks, r);
+      const obstacles = await canvasObstaclesOf(tasks, r);
       assert.ok(obstacles.length >= 1, `${key}/${r.from}→${r.to}：带域障碍集非空（空集 ⇒ 下面那个 0 是空转）`);
       const hits = canvasHits(r.d, obstacles);
       assert.deepEqual(
@@ -3969,34 +2890,14 @@ test("G11-画布穿模②（本枚极性 = **必为 0** · n7 与算法同轮翻
         `${key} k=${r.span}：${r.from}(${r.fromProject})→${r.to}(${r.toProject}) 渲染层走廊须 **0 命中**（实得 ${hitTexts(hits).join(" ")}）`,
       );
       edges += 1;
-      // ---- 反对照（「0」不得是判据退化的 0）：把同一条边压回**改前那一形** —— 竖腿直落、不绕画布外缘、
-      //      水平段落在两框之间（正落在被跨越的兄弟框矩形里）⇒ 同一障碍集上必判红。k≥2 才有被跨越的框。
-      if (r.span < 2) continue;
-      const pts = dPoints(r.d);
-      const head = pts[0];
-      const tail = pts[pts.length - 1];
-      const oldForm = crossPath(
-        head[0],
-        head[1],
-        head[0] + DG_LANE_MIN,
-        Math.round((head[1] + tail[1]) / 2),
-        tail[0],
-        tail[1],
-      );
-      controls += 1;
-      if (canvasHits(oldForm, obstacles).length > 0) controlsHit += 1;
     }
   }
   assert.ok(edges >= 6, `被测跨框边枚数 ${edges} ≥ 6 ⇒ 五形边集全入走线（丢边会同时把本枚测空）`);
-  assert.ok(
-    controls >= 1 && controlsHit >= 1,
-    `改前直落形反对照判红 ${controlsHit}/${controls} ⇒ 判据真的在拦「腿纵穿兄弟框」这一形，② 的 0 才有意义`,
-  );
 });
 
-test("G11-画布穿模③（本枚极性 = **必为 0** · n7 与算法同轮翻转）：n1 真板集全部路由的画布级命中边集合为空", () => {
+test("G11-画布穿模③（本枚极性 = **必为 0** · n7 与算法同轮翻转）：n1 真板集全部路由的画布级命中边集合为空", async () => {
   const tasks = realTasks();
-  const scene = canvasSceneOf(tasks);
+  const scene = await canvasSceneOf(tasks);
   const intra = scene.routes.filter((r) => r.fromProject === r.toProject);
   assert.equal(scene.routes.length, scene.cross.length + intra.length, "对账前提：路由集 = 跨框档 ∪ 同框档（不重不漏，同一取数面）");
   assert.ok(scene.cross.length >= 1, `真板集确有跨框边 ${scene.cross.length} 枚（0 枚 ⇒ 本条对 I1′ 空转，回到 i6 的旧缺口）`);
@@ -4005,7 +2906,7 @@ test("G11-画布穿模③（本枚极性 = **必为 0** · n7 与算法同轮翻
   const hitEdges = [];
   let obstacleRows = 0;
   for (const r of scene.routes) {
-    const obstacles = canvasObstaclesOf(tasks, r);
+    const obstacles = await canvasObstaclesOf(tasks, r);
     assert.ok(obstacles.length >= 1, `${r.from}→${r.to}：带域障碍集非空（空集 ⇒ 该边的 0 命中是空转）`);
     obstacleRows += 1;
     const hits = canvasHits(r.d, obstacles);
@@ -4024,36 +2925,6 @@ test("G11-画布穿模③（本枚极性 = **必为 0** · n7 与算法同轮翻
   );
   // ---- 覆盖面钉：判据真的逐条跑过（不是「无路由 ⇒ 无命中」）----
   assert.equal(obstacleRows, scene.routes.length, `逐条边账 ${obstacleRows} 枚 === 路由集枚数（每条都过了带域判据）`);
-  // ---- 反对照：把真板 k≥2 的跨框边压回改前一形（腿直落、水平段落带间）⇒ 同一障碍集上必判红 ----
-  let controls = 0;
-  let controlsHit = 0;
-  for (const r of scene.cross.filter((x) => x.span >= 2)) {
-    const pts = dPoints(r.d);
-    const head = pts[0];
-    const tail = pts[pts.length - 1];
-    const oldForm = crossPath(
-      head[0],
-      head[1],
-      head[0] + DG_LANE_MIN,
-      Math.round((head[1] + tail[1]) / 2),
-      tail[0],
-      tail[1],
-    );
-    controls += 1;
-    const hits = canvasHits(oldForm, canvasObstaclesOf(tasks, r));
-    if (hits.length === 0) continue;
-    controlsHit += 1;
-    // 红字面的可读性口径随本枚保留（将来若红，必须点名被穿者）
-    assert.ok(
-      hits.every((h) => h.obstacle.startsWith("chip:") || h.obstacle.startsWith("frame:")),
-      `${r.from}→${r.to}：命中项须点名被穿者（chip / 框矩形）`,
-    );
-  }
-  assert.ok(controls >= 1, `真板集确有 k≥2 的跨框边可作反对照（实得 ${controls} 枚）`);
-  assert.ok(
-    controlsHit >= 1,
-    `真板集上改前一形判红 ${controlsHit}/${controls} ⇒ ③ 的 0 是「同一判据、同一障碍集、换了走线」的结果，不是判据在真板几何上失灵`,
-  );
 });
 
 // ---------------------------------------------------------------------------
@@ -4087,14 +2958,14 @@ const GOLDEN_AFTER = Object.freeze({ hitsEdges: 0, hitChips: 0, overlapPairs: 0 
  * 真板集 → **画布级穿模计数**（L1）：逐条本质边吃 n4 的带域障碍集与混合判据，零新度量。
  * 出参含逐条明细 ⇒ 复核失败时能直接点名是哪条边、哪枚 chip。
  */
-function realPenetrationCounts() {
+async function realPenetrationCounts() {
   const tasks = realTasks();
-  const scene = canvasSceneOf(tasks);
+  const scene = await canvasSceneOf(tasks);
   const edges = [];
   const chips = new Set();
   let hits = 0;
   for (const r of scene.routes) {
-    const found = canvasHits(r.d, canvasObstaclesOf(tasks, r));
+    const found = canvasHits(r.d, await canvasObstaclesOf(tasks, r));
     if (found.length === 0) continue;
     hits += found.length;
     const victims = [...new Set(found.map((h) => h.obstacle))];
@@ -4122,8 +2993,8 @@ function realPenetrationCounts() {
  * 常量逐字沿用 `G5_SAMPLES / G5_NEAR_PX / G5_RED_MIN / G5_END_EXEMPT_PX / G5_PARALLEL_SIN_MAX` ——
  * 其中「显式豁免共用端点 24px」由 {@link countNearPairs} 承担（同源扇出 = 合法共端点，不是叠线）。
  */
-function realOverlapCounts() {
-  const routes = canvasSceneOf(realTasks()).routes;
+async function realOverlapCounts() {
+  const routes = (await canvasSceneOf(realTasks())).routes;
   const byEdge = new Map(routes.map((r) => [`${r.from}→${r.to}`, r]));
   const { hits, rawHits, pairs } = findOverlaps(routes);
   /** 余对**逐条点名**（段形 + 跨度 + 是否跨框档）—— X3 丙「登记超载」的取证面，红字直读不用二次量。 */
@@ -4144,9 +3015,9 @@ function realOverlapCounts() {
   };
 }
 
-test("G13-真板复现①（改后 golden · 极性 = **必为 0 / 0**，n7 与算法同轮翻转）：真板集画布级穿模 = 0 边 / 0 chip", () => {
-  const first = realPenetrationCounts();
-  const second = realPenetrationCounts();
+test("G13-真板复现①（改后 golden · 极性 = **必为 0 / 0**，n7 与算法同轮翻转）：真板集画布级穿模 = 0 边 / 0 chip", async () => {
+  const first = await realPenetrationCounts();
+  const second = await realPenetrationCounts();
   // ---- golden 可复核（①）：同轮**二次运行**实测逐字段相等（判据确定性，非一次采样噪声）----
   assert.deepEqual(second, first, "同轮二次运行实测须逐字段相等 —— 不等 ⇒ 走线含非确定量，golden 无从谈起");
   // ---- 覆盖面钉：0 不得是「没边可测」的 0 ----
@@ -4158,373 +3029,6 @@ test("G13-真板复现①（改后 golden · 极性 = **必为 0 / 0**，n7 与�
   // ---- 改前基线**留在账面**（本枚不再测它；③ 的反对照负责证明判据仍咬人）----
   assert.ok(GOLDEN_BEFORE.hitsEdges >= 1 && GOLDEN_BEFORE.hitChips >= 1, "改前 golden 是非零命中数 ⇒ 「0/0」是一次真实的翻转，不是把判据调空");
   assert.ok(first.routes >= GOLDEN_BEFORE.hitsEdges, `路由面枚数须容得下改前那 ${GOLDEN_BEFORE.hitsEdges} 枚命中边（否则改前值无从产生）`);
-});
-
-test("G13-真板复现②（改后 golden · G5 采样叠点法搬画布全集 · 显式豁免共用端点 24px）：真板集叠线 = 0 段对", () => {
-  assert.equal(G5_END_EXEMPT_PX, 24, "共用端点豁免半径逐字 = 24px（G5 常量沿用，本枚不另立值）");
-  const first = realOverlapCounts();
-  const second = realOverlapCounts();
-  // ---- golden 可复核（①）----
-  assert.deepEqual(second, first, "同轮二次运行叠线实测须逐字段相等");
-  // ---- ③：叠线段对数钉到**改后 golden = 0** ----
-  assert.equal(
-    first.overlapPairs,
-    GOLDEN_AFTER.overlapPairs,
-    `叠线段对数须 === 改后 golden 0（实得 ${first.overlapPairs}：${first.detail.join(" / ") || "无叠线"}）`,
-  );
-  // ---- 两头不许空转：段对面非空（测过）+ raw 面确有被豁免剔掉的共端点 ----
-  assert.ok(first.pairs > 0, `段对检查面非空（画布路径全集 ${first.pairs} 段对）`);
-  assert.ok(
-    first.rawPairHits > first.overlapPairs,
-    `raw 面（不剔共端点、不判平行）命中 ${first.rawPairHits} 段对 > 判红 ${first.overlapPairs} 段对 ⇒ 24px 共端点豁免确有生效（同源扇出未被计成叠线）`,
-  );
-  // ---- 改前基线留在账面：判红数从 ${GOLDEN_BEFORE.overlapPairs} 段对真降到 0 ----
-  assert.ok(GOLDEN_BEFORE.overlapPairs >= 1, "改前 golden 是非零段对数 ⇒ 本枚的 0 是一次真实的翻转");
-});
-
-// ---------------------------------------------------------------------------
-// G12-画布叠线与容量（REQ-2026-10-14-02 · 承接轨② n8c · 改造文档 §6 第二枚增补 ANCHOR-4）
-// 三条**由构造成立**的容量不等式，按现码构造式逐式实测（本族**只读构造、不改算法**）：
-//   ① **带高式** `gapH ≥ 2·DG_CROSS_MIN + lanes·DG_BUS_PITCH` —— 消费面 = `canvasLayout`
-//   ② **列宽式** `gapW ≥ DG_LANE_MIN·2 + n·DG_LANE_PITCH` —— 消费面 = `pipeGridLayout`
-//   ③ **外缘** `seat < DG_OUTER_MARGIN_SEATS·2 = 4` 的**严格**不等式 —— 消费面 = `pickCrossCorridors`
-//     的 i7 严格 `>`（`legCorridorLadder` 同式），`OUTER_LANE_CAPACITY` 逐字 **4**
-// 三式共用同一句反面：**席数不够 ⇒ 只能共段 ⇒ 代价落在「叠线账」上、绝不落在「穿模账」上**（X3 丙）。
-// **两头不许空转**（照 `G4-穿节点④` / `G11-走廊③④` 先例，每式各配一枚当场判红的违反形）：
-//   ① 兜底宽 `DG_FRAME_GAP_MIN` 承载 `G12_SHORT_BAND_SEATS` 席 ⇒ 同一中线分布式把首条 lane 抬回**源框矩形**；
-//   ② n8a 之前的旧式预算（列通道只数框内 long 腿 ⇒ 需求 > 预算）⇒ 同列两条跨框腿**共段** ⇒ 叠线账判红；
-//   ③ 第 5 席 `at` **恰贴**最右框右缘（贴边即拒 ⇒ 严格 `>` 当场破）· 第 6 席落进框内 ⇒ 画该 x 的竖腿判红。
-// **不另立常量**：叠线判据原样吃 `G5_SAMPLES / G5_NEAR_PX / G5_RED_MIN / G5_END_EXEMPT_PX / G5_PARALLEL_SIN_MAX`
-// （24px 共端点豁免沿用），穿模判据原样吃 `canvasHits` 的 A6 带域混合判据。
-// ---------------------------------------------------------------------------
-
-/** 框间带在带高 `gapH` 上**可容的席数**（① 的容量读法：不等式 ⇔ 「这条带放得下几条线」同一句话）。 */
-const bandSeatsAt = (gapH) => Math.floor((gapH - DG_CROSS_MIN * 2) / DG_BUS_PITCH);
-
-/** 列间通道在列距 `gapW` 上**可容的席数**（② 的容量读法，同款）。 */
-const columnSeatsAt = (gapW) => Math.floor((gapW - DG_LANE_MIN * 2) / DG_LANE_PITCH);
-
-/** 框间带第 `j` 条 lane 的 y —— 与 `canvasLayout` 的中线分布式逐字同式（① 的正反两面共用这一把尺）。 */
-const bandLaneYAt = (bandTop, gapH, seats, j) =>
-  bandTop + Math.floor((gapH - seats * DG_BUS_PITCH) / 2) + Math.floor(DG_BUS_PITCH / 2) + j * DG_BUS_PITCH;
-
-/** 列间通道第 `i` 条 lane 的 x —— 与 `pipeGridLayout` 的分布式逐字同式（② 用；入参 = 本列 chip 右缘）。 */
-const columnLaneXAt = (chipRight, i) => chipRight + DG_LANE_MIN + i * DG_LANE_PITCH;
-
-/**
- * 画布外缘第 `seat` 席的 x —— 与 `pickCrossCorridors.marginAt` / `legCorridorLadder` 的席→线算式同式
- * （左族 `seat < DG_OUTER_MARGIN_SEATS`、右族取 `seat − DG_OUTER_MARGIN_SEATS` 偏移）。
- * **本函数按席号直算、不取模** ⇒ 喂 `seat ≥ OUTER_LANE_CAPACITY` 得到的正是「硬容量之外那一席」的位置，
- * ③ 的违反形吃的就是这一枚差别（实现里的取模复用 = 共段，见 `G11-走廊⑤`）。
- */
-const outerMarginXAt = (layout, seat) =>
-  seat < DG_OUTER_MARGIN_SEATS
-    ? DG_CANVAS_PAD + seat * DG_CORRIDOR_MARGIN_STEP
-    : layout.width - DG_CANVAS_PAD - (seat - DG_OUTER_MARGIN_SEATS) * DG_CORRIDOR_MARGIN_STEP;
-
-/** 最右框右缘（i7 严格不等式的右端点；与 `G11-走廊⑤` 的 `rightEdge` 同一算式）。 */
-const outerRightEdgeOf = (layout) =>
-  DG_CANVAS_GUTTER + layout.frames.reduce((mx, f) => Math.max(mx, f.frameW), 0);
-
-/**
- * **全体框矩形**障碍面（不剔本边两端所属框）—— 只在 ①③ 的**违反形**上用：违反形的内容恰是「腿进了不该进的框」，
- * 带域豁免（A6 的 O2 只数非本边两端所属框）在此不适用。正反面因此各吃各的障碍面，不共用一条放宽的判据。
- */
-const frameRectsOf = (layout) =>
-  layout.frames.map((f) => ({ id: `frame:${f.projectId}`, rect: [f.dx, f.dx + f.frameW, f.dy, f.dy + f.frameH] }));
-
-/** ① 的违反形超载席数：兜底宽可容 `bandSeatsAt(DG_FRAME_GAP_MIN) = 0` 席 ⇒ 任何正数都违反，取 5 使分布式**溢出到框内**（几何面也判红）。 */
-const G12_SHORT_BAND_SEATS = 5;
-
-test("G12-①带高式（gapH ≥ 2·DG_CROSS_MIN + lanes·DG_BUS_PITCH · 消费 canvasLayout）：逐带实测式子成立 ∧ lane y === 中线分布式 ∧ 距上下框缘 ≥ DG_CROSS_MIN；兜底宽承载 5 席的违反形必判红", () => {
-  const bands = [];
-  const ledger = { linear: 0, floored: 0 };
-  for (const [label, tasks] of bandFixtures()) {
-    const layout = fixedPointOf(tasks).layout;
-    assert.equal(layout.bandLanes.length, layout.gapH.length, `${label}：带 lane 集与带高数组同长（逐带对账的前提）`);
-    layout.bandLanes.forEach((lanes, i) => {
-      const own = layout.frames[i];
-      const next = layout.frames[i + 1];
-      assert.ok(own !== undefined && next !== undefined, `${label} 带 ${i}：一枚带须夹在两枚框之间`);
-      const bandTop = own.dy + own.frameH;
-      const nextTop = next.dy;
-      const gapH = layout.gapH[i];
-      const seats = lanes.length;
-      bands.push(`${label}#${i}:${seats}席/${gapH}px`);
-      // ---- 式子本体 + 同一句话的容量读法 ----
-      assert.ok(
-        gapH >= DG_CROSS_MIN * 2 + seats * DG_BUS_PITCH,
-        `${label} 带 ${i}：带高式成立否 —— gapH=${gapH} 须 ≥ 2·DG_CROSS_MIN(${DG_CROSS_MIN * 2}) + ${seats}·DG_BUS_PITCH(${seats * DG_BUS_PITCH}) = ${DG_CROSS_MIN * 2 + seats * DG_BUS_PITCH}`,
-      );
-      assert.ok(
-        bandSeatsAt(gapH) >= seats,
-        `${label} 带 ${i}：可容席数 ${bandSeatsAt(gapH)} 须 ≥ 实占席数 ${seats}（容量读法与上式同一句）`,
-      );
-      assert.equal(
-        nextTop - bandTop,
-        gapH,
-        `${label} 带 ${i}：带高 = 上下框缘之间那段净空（式子消费的量，不留第二份口径）`,
-      );
-      // ---- 「由构造成立」的直接凭据：实占 lane y 逐条 === 中线分布式；净空 ≥ DG_CROSS_MIN ----
-      [...lanes].forEach((y, j) => {
-        assert.equal(y, bandLaneYAt(bandTop, gapH, seats, j), `${label} 带 ${i} lane ${j}：y === canvasLayout 的中线分布式`);
-        const clearance = Math.min(y - bandTop, nextTop - y);
-        assert.ok(
-          clearance >= DG_CROSS_MIN,
-          `${label} 带 ${i} lane ${j}：y=${y} 距上下框缘的净空 ${clearance} 须 ≥ DG_CROSS_MIN(${DG_CROSS_MIN}) —— 横腿才不进框`,
-        );
-      });
-      if (seats >= 1) ledger.linear += 1;
-      else ledger.floored += 1;
-    });
-  }
-  assert.ok(ledger.linear >= 3, `线性区实测 ${ledger.linear} 枚带 ≥ 3（逐条 lane y 对账真跑到，${bands.join("、")}）`);
-  assert.ok(ledger.floored >= 1, `兜底档实测 ${ledger.floored} 枚空带 ≥ 1（两档都覆盖，不得只测富余侧）`);
-
-  // ---- 违反形必判红：兜底宽承载 5 席 ⇒ 同一把尺把首条线抬回**源框矩形**（正反面共用分布式，只差带高）----
-  assert.ok(
-    bandSeatsAt(DG_FRAME_GAP_MIN) < G12_SHORT_BAND_SEATS,
-    `兜底宽 ${DG_FRAME_GAP_MIN} 可容 ${bandSeatsAt(DG_FRAME_GAP_MIN)} 席 < ${G12_SHORT_BAND_SEATS} 席 ⇒ 该形在算术上就站不住`,
-  );
-  let red = 0;
-  for (const [label, tasks] of [["F1", f1AdjacentForward()], ["F5a", f5OuterOverload()], ["真板 eb86d5e8", realTasks()]]) {
-    const layout = fixedPointOf(tasks).layout;
-    const own = layout.frames[0];
-    assert.ok(own !== undefined && layout.frames.length >= 2, `${label}：违反形须有框间带可借（至少两框）`);
-    const bandTop = own.dy + own.frameH;
-    const yBad = bandLaneYAt(bandTop, DG_FRAME_GAP_MIN, G12_SHORT_BAND_SEATS, 0);
-    assert.ok(
-      yBad < bandTop,
-      `${label}：兜底宽承载 ${G12_SHORT_BAND_SEATS} 席 ⇒ 首条 lane y=${yBad} 已越过带上缘 ${bandTop}（落进源框 ${own.dy}..${bandTop}）`,
-    );
-    const obstacles = frameRectsOf(layout);
-    const bad = `M${own.dx + 1},${yBad} L${own.dx + own.frameW - 1},${yBad}`;
-    const badHits = canvasHits(bad, obstacles);
-    assert.ok(badHits.length >= 1, `${label}：违反形的横腿须判红（实得 ${hitTexts(badHits).join(", ") || "零命中 ⇒ 判据空转"}）`);
-    // 同一枚横腿搬到**实态带高**给出的 lane y 上 ⇒ 0 命中 ⇒ 判红来自带高不足、不来自尺子偏紧
-    const yGood = (layout.bandLanes[0] ?? [])[0];
-    if (yGood !== undefined) {
-      assert.deepEqual(
-        canvasHits(`M${own.dx + 1},${yGood} L${own.dx + own.frameW - 1},${yGood}`, obstacles),
-        [],
-        `${label}：实态那条带 lane 上的横腿 0 命中（对照面 ⇒ 上句的判红确由带高式所挡）`,
-      );
-    }
-    red += 1;
-  }
-  assert.equal(red, 3, `违反形实测 ${red} 枚（F1 / F5a / 真板）都判红`);
-});
-
-test("G12-②列宽式（gapW ≥ DG_LANE_MIN·2 + n·DG_LANE_PITCH · 消费 pipeGridLayout）：逐列实测式子成立 ∧ lane x === 通道分布式 ∧ 距左右 chip 缘 ≥ DG_LANE_MIN；旧式预算（需求 > 预算）⇒ 同列两腿共段必判红", () => {
-  const columns = [];
-  for (const [label, tasks] of bandFixtures()) {
-    const { grids } = fixedPointOf(tasks);
-    for (const [projectId, grid] of grids) {
-      assert.equal(grid.gapW.length, Math.max(0, grid.colX.length - 1), `${label}/${projectId}：列距枚数 === 列数 − 1`);
-      assert.equal(grid.lanes.length, grid.gapW.length, `${label}/${projectId}：通道集与列距集同长（逐列对账的前提）`);
-      grid.gapW.forEach((gapW, c) => {
-        const seats = (grid.lanes[c] ?? []).length;
-        const chipRight = grid.colX[c] + DG_NODE_W;
-        const nextColLeft = grid.colX[c + 1];
-        assert.ok(nextColLeft !== undefined, `${label}/${projectId} 列 ${c}：右邻列在册（末列无通道，不进本账）`);
-        columns.push(`${label}/${projectId}#${c}:${seats}席/${gapW}px`);
-        // ---- 式子本体 + 容量读法 + 「列距就是式子消费的那枚量」 ----
-        assert.ok(
-          gapW >= DG_LANE_MIN * 2 + seats * DG_LANE_PITCH,
-          `${label}/${projectId} 列 ${c}：列宽式成立否 —— gapW=${gapW} 须 ≥ 2·DG_LANE_MIN(${DG_LANE_MIN * 2}) + ${seats}·DG_LANE_PITCH(${seats * DG_LANE_PITCH}) = ${DG_LANE_MIN * 2 + seats * DG_LANE_PITCH}`,
-        );
-        assert.ok(
-          columnSeatsAt(gapW) >= seats,
-          `${label}/${projectId} 列 ${c}：可容席数 ${columnSeatsAt(gapW)} 须 ≥ 实占席数 ${seats}`,
-        );
-        assert.equal(nextColLeft - chipRight, gapW, `${label}/${projectId} 列 ${c}：列距 = 本列 chip 右缘到右邻列 chip 左缘`);
-        [...(grid.lanes[c] ?? [])].forEach((x, i) => {
-          assert.equal(x, columnLaneXAt(chipRight, i), `${label}/${projectId} 列 ${c} lane ${i}：x === pipeGridLayout 的通道分布式`);
-          assert.ok(
-            Math.min(x - chipRight, nextColLeft - x) >= DG_LANE_MIN,
-            `${label}/${projectId} 列 ${c} lane ${i}：x=${x} 距左右 chip 缘的净空 ${Math.min(x - chipRight, nextColLeft - x)} 须 ≥ DG_LANE_MIN(${DG_LANE_MIN})`,
-          );
-        });
-      });
-    }
-  }
-  assert.ok(columns.length >= 4, `列面实测 ${columns.length} 枚通道（${columns.slice(0, 6).join("、")}…）⇒ 本钉非空转`);
-
-  // ---- 违反形必判红 = n8a 之前的旧式预算面：列宽式对「真需求」不成立 ⇒ 腿只能共段 ⇒ 代价落在叠线账 ----
-  const tasks8b = f8ChannelTwoLegs();
-  const on = corridorSceneOf(tasks8b, true);
-  const off = corridorSceneOf(tasks8b, false);
-  const onGrid = on.grids.get("board");
-  const offGrid = off.grids.get("board");
-  assert.ok(onGrid !== undefined && offGrid !== undefined, "F8b board 网格在两侧都在册");
-  const demand = onGrid.lanes[1].length;
-  assert.ok(demand >= 3, `F8b 列 1 的真需求 === ${demand} 席（1 条框内 long 腿 + 2 条本框跨框腿）`);
-  assert.ok(
-    columnSeatsAt(offGrid.gapW[1]) < demand,
-    `旧式列宽 gapW=${offGrid.gapW[1]} 只可容 ${columnSeatsAt(offGrid.gapW[1])} 席 < 真需求 ${demand} 席 ⇒ 列宽式在旧式上**不成立**（本枚的违反形）`,
-  );
-  assert.ok(columnSeatsAt(onGrid.gapW[1]) >= demand, `新式 gapW=${onGrid.gapW[1]} 可容 ${columnSeatsAt(onGrid.gapW[1])} 席 ≥ 真需求 ${demand} 席`);
-  const offLegX = [...crossLegXs(off)];
-  assert.equal(offLegX.length, 1, `旧式两腿共用同一条通道线（出口 x 实得 ${offLegX.join(",")}）⇒ 结构上就是共段`);
-  const offOverlap = findOverlaps(off.routes);
-  const onOverlap = findOverlaps(on.routes);
-  assert.ok(
-    offOverlap.hits.length >= 1,
-    `旧式（列宽式被违反）在叠线账上须判红（实得 ${offOverlap.hits.length} 段对）—— 违反形不判红 ⇒ 本钉空转`,
-  );
-  assert.equal(
-    onOverlap.hits.length,
-    0,
-    `新式（列宽式成立）叠线 = 0 段对（实得 ${onOverlap.hits.map((h) => `${h.a}||${h.b}`).join(" / ") || "无"}）⇒ 抬列宽确实把共段消掉了`,
-  );
-});
-
-test("G12-③外缘硬容量 4 · 严格不等式（seat < DG_OUTER_MARGIN_SEATS·2 = 4 · 消费 pickCrossCorridors 的 i7 严格 >）：四席逐条整个落在框外 ∧ 出参只取这四条线；第 5 席恰贴框缘、第 6 席落进框内 ⇒ 判红；超载只共段不穿模", () => {
-  assert.equal(DG_OUTER_MARGIN_SEATS * 2, OUTER_LANE_CAPACITY, "外缘硬容量 === 2+2");
-  assert.equal(OUTER_LANE_CAPACITY, 4, "外缘硬容量逐字 4（改造文档 X3 / i7 的取值面）");
-  assert.equal(
-    DG_CANVAS_GUTTER,
-    DG_CANVAS_PAD + DG_OUTER_MARGIN_SEATS * DG_CORRIDOR_MARGIN_STEP,
-    `4 席之界由构造钉死：${DG_CANVAS_GUTTER} === DG_CANVAS_PAD(${DG_CANVAS_PAD}) + ${DG_OUTER_MARGIN_SEATS}·DG_CORRIDOR_MARGIN_STEP(${DG_OUTER_MARGIN_SEATS * DG_CORRIDOR_MARGIN_STEP}) ⇒ 第 5 席的 x **恰落**最右框右缘（贴边即拒）`,
-  );
-  const clearanceMin = Math.ceil(DG_CORRIDOR_BULGE_MAX / 2);
-  const lineSets = [];
-  for (const shape of corridorFixtures()) {
-    const scene = corridorSceneOf(shape.tasks);
-    const minDx = Math.min(...scene.layout.frames.map((f) => f.dx));
-    const rightEdge = outerRightEdgeOf(scene.layout);
-    const four = [];
-    for (let seat = 0; seat < OUTER_LANE_CAPACITY; seat += 1) {
-      const at = outerMarginXAt(scene.layout, seat);
-      four.push(at);
-      // ---- i7 严格不等式（**逐字不等**：贴边即不算在外）；席→线分族同实现（前 2 席左族、后 2 席右族）----
-      if (seat < DG_OUTER_MARGIN_SEATS) {
-        assert.ok(at < minDx, `${shape.key} 左席 ${seat}：x=${at} 须严格 < 框左缘 ${minDx}`);
-        assert.ok(minDx - at >= clearanceMin, `${shape.key} 左席 ${seat}：净空 ${minDx - at} 须 ≥ ${clearanceMin}（转角弧外扩上界）`);
-      } else {
-        assert.ok(at > rightEdge, `${shape.key} 右席 ${seat}：x=${at} 须严格 > 最右框右缘 ${rightEdge}`);
-        assert.ok(at - rightEdge >= clearanceMin, `${shape.key} 右席 ${seat}：净空 ${at - rightEdge} 须 ≥ ${clearanceMin}（转角弧外扩上界）`);
-      }
-    }
-    lineSets.push(new Set(four));
-    // ---- 出参面：任何边任何席号取到的 ML/MR 线，都只能是上面这四条（不凭空造第五种线）----
-    for (const seat of [0, 1, 2, 3, 4, 9, 99]) {
-      for (const row of corridorRowsOf(shape.tasks)) {
-        const picked = corridorOf(scene, row.edge, { margin: seat }).plan;
-        for (const c of picked.corridors.filter((x) => x !== null && (x.kind === "ML" || x.kind === "MR"))) {
-          assert.equal(c.capacity, OUTER_LANE_CAPACITY, `${shape.key}：出参外缘走廊 ${c.id} 容量逐字 = 4`);
-          assert.ok(c.seat >= 0 && c.seat < OUTER_LANE_CAPACITY, `${shape.key}：出参席号 ${c.seat} ∈ [0,4)`);
-          assert.equal(
-            four.includes(c.at),
-            true,
-            `${shape.key} margin=${seat}：出参 ${c.id}（at=${c.at}）须命中四条外缘线之一（${four.join(",")}）`,
-          );
-        }
-      }
-    }
-  }
-  assert.ok(lineSets.length >= 6, `外缘线集实测 ${lineSets.length} 形 ⇒ 正面覆盖面非空`);
-
-  // ---- 违反形必判红：硬容量之外的席（第 5 席贴边 / 第 6 席进框）在同一把尺上当场破 ----
-  let red = 0;
-  for (const [label, tasks] of [["F3", f3SpanTwoForward()], ["F4", f4SpanTwoBackflow()], ["真板 eb86d5e8", realTasks()]]) {
-    const scene = corridorSceneOf(tasks);
-    const minDx = Math.min(...scene.layout.frames.map((f) => f.dx));
-    const rightEdge = outerRightEdgeOf(scene.layout);
-    const fifth = outerMarginXAt(scene.layout, OUTER_LANE_CAPACITY);
-    const sixth = outerMarginXAt(scene.layout, OUTER_LANE_CAPACITY + 1);
-    assert.equal(fifth, rightEdge, `${label}：右族第 5 席 x=${fifth} **恰贴**最右框右缘 ${rightEdge} ⇒ 严格不等号不成立（贴边即拒，正是 i7 用严格号的理由）`);
-    assert.ok(sixth < rightEdge, `${label}：右族第 6 席 x=${sixth} 已落进框内（< ${rightEdge}）`);
-    assert.ok(
-      DG_CANVAS_PAD + OUTER_LANE_CAPACITY * DG_CORRIDOR_MARGIN_STEP > minDx,
-      `${label}：左族第 5 席 x=${DG_CANVAS_PAD + OUTER_LANE_CAPACITY * DG_CORRIDOR_MARGIN_STEP} 亦不严格在框左缘 ${minDx} 之外 ⇒ 两族同界`,
-    );
-    const top = Math.min(...scene.layout.frames.map((f) => f.dy));
-    const bottom = Math.max(...scene.layout.frames.map((f) => f.dy + f.frameH));
-    const hits = canvasHits(`M${sixth},${top + 1} L${sixth},${bottom - 1}`, frameRectsOf(scene.layout));
-    assert.ok(hits.length >= 1, `${label}：画在第 6 席 x=${sixth} 的竖腿须判红（实得 ${hitTexts(hits).join(", ") || "零命中 ⇒ 判据空转"}）`);
-    red += 1;
-  }
-  assert.equal(red, 3, `外缘违反形实测 ${red} 枚（F3 / F4 / 真板）都判红`);
-
-  // ---- 超载只共段、不穿模（容量吃紧的那一形：F5a 五枚跨框边 > 4 席）----
-  const f5a = f5OuterOverload();
-  const rows5 = corridorRowsOf(f5a);
-  assert.ok(rows5.length > OUTER_LANE_CAPACITY, `F5a 确有 ${rows5.length} 枚跨框边 > 外缘 4 席 ⇒ 容量吃紧的形在册`);
-  const usedXs = new Set(
-    rows5.flatMap((r) => r.plan.corridors.filter((c) => c !== null && (c.kind === "ML" || c.kind === "MR")).map((c) => c.at)),
-  );
-  assert.ok(usedXs.size <= OUTER_LANE_CAPACITY, `五枚边所用的外缘 x 至多 4 条（实得 ${usedXs.size}）⇒ 超出部分只能共段、不新造线`);
-  assert.equal(
-    rows5.reduce((n, r) => n + canvasHits(r.d, r.obstacles).length, 0),
-    0,
-    "超载形在 A6 带域障碍集上全 0 命中 ⇒ **不降级为穿模**（X3 丙的几何面）",
-  );
-  const squeezed = rows5.map((r) => corridorOf(corridorSceneOf(f5a), r.edge, { band: 99, exit: 99, entry: 99 }));
-  assert.ok(
-    squeezed.every((r) => r.plan.overCapacity === true),
-    "越界席号逐枚出声（不得静默）⇒ 超载是**登记**过的共段",
-  );
-  assert.deepEqual(
-    squeezed.map((r) => r.segs.length),
-    rows5.map((r) => r.plan.points.length - 1),
-    "超载档段数与首席档逐位相同（仍 2k+3 ⇒ 降级只发生在共段，不塌段）",
-  );
-});
-
-test("G12-④兜底档 ⇔ 0 席 + 判据面未放宽 + 真板集三式容量账：bandSeatsAt(DG_FRAME_GAP_MIN) === 0 ∧ columnSeatsAt(DG_COL_GAP_MIN) === 0 ∧ G5 常量逐字沿用（24px 豁免不另立值）", () => {
-  // ---- 两式的兜底档都恰是「0 席」⇒ 兜底宽只服务空带，一有需求即抬宽（式子与档位是同一句话）----
-  assert.equal(bandSeatsAt(DG_FRAME_GAP_MIN), 0, `带高式兜底档：${DG_FRAME_GAP_MIN}px 恰可容 0 席`);
-  assert.equal(bandHFor(1) > DG_FRAME_GAP_MIN, true, `一席即抬宽：bandHFor(1)=${bandHFor(1)} > 兜底宽 ${DG_FRAME_GAP_MIN}`);
-  assert.equal(columnSeatsAt(DG_COL_GAP_MIN), 0, `列宽式兜底档：${DG_COL_GAP_MIN}px 恰可容 0 席`);
-  assert.equal(
-    DG_LANE_MIN * 2 + DG_LANE_PITCH > DG_COL_GAP_MIN,
-    true,
-    `一席即抬宽：2·DG_LANE_MIN + DG_LANE_PITCH = ${DG_LANE_MIN * 2 + DG_LANE_PITCH} > 兜底列距 ${DG_COL_GAP_MIN}`,
-  );
-  // ---- 判据面逐字沿用 G5（本族不另立常量、不放宽半径）----
-  assert.equal(G5_SAMPLES, 24, "采样点数沿用 G5");
-  assert.equal(G5_NEAR_PX, 1.5, "近距阈值沿用 G5");
-  assert.equal(G5_RED_MIN, 2, "判红门槛沿用 G5（≥ 2 枚叠点才算一段对）");
-  assert.equal(G5_END_EXEMPT_PX, 24, "共端点豁免半径沿用 G5 = 24px（本枚不另立值）");
-  assert.ok(G5_PARALLEL_SIN_MAX > 0 && G5_PARALLEL_SIN_MAX < 1, `平行判据沿用 G5（sin 上界 ${G5_PARALLEL_SIN_MAX}）`);
-
-  // ---- 真板集上的三式容量账（逐式给出实占 / 可容两枚读数，不留「按公式推断」的空洞）----
-  const tasks = realTasks();
-  const layout = fixedPointOf(tasks).layout;
-  layout.bandLanes.forEach((lanes, i) => {
-    const gapH = layout.gapH[i];
-    assert.ok(
-      gapH >= DG_CROSS_MIN * 2 + lanes.length * DG_BUS_PITCH,
-      `真板带 ${i}：${lanes.length} 席 ⇒ 带高式（gapH=${gapH}，可容 ${bandSeatsAt(gapH)}）`,
-    );
-    assert.ok(bandSeatsAt(gapH) >= lanes.length, `真板带 ${i}：实占 ${lanes.length} ≤ 可容 ${bandSeatsAt(gapH)}`);
-  });
-  assert.ok(layout.bandLanes.reduce((n, b) => n + b.length, 0) >= 1, "真板确有已分配席位的带（空账不构凭据）");
-  let columnRows = 0;
-  for (const [, grid] of fixedPointOf(tasks).grids) {
-    grid.gapW.forEach((gapW, c) => {
-      const seats = (grid.lanes[c] ?? []).length;
-      assert.ok(gapW >= DG_LANE_MIN * 2 + seats * DG_LANE_PITCH, `真板列 ${c}：${seats} 席 ⇒ 列宽式（gapW=${gapW}，可容 ${columnSeatsAt(gapW)}）`);
-      assert.ok(columnSeatsAt(gapW) >= seats, `真板列 ${c}：实占 ${seats} ≤ 可容 ${columnSeatsAt(gapW)}`);
-      columnRows += 1;
-    });
-  }
-  assert.ok(columnRows >= 1, `真板列面实测 ${columnRows} 枚通道`);
-  const minDx = Math.min(...layout.frames.map((f) => f.dx));
-  const rightEdge = outerRightEdgeOf(layout);
-  for (let seat = 0; seat < OUTER_LANE_CAPACITY; seat += 1) {
-    const at = outerMarginXAt(layout, seat);
-    if (seat < DG_OUTER_MARGIN_SEATS) {
-      assert.ok(at < minDx, `真板左席 ${seat}：x=${at} 须严格 < 框左缘 ${minDx}`);
-    } else {
-      assert.ok(at > rightEdge, `真板右席 ${seat}：x=${at} 须严格 > 最右框右缘 ${rightEdge}`);
-    }
-  }
-  assert.ok(
-    outerMarginXAt(layout, OUTER_LANE_CAPACITY) <= rightEdge,
-    `真板第 5 席 x=${outerMarginXAt(layout, OUTER_LANE_CAPACITY)} 不再严格在外 ⇒ 硬容量 4 在真板读数上成立`,
-  );
 });
 
 // ---------------------------------------------------------------------------
@@ -4568,24 +3072,6 @@ const corridorFixtures = () => [
 ];
 
 /**
- * 一枚任务集 → 画布层 `planCanvas` 的**同款入参**（= `renderDependencyGraphSection` 内部那一趟的前导：
- * 约简 → 号序 → 分层 → 管道 → 跨框边 → taskId→project）。镜像与真实现共用这一枚前导 ⇒
- * 「镜像跑的是同一张图」是同一份入参、不是叙述。
- */
-function canvasSceneInputsOf(tasks) {
-  const graph = buildGraphWithPipelines(tasks);
-  const { kept } = transitiveReduce(graph.edges);
-  const ordinals = taskOrdinalMap(tasks);
-  const layers = layerOfGraph(graph.nodes, ordinals, kept);
-  const pipes = graph.pipelines;
-  const projectByTask = new Map(graph.nodes.map((n) => [n.taskId, n.projectId]));
-  const crossEdges = kept
-    .filter((e) => projectByTask.get(e.from) !== projectByTask.get(e.to))
-    .map((e) => ({ from: e.from, to: e.to, fromProject: projectByTask.get(e.from), toProject: projectByTask.get(e.to) }));
-  return { graph, kept, ordinals, layers, pipes, projectByTask, crossEdges };
-}
-
-/**
  * `bandDemandOf` 的测试侧同构：本轮布局上的跨框走线 → 各框间带 `max(busLane)+1`。
  * **定序与真实现同式**（源 projectId 升序 → 源号序 → 目标号序 → from → to）。
  */
@@ -4623,428 +3109,8 @@ function bandDemandOfScene(layout, routes, projectByTask, ordinals) {
 const sceneSignature = (layout) =>
   `${layout.gapH.join(",")}\u0000${layout.bandLanes.map((b) => b.join(",")).join("\u0001")}\u0000${layout.width}x${layout.height}`;
 
-/**
- * 一枚任务集 → **走廊可用的画布场景**（`{ layout, grids, routes, bandPasses, bandUnconverged }`，全部画布坐标）。
- * `planCanvas` 的测试侧同构：逐框 `gapLanes` 回灌（= `planPipeGrid`）→ 画布几何 → 平移网格
- * （`frame.dx/dy` + 框内 origin）→ 走线 → 框间带实占回灌 → **≤ `maxPasses` 轮定序不动点**。
- * 出参 `grids` 即 {@link CanvasGrids} 的那份已平移网格（`pickCrossCorridors` 的入参参照系）。
- * `crossDemand = false` ⇒ **退回 n8a 之前的旧式**（列通道只数框内 long 腿）—— 只供 ⑦ 的恒等式反锚
- * 当对照面用，默认 `true` 与实现逐字同式。
- * `maxPasses = 1` ⇒ **退回 n8b 之前的单趟形态**（回灌一趟即返回、不再比签名）—— 只供 ④ 的
- * 「不动点态 ≥ 单趟态」与 ⑫ 的「收敛于第 2 轮 ⇒ 出参逐字等于单趟态」当对照面用。
- */
-function corridorSceneOf(tasks, crossDemand = true, maxPasses = DG_BAND_MAX_PASSES) {
-  const { kept, ordinals, layers, pipes, projectByTask, crossEdges } = canvasSceneInputsOf(tasks);
-
-  // 回灌 ①：框内列通道 —— 与 `planPipeGrid` 逐字同式（**n8a 框内侧**：long 腿按 `a.col` 与 `b.col−1`
-  // 各占一枚 lane，**本框的跨框腿同样占席位**（出口 = 源列之右、入口 = 目标列之左，越界的首 / 末列不计））。
-  // 该 demand 只吃 `crossEdges`、与画布几何无关 ⇒ **逐轮同值**，故不动点循环不重算网格（与实现同款）。
-  const grids = new Map();
-  for (const pipe of pipes) {
-    const columns = compressPipeLayers(pipe, layers);
-    const base = pipeGridLayout(pipe, columns, ordinals);
-    const longs = routeIntraEdges(kept, base).filter((e) => e.kind === "long");
-    const gapLanes = new Array(Math.max(0, base.cols - 1)).fill(0);
-    for (const e of longs) {
-      const a = base.cellOf.get(e.from);
-      const b = base.cellOf.get(e.to);
-      if (a === undefined || b === undefined) continue;
-      gapLanes[a.col] = (gapLanes[a.col] ?? 0) + 1;
-      const targetGap = b.col - 1;
-      if (targetGap >= 0 && targetGap < gapLanes.length) gapLanes[targetGap] = (gapLanes[targetGap] ?? 0) + 1;
-    }
-    for (const e of (crossDemand ? crossEdges : [])) {
-      const exit = base.cellOf.get(e.from);
-      if (exit !== undefined) {
-        const exitGap = exit.col;
-        if (exitGap >= 0 && exitGap < gapLanes.length) gapLanes[exitGap] = (gapLanes[exitGap] ?? 0) + 1;
-      }
-      const entry = base.cellOf.get(e.to);
-      if (entry !== undefined) {
-        const entryGap = entry.col - 1;
-        if (entryGap >= 0 && entryGap < gapLanes.length) gapLanes[entryGap] = (gapLanes[entryGap] ?? 0) + 1;
-      }
-    }
-    grids.set(pipe.projectId, pipeGridLayout(pipe, columns, ordinals, { gapLanes, busLaneCount: longs.length }));
-  }
-  const locals = pipes.map((p) => grids.get(p.projectId) ?? emptyGridForTest());
-
-  const routeAll = (layout) => {
-    const canvasGrids = new Map();
-    for (const frame of layout.frames) {
-      const grid = grids.get(frame.projectId);
-      if (grid !== undefined)
-        canvasGrids.set(frame.projectId, shiftPipeGrid(grid, frame.dx + DG_GRID_ORIGIN_X, frame.dy + DG_GRID_ORIGIN_Y));
-    }
-    const intra = [];
-    for (const frame of layout.frames) {
-      const grid = canvasGrids.get(frame.projectId);
-      if (grid !== undefined) intra.push(...routeIntraEdges(kept, grid));
-    }
-    return { canvasGrids, routes: [...intra, ...routeCrossFrameEdges(crossEdges, { layout, grids: canvasGrids }, intra)] };
-  };
-
-  // 回灌 ②：框间带 lane 占用 → **定序不动点**（与 `planCanvas` 同判据：每轮据实占重画几何、比签名，
-  // 签名相同即收敛；`maxPasses` 轮内未拿到收敛凭据 ⇒ `bandUnconverged` 出声，不得静默返回）
-  let layout = canvasLayout(pipes, locals);
-  let done = routeAll(layout);
-  let bandPasses = 0;
-  let bandUnconverged = true;
-  for (let round = 1; round <= maxPasses; round++) {
-    bandPasses = round;
-    const next = canvasLayout(pipes, locals, { gapLanes: bandDemandOfScene(layout, done.routes, projectByTask, ordinals) });
-    if (sceneSignature(next) === sceneSignature(layout)) {
-      bandUnconverged = false;
-      break;
-    }
-    layout = next;
-    done = routeAll(layout);
-  }
-  return { layout, grids: done.canvasGrids, routes: done.routes, bandPasses, bandUnconverged };
-}
-
-/** 空网格（`pipeGridLayout` 的空管道短路出参在测试侧的同构件 —— 只为 `locals` 定长占位）。 */
-const emptyGridForTest = () => pipeGridLayout({ projectId: "empty", nodes: [] }, new Map(), new Map());
-
-/**
- * 一条跨框边 → `{ plan, d, segs, a, b }`（走廊序列 → path 的唯一序式）。
- * `seats` 原样透传给 {@link pickCrossCorridors}（缺省全 0 = 首席；超载档由 ⑤ 显式喂越界席号）。
- */
-function corridorOf(scene, edge, seats) {
-  const a = scene.grids.get(edge.fromProject)?.cellOf.get(edge.from);
-  const b = scene.grids.get(edge.toProject)?.cellOf.get(edge.to);
-  assert.ok(a !== undefined && b !== undefined, `两端 cell 须在画布网格内在册（${edge.from} / ${edge.to}）`);
-  const plan = pickCrossCorridors({
-    fromProject: edge.fromProject,
-    toProject: edge.toProject,
-    a,
-    b,
-    grids: scene.grids,
-    layout: scene.layout,
-    ...(seats === undefined ? {} : { seats }),
-  });
-  assert.ok(plan !== null, `跨框档成立 ⇒ pickCrossCorridors 不得返回 null（${edge.from}→${edge.to}）`);
-  const d = corridorPath(plan.points);
-  return { plan, d, segs: dSegments(d), a, b };
-}
-
-/**
- * 一枚任务集的全部跨框边 → 逐边 `{ edge, plan, d, segs, obstacles, a, b }`。
- * **几何同源性钉在本函数里**：走廊场景的端点须逐字等于渲染层 path 的首末点。
- */
-function corridorRowsOf(tasks) {
-  const render = canvasSceneOf(tasks);
-  const scene = corridorSceneOf(tasks);
-  return render.cross.map((edge) => {
-    const row = corridorOf(scene, edge);
-    const rp = dPoints(edge.d);
-    assert.deepEqual(row.plan.points[0], rp[0], `${edge.from}→${edge.to}：走廊首顶点 === 渲染层起点（I2 端点式未动）`);
-    assert.deepEqual(
-      row.plan.points[row.plan.points.length - 1],
-      rp[rp.length - 1],
-      `${edge.from}→${edge.to}：走廊末顶点 === 渲染层终点（I2 端点式未动）`,
-    );
-    return { edge, obstacles: canvasObstaclesOf(tasks, edge), ...row };
-  });
-}
-
 /** 走廊门类闭集（改造文档 A2 的 7 类 ⇒ 8 枚取值；出现第 9 枚即本钉红）。 */
 const CROSS_CORRIDOR_KINDS = ["CH", "PL", "PR", "ML", "MR", "BD", "PB", "PT"];
-
-test("G11-走廊①统一律段数 = 2k+3：七形逐边实测（顶点 2k+4 · 走廊 2k+3 · 非 null 2k+1 · C 枚数 === 段数 · L 枚数 === 0）", () => {
-  let edges = 0;
-  const kSeen = new Set();
-  const perK = new Map();
-  for (const shape of corridorFixtures()) {
-    const rows = corridorRowsOf(shape.tasks);
-    assert.ok(rows.length >= 1, `${shape.key} 确有跨框边（无跨框边 ⇒ 本形对走廊块空转）`);
-    for (const { plan, d, segs, edge } of rows) {
-      const k = plan.k;
-      assert.equal(k, edge.span, `${edge.from}→${edge.to}：plan.k === 渲染层跨度 |tIdx − sIdx|`);
-      assert.ok(k >= 1, "跨框档数恒 ≥ 1（两端同框由 plan 短路 null，不入本面）");
-      assert.equal(plan.points.length, 2 * k + 4, `${shape.key}/${edge.from}→${edge.to}：顶点枚数 === 2k+4`);
-      assert.equal(plan.corridors.length, 2 * k + 3, "走廊序与段序一一对应 ⇒ 枚数 === 段数 === 2k+3");
-      assert.equal(
-        plan.corridors.filter((c) => c !== null).length,
-        2 * k + 1,
-        "非 null 走廊 = 竖腿 k+1 + 带内长横 k = 2k+1（首末短桩不占走廊 ⇒ 由 I2 端点式固定）",
-      );
-      assert.equal(segs.length, 2 * k + 3, `${shape.key}/${edge.from}→${edge.to}：k=${k} ⇒ 段数实测 === ${2 * k + 3}`);
-      const cmds = dCmds(d);
-      assert.equal(cmds.filter((c) => c === "C").length, 2 * k + 3, "「命令枚数」逐字成立：一枚走廊段一枚 C ⇒ C 枚数 === 段数");
-      assert.equal(cmds.filter((c) => c === "L").length, 0, "走廊形不产 L（转角两段共享同一条切线 ⇒ C¹ 连续）");
-      assert.deepEqual(cmds.filter((c) => c !== "M" && c !== "C"), [], "path 命令族 ⊆ {M, C}");
-      perK.set(k, (perK.get(k) ?? 0) + 1);
-      kSeen.add(k);
-      edges += 1;
-    }
-  }
-  // ---- 三档都真被测到（k=3→9 由 F6 承载；F1..F5 只覆盖 5 / 7 两档）----
-  assert.deepEqual([...kSeen].sort((a, b) => a - b), [1, 2, 3], "验收 ① 的 k=1→5 / k=2→7 / k=3→9 三档全部实测到");
-  assert.ok(perK.get(1) >= 1 && perK.get(2) >= 1 && perK.get(3) >= 1, "每档至少一枚边（不得只靠一档推全式）");
-  assert.ok(edges >= 12, `被测跨框边总数 ${edges} ≥ 12（七形边集非空 ⇒ 本锚不空转）`);
-});
-
-test("G11-走廊②端点落线：每段骨架两端都落在该段走廊的 at 线上；短桩内端落相邻腿线 ⇒ 固定坐标集合 ⊂ 走廊 at 值集合", () => {
-  const kindsSeen = new Set();
-  let stubs = 0;
-  for (const shape of corridorFixtures()) {
-    for (const { plan, segs, edge } of corridorRowsOf(shape.tasks)) {
-      assert.equal(segs.length, plan.corridors.length, `${shape.key}/${edge.from}→${edge.to}：段与走廊一一对应（②的前提）`);
-      const corridors = plan.corridors.filter((c) => c !== null);
-      const atSet = new Set(corridors.map((c) => c.at));
-      assert.ok(corridors.every((c) => Number.isInteger(c.at)), "走廊线全整数（与网格同一数值面）");
-      plan.corridors.forEach((c, i) => {
-        const seg = segs[i];
-        assert.ok(seg !== undefined, `第 ${i} 段在册`);
-        const p = seg.pts[0];
-        const q = seg.pts[seg.pts.length - 1];
-        if (c === null) {
-          // 短桩：水平、y = 端点 chipMidY；**内端**（靠腿那一头）x = 相邻那枚竖腿的 at
-          stubs += 1;
-          assert.equal(p[1], q[1], `短桩段 ${i} 须水平（I2：端点 = chip 缘中点 ⇒ 桩只走 x）`);
-          const first = i === 0;
-          const neighbor = first ? plan.corridors[1] : plan.corridors[plan.corridors.length - 2];
-          assert.ok(neighbor !== null && neighbor !== undefined, `短桩 ${i} 的邻段是竖腿`);
-          const inner = first ? q : p;
-          assert.equal(
-            inner[0],
-            neighbor.at,
-            `短桩 ${i} 的内端 x === 邻腿走廊 at（${neighbor.id}，实得 ${inner[0]} vs ${neighbor.at}）`,
-          );
-          return;
-        }
-        kindsSeen.add(c.kind);
-        assert.ok(CROSS_CORRIDOR_KINDS.includes(c.kind), `走廊门类 ${c.kind} ⊂ 闭集 ${CROSS_CORRIDOR_KINDS.join("/")}`);
-        assert.ok(c.seat >= 0 && c.capacity >= 0, `走廊 ${c.id} 席号 / 容量非负`);
-        assert.equal(
-          c.axis === "v" ? p[0] === c.at && q[0] === c.at : p[1] === c.at && q[1] === c.at,
-          true,
-          `段 ${i}（走廊 ${c.id}，轴 ${c.axis}）两端须落在 at=${c.at} 这条线上（实得 [${p}]→[${q}]）`,
-        );
-      });
-      // 逐字面「端点 ⊂ 走廊集合」：每段那条固定坐标都出现在走廊 at 值集合里（短桩的固定量 = 端点 chipMidY）
-      segs.forEach((seg, i) => {
-        const c = plan.corridors[i];
-        const p = seg.pts[0];
-        if (c === null) return; // 短桩不占走廊（其固定坐标 = 端点 chipMidY，由上面的邻腿 at 钉覆盖）
-        const fixed = c.axis === "v" ? p[0] : p[1];
-        assert.equal(fixed, c.at, `段 ${i} 的固定坐标须等于该段走廊 at（${c.id}）`);
-        assert.ok(atSet.has(fixed), `段 ${i} 的固定坐标 ${fixed} ⊂ 走廊 at 值集合`);
-      });
-    }
-  }
-  assert.equal(stubs % 2, 0, "短桩按边成对（每边首末各一枚）");
-  assert.ok(stubs >= 24, `短桩枚数实测 ${stubs} ⇒ 首末桩面被度量到（每边 2 枚）`);
-  // `MR`（出口侧远档外缘）在**首席** corpus 里永不被自然取到 —— 出口腿恒先降 `PR`（本框 pad 条带），
-  // 只有出口席溢出（seat ≥ 本框 `PR` 之后的外缘档）才够到 `MR`。⇒ 用一枚**显式出口席**探针把该档钉实
-  // （与 ⑤ 的超载档同源，但这里只取 `k === 1` 相邻形：`exit:1` 即把出口腿压到画布右外缘）。
-  {
-    const f1 = corridorFixtures().find((s) => s.key === "F1");
-    const scene = corridorSceneOf(f1.tasks);
-    const edge = canvasSceneOf(f1.tasks).cross[0];
-    const row = corridorOf(scene, edge, { exit: 1 });
-    const exitLeg = row.plan.corridors[1];
-    assert.ok(exitLeg !== null && exitLeg !== undefined, "出口竖腿在册");
-    assert.equal(exitLeg.kind, "MR", `出口席 1 ⇒ 竖腿降到底档 MR（实得 ${exitLeg.kind}）`);
-    kindsSeen.add(exitLeg.kind);
-  }
-  assert.equal(
-    ["CH", "PL", "PR", "ML", "MR", "BD"].every((kk) => kindsSeen.has(kk)),
-    true,
-    `三档降档 + 中段带全部真被取到（实得 ${[...kindsSeen].sort().join("/")}）—— MR 经显式出口席探针、PB/PT 只在带缺失时出现不要求`,
-  );
-});
-
-test("G11-走廊③canvasHits 恒 0（A6 带域障碍集）：七形全部新路径零命中，且 k≥2 的「直落形」反对照必判红（防空转）", () => {
-  let rows = 0;
-  let controls = 0;
-  let controlsHit = 0;
-  for (const shape of corridorFixtures()) {
-    for (const row of corridorRowsOf(shape.tasks)) {
-      const { edge, plan, d, obstacles, a, b } = row;
-      assert.ok(obstacles.length >= 1, `${shape.key}/${edge.from}→${edge.to}：带域障碍集非空（空集 ⇒ ③ 恒真是空转）`);
-      const hits = canvasHits(d, obstacles);
-      assert.deepEqual(hits, [], `${shape.key} k=${plan.k}：新走廊在 A6 带域障碍集上须 0 命中（实得 ${hitTexts(hits).join(", ")}）`);
-      rows += 1;
-      // ---- 反对照：只用出口腿「直落」到目标行（不绕外缘 / 不进带）⇒ 必穿中间框 ----
-      if (plan.k < 2) continue;
-      const exitLeg = plan.corridors[1];
-      assert.ok(exitLeg !== null && exitLeg !== undefined, "出口竖腿在册（反对照沿用它那条 x）");
-      const straight =
-        `M${a.chipRight},${a.chipMidY} L${exitLeg.at},${a.chipMidY}` +
-        ` L${exitLeg.at},${b.chipMidY} L${b.chipX},${b.chipMidY}`;
-      controls += 1;
-      if (canvasHits(straight, obstacles).length > 0) controlsHit += 1;
-    }
-  }
-  assert.ok(rows >= 12, `新路径实测 ${rows} 枚 ⇒ ③ 覆盖面非空`);
-  assert.ok(controls >= 1, `k≥2 的直落反对照 ${controls} 枚`);
-  assert.ok(
-    controlsHit >= 1,
-    `反对照至少一枚判红（实得 ${controlsHit}/${controls}）⇒ 判据真的在拦「腿纵穿兄弟框」这一形，③ 的 0 才有意义`,
-  );
-});
-
-test("G11-走廊④首弧第二控制点 y ≠ y0（件一根因单点消解）+ 转角 2k+2 + 弧不外扩（≤ DG_CORRIDOR_BULGE_MAX < DG_LANE_MIN）", () => {
-  assert.equal(DG_CORRIDOR_MIN_RUN, 12, "并段门槛 = 2·arcK_min（arcK 下界 6 ⇒ 12；arcK 函数体不动）");
-  assert.ok(
-    DG_CORRIDOR_BULGE_MAX < DG_LANE_MIN,
-    `外扩上界须严格小于半格通道宽（${DG_CORRIDOR_BULGE_MAX} < ${DG_LANE_MIN}）⇒ 退化弧也顶不到两侧 chip`,
-  );
-  let oldTotal = 0;
-  let oldDefect = 0;
-  for (const shape of corridorFixtures()) {
-    for (const { plan, segs, a, b } of corridorRowsOf(shape.tasks)) {
-      const y0 = plan.points[0]?.[1] ?? Number.NaN;
-      const head = segs[0];
-      assert.equal(head.kind, "cubic", "首段 = 弧（源 chip 右缘中点水平出射）");
-      assert.equal(head.pts[0][1], y0, "起点 y === 源 chipMidY（I2 端点式）");
-      assert.equal(head.pts[1][1], y0, "第一控制点仍在 y0 ⇒ 出射切线水平（端点式不变）");
-      assert.notEqual(
-        head.pts[2][1],
-        y0,
-        `**第二控制点须离开 y0**（实得 ${head.pts[2][1]} vs ${y0}）—— 旧原语 crossPath 的「贴行横扫」正是两枚控制点全 = y0（下面逐枚对照的就是那一形）`,
-      );
-      assert.equal(segs.length - 1, 2 * plan.k + 2, `转角枚数 === 2k+2（每转角一枚 C 弧）`);
-      segs.forEach((seg, i) => {
-        const p = seg.pts[0];
-        const q = seg.pts[seg.pts.length - 1];
-        const len = Math.hypot(q[0] - p[0], q[1] - p[1]);
-        const bulgeIn = Math.hypot(seg.pts[1][0] - p[0], seg.pts[1][1] - p[1]);
-        const bulgeOut = Math.hypot(seg.pts[2][0] - q[0], seg.pts[2][1] - q[1]);
-        assert.ok(bulgeIn <= DG_CORRIDOR_BULGE_MAX + 1, `段 ${i} 首控制点外扩越界（${bulgeIn}）`);
-        assert.ok(bulgeOut <= DG_CORRIDOR_BULGE_MAX + 1, `段 ${i} 末控制点外扩越界（${bulgeOut}）`);
-        assert.ok(bulgeIn <= len / 2 + 1, `段 ${i} 控制点长须 ≤ 半段长（不越过中点 ⇒ 不自交）`);
-      });
-      // **对照面改吃旧原语**（n7 接线后渲染层不再产「贴行横扫」形 ⇒ 若还从渲染面读数，本锚会在正确的码上判空转）。
-      // 同一端点集用未动的 `crossPath` 发射 ⇒ 首弧两控制点**恒** = y0（件一根因的常驻反例）。
-      const bandY =
-        plan.corridors.find((c) => c !== null && c.axis === "h")?.at ?? Math.round((y0 + b.chipMidY) / 2);
-      const oldHead = dSegments(
-        crossPath(a.chipRight, a.chipMidY, a.chipRight + DG_LANE_MIN, bandY, b.chipX, b.chipMidY),
-      )[0];
-      oldTotal += 1;
-      if (oldHead !== undefined && oldHead.kind === "cubic" && oldHead.pts[1][1] === y0 && oldHead.pts[2][1] === y0)
-        oldDefect += 1;
-    }
-  }
-  assert.ok(oldTotal >= 1, `对照面在七形上确有边可测（实得 ${oldTotal} 枚）`);
-  assert.equal(oldDefect, oldTotal, `旧原语的首弧**逐枚**是「两控制点全 = y0」的贴行横扫形（${oldDefect}/${oldTotal}）⇒ 本锚对照的是缺陷形本身，而上面逐边正钉的是新发射器`);
-});
-
-test("G11-走廊⑤三档降档 · 外缘硬容量 2+2 · 超载只共段不穿模（X3 丙：越界席号 ⇒ overCapacity 出声、几何面 0 命中且仍 2k+3）", () => {
-  assert.equal(DG_OUTER_MARGIN_SEATS * 2, OUTER_LANE_CAPACITY, "外缘硬容量逐字 = 2+2 = 4 席（改造文档 X3 / i7）");
-  assert.equal(DG_PAD_STRIP_SEATS, 1, "单条 pad 条带只有一枚中线 ⇒ 1 席");
-  const rightEdge = (layout) => DG_CANVAS_GUTTER + layout.frames.reduce((mx, f) => Math.max(mx, f.frameW), 0);
-  // 外缘席位离框外缘的**净空**须容得下转角弧的横向外扩（弧相对弦的外扩上界 ≈ `BULGE_MAX/2`）——
-  // 本锚是「第二席取 `PAD + PITCH = 22`（离框 2px）⇒ 弧顶进兄弟框」这一形的常驻钉。
-  const marginClearanceMin = Math.ceil(DG_CORRIDOR_BULGE_MAX / 2);
-  let marginRows = 0;
-  let overRows = 0;
-  for (const shape of corridorFixtures()) {
-    const scene = corridorSceneOf(shape.tasks);
-    const edgeMinDx = Math.min(...scene.layout.frames.map((f) => f.dx));
-    for (const row of corridorRowsOf(shape.tasks)) {
-      const { plan } = row;
-      const margins = plan.corridors.filter((c) => c !== null && (c.kind === "ML" || c.kind === "MR"));
-      for (const c of margins) {
-        marginRows += 1;
-        assert.equal(c.capacity, OUTER_LANE_CAPACITY, `外缘走廊 ${c.id} 容量逐字 = 4`);
-        assert.ok(c.seat >= 0 && c.seat < OUTER_LANE_CAPACITY, `${c.id} 席号 ∈ [0,4)`);
-        assert.equal(
-          c.at < edgeMinDx || c.at > rightEdge(scene.layout),
-          true,
-          `i7 严格不等式：外缘腿 ${c.id}（at=${c.at}）须整个落在全部框之外（框左缘 ${edgeMinDx} / 最右框右缘 ${rightEdge(scene.layout)}）`,
-        );
-        assert.ok(
-          Math.min(Math.abs(c.at - edgeMinDx), Math.abs(c.at - rightEdge(scene.layout))) >= marginClearanceMin,
-          `外缘腿 ${c.id}（at=${c.at}）离框外缘的净空须 ≥ ${marginClearanceMin}px（弧外扩上界）—— 否则转角弧顶进兄弟框矩形`,
-        );
-      }
-      if (plan.overCapacity) overRows += 1;
-    }
-  }
-  assert.ok(marginRows >= 1, `k≥2 的长竖腿真落外缘（实得 ${marginRows} 枚）`);
-  assert.ok(overRows >= 1, `七形里确有出声超载的边（实得 ${overRows} 枚 —— 现回灌未给新算法留带席位，必须可见）`);
-
-  // ---- X3 丙的执行面：喂越界席号 ⇒ 复用首席（共段），几何面不得变成穿模 ----
-  const f3 = f3SpanTwoForward();
-  const overEdge = canvasSceneOf(f3).cross.find((r) => r.span === 2);
-  assert.ok(overEdge !== undefined, "F3 确有 k=2 边（超载档载体）");
-  const scene = corridorSceneOf(f3);
-  const base = corridorOf(scene, overEdge);
-  const over = corridorOf(scene, overEdge, { exit: 99, entry: 99, band: 99 });
-  assert.equal(over.plan.overCapacity, true, "越界席号 ⇒ overCapacity 必须出声（不得静默）");
-  assert.equal(over.segs.length, base.segs.length, "超载只降级为**共段**：段数不塌（仍 2k+3）");
-  assert.equal(over.segs.length, 2 * overEdge.span + 3, `超载档段数 === ${2 * overEdge.span + 3}（实得 ${over.segs.length}）`);
-  const obstacles = canvasObstaclesOf(f3, overEdge);
-  assert.deepEqual(canvasHits(over.d, obstacles), [], "超载档在 A6 带域障碍集上仍 0 命中 ⇒ **不降级为穿模**");
-  assert.deepEqual(canvasHits(base.d, obstacles), [], "同边首席档同样 0 命中（对照面）");
-  assert.deepEqual(
-    over.plan.corridors.map((c) => (c === null ? null : c.kind)),
-    base.plan.corridors.map((c) => (c === null ? null : c.kind)),
-    "复用首席 ⇒ 门类序列与首席档逐位相同（降级只发生在「共段」，不在「换走廊族」）",
-  );
-  // 外缘席号按**硬容量取模**（4 席一圈）⇒ `margin: 4` 与首席同席 = 共段；`margin: 1` 换到第二席、不越框
-  assert.deepEqual(
-    corridorOf(scene, overEdge, { margin: 4 }).plan.corridors.map((c) => (c === null ? null : c.at)),
-    base.plan.corridors.map((c) => (c === null ? null : c.at)),
-    "margin 席号按 4 取模 ⇒ 第 5 席回到首席（共段，不新增第五种线）",
-  );
-  const second = corridorOf(scene, overEdge, { margin: 1 });
-  assert.equal(
-    second.plan.corridors.some((c) => c !== null && (c.kind === "ML" || c.kind === "MR")),
-    true,
-    "margin: 1 确有外缘长竖腿（换席面的前提）",
-  );
-  assert.deepEqual(canvasHits(second.d, obstacles), [], "第二席同样 0 命中 ⇒ 换席只在留足净空的那两条线之间移动");
-
-  // ---- 多边共段：F5a 五枚回流边挤同一批外缘 ⇒ 所用外缘 x 至多 4 条、且全 0 命中 ----
-  const f5a = f5OuterOverload();
-  const rows5a = corridorRowsOf(f5a);
-  assert.equal(rows5a.length, 5, "F5a 确有 5 枚跨框边（超载档的载体）");
-  const xs = new Set(
-    rows5a.flatMap((r) =>
-      r.plan.corridors.filter((c) => c !== null && (c.kind === "ML" || c.kind === "MR")).map((c) => c.at),
-    ),
-  );
-  assert.ok(xs.size <= OUTER_LANE_CAPACITY, `五枚边所用的外缘 x 至多 ${OUTER_LANE_CAPACITY} 条（实得 ${xs.size}）⇒ 共段而非漂进 chip`);
-  assert.deepEqual(
-    rows5a.reduce((n, r) => n + canvasHits(r.d, canvasObstaclesOf(f5a, r.edge)).length, 0),
-    0,
-    "F5a 五枚新路径全 0 命中",
-  );
-});
-
-test("G11-走廊⑥旧原语未动钉：crossPath 的产出与走廊发射器互不串味（n7 只换出参指向、旧函数体零改动）", () => {
-  // n7 的改动面 = `routeCrossFrameEdges` 出参由 `crossPath` **切到** `corridorPath`；旧原语**仍在册可调**、
-  // 函数体一行未动 ⇒ 本枚吃的是「两形并存、各走各的」这一结构凭据（加 class = n9 的活，本枚不加）。
-  assert.equal(DG_EDGE_CLS, "dg-edge", "DG_EDGE_CLS 逐字未动（n7 不加 class / 不改类名）");
-  const tasks = f3SpanTwoForward();
-  const cross = canvasSceneOf(tasks).cross;
-  assert.equal(cross.length >= 1, true, "渲染层仍画跨框边（接线只换形、不换枚数 ⇒ 丢边会当场红在本枚）");
-  const d = cross[0]?.d ?? "";
-  const pts = dPoints(d);
-  const head = pts[0];
-  const tail = pts[pts.length - 1];
-  assert.ok(head !== undefined && tail !== undefined, "渲染层跨框 path 首末点在册（I2 端点式可读）");
-  // ---- 接线已发生的反向凭据：渲染层命令族 ⊆ {M, C}（旧形含 L ⇒ 现形不含）----
-  assert.deepEqual(
-    dCmds(d).filter((c) => c !== "M" && c !== "C"),
-    [],
-    `渲染层跨框 path 命令族须 ⊆ {M, C}（走廊发射器不产 L，实得 ${dCmds(d).join("")}）`,
-  );
-  // ---- 旧原语仍产旧形（同一端点集、函数体未动 ⇒ 与走廊形可辨、互不串味）----
-  const oldD = crossPath(head[0], head[1], head[0] + DG_LANE_MIN, Math.round((head[1] + tail[1]) / 2), tail[0], tail[1]);
-  assert.ok(dCmds(oldD).includes("L"), `旧原语 crossPath 未被走廊形污染（须仍含 L，实得 ${dCmds(oldD).join("")}）`);
-  assert.notEqual(oldD, d, "同一端点：旧原语形 ≠ 渲染层走廊形（两形并存，接线不是「把旧函数改了」）");
-  assert.equal(oldD.startsWith(`M${head[0]},${head[1]}`), true, "旧原语端点式 = 走廊形端点式（件三 I2 单源未动）");
-  // ---- 测试侧走廊场景（`corridorSceneOf`）与渲染层同源：起点逐字相等 ----
-  const newD = corridorOf(corridorSceneOf(tasks), cross[0]).d;
-  assert.equal(dCmds(newD).includes("L"), false, "走廊发射器不产 L（本枚锚吃的是新函数、不是旧 path）");
-  assert.equal(newD.startsWith(`M${head[0]},${head[1]}`), true, "新路径起点 = 渲染层起点（I2 端点定义式单源未动）");
-});
 
 // ---------------------------------------------------------------------------
 // G11-走廊⑦⑧⑨（REQ-2026-10-14-02 · 承接轨② n8a · 改造文档 §6 第二枚增补 A4「框内侧」）：
@@ -5093,8 +3159,8 @@ const gridFaceOf = (scene) => ({
 });
 
 /** 渲染层列距（chip **局部**左缘升序的相邻差 − `DG_NODE_W`）⇒ 与网格 `gapW` 同一判据面。 */
-const renderColGapsOf = (tasks, projectId) => {
-  const frame = canvasSceneOf(tasks).frames.find((f) => f.projectId === projectId);
+const renderColGapsOf = async (tasks, projectId) => {
+  const frame = (await canvasSceneOf(tasks)).frames.find((f) => f.projectId === projectId);
   assert.ok(frame !== undefined, `${projectId} 框在渲染层在册`);
   const xs = [...new Set([...frame.cells.values()].map((c) => c.left))].sort((a, b) => a - b);
   return xs.slice(1).map((x, i) => x - xs[i] - DG_NODE_W);
@@ -5106,317 +3172,13 @@ const exitLegX = (d) => dPoints(d)[3]?.[0];
 /** 场景内全部跨框腿所用的出口 x 集合（「分席 / 共段」的读数面）。 */
 const crossLegXs = (scene) => new Set(scene.routes.filter((r) => r.kind === "cross").map((r) => exitLegX(r.d)));
 
-test("G11-走廊⑦恒等式反锚：跨框腿 demand 为空 ⇒ 列通道 / 框宽高 / 全部 path 逐字不变（本枚只动「有跨框腿」那一侧）", () => {
-  // 现三枚夹具全单 project ⇒ `crossEdges` 恒空 ⇒ 新式（计入跨框腿）与旧式（只数 long 腿）**必须逐字相等**
-  // ⇒ 全量既有坐标字面锚零翻案（这是「本枚不改单 project 形态」的机械凭据，不靠人工核）。
-  for (const [label, tasks] of [["样本076bbb84", sample076bbb84()], ["压力14节点", g45StressTasks()], ["busReuse", busReuseTasks()]]) {
-    assert.equal(canvasSceneOf(tasks).cross.length, 0, `${label} 确为零跨框边形（「demand 为空」的前提成立）`);
-    const on = gridFaceOf(corridorSceneOf(tasks, true));
-    const off = gridFaceOf(corridorSceneOf(tasks, false));
-    assert.ok(on.routes.length >= 5, `${label} 走线面对账非空（空面比恒等 = 假凭据，实得 ${on.routes.length} 条）`);
-    assert.ok(on.grids.reduce((n, g) => n + g.lanes.length, 0) >= 1, `${label} 通道面在册（零通道夹具测不出「等」的意义）`);
-    assert.deepEqual(on, off, `${label}：跨框腿 demand 为空 ⇒ 列通道 / 宽高 / path 逐字相等`);
-  }
-  // ---- 两头不许空转：真有跨框腿的形上两式**必分叉**（否则本枚是空改）----
-  for (const [label, tasks] of [["F8", f8ChannelDemand()], ["F8b", f8ChannelTwoLegs()]]) {
-    assert.equal(canvasSceneOf(tasks).cross.length >= 1, true, `${label} 确有跨框边`);
-    assert.notEqual(
-      JSON.stringify(gridFaceOf(corridorSceneOf(tasks, true))),
-      JSON.stringify(gridFaceOf(corridorSceneOf(tasks, false))),
-      `${label}：跨框腿在场 ⇒ 新式网格必与旧式分叉（demand 真被计入）`,
-    );
-  }
-});
-
-test("G11-走廊⑧计入钉：一列 1 条 intra-long + 1 条本框跨框腿 ⇒ lanes.length === 2 ∧ gapW === max(DG_COL_GAP_MIN, 2·DG_LANE_MIN + 2·DG_LANE_PITCH)（F8b 分席 · 旧式共段）", () => {
-  const gapWFor = (n) => Math.max(DG_COL_GAP_MIN, DG_LANE_MIN * 2 + n * DG_LANE_PITCH);
-  // ---- F8：列 1 从 1 席抬到 2 席（本枚的全部语义就在这一枚加数上）----
-  const f8 = f8ChannelDemand();
-  const on8 = corridorSceneOf(f8, true).grids.get("board");
-  const off8 = corridorSceneOf(f8, false).grids.get("board");
-  assert.equal(on8.cols, 3, "F8 board 三列（列 1 = long 腿与跨框腿的公共出口列）");
-  assert.equal(on8.lanes[1].length, 2, `F8 列 1 通道席数 === 2（1 条 intra-long + 1 条跨框腿，实得 ${on8.lanes[1]?.length}）`);
-  assert.equal(on8.gapW[1], gapWFor(2), `F8 列 1 gapW === ${gapWFor(2)}（实得 ${on8.gapW[1]}）`);
-  assert.equal(off8.lanes[1].length, 1, "旧式同列只 1 席（long 腿那一席 ⇒ 跨框腿无席可分，正是共段的结构因）");
-  assert.equal(off8.gapW[1], gapWFor(1), `旧式列宽 === ${gapWFor(1)}`);
-  assert.equal(on8.width - off8.width, on8.gapW[1] - off8.gapW[1], "框宽增量 === 该列通道增量（宽度只从 gapW 来，无第二处加数）");
-  assert.equal(on8.height, off8.height, `带高不受本枚影响（height 逐字相等，实得 ${on8.height}）`);
-  assert.deepEqual([...renderColGapsOf(f8, "board")], [...on8.gapW], "渲染层列距 === 网格 gapW（多预算的那一席真留出来了）");
-  // ---- F8b：同列两条跨框腿 ⇒ 三席 ⇒ **分席**（旧式两腿共段）----
-  const f8b = f8ChannelTwoLegs();
-  const onB = corridorSceneOf(f8b, true);
-  const offB = corridorSceneOf(f8b, false);
-  const gridB = onB.grids.get("board");
-  assert.equal(gridB.lanes[1].length, 3, `F8b 列 1 席数 === 3（1 long + 2 跨框腿，实得 ${gridB.lanes[1]?.length}）`);
-  assert.equal(gridB.gapW[1], gapWFor(3), `F8b 列 1 gapW === ${gapWFor(3)}（实得 ${gridB.gapW[1]}）`);
-  assert.deepEqual([...renderColGapsOf(f8b, "board")], [...gridB.gapW], "F8b 渲染层列距 === 网格 gapW");
-  const legsOf = (scene) =>
-    scene.routes
-      .filter((r) => r.kind === "cross")
-      .map((r) => `${r.from}\u2192${r.to}@${exitLegX(r.d)}`);
-  const onLegs = crossLegXs(onB);
-  const offLegs = crossLegXs(offB);
-  assert.equal(onLegs.size, 2, `demand 计入后两腿**分席**（所用出口 x 两枚，实得 ${[...onLegs].join(",")}）`);
-  assert.equal(offLegs.size, 1, `旧式两腿**共段**（出口 x 同一枚，实得 ${[...offLegs].join(",")} ⇒ 本锚的真凭据是「由 1 变 2」）`);
-  assert.deepEqual(
-    legsOf(onB).map((s) => Number(s.split("@")[1])).sort((a, b) => a - b),
-    [...gridB.lanes[1]].slice(0, 2).sort((a, b) => a - b),
-    "两腿所用 x === 本列预算线的前两席（分席取自预留面、不是凭空造坐标）",
-  );
-});
-
-test("G11-走廊⑨不漂钉：跨框腿落的通道线 x ∈ 本框该列 gapW 区间（第二 / 第三席与超载复用首席同样不漂出通道）", () => {
-  /** 一枚走廊序里的 `CH` 档（档 1 = 列间通道，本钉只管这一档）。 */
-  const chOf = (plan) => plan.corridors.filter((c) => c !== null && c.kind === "CH");
-  const measured = { seats: 0, rendered: 0 };
-  for (const [label, tasks] of [["F8", f8ChannelDemand()], ["F8b", f8ChannelTwoLegs()], ["F7", f7ColumnChannel()]]) {
-    const scene = corridorSceneOf(tasks);
-    for (const edge of canvasSceneOf(tasks).cross) {
-      const grid = scene.grids.get(edge.fromProject);
-      const a = grid?.cellOf.get(edge.from);
-      assert.ok(grid !== undefined && a !== undefined, `${label}/${edge.from}→${edge.to}：源框网格与 cell 在册`);
-      const chief = corridorOf(scene, edge, { exit: 0 }).plan;
-      const capacity = chOf(chief)[0]?.capacity ?? 0;
-      // 「跨框腿自己占的那一席须在」= 本枚的正面读数（旧式 capacity 恒 1 ⇒ 当场红）
-      assert.ok(capacity >= 2, `${label}/${edge.from}→${edge.to}：档 1 容量 ≥ 2（intra-long 1 席 + 跨框腿 ≥ 1 席，实得 ${capacity}）`);
-      // 席号面：首席 / 第二席 / 末席 / 越界席 —— 凡落在 `CH` 的 x 都须在本框通道区间内
-      for (const seat of [0, 1, capacity - 1, capacity, capacity + 5]) {
-        const row = corridorOf(scene, edge, { exit: seat });
-        for (const ch of chOf(row.plan)) {
-          const col = grid.lanes.findIndex((l) => l.includes(ch.at));
-          assert.ok(col >= 0, `${label}/${edge.from}→${edge.to} 席 ${seat}：通道线 x=${ch.at} 必是本框某列的预算线（不得凭空造 x）`);
-          const left = (grid.colX[col] ?? 0) + DG_NODE_W;
-          const right = grid.colX[col + 1];
-          assert.ok(right !== undefined, `${label}：CH 只在本列右邻有列时成立（末列档 1 结构性不可用）`);
-          assert.ok(
-            ch.at > left && ch.at < right,
-            `${label}/${edge.from}→${edge.to} 席 ${seat}：通道段 x=${ch.at} 须 ∈ (${left}, ${right}) = 本框 gapW=${grid.gapW[col]} 的通道区间`,
-          );
-          measured.seats += 1;
-        }
-      }
-      // 越界席号的降级形态 = **复用首席**（X3 丙：只共段、不穿模）⇒ 既不新增线种、也不漂出通道
-      const last = corridorOf(scene, edge, { exit: capacity + 5 });
-      assert.equal(last.plan.overCapacity, true, `${label}/${edge.from}→${edge.to}：越界席号须出声（不得静默）`);
-      assert.deepEqual(
-        chOf(last.plan).map((c) => c?.at),
-        chOf(chief).map((c) => c?.at),
-        `${label}：越界席复用首席 x（共段而非穿模 —— 本枚抬的是容量、不是降级形态）`,
-      );
-      // 渲染层同判据：真画出的那条腿也须落在本列通道区间内
-      const rendered = scene.routes.find((r) => r.kind === "cross" && r.from === edge.from && r.to === edge.to);
-      assert.ok(rendered !== undefined, `${label}/${edge.from}→${edge.to}：渲染层确有该跨框 path`);
-      const x = exitLegX(rendered.d);
-      const right = grid.colX[a.col + 1];
-      assert.ok(
-        x > a.chipRight && (right === undefined || x < right),
-        `${label}/${edge.from}→${edge.to}：渲染层出口腿 x=${x} 须 > 本 chip 右缘 ${a.chipRight}${right === undefined ? "（末列无右邻）" : ` 且 < 右邻列 chip 左缘 ${right}`}`,
-      );
-      if (right !== undefined) measured.rendered += 1;
-    }
-  }
-  assert.ok(measured.seats >= 6, `席号面实测 ${measured.seats} 枚通道段 ≥ 6（本钉非空转）`);
-  assert.ok(measured.rendered >= 3, `渲染层实测 ${measured.rendered} 条腿 ≥ 3（两面对账都真跑到）`);
-});
-
 // ---------------------------------------------------------------------------
-// G11-走廊⑩⑪⑫⑬（REQ-2026-10-14-02 · 承接轨② n8b · 改造文档 §6 第二枚增补 A4「画布侧」· 风险 X1 / X2）：
-// `planCanvas` 的**框间带**预算由「一趟回灌」抬为 **≤ `DG_BAND_MAX_PASSES`（= 3）轮的定序不动点** ——
-// 每轮 = 走线 → 据实占重算各带 lane 数 → `canvasLayout` 重画几何 → **比签名**；签名相同即收敛 break，
-// 上限内未拿到收敛凭据 ⇒ 出参 `bandUnconverged` **出声**（X1 政策 = 定序 + 固定轮次 + 未收敛即出声）。
-// **不动点只动画布侧**：框内侧（n8a）的列通道 demand 只吃 `crossEdges`、与本框 `dx/dy` 无关 ⇒ 逐轮同值，
-// 故本块的轮次读数全部落在 `layout.gapH` / `bandLanes` 上，不重算网格。
-// 四枚钉：**⑩ 确定性**（乱序 tasks + 乱序 crossEdges 两形都逐字段等 ⇒ X1「非确定」的反面；另逐字钉上限 = 3）
-//   · **⑪ 轮次可观测**（**线性区**（该带实占 ≥ 1 席）带 lane 增量 1 席 ⇒ `bandH` 增量恰 `DG_BUS_PITCH`；
-//     空席带落 `DG_FRAME_GAP_MIN` 兜底宽 —— 是既有消费面公式 `max` 的结构行为、本枚只喂不改，故另钉一档；
-//     且夹具**收敛于第 2 轮**、第 1 轮真把带抬过 ⇒ 防「跑满 3 轮当作收敛」掩盖未收敛）
-//   · **⑫ 未收敛出声**（轮次上限收到 1 ⇒ 真实现的出声支被跑到、几何面与 cap=2 逐字段等 ⇒ 出声只改标记；
-//     cap=2 即不出声 ⇒ 判据真挂在「不收敛」上）
-//   · **⑬ 单调不缩**（现三夹具 + 走廊七形 + 真板的不动点态 `height` ≥ 单趟态、`width` 逐字等 ⇒ X2 反锚）。
-// **凭据面 = 真实现 `planCanvas`**（本枚起该函数随 `CanvasPlan` 一并导出）；测试侧镜像 `corridorSceneOf`
-//   在 {@link fixedPointOf} 里逐字段对账 ⇒ 镜像一旦漂移，⑩⑪⑫⑬ 一起红（同源钉随本族四枚钉同批跑，不另立一族）。
-// **实测分野登记**：自然夹具上「跑满上限仍未收敛」这一支**结构上不可达**（六千形搜索 ⇒ 带跨框边的形一律
-//   收敛于第 2 轮），故 ⑫ 经 `planCanvas` 的 `maxPasses` 测试缝取证 —— 无该缝则 X1 的出声判据是一条永不被
-//   执行的分支（生产调用不传该参 ⇒ 行为逐字不变）。
+// G11-走廊⑩⑪⑫⑬（REQ-2026-10-14-02 · 承接轨② n8b · 改造文档 §6 第二枚增补 A4「画布侧」）——
+// ↑ v0.10.7 N10（REQ-2026-10-15-01 · §2.3「删」段）：四枚钉的凭据面 `planCanvas` / `canvasLayout` 与
+//   其带高公式的三枚入参常量已随走线族整族退休 ⇒
+//   本块的镜像 `planFaceOf` / 夹具集 `bandFixtures` / 公式反证面 `bandHFor` 三枚死重照本族删除
+//   （⑩⑪⑫⑬ 的测试本体已在 N6 / N9 摘除）。画布几何的行为级判据保留在 N6 降级后的四把尺上。
 // ---------------------------------------------------------------------------
-
-/** 不动点出参的**面值面**（逐字段、不比对象引用 —— `canvasLayout` 每轮新建对象）。 */
-const planFaceOf = (plan) => ({
-  frames: plan.layout.frames.map((f) => [f.projectId, f.dx, f.dy, f.frameW, f.frameH, f.gridW, f.gridH]),
-  gapH: [...plan.layout.gapH],
-  bandLanes: plan.layout.bandLanes.map((b) => [...b]),
-  width: plan.layout.width,
-  height: plan.layout.height,
-  routes: plan.routes.map((r) => `${r.from}\u2192${r.to}#${r.kind}:${r.d}@\u03bb${r.lambda}\u03bc${r.mu}y${r.yb}b${r.busLane}`),
-  bandPasses: plan.bandPasses,
-  bandUnconverged: plan.bandUnconverged,
-});
-
-/** 真实现那一趟：`tasks` → `planCanvas` 入参（= `renderDependencyGraphSection` 内部同一前导）。 */
-function realPlanOf(tasks, maxPasses = DG_BAND_MAX_PASSES) {
-  const { kept, ordinals, layers, pipes, projectByTask, crossEdges } = canvasSceneInputsOf(tasks);
-  return planCanvas(pipes, kept, layers, ordinals, crossEdges, projectByTask, maxPasses);
-}
-
-/**
- * **不动点态（含同源对账）**：真实现 `planCanvas` 与测试侧镜像 `corridorSceneOf` 在同一 cap 下逐字段相等
- * ⇒ 本块四枚钉的凭据始终落在真实现上，镜像只作对照面（漂移当场红）。
- */
-function fixedPointOf(tasks, maxPasses = DG_BAND_MAX_PASSES) {
-  const real = realPlanOf(tasks, maxPasses);
-  const scene = corridorSceneOf(tasks, true, maxPasses);
-  assert.deepEqual(
-    planFaceOf(real),
-    planFaceOf({
-      layout: scene.layout,
-      routes: scene.routes,
-      bandPasses: scene.bandPasses,
-      bandUnconverged: scene.bandUnconverged,
-    }),
-    `镜像与真实现逐字段同源（cap=${maxPasses}）`,
-  );
-  return real;
-}
-
-/** 本块的对账夹具集 = 现三枚单 project 形 + 走廊七形 + 真板集。 */
-const bandFixtures = () => [
-  ["样本076bbb84", sample076bbb84()],
-  ["压力14节点", g45StressTasks()],
-  ["busReuse", busReuseTasks()],
-  ...corridorFixtures().map((f) => [f.key, f.tasks]),
-  ["真板 eb86d5e8", realTasks()],
-];
-
-/**
- * 一枚夹具的**喂数面**：`{ pipes, locals }` —— `locals` 取自不动点出参的**局部**网格（S1 那份），
- * 故 ⑪ 的「多喂一席」用的就是本形自己的实占数、不凭空造网格。
- */
-function canvasFeedsOf(tasks) {
-  const { pipes } = canvasSceneInputsOf(tasks);
-  const plan = realPlanOf(tasks);
-  return { pipes, locals: pipes.map((p) => plan.grids.get(p.projectId) ?? emptyGridForTest()), plan };
-}
-
-/** 带高消费面公式（改造文档 §2.3 —— 本枚**只喂不改**，故此式即「未改公式」的反证面）。 */
-const bandHFor = (n) => Math.max(DG_FRAME_GAP_MIN, DG_CROSS_MIN * 2 + n * DG_BUS_PITCH);
-
-test("G11-走廊⑩确定性钉（X1 反面）：乱序 tasks / 乱序 crossEdges 两形跑不动点 ⇒ layout 与 routes 逐字段相等；轮次上限常量 === 3", () => {
-  assert.equal(DG_BAND_MAX_PASSES, 3, "X1「固定轮次」= 3 轮逐字钉（抬 / 降上限须连带翻本钉）");
-  for (const [label, tasks] of bandFixtures()) {
-    const base = fixedPointOf(tasks);
-    // ---- (a) 乱序入参（沿用现「乱序入参出参逐字段相等」锚形）----
-    assert.deepEqual(planFaceOf(fixedPointOf([...tasks].reverse())), planFaceOf(base), `${label}：tasks 乱序 ⇒ 不动点出参逐字段相等`);
-    assert.equal(
-      renderDependencyGraphSection([...tasks].reverse()).html,
-      renderDependencyGraphSection(tasks).html,
-      `${label}：渲染层逐字相等（同一份不动点经 SSR 出口）`,
-    );
-    // ---- (b) 只乱序 `crossEdges`：本枚新增取数面的定序凭据 ----
-    const inputs = canvasSceneInputsOf(tasks);
-    const shuffled = planCanvas(
-      inputs.pipes,
-      inputs.kept,
-      inputs.layers,
-      inputs.ordinals,
-      [...inputs.crossEdges].reverse(),
-      inputs.projectByTask,
-    );
-    assert.deepEqual(
-      planFaceOf(shuffled),
-      planFaceOf(base),
-      `${label}：crossEdges 乱序 ⇒ 不动点出参逐字段相等（带实占的定序在取数内自持、不吃入参序）`,
-    );
-  }
-});
-
-test("G11-走廊⑪轮次可观测：线性区（≥1 席）带 lane 增量 1 席 ⇒ bandH 增量恰 DG_BUS_PITCH（空席带落兜底宽另钉一档）；夹具**收敛于第 2 轮**且第 1 轮真抬过带（防「跑满 3 轮当作收敛」）", () => {
-  const measured = [];
-  const flooredTags = [];
-  for (const [label, tasks] of [["F1", f1AdjacentForward()], ["F3", f3SpanTwoForward()], ["F8b", f8ChannelTwoLegs()], ["真板", realTasks()]]) {
-    const { pipes, locals, plan } = canvasFeedsOf(tasks);
-    assert.equal(plan.bandPasses, 2, `${label}：收敛于第 2 轮（实得 ${plan.bandPasses}）—— 「跑满上限即算收敛」的读法在此当场红`);
-    assert.equal(plan.bandUnconverged, false, `${label}：第 2 轮拿到收敛凭据 ⇒ 不出声`);
-    assert.ok(plan.layout.gapH.length >= 1, `${label}：框间带在册（零带夹具测不出轮次意义）`);
-    // ---- 第 1 轮非空转：无预算构图态各带全落兜底宽 ⇒ 回灌真改变过布局 ----
-    const bare = canvasLayout(pipes, locals);
-    assert.ok(bare.gapH.every((h) => h === DG_FRAME_GAP_MIN), `${label}：构图态各带 === ${DG_FRAME_GAP_MIN}（兜底宽 ⇒ 第 1 轮回灌确已改写过布局）`);
-    // ---- 消费面公式未改 + **线性区**增量恰一席 ----
-    //   公式 `bandH = max(DG_FRAME_GAP_MIN, 2·DG_CROSS_MIN + n·DG_BUS_PITCH)`：`n = 0` 时 `2·DG_CROSS_MIN = 28 < 32`
-    //   ⇒ 空席带落**兜底宽**，该档 +1 席的增量被 `max` 吃掉一截（32 → 40 只涨 8）—— 这是既有消费面公式的
-    //   结构性行为（本枚**只喂不改**公式），不是本枚引入。故「增量恰 `DG_BUS_PITCH`」的增量钉挂在**线性区**
-    //   （`n ≥ 1`）；兜底档改钉「仍 === 兜底宽 ∧ 涨后仍 === 公式值」，两档都不许静默放行。
-    const seats = plan.layout.bandLanes.map((b) => b.length);
-    const linear = [];
-    const floored = [];
-    plan.layout.gapH.forEach((h, i) => {
-      const n = seats[i] ?? 0;
-      assert.equal(h, bandHFor(n), `${label} 带 ${i}：gapH === 消费面公式（${n} 席 ⇒ ${h}）`);
-      const plus = seats.map((v, j) => (j === i ? v + 1 : v));
-      const hPlus = canvasLayout(pipes, locals, { gapLanes: plus }).gapH[i];
-      assert.equal(hPlus, bandHFor(n + 1), `${label} 带 ${i}：+1 席后带高仍 === 同一公式值（只喂、不改公式）`);
-      if (n >= 1) {
-        assert.equal(hPlus - h, DG_BUS_PITCH, `${label} 带 ${i}（线性区 ${n} 席）：+1 席 ⇒ bandH 增量恰 DG_BUS_PITCH（实得 ${hPlus} − ${h} = ${hPlus - h}）`);
-        linear.push(`${label}#${i}@${n}`);
-      } else {
-        assert.equal(h, DG_FRAME_GAP_MIN, `${label} 带 ${i}：空席带 === 兜底宽 ${DG_FRAME_GAP_MIN}（实得 ${h}）`);
-        floored.push(`${label}#${i}`);
-      }
-    });
-    for (const tag of linear) measured.push(tag);
-    flooredTags.push(...floored);
-  }
-  assert.ok(measured.length >= 4, `线性区实测 ${measured.length} 枚带（${measured.join("、")}）≥ 4（增量钉非空转）`);
-  assert.ok(flooredTags.length >= 1, `兜底档实测 ${flooredTags.length} 枚带 ≥ 1（两档分流都真跑到，${flooredTags.join("、")}）`);
-  // ---- 跨夹具读数：F1 带 0 = 1 席 / F8b 带 0 = 2 席 ⇒ 席数增量 1、bandH 增量恰 12 ----
-  const f1 = fixedPointOf(f1AdjacentForward());
-  const f8b = fixedPointOf(f8ChannelTwoLegs());
-  assert.equal(f1.layout.bandLanes[0].length, 1, "F1 带 0 实占 1 席");
-  assert.equal(f8b.layout.bandLanes[0].length, 2, "F8b 带 0 实占 2 席（n8a 抬列通道、本枚抬框间带）");
-  assert.equal(f8b.layout.gapH[0] - f1.layout.gapH[0], DG_BUS_PITCH, "带 lane 数增量 = 1 ⇒ bandH 增量恰 DG_BUS_PITCH");
-});
-
-test("G11-走廊⑫未收敛出声锚：cap 收到 1 ⇒ 真实现出参带可见出声标记（几何面与 cap=2 逐字段等 ⇒ 出声只改标记；cap=2 即不出声 ⇒ 判据真挂在不收敛上）", () => {
-  for (const [label, tasks] of [["F1", f1AdjacentForward()], ["F3", f3SpanTwoForward()], ["F8b", f8ChannelTwoLegs()], ["真板", realTasks()]]) {
-    const loud = fixedPointOf(tasks, 1);
-    const calm = fixedPointOf(tasks, 2);
-    assert.equal(loud.bandPasses, 1, `${label}：cap=1 ⇒ 只跑一轮回灌`);
-    assert.equal(loud.bandUnconverged, true, `${label}：一轮内未拿到收敛凭据 ⇒ **必须出声**（不得静默返回）`);
-    assert.equal(calm.bandUnconverged, false, `${label}：同一形第 2 轮拿到凭据 ⇒ 不出声（出声不是「cap 没跑满」的副产物）`);
-    assert.deepEqual(
-      planFaceOf(loud),
-      { ...planFaceOf(calm), bandPasses: 1, bandUnconverged: true },
-      `${label}：出声只改两枚标记，几何面与走线逐字段不变（本枚不引入第二套布局形态）`,
-    );
-    // ---- 「本轮必变」的凭据面：无预算构图态与回灌态签名不等 ⇒ cap=1 确是「未确认收敛」而非「无需求」 ----
-    const { pipes, locals } = canvasFeedsOf(tasks);
-    assert.notEqual(
-      sceneSignature(canvasLayout(pipes, locals, { gapLanes: [1] })),
-      sceneSignature(canvasLayout(pipes, locals)),
-      `${label}：带预算 +1 席必然改写签名 ⇒ 不动点的比对面有效（签名恒等 = 本钉空转）`,
-    );
-  }
-  // ---- 零跨框的一侧：第 1 轮即达不动点 ⇒ 不出声（不得把「无带可抬」误报成发散） ----
-  for (const [label, tasks] of [["样本076bbb84", sample076bbb84()], ["压力14节点", g45StressTasks()], ["busReuse", busReuseTasks()]]) {
-    const plan = fixedPointOf(tasks, 1);
-    assert.equal(plan.bandPasses, 1, `${label}：零跨框 ⇒ 首轮回灌即等值`);
-    assert.equal(plan.bandUnconverged, false, `${label}：零跨框不得误报未收敛`);
-  }
-});
-
-test("G11-走廊⑬单调不缩（X2 反锚）：现三夹具 + 走廊七形 + 真板的不动点态 layout.width/height ≥ 单趟态（只松不紧；width 逐字等）", () => {
-  for (const [label, tasks] of bandFixtures()) {
-    const one = fixedPointOf(tasks, 1); // 单趟态 = n8b 之前的旧形态（一趟回灌、不验证）
-    const fp = fixedPointOf(tasks); // 不动点态（cap = DG_BAND_MAX_PASSES）
-    assert.equal(fp.layout.width, one.layout.width, `${label}：宽度只从框宽来 ⇒ 逐字等（本枚不抬 gapW，坐标字面锚不连带翻案）`);
-    assert.ok(fp.layout.height >= one.layout.height, `${label}：height 只松不紧（不动点 ${fp.layout.height} vs 单趟 ${one.layout.height}）`);
-    assert.equal(fp.layout.gapH.length, one.layout.gapH.length, `${label}：带枚数不随轮次变`);
-    fp.layout.gapH.forEach((h, i) => {
-      assert.ok(h >= (one.layout.gapH[i] ?? 0), `${label} 带 ${i}：带高同样只松不紧（${h} vs ${one.layout.gapH[i]}）`);
-    });
-    // ---- 同一参照系下的走线面：枚数不许多不许少（回灌只松不紧 ⇒ 不得吞边、也不得造第二枚 path） ----
-    assert.equal(fp.routes.length, one.routes.length, `${label}：路由枚数逐字等`);
-  }
-});
 
 // ---------------------------------------------------------------------------
 // G14（v0.10.6 追加件 n9 · REQ-2026-10-14-02 · 改造文档 §6 增补节第二块「追加件」）：
@@ -5436,7 +3198,7 @@ const g14Fixtures = () => [
   ["样本076bbb84（零跨框 ⇒ 追加类必不出场的一侧）", sample076bbb84()],
 ];
 
-test("G14-①类名常量面：DG_EDGE_CROSS_CLS 首 token = DG_EDGE_CLS、恰两枚 class、不含子串 dg-edges；DG_EDGE_CLS 逐字未动", () => {
+test("G14-①类名常量面：DG_EDGE_CROSS_CLS 首 token = DG_EDGE_CLS、恰两枚 class、不含子串 dg-edges；DG_EDGE_CLS 逐字未动", async () => {
   assert.equal(DG_EDGE_CLS, "dg-edge", "基础类名逐字未动（追加件不改它，只在其下并列第二枚导出）");
   assert.equal(DG_EDGE_CROSS_CLS, "dg-edge dg-edge-cross", "跨框类名 = 基础类 + 追加类（渲染侧直嵌、零拼接）");
   assert.equal(
@@ -5448,31 +3210,7 @@ test("G14-①类名常量面：DG_EDGE_CROSS_CLS 首 token = DG_EDGE_CLS、恰�
   assert.equal(DG_EDGE_CROSS_CLS.includes("dg-edges"), false, "类名不得含子串 dg-edges（否则 `.dg-edges` 边清单的在场判据被图形面染色）");
 });
 
-test("G14-②出参类名分席：cross 出参 cls = DG_EDGE_CROSS_CLS（正钉）、intra 出参仍 = DG_EDGE_CLS（反向钉，不得被顺手换色）", () => {
-  let seenCross = 0;
-  for (const [label, tasks] of g14Fixtures()) {
-    const routes = corridorSceneOf(tasks).routes;
-    const paths = edgePaths(renderDependencyGraphSection(tasks).html);
-    assert.equal(routes.length, paths.length, `${label}：模型出参枚数 === 画布 path 枚数（分席对账前先确认同一池）`);
-    const modelCross = routes.filter((e) => e.kind === "cross");
-    const modelIntra = routes.filter((e) => e.kind !== "cross");
-    seenCross += modelCross.length;
-    for (const e of modelCross)
-      assert.equal(e.cls, DG_EDGE_CROSS_CLS, `${label}：跨框出参 cls 须指向 DG_EDGE_CROSS_CLS（${e.from}→${e.to}）`);
-    for (const e of modelIntra) {
-      assert.equal(e.cls, DG_EDGE_CLS, `${label}：框内出参 cls 逐字未动（${e.from}→${e.to}）`);
-      assert.equal(e.cls.includes("dg-edge-cross"), false, `${label}：框内出参不得带追加类（反向钉）`);
-    }
-    // 渲染面同席：出参序（intra 在前、cross 在后）= HTML 出现序 ⇒ class 由渲染侧逐字直嵌
-    paths.forEach((p, i) =>
-      assert.equal(p.cls, routes[i].cls, `${label}：第 ${i} 枚 path 的 class === 同序出参的 cls（零 kind 判断、零拼接）`),
-    );
-    assert.equal(crossClsCount(paths), modelCross.length, `${label}：类面跨框枚数 === 模型面跨框枚数`);
-  }
-  assert.ok(seenCross > 0, "空转守卫：确有跨框边进过类面（全为零时上面那枚正钉会空转）");
-});
-
-test("G14-③CSS 面：跨框着色规则恰一条、声明闭集 = 只一枚 stroke、引既有 token、零几何声明；基础规则与图例枚数逐字不变", () => {
+test("G14-③CSS 面：跨框着色规则恰一条、声明闭集 = 只一枚 stroke、引既有 token、零几何声明；基础规则与图例枚数逐字不变", async () => {
   const css = renderPage({ title: "t", active: "features", bodyHtml: "" });
   const block = pipeCssBlock();
   const lines = block.split("\n").filter((l) => l.trim().startsWith(".dg-links path"));
@@ -5499,16 +3237,16 @@ test("G14-③CSS 面：跨框着色规则恰一条、声明闭集 = 只一枚 st
   );
   // 待裁 ⑥ 已裁 = 图例不加行：跨框换色不新增图例条目 ⇒ 枚数与图例行字面均逐字不变
   const legendRow = (html) => /<p class="hint dg-legend-row">([\s\S]*?)<\/p>/.exec(html)[1];
-  const withCross = renderDependencyGraphSection(pipe6Tasks()).html;
-  const noCross = renderDependencyGraphSection(sample076bbb84()).html;
+  const withCross = (await renderDependencyGraphSection(pipe6Tasks())).html;
+  const noCross = (await renderDependencyGraphSection(sample076bbb84())).html;
   assert.equal((withCross.match(/class="dg-legend"/g) ?? []).length, NODE_STATE_ORDER.length, "图例枚数 = NODE_STATE_ORDER 枚数（不加行）");
   assert.equal(legendRow(withCross), legendRow(noCross), "图例行逐字未变（跨框侧与单管道侧同形 ⇒ 未为连线色另立条目）");
   assert.equal(withCross.includes("dg-edge-cross"), true, "空转守卫：对照面确有跨框线（图例不变不是「没东西可着色」）");
 });
 
-test("G14-④三面同源钉：类面（path class）=== 几何面（端点落框）=== 文本面（`.dg-edges` 清单）=== 模型面（本质跨框边）", () => {
+test("G14-④三面同源钉：类面（path class）=== 几何面（端点落框）=== 文本面（`.dg-edges` 清单）=== 模型面（本质跨框边）", async () => {
   for (const [label, tasks] of g14Fixtures()) {
-    const { html } = renderDependencyGraphSection(tasks);
+    const { html } = (await renderDependencyGraphSection(tasks));
     const { list, cross, cls, paths } = crossFaceCounts(html);
     const model = crossKeptEdges(tasks).length;
     assert.equal(cls, cross, `${label}：类面 === 几何面（换了色却没连线、或连了线却没换色，都在此判红）`);
@@ -5517,227 +3255,522 @@ test("G14-④三面同源钉：类面（path class）=== 几何面（端点落�
     assert.ok(cls <= paths, `${label}：类面 ≤ 画布 path 总枚数（框内线共用同一出口，只许少不许多）`);
   }
   // 非空转两侧：跨框在场形与单管道形各钉一面
-  const combo = crossFaceCounts(renderDependencyGraphSection(pipe6Tasks()).html);
+  const combo = crossFaceCounts((await renderDependencyGraphSection(pipe6Tasks())).html);
   assert.deepEqual([combo.cls, combo.cross, combo.list, combo.intra], [4, 4, 4, 1], "跨框侧三面同为 4（框内 1 枚不带追加类）");
-  const none = crossFaceCounts(renderDependencyGraphSection(sample076bbb84()).html);
+  const none = crossFaceCounts((await renderDependencyGraphSection(sample076bbb84())).html);
   assert.deepEqual([none.cls, none.cross, none.list], [0, 0, 0], "单管道侧三面同零");
   assert.ok(none.paths > 0, "同零不是「整图没画」（框内线照在，只是都不带追加类）");
-});
-
-test("G14-⑤反证钉：把追加类归一回基础类后 path 枚数与 `d` 序列逐字相等 ⇒ 本件纯描边、不改走线", () => {
-  for (const [label, tasks] of g14Fixtures()) {
-    const { html } = renderDependencyGraphSection(tasks);
-    const after = edgePaths(html);
-    // 「改色前」的形态 = 同一份 HTML 里把跨框 class 换回基础 class —— 本件的全部 DOM 面改动就这一处
-    const before = edgePaths(html.split(`class="${DG_EDGE_CROSS_CLS}"`).join(`class="${DG_EDGE_CLS}"`));
-    assert.deepEqual(before.map((e) => e.d), after.map((e) => e.d), `${label}：归一前后 d 序列逐字相等（走线 / 顺序 / 端点零变化）`);
-    assert.equal(before.length, after.length, `${label}：归一前后 path 枚数相等（换色不增删线）`);
-    assert.deepEqual(
-      after.map((e) => e.d),
-      corridorSceneOf(tasks).routes.map((e) => e.d),
-      `${label}：画布 d 序列 === 模型走线 d 序列（同序 ⇒ class 不参与几何）`,
-    );
-    const tags = html.match(/<path[^>]*>/g) ?? [];
-    assert.ok(tags.length > 0, `${label}：空转守卫 —— 确有 path 可核`);
-    for (const t of tags)
-      assert.match(t, /^<path class="[^"]*" d="[^"]*"\/>$/, `${label}：path 仍只带 class + d 两枚属性（追加类写在 class 值内，不得另起属性）：${t}`);
-  }
 });
 
 // ---------------------------------------------------------------------------
 // G15 · 承接轨③ n8d「入点侧向让位」（REQ-2026-10-14-02 · 改造文档 §6 承接节）
 //
-// 残差定性（n8c 取证）：真板 `G13-真板复现②` 的唯一红是**单点端口汇聚**（两条跨框腿共用同一枚目标 chip
-// 左缘中点的水平入点短桩，重叠 134px）—— A5 三式由构造成立、实占 ≤ 可容 ⇒ **不是容量欠账**，
-// 加席 / 抬宽无从下手。合规修法只有一条：**接近段侧向让位**（同端口多条边各走自己的接近 y，末尾再各自
-// 弯回 chip 中点），使任意两条只在距端点 ≤ `G5_END_EXEMPT_PX = 24px` 内合流。
-//
-// 本块三枚锚各自钉一层：
-//   ① 形状与降级（纯函数面 `layerCrossApproach`）：首席（秩 0）逐字不动；分层只改末两枚顶点之前；
-//      凡「放不下」（幅度超界 / 折点间距不足 / 落进障碍集）⇒ 返回原顶点序 = **复用首席的共段形态**
-//      （X3 政策丙：降级为共段、绝不降级为穿模）—— 与 `pickCrossCorridors` 超载处置同形。
-//   ② 件三回归面（全部夹具、全部路由）：连线两端仍 = 源 chip 右缘中点 → 目标 chip 左缘中点，偏差 ≤ ±1px；
-//      让位**不得**把入点沿 chip 缘分布。
-//   ③ 真板实占 + 确定性：真板确有 ≥1 条让位线在位（接近段 y ≠ chipMidY、其末段长 ≤ 24px 豁免圈内）——
-//      防「写了机制没人走到」；乱序入参 ⇒ 走线读数逐字段同形（秩由既定序式导出，不含输入序噪声）。
-//
-// **本块零放宽**：`G5_*` 五枚常量、`G5_END_EXEMPT_PX`、`GOLDEN_BEFORE` 与 `G13②` 的「必为 0」极性均未动。
+// v0.10.7 N9：本块原 ①「形状与降级」锚吃的是跨框走线一族里的让位纯函数（已随该族删除）⇒ 该锚与
+//   其取数夹具（`g15Points` / `g15Tail` / `approachReadOf` 等）一并退休；下方 G15-②③ 两枚已由 N6
+//   降级为行为级四把尺（不依赖让位原语）。跨框路由归 ELK，让位不再是板侧构造。
 // ---------------------------------------------------------------------------
 
-/** 一枚 k=1 走廊顶点序的最小形状（`pickCrossCorridors` 出参形：短桩 → 出口腿 → 带 → 入口腿 → 短桩）。 */
-const g15Points = (o = {}) => {
-  const { x0 = 100, y0 = 60, exitX = 150, bandY = 300, entryX = 200, x1 = 300, y1 = 60 } = o;
-  return [[x0, y0], [exitX, y0], [exitX, bandY], [entryX, bandY], [entryX, y1], [x1, y1]];
-};
-const G15_FREE = () => true;
-const g15Tail = (pts) => pts.slice(pts.length - 4);
+// ---------------------------------------------------------------------------
+// v0.10.7 N4（REQ-2026-10-15-01 · 改造文档 §2.4 兜底条）：async 出口 = 出错回吐空图 + 一行提示
+//   判据 = 注入**抛错桩**（经 graph-elk 真 catch 面）⇒ 出口 **resolve 不 reject**、整节只一行
+//          `class="hint warn"`、无未闭合标签 / 无裸引号；**负钉** = 正常路径不出该行、出参与同步版逐字相等。
+// ---------------------------------------------------------------------------
 
-/** 段首 / 段末点（`dSegments` 对弧给 4 枚控制点、对直给 2 枚端点 ⇒ 两端恒在 `[0]` 与 `[len-1]`）。 */
-const segBegin = (seg) => seg.pts[0];
-const segEnd = (seg) => seg.pts[seg.pts.length - 1];
+/** 抛错桩工厂：求解子步骤当场抛 ⇒ catch 面回 `{ flat: null, reason }`，出口只可能拿到出错信号。 */
+const throwingLayoutFn = (message) => (source) =>
+  layoutGraphGuarded(source, async () => {
+    throw new Error(message);
+  });
+
+/** 兜底用例的干净夹具：同管道两枚链任务（无环 / 无悬空 ⇒ 正常路径本就不出 hint warn 行）。 */
+const n4Tasks = () => [task("task-aaaaaaaa", "completed", []), task("task-bbbbbbbb", "completed", ["task-aaaaaaaa"])];
+
+test("N4出口-① 注入抛错桩 ⇒ resolve 不 reject、整节只回吐一行 hint warn", async () => {
+  const section = await renderDependencyGraphSection(n4Tasks(), 1, throwingLayoutFn('solve blew up: "q" <t>'));
+  assert.match(section.html, /^<p class="hint warn">[\s\S]*<\/p>$/);
+  assert.equal((section.html.match(/class="hint warn"/g) ?? []).length, 1);
+});
+
+test("N4出口-② 兜底行 p 一对一闭合、错因转义（无裸引号）、零图形壳", async () => {
+  const section = await renderDependencyGraphSection(n4Tasks(), 1, throwingLayoutFn('solve blew up: "q" <t>'));
+  assert.equal(section.html.split("<p").length - 1, 1, "开始标签 <p> 恰一枚");
+  assert.equal(section.html.split("</p>").length - 1, 1, "闭合标签 </p> 恰一枚（未闭合 ⇒ 本条红）");
+  assert.equal((section.html.match(/"/g) ?? []).length, 2, "裸引号只允许 class 属性那一对");
+  assert.ok(section.html.includes("&quot;") && section.html.includes("&lt;"), "错因里的引号 / 尖括号须转义后入面");
+  for (const shell of ['<div class="dep-graph"', "<svg", "<h2", "<details"]) {
+    assert.equal(section.html.includes(shell), false, `兜底面不得带图形壳：${shell}`);
+  }
+});
+
+test("N4出口-③ 负钉：正常路径（缺省真求解）不出兜底行，且出参与同步版逐字相等", async () => {
+  const section = await renderDependencyGraphSection(n4Tasks());
+  assert.equal(section.html.includes("布局失败"), false);
+  assert.equal(section.html.includes('class="hint warn"'), false);
+  assert.ok(section.html.includes('<div class="dg-canvas"'), "正常路径照出图形面");
+  assert.equal(section.html, (await renderDependencyGraphSection(n4Tasks())).html, "兜底门不得改动正常路径的任何一个字节");
+});
+
+test("N4出口-④ 空短路 ⇒ 整节不渲染且一律不跑求解（桩被调用即红）", async () => {
+  let calls = 0;
+  const spy = async (source) => {
+    calls += 1;
+    return layoutGraphGuarded(source);
+  };
+  assert.deepEqual(await renderDependencyGraphSection([], 1, spy), { html: "" });
+  assert.equal(calls, 0);
+});
+
+test("N4出口-⑤ 页面接线源面锚：详情页走 await 的 async 出口（「不 500」的前提）", async () => {
+  const serverSrc = readFileSync(new URL("../src/server.ts", import.meta.url), "utf8");
+  assert.ok(serverSrc.includes("await renderDependencyGraphSection("), "详情页未经 async 出口 ⇒ ELK 出错仍会 500");
+  // v0.10.7 N5：async 过渡别名已合流进唯一公开口 ⇒ 「清零」的对象不再是某个名字，而是**任何未被 await 的调用点**
+  const bare = [];
+  for (let i = serverSrc.indexOf("renderDependencyGraphSection("); i >= 0; i = serverSrc.indexOf("renderDependencyGraphSection(", i + 1)) {
+    if (!serverSrc.slice(0, i).endsWith("await ")) bare.push(i);
+  }
+  assert.deepEqual(bare, [], "server.ts 内不得出现不带 await 的 renderDependencyGraphSection 调用点");
+});
+
+// ---------------------------------------------------------------------------
+// N5（v0.10.7 承接轨）接线正钉：渲染层坐标源 = ELK 出参（三管道夹具 · 四条机械判据）
+// ---------------------------------------------------------------------------
+
+const n5Tasks = () => [
+  task("n5aaaaaaaa", "completed", [], { projectId: "proj-a", createdAt: "2026-10-13T00:00:01Z" }),
+  task("n5bbbbbbbb", "completed", ["n5aaaaaaaa"], { projectId: "proj-a", createdAt: "2026-10-13T00:00:02Z" }),
+  task("n5cccccccc", "completed", ["n5bbbbbbbb"], { projectId: "proj-b", createdAt: "2026-10-13T00:00:03Z" }),
+  task("n5dddddddd", "completed", ["n5cccccccc"], { projectId: "proj-c", createdAt: "2026-10-13T00:00:04Z" }),
+];
+
+test("N5接线① DOM 壳与层枚数：三管道夹具 ⇒ 恰一枚 svg.dg-links + 三枚 details.pipe + 零 script", async () => {
+  const { html } = await renderDependencyGraphSection(n5Tasks());
+  assert.equal((html.match(/<svg class="dg-links">/g) ?? []).length, 1, "画布级边线层恰一枚（框内不再出 svg —— S1 单画布）");
+  assert.equal((html.match(/<details class="pipe"/g) ?? []).length, 3, "三管道 ⇒ 三枚框（DOM 壳 details.pipe 照留）");
+  assert.equal(html.includes("<script"), false, "SSR 零脚本（读面不注入 JS，holdAnchor 前提不破）");
+});
+
+test("N5接线② 正钉：框盒 / cell 局部坐标逐枚等于同夹具现算的 ELK 出参（不抄字面）", async () => {
+  const tasks = n5Tasks();
+  const graph = buildGraphWithPipelines(tasks);
+  const ordinals = taskOrdinalMap(tasks);
+  const pipelines = groupPipelines(graph, ordinals);
+  const { kept } = transitiveReduce(graph.edges);
+  const laid = await layoutGraphGuarded({ pipelines, edges: kept });
+  assert.ok(laid.flat !== null, `ELK 求解不得走兜底面（错因 ${String(laid.reason)}）`);
+  const flat = laid.flat;
+  const { html } = await renderDependencyGraphSection(tasks);
+  assert.equal(flat.lanes.length, 3, "夹具确有 3 枚 lane（单框夹具测不出跨框坐标源）");
+  for (const lane of flat.lanes) {
+    const style = `left:${lane.x}px;top:${lane.y}px;width:${lane.w}px;height:${lane.h}px`;
+    assert.ok(
+      html.includes(`<details class="pipe" open style="${style}">`),
+      `${lane.projectId} 框的 inline 盒 === ELK lane 盒（实得样式串未在 HTML 中在册：${style}）`,
+    );
+  }
+  for (const node of flat.nodes) {
+    const lane = flat.lanes.find((l) => l.id === node.laneId);
+    assert.ok(lane !== undefined, `${node.id} 的所属 lane 在册`);
+    const localX = node.x - lane.x - DG_GRID_ORIGIN_X;
+    const localY = node.y - lane.y - DG_GRID_ORIGIN_Y - DG_BADGE_H;
+    assert.ok(localX >= 0 && localY >= 0, `${node.id} cell 局部坐标不得为负（负值 = 节点压进标题带）：${localX},${localY}`);
+    assert.ok(
+      html.includes(`<span class="dg-cell" style="left:${localX}px;top:${localY}px">`),
+      `${node.id} 的 cell 局部坐标 = ELK 绝对盒换算值（${localX},${localY}）`,
+    );
+  }
+});
+
+test("N5接线③ 反锚：框位不再是 planCanvas 的 gutter 累加等式（坐标源真换了，不是同值巧合）", async () => {
+  const tasks = n5Tasks();
+  const { html } = await renderDependencyGraphSection(tasks);
+  const frames = [...html.matchAll(/<details class="pipe" open style="left:([-\d.]+)px;top:([-\d.]+)px;width:([-\d.]+)px/g)].map(
+    (m) => ({ left: Number(m[1]), top: Number(m[2]), width: Number(m[3]) }),
+  );
+  assert.equal(frames.length, 3);
+  // 旧 planCanvas（v0.10.7 N10 已退休）：横向堆叠 ⇒ left[i] = gutter + Σ(left[j]+width[j]+gutter)（j<i），且 top 同值
+  // 该画布留白常量随走线族删除 ⇒ 本反锚改吃其**面值**（原值 = 24），判据不变（仍要求等式不成立）
+  const OLD_CANVAS_GUTTER = 24;
+  let acc = OLD_CANVAS_GUTTER;
+  const oldLefts = frames.map((f) => {
+    const v = acc;
+    acc += f.width + OLD_CANVAS_GUTTER;
+    return v;
+  });
+  const topsAllEqual = new Set(frames.map((f) => f.top)).size === 1;
+  assert.equal(
+    frames.every((f, i) => f.left === oldLefts[i]) && topsAllEqual,
+    false,
+    `渲染层框位仍逐枚等于 planCanvas 的 gutter 累加等式（${JSON.stringify(frames.map((f) => [f.left, f.top]))} vs ${JSON.stringify(oldLefts)}）⇒ 坐标源未换`,
+  );
+});
+
+// ===========================================================================
+// 承接轨 N6（REQ-2026-10-15-01 · 改造文档 §4「行为级四把尺」）：**十四枚输出形状锚的降级落点**
+//
+// 原锚钉的是走线族**内部形状**（2k+3 段数 / 走廊 at 线 / 通道席位数 / 弧控制点 / 入点让位档）——
+// 这些量随 §2.3 退休清单整族消失，且其中一部分在 ELK 形态下**语义不再成立**：多枚入边汇入同一枚
+// 目标 chip 的左缘中点 ⇒ 共段是原生形态而非缺陷（原「汇聚端口至多一条直通」正是被这一条推翻的）。
+// 本块把每一枚**逐条换成四把尺** ——
+//   `overlap`（节点盒两两零交 · 节点盒不压标题带）· `segRect`/`penCount`（边段穿节点 / 穿框 = 0）
+//   · `devOf`（连线两端贴 chip 缘中点 = 0.0px）· 同 project 节点同框（「带序断言」的替代形）。
+// 取数面 = {@link behaviorSceneOf}：只读 HTML / SVG 出参 + 画布下发的六枚 CSS 变量 ⇒ 对退休符号零引用
+// （§2.3 落地、`DG_*` 从导出面消失之后，本块照跑 —— 这才是「降级为行为级」的可核含义）。
+// ===========================================================================
+
+/** 行为级四把尺的吃数夹具（真板全量集另在 G13/G15 两枚里单独吃）。 */
+const RULER_FIXTURES = () => [
+  ["pipe6（3 框 · 跨框 4）", pipe6Tasks()],
+  ["样本076bbb84（单框 7 节点 · 声明 10 / 本质 8）", sample076bbb84()],
+  ["折叠+约简（2 框 · 省略 1 · 跨框 4）", foldReduceTasks()],
+  ["跨管道同集（3 框 · 省略 1 · 全跨框）", crossReduceTasks()],
+];
+
+const htmlOfTasks = async (tasks) => (await renderDependencyGraphSection(tasks)).html;
+const sceneOfTasks = async (tasks) => behaviorSceneOf(await htmlOfTasks(tasks));
+
+/** 两点同位（出参坐标收拢到 0.01px ⇒ 0.6px 容差只吃这一层收拢，不构成放宽）。 */
+const samePt = (a, b) => Math.abs(a[0] - b[0]) < 0.6 && Math.abs(a[1] - b[1]) < 0.6;
+
+/** 折线两端 → 两端 chip（**几何反查**；查不到即判红，不得静默当成「这条边不存在」）。 */
+function needEnds(scene, pts, label) {
+  const from = chipByEndpoint(scene, pts[0], "from");
+  const to = chipByEndpoint(scene, pts[pts.length - 1], "to");
+  assert.ok(from !== null, `${label}：首点须贴在某枚 chip 的右缘中点（实得 ${JSON.stringify(pts[0])}）`);
+  assert.ok(to !== null, `${label}：末点须贴在某枚 chip 的左缘中点（实得 ${JSON.stringify(pts[pts.length - 1])}）`);
+  return { from, to };
+}
+
+/** 一枚折线的障碍集（A6 带域的行为级同形）：chip 除本线两端、框除两端所属框（腿的首段必然在本框内）。 */
+function obstaclesFor(scene, pts, label = "障碍集取端点") {
+  const ends = needEnds(scene, pts, label);
+  const ownProjects = new Set([ends.from.projectId, ends.to.projectId]);
+  return {
+    ends,
+    chips: scene.chips.filter((c) => c.taskId !== ends.from.taskId && c.taskId !== ends.to.taskId).map((c) => c.box),
+    frames: scene.frames.filter((f) => !ownProjects.has(f.projectId)).map((f) => f.box),
+  };
+}
 
 /**
- * 一条 path 的**让位读数**：`null` = 首席直通（接近段即入点短桩、落 chip 中线）；
- * 否则 = `{ y, lead }` —— 分层接近线的 y 与其后那枚短桩的长度。
- *
- * 分层形的段尾三枚恒为 **水平接近段（y=让位线）→ 竖直到位折点 → 水平短桩（y=chip 中线）**；
- * 未分层形的段尾三枚是「带内长横 → 入口竖腿 → 入点短桩」—— 两者靠**折点长度 ≤ 让位幅度上界**
- * 与**短桩长恰 = 折点提前量**两式分开（单看「倒数第三段水平」会误读未分层形）。
+ * 四把尺的一次全量读数：
+ * `penChip` = 全部折线穿入**他人节点盒**的段数之和 · `penFrame` = 穿入**他人框盒**的段数之和 ·
+ * `devMax` = 端点偏差最大值（0.1px 精度）· `boxPairs` = 节点盒两两真相交对数 ·
+ * `pressed` = 压进本框标题带的节点数。
  */
-const approachReadOf = (d) => {
-  const segs = dSegments(d);
-  const run = segs[segs.length - 3];
-  const jog = segs[segs.length - 2];
-  const stub = segs[segs.length - 1];
-  if (run === undefined || jog === undefined || stub === undefined) return null;
-  const yR = segBegin(run)[1];
-  const yEnd = segEnd(stub)[1];
-  if (segEnd(run)[1] !== yR || yR === yEnd) return null; // 接近段须水平、且不在中线上
-  if (segBegin(jog)[0] !== segEnd(jog)[0]) return null; // 折点段须竖直
-  const off = Math.abs(segBegin(jog)[1] - segEnd(jog)[1]);
-  if (off > DG_APPROACH_MAX_OFF) return null;
-  const lead = Math.abs(segEnd(stub)[0] - segBegin(stub)[0]);
-  if (Math.abs(lead - DG_APPROACH_LEAD) > 1) return null;
-  if (Math.abs(segBegin(jog)[0] - segEnd(run)[0]) > 1) return null;
-  return { y: yR, lead };
-};
-
-test("G15-①形状与降级：`layerCrossApproach` 首席恒等 / 秩 1–3 交替让位 / 三形放不下各回原顶点序（共段不穿模）+ 末段长 ∈ 豁免圈", () => {
-  // ---- 常量耦合面（本单元只导出几何量，判据常量在测试侧 ⇒ 不等式只能在这里钉）----
-  assert.ok(DG_APPROACH_LEAD <= G5_END_EXEMPT_PX, `折点提前量 ${DG_APPROACH_LEAD} ≤ 共端点豁免半径 ${G5_END_EXEMPT_PX} ⇒ 分层后各边自己的入点短桩整段落进豁免圈（否则 G13② 无从翻 0）`);
-  assert.ok(DG_APPROACH_LEAD >= DG_CORRIDOR_MIN_RUN, `折点提前量 ${DG_APPROACH_LEAD} ≥ 最小可用段长 ${DG_CORRIDOR_MIN_RUN} ⇒ 让位后的末弧不退化成尖角`);
-  assert.equal(DG_APPROACH_MAX_OFF, DG_NODE_H / 2, `让位幅度上界 === 自身行 chip 半高 ${DG_NODE_H / 2} ⇒ 分层线不出自身行 chip 带（该 x 区间本行结构性无 chip）`);
-  assert.equal(DG_APPROACH_MAX_OFF % DG_APPROACH_SEAT_PITCH, 0, "上界为席距整数倍 ⇒ 交替分层恰得 ±1 / ±2 共 4 席");
-
-  // ---- ① 首席恒等（秩 0 ⇒ 返回入参本身，走线逐字不变）----
-  const pts = g15Points();
-  assert.equal(layerCrossApproach(pts, 0, G15_FREE), pts, "秩 0 = 首席 ⇒ 返回同一数组引用（单入边端口零改动）");
-
-  // ---- ② 秩 1–3：来带侧优先、两侧交替、按档抬升（`bandY > y1` ⇒ 来带在下）----
-  const bendX = 300 - DG_APPROACH_LEAD;
-  const seats = [
-    [1, 60 + DG_APPROACH_SEAT_PITCH],
-    [2, 60 - DG_APPROACH_SEAT_PITCH],
-    [3, 60 + 2 * DG_APPROACH_SEAT_PITCH],
-  ];
-  for (const [rank, yApp] of seats) {
-    const out = layerCrossApproach(pts, rank, G15_FREE);
-    assert.deepEqual(out.slice(0, pts.length - 2), pts.slice(0, pts.length - 2), `秩 ${rank}：末两枚顶点之前逐字不动`);
-    assert.deepEqual(
-      g15Tail(out),
-      [[200, yApp], [bendX, yApp], [bendX, 60], [300, 60]],
-      `秩 ${rank}：接近线落 y=${yApp}、折点 x=${bendX}、末段仍水平入 (300,60)`,
-    );
-    assert.deepEqual(out[out.length - 1], [300, 60], `秩 ${rank}：末点 = 目标左缘中点（件三由构造不动）`);
-    assert.equal(Math.abs(yApp - 60) <= DG_APPROACH_MAX_OFF, true, `秩 ${rank}：让位幅度在界内`);
-    const layered = corridorPath(out);
-    assert.equal((layered.match(/L/g) ?? []).length, 0, `秩 ${rank}：走廊形照旧不产 L（C¹ 连续不因分层破）`);
-    assert.equal(dSegments(layered).length, dSegments(corridorPath(pts)).length + 2, `秩 ${rank}：分层恰添两段（接近横段 + 折点竖段），塌缩律未吃掉新顶点`);
-    assert.equal(approachReadOf(layered)?.y, yApp, `秩 ${rank}：渲染层读数与顶点序同值（本锚的读法不是纸面形）`);
+function rulerReadout(scene) {
+  let penChip = 0;
+  let penFrame = 0;
+  let devMax = 0;
+  for (const { d } of scene.paths) {
+    const pts = dPoints(d);
+    const { ends, chips, frames } = obstaclesFor(scene, pts);
+    const dev = devOf(pts, ends.from.box, ends.to.box);
+    assert.ok(dev !== null, `path ${d.slice(0, 20)}… 的端点偏差可核（点列 ≥ 2 且两端盒在手）`);
+    devMax = Math.max(devMax, dev);
+    penChip += penCount(pts, chips);
+    penFrame += penCount(pts, frames);
   }
-
-  // ---- ③ 三形「放不下」⇒ 各回原顶点序（降级为共段，不穿模、不硬挤）----
-  assert.equal(layerCrossApproach(pts, 5, G15_FREE), pts, "秩 5 ⇒ |off| 越上界 ⇒ 原顶点序（席位不足 = 共段，与 X3 丙同形）");
-  assert.equal(layerCrossApproach(pts, 1, () => false), pts, "障碍挡住 ⇒ 原顶点序（分层几何落进 §2.3 障碍集即让位作废）");
-  assert.equal(layerCrossApproach(g15Points({ entryX: bendX }), 1, G15_FREE)?.length, 6, "折点与腿重合（分层横段 < 最小可用段长）⇒ 不硬挤");
-  assert.equal(layerCrossApproach(g15Points({ entryX: 300 }), 1, G15_FREE)?.length, 6, "腿正对左缘 ⇒ 无接近段可分层，原样返回");
-  // 长档形（k=2 ⇒ 顶点 8 枚）同样只在末两枚顶点之前动手：中段的外缘长竖与带内线逐字不动
-  const wide = [
-    [100, 60], [150, 60], [150, 200], [40, 200], [40, 300], [200, 300], [200, 60], [300, 60],
-  ];
-  const wideOut = layerCrossApproach(wide, 1, G15_FREE);
-  assert.deepEqual(wideOut.slice(0, wide.length - 2), wide.slice(0, wide.length - 2), "k=2 形：末两枚之前逐字不动（外缘长竖与带内长横不被让位面牵动）");
-  assert.deepEqual(g15Tail(wideOut), [[200, 67], [282, 67], [282, 60], [300, 60]], "k=2 形：让位只发生在入口侧");
-  assert.equal(approachReadOf(corridorPath(wideOut))?.y, 67, "k=2 形的渲染层读数与顶点序同值");
-
-  // ---- ④ 障碍判据的矩形须盖住转角弧外扩（保守面，不含 `DG_CORRIDOR_BULGE_MAX` 即漏量）----
-  let box = null;
-  layerCrossApproach(pts, 1, (x0, x1, y0, y1) => {
-    box = [x0, x1, y0, y1];
-    return true;
-  });
-  assert.ok(box !== null, "分层在位 ⇒ 障碍判据确被调用（不是写完没查）");
-  assert.equal(box[0], 200 - DG_CORRIDOR_BULGE_MAX, `矩形左界 = min(entryX,bendX,x1) − 外扩上界（实得 ${box[0]}）`);
-  assert.equal(box[1], 300 + DG_CORRIDOR_BULGE_MAX, "矩形右界盖到端点 x1 + 外扩上界");
-  assert.equal(box[2], 60 - DG_CORRIDOR_BULGE_MAX, "矩形下界含 chip 中线一侧的外扩余量");
-  assert.equal(box[3], 60 + DG_APPROACH_SEAT_PITCH + DG_CORRIDOR_BULGE_MAX, "矩形上界含接近线一侧的外扩余量");
-});
-
-test("G15-②件三回归面（让位不得动端点）：真板 + 走廊七形 + 组合夹具的全部路由两端 = 源右缘中点 → 目标左缘中点（≤ ±1px）", () => {
-  const shapes = [
-    ["真板 eb86d5e8", realTasks()],
-    ...g14Fixtures(),
-    ...corridorFixtures().map((f) => [`${f.key}`, f.tasks]),
-  ];
-  const midY = (c) => (c.rect[2] + c.rect[3]) / 2;
-  let routes = 0;
-  let cross = 0;
-  let layered = 0;
-  for (const [label, tasks] of shapes) {
-    const scene = canvasSceneOf(tasks);
-    const chip = new Map(scene.chips.map((c) => [c.taskId, c]));
-    for (const r of scene.routes) {
-      const a = chip.get(r.from);
-      const b = chip.get(r.to);
-      assert.ok(a !== undefined && b !== undefined, `${label}/${r.from}→${r.to}：两端 chip 矩形在册`);
-      const p = dPoints(r.d);
-      const first = p[0];
-      const last = p[p.length - 1];
-      assert.ok(
-        Math.abs(first[0] - a.rect[1]) <= 1 && Math.abs(first[1] - midY(a)) <= 1,
-        `${label}/${r.from}→${r.to}：起点 = 源 chip 右缘中点（实得 ${first}，期望 ${[a.rect[1], midY(a)]}）`,
-      );
-      assert.ok(
-        Math.abs(last[0] - b.rect[0]) <= 1 && Math.abs(last[1] - midY(b)) <= 1,
-        `${label}/${r.from}→${r.to}：**件三** 终点 = 目标 chip 左缘中点（实得 ${last}，期望 ${[b.rect[0], midY(b)]}）`,
-      );
-      const read = r.fromProject === r.toProject ? null : approachReadOf(r.d);
-      if (read !== null) {
-        layered += 1;
-        assert.ok(Math.abs(read.y - midY(b)) > 1, `${label}/${r.from}→${r.to}：让位线不得仍贴 chip 中线`);
-        assert.ok(Math.abs(read.lead - DG_APPROACH_LEAD) <= 1, `${label}/${r.from}→${r.to}：让位后的入点短桩长 ${read.lead} 须恰 = 折点提前量 ${DG_APPROACH_LEAD}（≤ 豁免半径 ${G5_END_EXEMPT_PX}）`);
-      }
-      routes += 1;
-      if (r.fromProject !== r.toProject) cross += 1;
+  const boxPairs = [];
+  for (let i = 0; i < scene.chips.length; i += 1) {
+    for (let j = i + 1; j < scene.chips.length; j += 1) {
+      if (overlap(scene.chips[i].box, scene.chips[j].box)) boxPairs.push(`${scene.chips[i].taskId}×${scene.chips[j].taskId}`);
     }
   }
-  assert.ok(routes >= 40 && cross >= 8, `覆盖面非空：路由 ${routes} 枚 / 跨框 ${cross} 枚 ⇒ 本锚不是「无面可测」`);
-  assert.ok(layered >= 1, `让位在实测面真发生（${layered} 枚跨框边走分层接近线）⇒ 件三钉的不是恒等式的空壳`);
+  return { penChip, penFrame, devMax, boxPairs, pressed: scene.chips.filter((c) => overlap(c.box, c.titleBand)) };
+}
+
+/** 把声明边集里的**可推出边**就地删掉 ⇒ 得到「约简后作为声明」的同形夹具（约简前后对照用）。 */
+function dropRedundant(tasks) {
+  const dropped = new Set(transitiveReduce(buildTaskGraph(tasks).edges).dropped.map((e) => `${e.from}>${e.to}`));
+  return tasks.map((t) => ({ ...t, dependencies: (t.dependencies ?? []).filter((d) => !dropped.has(`${d}>${t.taskId}`)) }));
+}
+
+test("G11-走廊①（N6 降级为行为级 · 原「统一律段数 = 2k+3」随走线族退休）：全部折线段轴对齐 ⇒ 读面无斜段", async () => {
+  let segments = 0;
+  for (const [label, tasks] of [...RULER_FIXTURES(), ["真板全量集", realTasks()]]) {
+    const scene = await sceneOfTasks(tasks);
+    for (const { d } of scene.paths) {
+      const pts = dPoints(d);
+      assert.ok(pts.length >= 2, `${label}：path ${d.slice(0, 20)}… 至少两点`);
+      assert.equal(allAxisAligned(pts), true, `${label}：折线必须处处正交（出现斜段 = 「不直」回退）：${d}`);
+      segments += pts.length - 1;
+    }
+  }
+  assert.ok(segments > 100, `空转守卫：正交性真的数到了 ${segments} 段`);
 });
 
-test("G15-③真板实占 + 确定性：汇聚端口至多一条首席直通、其余各让一档（叠线 0 的成因面）；乱序入参读数逐字段同形", () => {
-  const sceneOf = (tasks) => {
-    const scene = canvasSceneOf(tasks);
-    const chip = new Map(scene.chips.map((c) => [c.taskId, c]));
-    return scene.cross.map((r) => ({
-      key: `${r.from}→${r.to}`,
-      port: chip.get(r.to).rect[0] + "," + (chip.get(r.to).rect[2] + chip.get(r.to).rect[3]) / 2,
-      approach: approachReadOf(r.d)?.y ?? "mid",
-      d: r.d,
-    }));
-  };
-  const rows = sceneOf(realTasks());
-  const byPort = new Map();
-  for (const r of rows) {
-    const list = byPort.get(r.port);
-    if (list) list.push(r);
-    else byPort.set(r.port, [r]);
+test("G11-走廊②（N6 降级为行为级 · 原「骨架两端落在走廊 at 线上」）：devOf 尺 = 连线两端贴 chip 缘中点 ⇒ 逐条 0.0px", async () => {
+  for (const [label, tasks] of [...RULER_FIXTURES(), ["真板全量集", realTasks()]]) {
+    const scene = await sceneOfTasks(tasks);
+    assert.ok(scene.paths.length > 0, `${label}：确有边线可核（0 枚即空转）`);
+    for (const { d } of scene.paths) {
+      const pts = dPoints(d);
+      const { from, to } = needEnds(scene, pts, `${label} path ${d.slice(0, 20)}…`);
+      assert.equal(devOf(pts, from.box, to.box), 0, `${label}：${from.taskId}→${to.taskId} 端点偏差 = 0（尺 = devOf，0.1px 精度）`);
+    }
   }
-  const busy = [...byPort].filter(([, v]) => v.length >= 2);
-  assert.ok(busy.length >= 1, "真板确有汇聚端口（≥2 枚跨框边同落一枚 chip 左缘中点）⇒ 本锚不空转");
-  for (const [port, list] of busy) {
-    const direct = list.filter((r) => r.approach === "mid");
-    assert.ok(
-      direct.length <= 1,
-      `端口 ${port}：贴中线的直通形至多一枚（其余须各自让位一档，实得 ${direct.length} 枚：${list.map((r) => `${r.key}@${r.approach}`).join(" / ")}）`,
-    );
-    const yields = list.filter((r) => r.approach !== "mid");
-    if (yields.length >= 1)
-      assert.equal(new Set(yields.map((r) => r.approach)).size, yields.length, `端口 ${port}：各让位边接近线两两不同 y（让位若塌回同档 = 叠线复发）`);
-  }
-  // ---- 确定性：乱序入参 ⇒ 同集合的 (边, 端口, 接近线) 读数逐条相等 ----
-  const shuffled = [...realTasks()].reverse();
-  const a = [...rows].sort((p, q) => (p.key < q.key ? -1 : 1));
-  const b = [...sceneOf(shuffled)].sort((p, q) => (p.key < q.key ? -1 : 1));
-  assert.deepEqual(b.map((r) => `${r.key}|${r.port}|${r.approach}`), a.map((r) => `${r.key}|${r.port}|${r.approach}`), "乱序 tasks ⇒ 每条跨框边的端口与接近线读数逐字段相等（秩不含输入序噪声）");
 });
+
+test("G11-走廊③（N6 降级为行为级 · 原「canvasHits 恒 0 于 A6 带域 + 直落形反对照」）：penCount 尺逐夹具恒 0，且合成直贯形必判红", async () => {
+  for (const [label, tasks] of RULER_FIXTURES()) {
+    const scene = await sceneOfTasks(tasks);
+    const read = rulerReadout(scene);
+    assert.equal(read.penChip, 0, `${label}：全部折线穿入他人节点盒的段数 = 0（实得 ${read.penChip}）`);
+    assert.equal(read.penFrame, 0, `${label}：全部折线穿入他人框盒的段数 = 0（实得 ${read.penFrame}）`);
+    // 反对照（防空转）：人造一段直贯某枚 chip 盒心 ⇒ 同一把尺必须数到 ≥ 1
+    const victim = scene.chips[0];
+    const midY = victim.box.y + victim.box.h / 2;
+    const fake = [[victim.box.x - 20, midY], [victim.box.x + victim.box.w + 20, midY]];
+    assert.ok(penCount(fake, [victim.box]) >= 1, `${label}：反对照失配 ⇒ penCount 尺本身失效（穿盒心的一段被数成 0）`);
+  }
+});
+
+test("G11-走廊④（N6 降级为行为级 · 原「首弧第二控制点 y ≠ y0 + 转角 2k+2 + 弧不外扩」随弧族退休）：出参命令族闭集 = {{M, L}}，零曲线命令", async () => {
+  let paths = 0;
+  for (const [label, tasks] of [...RULER_FIXTURES(), ["真板全量集", realTasks()]]) {
+    const scene = await sceneOfTasks(tasks);
+    for (const { d } of scene.paths) {
+      const cmds = new Set(dCmds(d));
+      for (const c of cmds) assert.ok(c === "M" || c === "L", `${label}：命令族只许 M / L（实得 ${c} ⇒ 曲线族复活，正交描边失效）：${d}`);
+      assert.equal(dCmds(d)[0], "M", `${label}：每枚 path 以 M 起手`);
+      paths += 1;
+    }
+  }
+  assert.ok(paths > 20, `空转守卫：命令族面真的核了 ${paths} 枚 path`);
+});
+
+test("G11-走廊⑧（N6 降级为行为级 · 原「列宽预算式（gapW ≥ 2·列通道宽 + n·节距）」随列预算退休）：overlap 尺 ⇒ 节点盒两两零交 + 同 project 节点同框", async () => {
+  for (const [label, tasks] of [...RULER_FIXTURES(), ["真板全量集", realTasks()]]) {
+    const scene = await sceneOfTasks(tasks);
+    const read = rulerReadout(scene);
+    assert.deepEqual(read.boxPairs, [], `${label}：节点盒两两零交（列宽够不够的最终读面就是这个）`);
+    // 带序断言的替代形（改造文档 §4「行为级四把尺」第四条）：同 project 的节点恒在同一枚框里
+    const perProject = new Map();
+    for (const n of buildTaskGraph(tasks).nodes) perProject.set(n.projectId, (perProject.get(n.projectId) ?? 0) + 1);
+    assert.equal(scene.frames.length, perProject.size, `${label}：每 project 恰一枚框`);
+    for (const f of scene.frames)
+      assert.equal(f.cells.size, perProject.get(f.projectId), `${label}：框 ${f.projectId} 的 cell 枚数 === 该 project 节点数`);
+    const ids = scene.chips.map((c) => c.taskId);
+    assert.equal(new Set(ids).size, ids.length, `${label}：chip 全集不重不漏`);
+  }
+});
+
+test("G12-③（N6 降级为行为级 · 原「外缘硬容量 4 席 · seat < 4 严格不等式」随走廊选型退休）：跨框折线不得穿入非两端所属框，人造越界形判红", async () => {
+  let crossTotal = 0;
+  for (const [label, tasks] of [...RULER_FIXTURES(), ["真板全量集", realTasks()]]) {
+    const scene = await sceneOfTasks(tasks);
+    const cross = scene.paths.filter((p) => {
+      const pts = dPoints(p.d);
+      const { from, to } = needEnds(scene, pts, label);
+      return from.projectId !== to.projectId;
+    });
+    crossTotal += cross.length;
+    for (const { d } of cross) {
+      const pts = dPoints(d);
+      const { frames } = obstaclesFor(scene, pts, label);
+      assert.equal(penCount(pts, frames), 0, `${label}：跨框折线穿入他人框盒 = 0（实得 ${penCount(pts, frames)}）：${d}`);
+    }
+    // 反对照：把一条腿硬拖进一枚框的盒心 ⇒ 同一把尺判红（尺失效 ⇒ 上面的 0 是空转）
+    const foreign = scene.frames[scene.frames.length - 1];
+    const midY = foreign.box.y + foreign.box.h / 2;
+    assert.ok(
+      penCount([[foreign.box.x - 30, midY], [foreign.box.x + foreign.box.w + 30, midY]], [foreign.box]) >= 1,
+      `${label}：反对照失配 ⇒ 框级 penCount 失效`,
+    );
+  }
+  assert.ok(crossTotal >= 8, `空转守卫：跨框边真的核了 ${crossTotal} 枚（单框夹具贡献 0，靠跨框夹具与真板集兜住）`);
+});
+
+test("G11-画布穿模①（N6 降级为行为级 · 原「手写 7 段走廊在带域障碍集上 0 命中」的走廊入参退休）：尺的判据自证 —— 正反两形同枚成立", async () => {
+  const scene = await sceneOfTasks(pipe6Tasks());
+  const read = rulerReadout(scene);
+  // 正形：真出参四把尺全 0
+  assert.deepEqual([read.penChip, read.penFrame, read.devMax, read.boxPairs.length, read.pressed.length], [0, 0, 0, 0, 0], "正形：真出参全 0");
+  // 反形 A：把一段横拖过某枚 chip ⇒ 穿节点计数升
+  const victim = scene.chips.find((c) => c.projectId === "orch") ?? scene.chips[0];
+  const midY = victim.box.y + victim.box.h / 2;
+  assert.ok(penCount([[victim.box.x - 5, midY], [victim.box.x + victim.box.w + 5, midY]], [victim.box]) >= 1, "反形 A：穿节点的一段必被数到");
+  // 反形 B：把首点从缘中点挪开 1px ⇒ devOf 尺判红（不得仍是 0）
+  const pts = dPoints(scene.paths[0].d);
+  const { from, to } = needEnds(scene, pts, "pipe6");
+  assert.equal(devOf(pts, from.box, to.box), 0, "原形偏差 = 0");
+  const shifted = [[pts[0][0] + 1, pts[0][1]], ...pts.slice(1)];
+  assert.ok((devOf(shifted, from.box, to.box) ?? 0) > 0, "反形 B：端点挪 1px 必被 devOf 数出非零");
+});
+
+test("G13-真板复现②（N6 降级为行为级 · 原「叠线段对 = 0（G5 采样叠点法 · 豁免共用端点 24px）」随共段禁令退休）：真板集全四把尺读数 = 0", async () => {
+  const scene = await sceneOfTasks(realTasks());
+  const read = rulerReadout(scene);
+  assert.equal(scene.paths.length > 0, true, "真板集确有边线");
+  assert.equal(read.penChip, 0, `真板：穿节点段数 = 0（实得 ${read.penChip}）`);
+  assert.equal(read.penFrame, 0, `真板：穿框段数 = 0（实得 ${read.penFrame}）`);
+  assert.equal(read.devMax, 0, `真板：端点偏差最大值 = 0.0px（实得 ${read.devMax}）`);
+  assert.deepEqual(read.boxPairs, [], `真板：节点盒零相交（实得 ${read.boxPairs.join("、")}）`);
+  assert.deepEqual(read.pressed, [], `真板：无节点压进标题带（实得 ${read.pressed.map((c) => c.taskId).join("、")}）`);
+});
+
+test("G14-②（N6 降级为行为级 · 原「模型出参 cls 分席」的模型对账退休）：class 面 ⇔ 端点落框，从 HTML 反查零模型", async () => {
+  for (const [label, tasks] of [...RULER_FIXTURES(), ["真板全量集", realTasks()]]) {
+    const scene = await sceneOfTasks(tasks);
+    let cross = 0;
+    for (const { cls, d } of scene.paths) {
+      const tokens = cls.split(" ");
+      assert.equal(tokens[0], "dg-edge", `${label}：首 token 恒为基础类（CSS 基础规则照命中）：${cls}`);
+      assert.ok(tokens.length === 1 || (tokens.length === 2 && tokens[1] === "dg-edge-cross"), `${label}：类面闭集两枚（实得 ${cls}）`);
+      const pts = dPoints(d);
+      const { from, to } = needEnds(scene, pts, label);
+      const isCross = tokens.length === 2;
+      assert.equal(isCross, from.projectId !== to.projectId, `${label}：追加类 ⇔ 两端异框（实得 ${from.taskId}@${from.projectId} → ${to.taskId}@${to.projectId} / class ${cls}）`);
+      if (isCross) cross += 1;
+    }
+    if (label.startsWith("pipe6")) assert.equal(cross, 4, "空转守卫：跨框着色真的发生过 4 枚");
+  }
+});
+
+test("G15-②（N6 降级为行为级 · 原「件三让位不得动端点 ±1px」的让位前提退休）：全部夹具全部路由端点偏差 = 0.0px", async () => {
+  let checked = 0;
+  for (const [label, tasks] of [...RULER_FIXTURES(), ["真板全量集", realTasks()]]) {
+    const scene = await sceneOfTasks(tasks);
+    const read = rulerReadout(scene);
+    assert.equal(read.devMax, 0, `${label}：端点偏差最大值 = 0（原 ±1px 余量在 ELK 面用不上）`);
+    checked += scene.paths.length;
+  }
+  assert.ok(checked >= 20, `空转守卫：端点偏差真的逐条核了 ${checked} 枚`);
+});
+
+test("G15-③（N6 降级为行为级 · 原「汇聚端口至多一条首席直通、其余各让一档」在 ELK 面语义不成立 ⇒ 共段是原生形态）：改钉四把尺全 0 + 乱序入参同读数", async () => {
+  const tasks = realTasks();
+  const scene = await sceneOfTasks(tasks);
+  const read = rulerReadout(scene);
+  assert.equal(read.penChip, 0, "真板：共段不得越界成穿模");
+  assert.equal(read.devMax, 0, "真板：汇聚端口的每一枚入边仍贴左缘中点（共段 ≠ 端点漂移）");
+  // 汇聚形态本身如实登记（>= 2 枚入边贴同一左缘中点 = 合法原生形态，不再是缺陷）
+  const byTail = new Map();
+  for (const { d } of scene.paths) {
+    const pts = dPoints(d);
+    const tail = pts[pts.length - 1];
+    const key = `${tail[0]},${tail[1]}`;
+    byTail.set(key, (byTail.get(key) ?? 0) + 1);
+  }
+  const converged = [...byTail.values()].filter((n) => n >= 2).length;
+  assert.ok(converged >= 1, `真板确有 ≥1 处多入边汇聚端口（实得 ${converged} 处）⇒ 本枚钉的是共段合法化后的新判据，不是空壳`);
+  // 确定性：入参乱序 ⇒ 折线集合与节点集合逐字同形
+  const shuffled = await sceneOfTasks([...tasks].reverse());
+  assert.equal(shuffled.chips.length, scene.chips.length, "乱序入参 ⇒ chip 全集同数");
+  assert.deepEqual(
+    shuffled.paths.map((p) => p.d).sort(),
+    scene.paths.map((p) => p.d).sort(),
+    "乱序入参 ⇒ 折线集合逐字相等（几何不随入参序漂）",
+  );
+});
+
+test("N2对锚①（N6 降级为行为级 · 原「画布面长边枚数 3 → 1」的长/短分档随走线族退休）：图形面吃本质边、被省略者在图形面零痕迹", async () => {
+  const tasks = sample076bbb84();
+  const scene = await sceneOfTasks(tasks);
+  const graph = buildTaskGraph(tasks);
+  const { kept, dropped } = transitiveReduce(graph.edges);
+  assert.deepEqual([graph.edges.length, kept.length, dropped.length], [10, 8, 2], "夹具基线：声明 10 / 本质 8 / 省略 2");
+  assert.equal(scene.paths.length, kept.length, "画布 path 枚数 === 本质边数（不是声明数）");
+  const keptKeys = new Set(kept.map((e) => `${e.from}>${e.to}`));
+  const drawn = scene.paths.map((p) => {
+    const { from, to } = needEnds(scene, dPoints(p.d), "样本076bbb84");
+    return `${from.taskId}>${to.taskId}`;
+  });
+  for (const key of drawn) assert.ok(keptKeys.has(key), `图形面只可能出现本质边（实得 ${key}）`);
+  for (const e of dropped) assert.equal(drawn.includes(`${e.from}>${e.to}`), false, `被省略的 ${e.from}→${e.to} 在图形面零痕迹`);
+  assert.equal(new Set(drawn).size, drawn.length, "本质边与折线一对一（同一枚不被画两次）");
+});
+
+test("N3对锚④（N6 降级为行为级 · 原「约简后网格 width/height ≤ 约简前」的网格盒模退休）：删冗余边不放大画布盒 + 画布固定盒零出血", async () => {
+  for (const [label, tasks] of [...RULER_FIXTURES(), ["真板全量集", realTasks()]]) {
+    const withRedundant = behaviorSceneOf(await htmlOfTasks(tasks));
+    const withoutRedundant = behaviorSceneOf(await htmlOfTasks(dropRedundant(tasks)));
+    assert.ok(
+      withoutRedundant.canvas.w <= withRedundant.canvas.w + 0.01 && withoutRedundant.canvas.h <= withRedundant.canvas.h + 0.01,
+      `${label}：约简后画布盒不放大（${withRedundant.canvas.w}×${withRedundant.canvas.h} → ${withoutRedundant.canvas.w}×${withoutRedundant.canvas.h}）`,
+    );
+    for (const f of withRedundant.frames)
+      assert.ok(
+        f.box.x >= 0 && f.box.y >= 0 && f.box.x + f.box.w <= withRedundant.canvas.w + 0.01 && f.box.y + f.box.h <= withRedundant.canvas.h + 0.01,
+        `${label}：框盒 ${f.projectId} 完全落在画布固定盒内（出血 = 出参被裁掉）`,
+      );
+    for (const { d } of withRedundant.paths)
+      for (const [x, y] of dPoints(d))
+        assert.ok(x >= 0 && y >= 0 && x <= withRedundant.canvas.w + 0.01 && y <= withRedundant.canvas.h + 0.01, `${label}：折线点 ${x},${y} 不出画布盒`);
+  }
+});
+
+test("N3不翻向确认（N6 降级为行为级 · 原「走线族三处载体仍吃声明原边集」的载体退休）：图形面吃本质边、审计面（h2 三数 + chip 依赖段）仍吃声明原值", async () => {
+  const tasks = sample076bbb84();
+  const html = await htmlOfTasks(tasks);
+  const scene = behaviorSceneOf(html);
+  const graph = buildTaskGraph(tasks);
+  const { kept, dropped } = transitiveReduce(graph.edges);
+  assert.equal(scene.paths.length, kept.length, "图形面 = 本质边集（约简确实发生在描边之前）");
+  const h2 = parseH2(html);
+  assert.equal(h2.declared, graph.edges.length, "审计面 h2「声明」仍吃原值 10");
+  assert.equal(h2.omitted, dropped.length, "审计面 h2「传递省略」如实报 2");
+  const n6Title = [...scene.chips].find((c) => c.taskId === "n6");
+  assert.ok(n6Title !== undefined, "n6 在图形面在场");
+  const depsSeg = /依赖：([^"]*)/.exec(html.split('title="n6 · ')[1] ?? "")?.[1] ?? "";
+  for (const dep of ["n1", "n2", "n3", "n4", "n5"])
+    assert.ok(depsSeg.includes(dep), `审计面（chip title 的依赖段）仍列声明原值 ⇒ 被省略的 ${dep} 不得从 title 里消失：实得「${depsSeg}」`);
+});
+
+// ---------------------------------------------------------------------------
+// v0.10.7 N11（REQ-2026-10-15-01 · 承接轨 · 改造文档 §4「测试锚面 · 补 2 枚」）
+//   补负钉锚 + 恢复全量口径（**根列车同族 2 枚负钉属宿主主笔 `.omo/skills/regression-test/`，
+//   本节点只落板侧用例、不碰根列车**）：
+//   ① 退休符号（阵型/画布族 + `DG_APPROACH_*` 三枚 + `layerCrossApproach`）在**去注释后**的
+//      `src/graph-view.ts` 内各命中 0；
+//   ② `elkjs` 在 `board/package.json.dependencies` 在册（§2.1-5 · ELK 求解器接线凭据）；
+//   ③ N4 空图负钉（全量口径）：真板夹具 eb86d5e8（28 节点）走缺省求解 ⇒ 出口 HTML 不得含
+//      「依赖图布局失败」/「回吐空图」两串（此前 N4出口-③ 只用 `n4Tasks` 两枚链任务，本枚补到全量面）；
+//   ④ 体量登记（快照）：`src/graph-view.ts` 行数 ≤ 1200 且本文件顶层 test 枚数 ≥ 85
+//      （§2.3 退休清单落地后从 v0.10.5 走线族时代 ≈ 2400 行回落到 ~860 行，反弹 = 走线族回填 = 本枚红）。
+// ---------------------------------------------------------------------------
+
+/** 去块注释（`/* … * /`）与去 `//` 到行尾的粗筛（与 §4 判据「去注释 grep」同口径 · 本节点唯一用途）。 */
+const stripTsComments = (src) => src.replace(/\/\*[\s\S]*?\*\//g, "").replace(/\/\/[^\n]*/g, "");
+
+test("N11负钉① 退休符号在去注释后的 src/graph-view.ts 内各命中 0（阵型/画布族 + DG_APPROACH 三枚 + layerCrossApproach）", () => {
+  const code = stripTsComments(readFileSync(new URL("../src/graph-view.ts", import.meta.url), "utf8"));
+  for (const sym of [
+    "layerCrossApproach",
+    "DG_APPROACH_SNAP_PX",
+    "DG_APPROACH_LATERAL_PX",
+    "DG_APPROACH_STUB_PX",
+    "planCanvas",
+    "pipeGridLayout",
+  ]) {
+    const hits = code.split(sym).length - 1;
+    assert.equal(hits, 0, `退休符号 ${sym} 在去注释后的 src/graph-view.ts 不得残留（实得 ${hits} 处）`);
+  }
+});
+
+test("N11负钉② elkjs 在 board/package.json dependencies 在册（§2.1-5 · ELK 求解器接线凭据）", () => {
+  const pkg = JSON.parse(readFileSync(new URL("../package.json", import.meta.url), "utf8"));
+  assert.equal(typeof pkg.dependencies?.elkjs, "string", "dependencies.elkjs 必须是版本串");
+  assert.match(pkg.dependencies.elkjs, /^\^?\d+\.\d+\.\d+/, `dependencies.elkjs 须为 semver（实得 ${pkg.dependencies?.elkjs}）`);
+});
+
+test("N11负钉③ N4 空图负钉（真板全量口径）：eb86d5e8 走缺省求解 ⇒ 出口 HTML 不含兜底两串", async () => {
+  const { html } = await renderDependencyGraphSection(realTasks());
+  assert.ok(html.length > 0, "真板必有出参（本枚负钉的前提，html 若空 = 出图塌 · 非「未触发兜底」）");
+  assert.equal(html.includes("依赖图布局失败"), false, "N4 兜底行的字面不得出现在正常路径（真板 28 节点面）");
+  assert.equal(html.includes("回吐空图"), false, "「回吐空图」四字属 catch 面独占，正常路径不得染指");
+});
+
+test("N11登记④ 体量快照：src/graph-view.ts 行数 ≤ 1200 · 本文件顶层 test 枚数 ≥ 85（退休清单落地后的回落档不得反弹）", () => {
+  const viewLines = readFileSync(new URL("../src/graph-view.ts", import.meta.url), "utf8").split("\n").length;
+  const testPins = readFileSync(new URL("./graph-view.test.mjs", import.meta.url), "utf8")
+    .split("\n")
+    .filter((l) => /^test\(/.test(l)).length;
+  assert.ok(viewLines <= 1200, `src/graph-view.ts 行数 ${viewLines} > 1200 ⇒ 退休清单落地后的回落档反弹（v0.10.5 走线族时代 ≈ 2400）`);
+  assert.ok(
+    testPins >= 85,
+    `graph-view.test.mjs 顶层 test 枚数 ${testPins} < 85 ⇒ N11 补钉 4 枚不得摘除（N10 收口基线 82 + 本节点 4 = 86）`,
+  );
+});
+
+

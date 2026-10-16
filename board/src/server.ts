@@ -202,14 +202,14 @@ import {
   type GroupMemberWriteOptions,
 } from "./group-admin.js";
 import { OrgsLedgerStore, defaultOrgsLedgerFile, enabledOrgNames, findOrgRecord, ledgerOrgNames, disabledOrgNames, isOrgDisabled } from "./orgs-ledger.js";
-import { VersionsLedgerStore, defaultVersionsLedgerFile, ledgerVersionNames, releasedVersionNames, type VersionsLedger } from "./versions-ledger.js";
+import { VersionsLedgerStore, defaultVersionsLedgerFile, ledgerVersionNames, releasedVersionNames, type VersionOrgFilter, type VersionsLedger } from "./versions-ledger.js";
 import { createVersionsWriteClient, describeVersionWriteError, type VersionsWriteClient } from "./versions-write.js";
 import { SuspendLedgerStore, defaultSuspendLedgerFile, type SuspendedEntry } from "./suspend-ledger.js";
 import { statDirKind } from "./host-runtime.js";
 import { readVersion } from "./version.js";
 import { isVersionLocked } from "./version-status.js";
 import { normalizeVersion, sortPoolEntries } from "./version-order.js";
-import { defaultRepoRoot, readDoc, type DocsSource } from "./docs-read.js";
+import { defaultRepoRoot, docExistsOnDisk, readDoc, type DocsSource } from "./docs-read.js";
 import { docsMoveRegistrations, executeDocsMove, planDocsMove, type DocsMoveResult } from "./docs-move.js";
 import { defaultStaticRoot, findVendoredAsset, VENDORED_ASSETS, MERMAID_ASSET, mermaidAssetScriptTag, mermaidRenderScript, vendoredAssetExists } from "./docs-render.js";
 import { renderDependencyGraphSection } from "./graph-view.js";
@@ -304,8 +304,11 @@ import {
   renderTurnProgress,
   renderTurnTrace,
   registeredDecisionDocFiles,
+  registeredDecisionDocRefs,
+  resolveDocDirFromRegistrations,
   selectRequirementPool,
   stopBridgeErrorOverlay,
+  type RegisteredDocExists,
   type TasksPreviewInput,
   turnOutcomeErrorOverlay,
 } from "./web/views.js";
@@ -846,6 +849,36 @@ export function projectVersionTierOf(projection: EngineVersionsProjection | null
 }
 
 /**
+ * **可删版号集合**（REQ-2026-10-15-05 N1 · 改造文档 §2.2 N1）—— 页级 `×` 显示判据用的集合，**不是写闸**
+ * （引擎删版放行判据在 orch 侧，板不重算、不代判）。
+ *
+ * 数据通路**与显示面分家、不得合并**：本函数只吃**原始** `projection.entries`；
+ * 显示面（版本列 / 徽标 / 摘要）继续吃「投影-或-本地读缓存」的台账形状（见 {@link projectionLedgerOf}）。
+ * 判据 = **白名单**（不是「非 `released`」黑名单）∧ org 切片 ∧ `normalizeVersion` 归一后的版号：
+ * - `status ∈ {"notstart","active"}` —— **严格判等**；脏值 / `null`（老桥缺键）**不入集**，
+ *   折叠归一一律不做（把未知状态当可删 = 只松不紧）；
+ * - `projection === null`（本进程从未读到过投影）⇒ **空集**（不是 `undefined`、更不是「全放行」——
+ *   读不到台账时一个 `×` 都不出，fail-closed）；
+ * - 空版号条目忽略（无版号无从谈删）。
+ * **负向钉**：本函数体内**不得**出现 {@link projectionLedgerOf}（该折叠把脏状态归一成 `notstart`，
+ * 经它取数会把「状态未知的版本」染成可删）。
+ */
+export function deletableVersionSetOf(
+  projection: EngineVersionsProjection | null,
+  org?: VersionOrgFilter,
+): Set<string> {
+  const names = new Set<string>();
+  if (projection === null) return names;
+  for (const entry of projection.entries) {
+    if (org !== undefined && entry.org !== org) continue;
+    if (entry.status !== "notstart" && entry.status !== "active") continue;
+    const v = normalizeVersion(entry.version);
+    if (v !== "") names.add(v);
+  }
+  return names;
+}
+
+/**
  * project 档**三态显示闭集**里「读不到」那一档的降级条正文单点（v0.10.1 B2 · C-7：
  * 在场有行 / 在场无行 / 读不到）：`live` 与 `empty` ⇒ `null`（**无降级条** —— `empty` 是
  * **合法事实**「未登记，本版本起生效」，由 project 档自己渲文案，不是降级），
@@ -902,8 +935,14 @@ function respondVersionProjectionClosed(
  * 排期看板正文单点（v0.9.6 B5a 起唯一调用方 = D 档组织空间排期页；全局 `/schedule` 页已退役）：
  * 数据源由调用方给定（空间 = 先过 {@link featuresOfOrg} 按 ownerGroup 过滤）。
  * 弹窗表单的组织上下文（BD8）：`spaceOrg` 非空 ⇒ 免选形态（只读展示 + hidden 值必发 + action 带前缀）。
- * **v0.10.0 B4 数据源分家**：`lockedVersions` = **引擎投影喂入**的已发版名单（调用方经
- * {@link versionProjectionOf} 取，按 `spaceOrg` 切片）；`ledger` = 本地台账，**不再参与锁判定**。
+ * **v0.10.0 B4 数据源分家**：`lockedVersions` = **引擎投影喂入**的已发版名单（判据 `isVersionLocked`
+ * 零改动，**不参与**本地台账）；`projection` 由调用方经 {@link versionProjectionOf} **一次取好后传入**
+ * —— 本单点**不自行读取**（同一次上游读取由页级供数点共用，「排期页一次渲染 = 一次上游读取」的锚 =
+ * `test/v0101-server-projection-two-tier.test.mjs` B2-④）。
+ * **REQ-2026-10-15-05 N1 页级换源**：`ledger` 由「本地台账」升为调用方喂入的**投影优先台账**
+ * （照 {@link portalSummaryLedgerOf} 先例：仅在**从未读到过投影**时才是本地读缓存）。
+ * **REQ-2026-10-15-05 B-N2**：`deletableVersions` = 调用方经 {@link deletableVersionSetOf} 裁出的
+ * **可删版号集合**（列头 `×` 的唯一显示判据来源，与 `ledger` 分家）—— 本单点只透传、不重算。
  * **版本列并集（v0.10.0 尾段 N1）**：列源 = **引擎版本台账清单 ∪ 卡派生版号**（并集留板，见
  * {@link projectionVersionNames} / {@link groupFeaturesByVersion}）—— **绝不只渲染引擎清单**
  * （引擎无条目 ∧ 卡有 `version` ⇒ 该卡仍须成列，否则它在版本面失去清单读面）；本地台账只在
@@ -929,18 +968,19 @@ async function renderScheduleBoard(
   features: readonly FeatureListItem[],
   ledger: VersionsLedger,
   spaceOrg: string | null,
+  projection: EngineVersionsProjection | null,
+  deletableVersions: ReadonlySet<string>,
 ): Promise<string> {
   const org = spaceOrg === null ? undefined : spaceOrg.trim();
   // B4：已发版锁名单改由引擎投影喂入（判据 `isVersionLocked` 零改动）；投影不可达 ⇒ 退到
   // 最后一次投影（读面只紧不松），仍拿不到 ⇒ 空名单 = 不显示锁样式（执法在写口 fail-closed）。
-  const projection = await versionProjectionOf(ctx);
   const lockedVersions = releasedVersionNames(versionProjectionLedgerOf(projection), org);
   // N1：版本列的台账侧版号 = 引擎清单（事实源）；投影从未读到过 ⇒ 退到本地台账读缓存
   // （降级档，正常档空数组）。并集（∪ 卡派生版号）在视图侧完成，此处不预裁。
   const engineColumnVersions = projectionVersionNames(projection, org);
   const ledgerColumnVersions = projection === null ? ledgerVersionNames(ledger, org) : [];
   return (
-    renderSchedule(groupFeaturesByVersion(features, ledgerColumnVersions, engineColumnVersions), selectRequirementPool(features), lockedVersions, ledger, org) +
+    renderSchedule(groupFeaturesByVersion(features, ledgerColumnVersions, engineColumnVersions), selectRequirementPool(features), lockedVersions, ledger, org, deletableVersions) +
     // 提需求弹窗骨架（表单原样复用；orgsDir 三档提示与锁版警示随表单呈现）
     renderNewRequirementDialog(ctx.write.defaultGroup, orgsStatusOf(ctx.host), lockedVersions, spaceOrg) +
     (spaceOrg !== null ? renderNewVersionDialog(spaceOrg) : "")
@@ -1073,7 +1113,9 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
   // T2 依赖图（v0.10.3 N2c 起 = 管道制自绘 DOM/CSS）：区块**零脚本** ⇒ 详情页整页档不再注入
   // mermaid 资产与渲染脚本。排期页 `schedulePageScripts` 的那一枚**保留**（浮层内点开的文档页
   // 仍要渲染 mermaid —— 摘错 ⇒ 浮层里 mermaid 退化成源文本）。
-  const graph = renderDependencyGraphSection(detail.tasks);
+  // **v0.10.7 N4**：改走 async 出口（ELK 求解 / 映射出错 ⇒ 回吐空图 + 一行提示，本页不 500）。
+  // **v0.10.7 N5**：async 出口合流进唯一公开口 `renderDependencyGraphSection`（几何 = ELK 出参）。
+  const graph = await renderDependencyGraphSection(detail.tasks);
   // 版本切片读面（v0.9.6 B3）：详情页的排期锁 = **该卡归属组织**的 released 切片
   // （归属缺失 ⇒ 空串桶 `""`，与 `migrateLedgerOrgs` 的未归属桶同构）—— 他组织的同版号不锁本卡。
   // **v0.10.0 B4**：切片的数据源由本地台账换成**引擎版本台账投影**（锁判据 `isVersionLocked` 零改动）。
@@ -1101,6 +1143,8 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
         answerFormHtml: answerForm,
         graphHtml: graph.html,
         acceptanceHtml: renderAcceptanceSection(detail.acceptance),
+        // N6：失联警示判据 = 登记路径在盘上是否存在（server 侧预算，视图不碰 fs）
+        docExists: registeredDocExistenceOf(ctx, f),
       },
     ),
     // v0.10.4 REQ-2026-10-11-03 N5：详情页整页档收第八枚（单档盖 `/features/:id` 与空间档两入口）。
@@ -1147,8 +1191,38 @@ function hostChainSnapshotOf(ctx: Ctx, featureId: string): ChainStateSnapshot | 
 }
 
 /**
+ * 登记文档的**盘上存在性**预算（REQ-2026-10-15-05 N6 · 改造文档 §2.2 N6）：失联警示的判据源。
+ * 逐条登记路径走 `docs-read.docExistsOnDisk`（同族守卫、只 stat 不读内容），目录段与读端点
+ * **同一单点**（{@link resolveDocDirFromRegistrations} 的末条登记，未带段 ⇒ 回落 `version`）；
+ * 取源次序同 {@link handleFeatureDoc}（源 A 未命中回落源 B）。
+ * 算好的布尔（键 = 文件名段）喂视图 ⇒ **视图层保持无 `node:fs`**。
+ */
+function registeredDocExistenceOf(
+  ctx: Ctx,
+  feature: { version: string | null; ownerGroup: string | null; decisions: string | null },
+): RegisteredDocExists {
+  const dirs = { repoRoot: ctx.docs.repoRoot, orgsDir: ctx.docs.orgsDir, org: feature.ownerGroup };
+  const exists = new Map<string, boolean>();
+  for (const ref of registeredDecisionDocRefs(feature.decisions)) {
+    const dirSegment = (ref.dir ?? feature.version ?? "").trim();
+    exists.set(
+      ref.file,
+      dirSegment === ""
+        ? false
+        : docExistsOnDisk(dirs, "A", dirSegment, ref.file) ||
+            docExistsOnDisk(dirs, "B", dirSegment, ref.file),
+    );
+  }
+  return exists;
+}
+
+/**
  * `GET /features/:id/docs?file=<name>[&src=A|B]`（BD11 a 案 HTTP 面）：
- * 版本与归属组织从桥侧详情取（**不接受调用方传 version** ⇒ 无从绕开白名单），
+ * **读锚目录段由本需求 `decisions` 登记解析给出**（REQ-2026-10-15-05 N5 · 改造文档 §2.2 N5）——
+ * 取**该 `file` 的末条登记**的目录段（{@link resolveDocDirFromRegistrations}，单点解析），
+ * 未命中 ⇒ **回落 `feature.version`**；回落值也为空（未排期 / 删版后清 `version`）⇒ 空段进
+ * {@link readDoc} 出**结构化 `docs_read_invalid`**（**不猜目录**，文案不泄根）。
+ * 归属组织仍从桥侧详情取，**不接受调用方传目录段或 version**（`href` 只带 `file`）⇒ 无从绕开允许集，
  * 落盘读取全权交 docs-read 的四件套守卫。读面恒 GET、不过 CSRF（既有口径）。
  *
  * 两档呈现（同 `wantsJson` 分流先例）：`Accept: text/html`（浏览器点开）⇒ 整页；
@@ -1174,16 +1248,21 @@ async function handleFeatureDoc(
   const srcExplicit = srcParam === "A" || srcParam === "B";
   let version: string | null;
   let org: string | null;
+  let decisions: string | null;
   try {
     const detail = await ctx.client.getFeature(featureId);
     version = detail.feature.version;
     org = detail.feature.ownerGroup;
+    decisions = detail.feature.decisions;
   } catch (err) {
     respondText(res, 502, `需求数据读取失败，无法定位文档：${errText(err)}`);
     return;
   }
+  // N5 读锚：登记末条目录段优先，未命中回落 `feature.version`（**登记与盘上不一致 ⇒ 只显示
+  // 「打不开」，板不回写登记** —— 板无 `decisions` 写口，这是既定形态、不是缺陷）。
+  const dirSegment = resolveDocDirFromRegistrations(decisions, file) ?? version ?? "";
   const dirs = { repoRoot: ctx.docs.repoRoot, orgsDir: ctx.docs.orgsDir, org };
-  const read = (source: DocsSource) => readDoc(dirs, source, version ?? "", file);
+  const read = (source: DocsSource) => readDoc(dirs, source, dirSegment, file);
   let src: DocsSource = srcExplicit ? (srcParam as DocsSource) : "A";
   let result = read(src);
   if (!srcExplicit && !result.ok && result.code === "docs_read_not_found") {
@@ -2048,10 +2127,33 @@ function renderSpaceNav(org: string, view: OrgSpaceView | null): string {
  * **建版本入口归本页（v0.9.6 B4 · 口径 4 / 24）**：页头「＋ 新版本」按钮 + {@link renderNewVersionDialog}
  * 骨架同批在位（骨架由 {@link renderScheduleBoard} 在 `spaceOrg !== null` 档渲染）——台账按
  * `(org, version)` 成域后，本页是**全站唯一**的登记新版本入口（全局 `/schedule` 那份已随 B5a 整页退役）。
+ * **REQ-2026-10-15-05 N1 页级换源（改造文档 §2.2 N1）**：页级 `ledger` 由「恒读本地台账」改为
+ * **投影优先、仅在从未读到过投影时退本地读缓存**（照 {@link portalSummaryLedgerOf} 先例形态）——
+ * 投影在本页**只取一次**，同时喂 `ledger` 与 {@link renderScheduleBoard}（不新增上游读取）。
+ * **本地台账的降级读缓存角色不废**（撤它会同时打掉桥宕时的版本列渲染）。
+ * 两条数据通路**分家**：显示面吃这份 `ledger`，`×` 的可删判据另吃 {@link deletableVersionSetOf}
+ * （由投影原始 `entries` 裁，见 B-N2）。
+ * **REQ-2026-10-15-05 N9 + B-N13（改造文档 §2.2 N9 / §4 真机清单第 5 条）**：`×` 的显示面依赖桥可达性
+ * ⇒ 投影不可读那一档除「整页无 `×`」（B-N12 ③）外，页头另给**一行原因短条**，免得读面把 fail-closed
+ * 表现成「所有版本都不可删」的静默形态。文案**不另写一套** —— 单点 = {@link Ctx.engineVersionsFailure}
+ * （由 {@link versionProjectionOf} 经 {@link versionProjectionUnreadableText} 落根因码，与写口 503 /
+ * 管理页「核对源健康度」短条第三档同源）；包装照 {@link renderOrgConfigHealthBar} 的页头短条形态
+ * （`<p class="hint">`）。判据 = 「本轮投影读失败」⇒ **从未读到**（无 `×`）与 **stale**（`×` 由最后一次
+ * 投影裁）两档都出声；本节点不写任何业务判据文案。
  */
 async function pageOrgSpaceSchedule(ctx: Ctx, org: string, all: readonly FeatureListItem[], orgNav: PageOrgNav): Promise<Page> {
   const features = featuresOfOrg(all, org);
-  const ledger = ctx.versionsLedger.load().ledger;
+  // N1：页级台账换源 —— 读到投影 ⇒ 投影折叠（三态齐全，徽标 / 摘要照常）；从未读到过 ⇒ 退本地台账读缓存。
+  const projection = await versionProjectionOf(ctx);
+  const ledger = projection === null ? ctx.versionsLedger.load().ledger : projectionLedgerOf(projection);
+  // B-N2：× 的可删判据走**独立通路**（从投影原始 entries 按白名单裁，不经上面的显示折叠）；
+  // 判据原文见规范 §7「版本删除纪律」，板侧不重算、只裁显示。
+  const deletableVersions = deletableVersionSetOf(projection, org);
+  // N9/B-N13：投影不可读 ⇒ 页头一行原因短条（只透单点文案，不夹带任何业务判据）。
+  const projectionUnreadableBar =
+    ctx.engineVersionsFailure === null
+      ? ""
+      : `<p class="hint">${escapeHtml(ctx.engineVersionsFailure)}</p>`;
   return {
     title: `空间 · ${org} · 排期`,
     active: "schedule",
@@ -2061,7 +2163,7 @@ async function pageOrgSpaceSchedule(ctx: Ctx, org: string, all: readonly Feature
       '<button type="button" id="new-req-open" class="header-actions">＋ 新增需求</button>' +
       '<button type="button" id="new-version-open" class="header-actions" hidden>＋ 新版本</button>',
     // B5b ⑤：看板页头 `<h2>` 由本页给出（`renderSchedule` 不再自带）
-    bodyHtml: `${renderSpaceNav(org, "schedule")}<h2>排期看板</h2>${await renderScheduleBoard(ctx, features, ledger, org)}`,
+    bodyHtml: `${renderSpaceNav(org, "schedule")}<h2>排期看板</h2>${projectionUnreadableBar}${await renderScheduleBoard(ctx, features, ledger, org, projection, deletableVersions)}`,
     extraScripts: schedulePageScripts(ctx),
   };
 }

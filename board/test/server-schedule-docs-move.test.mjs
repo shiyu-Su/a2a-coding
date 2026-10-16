@@ -8,7 +8,9 @@
  * - MV-③：守卫负例 —— 越树 / 层级越界 / 非法版本段 / 非 .md ⇒ `rejected` 且**零文件动作**；
  *   未登记文件（不在 decisions 里）原地不动；
  * - MV-④：主干未命中（= 组织工作区（源 B）形态）⇒ 不自动搬、`manual` 列出、第二跳不发生；
- * - MV-⑤：清空回池 / 非 semver 目标 ⇒ 整体不搬（文档留原目录，M6 失联警示照旧）；
+ * - MV-⑤：清空回池 / 非 semver 目标 ⇒ 整体不搬（文档留原目录 ⇒ 登记路径在盘上仍在 ⇒
+ *   **读锚照样定位到它、M6 失联警示不成立**；REQ-2026-10-15-05 N6 起失联判据 = 盘上存在性，
+ *   不再是「文档留在旧版本目录」这件事本身）；
  * - MV-⑥：善后第二跳失败**不回滚**已成功的排期写（仍 200，异常如实进 `docMoves.failed`）。
  *
  * mv 是服务端文件动作、不经 HTTP 写路由面（故本文件不测 `/static` 白名单，那条在既有面锚里）。
@@ -25,6 +27,7 @@ import {
   executeDocsMove,
   planDocsMove,
 } from "../dist/docs-move.js";
+import { docExistsOnDisk } from "../dist/docs-read.js";
 import { engineNoLockFetcher } from "./engine-versions-fixture.mjs";
 
 const NOW = Date.parse("2026-09-26T12:00:00Z");
@@ -272,7 +275,13 @@ test("MV-⑤：清空回池 / 非 semver 目标版本 ⇒ 整体不搬（文档�
         assert.equal(seen.length, 1, "无第二跳");
       });
     }
-    assert.ok(existsSync(join(root, "doc/v0.9.1/甲-改造文档.md")), "文档原地未动（M6 失联警示行仍如实显示）");
+    assert.ok(existsSync(join(root, "doc/v0.9.1/甲-改造文档.md")), "文档原地未动");
+    // N6 失联判据 = 登记路径在盘上是否存在 ⇒ 原地未动即「在盘上」⇒ 不构成失联、不警示
+    assert.equal(
+      docExistsOnDisk({ repoRoot: root, orgsDir: null, org: "g" }, "A", "v0.9.1", "甲-改造文档.md"),
+      true,
+      "读锚按登记路径仍定位得到这份文档 ⇒ M6 失联警示不成立",
+    );
   } finally {
     rmSync(root, { recursive: true, force: true });
   }

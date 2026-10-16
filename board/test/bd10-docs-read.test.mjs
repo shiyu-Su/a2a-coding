@@ -3,20 +3,26 @@
  * REQ-v0.9.2-2026-09-26-01 起目录扫描 `listDocs` / 分类标注作废 ⇒ 对应用例随删，
  * 本文件只剩**单文件读取守卫**）。
  *
- * 覆盖：`..` / `%2e%2e` / 盘符 / 绝对路径 / 反斜杠 / 非 .md / 超 256KiB / version 非法
+ * 覆盖：`..` / `%2e%2e` / 盘符 / 绝对路径 / 反斜杠 / 非 .md / 超 256KiB / **目录段不合规**
+ *   （= 非版号且非 `pool` 的段，REQ-2026-10-15-05 N4 起读面入参语义由 version 改**目录段**）
  *   ⇒ 全部结构化拒绝或截断降级，**不抛未捕获异常**；失败文案不泄根。
+ * 负向锚两枚分立（N7 锚面要求）：「非版号且非 `pool` 的段 ⇒ 拒」与「`pool` ⇒ 放行」
+ *   各自一枚，谓词层与 `readDoc` 层各一对 —— 允许集放宽不得把负判据吞掉。
  */
 import { test } from "node:test";
 import assert from "node:assert/strict";
-import { mkdtempSync, mkdirSync, writeFileSync, rmSync } from "node:fs";
+import { mkdtempSync, mkdirSync, writeFileSync, rmSync, readFileSync } from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
+import { fileURLToPath } from "node:url";
 
 import {
   MAX_DOC_FILE_BYTES,
   defaultRepoRoot,
   docsRootFor,
   isValidDocVersion,
+  isAllowedDocDirSegment,
+  docExistsOnDisk,
   readDoc,
 } from "../dist/docs-read.js";
 
@@ -26,12 +32,12 @@ function tmpDisk(prefix) {
   return { dir, abs: dir };
 }
 
-/** 落一份文档：source=A ⇒ <disk>/doc/{version}/{name}；B ⇒ <disk>/orgs/org1/doc/{version}/{name}。 */
-function putDoc(disk, source, version, name, content = "# doc\n") {
+/** 落一份文档：source=A ⇒ <disk>/doc/{目录段}/{name}；B ⇒ <disk>/orgs/org1/doc/{目录段}/{name}。 */
+function putDoc(disk, source, dirSegment, name, content = "# doc\n") {
   const base =
     source === "A"
-      ? join(disk.abs, "doc", version)
-      : join(disk.abs, "orgs", "org1", "doc", version);
+      ? join(disk.abs, "doc", dirSegment)
+      : join(disk.abs, "orgs", "org1", "doc", dirSegment);
   mkdirSync(base, { recursive: true });
   writeFileSync(join(base, name), content, "utf8");
 }
@@ -40,7 +46,7 @@ function putDoc(disk, source, version, name, content = "# doc\n") {
 // ① 守卫负例
 // ---------------------------------------------------------------------------
 
-test("version 白名单：合法收下，非法一律拒（且不抛）", () => {
+test("版号谓词 isValidDocVersion：合法版号收下，其余一律拒（且不抛）—— 它不管 pool（pool 由允许集放行，见下）", () => {
   assert.equal(isValidDocVersion("v0.9.1"), true);
   assert.equal(isValidDocVersion("v10.0.23"), true);
   for (const bad of ["", "v0.9", "v0.9.1.2", "0.9.1", "V0.9.1", "v0.9.x", "v0.9.1/", "../v0.9.1", "v0.9.1.md", "version"]) {
@@ -48,14 +54,36 @@ test("version 白名单：合法收下，非法一律拒（且不抛）", () => 
   }
 });
 
-test("version 非法 ⇒ readDoc 结构化拒绝（不抛错）", () => {
+test("目录段负锚：非版号且非 pool 的段 ⇒ readDoc 结构化拒绝（不抛错、不泄根）", () => {
   const disk = tmpDisk("board-docs-");
+  putDoc(disk, "A", "v1.2.3", "a.md", "# 在盘上但段不合规\n");
   const dirs = { repoRoot: disk.abs, orgsDir: null, org: null };
-  for (const bad of ["v9", "../../etc"]) {
+  for (const bad of ["v9", "../../etc", "v0.10", "docs", "latest", "POOL", "pool ", "", "C:", "a%2e"]) {
     const r = readDoc(dirs, "A", bad, "a.md");
-    assert.equal(r.ok, false);
-    assert.equal(r.code, "docs_read_invalid");
+    assert.equal(r.ok, false, bad);
+    assert.equal(r.code, "docs_read_invalid", bad);
+    assert.ok(!r.error.includes(disk.abs), `失败文案不得泄根路径: ${bad}`);
   }
+  rmSync(disk.abs, { recursive: true, force: true });
+});
+
+test("目录段正锚：pool ⇒ readDoc 放行（未排期停靠档读得开，其余三件套照过）", () => {
+  const disk = tmpDisk("board-docs-");
+  putDoc(disk, "A", "pool", "unscheduled-需求确认单.md", "# pool 档\n");
+  putDoc(disk, "B", "pool", "org-pool.md", "# 组织工作区 pool 档\n");
+  const dirs = { repoRoot: disk.abs, orgsDir: join(disk.abs, "orgs"), org: "org1" };
+  const r = readDoc(dirs, "A", "pool", "unscheduled-需求确认单.md");
+  assert.equal(r.ok, true);
+  assert.equal(r.content, "# pool 档\n");
+  const fromB = readDoc(dirs, "B", "pool", "org-pool.md");
+  assert.equal(fromB.ok, true, "pool 放行同样覆盖源 B");
+  // 放行只针对「目录段」这一维：文件名守卫 / .md 闭集 / 根内收 / 上限不得因 pool 放宽
+  const notMd = readDoc(dirs, "A", "pool", "unscheduled-需求确认单.txt");
+  assert.equal(notMd.ok, false);
+  assert.equal(notMd.code, "docs_read_invalid");
+  const escape = readDoc(dirs, "A", "pool", "../v1.2.3/a.md");
+  assert.equal(escape.ok, false);
+  assert.ok(escape.code === "docs_read_invalid" || escape.code === "docs_read_escapes_root");
   rmSync(disk.abs, { recursive: true, force: true });
 });
 
@@ -155,3 +183,56 @@ test("目录扫描已作废：docs-read 不再导出 listDocs / classifyDoc（RE
   assert.equal(mod.classifyDoc, undefined, "分类标注随清单一并作废");
   assert.equal(typeof mod.readDoc, "function", "单文件守卫读取仍在（打开通道不动）");
 });
+
+// ---------------------------------------------------------------------------
+// v0.10.7 B-N4：文档读允许集（版号 ∨ pool）+ 盘上存在性探针
+// ---------------------------------------------------------------------------
+
+test("允许集正锚：合法版号 ∨ 字面 pool ⇒ 放行（pool 不是版本号，是允许的目录段）", () => {
+  assert.equal(isAllowedDocDirSegment("v0.10.7"), true);
+  assert.equal(isAllowedDocDirSegment("pool"), true);
+  assert.equal(isValidDocVersion("pool"), false, "pool 仍不是版号 —— 放行来自允许集，不来自版号白名单");
+});
+
+test("允许集负锚：非版号且非 pool 的段 ⇒ 一律拒（含段卫生负例 / 大小写与空白变体 / 带分隔符的 pool）", () => {
+  for (const bad of ["v0.10", "v0", "..", "a%2eb", "C:", "", "doc", "pool ", "POOL", "pool/evil", "pool\\evil", "backlog"]) {
+    assert.equal(isAllowedDocDirSegment(bad), false, bad);
+  }
+});
+
+test("docExistsOnDisk：存在 ⇒ true；缺失 / 非 .md / 非法目录段 ⇒ false（一律不抛）", () => {
+  const disk = tmpDisk("board-docs-");
+  putDoc(disk, "A", "pool", "here.md");
+  putDoc(disk, "A", "v0.10.7", "there.md");
+  const dirs = { repoRoot: disk.abs, orgsDir: null, org: null };
+  assert.equal(docExistsOnDisk(dirs, "A", "pool", "here.md"), true);
+  assert.equal(docExistsOnDisk(dirs, "A", "v0.10.7", "there.md"), true);
+  assert.equal(docExistsOnDisk(dirs, "A", "v0.10.7", "missing.md"), false);
+  assert.equal(docExistsOnDisk(dirs, "A", "pool", "missing.md"), false);
+  assert.equal(docExistsOnDisk(dirs, "A", "v0.10", "there.md"), false, "非版号非 pool 的段不探测");
+  assert.equal(docExistsOnDisk(dirs, "A", "..", "here.md"), false);
+  assert.equal(docExistsOnDisk(dirs, "A", "pool", "here.txt"), false, ".md 闭集不动");
+  assert.equal(docExistsOnDisk(dirs, "B", "pool", "here.md"), false, "源 B 未配置 ⇒ false，不越权");
+  rmSync(disk.abs, { recursive: true, force: true });
+});
+
+test("负向锚：DOC_VERSION_PATTERN 与 isValidDocVersion 逐字未改（扩允许集不得动版号判据）", () => {
+  const src = readFileSync(
+    join(dirnameOfModule(), "..", "src", "docs-read.ts"),
+    "utf8",
+  );
+  assert.ok(
+    src.includes("export const DOC_VERSION_PATTERN = /^v\\d+\\.\\d+\\.\\d+$/;"),
+    "版号白名单正则须逐字保留（docs-move 改版善后共用）",
+  );
+  assert.ok(
+    src.includes("export function isValidDocVersion(version: string): boolean {") &&
+      src.includes("return DOC_VERSION_PATTERN.test(version);"),
+    "isValidDocVersion 须逐字保留（形参名 + 实现）",
+  );
+  assert.equal(isValidDocVersion("pool"), false, "pool 不得被认成版本号");
+});
+
+function dirnameOfModule() {
+  return fileURLToPath(new URL(".", import.meta.url));
+}

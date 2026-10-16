@@ -21,7 +21,7 @@ import {
   serializeVersionsLedger,
   setVersionStatus,
 } from "../dist/versions-ledger.js";
-import { createBoardServer } from "../dist/server.js";
+import { createBoardServer, deletableVersionSetOf } from "../dist/server.js";
 import { engineProjectionAbsentFetcher, engineProjectionFetcher, engineEnvelopeFetcher, engineEnvelopeOf, engineProjectionOf, engineProjectLiveField } from "./engine-versions-fixture.mjs";
 
 const NOW = "2026-09-27T12:00:00.000Z";
@@ -373,4 +373,114 @@ test("B5-③（负向钉 b·反向不染色）Group released ∧ project 同名�
   assert.deepEqual(lockedVersions, ["v0.10.0"], "锁名单只由 Group 条目派生（project 侧 open 不把它摘掉）");
   const html = renderSchedule(groupFeaturesByVersion([feature("F1", "v0.10.0")], [], projectionVersionNames(projection)), [], lockedVersions, ledgerWith([]));
   assert.match(headOf(html, "v0.10.0"), /<span class="kbadge vbadge locked"[^>]*>🔒 已发版<\/span>/);
+});
+
+// ---------------------------------------------------------------------------
+// REQ-2026-10-15-05 N1（改造文档 §2.2 N1）—— **两条通路分家**：
+//   ① 页级 `ledger` 换源 = 投影优先、**仅在从未读到过投影时**退本地读缓存（照门户摘要先例）；
+//   ② `×` 的可删判据另吃 `deletableVersionSetOf`（从**原始** `projection.entries` 裁，
+//     判据 = **白名单** {notstart, active} 严格判等 ∧ org 切片 ∧ normalizeVersion；
+//     `projection === null` ⇒ **空集**，不是 undefined、不是「全放行」）。
+//   本节点只产**显示判据**用的集合（引擎写闸在 orch 侧，板不重算）；卡条件归 N2。
+// ---------------------------------------------------------------------------
+
+test("B-N1-① deletableVersionSetOf 三档：notstart（零卡空列）/ active 入集；released 不入；null 与脏值不入（白名单 ≠ 黑名单）", () => {
+  const p = projectionOf([
+    { org: ORG, version: "v3.1.0", status: "notstart" },
+    { org: ORG, version: "v3.2.0", status: "active" },
+    { org: ORG, version: "v3.3.0", status: "released" },
+    { org: ORG, version: "v3.4.0", status: null },
+    { org: ORG, version: "v3.5.0", status: "open" },
+    { org: ORG, version: "  v3.6.0  ", status: "active" },
+    { org: ORG, version: "   ", status: "notstart" },
+  ]);
+  assert.deepEqual(
+    [...deletableVersionSetOf(p, ORG)].sort(),
+    ["v3.1.0", "v3.2.0", "v3.6.0"],
+    "两枚白名单态入集（含零卡空列 v3.1.0 与带空白版号 v3.6.0）；released / null / 脏值一律不入",
+  );
+  assert.ok(![...deletableVersionSetOf(p, ORG)].includes("v3.3.0"), "released 不入（已发版冻结）");
+  assert.ok(![...deletableVersionSetOf(p, ORG)].includes("v3.4.0"), "status null（老桥缺键）不入 ⇒ 未知不当可删");
+  assert.ok(![...deletableVersionSetOf(p, ORG)].includes("v3.5.0"), "脏值 open 不入（白名单严格判等，不折叠归一）");
+});
+
+test("B-N1-② deletableVersionSetOf：projection === null ⇒ 空集（fail-closed）；org 切片同名不染色", () => {
+  const empty = deletableVersionSetOf(null);
+  assert.ok(empty instanceof Set, "空集档也返 Set（不是 undefined、不是「全放行」）");
+  assert.deepEqual([...empty], [], "从未读到过投影 ⇒ 一个 × 都不出");
+  assert.deepEqual([...deletableVersionSetOf(null, ORG)], [], "带 org 切片同档 ⇒ 空集");
+  const p = projectionOf([
+    { org: "alpha", version: "v4.0.0", status: "active" },
+    { org: "beta", version: "v4.0.0", status: "released" },
+    { org: "", version: "v4.1.0", status: "notstart" },
+  ]);
+  assert.deepEqual([...deletableVersionSetOf(p, "alpha")], ["v4.0.0"], "只取本组织条目（他组织同版号的 released 不把它摘掉）");
+  assert.deepEqual([...deletableVersionSetOf(p, "beta")], [], "他组织同名 ⇒ 本侧空集");
+  assert.deepEqual([...deletableVersionSetOf(p, "")], ["v4.1.0"], "空串 = 未归属桶精确档（同 projectionVersionNames）");
+  assert.deepEqual([...deletableVersionSetOf(p)].sort(), ["v4.0.0", "v4.1.0"], "不限组织档 = 两枚白名单条目");
+});
+
+test("B-N1-③（负向锚·源面）deletableVersionSetOf 体内不出现 projectionLedgerOf ⇒ 独立通路（该折叠把脏状态归一成 notstart）", () => {
+  const src = readFileSync(new URL("../src/server.ts", import.meta.url), "utf8");
+  const signature = "export function deletableVersionSetOf(";
+  const start = src.indexOf(signature);
+  assert.ok(start !== -1, "server.ts 未找到 deletableVersionSetOf 单点");
+  const end = src.indexOf("\n}", start);
+  assert.ok(end !== -1, "deletableVersionSetOf 体内未定位到函数结尾");
+  const body = src.slice(start, end);
+  assert.ok(!body.includes("projectionLedgerOf"), "可删集不得经显示面折叠取数（两条通路不得合并）");
+  assert.ok(body.includes("projection.entries"), "可删集只吃投影的原始 entries");
+});
+
+test("B-N1-④ HTTP 页级换源：同一份本地台账（notstart）⇒ 投影在场以投影为准（进行中）、投影从未读到过才退读缓存（未开始）", async () => {
+  const dir = mkdtempSync(join(tmpdir(), "board-bn1-"));
+  try {
+    const ledgerFile = join(dir, "versions.json");
+    writeFileSync(ledgerFile, serializeVersionsLedger(ledgerWith([["v3.1.0", "notstart"]])), "utf8");
+    // 名下只有想法卡 ⇒ 卡派生档也是「未开始」，故列头显示只可能由喂入的台账决定
+    const client = {
+      baseUrl: "http://fake",
+      async getFeatures() {
+        return { features: [feature("F1", "v3.1.0", { stage: "需求分析", approval: "未发起", state: "waiting_approval" })], stateCounts: null };
+      },
+    };
+    const live = await createBoardServer({
+      host: "127.0.0.1",
+      port: 0,
+      client,
+      versionsLedgerFile: ledgerFile,
+      engineVersionsFetcher: engineProjectionFetcher([{ org: ORG, version: "v3.1.0", status: "active" }]),
+    });
+    let text;
+    try {
+      text = await (await fetch(`http://127.0.0.1:${live.port}/org/${ORG}/schedule`)).text();
+    } finally {
+      await live.close();
+    }
+    assert.match(
+      text,
+      /<h3>v3\.1\.0 <span class="kbadge vbadge wip" title="版本台账状态：进行中。">进行中<\/span>/,
+      "投影在场 ⇒ 徽标以投影为准（本地台账的 notstart 不再决定显示，退居读缓存）",
+    );
+
+    const absent = await createBoardServer({
+      host: "127.0.0.1",
+      port: 0,
+      client,
+      versionsLedgerFile: ledgerFile,
+      engineVersionsFetcher: engineProjectionAbsentFetcher(),
+    });
+    try {
+      const degraded = await (await fetch(`http://127.0.0.1:${absent.port}/org/${ORG}/schedule`)).text();
+      assert.match(
+        headOf(degraded, "v3.1.0"),
+        /<span class="kbadge vbadge notstart"[^>]*title="版本台账状态：未开始 = 名下无已过需求确认门的卡。"/,
+        "投影从未读到过 ⇒ 本地台账读缓存照常决定徽标（读缓存角色不废）",
+      );
+    } finally {
+      await absent.close();
+    }
+  } finally {
+    rmSync(dir, { recursive: true, force: true });
+  }
 });

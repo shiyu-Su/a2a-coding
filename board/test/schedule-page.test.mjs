@@ -28,7 +28,7 @@ import {
   renderPage,
 } from "../dist/web/layout.js";
 import { createBoardServer } from "../dist/server.js";
-import { engineNoLockFetcher, engineEnvelopeFetcher } from "./engine-versions-fixture.mjs";
+import { engineNoLockFetcher, engineProjectionFetcher, engineEnvelopeFetcher } from "./engine-versions-fixture.mjs";
 
 function feature(featureId, version, overrides = {}) {
   return {
@@ -1026,7 +1026,16 @@ test("N4-④（B5a 重指空间排期页）HTTP 面：版本台账 released 条�
     ) + "\n",
     "utf8",
   );
-  const handle = await createBoardServer({ host: "127.0.0.1", port: 0, client, versionsLedgerFile: ledgerFile });
+  const handle = await createBoardServer({
+    host: "127.0.0.1",
+    port: 0,
+    client,
+    versionsLedgerFile: ledgerFile,
+    // REQ-2026-10-15-05 N1 页级换源：列头徽标的「版本台账」事实源 = **引擎版本台账投影**
+    // （本地台账文件降为「从未读到过投影」档的读缓存）⇒ 本枚改由夹具喂同值条目（恒注入，
+    // 不注入会打开开发机的真实引擎、锁随本机台账漂移）。降级档的读缓存面另锚 = versions-columns B-N1-④。
+    engineVersionsFetcher: engineProjectionFetcher([{ org: "alpha", version: "v0.9.1", status: "released" }]),
+  });
   try {
     const text = await (await fetch(`http://127.0.0.1:${handle.port}/org/alpha/schedule`)).text();
     assert.match(text, /<h3>v0\.9\.1 <span class="kbadge vbadge locked"[^>]*>🔒 已发版<\/span>/);

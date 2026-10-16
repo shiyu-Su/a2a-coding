@@ -40,6 +40,7 @@ import {
   handleFeatureStatus,
   type FeatureToolFailure,
 } from "../bridge/feature-tools.js";
+import { versionActivator } from "../bridge/versions-activation.js";
 
 const GROUP = "g-x-n3";
 const VERSION = "0.10.5";
@@ -60,9 +61,17 @@ function mustFail(outcome: { ok: boolean }): FeatureToolFailure {
   return outcome as unknown as FeatureToolFailure;
 }
 
-/** 独立库 + 一枚**未激活**（`notstart`）版号 —— 锚 2c 的双向判据要求起点确定 */
+/**
+ * 独立库 + 一枚**未激活**（`notstart`）版号 —— 锚 2c 的双向判据要求起点确定。
+ *
+ * `clearThrottle()`（v0.10.7 n3 随门① 首触发点加的**测试钩子**）：`versionActivator` 是**进程内单例**，
+ * 节流表不随 `close()` 消解 ⇒ 前一发兜底激活留下的同键时刻，会把本发新库里同一
+ * `(GROUP, VERSION)` 的激活尝试挡在 30s 窗口外（表现为「放行同轮仍 `notstart`」的**夹具假红**，
+ * 非引擎判据变化）。生产路径不调、节流语义不变。
+ */
 function freshDb(): void {
   close();
+  versionActivator.clearThrottle();
   mustOk(versionLedgerCreate({ ownerGroup: GROUP, version: VERSION }));
 }
 

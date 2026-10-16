@@ -1,10 +1,10 @@
 /**
  * 板读文档面（BD10 · REQ-v0.9.1-2026-09-25-04 · **纯函数**，零 HTTP —— HTTP 归 BD11）。
  *
- * 职责：文档根解析 + version/文件名解析 + 单文件读取（守卫端点 `/features/:id/docs?file=`）。
- * 双源（改造文档裁决 ①）：
- * - 源 A = `<repoRoot>/doc/{version}/`（主仓根，板配置键 `repoRoot`，缺省 = 板根上一级）；
- * - 源 B = `<orgsDir>/<org>/doc/{version}/`（组织工作区，沿用既有 `orgsDir` 配置）。
+ * 职责：文档根解析 + 目录段/文件名解析 + 单文件读取（守卫端点 `/features/:id/docs?file=`）。
+ * 双源（改造文档裁决 ①；目录段 = 版号或 `pool`）：
+ * - 源 A = `<repoRoot>/doc/{目录段}/`（主仓根，板配置键 `repoRoot`，缺省 = 板根上一级）；
+ * - 源 B = `<orgsDir>/<org>/doc/{目录段}/`（组织工作区，沿用既有 `orgsDir` 配置）。
  *
  * **目录扫描（`listDocs`）已作废**（REQ-v0.9.2-2026-09-26-01 按需求归约）：详情页「阶段产出」
  * 改由本需求 `decisions` 登记驱动，板不再列 `doc/{版本}/` 全目录。
@@ -12,7 +12,8 @@
  * **守卫四件套**（裁决 ②，读取路径全部必配）：
  * 1. 根内收 —— resolve 后核验仍在允许根内（照抄 `resolveOrgWorkspace` 双保险，
  *    host-face.ts:117-133 风格；拒 `..`/盘符/分隔符 + Windows 大小写不敏感比较）；
- * 2. version 白名单 —— `^v\d+\.\d+\.\d+$`，不匹配 ⇒ 结构化拒绝（**不抛错**）；
+ * 2. 目录段允许集 —— `isSafeSegment` ∧（版号 `^v\d+\.\d+\.\d+$` ∨ 字面 `pool`），
+ *    不匹配 ⇒ 结构化拒绝（**不抛错**）；`pool` = 未排期停靠档目录名，**不是版本号**；
  * 3. 仅 `.md` 后缀闭集（读取前校验）；
  * 4. 256KiB 读上限（先例 write-guard.ts:30），超限只读到上限并打截断标记（不整读大文件）。
  *
@@ -31,6 +32,9 @@ export const DOC_VERSION_PATTERN = /^v\d+\.\d+\.\d+$/;
 
 /** 文档扩展名闭集（守卫 3）。 */
 export const DOC_FILE_SUFFIX = ".md";
+
+/** 未排期停靠档的目录名（守卫 2 允许集里唯一的非版号段；它**不是**版本号）。 */
+export const DOC_POOL_DIR_SEGMENT = "pool";
 
 /** 双源标识：A = 主仓根，B = 组织工作区。 */
 export type DocsSource = "A" | "B";
@@ -55,6 +59,15 @@ function isSafeSegment(seg: string): boolean {
     !seg.includes(":") &&
     !seg.includes("%")
   );
+}
+
+/**
+ * 守卫 2（目录段允许集）：段卫生 ∧（版号白名单 ∨ 字面 `pool`）。
+ * **`DOC_VERSION_PATTERN` / `isValidDocVersion` 逐字不动** —— 两者被 `docs-move.ts` 的
+ * 改版善后共用，扩版号白名单会让善后开始搬 `pool`（与「删版不搬文档」对撞）。
+ */
+export function isAllowedDocDirSegment(seg: string): boolean {
+  return isSafeSegment(seg) && (isValidDocVersion(seg) || seg === DOC_POOL_DIR_SEGMENT);
 }
 
 /**
@@ -106,18 +119,18 @@ function fail(code: ReadDocFail["code"], error: string): ReadDocFail {
 
 /**
  * 单文档读取（守卫全四件套过一遍才落盘）：
- * version 白名单 → 文件名段卫生 + `.md` 闭集 → 拼根 → 根内收核验 → stat 判存在/是文件 →
+ * 目录段允许集 → 文件名段卫生 + `.md` 闭集 → 拼根 → 根内收核验 → stat 判存在/是文件 →
  * 上限内分块读（超限只读 256KiB 打 `truncated`，不整读）。
  * 任何一步不过 ⇒ 结构化失败；盘上异常 ⇒ 同样失败，不抛穿。
  */
 export function readDoc(
   dirs: { repoRoot: string; orgsDir: string | null; org: string | null },
   source: DocsSource,
-  version: string,
+  dirSegment: string,
   name: string,
 ): ReadDocResult {
-  if (!isValidDocVersion(version)) {
-    return fail("docs_read_invalid", "版本号不符合 v{major}.{minor}.{patch} 白名单，不打开任何目录");
+  if (!isAllowedDocDirSegment(dirSegment)) {
+    return fail("docs_read_invalid", "文档目录段不在白名单（v{major}.{minor}.{patch} 版号或 pool），不打开任何目录");
   }
   if (!isSafeSegment(name) || !name.endsWith(DOC_FILE_SUFFIX)) {
     return fail("docs_read_invalid", "文档名含非法字符或不是 .md，拒绝读取");
@@ -127,7 +140,7 @@ export function readDoc(
     orgsDir: dirs.orgsDir === null ? "" : resolve(dirs.orgsDir),
     org: dirs.org ?? "",
   });
-  const target = resolve(join(docRoot, version, name));
+  const target = resolve(join(docRoot, dirSegment, name));
   if (!insideRoot(resolve(docRoot), target)) {
     return fail("docs_read_escapes_root", "目标落在文档根之外，拒绝读取");
   }
@@ -168,4 +181,32 @@ export function readDoc(
     text = text.replace(/\uFFFD$/, "");
   }
   return { ok: true, content: text, truncated, bytes: read };
+}
+
+/**
+ * 盘上存在性探针（M6 失联警示的判据载体）：只答「该登记路径在盘上有没有这份文件」。
+ * 与 `readDoc` 同族守卫（目录段允许集 / 文件名段卫生 + `.md` 闭集 / 拼根 / 根内收 / stat），
+ * 但**不打开、不读内容**（256KiB 上限只约束读面，本探针无读操作）；
+ * 任何一步不过或盘上异常 ⇒ `false`，**不抛、不泄根**。
+ */
+export function docExistsOnDisk(
+  dirs: { repoRoot: string; orgsDir: string | null; org: string | null },
+  source: DocsSource,
+  dirSegment: string,
+  name: string,
+): boolean {
+  if (!isAllowedDocDirSegment(dirSegment)) return false;
+  if (!isSafeSegment(name) || !name.endsWith(DOC_FILE_SUFFIX)) return false;
+  const docRoot = docsRootFor(source, {
+    repoRoot: resolve(dirs.repoRoot),
+    orgsDir: dirs.orgsDir === null ? "" : resolve(dirs.orgsDir),
+    org: dirs.org ?? "",
+  });
+  const target = resolve(join(docRoot, dirSegment, name));
+  if (!insideRoot(resolve(docRoot), target)) return false;
+  try {
+    return statSync(target).isFile();
+  } catch {
+    return false;
+  }
 }
