@@ -27,6 +27,8 @@
 
 - **仓库根三枚部署验证打包产物移出仓库**（`machine-0.8.3-validation.zip` · `machine-0.8.4-validation.zip` · `machine-0.8.5-validation.zip`，合计 ≈0.9MB）—— 用户 2026-10-16 裁定「要删掉」。三枚是 v0.8.3–v0.8.5 的部署验证包，当时按**用户裁决「保留 + 入库」**随 commit `b3cf5c1`（v0.8.4）/ `4de1b74`（v0.8.6）入库（见下方 v0.8.3 段「部署打包工具入库」）⇒ **本次为对既有裁决的改判**；三者仍在 git 历史中（`git show <rev>:<path>` 可取回）。`.gitignore` 同步加 `/*-validation.zip` 防复发；本地未入库的 `machine-0.8.7-validation.zip`（自 v0.8.7 起既有的「留盘不入库」形态）**保持在盘、未动**。
 
+- **仓根 `opencode.json` 退役**（用户 2026-10-16 裁定删除）—— 本仓宿主面已收敛到 ZCode（规范引入走 `AGENTS.md`、接入配置在 `.zcode/config.json`），opencode 宿主配置不再需要；`AGENTS.md` 首段同步改写。**opencode 侧的 canonical 样例 `opencode.json.example` 保留**（`README.md:249` 与 `flow/hosts/opencode.md:44` 均指向它，且根回归 `test-v0.7.1-wait-and-stdio-retire.js` 有「remote 单条目」锚）⇒ `flow/hosts/opencode.md` 的跨包链接不受影响。
+
 ### Fixed
 
 - **板上删不掉任何版本**（症状活过 8 个版本）——`×` 的可见性判据查了一份**已退役的事实源**：`views.ts` 用 `findVersionRecord(ledger, …)` 判「台账有无该版」，而 `ledger` 取自板本地 `.data/versions.json`（已冻结：10 条、最大 `v0.9.8`）⇒ 对 v0.10.0 之后创建的**每一个**版本都不渲染（**v0.10.0 B2「写面下沉」漏换的最后一个消费点**）。修法 = 页级 `ledger` 改「**引擎投影优先、仅在从未读到过投影时退本地读缓存**」，并另开「**可删版号集合**」通路（两条数据通路分家，显示面照旧）。**真机凭据**：排期页 `class="inline vdel"` **由 0 变 2**（恰两个零卡未开始版本 `v0.10.8` / `v0.11.0`）。

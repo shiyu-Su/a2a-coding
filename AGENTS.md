@@ -1,6 +1,6 @@
 # a2a-coding — ZCode 工作区指令
 
-> 本文件对应 opencode 宿主根 `opencode.json` 的 `instructions` 数组（canonical 样例：`opencode.json.example`，接入说明见 `flow/hosts/opencode.md`）。ZCode 没有 `instructions` 数组机制，规范引入走本文件；宿主接入配置（MCP a2a + 守卫 hook）在 `.zcode/config.json`。
+> 本仓宿主面**已收敛到 ZCode**：规范引入走本文件，宿主接入配置（MCP a2a + 守卫 hook）在 `.zcode/config.json`。**opencode 宿主配置 `opencode.json` 已于 2026-10-16 删除**（用户裁定）；opencode 侧的 `instructions` 数组机制与 canonical 样例 `opencode.json.example` 仍在（接入说明见 `flow/hosts/opencode.md`），供**其它**项目接入本流程规范时参考。
 
 ## 需求流程（Requirement Flow）
 
