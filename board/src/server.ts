@@ -130,7 +130,6 @@ import {
   type EngineVersionsProjection,
   type FeatureListItem,
   type ProjectVersionsField,
-  type ProjectsView,
   projectVersionsOf,
 } from "./bridge-client.js";
 import { dispositionHttpStatus, terminalTurnRejection, diagnoseOrgsDir, ORGS_DIR_NOT_CONFIGURED, ORG_DISABLED, type BoardHostFace, type TriggerTurnOutcome } from "./host-face.js";
@@ -299,7 +298,7 @@ import {
   renderDocPage,
   renderSchedule,
   renderTasks,
-  renderTasksPick,
+  resolveStageSelection,
   renderTurnOutcome,
   renderTurnProgress,
   renderTurnTrace,
@@ -309,7 +308,6 @@ import {
   selectRequirementPool,
   stopBridgeErrorOverlay,
   type RegisteredDocExists,
-  type TasksPreviewInput,
   turnOutcomeErrorOverlay,
 } from "./web/views.js";
 
@@ -1049,8 +1047,10 @@ async function pageOrgPortal(ctx: Ctx): Promise<Page> {
  * 需求详情页（整页与 `#feat-dialog` 浮层共用同一正文）。
  * **①′（REQ-2026-10-12-01 增补）**：正文不带空间 tab 行、也不带返回链 ⇒ 本函数无空间路由入参。
  * 出路 = 侧栏（一级门户 `/` + 二级组排期 `/org/<名>/schedule`）/ 浮层三出口（关闭钮 · ESC · 点遮罩）。
+ * **v0.10.8 B-10**：`stageQuery` = URL `?stage=` 原值（调用点从 `url.searchParams` 直读，不 trim ——
+ * 回落判据在 `views.resolveStageSelection` 单点），选中结论下传 `extras.selectedStage`。
  */
-async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
+async function pageFeatureDetail(ctx: Ctx, featureId: string, stageQuery: string | null = null): Promise<Page> {
   const detail = await ctx.client.getFeature(featureId);
   let trace = null;
   let traceError: string | null = null;
@@ -1145,6 +1145,9 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string): Promise<Page> {
         acceptanceHtml: renderAcceptanceSection(detail.acceptance),
         // N6：失联警示判据 = 登记路径在盘上是否存在（server 侧预算，视图不碰 fs）
         docExists: registeredDocExistenceOf(ctx, f),
+        // v0.10.8 B-10 切换侧：URL `?stage=` 经三级回落后下传**结论**（步条 `on` 与表侧过滤同值）——
+        // 选中态必须落 URL：详情页活刷按 `pathname + search` 重取，不落 URL 的选择每拍被打回默认。
+        selectedStage: resolveStageSelection(detail, stageQuery),
       },
     ),
     // v0.10.4 REQ-2026-10-11-03 N5：详情页整页档收第八枚（单档盖 `/features/:id` 与空间档两入口）。
@@ -1326,37 +1329,6 @@ async function pageHost(ctx: Ctx, notice: string | null): Promise<Page> {
 }
 
 /**
- * 本组织**声明面**成员 projectId 集（v0.9.6 C2 · §4 口径 6）：数据源 = 3300 `GET /api/groups`
- * （{@link Ctx.orgGroups}，组结构声明面），**不用**逐组 `a2a_projects` 运行态（桥抖动 ⇒ 清单抖动）。
- * 返回值三态：
- * - `Set<string>`（可判定）= 该组声明成员的 projectId 集；组未声明（盘/台账可先于 orch 组存在）⇒ **空集 = 真空**（本组织无项目，非缺位）；
- * - `null`（不可判定）= 查询器未装配（`orgGroups === null`）或声明面读失败（`ok=false` / 抛异常）⇒
- *   调用方**不得**据此外泄他组项目，也不得谎报「本组织无项目」。
- */
-async function orgDeclaredProjectIds(ctx: Ctx, org: string): Promise<Set<string> | null> {
-  if (ctx.orgGroups === null) return null;
-  const outcome: OrgGroupsOutcome = await ctx.orgGroups().catch(
-    (err: unknown): OrgGroupsOutcome => ({
-      ok: false,
-      code: "groups_query_failed",
-      error: err instanceof Error ? err.message : String(err),
-    }),
-  );
-  if (!outcome.ok) return null;
-  const row = outcome.groups.find((g) => g.name === org);
-  if (row === undefined) return new Set<string>();
-  return new Set(row.members.map((m) => m.projectId));
-}
-
-/** 交集过滤：保留 `projects` 快照中 projectId ∈ `ids` 的机器项（`renderTasksPick` 只读 `machines[].projects`）。 */
-function filterProjectsToIds(projects: ProjectsView, ids: ReadonlySet<string>): ProjectsView {
-  return {
-    ...projects,
-    machines: projects.machines.map((m) => ({ ...m, projects: m.projects.filter((p) => ids.has(p.projectId)) })),
-  };
-}
-
-/**
  * 深链任务页头「所属组织」标注（v0.9.6 C3 · §4 口径 34）：projectId → 声明面命中组名。
  * 三态：命中 ⇒ 组名；未命中 ⇒「无归属组织」；查询器未装配 / 声明面读失败 ⇒ `null`（不可判定，
  * 页头不渲该行）。**不臆造默认组**（`ctx.write.defaultGroup` 不参与本判定）。
@@ -1384,60 +1356,10 @@ async function pageTasks(
   orgNav: PageOrgNav,
 ): Promise<void> {
   const project = url.searchParams.get("project");
+  // REQ-2026-10-17-01 B-6（乙′ 前半）：选单档（`/tasks` 无 `project` ⇒ 项目选单页）随空间任务页整支删 ⇒
+  // 本函数现仅服务全局深链 `/tasks?project=X`（调用方已判 `project` 非空）；此 guard 只做 `string | null` 收窄。
   if (project === null || project.length === 0) {
-    let projects = null;
-    let projectsError: string | null = null;
-    try {
-      projects = await ctx.client.getProjects();
-    } catch (err) {
-      projectsError = errText(err);
-    }
-    // v0.9.6 C2（§4 · 口径 6）：空间任务页项目清单 = **交集式真过滤**
-    // = getProjects() 快照的 projectId ∩ 本组织声明面（3300 `GET /api/groups`）该组 `members[].projectId`。
-    // 数据源用**声明面**（orgGroups），**不用**逐组 `a2a_projects` 运行态（桥抖动 ⇒ 清单抖动）；
-    // 组织存在性 / 停用校验已由 `resolveOrgSpaceRoute` 承担，此处不新增触桥。全局档（org===null）不滤。
-    let membershipError: string | null = null;
-    if (org !== null && projects !== null) {
-      const ids = await orgDeclaredProjectIds(ctx, org);
-      if (ids === null) {
-        // 声明面不可判定（查询器未装配 / 3300 读失败）⇒ 不猜、不外泄他组：清空清单 + 如实标注
-        membershipError = "本组织项目集合暂不可判定（声明面 GET /api/groups 读取失败）⇒ 不呈现项目清单（仍可手工输入项目名查询）";
-        projects = { ...projects, machines: [], runners: [] };
-      } else {
-        projects = filterProjectsToIds(projects, ids);
-      }
-    }
-    // 件5（REQ-2026-09-30-04 · 样张④「查询前默认带出近 N 条，不再空屏」）：
-    // 仅**空间档 ∧ 声明面可判定 ∧ 过滤后清单非空**时，对过滤后首个项目做一次只读 `getTasks`。
-    // 全局档到不了本分支（C1 起裸 `/tasks` 已收 303，`/tasks?project=` 走下方深链档）；
-    // 读失败 / 抛错 ⇒ `preview = null`（降级为旧「先选项目」形态，不炸页、不编造空清单）。
-    let preview: TasksPreviewInput | null = null;
-    if (org !== null && membershipError === null && projects !== null) {
-      const candidates = [
-        ...new Set(projects.machines.flatMap((m) => m.projects.map((p) => p.projectId))),
-      ].sort();
-      const first = candidates[0];
-      if (first !== undefined) {
-        try {
-          preview = { view: await ctx.client.getTasks(first, { limit: TASKS_PREVIEW_LIMIT }), limit: TASKS_PREVIEW_LIMIT };
-        } catch {
-          preview = null;
-        }
-      }
-    }
-    sendPage(res, {
-      title: org === null ? "任务视图" : `空间 · ${org} · 任务`,
-      // v0.9.6 B5a（口径 37/38）：全局 /tasks* 的 NAV 高亮归「项目」（NAV 摘「任务」条后不空置）；
-      // 空间任务页不套用（空间侧导航归 B5b 处置）。
-      active: org === null ? "projects" : "tasks",
-      orgNav,
-      // B5b ④：空间档补二级导航行（全局档不渲）；件1 起组清单归侧栏，本行只留三枚 tab
-      bodyHtml:
-        (org === null ? "" : renderSpaceNav(org, "tasks")) +
-        renderTasksPick(projects, projectsError, org, membershipError, preview),
-      // v0.10.4 REQ-2026-10-11-03 N5：任务页选单档收第八枚（三动线局部化的宿主；动线在 views 侧）。
-      extraScripts: PAGE_LIVE_SCRIPT,
-    });
+    respondError(res, accept, 400, "missing_project", "缺少 project 参数（任务选单页已退役，仅保留深链 /tasks?project=X）");
     return;
   }
   // REQ-v0.9.2 N4：`state`/`limit` 接进桥（客户端已具备并真发 query，bridge-client `getTasks`）——
@@ -1636,11 +1558,6 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
 const TRACE_SUFFIX = "/trace";
 /** `?limit=` 上界（REQ-v0.9.2 N4）：越界与格式错误同样落结构化 400，防超大值直传桥。 */
 const MAX_TASKS_LIMIT = 500;
-/**
- * 空间任务页「查询前默认带出」的条数（REQ-2026-09-30-04 件5 · 原型 v2.3 样张④：不再空屏）。
- * 只作用于选单档的首屏预览那**一次**只读 `getTasks`，与用户手填 `?limit=` 无关。
- */
-const TASKS_PREVIEW_LIMIT = 10;
 /** 单文档子路径（BD11）：`GET /features/:id/docs?file=<name>`。 */
 const DOCS_SUFFIX = "/docs";
 
@@ -1828,7 +1745,7 @@ async function handle(
       }
       if (spaceRoute.kind === "feature_detail") {
         try {
-          sendPage(res, { ...(await pageFeatureDetail(ctx, spaceRoute.featureId)), orgNav: spaceNav });
+          sendPage(res, { ...(await pageFeatureDetail(ctx, spaceRoute.featureId, url.searchParams.get("stage"))), orgNav: spaceNav });
         } catch (err) {
           sendPage(res, bridgeDownPage(`目标 = ${url.pathname}`, err, "features", spaceNav));
         }
@@ -1843,10 +1760,9 @@ async function handle(
             res,
             await pageOrgSpaceManage(ctx, spaceRoute.org, resolved.features, spaceNav, url.searchParams.get("page")),
           );
-        } else {
-          await pageTasks(ctx, url, res, req.headers.accept, spaceRoute.org, spaceNav);
         }
       } catch (err) {
+        // REQ-2026-10-17-01 B-6（乙′ 前半）：空间任务档整支删 ⇒ 无 `tasks` 视图分派支（原 else→pageTasks 摘除）
         sendPage(res, bridgeDownPage(`目标 = ${url.pathname}`, err, SPACE_ACTIVE, spaceNav));
       }
       return;
@@ -1972,7 +1888,7 @@ async function handle(
   }
   try {
     if (route.kind === "feature") {
-      sendPage(res, { ...(await pageFeatureDetail(ctx, route.id)), orgNav: globalNav });
+      sendPage(res, { ...(await pageFeatureDetail(ctx, route.id, url.searchParams.get("stage"))), orgNav: globalNav });
     } else if (route.kind === "feature-docs") {
       await handleFeatureDoc(ctx, res, req, route.id, url.searchParams);
     } else if (route.kind === "host") {
@@ -2098,7 +2014,8 @@ function featureOrgGroups(features: readonly FeatureListItem[]): string[] {
 }
 
 /**
- * 空间二级导航行（v0.9.6 B5b · 口径 14 / 19–23）：三枚 tab「排期 · 任务 · 管理」。
+ * 空间二级导航行（v0.9.6 B5b · 口径 14 / 19–23）：**REQ-2026-10-17-01 B-6（乙′ 前半）后剩两枚 tab「排期 · 管理」**
+ * （原「任务」枚随空间任务档整支删）。
  * **REQ-2026-09-30-04 件1 的两处改动**：① 原行右组织切换器（{@link renderOrgSwitcher} 单点复用）撤除
  * ⇒ 组织切换形态改为**侧栏二级菜单**（功能语义不变，仍是各组织 → `/org/<名>/` 的服务端渲染链接）；
  * ② 显示文案改名「组织空间」→「项目组空间」（**URL `/org/<名>`、台账键名、目录名、代码标识符一律不动**）。
@@ -2110,12 +2027,12 @@ function featureOrgGroups(features: readonly FeatureListItem[]): string[] {
  * `<p class="hint">项目组空间 …` 的原文形态逐字不动（BD7 的窗口定界锚靠它）。
  *
  * **③（REQ-2026-10-11-05）· ①′（REQ-2026-10-12-01 增补）**：详情页不携本行，正文亦无返回链出口 ⇒
- * `null` 档无调用方；本体与 `b-tabs` 样式**一律不动**（任务 / 排期 / 管理三页仍是人可点的唯一入口）。
+ * `null` 档无调用方；本体与 `b-tabs` 样式**一律不动**（排期 / 管理两页仍是人可点的唯一入口）。
  */
 function renderSpaceNav(org: string, view: OrgSpaceView | null): string {
   const link = (v: OrgSpaceView, text: string): string =>
     `<a class="fl${v === view ? " on" : ""}" href="${escapeHtml(orgSpaceLink(org, v))}"${v === view ? ' style="font-weight:700"' : ""}>${text}</a>`;
-  return `<div class="b-tabs"><p class="hint">项目组空间 <b>${escapeHtml(org)}</b>：${link("schedule", "排期")} · ${link("tasks", "任务")} · ${link("manage", "管理")}</p></div>`;
+  return `<div class="b-tabs"><p class="hint">项目组空间 <b>${escapeHtml(org)}</b>：${link("schedule", "排期")} · ${link("manage", "管理")}</p></div>`;
 }
 
 /**

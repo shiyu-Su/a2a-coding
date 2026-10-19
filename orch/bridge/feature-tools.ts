@@ -97,7 +97,7 @@ import {
   versionLedgerHas,
   versionLedgerStatus,
 } from "../session/store.js";
-import { EVENT_FAILURE_REPORT, planResume } from "./scheduler.js";
+import { EVENT_FAILURE_REPORT, isDagNode, planResume } from "./scheduler.js";
 import { activateVersionForFeature, versionActivator } from "./versions-activation.js";
 import type {
   FeatureContextPatch,
@@ -106,7 +106,7 @@ import type {
   QueueState,
   QueuedTaskRecord,
 } from "../session/store.js";
-import type { TaskLane, TaskType } from "../types.js";
+import type { TaskLane, TaskMode, TaskType } from "../types.js";
 import {
   allowedTransitions,
   canTransition,
@@ -189,6 +189,20 @@ export interface FeatureTaskSummary {
    * machine 侧按本机 `agentConfig.roles` 路由该次会话的四个旋钮。
    */
   taskType: TaskType;
+  /**
+   * **执行通道**（v0.10.8 O-5 additive；来源 `tasks.mode`，取值见 {@link TaskMode}）：
+   * 与 `lane`/`taskType` 同一条声明链，**读侧不存在 NULL** —— 列里的 NULL 已在读侧归一为缺省档
+   * `dag`（= 本列引入前的唯一行为，归一只在 store 读侧一处），故本字段**恒有值、不得省略**。
+   */
+  mode: TaskMode;
+  /**
+   * **派发当刻阶段快照**（v0.10.8 O-9 additive；来源 `tasks.stage`，值域 {@link FeatureStage}）：
+   * 值 = 该 task 派发当刻其 Feature 登记字段 `stage` 的快照。
+   *
+   * ⚠️ 与 `mode` **相反**：本列**无默认档**、读侧 NULL **照实读出 `null`**（不归一、不兜底 ——
+   * 兜底成任何一档 = 给存量行凭空赋阶段语义），故本字段**可 null**（展示侧 `null` 显 `—`）。
+   */
+  stage: FeatureStage | null;
   prompt: string | null;
   remoteTaskId: string | null;
   dependencies: string[] | null;
@@ -395,6 +409,10 @@ function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
     lane: rec.lane,
     // 职责位恒有值（读侧 NULL 已归一 unit_agent）：**不得省略字段**（v0.10.2 O-3）
     taskType: rec.taskType,
+    // 执行通道恒有值（读侧 NULL 已归一 dag）：**不得省略字段**（v0.10.8 O-5）
+    mode: rec.mode,
+    // 派发当刻阶段快照：读侧 NULL 照实为 null，**不归一 / 不兜底**（v0.10.8 O-9）
+    stage: rec.stage,
     prompt: rec.prompt,
     remoteTaskId: rec.remoteTaskId,
     dependencies: rec.dependencies,
@@ -1317,6 +1335,16 @@ export interface FeatureStatusSuccess extends Partial<FeatureStageDetail> {
   ok: true;
   feature?: FeatureRecord;
   tasks?: FeatureTaskSummary[];
+  /**
+   * **tasks 表截断标记**（v0.10.8 O-5 additive；**仅单 Feature 查询返回**，列表分支出参不变）。
+   *
+   * 判据 = `nodes.length === limit`（本分支 `limit = 1000`）：单查的 `tasks` 表按 `limit` 截断，
+   * 而 **`acceptance.stateCounts` / 列表 `taskCount` 走聚合 SQL、不受 `limit` 约束**（计数不截断）⇒
+   * 真节点数 > 1000 时 `tasks` 只剩前 1000 行、计数却仍是全量，二者**逐字对不上**。本标记解释这一
+   * 差异：`true` ⇒ `tasks` 触顶、可能还有未展示的尾部（`stateCounts` 求和 > `tasks.length`）；
+   * `false` ⇒ `tasks` 已含全部节点（`stateCounts` 求和 === `tasks.length`）。
+   */
+  tasksTruncated?: boolean;
   /** 该 Feature 已登记的产物（v0.4.0；仅单 Feature 查询返回） */
   artifacts?: ArtifactRecord[];
   /**
@@ -1437,7 +1465,11 @@ export function handleFeatureStatus(
     // 归属校验（谁建谁见）：非本组 ⇒ 拒绝（他组 Feature 不返回详情）
     const denied = ownershipFailure(feature, identity);
     if (denied !== null) return denied;
-    const tasks = listFeatureTasks(feature.featureId, { limit: 1000 }).map(summarizeTask);
+    const limit = 1000;
+    const nodes = listFeatureTasks(feature.featureId, { limit });
+    const tasks = nodes.map(summarizeTask);
+    // 表截断标记（v0.10.8 O-5）：nodes 触顶 limit ⇒ 表被截断而 `stateCounts`/`taskCount` 计数不截断
+    const tasksTruncated = nodes.length === limit;
     const artifacts = listArtifactsByFeature(feature.featureId, 1000);
     // 明细七枚（增补 `6cc46dd2` N5 · 平铺在顶层）= 由**本次读到的那一行**派生。
     // 单查是**纯读**（此前无任何写入）⇒ 不需要 {@link stageDetailAfterWrite} 的写后重读，
@@ -1447,6 +1479,7 @@ export function handleFeatureStatus(
       ok: true,
       feature,
       tasks,
+      tasksTruncated,
       artifacts,
       acceptance: buildFeatureAcceptance(feature, identity),
       // v0.10.1 O7 / C-19：归属按 feature_id 单查（详情路径只有一个 Feature，无 1+N 之虞）；
@@ -1918,8 +1951,8 @@ export type FeatureAdvanceExit = FeatureAdvanceSuccess & FeatureStageDetail;
  */
 const STAGE_DERIVATION: Record<FeatureState, FeatureStage | null> = {
   waiting_approval: null,
-  version_planning: "改造方案",
-  decomposing: "改造方案",
+  version_planning: "改造",
+  decomposing: "改造",
   executing: "改造",
   integrating: "回归",
   testing: "回归",
@@ -2194,10 +2227,14 @@ export function handleFeatureAdvance(
   }
 
   // needs_input → executing：以同 contextId 续接待澄清任务（补齐 answer 后续推）
+  // **v0.10.8 O-4（④）**：取集先过 `isDagNode`。`mode="inquiry"` 自 O-2 起亦携带 `featureId` ⇒ 会落进
+  // 本读集；它的 `input-required` 是**边界轮**的待澄清（由 `a2a_ask` 侧自行续接，不经 Feature 主链）。
+  // 若不过滤：`rearmTask` 会把 inquiry 行清 `dispatch_guard` 重排成 `working` ⇒ 被调度器当**就绪 DAG
+  // 节点**重派（且 `find` 命中谁取决于行序，可能顶掉真正待澄清的 DAG 节点）。
   if (feature.state === "needs_input" && args.to === "executing") {
-    const pending = listFeatureTasks(feature.featureId, { limit: 1000 }).find(
-      (n) => n.state === "input-required",
-    );
+    const pending = listFeatureTasks(feature.featureId, { limit: 1000 })
+      .filter(isDagNode)
+      .find((n) => n.state === "input-required");
     if (pending !== undefined) {
       const base = pending.dispatchMessage ?? pending.prompt ?? "";
       const answer = args.answer === undefined || args.answer.length === 0 ? "" : args.answer;
@@ -2321,7 +2358,10 @@ function handleRetryResume(
   }
 
   // 先校验：任一 id 非法 ⇒ 整单拒绝（**不静默跳过、不做部分重派**）
-  const nodes = listFeatureTasks(feature.featureId, { limit: 1000 });
+  // **v0.10.8 O-4（⑤）**：节点集先过 `isDagNode` ⇒ inquiry 行**不进** `planResume`：
+  // 传 inquiry id 当 `retryTaskIds` 即「id 不在本 Feature 的 DAG 节点集」⇒ 落 `plan.invalid` 整单拒；
+  // 解冻集合同样只含 DAG 节点（inquiry 不是可解冻的闭包成员）。
+  const nodes = listFeatureTasks(feature.featureId, { limit: 1000 }).filter(isDagNode);
   const plan = planResume(nodes, args.retryTaskIds);
   if (plan.invalid.length > 0) {
     return {
@@ -2491,6 +2531,18 @@ export function handleFeatureApprove(
    * 而 `advance` 已被 `feature_approval_required` 守卫挡死。
    */
   const target: FeatureState = feature.parentFeatureId === null ? "version_planning" : "decomposing";
+  /**
+   * **`stage` 半派生（v0.10.8 O-2 / 范围扩展）**：`approve` 迁入的目标态（`version_planning` 主轨 /
+   * `decomposing` 增补·承接轨）此前**只经 `updateFeatureState` 落主链、不派生 `stage`** ⇒ `version_planning`
+   * 停在门① 显式写的「改造方案」，`STAGE_DERIVATION.version_planning` 一行运行时不生效。
+   * 这里补齐派生，**与 `handleFeatureAdvance` 的唯一调用点同源**：同一 `deriveStageForState`、同一
+   * `updateFeatureRegistration({ stage })` 写口，不另立第二份映射。落点在主链迁移**之前**、与 `advance`
+   * 路「派生先于 `updateFeatureState`」同序。
+   */
+  const derivedStage = deriveStageForState(target);
+  if (derivedStage !== null) {
+    updateFeatureRegistration(feature.featureId, { stage: derivedStage });
+  }
   const updated = updateFeatureState(feature.featureId, target);
   // 过审即把门状态落定（**单向、无回边**）：同一张单不得被重复过审解释
   updateFeatureRegistration(feature.featureId, { approval: "已通过" });
@@ -2564,7 +2616,9 @@ export function handleFeatureCancel(
  * MCP `a2a_feature_trace`（按连接身份做归属校验）与工作台 `GET /api/features/:id/trace`（无身份）。
  *
  * 口径：
- * - 只输出**非终态节点**（`working` / `input-required`；`completed` / `failed` / `blocked` 不出）；
+ * - 只输出**非终态**且**是 DAG 节点**（`isDagNode`，v0.10.8 O-4）的行（`working` / `input-required`；
+ *   `completed` / `failed` / `blocked` 不出；`mode="inquiry"` 的归属行不出 —— 但它仍可作为
+ *   `readOccupants[]` 的只读占位者出现，二者是两套集合）；
  * - **项目忙判定走队列态**（`state='working' ∧ queue_state IN ('queued','claimed','running') ∧ 写档`，
  *   经 `listBusyTasksForProject` = `listBusyProjectIds` 同一谓词的行级展开）——
  *   **不走 `remote_task_id`**（pull 模型下该列在飞期间恒 NULL，用了永远判「不忙」）；
@@ -2592,7 +2646,11 @@ export function handleFeatureTrace(
   const denied = ownershipFailure(feature, identity);
   if (denied !== null) return denied;
 
-  const nodes = listFeatureTasks(feature.featureId, { limit: 1000 });
+  // **v0.10.8 O-4（trace 侧）**：节点集先过 `isDagNode` ⇒ inquiry 行**不进** `nodes[]`（它不是 DAG
+  // 节点，答不了「这个 Feature 为什么还没完成」）。⚠ 只收窄**本 Feature 的节点集**；下面
+  // `readOccupants[]` 是**项目级只读占位**（可跨 Feature）⇒ **一字不剔**，inquiry 的只读行仍是
+  // 「为什么没跑」的真占位答案（验收锚见 `test/v0108-n6-*.test.ts` 的 grep 断言）。
+  const nodes = listFeatureTasks(feature.featureId, { limit: 1000 }).filter(isDagNode);
   const byId = new Map(nodes.map((n) => [n.taskId, n]));
   /** 读缓存：同项目写档忙明细 / 同项目只读档占位 / 同一位次上界的计数各查一次（节点上限 1000，纯读、量小） */
   const busyByProject = new Map<string, QueuedTaskRecord[]>();
@@ -2629,6 +2687,9 @@ export function handleFeatureTrace(
     };
 
     // ★ 只读档占位面（写忙集 O-N1 起排除 read ⇒ 这一格不能空着，否则假空洞 = U9）
+    // ⚠ **项目级只读占位、不是 Feature 节点集** ⇒ v0.10.8 O-4 的 `isDagNode` 收窄**不作用于这里**
+    //   （N6-READ-OCCUPANTS-NO-MODE-FILTER）：inquiry 的只读行是本 machine 真占位者，剔掉即把
+    //   「为什么没跑」答丢；收窄只发生在上面的 nodes[]。
     let readLaneTasks = readLaneByProject.get(n.projectId);
     if (readLaneTasks === undefined) {
       readLaneTasks = listReadLaneTasksForProject(n.projectId);

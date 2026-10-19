@@ -29,6 +29,7 @@ import type {
   RiskLevel,
   SessionRecord,
   TaskLane,
+  TaskMode,
   TaskRecord,
   TaskState,
   TaskType,
@@ -46,6 +47,7 @@ import {
   isVersionLedgerStatus,
   ORPHAN_FAILURE_KIND,
   TASK_LANES,
+  TASK_MODES,
   TASK_TYPES,
 } from "../types.js";
 
@@ -428,6 +430,23 @@ export interface TaskCreateInput {
    * `dev_manager` 降成 `unit_agent`**」（重派 / 补登记都走同一条 upsert）。要显式改档必须**显式传值**。
    */
   taskType?: TaskType | null;
+  /**
+   * **执行通道**（v0.10.8 O-4 · orch-N1，落 `tasks.mode`；缺省 `undefined` = 落库 NULL ⇒ 读侧按
+   * `dag` 解释 = 本字段引入前的唯一行为）。
+   *
+   * ⚠️ **ON CONFLICT 走 `COALESCE(excluded.mode, mode)`**（保留首次声明）：与 `lane`/`task_type`
+   * 同一条理由 —— 不带通道的重登记不得把 `inquiry` 压成 `dag`（反之亦然）。
+   */
+  mode?: TaskMode | null;
+  /**
+   * **派发当刻阶段快照**（v0.10.8 O-9 · orch-N2，落 `tasks.stage`；缺省 `undefined` = 落库 NULL
+   * ⇒ 读侧照实读出 `null`，**无缺省档可归**，与 `mode` 相反）。
+   *
+   * ⚠️ **ON CONFLICT 走 `COALESCE(excluded.stage, stage)`**（改造文档 §2.2 O-9 硬细节：
+   * **快照只认首次，重派不得改写**）：与 `lane`/`task_type`/`mode` 同一条纪律 —— 缺省不是任何
+   * 阶段而是 NULL，正是为了「不带快照的重登记不会把已摄快照覆盖掉」。要显式改值必须**显式传值**。
+   */
+  stage?: FeatureStage | null;
 }
 
 /** `listTasks` 入参：按项目（可选状态）取最近任务 */
@@ -1013,6 +1032,10 @@ function isTaskType(v: string): v is TaskType {
   return (TASK_TYPES as readonly string[]).includes(v);
 }
 
+function isTaskMode(v: string): v is TaskMode {
+  return (TASK_MODES as readonly string[]).includes(v);
+}
+
 /**
  * **写档 SQL 片段**（v0.8.10 O-N1；忙集谓词与 `claimTask` 写优先排序**共用同一片段**）。
  *
@@ -1250,12 +1273,24 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
  * `dispatch_guard` / `diagnostics_json` / `dispatch_rendered` 三列同此），老库升级路径不变。
  *
  * v0.10.2 O-1：加 `task_type`（职责位）。**同一条纪律：列只加在迁移段、不进 `TASKS_DDL`**。
+ *
+ * v0.10.8 O-4（orch-N1）：加 `mode`（执行通道）。**同一条纪律：列只加在迁移段、不进 `TASKS_DDL`、
+ * 存量不回填**（NULL ⇒ 读侧 `readMode` 归一 `dag`）。⚠️ `mode` **刻意不进队列视角**
+ * （`QUEUE_TASK_COLUMNS` 走 `TASK_COLUMNS_CORE`，不带 `mode`）—— `/api/tasks` 出参不动
+ * （改造文档 §2.1 O-5）；队列行无 `mode` 键 ⇒ 读侧恒归一 `dag`，队列侧无 mode 消费方。
+ *
+ * v0.10.8 O-9（orch-N2）：加 `stage`（派发当刻阶段快照）。**同一条纪律：列只加在迁移段、
+ * 不进 `TASKS_DDL`、存量不回填**；但读侧与 `mode` **相反** —— NULL 照实读出 `null`、**不归一、
+ * 不兜底**（本列没有默认档；改造文档 §2.2 O-9「NULL 一律显 `—`、不得兜底成「需求分析」」）。
+ * ⚠️ `stage` **刻意不进队列视角**：队列行无 `stage` 键 ⇒ 读侧恒 `null`，`/api/tasks` 出参不动。
  */
-const TASK_COLUMNS =
+const TASK_COLUMNS_CORE =
   "task_id, project_id, context_id, state, lane, task_type, artifacts_json, text, prompt, " +
   "feature_id, dependencies, input_artifacts, remote_task_id, dispatch_guard, dispatch_message, dispatch_rendered, updated_at, " +
   "retry_count, failure_kind, diagnostics_json, " +
   "created_at, started_at, finished_at";
+
+const TASK_COLUMNS = `${TASK_COLUMNS_CORE}, mode, stage`;
 
 /** features 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToFeature） */
 const FEATURE_COLUMNS =
@@ -1320,6 +1355,8 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     state,
     lane: readLane(row),
     taskType: readTaskType(row),
+    mode: readMode(row),
+    stage: readTaskStage(row),
     artifactsJson: readNullableString(row, "artifacts_json"),
     text: readNullableString(row, "text"),
     prompt: readNullableString(row, "prompt"),
@@ -1561,8 +1598,52 @@ function readTaskType(row: Record<string, unknown>): TaskType {
   return raw;
 }
 
-/** `tasks` 队列视角全列清单（SELECT 单一事实源；含队列五列；`lane` 随 `TASK_COLUMNS` 一并进入） */
-const QUEUE_TASK_COLUMNS = `${TASK_COLUMNS}, queue_state, claimed_by, claim_token, claimed_at, queued_at`;
+/**
+ * 解析 `mode` 列（v0.10.8 O-4 · orch-N1）：**NULL 归一为 `dag`**（本列引入前的唯一行为；
+ * 存量行**不回填**，NULL 承载「建行早于本列」这一事实 —— 队列视角 `QUEUE_TASK_COLUMNS`
+ * 不带该键，同样走此归一）。
+ * 非 NULL 但闭集外的值 = 数据损坏（fail-fast，与 `readTaskType` 同纪律；**不兜底归一**）。
+ *
+ * 兜底方向与 `readLane` 同理不可反：NULL 若按 `inquiry` 解释 = 把全部存量节点剔出
+ * DAG 判据集（静默废掉调度）。
+ */
+function readMode(row: Record<string, unknown>): TaskMode {
+  const raw = readNullableString(row, "mode");
+  if (raw === null) return "dag";
+  if (!isTaskMode(raw)) {
+    throw new Error(`[session-store] 列 mode 数据损坏：非法值 ${raw}`);
+  }
+  return raw;
+}
+
+/**
+ * 解析 `tasks.stage` 列（v0.10.8 O-9 · orch-N2）：**NULL 照实读出 `null` —— 不归一、不兜底**。
+ * 形制与 {@link readMode} **同形状、相反的第二段**：`mode` 有缺省档（`dag` = 本列引入前的唯一
+ * 行为）可归一，`stage` **没有默认档** —— NULL 承载「建行早于本列 / 未摄快照」这一事实，兜底成
+ * 任何一档（如「需求分析」）都是给存量行凭空赋阶段语义（改造文档 §2.2 O-9：NULL 一律显 `—`）。
+ * 队列视角不带该键（`QUEUE_TASK_COLUMNS` 无 `stage`）⇒ 队列行同样读 `null`。
+ *
+ * 非 NULL 但闭集外的值 = 数据损坏（fail-fast，与 `readMode`/`readTaskType` 同纪律；**不兜底归一**
+ * —— 与 features 侧 `readStage` 的「脏值落缺省不 throw」**相反**：那是登记面不得挡引擎，
+ * 本列是快照事实面，脏了就该炸出来）。
+ */
+function readTaskStage(row: Record<string, unknown>): FeatureStage | null {
+  const raw = readNullableString(row, "stage");
+  if (raw === null) return null;
+  if (!isFeatureStage(raw)) {
+    throw new Error(`[session-store] 列 stage 数据损坏：非法值 ${raw}`);
+  }
+  return raw;
+}
+
+/**
+ * `tasks` 队列视角全列清单（SELECT 单一事实源；含队列五列；`lane` 随核心列清单一并进入）。
+ * ⚠️ **不含 `mode`**（v0.10.8 O-4 · orch-N1）：`/api/tasks` 出参不动，队列侧无 mode 消费方；
+ * 队列行无 `mode` 键 ⇒ `readMode` 恒归一 `dag`（与存量行同一读侧口径）。
+ * ⚠️ **同样不含 `stage`**（v0.10.8 O-9 · orch-N2）：队列行无 `stage` 键 ⇒ `readTaskStage` 恒读
+ * `null`（本列无缺省档、不归一不兜底，与 `mode` 的归一口径**相反**）。
+ */
+const QUEUE_TASK_COLUMNS = `${TASK_COLUMNS_CORE}, queue_state, claimed_by, claim_token, claimed_at, queued_at`;
 
 function rowToQueuedTask(row: Record<string, unknown>): QueuedTaskRecord {
   return {
@@ -2173,6 +2254,8 @@ export class SessionStore {
     // 重启后投影仍在）。段落划分（顺序固定）：
     //   段 1：`tasks` 队列五列；段 1b：`tasks.lane`（v0.8.10 O-N1，含存量归一）；
     //   段 1c：`tasks.task_type`（v0.10.2 O-1，存量**不回填**）；
+    //   段 1d：`tasks.mode`（v0.10.8 O-4 · orch-N1，存量**不回填**）；
+    //   段 1e：`tasks.stage`（v0.10.8 O-9 · orch-N2，存量**不回填**）；
     //   段 2：`runners` 表；段 3：`runner_projects` 表；段 4：队列 / 注册表索引。
     // 段 1：`tasks` 队列列。老行一律留 NULL（`queue_state` NULL ⇒ 读侧视为 `settled`，**不回填**）。
     for (const column of [
@@ -2218,6 +2301,51 @@ export class SessionStore {
     // （`ALTER` 不改 `updated_at`、不写事件 —— 迁移非运行期状态变更）。
     try {
       this.db.exec("ALTER TABLE tasks ADD COLUMN task_type TEXT");
+    } catch {
+      // 列已存在（幂等）
+    }
+    // 段 1d（v0.10.8 O-4 · orch-N1 · 改造文档 §2.1 O-4）：`tasks.mode` 执行通道列（dag / inquiry）。
+    // 口径 = **缺省 `dag`**（本列引入前的唯一行为：存量行 NULL 按 DAG 解释 = 零行为变化）。
+    //
+    // ⚠️ **存量不回填**（照段 1c `task_type`，不照段 1b `lane`）：本列在 N1 **没有任何 SQL 谓词消费**，
+    // 归一唯一落点 = 读侧 `readMode`（NULL ⇒ `dag`）；回填 `'dag'` 会把「建行早于本列」与
+    // 「显式建为 dag」两种事实压平，后续节点集合判据（O-4）与 prune 改判（O-8）无从区分。
+    //
+    // 纪律照既有：只加列、必可空、不复用既有列、读侧 `readMode`、**只在 ctor try-ALTER**
+    // （`ALTER` 不改 `updated_at`、不写事件 —— 迁移非运行期状态变更）。
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN mode TEXT");
+    } catch {
+      // 列已存在（幂等）
+    }
+    // 段 1e（v0.10.8 O-9 · orch-N2 · 改造文档 §2.2 O-9）：`tasks.stage` 派发当刻阶段快照列。
+    // 口径 = **无缺省档**：值 = 该 task 派发当刻其 Feature 登记 `stage` 的快照；NULL = 「建行早于
+    // 本列 / 未摄快照」，读侧 `readTaskStage` 照实读出 `null`。
+    //
+    // ⚠️ **存量不回填**（照段 1c/1d 的纪律），且读侧**不兜底**（与段 1d `mode` 相反）：`mode` 有
+    // 缺省档 `dag` 可归一，`stage` 没有 —— 回填或兜底成任何一档（如「需求分析」）都是给存量行
+    // 凭空赋阶段语义，板侧按阶段过滤会错桶（改造文档 §2.2 O-9：NULL 一律显 `—`）。
+    //
+    // 纪律照既有：只加列、必可空、不复用既有列、读侧 `readTaskStage`、**只在 ctor try-ALTER**
+    // （`ALTER` 不改 `updated_at`、不写事件 —— 迁移非运行期状态变更）。
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN stage TEXT");
+    } catch {
+      // 列已存在（幂等）
+    }
+    // 段 1f（v0.10.8 M1 · 改造文档 §2.2 修正2 / §3）：`tasks.settled_by` 结算接管人列。
+    // 口径 = **无缺省档的纯审计位**：值 = 把本行从 `input-required` 结算为终态的续答新行 taskId；
+    // NULL = 「未被接管 / 本列引入前的行 / 非结算写入」。
+    //
+    // ⚠️ **存量不回填、读侧不兜底**（照段 1c/1d/1e 的「无 SQL 谓词消费 ⇒ 不归一」纪律）：本列读者 =
+    // 排查脚本与归属回填卡，**不进 `TASK_COLUMNS` / `TaskRecord` / 出参**（改造文档 §2.3：
+    // 审计位不是展示位；直查列原值即得）。写侧唯一入口 = `compareAndSwapTaskState` 的
+    // `settledBy` 形参（与 CAS **同一条 UPDATE**，不接受两步写 ⇒ 无「已结算未记账」中间态）。
+    //
+    // 纪律照既有：只加列、必可空、不复用既有列、**只在 ctor try-ALTER**
+    // （`ALTER` 不改 `updated_at`、不写事件 —— 迁移非运行期状态变更）。
+    try {
+      this.db.exec("ALTER TABLE tasks ADD COLUMN settled_by TEXT");
     } catch {
       // 列已存在（幂等）
     }
@@ -2356,16 +2484,18 @@ export class SessionStore {
     this.db
       .prepare(
         `INSERT INTO tasks
-           (task_id, project_id, context_id, state, lane, task_type, artifacts_json, text, prompt,
+           (task_id, project_id, context_id, state, lane, task_type, mode, stage, artifacts_json, text, prompt,
             feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, dispatch_rendered, updated_at,
             created_at, started_at, finished_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(task_id) DO UPDATE SET
            project_id = excluded.project_id,
            context_id = excluded.context_id,
            state = excluded.state,
            lane = COALESCE(excluded.lane, lane),
            task_type = COALESCE(excluded.task_type, task_type),
+           mode = COALESCE(excluded.mode, mode),
+           stage = COALESCE(excluded.stage, stage),
            artifacts_json = excluded.artifacts_json,
            text = excluded.text,
            prompt = excluded.prompt,
@@ -2386,6 +2516,8 @@ export class SessionStore {
         rec.state,
         rec.lane ?? null,
         rec.taskType ?? null,
+        rec.mode ?? null,
+        rec.stage ?? null,
         rec.artifactsJson ?? null,
         rec.text ?? null,
         prompt,
@@ -2415,6 +2547,11 @@ export class SessionStore {
    * v0.5.0：**`finished_at` 写口** —— 转入终态（`completed` / `failed` / `blocked`）时落时刻；
    * 转入非终态（`working` / `input-required`）时**保留原值**，不在此做隐式清空
    * （清空点是 `rearmTask` / `rearmForRetry`，它们才是"回到未完成"的显式动作）。
+   *
+   * v0.10.8 M1：可选 `settledBy`（接管人 taskId）**并入同一条 UPDATE** 的 `SET` 段
+   * （改造文档 §2.2 修正2：**不接受两步写** —— 拆两条语句就有「已结算未记账」中间态）。
+   * 缺省（`undefined` / `null`）⇒ 赋值片段与参数**一个都不加**，既有调用方 SQL 逐字不变、
+   * 已落的 `settled_by` 不被覆写；CAS 零命中（`changes = 0`）时与 `state` 同语句整体不写。
    */
   compareAndSwapTaskState(
     taskId: string,
@@ -2422,22 +2559,34 @@ export class SessionStore {
     to: TaskState,
     artifactsJson?: string | null,
     text?: string | null,
+    settledBy?: string | null,
   ): boolean {
     const now = nowIso();
     const finishedAt = isFinishedState(to) ? now : null;
+    const assignments = [
+      "artifacts_json = COALESCE(?, artifacts_json)",
+      "text = COALESCE(?, text)",
+      "finished_at = COALESCE(?, finished_at)",
+      "updated_at = ?",
+    ];
+    const assignmentParams: Array<string | number | null> = [
+      artifactsJson ?? null,
+      text ?? null,
+      finishedAt,
+      now,
+    ];
+    if (settledBy !== undefined && settledBy !== null) {
+      assignments.push("settled_by = ?");
+      assignmentParams.push(settledBy);
+    }
     const changes = conditionalStateUpdate(this.db, {
       table: "tasks",
       keyColumn: "task_id",
       key: taskId,
       expectedState: expectedFrom,
       nextState: to,
-      assignments: [
-        "artifacts_json = COALESCE(?, artifacts_json)",
-        "text = COALESCE(?, text)",
-        "finished_at = COALESCE(?, finished_at)",
-        "updated_at = ?",
-      ],
-      assignmentParams: [artifactsJson ?? null, text ?? null, finishedAt, now],
+      assignments,
+      assignmentParams,
     });
     return changes > 0;
   }
@@ -2448,12 +2597,16 @@ export class SessionStore {
    * v0.4.0：状态发生**变化**且新态非 `working` 时，自动写事件收件箱
    * （`blocked` → `task.blocked`；`completed`/`failed`/`input-required` → `task.settled`）。
    * v0.4.1：写入改为 CAS（`WHERE state = <读到的原态>`），并发被抢先时不覆盖、不重复写事件。
+   * v0.10.8 M1：可选 `settledBy` 透传给 {@link compareAndSwapTaskState}（同一条 UPDATE 落账，
+   * §2.2 修正2）；事件段口径不变 —— **本写口不发 `task.continued`**（该事件由回传侧
+   * `continueAttempts` 派生，见 `upsertTaskResult`）。
    */
   updateTaskState(
     taskId: string,
     state: TaskState,
     artifactsJson?: string | null,
     text?: string | null,
+    settledBy?: string | null,
   ): TaskRecord | null {
     const previous = this.getTask(taskId);
     if (previous === null) return null;
@@ -2463,6 +2616,7 @@ export class SessionStore {
       state,
       artifactsJson,
       text,
+      settledBy,
     );
     const stored = this.getTask(taskId);
     if (changed && stored !== null && previous.state !== stored.state) {
@@ -2488,6 +2642,69 @@ export class SessionStore {
   getTask(taskId: string): TaskRecord | null {
     const row = this.db.prepare(`SELECT ${TASK_COLUMNS} FROM tasks WHERE task_id = ?`).get(taskId);
     return row === undefined ? null : rowToTask(row);
+  }
+
+  /**
+   * **旧行查询：本枚续答可接管的「待澄清」询问行**（v0.10.8 M1 · 改造文档 §2.2 护栏①②）。
+   * 返回同 `contextId` 下最可能被续答接管的旧行（`updated_at` 最新一条），无候选返回 null。
+   *
+   * - WHERE 一律**列值严格等式**（`mode = 'inquiry' ∧ state = 'input-required' ∧ context_id = ?
+   *   ∧ task_id <> ?`）：**禁走 `readMode` 归一、禁 `mode <> 'dag'` 这类取反式** —— 取反会把
+   *   `mode IS NULL` 的存量真 DAG 行捞进来（护栏①，本卡唯一不可自愈风险面）；
+   * - 多命中 ⇒ 只取 `updated_at` 最新一条并 `console.error` 留痕，其余留给存量清理脚本
+   *   （M3），**不循环结算**（护栏②）；`LIMIT 2` = 「有无第二条」的最小取证，不整表扫；
+   * - 只读、无副作用；M1 不接线（生产调用点是 M2 的建行路径）。
+   */
+  findOpenInquiryPredecessor(contextId: string, excludeTaskId: string): TaskRecord | null {
+    const rows = this.db
+      .prepare(
+        `SELECT ${TASK_COLUMNS} FROM tasks
+         WHERE mode = 'inquiry' AND state = 'input-required' AND context_id = ? AND task_id <> ?
+         ORDER BY updated_at DESC
+         LIMIT 2`,
+      )
+      .all(contextId, excludeTaskId) as Array<Record<string, unknown>>;
+    const first = rows[0];
+    if (first === undefined) return null;
+    if (rows.length > 1) {
+      console.error(
+        `[session-store] findOpenInquiryPredecessor 同 context 多命中：context_id=${contextId}，` +
+          `只取最新 task_id=${String(first["task_id"])}，其余留给存量清理脚本`,
+      );
+    }
+    return rowToTask(first);
+  }
+
+  /**
+   * **同步事务原语**（v0.10.8 M2 · 改造文档 §2.2 修正1）：把一段**全同步**的写序列包进
+   * 单条 `BEGIN IMMEDIATE` ⇒ 「半套副作用」不再可能对外可见。
+   *
+   * 存在的理由 = `db` 是本类的私有件，调用方要原子化**多个既有原语**（不是重写它们）
+   * 时唯一的安全落点：原语各自 `prepare/run`，由本口决定事务边界。
+   *
+   * ⚠️ 两条硬约束（违反即语义崩塌，调用方自负）：
+   * - `fn` **必须同步**：事务体内不得跨 `await`（长 I/O 期间持写锁 = 全库停摆）；
+   * - `fn` 体内**不得**调用自开 `BEGIN IMMEDIATE` 的方法（如
+   *   {@link SessionStore.versionLedgerDelete} / {@link SessionStore.versionLedgerActivate}）
+   *   ⇒ SQLite 直接报「事务已活动」。单语句原语（`createTask` / `updateTaskState` /
+   *   只读的 `getTask` / `findOpenInquiryPredecessor`）可安全嵌套。
+   *
+   * 失败即回滚并**原样抛出**（ROLLBACK 自身失败不掩盖原始错误）。
+   */
+  runInTransaction<T>(fn: () => T): T {
+    this.db.exec("BEGIN IMMEDIATE");
+    try {
+      const value = fn();
+      this.db.exec("COMMIT");
+      return value;
+    } catch (err) {
+      try {
+        this.db.exec("ROLLBACK");
+      } catch {
+        // 事务已不在活动态：保留原始错误，不掩盖
+      }
+      throw err;
+    }
   }
 
   /**
@@ -2805,8 +3022,9 @@ export class SessionStore {
    *
    * - **`lane = 'read'` 是精确匹配**（与写侧两处判据相反）：NULL 归一为**写**档 ⇒ 只读档**只有显式声明**
    *   才存在，漏掉 `NULL` 是**刻意**的（写成 `(lane IS NULL OR lane='read')` 会把存量行当成占位者）。
-   * - **跨 Feature、全项目集内该项目**：只读占位者可能是别的 Feature 的节点，也可能是散活行
-   *   （`feature_id IS NULL`，如 `mode="inquiry"` ⇒ O-N4 起恒只读档）。
+   * - **跨 Feature、全项目集内该项目**：只读占位者可能是别的 Feature 的节点，也可能是**存量**散活行
+   *   （`feature_id IS NULL` 仅见于 v0.10.8 收紧前的存量行；O-1/O-2 起 `mode="inquiry"` 派发**恒带
+   *    `feature_id`** ⇒ 不得再把「散活」等同于 `feature_id IS NULL`；inquiry 行 O-N4 起恒只读档）。
    * - 按 `queued_at` 升序（与 `claimTask` 的第二键同向 = 同档内的实际领取先后）。
    */
   listReadLaneTasksForProject(projectId: string): QueuedTaskRecord[] {
@@ -5130,20 +5348,30 @@ export class SessionStore {
   /**
    * 清理保留策略：删除超期 / 每项目超量的**非 working** 任务记录，返回删除条数。
    * 超期按 `updated_at` 早于 `retentionDays`；超量按每项目保留最新 `maxPerProject` 条。
-   * v0.3.0：**排除活跃 Feature 的任务**（其 `feature_id` 非空且所属 Feature 未终态），
+   * v0.3.0：**排除活跃 Feature 的 DAG 任务**（其 `feature_id` 非空且所属 Feature 未终态），
    * 避免误删在飞编排的证据。
-   * v0.4.0 复核：`blocked` 属非 working，但**活跃 Feature 的 `blocked` 任务同样受 `prunable`
+   * v0.4.0 复核：`blocked` 属非 working，但**活跃 Feature 的 `blocked` DAG 任务同样受 `prunable`
    * 保护**（其所属 Feature 非终态 → 不满足 `feature_id IS NULL` 也不在终态集合内），
    * 仅当所属 Feature 已终态（completed/failed/cancelled）时才随 `blocked` 一并归档。
+   * v0.10.8 O-8（★R1 保留口径改判 · 改造文档 §2.1 O-8）：上述「活跃 Feature 保护」收窄为
+   * **仅 dag 行**；`mode='inquiry'` 行改按 `mode` 选、只看年龄（满 7 天）裁、**不看 Feature 态**，
+   * 不再借 `feature_id IS NULL` 选行（该项仅存留于 dag 分支作存量解释）。终态 Feature 的 dag
+   * 任务「终态后整批 7 天消失」形态不变。
    */
   pruneTasks(opts: PruneTasksOptions = {}): number {
     const retentionDays = opts.retentionDays ?? TASK_RETENTION_DAYS;
     const maxPerProject = opts.maxPerProject ?? TASK_MAX_PER_PROJECT;
     const cutoffIso = new Date(Date.now() - retentionDays * 86_400_000).toISOString();
-    // 仅「无 Feature 归属」或「所属 Feature 已终态」的任务可被清理
+    // v0.10.8 O-8（★R1 保留口径改判 · 改造文档 §2.1 O-8）：prune 选行改**两分支**——
+    //  (a) inquiry 行按 `mode = 'inquiry'` 选，只看 `updated_at` 年龄（外层 DELETE 已带 cutoff），
+    //      **不看 Feature 态**：活跃 Feature 的追问满 7 天即归档，不再随其未终态受保护；
+    //  (b) dag / 存量（`mode = 'dag'` 或迁移段引入前的 NULL）保留原口径：无 Feature 归属
+    //      （`feature_id IS NULL`；O-1/O-2 收紧后新行恒带 `feature_id`，此项仅作存量解释、逐字不变）
+    //      或所属 Feature 已终态。不再靠 `feature_id IS NULL` 选 inquiry 行。
     const prunable =
-      "(feature_id IS NULL OR feature_id IN (" +
-      "SELECT feature_id FROM features WHERE state IN ('completed','failed','cancelled')))";
+      "(mode = 'inquiry' OR " +
+      "((mode IS NULL OR mode = 'dag') AND (feature_id IS NULL OR feature_id IN (" +
+      "SELECT feature_id FROM features WHERE state IN ('completed','failed','cancelled')))))";
     const expired = this.db
       .prepare(`DELETE FROM tasks WHERE state <> 'working' AND updated_at < ? AND ${prunable}`)
       .run(cutoffIso).changes;

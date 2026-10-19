@@ -66,7 +66,7 @@ export const MOUNTABLE_FEATURE_STATES: readonly FeatureState[] = ["executing", "
 
 /**
  * `a2a_call` 的执行意图（**必填，无缺省** —— REQ-v0.4.1-2026-09-16-01 §2.5）：
- * - `inquiry` = 只读询问 / 核实（Step 0/1；**不得带 `featureId`**，立即派发）；
+ * - `inquiry` = 只读询问 / 核实（Step 0/1；**必带 `featureId`** = 归属声明，立即派发、不登记 DAG 节点）；
  * - `execute` = 执行型派发（**必带 `featureId`**，登记 Feature DAG 节点，由调度器派发）。
  *
  * 选"必填"而非任一缺省：缺省 `inquiry` 会让"忘带 mode 的执行"**沉默漏过**；缺省 `execute` 会
@@ -87,7 +87,7 @@ export const a2aCallSchema = {
   mode: z
     .enum(A2A_CALL_MODES)
     .describe(
-      '**必填**：`"execute"` = 执行型派发（必带 featureId，登记 Feature DAG 节点）；`"inquiry"` = 只读询问 / 核实（不得带 featureId，立即派发）',
+      '**必填**：`"execute"` = 执行型派发（必带 featureId，登记 Feature DAG 节点）；`"inquiry"` = 只读询问 / 核实（**亦必带 featureId** = 归属声明，立即派发、不登记 DAG 节点）',
     ),
   contextId: z
     .string()
@@ -103,7 +103,7 @@ export const a2aCallSchema = {
     .string()
     .optional()
     .describe(
-      `挂载到 Feature（**仅 mode="execute" 可用，且必填**）：任务作为 DAG 节点登记（返回本地 taskId），由调度器在依赖满足后自动派发；可挂载态 = ${MOUNTABLE_FEATURE_STATES.join(" / ")}`,
+      `挂载 / 归属到 Feature（**两种 mode 均必填**）：mode="execute" = 挂载（任务作为 DAG 节点登记、返回本地 taskId、由调度器在依赖满足后自动派发；受可挂载态约束 = ${MOUNTABLE_FEATURE_STATES.join(" / ")}）；mode="inquiry" = 归属声明（落 tasks.feature_id 作只读询问节点，**不登记 DAG 节点、不受可挂载态约束**）`,
     ),
   dependencies: z
     .array(z.string())
@@ -181,15 +181,18 @@ export const configWriteGroupSchema = {
 export type CallAdmission = { ok: true } | { ok: false; code: string; error: string };
 
 /**
- * `a2a_call` **对偶校验**（纯函数、无副作用、可单测）：
- * - `mode="execute"` ⇒ **必带 `featureId`**（执行必走 Feature DAG；码 `feature_required_for_execute`）；
- * - `mode="inquiry"` ⇒ **不得带 `featureId`**（禁止用"询问"往 DAG 塞执行节点；码
- *   `feature_not_allowed_for_inquiry`）。
+ * `a2a_call` **对偶校验**（纯函数、无副作用、可单测）—— **两种 mode 均必填 `featureId`**（v0.10.8 O-1 收紧）：
+ * - `mode="execute"` ⇒ **必带 `featureId`**（执行必走 Feature DAG 挂载；码 `feature_required_for_execute`）；
+ * - `mode="inquiry"` ⇒ **必带 `featureId`**（归属声明：只读询问亦须挂到某 Feature、落 `tasks.feature_id`，
+ *   但**不登记 DAG 节点、不受可挂载态约束**；码 `feature_required_for_inquiry`，与 execute 码对偶）。
+ *   原「`inquiry` 不得带 `featureId`」的对偶拦（询问误带 `featureId` 之拒）**整码退役**
+ *   —— 收紧后 `inquiry` 恰须带 `featureId`，该拒已无任何触发条件。
  *
- * **职责位与本判据正交**（v0.10.2 增补三 E-1）：`taskType` **两种 mode 均可携带** ——
- * 原「`inquiry` 不得带 `taskType`」的拒（码 `task_type_not_allowed_for_inquiry`）**已下线**
- * （`lane` 与 `task_type` 是正交两列，`inquiry` 的读档语义不因此改变）。
- * `taskType` 的**值域**校验由 {@link validateCallTaskType} / {@link a2aCallArgsSchema} 负责。
+ * **校验留在本函数、不在 zod 层加 `featureId` 必填**（错误码须单一事实源；`tools/list` 的
+ * JSON Schema 本不承载跨字段约束）。**职责位与本判据正交**（v0.10.2 增补三 E-1）：`taskType`
+ * **两种 mode 均可携带** —— 原「`inquiry` 不得带 `taskType`」的拒（码 `task_type_not_allowed_for_inquiry`）
+ * **已下线**（`lane` 与 `task_type` 是正交两列，`inquiry` 的读档语义不因此改变）。`taskType` 的
+ * **值域**校验由 {@link validateCallTaskType} / {@link a2aCallArgsSchema} 负责。
  *
  * `mode` / `taskType` 的「可选 + 枚举收窄」由 {@link a2aCallSchema} 在 schema 层强制
  * （缺参 / 非法值在 MCP 层即被拒，见 `test/register-tools.test.ts`）。
@@ -209,13 +212,13 @@ export function validateCallMode(args: {
         'Step 0/1 的只读核实 / 调研请改用 mode="inquiry"。',
     };
   }
-  if (args.mode === "inquiry" && hasFeatureId) {
+  if (args.mode === "inquiry" && !hasFeatureId) {
     return {
       ok: false,
-      code: "feature_not_allowed_for_inquiry",
+      code: "feature_required_for_inquiry",
       error:
-        'mode="inquiry" 不得携带 featureId（询问不得往 Feature DAG 登记执行节点）；' +
-        '确需执行请改用 mode="execute"。',
+        'mode="inquiry" 必须携带 featureId（v0.10.8 O-1 收紧：只读询问亦须声明归属 Feature ⇒ 落 tasks.feature_id 作只读询问节点，' +
+        '不登记 DAG 节点、不受可挂载态约束）。',
     };
   }
   return { ok: true };
@@ -321,7 +324,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     {
       description:
         "向目标项目派发一轮任务：解析项目→机器，**任务入队**（Runner 反向注册后经 `/runner/connect` 领取并在目标机本地执行），返回文本结果 + artifacts。传入相同 contextId 可续接上下文；返回 contextId 便于继续追问。wait=false 时立即返回句柄（全异步，不进入同步等待）。" +
-        `**mode 必填（无缺省）**：mode="execute" = 执行型派发，**必带 featureId**，任务作为 Feature DAG 节点登记（不立即派发），由调度器按 dependencies 串行自动派发（可挂载态 = ${MOUNTABLE_FEATURE_STATES.join(" / ")}）；mode="inquiry" = 只读询问 / 核实（Step 0/1 用），**不得带 featureId**，经队列立即下发。` +
+        `**mode 必填（无缺省）**，**两种 mode 均必填 featureId**：mode="execute" = 执行型派发，任务作为 Feature DAG 节点**挂载**登记（不立即派发），由调度器按 dependencies 串行自动派发（受可挂载态约束 = ${MOUNTABLE_FEATURE_STATES.join(" / ")}）；mode="inquiry" = 只读询问 / 核实（Step 0/1 用），featureId 仅作**归属声明**（落 tasks.feature_id、不登记 DAG 节点、不受可挂载态约束），经队列立即下发。` +
         "**即时性说明**：任务入队后桥经 `/runner/connect` 的 wake 信号**尽力立即下发**；目标机 Runner 未连接时，照常入队（**不拒绝**），最长等其下一轮轮询周期（约 `runner.holdMs`，默认 25s）被领取。" +
         "**只读声明**：`readOnly=true` 标记节点为只读档（machine 侧只读闸内放行、不占写忙集）；缺省 / false = 按写档（保守）。inquiry 恒为只读档，无需声明。" +
         "**职责位声明**：`taskType` 声明节点以哪个职责位出场（取值 ∈ " +
@@ -358,11 +361,22 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           );
           return outcome.ok ? textResult(outcome) : errorResult(outcome);
         }
+        const inquiryFeatureId = args.featureId;
+        if (inquiryFeatureId === undefined || inquiryFeatureId.length === 0) {
+          // 不可达：`validateCallMode` 已拦下该组合；此处仅作类型收窄（不用非空断言）
+          return errorResult({
+            ok: false,
+            code: "feature_required_for_inquiry",
+            error: 'mode="inquiry" 必须携带 featureId',
+          });
+        }
         const outcome = await core.call(
           args.project,
           args.message,
           args.contextId,
           args.wait ?? true,
+          // v0.10.8 O-1/O-2：inquiry 的 featureId = 归属声明，随建行落 tasks.feature_id
+          inquiryFeatureId,
           "inquiry",
           // v0.10.2 增补三 E-1：inquiry 也可声明职责位（读档不变）
           args.taskType,

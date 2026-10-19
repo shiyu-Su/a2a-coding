@@ -86,6 +86,15 @@
  * （改造文档 §2.1-1），原「框外公共通道带 / 弧—直—弧—直—弧 / 统一装箱 / 走廊降档 / 入点侧向让位」一族不再进 DOM；
  * 其 path 原语、类型与专属常量（走线装箱 / 走廊选型 / 入点让位 / 跨框走廊一族与其路由类型）**已于 v0.10.7 N9 整体删除**
  * —— 逐枚名单见改造文档 §2.3「删」段，本文件不再点名（退休符号零残留判据 = §4 实现级）。
+ *
+ * **v0.10.8 B-2/B-4（REQ-2026-10-17-01 · 改造文档 §2.3）：依赖图按 `mode` 剔除** —— **全集进图、
+ * {@link taskOrdinalMap} 全集算号**（{@link buildTaskGraph} 本体与 `taskOrdinalMap` 入参一字不动，
+ * server 侧调用不预过滤——喂子集 ⇒ 子集重编号 `1..M` ⇒ 砸穿「表/图同号」审计契约），**剔除只发生在
+ * 节点渲染层**：{@link groupPipelines} 出组的节点表、喂 ELK 的边集、卡头任务数与 chip 落 DOM 一族消费面
+ * （{@link drawSubsetExcludingInquiry}）。判据 = 唯一正向 `mode === "inquiry"`；`mode` 纯透传可 null、
+ * **不 `?? "dag"` 兜底** ⇒ `null` / 未知值一律进图（fail-conservative，不吞不猜；不用 `taskType` / `lane`）。
+ * **chip 号 = 全集号、可不连续 = 特性非缺陷**。`readOccupants` 类消费面不动；h2 声明计数 / `dangling`·
+ * `cycleEdges` 提示行 / `renderChip` 的 `依赖：` 段仍吃账面原值。
  */
 import type { FeatureTaskItem, TraceNode } from "./bridge-client.js";
 import {
@@ -759,6 +768,34 @@ interface RenderCtx {
 }
 
 /**
+ * B-2 剔除判据（v0.10.8 · 改造文档 §2.3）：**唯一正向 `mode === "inquiry"`**。`mode` 纯透传可 null
+ * （老桥缺键 ⇒ null / undefined），**不 `?? "dag"` 兜底** ⇒ `null` / 未知值一律**进图**
+ * （fail-conservative，不吞不猜）；**不用 `taskType`**（职责位）/ **`lane`**（默认值造反）当判据。
+ */
+const isInquiryNode = (task: FeatureTaskItem): boolean => task.mode === "inquiry";
+
+/**
+ * 节点渲染层剔除（B-2/B-4）：从 {@link groupPipelines} 出组的节点表剔去 inquiry 节点（框被剔空 ⇒ 整框退役），
+ * 并把**端点落在被剔节点上**的 kept 边一并剔出喂 ELK 的边集（否则 ELK 按未知端点原样引 port id，线会指向幽灵）。
+ * **不二次约简** —— `kept` 仍由全集单次 {@link transitiveReduce} 而来（§2.3-2 共用同一份的事实源不动）；
+ * 编号表也不重算（chip 号 = 全集号、可不连续）。全集零 inquiry ⇒ 原样返回同一引用（零行为变化）。
+ */
+function drawSubsetExcludingInquiry(
+  pipelines: readonly GraphPipeline[],
+  kept: readonly { from: string; to: string }[],
+): ElkGraphSource {
+  const inquiryIds = new Set<string>();
+  for (const p of pipelines) for (const n of p.nodes) if (isInquiryNode(n)) inquiryIds.add(n.taskId);
+  if (inquiryIds.size === 0) return { pipelines, edges: kept };
+  return {
+    pipelines: pipelines
+      .map((p) => ({ ...p, nodes: p.nodes.filter((n) => !isInquiryNode(n)) }))
+      .filter((p) => p.nodes.length > 0),
+    edges: kept.filter((e) => !inquiryIds.has(e.from) && !inquiryIds.has(e.to)),
+  };
+}
+
+/**
  * 详情页「依赖图」区块的**唯一公开口**（`tasks` = 详情出参任务清单）——
  * **v0.10.7 N5（REQ-2026-10-15-01 · 改造文档 §2.2「落点」）起 = async + 坐标源 = ELK 出参**
  * （接管 v0.10.5 G5 的网格 + 通道走线自绘：走线族不再进 DOM，退休属后续节点）。
@@ -771,6 +808,9 @@ interface RenderCtx {
  * 整节**只回吐一行**提示（`class="hint warn"`）—— 不抛异常、不静默、页面不 500。
  * 两枚空短路（无任务 / 零节点）**不跑求解** ⇒ 不出提示行。
  * `layout` 仅供测试注入抛错桩，生产侧不传（缺省 {@link layoutGraphGuarded}）。
+ *
+ * **v0.10.8 B-4**：入参 `tasks` = **全集**（server 不预过滤）；{@link taskOrdinalMap} 全集算号后，
+ * 剔除只发生在渲染消费面（{@link drawSubsetExcludingInquiry} 与卡头任务数）⇒ 图 chip 号可不连续、与表同号。
  */
 export async function renderDependencyGraphSection(
   tasks: readonly FeatureTaskItem[],
@@ -786,14 +826,18 @@ export async function renderDependencyGraphSection(
 
   // 全图**单次**传递约简（改造文档 §2.3-2）：喂 ELK 的边集与底部清单行共用同一份 kept
   const { kept, dropped } = transitiveReduce(graph.edges);
+  // B-4：`tasks` 全集算号（入参一字不动）——剔除后 chip 仍背全集号，可不连续
   const ordinals = taskOrdinalMap(tasks);
   const pipelines = groupPipelines(graph, ordinals);
 
-  const laid = await layout({ pipelines, edges: kept });
+  // B-2/B-4：剔除只在节点渲染层消费面（喂 ELK 的节点表与边集 + 卡头任务数）；h2 声明计数 / notes 行 / chip 依赖段仍吃原值
+  const drawn = drawSubsetExcludingInquiry(pipelines, kept);
+
+  const laid = await layout(drawn);
   if (laid.flat === null) {
     return { html: `<p class="hint warn">依赖图布局失败，本节回吐空图：${escapeHtml(laid.reason ?? "")}</p>` };
   }
-  return { html: renderSectionHtml(graph, pipelines, kept, dropped, ordinals, laid.flat) };
+  return { html: renderSectionHtml(graph, drawn.pipelines, drawn.edges, dropped, ordinals, laid.flat) };
 }
 
 /**
@@ -849,7 +893,7 @@ function renderSectionHtml(
   }
 
   return (
-    `<h2>依赖图（${graph.nodes.length} 任务 · ${pipelines.length} 管道 · 声明 ${graph.edges.length} 边（本质 ${kept.length} · 传递省略 ${dropped.length}））</h2>\n` +
+    `<h2>依赖图（${graph.nodes.filter((n) => !isInquiryNode(n)).length} 任务 · ${pipelines.length} 管道 · 声明 ${graph.edges.length} 边（本质 ${kept.length} · 传递省略 ${dropped.length}））</h2>\n` +
     `<p class="hint dg-legend-row">${renderGraphLegend()}</p>\n` +
     (notes.length > 0 ? `<p class="hint warn">${notes.join(" · ")}</p>\n` : "") +
     `<div class="dep-graph">\n` +

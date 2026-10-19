@@ -105,7 +105,8 @@ export interface FeatureTaskItem {
   taskId: string;
   projectId: string;
   state: string;
-  lane: string;
+  /** 纯透传可 null（值域归桥；曾 `?? "write"` 兜底系死重——全板零消费方）。 */
+  lane: string | null;
   failureKind: string | null;
   retryCount: number | null;
   dependencies: string[] | null;
@@ -131,6 +132,10 @@ export interface FeatureTaskItem {
   prompt: string | null;
   /** 职责位原样透传（值域归桥，板不自造中文词，口径同 trace `waitReason`）。 */
   taskType: string | null;
+  /** 执行模式原样透传（值域归桥）。契约透传节点新增；缺键 ⇒ null，**不 `?? "dag"` 兜底**。 */
+  mode: string | null;
+  /** 任务阶段原样透传（值域归桥，口径同 `taskType`）。缺键 ⇒ null，**不回落「需求分析」**；与 Feature 顶层 `stage` 不同源。 */
+  stage: string | null;
 }
 
 /**
@@ -539,7 +544,7 @@ export function parseFeatureDetail(json: unknown): FeatureDetailView {
       taskId: reqStr(t.taskId, "task.taskId"),
       projectId: reqStr(t.projectId, "task.projectId"),
       state: reqStr(t.state, "task.state"),
-      lane: str(t.lane) ?? "write",
+      lane: str(t.lane),
       failureKind: str(t.failureKind),
       retryCount: num(t.retryCount),
       dependencies: t.dependencies === null ? null : strArray(t.dependencies),
@@ -552,6 +557,8 @@ export function parseFeatureDetail(json: unknown): FeatureDetailView {
       claimedBy: str(t.claimedBy),
       prompt: str(t.prompt),
       taskType: str(t.taskType),
+      mode: str(t.mode),
+      stage: str(t.stage),
     };
   });
   return {

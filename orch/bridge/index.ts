@@ -39,6 +39,7 @@ import {
   type ArtifactRecord,
   type EventRecord,
   type FeatureRecord,
+  type FeatureStage,
   type InputArtifactRef,
   type MachineRef,
   type ProjectGroup,
@@ -96,6 +97,7 @@ import { createProjectVersionsEndpoints } from "./project-versions-endpoints.js"
 import { activateVersionForFeature } from "./versions-activation.js";
 import {
   FeatureScheduler,
+  isDagNode,
   isLocalTerminalTask,
   type FeatureDispatchResult,
 } from "./scheduler.js";
@@ -700,8 +702,22 @@ export interface DispatchTaskInput {
    * Feature 节点行已存在（`registerFeatureNode` 已建）⇒ 传 `null`，不重复落库。
    * `taskType`（v0.10.2 增补三 E-1）= 职责位**声明原样透传**（缺省 undefined = 落库 NULL ⇒
    * 读侧归一 `unit_agent`）；**与 `lane` 正交** —— inquiry 建行仍恒 `lane='read'`。
+   *
+   * **v0.10.8 O-2 / O-9（本节点三枚必填字段）**：inquiry 行自此**必带归属** ——
+   * `featureId` = 归属声明（落 `tasks.feature_id`，**不是** DAG 挂载）；`mode` 恒 `"inquiry"`
+   * （落 `tasks.mode`，调度器与 Feature 读面的节点集合判据据此把它剔出 DAG 集）；
+   * `stage` = **派发当刻其 Feature 登记 `stage` 的快照**（落 `tasks.stage`；由调用方
+   * `handleCall` 现读 `getFeature(...).stage` 传入，本层不再查询）。
+   * 三枚在类型上必填 ⇒ 「漏传 = 编译错误」，不存在「建出无归属的 inquiry 行」这条路径。
    */
-  newTask: { prompt: string; dispatchMessage: string; taskType?: TaskType | null } | null;
+  newTask: {
+    prompt: string;
+    dispatchMessage: string;
+    taskType?: TaskType | null;
+    featureId: string;
+    mode: "inquiry";
+    stage: FeatureStage;
+  } | null;
   /**
    * 连接身份（v0.8.6 §2.2；`null` / 缺省 = 无身份 ⇒ 全组聚合视图）。
    * - **inquiry 路径**（`handleCall`）：由 `coreFor(identity)` 绑定注入 = 调用方连接身份；
@@ -883,7 +899,12 @@ function startLocalTaskWatcher(taskId: string): void {
         );
         return;
       }
-      // 终态已由 persist 落库；Feature 节点据此续推 DAG（无 Feature 归属 = 独立 inquiry，零动作）
+      /**
+       * 终态已由 persist 落库；带 `feature_id` 的行据此通知调度器。
+       * ⚠️ v0.10.8 O-2 起 **inquiry 行亦带 `feature_id`**（归属声明）⇒「无 Feature 归属 =
+       * 独立 inquiry」这条旧等式不再成立：是否续推 DAG 由调度器按 `tasks.mode` 判据裁决
+       * （`isDagNode` 早退 ⇒ inquiry 结算只落库、不传播、不改 Feature 态），本处只负责通知。
+       */
       if (featureId !== null) {
         scheduler.notifyTaskSettled(featureId, taskId, { state: task.state, text: task.text });
       }
@@ -932,21 +953,46 @@ export async function dispatchTask(input: DispatchTaskInput): Promise<DispatchOu
     return { ok: false, code: deniedAtTarget.code, error: deniedAtTarget.error, contextId };
   }
 
-  // ③ 独立任务建行（前置全部通过之后 ⇒ 失败路径零副作用、零脏行）
-  if (input.newTask !== null && getTask(taskId) === null) {
-    createTask({
-      taskId,
-      projectId,
-      contextId,
-      state: "working",
-      // v0.8.10 O-N4：散活（inquiry）本就是只读语义 ⇒ 恒落只读档。
-      // 不显式标则按缺省 = 写档 ⇒ 撞 machine 写闸 ⇒ 散活排到 Feature 写节点后面。
-      lane: "read",
-      // v0.10.2 增补三 E-1：职责位原样透传声明（缺省 undefined = 落库 NULL ⇒ 读侧归一
-      // unit_agent）；与 `lane` 正交，本行**不改**上面「恒 read」的读档语义。
-      taskType: input.newTask.taskType,
-      prompt: truncatePrompt(input.newTask.prompt),
-      dispatchMessage: input.newTask.dispatchMessage,
+  // ③ 独立任务建行 + 旧行结算（前置全部通过之后 ⇒ 失败路径零副作用、零脏行）
+  const newTask = input.newTask;
+  if (newTask !== null && getTask(taskId) === null) {
+    // v0.10.8 M2（改造文档 §2.2 修正1）：**建行在前、结算旧行在后、两者同一事务**。
+    // 顺序由「败式不对称」定死：结算先成而建行败 ⇒ 该询问**永久失去续推点**（不可自愈）；
+    // 建行成而结算败 ⇒ 仅计数漂移（存量清理脚本可追补）。
+    // ⚠️ 事务**止于结算调用**：④ 入队与 `wakeRunner` 留在事务外（体内不跨 `await`/长 I/O 持锁）。
+    // 结算面由 M1 的查询判据（列值等式 `mode = 'inquiry' ∧ state = 'input-required'`）封顶：
+    // **DAG 节点一律不命中**（`isDagNode` 围栏与 `advance(answer)` 续接语义本卡一字不动）。
+    const store = getDefaultStore();
+    store.runInTransaction(() => {
+      createTask({
+        taskId,
+        projectId,
+        contextId,
+        state: "working",
+        // v0.8.10 O-N4：散活（inquiry）本就是只读语义 ⇒ 恒落只读档。
+        // 不显式标则按缺省 = 写档 ⇒ 撞 machine 写闸 ⇒ 散活排到 Feature 写节点后面。
+        lane: "read",
+        // v0.10.2 增补三 E-1：职责位原样透传声明（缺省 undefined = 落库 NULL ⇒ 读侧归一
+        // unit_agent）；与 `lane` 正交，本行**不改**上面「恒 read」的读档语义。
+        taskType: newTask.taskType,
+        // v0.10.8 O-2：inquiry 的归属声明落 `feature_id`（`handleCall` 已在建行前验过
+        // 存在 + 归属 ⇒ 此处只是透传，不再查询、不再校验）。
+        featureId: newTask.featureId,
+        // v0.10.8 O-4：通道位显式写 `"inquiry"`（不靠读侧归一）—— 调度器 / Feature 读面的
+        // 节点集合判据只认这一位区分「DAG 节点 vs 只读询问节点」。
+        mode: newTask.mode,
+        // v0.10.8 O-9：派发当刻的阶段快照（值由调用方取自 Feature 登记 `stage`；本行是建行
+        // 首写 ⇒ 后续重派经 `COALESCE` 永不改写）。
+        stage: newTask.stage,
+        prompt: truncatePrompt(newTask.prompt),
+        dispatchMessage: newTask.dispatchMessage,
+      });
+      // 旧行结算（同一条 CAS UPDATE 落 `state` + `settled_by` = 本枚新 taskId，不留
+      // 「已结算未记账」中间态）；同 context 多命中时只结算最新一枚，其余留给清理脚本（M3）。
+      const predecessor = store.findOpenInquiryPredecessor(contextId, taskId);
+      if (predecessor !== null) {
+        store.updateTaskState(predecessor.taskId, "completed", null, null, taskId);
+      }
     });
   }
 
@@ -988,12 +1034,21 @@ export async function dispatchTask(input: DispatchTaskInput): Promise<DispatchOu
 
 /**
  * `a2a_call` 的**立即派发路径**（REQ-v0.4.1-2026-09-16-01 §2.5）：**只承载 `inquiry`**。
- * 执行型派发（`mode="execute"`）必带 `featureId` ⇒ 走 {@link registerFeatureNode}（登记 DAG 节点，
- * 由调度器派发），永不进入本函数。
+ * 执行型派发（`mode="execute"`）走 {@link registerFeatureNode}（登记 DAG 节点，由调度器派发），
+ * 永不进入本函数。
  *
  * 契约以**类型级**表达：`mode` 只能取字面量 `"inquiry"` —— 传 `"execute"` 即**编译错误**；
- * `mode` 的必填性 / 对偶校验**不在本层重复实现**（单一事实源：`register-tools.ts` 的
- * `a2aCallSchema` 与 `validateCallMode`）。缺省值使既有 4 参调用点行为完全等价（A 步零破坏）。
+ * `mode` 的必填性 / 两 mode 的 `featureId` 必填校验**不在本层重复实现**（单一事实源：
+ * `register-tools.ts` 的 `a2aCallSchema` 与 `validateCallMode`）。
+ *
+ * **v0.10.8 O-2 / O-3（改造文档 §2.1）**：`featureId` 收紧为必填 = inquiry 的**归属声明**，
+ * 建行落 `tasks.feature_id` + `mode='inquiry'` + `stage` 快照。本层的两枚校验
+ * **置于建行之前**（`dispatchTask` 之前 ⇒ 失败路径连一行都不建，零脏行）：
+ * - **只验存在**：`getFeature` 命中，否则 `feature_not_found`；
+ * - **归属校验**：与 {@link ownershipFailure} 同源（禁止第二套判据，同 `registerFeatureNode`）；
+ * - ⚠️ **不验挂载态**（`MOUNTABLE_FEATURE_STATES` 与本路径无关）：Step 0/1 期间 Feature 恒在
+ *   `waiting_approval` / 更前档位，若按挂载门校验，「必填」会被误读成「挂载校验」⇒ inquiry
+ *   永不合法。**终态 Feature 同样允许挂**（收尾追问要挂）。
  *
  * v0.7.0 A4：经队列派发 —— 前置通过后落独立任务行 → 入队 + wake → 同步预算内等终态；
  * 拿到终态回真实结果，否则回 `working` + `taskId`（**对外契约不变**）。
@@ -1007,6 +1062,7 @@ async function handleCall(
   text: string,
   contextIdInput: string | undefined,
   wait: boolean,
+  featureId: string,
   mode: "inquiry" = "inquiry",
   taskType?: TaskType | undefined,
   identity: string | null = null,
@@ -1015,12 +1071,30 @@ async function handleCall(
   const contextId =
     contextIdInput !== undefined && contextIdInput.length > 0 ? contextIdInput : randomUUID();
 
+  // O-3 两枚校验（零 I/O，置于建行之前 ⇒ 失败路径零脏行）
+  const feature = getFeature(featureId);
+  if (feature === null) {
+    return { ok: false, code: "feature_not_found", error: `未知 Feature ${featureId}`, contextId };
+  }
+  const owned = ownershipFailure(feature, identity);
+  if (owned !== null) {
+    return { ok: false, code: owned.code, error: owned.error, contextId };
+  }
+
   const sent = await dispatchTask({
     taskId: randomUUID(),
     projectId,
     contextId,
     wait,
-    newTask: { prompt: text, dispatchMessage: text, taskType },
+    newTask: {
+      prompt: text,
+      dispatchMessage: text,
+      taskType,
+      featureId,
+      mode: "inquiry",
+      // O-9 快照：取派发当刻 Feature 登记 `stage` 的原值（陈旧照实呈现、不推导、不兜底）
+      stage: feature.stage,
+    },
     identity,
   });
   if (!sent.ok) {
@@ -1233,10 +1307,14 @@ function buildNodeDispatchMessage(node: TaskRecord, feature: FeatureRecord | nul
  * `analyzing`（分析扇出）已随主链收敛**有意撤销**；
  * 登记 ≠ 派发 —— `tick` 只看 `executing`，故 `decomposing` 内登记的节点不占机器资源。
  * 变更该常量即自动更新文案，经 `join` 取用）；
- * `dependencies` 引用同 Feature 内的本地 taskId；`inputs` 声明本节点引用的上游产物；
+ * `dependencies` 引用同 Feature 内的本地 taskId（**且须是 DAG 节点** —— 指向
+ * `mode="inquiry"` 的只读询问行 ⇒ 即时拒，码 `dependency_is_inquiry`，见闸①）；
+ * `inputs` 声明本节点引用的上游产物；
  * `readOnly`（v0.8.10 O-N4）声明本节点并发档：仅显式 `true` ⇒ `lane='read'`，否则 `'write'`；
  * `taskType`（v0.10.2 O-2）声明本节点职责位：仅显式带值才落 `tasks.task_type`，
- * **缺省（undefined）= 落库 NULL = 未声明** ⇒ 读侧归一 `unit_agent`（**不在此处兜底写值**）。
+ * **缺省（undefined）= 落库 NULL = 未声明** ⇒ 读侧归一 `unit_agent`（**不在此处兜底写值**）；
+ * v0.10.8 O-4/O-9：本口是 **DAG 通道**的建行首写 ⇒ 显式落 `mode='dag'`，并落 `stage` =
+ * **登记当刻** Feature 登记 `stage` 的原值快照（重派经 `COALESCE` 不改写）。
  */
 function registerFeatureNode(
   projectId: string,
@@ -1297,6 +1375,33 @@ function registerFeatureNode(
   }
   const localTaskId = randomUUID();
   const deps = dependencies.length > 0 ? Array.from(new Set(dependencies)) : null;
+  /**
+   * **dep 双闸 · 闸①（v0.10.8 orch-N7 · 改造文档 §2.1 O-4）**：`dependencies` 命中
+   * `mode="inquiry"` 的行 ⇒ **即时结构化拒**（仍置于 `createTask` **之前** ⇒ 零脏行）。
+   * 判据与闸②（`validateDag`）同源，共用 {@link isDagNode}，不开第三口子
+   * （MCP 工具面与网页直调都经本口）。
+   *
+   * 为什么必须拦：inquiry 行自 O-2 起亦携带 `featureId` ⇒ 会落进同一 Feature 的任务集，
+   * `validateDag` 的悬空引用判据**放行**它；而它不由调度器派发，`depStateOf` 于是让下游
+   * 按一个只读行的态做 gating（该行 `failed` / `blocked` ⇒ 下游恒 `upstreamFailed`、永不派发）。
+   *
+   * 悬空引用（`getTask` 未命中）照旧不在此处判 —— 留给 `validateDag`，本闸不扩权。
+   */
+  if (deps !== null) {
+    for (const dep of deps) {
+      const depNode = getTask(dep);
+      if (depNode !== null && !isDagNode(depNode)) {
+        return {
+          ok: false,
+          code: "dependency_is_inquiry",
+          error:
+            `依赖 ${dep} 是只读询问节点（mode="inquiry"），不可作为 DAG 前置：` +
+            `它不参与调度器派发。需要前置关系请改用 mode="execute" 登记该节点。`,
+          contextId,
+        };
+      }
+    }
+  }
   const inputRefs = inputs !== undefined && inputs.length > 0 ? Array.from(inputs) : null;
   createTask({
     taskId: localTaskId,
@@ -1313,6 +1418,12 @@ function registerFeatureNode(
     // prompt 保留截断片段用于辨识；dispatchMessage 存全文供调度器派发
     prompt: message,
     featureId,
+    // v0.10.8 O-4：DAG 通道位显式写 `"dag"`（与 inquiry 建行口对称；不靠读侧归一 NULL⇒dag），
+    // 调度器与 Feature 读面的节点集合判据此有一位可直接对照的落库值。
+    mode: "dag",
+    // v0.10.8 O-9：派发当刻（登记当刻）Feature 登记 `stage` 的原值快照 —— 陈旧照实呈现、
+    // 不推导；重派经 `COALESCE` 永不改写（见 `dispatchFeatureNode`）。
+    stage: feature.stage,
     dependencies: deps,
     inputArtifacts: inputRefs,
     dispatchMessage: message,
@@ -1367,6 +1478,12 @@ async function dispatchFeatureNode(node: TaskRecord): Promise<FeatureDispatchRes
   const message = buildNodeDispatchMessage(node, feature);
   // v0.8.9 O2：渲染结果只写 `dispatchRendered`（本轮下发快照，Runner 领取即用）；
   // `dispatchMessage` 原样回写 = 未渲染 base 保持不变（防「反复派发 ⇒ 外壳叠加」）
+  //
+  // v0.10.8 O-9 硬细节（改造文档 §2.2）：重放建行**刻意不传 `mode` / `stage`**（同 `lane` /
+  // `task_type` 既有纪律）—— 缺省 = 落库 NULL，`createTask` 的 ON CONFLICT 走
+  // `COALESCE(excluded.mode, mode)` / `COALESCE(excluded.stage, stage)` ⇒ 保留首次值。
+  // **快照只认首次（登记当刻），重派不得改写**：重派时 Feature 可能已换档，若把 `node.stage`
+  // 回写就等于用「后一时刻的阶段」篡改「派发当刻的事实」。
   createTask({
     taskId: node.taskId,
     projectId: node.projectId,
@@ -1937,8 +2054,13 @@ export interface BridgeCore {
     contextId: string | undefined,
     wait: boolean,
     /**
+     * **归属声明（v0.10.8 O-1 起必填）**：`mode="inquiry"` 亦必带 `featureId` —— 建行落
+     * `tasks.feature_id`（见 {@link handleCall}）；**只验存在 + 归属，不验挂载态**。
+     */
+    featureId: string,
+    /**
      * **立即派发路径只承载 `inquiry`**（类型级约束，见 `handleCall`）；执行型派发
-     * （`mode="execute"`）必带 `featureId`，走 `registerFeatureNode`（登记 DAG，由调度器派发）。
+     * （`mode="execute"`）走 `registerFeatureNode`（登记 DAG，由调度器派发）。
      */
     mode?: "inquiry",
     /**
@@ -2002,8 +2124,8 @@ export function createCore(identity: string | null = null): BridgeCore {
     projects: (): Promise<MachinesView | Failure> => handleProjects(identity),
     tasks: (projectId, state, limit): Promise<TasksView | Failure> =>
       handleTasks(projectId, state, limit, identity),
-    call: (projectId, text, contextId, wait, mode, taskType): Promise<CallOutcome> =>
-      handleCall(projectId, text, contextId, wait, mode, taskType, identity),
+    call: (projectId, text, contextId, wait, featureId, mode, taskType): Promise<CallOutcome> =>
+      handleCall(projectId, text, contextId, wait, featureId, mode, taskType, identity),
     registerFeatureNode: (projectId, message, contextId, featureId, dependencies, inputs, readOnly, taskType): CallOutcome =>
       registerFeatureNode(projectId, message, contextId, featureId, dependencies, inputs, identity, readOnly, taskType),
     taskStatus: (taskId): Promise<TaskStatusOutcome> => handleTaskStatus(taskId, identity),

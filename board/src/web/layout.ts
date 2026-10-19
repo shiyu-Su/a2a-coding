@@ -1130,13 +1130,14 @@ export const PAGE_LIVE_SCRIPT = `<script>
   document.addEventListener("visibilitychange", function () { if (!document.hidden) runOneTick(); });
   var nowBtn = document.querySelector(".live-now");
   if (nowBtn !== null) { nowBtn.hidden = false; }
-  // ── 任务页局部动线：三条委托（chips / 不带过滤重查·换项目 / 过滤表单）+ pushState · popstate ──
-  // 共同闸 = 目标 pathname ∈ {/tasks, /org/<名>/tasks} ∧ 当前页也在这两档 ⇒ 才拦并局部化；
+  // ── 任务页局部动线：三条委托（chips / 不带过滤重查 / 过滤表单）+ pushState · popstate ──
+  // 共同闸 = 目标 pathname = /tasks ∧ 当前页也在该档 ⇒ 才拦并局部化；
   // 其余（含需求详情一类的跨页链）一律放行原生导航 ⇒ 全站 pushState 只发生在任务页三动线。
-  // 本枚活在 TS 模板字符串内：单反斜杠转义斜杠会被源码层当 NonEscapeCharacter 吃掉 ⇒ 运行值成裸斜杠
-  // 即整枚 parse 不过（钉 = live-refresh B4 / B8），故此处必须双写反斜杠。
+  // REQ-2026-10-17-01 B-6（乙′ ③）：/org/<名>/tasks 正则支随空间任务档整支删（负钉 = live-refresh B4）；
+  // 若日后重新引入正则，仍在 TS 模板字符串内 ⇒ 单反斜杠转义斜杠会被源码层当 NonEscapeCharacter 吃掉、
+  // 运行值成裸斜杠即整枚 parse 不过（钉 = live-refresh B8），必须双写反斜杠。
   function onTasksPath(p) {
-    return p === "/tasks" || /^\\/org\\/[^/]+\\/tasks$/.test(p);
+    return p === "/tasks";
   }
   function tasksUrl(raw) {
     if (raw === null || raw === undefined || raw === "" || onTasksPath(location.pathname) === false) return null;
@@ -1416,6 +1417,7 @@ export function renderPage(params: PageParams): string {
   .hint { color: #777; margin: 6px 0; }
   .hint.err { color: #b42318; }
   .hint.warn { color: #b26a00; }
+  .eff-line code { font-weight: 600; }
   pre.result { background: #8881; border: 1px solid #8884; border-radius: 6px; padding: 8px 10px; white-space: pre-wrap; word-break: break-word; font-family: ui-monospace, Consolas, monospace; font-size: 12px; margin: 6px 0; }
   table { border-collapse: collapse; width: 100%; font-family: ui-monospace, Consolas, monospace; font-size: 12px; }
   th, td { border: 1px solid #8884; padding: 4px 6px; text-align: left; vertical-align: top; }
@@ -1665,7 +1667,11 @@ export function renderPage(params: PageParams): string {
   .b-step.cur .b-step-name { color: var(--b-brand-ink); font-weight: 600; }
   .b-step-line { display: inline-block; width: 18px; height: 1px; background: var(--b-line); }
   .b-step-line.done { background: var(--b-brand-line); }
-  .b-steps-cur { margin-left: auto; color: var(--b-text-3); }
+  /* v0.10.8 B-10：六格即链接（切换器 = 步条本身，不新增控件）；on = 选中格（URL ?stage= 结论） */
+  a.b-step { text-decoration: none; }
+  a.b-step:hover .b-step-name, a.b-step:focus .b-step-name { text-decoration: underline; }
+  .b-step.on { border: 1px solid var(--b-brand); border-radius: var(--b-r-8); padding: 2px var(--b-sp-4); background: var(--b-brand-soft); }
+  .b-step.on .b-step-name { color: var(--b-brand-ink); font-weight: 600; }
   /* 两栏：主栏自适应 + 侧栏定宽；窄窗（含浮层 dialog 收窄时）回落单列 */
   .feat-cols { display: grid; grid-template-columns: minmax(0, 1fr) var(--b-feat-side); gap: var(--b-sp-16); align-items: start; }
   .feat-main, .feat-side { min-width: 0; }

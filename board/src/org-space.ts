@@ -106,7 +106,9 @@ function classifyRemainder(remainder: string, method: string | undefined): Remai
   // v0.9.6 B5b（口径 15）：组织空间需求清单读面整页退役 ⇒ 独立「退役形态」档（**不得删净落 404**：
   // GET 由调用方发 303 到同空间排期页，非 GET 走读面族同款 405，保持方法门与 BD6-④d 口径一致）
   if (remainder === "/features") return { retired: true };
-  if (remainder === "/tasks") return { view: "tasks" };
+  // REQ-2026-10-17-01 B-6（乙′ ②）：空间任务档 `/org/<名>/tasks` 整支删 ⇒ 与 F2 同归「退役形态」档
+  //（同上一条口径：GET 303 落同空间排期页、非 GET 405，**不得删净落 404 死面**）
+  if (remainder === "/tasks") return { retired: true };
   // §9-c：/orgs 管理页退役 ⇒ 成员管理与停用操作落空间内 manage 页（写 action 仍走全局端点）
   if (remainder === "/manage") return { view: "manage" };
   if (remainder.startsWith("/features/") && !remainder.slice("/features/".length).includes("/")) {

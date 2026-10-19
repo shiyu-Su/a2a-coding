@@ -86,26 +86,6 @@ const TASK_STATE_LABELS: Readonly<Record<string, string>> = {
 };
 
 /**
- * 任务视图状态过滤候选（REQ-v0.9.2 N4 · `renderTasksPick` 用）：值域 = 主链 **8** 态 + 异常 3 态 +
- * `blocked`（良性终态，§4 口径）。
- * （原「需求列表页过滤」共用常量随列表页退役收编于此，REQ-2026-09-26-04 Q3。）
- */
-const TASK_FILTER_STATES = [
-  "waiting_approval",
-  "version_planning",
-  "decomposing",
-  "executing",
-  "integrating",
-  "testing",
-  "reviewing",
-  "completed",
-  "needs_input",
-  "failed",
-  "cancelled",
-  "blocked",
-] as const;
-
-/**
  * 只读页常驻刷新的周期单点（REQ-2026-10-11-03 件N1 · 改造文档 §2.1 换块契约）：毫秒整数，
  * **只经 SSR 属性下发**（每页第一枚锚上的周期属性），不进任何脚本字面量 ⇒ 脚本不内置周期。
  */
@@ -624,6 +604,15 @@ export interface FeatureDetailExtras {
    * （键 = 文件名段）；缺省不传 ⇒ 不警示（视图层不碰 `node:fs`）。
    */
   docExists?: RegisteredDocExists;
+  /**
+   * 选中阶段（v0.10.8 B-10 表侧 · REQ-2026-10-17-01）：非空 ⇒ 执行明细**只出该阶段的子集行**
+   * （`#` 仍由全集算号，见 {@link renderExecutionRows}）；`undefined` / `null` ⇒ **不过滤**（全集出
+   * `<tr>`，未接线调用方保持旧形态）。详情页接线：`server.ts` 读 URL `?stage=` 后一律经
+   * {@link resolveStageSelection} 三级回落出**结论**下传（步条 `on` 与表侧过滤吃同一值）。
+   * 值域 = 行上 `tasks[].stage` 的桶键（六枚具名阶段 + `—` 无阶段档，见 {@link STAGE_UNASSIGNED}）；
+   * 桶外的值 ⇒ 该阶段 0 任务 ⇒ 走「区内空态行」（不猜、不静默回落全集）。
+   */
+  selectedStage?: string | null;
 }
 
 /**
@@ -655,6 +644,14 @@ function featCard(bodyHtml: string, extraClass = ""): string {
  */
 const STAGE_STEPS: readonly string[] = ["需求分析", "改造方案", "改造", "回归", "验收", "发版"];
 
+/**
+ * 步条六格的**可切档集**（v0.10.8 B-10 切换侧）：六格之外唯一还能被 `?stage=` 选中的桶键 =
+ * `—` 无阶段档（表侧可达〔选它才出 NULL 快照行，判据见 `v0108-b10-table-stage-filter` B10-④〕，
+ * 但**不占格** —— 本卡口径「六格即链接」，`—` 档无格 ⇒ `on` 恒不落任何格，不违「DOM 不空落」
+ * 〔表格仍有行〕）。三级默认回落只在**六格**里选，不兜 `—`。
+ */
+const STEP_SELECTABLE: readonly string[] = STAGE_STEPS;
+
 /** 显示阶段 → 步条档位；`null` = 归档不上（未知 / 终态回落登记值 ⇒ 不高亮、不猜）。 */
 interface StageStepPos {
   /** 当前段下标（0 起） */
@@ -672,10 +669,11 @@ function stageStepPos(d: DisplayStage): StageStepPos | null {
     case "改造方案":
       return { index: 1, doneThrough: 0, qualifier: null };
     case "定版中":
-      // v0.10.5 主链新增两态（`version_planning`）同归「改造方案」段 —— 不新增第七段，靠补注显形
-      return { index: 1, doneThrough: 0, qualifier: "定版中" };
+      // v0.10.5 主链新增两态（`version_planning`）+ `decomposing` 移挂「改造」段（v0.10.8 B-1：
+      // 定版 / 拆任务已属改造工序，不再占「改造方案」段；靠补注显形，不新增第七段）
+      return { index: 2, doneThrough: 1, qualifier: "定版中" };
     case "拆任务中":
-      return { index: 1, doneThrough: 0, qualifier: "拆任务中" };
+      return { index: 2, doneThrough: 1, qualifier: "拆任务中" };
     case "改造中":
       return { index: 2, doneThrough: 1, qualifier: null };
     case "改造中 · 待澄清":
@@ -694,13 +692,14 @@ function stageStepPos(d: DisplayStage): StageStepPos | null {
 }
 
 /**
- * 阶段步条（件2）：六段圆点 + 连线，完成段打勾、当前段实底；
- * 尾部一行保留「显示阶段（派生 / 登记）」—— 本条替代原元数据表的
- * 「阶段（显示）」+「阶段（登记）」双行，**派生 / 登记事实与 basis 标注一个不丢**。
+ * 阶段步条（件2 · v0.10.8 B-10 起**即切换器**）：六段圆点 + 连线，完成段打勾、当前段实底；
+ * **六格逐格是链接**（`<a href="/features/<id>?stage=…">`，不新增任何切换控件）——
+ * 绝对路径而非 `?stage=…` 相对串：浮层 `#feat-dialog` 的原生回落与第八枚活刷都要吃正确 URL。
+ * 选中格 `on` 绑 `resolveStageSelection` 的结论（与表侧过滤同一值）；段态（done/cur）仍绑派生档。
+ * 显示阶段 / 派生·登记事实的口径以元数据表为准（v0.10.8 B 链：步条尾部说明退场，不再重复）。
  */
-function renderStageStepBar(d: DisplayStage): string {
+function renderStageStepBar(featureId: string, d: DisplayStage, selected: string | null): string {
   const pos = stageStepPos(d);
-  const basis = d.basis === "derived" ? "派生" : "登记";
   const cells: string[] = [];
   STAGE_STEPS.forEach((name, i) => {
     if (i > 0) {
@@ -710,15 +709,12 @@ function renderStageStepBar(d: DisplayStage): string {
     const done = pos !== null && i <= pos.doneThrough;
     const cur = pos !== null && i === pos.index && !done;
     const label = cur && pos !== null && pos.qualifier !== null ? `${name} · ${pos.qualifier}` : name;
+    const cls = `b-step${done ? " done" : ""}${cur ? " cur" : ""}${name === selected ? " on" : ""}`;
     cells.push(
-      `<span class="b-step${done ? " done" : ""}${cur ? " cur" : ""}"><i class="b-step-dot">${done ? "✓" : ""}</i><b class="b-step-name">${escapeHtml(label)}</b></span>`,
+      `<a class="${cls}" href="/features/${encodeURIComponent(featureId)}?stage=${encodeURIComponent(name)}"><i class="b-step-dot">${done ? "✓" : ""}</i><b class="b-step-name">${escapeHtml(label)}</b></a>`,
     );
   });
-  const tail =
-    pos === null
-      ? `当前阶段 = <b>${escapeHtml(d.label)}</b> <span class="muted">（${basis} · 未归档到步条，如实显示）</span>`
-      : `当前 = <b>${escapeHtml(d.label)}</b> <span class="muted">（${basis}）</span>`;
-  return `<div class="b-steps">${cells.join("")}<span class="b-steps-cur">${tail}</span></div>`;
+  return `<div class="b-steps">${cells.join("")}</div>`;
 }
 
 /** 侧栏元数据卡（件2）：compact 两列（名 / 值），**替代原 4×2 大表**；阶段行已上步条，此处不再重复。 */
@@ -768,7 +764,8 @@ export function renderFeatureOwnershipCard(projects: FeatureDetailView["projects
 /**
  * 执行明细单表的固定列序（v0.10.3 N3 · 改造文档 §2-4，**顺序即判据**）：
  * 「三面表」退役后其信息各归一列 —— waitReason / 位次 / 写门 / 读档占位 / 已等待 合成「为什么没跑」，
- * 创建·开始·结束三时刻**裁掉**（时刻原值走 `/tasks` 面追溯）。
+ * 创建·开始·结束三时刻**裁掉**（原「时刻原值走 `/tasks` 面追溯」：随「任务展示收进需求卡片」改造，
+ * `/org/<名>/tasks` 空间档整支删、全局 `/tasks` 仅存 `?project=` 深链过渡档，独立时刻追溯面不再成立）。
  */
 const EXECUTION_COLUMNS: readonly string[] = [
   "#",
@@ -785,16 +782,89 @@ const EXECUTION_COLUMNS: readonly string[] = [
 ] as const;
 
 /**
+ * 阶段桶的「无阶段」档（v0.10.8 B-10 表侧）：`tasks[].stage` = 派发当刻 Feature 登记 `stage` 的快照，
+ * 纯透传可 null（O-9：存量行不回填 / 老桥缺键 ⇒ null）⇒ 归本档、格面**显 `—`**，
+ * **不得兜底成「需求分析」**或任何具名阶段（兜底 = 把「没记阶段」谎报成某一阶段的执行记录）。
+ */
+const STAGE_UNASSIGNED = "—";
+
+/**
+ * 行的阶段桶键：NULL / 空串 ⇒ `—`；**其余值照实当桶键**（含陈旧快照 —— 快照不可回改，
+ * 错桶即如实呈现，判据见改造文档 §2.2 O-9 已知缺陷；不并入 `—`，也不并入六格词表）。
+ */
+const stageBucketOf = (task: FeatureTaskItem): string => {
+  const s = task.stage;
+  return s === null || s === undefined || s === "" ? STAGE_UNASSIGNED : s;
+};
+
+/**
+ * 步条六格 ↔ 桶键的同一化桥（v0.10.8 B-10 切换侧）：派生显示档的**补注态**（定版中 / 拆任务中 /
+ * 待澄清）与「已完成」都不在桶键词表里 ⇒ 经 `stageStepPos` 段下标回落到所在段的真阶段名再选档 ——
+ * URL/过滤要的是段的本名，补注只是显示修饰。归档不上（`pos = null`）⇒ `null`，不猜。
+ */
+function displayStageToStep(d: DisplayStage): string | null {
+  const pos = stageStepPos(d);
+  return pos === null ? null : STAGE_STEPS[pos.index] ?? null;
+}
+
+/** 阶段桶有任务的最后落库时刻（组内最大 `createdAt`；全 null ⇒ null，不拿别的时刻顶替）。 */
+function stageGroupMaxCreated(tasks: readonly FeatureTaskItem[]): string | null {
+  let max: string | null = null;
+  for (const t of tasks) {
+    const c = t.createdAt;
+    if (c === null || c === "") continue;
+    if (max === null || c > max) max = c;
+  }
+  return max;
+}
+
+/**
+ * 选中阶段三级默认回落（v0.10.8 B-10 切换侧 · 改造文档 §2.3 B-10，**逐级生效**）：
+ * ① URL `?stage=` 命中桶键闭集（六格 + `—`）⇒ 照选 —— **即使该档 0 任务也不改判**
+ *   （走表侧「区内空态行」；非法/缺省才进回落，否则回落会越权覆盖人的显式选择）；
+ * ② `deriveDisplayStage` 档（经 {@link displayStageToStep} 落段本名，与 steps 锚同源）0 任务 ⇒
+ *   **最后一个有任务的阶段**：按阶段桶（只六格，`—` 不占格）组内最大 `createdAt` 定序取最后，
+ *   组内时刻全缺失（无法定序）⇒ 该组参选资格放弃；
+ * ③ 一任务都没有（或全落 `—` 桶）⇒ `STAGE_STEPS[0]` —— 六格必有一格 `on`，**DOM 不空落**。
+ * 返回值恒为六格之一或 `—`；`—` 只可能来自 ①（URL 显式）。
+ */
+export function resolveStageSelection(detail: FeatureDetailView, queryStage: string | null | undefined): string {
+  const raw = (queryStage ?? "").trim();
+  if (STEP_SELECTABLE.includes(raw) || raw === STAGE_UNASSIGNED) return raw;
+  const all = detail.tasks;
+  const f = detail.feature;
+  const derived = displayStageToStep(deriveDisplayStage(f.state, f.stage));
+  if (derived !== null && all.some((t) => stageBucketOf(t) === derived)) return derived;
+  let best: string | null = null;
+  let bestMax: string | null = null;
+  for (const step of STEP_SELECTABLE) {
+    const group = all.filter((t) => stageBucketOf(t) === step);
+    if (group.length === 0) continue;
+    const max = stageGroupMaxCreated(group);
+    if (max === null) continue;
+    if (bestMax === null || max >= bestMax) {
+      best = step;
+      bestMax = max;
+    }
+  }
+  return best ?? STAGE_STEPS[0]!;
+}
+
+/**
  * 执行明细单表的行（v0.10.3 N3）：一行一任务，**按 `taskOrdinalMap` 升序**（与图上 chip 同一张编号表 ——
  * 键 = `createdAt` 登记时刻，不在本处第二处派生）；`taskId` 去重口径同 {@link taskOrdinalMap}（首见即留）。
  * trace 命中 ⇒ 填「为什么没跑」，终态 / 无 trace ⇒ `—`；在飞不做「至 now」推算（时长函数照用）。
+ *
+ * **v0.10.8 B-10 表侧（同 B-4 图侧纪律）**：`tasks` = **要出行的集合**（可是全集、可是某阶段子集），
+ * `ordinals` **必须由全集算出后传进来** —— 在本函数内约简 ⇒ 子集重编号 `1..M`，连带砸穿
+ * 「同一 taskId 表/图同号」审计契约与「依赖」列 `#k` 寻址。
  */
 function renderExecutionRows(
   tasks: readonly FeatureTaskItem[],
   trace: FeatureTraceView | null,
   nowMs: number,
+  ordinals: ReadonlyMap<string, number>,
 ): string[] {
-  const ordinals = taskOrdinalMap(tasks);
   const byId = new Map<string, FeatureTaskItem>();
   for (const t of tasks) if (!byId.has(t.taskId)) byId.set(t.taskId, t);
   const traceByTask = new Map<string, TraceNode>();
@@ -858,18 +928,30 @@ export function renderFeatureDetail(
   // 件D 第三档（REQ-2026-10-11-05 增补 N3）：头部「整页打开」链带 `target="_blank"` ⇒ 浮层导航分支
   // （`layout.ts` 的 `hasAttribute("target")` 放行）原样交回浏览器原生开新标签；链在 head 不在锚内
   // ⇒ 第八枚永不替换它。
-  const head = `<h2>${escapeHtml(f.title === "" ? f.featureId : f.title)} <span class="muted mono" title="${escapeHtml(f.featureId)}">${escapeHtml(f.featureId)}</span>${renderParentFeatureBadge(f.parentFeatureId)} <a class="fd-fullpage" href="/features/${escapeHtml(f.featureId)}" target="_blank" rel="noopener">整页打开</a></h2>\n<div class="live-slot" data-live="steps" data-live-interval="${String(LIVE_INTERVALS.feature)}">${renderStageStepBar(d)}</div>`;
+  const head = `<h2>${escapeHtml(f.title === "" ? f.featureId : f.title)} <span class="muted mono" title="${escapeHtml(f.featureId)}">${escapeHtml(f.featureId)}</span>${renderParentFeatureBadge(f.parentFeatureId)} <a class="fd-fullpage" href="/features/${escapeHtml(f.featureId)}" target="_blank" rel="noopener">整页打开</a></h2>\n<div class="live-slot" data-live="steps" data-live-interval="${String(LIVE_INTERVALS.feature)}">${renderStageStepBar(f.featureId, d, extras.selectedStage ?? null)}</div>`;
 
   // v0.10.3 N3：任务表与「进展三面」表**并为一张 11 列单表**（三面表退役）。
   // 行的事实源 = `detail.tasks` 全集，序 = `taskOrdinalMap` 升序（编号与图上 chip 同一张表，键 = `createdAt` 登记时刻）；
   // trace 只按 taskId 命中后填「为什么没跑」一列，终态 / 无 trace ⇒ `—`。
-  const rows = renderExecutionRows(detail.tasks, trace, nowMs);
+  // v0.10.8 B-10（表侧 · REQ-2026-10-17-01）：**编号源 = 全集、出集源 = 选中阶段子集**（同 B-4 图侧）——
+  // 先在全集上算号与总数，再按 `stage` 取子集出 `<tr>`；预过滤喂入即全表重编号，故不得先切再数。
+  const allTasks = detail.tasks;
+  const ordinals = taskOrdinalMap(allTasks);
+  const totalRows = new Set(allTasks.map((t) => t.taskId)).size;
+  const selectedStage = extras.selectedStage ?? null;
+  const stageTasks =
+    selectedStage === null ? allTasks : allTasks.filter((t) => stageBucketOf(t) === selectedStage);
+  const rows = renderExecutionRows(stageTasks, trace, nowMs, ordinals);
+  // 阶段名只在选择生效时进标题（未选 = 全集 ⇒ 标题逐字不变，`任务（N）` 既有锚不翻）。
+  const stageTag = selectedStage === null ? "" : `${escapeHtml(selectedStage)} · `;
+  // **空态两级化**：① 全集 0 ⇒ 整节短路不渲（C2 现有行为，图/锚不连坐）；
+  // ② 选中阶段 0 ⇒ **不短路** —— 表头 + 区内空态行（步条在 `head` 恒在，人还能点别的阶段）。
   const executionTable =
-    rows.length === 0
+    totalRows === 0
       ? ""
-      : `<h2>任务（${rows.length}）</h2>
+      : `<h2>任务（${stageTag}${rows.length}）</h2>
 <table><thead><tr>${EXECUTION_COLUMNS.map((c) => `<th>${c}</th>`).join("")}</tr></thead>
-<tbody>${rows.join("")}</tbody></table>
+<tbody>${rows.length === 0 ? emptyRow(EXECUTION_COLUMNS.length, `本阶段暂无任务 · 全需求共 ${totalRows} 枚`) : rows.join("")}</tbody></table>
 <p class="hint">${escapeHtml(TRACE_READ_NOTE)}</p>`;
   const traceHint =
     trace === null
@@ -882,7 +964,9 @@ export function renderFeatureDetail(
   // 件2 → v0.10.3 N2c：依赖图先移出「执行明细」折叠（独立卡），本节点再**从侧栏上移主栏**
   // （管道制要宽度）；外壳函数与 `feat-graph` 类名一律保留（「无任务 ⇒ 图卡不渲」的锚读的就是类名）。
   // 件N1 锚 4/5 `graph` / 锚 5/5 `exec`：恒在壳包住图卡与执行明细折叠（空正文 ⇒ 壳在场、内容空）。
-  const graphCard = `<div class="live-slot" data-live="graph" data-live-lock>${featCard(extras.graphHtml ?? "", "feat-graph")}</div>`;
+  // v0.10.8 B-10 图侧闸（REQ-2026-10-17-01 · 改造文档 §2.3 B-10 · 用户指定）：**仅选中阶段 === 「改造」才渲图卡**；
+  // 其余五格与 `—` / 未接线（null）一律不渲。锚壳不连坐（第八枚活刷按 `data-live="graph"` 定位，壳必须恒在）。
+  const graphCard = `<div class="live-slot" data-live="graph" data-live-lock>${selectedStage === "改造" ? featCard(extras.graphHtml ?? "", "feat-graph") : ""}</div>`;
   const execution = `<div class="live-slot" data-live="exec">${
     executionBody === "" ? "" : foldSection("执行明细（任务 / 为什么没跑）", executionBody)
   }</div>`;
@@ -959,10 +1043,9 @@ function taskStateBadge(state: string): string {
 }
 
 /**
- * 结果表卡（件5）：{@link renderTasks}（查询档）与 {@link renderTasksPick}（默认带出档）
- * **共用同一张卡**，避免两处各存一份列定义。
+ * 结果表卡（件5）：{@link renderTasks}（深链查询档）渲染本卡（原共用它的任务选单档已随 B-6 退役）。
  * 列 = taskId（含 stale 徽标）/ 状态徽标 / 更新 / contextId / prompt 摘要；
- * `metaHtml` = 卡头右侧的计数与过滤说明（调用方拼，含「换项目」出口）；
+ * `metaHtml` = 卡头右侧的计数与过滤说明（调用方拼；「换项目」出口已随 REQ-2026-10-17-01 B-6 乙′ 摘除——目标裸 `/tasks` 303 即死链）；
  * `unreachableHtml` = 项目不可达提示行（由调用方给出，缺 ⇒ 不渲）。
  */
 function renderTasksResultCard(
@@ -991,94 +1074,11 @@ function renderTasksResultCard(
   );
 }
 
-/** {@link renderTasksPick} 的默认带出档（件5）：调用方已取回的近 N 条快照 + 该次读取的 limit。 */
-export interface TasksPreviewInput {
-  view: ProjectTasksView;
-  /** 本次默认带出的条数上限（服务端常量，如实回显用）。 */
-  limit: number;
-}
-
 /**
- * 任务页的页面周期属性（件N1 判据 6：选单档与深链档**共用同一渲染路径** ⇒ 本页恰 1 处代码产出它）。
+ * 任务页的页面周期属性（件N1 判据 6；B-6 后仅深链档 {@link renderTasks} 一处产出）。
  * 前导空格是属性分隔符 ⇒ 调用方直接接在锚 key 属性之后。
  */
 const TASKS_LIVE_INTERVAL_ATTR = ` data-live-interval="${String(LIVE_INTERVALS.tasks)}"`;
-
-/**
- * 任务页选单档（`GET /tasks` / `GET /org/<名>/tasks` **不带 `project`** 时）。
- *
- * REQ-2026-09-30-04 件5（原型 v2.3 样张④）：裸查询表单 → **过滤卡**（项目 / 状态 / 条数 + 查询钮）
- * + **快捷项目 chips** + **默认带出结果卡**（`preview` = 调用方已取回的近 N 条快照，
- * 未传 ⇒ 不渲结果卡，行为同旧「先选项目」。
- * **表单零属性改动**（`method="get"` + `action` 逐字不变，排版靠 `.b-filter` 后代选择器）⇒ 读面表单锚不失效。
- */
-export function renderTasksPick(
-  projects: ProjectsView | null,
-  pickError: string | null,
-  org: string | null = null,
-  membershipError: string | null = null,
-  preview: TasksPreviewInput | null = null,
-): string {
-  // D 档/BD6：空间内（org 非 null）选单与表单落 `/org/<名>/tasks`（链接仍指全局深链口径）
-  const tasksBase = org === null ? "/tasks" : orgSpaceLink(org, "tasks");
-  const previewView = preview?.view ?? null;
-  const previewProject = previewView?.projectId ?? "";
-  const chips =
-    projects !== null
-      ? projects.machines
-          .flatMap((m) => m.projects.map((p) => p.projectId))
-          .sort()
-          .map((pid) => {
-            const on = previewProject !== "" && previewProject === pid ? ' class="on"' : "";
-            return `<a${on} href="${escapeHtml(tasksBase)}?project=${encodeURIComponent(pid)}">${escapeHtml(pid)}</a>`;
-          })
-          .join("")
-      : "";
-  const hint =
-    pickError !== null
-      ? `<p class="hint err">项目清单读取失败：${escapeHtml(pickError)}（不影响手工输入项目名查询）</p>`
-      : "";
-  // v0.9.6 C2：空间档声明面不可判定（GET /api/groups 读失败）⇒ 清单已清空，如实标注、不外泄他组
-  const membershipHint =
-    membershipError !== null
-      ? `<p class="hint err">项目清单不可判定：${escapeHtml(membershipError)}</p>`
-      : "";
-  const stateSelect = `<option value="">全部</option>${TASK_FILTER_STATES.map(
-    (s) => `<option value="${escapeHtml(s)}">${escapeHtml(label(TASK_STATE_LABELS, s))}</option>`,
-  ).join("")}`;
-  // 件N1 锚 `tasks-result`（选单档 = 默认带出的结果卡）：恒在壳，未传 preview ⇒ 壳在场、内容空。
-  const previewCard = `<div class="live-slot" data-live="tasks-result">${
-    preview === null || previewView === null
-      ? ""
-      : renderTasksResultCard(
-          previewView,
-          `默认带出 <span class="mono">${escapeHtml(previewProject)}</span> 近 ${String(preview.limit)} 条（读回 ${String(previewView.tasks.length)} 条）· <a class="fl" href="${escapeHtml(tasksBase)}?project=${encodeURIComponent(previewProject)}">不带过滤重查</a>`,
-          previewView.reachable
-            ? ""
-            : `<p class="hint err">项目 ${escapeHtml(previewProject)} 当前不可达${previewView.notice !== null ? `：${escapeHtml(previewView.notice)}` : ""}</p>`,
-        )
-  }</div>`;
-  // 件N1 锚 2/2 `tasks-filter`：本档的第一枚锚 ⇒ 页面周期属性挂它（单点见上）。
-  // （`.b-card.b-filter` 卡体与 `<form>` 标签逐字不动，只套恒在壳）。
-  const filterAnchorOpen = `<div class="live-slot" data-live="tasks-filter"${TASKS_LIVE_INTERVAL_ATTR}>`;
-  return `${renderLiveBar(LIVE_INTERVALS.tasks)}
-<h2>任务视图</h2>
-${hint}
-${membershipHint}
-${filterAnchorOpen}${cardShell(
-  "过滤",
-  "点下方项目 chip 或填条件后查询",
-  `<form method="get" action="${escapeHtml(tasksBase)}">
-<label>projectId <input name="project" placeholder="项目 id"${preview === null ? "" : ` value="${escapeHtml(previewProject)}"`}></label>
-<label>状态 <select name="state">${stateSelect}</select></label>
-<label>limit <input name="limit" type="number" min="1" step="1" placeholder="不限"></label>
-<button type="submit">查询</button>
-</form>
-${chips === "" ? "" : `<div class="b-chips"><span class="b-chips-label">快捷项目</span>${chips}</div>`}`,
-  "b-filter",
-)}</div>
-${previewCard}`;
-}
 
 export function renderTasks(
   view: ProjectTasksView,
@@ -1099,7 +1099,7 @@ export function renderTasks(
             .filter((s) => s !== "")
             .join(" · "),
         )}</span> <span class="muted">（桥服务端过滤）</span>`;
-  const meta = `共 ${String(view.tasks.length)} 条${filterNote} · <a class="fl" href="${escapeHtml(org === null ? "/tasks" : orgSpaceLink(org, "tasks"))}">换项目</a>`;
+  const meta = `共 ${String(view.tasks.length)} 条${filterNote}`;
   // 件N1 锚 `tasks-result`（深链档本页唯一锚 ⇒ 页面周期属性挂它，单点见上）。
   const resultAnchorOpen = `<div class="live-slot" data-live="tasks-result"${TASKS_LIVE_INTERVAL_ATTR}>`;
   return `${renderLiveBar(LIVE_INTERVALS.tasks)}
@@ -1488,7 +1488,7 @@ function renderOrgProjectsTable(
     return (
       "<tr" + (p.machineError !== null ? ' class="warn"' : "") + ">" +
       `<td>${escapeHtml(p.machineId)}</td>` +
-      `<td><a class="fl" href="${escapeHtml(orgSpaceLink(org, "tasks"))}?project=${encodeURIComponent(p.projectId)}">${escapeHtml(p.projectId)}</a></td>` +
+      `<td><a class="fl" href="/tasks?project=${encodeURIComponent(p.projectId)}">${escapeHtml(p.projectId)}</a></td>` +
       `<td>${escapeHtml(dash(releasedVersionByProject.get(p.projectId.trim())))}</td>` +
       `<td>${escapeHtml(p.agentKind ?? "—")}</td>` +
       `<td>${p.a2aPort === null ? "—" : String(p.a2aPort)}</td>` +
@@ -1881,7 +1881,6 @@ export const ORG_HOST_AGENT_KIND_SUGGESTIONS = ["claude", "codex", "opencode", "
  * 靠隐藏 `action=setHostAgent` 分流（写路由白名单不扩条）；**整体覆盖两键**（不做增量 PATCH，
  * 留空 = 置 null 恢复全局默认）。回显行 = 每项生效值 + 来源标注（本组织 / 全局默认 / 后端缺省），
  * 缓解「只配 kind ⇒ 全局 model 对该组织静默失效」（改造文档 §6 遗留，不改成对回落）。
- * hint 三条固定口径见改造文档 §3（取值热生效等新建桥 / kind 写错 502 指引 / 种子 AGENTS.md 遗留）。
  * agentKind 一枚带 {@link ORG_HOST_AGENT_KIND_SUGGESTIONS} 的 `<datalist>` 建议下拉（REQ-2026-10-04-01
  * 增补）：**仍是可手填的文本框**，无 JS / 不支持 datalist 时原生退化为纯文本框。
  */
@@ -1896,13 +1895,10 @@ function renderOrgHostAgentCard(
     cfg.orgModel !== null ? "本组织" : cfg.orgKind !== null ? "后端缺省" : cfg.globalModel !== null ? "全局默认" : "后端缺省";
   const effModel =
     cfg.orgModel ?? (cfg.orgKind === null && cfg.globalModel !== null ? cfg.globalModel : "（后端缺省）");
-  const globalLine =
-    `全局默认：kind = <code>${escapeHtml(cfg.globalKind ?? "（宿主面未装配）")}</code> · ` +
-    `model = <code>${escapeHtml(cfg.globalModel ?? "（未配置 ⇒ 后端缺省）")}</code>`;
   return cardShell(
     "本组织 agent 配置",
     `<span class="mono">POST /orgs</span> · action=setHostAgent`,
-    `<p class="hint">生效值回显：kind = <code>${escapeHtml(effKind)}</code>（来源：${kindSource}）· model = <code>${escapeHtml(effModel)}</code>（来源：${modelSource}）· ${globalLine}。未配置的键回落全局；<b>组织改过 kind 而未配 model ⇒ 不沿用全局 model</b>（全局 model 按全局 kind 命名空间配置，跨适配器必错），由该 kind 适配器的后端缺省接管。</p>
+    `<p class="hint eff-line">生效值回显：kind = <code>${escapeHtml(effKind)}</code>（来源：${kindSource}）· model = <code>${escapeHtml(effModel)}</code>（来源：${modelSource}）</p>
 <form method="post" action="/orgs" class="w" data-submit="已提交，保存配置中…" data-ov="1">
 <input type="hidden" name="action" value="setHostAgent">
 <input type="hidden" name="org" value="${escapeHtml(org)}">
@@ -1910,12 +1906,7 @@ function renderOrgHostAgentCard(
 <datalist id="org-host-agent-kind-list">${ORG_HOST_AGENT_KIND_SUGGESTIONS.map((kind) => `<option value="${escapeHtml(kind)}"></option>`).join("")}</datalist>
 <label>agentModel（后端模型）<input name="agentModel" value="${escapeHtml(cfg.orgModel ?? "")}" placeholder="留空 = 回落全局默认 / 后端缺省"></label>
 <button type="submit">保存 agent 配置</button>
-</form>
-<ul class="hint muted">
-<li>改后对<b>已在线的该组织桥无效</b>：取值热、生效等新建桥 —— 须停桥后下一轮才用新值（与 config.json「仅对新建桥生效」同口径）。</li>
-<li><b>kind 写错</b> ⇒ 该组织下一轮起桥报 502 <code>spawn_failed</code>（页面显示为「宿主桥已断」）；板不预校验值域，<b>停桥改回即可</b>。下拉为<b>板侧维护的建议清单</b>（非闭集）：清单外的值仍可手填；后端新增适配器时需同步本清单。</li>
-<li>建组织种子 <code>AGENTS.md</code> 内的后端标识仍为<b>全局值</b>，不随本配置更新（已知遗留，登记于改造文档 §6）。</li>
-</ul>`,
+</form>`,
   );
 }
 
@@ -1927,8 +1918,8 @@ function renderOrgHostAgentCard(
  * **页头核对短条**（⑧a · REQ-2026-10-11-05 N9：紧接 `<h2>`，**先于项目卡**；卡面降级为一条
  *   `<p class="hint">`，本页**已注入**源的读取健康度 + warnings；第三源 = 引擎版本台账投影 project 档，随
  *   {@link OrgSpaceManageInput.versionProjection} 注入才参评）；
- * **项目卡** = 逐组只读 `a2a_projects`（运行态）；项目深链落**空间任务页**
- *   `/org/<名>/tasks?project=…`（v0.9.6 C3：manage 页内 org 已知，不再指全局 `/tasks`）；
+ * **项目卡** = 逐组只读 `a2a_projects`（运行态）；项目深链落**全局深链** `/tasks?project=…`
+ *   （REQ-2026-10-17-01 B-6 乙′：空间任务档整支删 ⇒ v0.9.6 C3 的空间深链改指回全局档，原目标 303 即死链）；
  * **两栏拖拽池** {@link renderMemberPoolColumns}（左池 / 右本组，v0.9.8 · REQ-2026-10-03-02）
  *   → 成员写**只此一条拖拽通路** → `POST /orgs/{org}/members`（隐藏 `action`；⑦ 起两枚手填表单与其
  *   折叠宿主已退役，无 JS / 无拖拽面 ⇒ 该档无页内写通路，登记于改造文档 §6）；**本组织 agent 配置卡**；**停用卡** → `POST /orgs`

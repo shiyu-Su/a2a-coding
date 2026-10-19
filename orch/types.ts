@@ -85,6 +85,22 @@ export const TASK_LANES = ["read", "write"] as const;
 export type TaskLane = (typeof TASK_LANES)[number];
 
 /**
+ * 任务执行通道取值集合（**v0.10.8 O-4 引入；orch 单元内唯一枚举源**，落 `tasks.mode`）。
+ *
+ * - `dag`：Feature DAG 节点（本列引入前的**唯一通道**）；
+ * - `inquiry`：询问型派发（Step 0/1）—— 不进 DAG 节点集合、不进挂载白名单，
+ *   prune 按 `mode='inquiry'` 年龄裁（判据面归 O-4 后续节点）。
+ *
+ * ⚠️ 与 `TASK_LANES`/`TASK_TYPES` 同形纪律：**落库列 `tasks.mode` 的 NULL 一律归一为 `dag`**
+ * （读侧 `readMode`，存量不回填）—— 反向（NULL 当 inquiry）等于把全部存量节点剔出 DAG 判据集。
+ * 本清单是 **orch 本地语义**（machine 零触达、非协议镜像，`PROTOCOL.md` 不动，见改造文档 O-7）。
+ */
+export const TASK_MODES = ["dag", "inquiry"] as const;
+
+/** 任务执行通道（由 `TASK_MODES` 派生；勿另立第二份清单） */
+export type TaskMode = (typeof TASK_MODES)[number];
+
+/**
  * 任务失败分类**六类闭集**（v0.4.1 引入；v0.6.1 REQ-05 起休眠；v0.8.7 O3 按二分恢复；
  * **v0.8.8 O1 硬切为六类**）。
  *
@@ -543,6 +559,31 @@ export interface TaskRecord {
    * （与 `lane` 的「NULL 归保守档 + COALESCE 保首次档」同形，兜底方向按各自缺省档取）。
    */
   taskType: TaskType;
+  /**
+   * **执行通道**（v0.10.8 O-4 · orch-N1，落 `tasks.mode`；取值见 {@link TASK_MODES}）。
+   *
+   * 声明形态（与 `lane`/`task_type` 同一条链）：建行入参 `mode` → 落库本列。
+   * **读侧不存在 NULL**：列里的 NULL 一律归一为缺省档 `dag`（= 本列引入前的唯一行为，
+   * 存量行**不回填**，NULL 承载「建行早于本列」这一事实；归一只在 `readMode` 一处）。
+   *
+   * ⚠️ 本节点（N1）只落「值域 + 落库」两段：节点集合判据（O-4 五处）、`FeatureTaskSummary`
+   * 出参（O-5）、prune 改判（O-8）各归后续节点。
+   */
+  mode: TaskMode;
+  /**
+   * **派发当刻阶段快照**（v0.10.8 O-9 · orch-N2，落 `tasks.stage`；值域复用
+   * {@link FEATURE_STAGES}，不另立第二份清单）：值 = 该 task 派发当刻其 Feature 登记字段
+   * `stage` 的快照（改造文档 §2.2 O-9）。
+   *
+   * 声明形态：建行入参 `stage` → 落库本列（写侧接值归后续节点，本节点只落「落库 + 读侧」）。
+   * **读侧 NULL 照实读出 `null` —— 不归一、不兜底**（与 `mode` **相反**：`mode` 有缺省档 `dag`
+   * 可归一，本列**没有默认档**，NULL 承载「建行早于本列 / 未摄快照」，兜底成任何一档 = 给存量行
+   * 凭空赋阶段语义 ⇒ 展示侧一律显 `—`，**不得兜底成「需求分析」**）。
+   *
+   * ⚠️ 已知缺陷（登记）：`features.stage` 是半派生回写 ⇒ 快照**可能滞后（陈旧照实呈现）**，
+   * 且快照**不可回改**（它是派发当刻的事实）。
+   */
+  stage: FeatureStage | null;
   artifactsJson: string | null;
   /** 任务结果纯文本（成功 = artifacts 文本；失败 = status.message 错误原因）；旧记录可能为 null */
   text: string | null;
