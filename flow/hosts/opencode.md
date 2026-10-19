@@ -41,8 +41,6 @@
 }
 ```
 
-**仓库根 [`opencode.json.example`](../../opencode.json.example) 是 canonical 宿主样例**（含 `/mcp` 与 `/<组名>/mcp` 两种形态，二选一启用）；`orch/opencode.json.example` 则是 **orch 单元自身**的历史配置样例（v0.4.1 由 `orch/opencode.json` 改名而来，用于避免 worker 侧再拉起第二座桥），**不是宿主接入样例**。
-
 > ⚠️ 桥的接入面由**桥自己读的 `<orch>/config/config.json`** 决定；remote 形态的宿主条目**不需要 `env`**（env 属于启动桥的 shell）。
 
 ## ② 旁路加载流程规范

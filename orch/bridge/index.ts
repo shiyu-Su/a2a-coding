@@ -2480,7 +2480,7 @@ process.on("SIGTERM", shutdown);
  * 而本模块顶层 `main()` 会**拉起整座桥**（core 租约 / DB / 传输面）⇒「import 即产生副作用」
  * 使 `bridge/index.ts` 不可被单测 import（`test/web.test.ts` 已书面记录该限制）。
  * 判定式只比较 `process.argv[1]` 与 `import.meta.url`：三种真实启动路径
- * （`orch/opencode.json.example` 的 `node …/dist/bridge/index.js`、`bridgectl.mjs` 的 spawn、
+ * （直接 `node …/dist/bridge/index.js`、`bridgectl.mjs` 的 spawn、
  * `npm run bridge`）的 `argv[1]` 都指向本文件 ⇒ 判定恒为真，**生产行为零变化**；
  * 仅「被 import」时不再自动启动。
  */
