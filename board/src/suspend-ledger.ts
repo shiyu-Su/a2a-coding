@@ -21,7 +21,7 @@
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { writeFileAtomic } from "./host-bridge-ledger.js";
+import { writeFileAtomic } from "./atomic-write.js";
 
 /** 台账 schema 版本（未来加字段时用于迁移判定）。 */
 export const SUSPEND_LEDGER_VERSION = 1;

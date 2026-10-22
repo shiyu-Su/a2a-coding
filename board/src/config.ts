@@ -25,12 +25,11 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { DEFAULT_BRIDGE_BASE_URL } from "./bridge-client.js";
 import { DEFAULT_MCP_BASE_URL } from "./requirement.js";
-import { DEFAULT_HOST_AGENT_KIND } from "./host-bridge.js";
-import { resolveMachineDistDir } from "./host-runtime.js";
 import { defaultRepoRoot } from "./docs-read.js";
 
 export const DEFAULT_PORT = 3400;
 export const DEFAULT_HOST = "127.0.0.1";
+const DEFAULT_HOST_AGENT_KIND = "claude";
 
 /** 唯一保留的 env 通道：只覆盖**配置文件路径**，不承载配置内容。 */
 export const CONFIG_PATH_ENV = "BOARD_CONFIG";
@@ -47,16 +46,12 @@ export interface BoardConfig {
   readonly orgsDir: string | null;
   /** 板级默认组织：**可选默认**；`null` = 未配置（BD11 起不是错误，表单留空才请求期 400）。 */
   readonly group: string | null;
+  /** 组织种子模板的工作流标记；板不使用它启动任何进程。 */
   readonly hostKind: string;
-  /** 宿主后端模型（v0.9.5 hostModel · 本次仅开 model 一键）：透传为起桥 `agentConfig.model`；`null` = 不透传 ⇒ 后端自身缺省。 */
-  readonly hostModel: string | null;
   readonly bridgeUrl: string;
   readonly mcpBaseUrl: string;
-  readonly machineDist: string;
   /** 主仓根（BD10 读文档面源 A 的锚点）：配置键 `repoRoot` 缺省 = 板根上一级（恒有值，非 null）。 */
   readonly repoRoot: string;
-  /** 单轮有界等待毫秒；`null` = 未配置 ⇒ 交下游 `DEFAULT_TURN_TIMEOUT_MS`。 */
-  readonly turnTimeoutMs: number | null;
 }
 
 /** 缺省配置文件落点：`<board>/config/config.json`（源码与 `dist/` 运行都落到同一处）。 */
@@ -119,16 +114,16 @@ function optStringArray(raw: Record<string, unknown>, key: string, remedy: strin
   return out;
 }
 
-function requireUrl(raw: string, key: string): string {
+function requireUrl(raw: string, key: string, port: "3300" | "8787"): string {
   let ok = false;
   try {
     const u = new URL(raw);
-    ok = (u.protocol === "http:" || u.protocol === "https:") && u.host !== "";
+    ok = (u.protocol === "http:" || u.protocol === "https:") && u.host !== "" && u.port === port;
   } catch {
     ok = false;
   }
   if (!ok) {
-    throw configError(key, `必须是含主机的 http(s):// 绝对地址（收到 "${raw}"）`, `如 http://127.0.0.1:3300；或整键删除用缺省值`);
+    throw configError(key, `必须是端口 ${port} 的 http(s):// 绝对地址（收到 "${raw}"）`, `改回 http://127.0.0.1:${port}；或整键删除用缺省值`);
   }
   return raw;
 }
@@ -154,33 +149,19 @@ export function validateConfig(parsed: unknown, sourcePath: string): BoardConfig
   const host = optString(raw, "host") ?? DEFAULT_HOST;
   const hostKind = optString(raw, "hostKind") ?? DEFAULT_HOST_AGENT_KIND;
   // hostModel（v0.9.5）：可选模型名；缺省 / 空串 ⇒ null = 不透传（后端自身缺省）。板不校验取值。
-  const hostModel = optString(raw, "hostModel");
-  const bridgeUrl = requireUrl(optString(raw, "bridgeUrl") ?? DEFAULT_BRIDGE_BASE_URL, "bridgeUrl");
-  const mcpBaseUrl = requireUrl(optString(raw, "mcpBaseUrl") ?? DEFAULT_MCP_BASE_URL, "mcpBaseUrl");
+  const bridgeUrl = requireUrl(optString(raw, "bridgeUrl") ?? DEFAULT_BRIDGE_BASE_URL, "bridgeUrl", "3300");
+  const mcpBaseUrl = requireUrl(optString(raw, "mcpBaseUrl") ?? DEFAULT_MCP_BASE_URL, "mcpBaseUrl", "8787");
 
   // orgsDir / group：**无缺省兜底可言** —— 留空 = 未配置（各自的「未配置语义」由消费方承担）。
   const orgsDirRaw = optString(raw, "orgsDir");
   const orgsDir = orgsDirRaw === null ? null : resolve(orgsDirRaw);
   const group = optString(raw, "group");
 
-  const machineDistRaw = optString(raw, "machineDist");
-  // 恒给出显式值 ⇒ 启动路径不再经 host-runtime 的 BOARD_MACHINE_DIST 兜底（旧 env 通道随之失效）。
-  const machineDist = machineDistRaw ?? resolveMachineDistDir({});
-
   // repoRoot（BD10）：读文档面源 A 的锚点，缺省 = 板根上一级；目录可不存在（列目录时按空清单降级）。
   const repoRootRaw = optString(raw, "repoRoot");
   const repoRoot = repoRootRaw === null ? defaultRepoRoot() : resolve(repoRootRaw);
 
-  let turnTimeoutMs: number | null = null;
-  if (raw.turnTimeoutMs !== undefined && raw.turnTimeoutMs !== null) {
-    const v = raw.turnTimeoutMs;
-    if (typeof v !== "number" || !Number.isInteger(v) || v <= 0) {
-      throw configError("turnTimeoutMs", `必须是正整数毫秒（收到 ${JSON.stringify(v)}）`, "改 turnTimeoutMs 为正整数，或整键删除交下游缺省（10 min）");
-    }
-    turnTimeoutMs = v;
-  }
-
-  return { sourcePath, port, host, orgsDir, group, hostKind, hostModel, bridgeUrl, mcpBaseUrl, machineDist, repoRoot, turnTimeoutMs };
+  return { sourcePath, port, host, orgsDir, group, hostKind, bridgeUrl, mcpBaseUrl, repoRoot };
 }
 
 /**

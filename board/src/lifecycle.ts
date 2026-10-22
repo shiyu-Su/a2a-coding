@@ -6,6 +6,8 @@
  *   `port`/`host` = 实际绑定值 ⇒ 启停脚本探测端点的**唯一事实源**（脚本不解析配置内容，BD12″）。
  * - 停机（信号 / `POST /shutdown`）路径删除；异常退出留下的陈旧文件由 `boardctl stop/status`
  *   识别并清理（陈旧 pidfile 不是锁，无害）。
+ * - 另承载**退出卫生**两件：`createShutdownChain` 的兜底闸（BD19 缺陷①）与 `resumeAndUnref`
+ *   （被继承管道写端钉住的 stdio 读端 ⇒ 撒手；B1 起板不再起 agent，本函数作为退出卫生出口保留）。
  */
 import { mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { dirname, join } from "node:path";
@@ -182,4 +184,31 @@ export function createShutdownChain(deps: ShutdownChainDeps): (via: string) => P
     })();
     return done;
   };
+}
+
+/**
+ * **排空 + 撒手**（BD19 缺陷①的主修，v0.11.0 B1 起随宿主面退役从 `host-process.ts` 迁入本模块）：
+ * `resume()` 让管道持续被消费（否则子进程写满 64KB 会阻塞），紧接着 `unref()` 让这两个句柄
+ * **不再参与父进程的存活判定**。
+ *
+ * 为什么必须撒手：Windows 上板 spawn 的是 `cmd.exe → 桥 → 后端`，**停止时只 SIGTERM 了直接子进程
+ * `cmd.exe`**（它退了就不再树杀），而孙进程**继承着同一根 stdout/stderr 管道的写端**
+ * ⇒ 父进程那头的读端永远等不到 EOF ⇒ 只要 `resume()` 过，它就是**一个有主的活跃句柄** ⇒
+ * 停机链跑完、端口已释放、日志已打「已停止」，进程却钉在事件循环上不走（2026-09-25 真机僵尸数小时）。
+ * 实测残余活跃资源清单 = `PipeWrap×2`（`process.getActiveResourcesInfo()`，见 {@link createShutdownChain} 兜底闸）。
+ *
+ * 只在**父进程侧**解除引用，不动子进程的 stdio 形态（仍 `pipe`，管道内容照旧可被消费）⇒
+ * 「不 `unref()` 子进程句柄：仍需 `exit` 事件跟踪该子进程」那条既有口径不受影响。
+ *
+ * 本函数是**板侧一旦引入子进程就该走的退出卫生出口**：B1 退役后板不再起宿主 agent，
+ * 生产侧暂无调用方，但「被继承管道钉住退出」这条教训的可执行形态保留在此并被 BD19 钉住，
+ * 不再回指已删除的宿主桥实现。
+ */
+export function resumeAndUnref(stream: NodeJS.ReadableStream | null | undefined): void {
+  // `stdio` 该槽为 `ignore` 时流是 `null` ⇒ 本就无句柄可钉，等同于已撒手。
+  if (stream === null || stream === undefined) return;
+  stream.resume();
+  // spawn 出来的 stdio 管道在 Node 里是 net.Socket 形态（有 unref）；拿不到就当已撒手（不抛）。
+  const maybe = stream as NodeJS.ReadableStream & { unref?: () => void };
+  maybe.unref?.();
 }

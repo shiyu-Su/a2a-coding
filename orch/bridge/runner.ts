@@ -9,7 +9,7 @@
  * |---|---|---|
  * | `POST /runner/register` | 注册 / 刷新投影 | Bearer token（常量时间）→ machineId ∈ `machines[]` → `protocolVersion` 主版本 ∈ `SUPPORTED_PEER_PROTOCOL_MAJORS`；`upsertRunner` + `runnerProjectsReplace` + `runner.registered` 事件 |
  * | `POST /runner/connect` | 长轮询（poll 即心跳） | 同上鉴权；claim 前置 = **未配组 ⇒ 全放**，配了组 ⇒ `(machineId,projectId) ∈ 任一组 memberKeys` **且**任务归属该机器（= 本机注册过的项目）；命中 claim CAS 即下发 `dispatch`，另可下发 `stop` / `cancel-task`；空超时 = 心跳（204） |
- * | `POST /runner/result` | 结果回传（ack） | 同上鉴权 + **claim_token 校验**（比对落库领取令牌；**O4 补结算窄口**：无令牌且 `state=failed` ∧ 行 `working` ∧ `claimed_by=本机` ⇒ 受理，否则照旧 409）→ `upsertTaskResult`（幂等键 `(machineId, taskId)`）→ O1：本次胜出 `failed` 时**校验 machine 上报的 `failureKind` 是否合 2.3 六类闭集**并落库（不合 ⇒ 安全兜底类 + warn 带原值，**绝不整包拒收**）→ 200 ack |
+ * | `POST /runner/result` | 结果回传（ack） | 同上鉴权 + **claim_token 校验**（比对落库领取令牌；**O4 补结算窄口**：无令牌且 `state=failed` ∧ 行 `working` ∧ `claimed_by=本机` ⇒ 受理，否则照旧 409）→ **O3 写前翻态 + O4 结算前分类（v0.11.0）**：上报 `completed` ∧ `detectProviderFailureReceipt(text)` 命中 ⇒ 同一次 UPDATE 改判 `failed` + warn 留痕（marker/snippet）、分类直落 `provider` + 脱敏片段；自报 `failed` ⇒ **O1 闭集校验** machine 上报的 `failureKind`（不合 ⇒ 安全兜底类 + warn 带原值，**绝不整包拒收**；不改上报取值）。两键与终态经 `upsertTaskResult`（幂等键 `(machineId, taskId)`）**同一条 UPDATE** 落库，`task.settled` 事件随附 `failureKind` + `failureSnippet` → 200 ack |
  *
  * 门闩与接入面（节点验收项）：
  * - **owner 门闩**：仅 core 租约 `owner` 的实例提供端点；
@@ -70,7 +70,6 @@ import {
   markRunnerOffline,
   requeueStaleTask,
   runnerProjectsReplace,
-  setTaskFailureKind,
   touchRunnerHeartbeat,
   upsertRunner,
   upsertTaskResult,
@@ -104,6 +103,8 @@ import {
 } from "../types.js";
 import { bridgeLog } from "./bridge-log.js";
 import type { DegradationSink } from "./index.js";
+import { detectProviderFailureReceipt } from "./provider-receipt.js";
+import { settleStageTaskOnSettled } from "./stage-settle.js";
 
 // ---------------------------------------------------------------------------
 // 降级登记键（v0.8.8 O5；两处静默降级各一键，登记到 index 注入的进程内登记表）
@@ -187,16 +188,16 @@ const SETTLED_TERMINAL_STATES: readonly TaskState[] = ["completed", "failed", "b
  */
 const ACP_AGENT_ERROR_KINDS: readonly string[] = ["spawn", "closed"];
 
-/** 该字符串是否为合格的六类值（闭集校验；清单唯一事实源 = `types.ts` 的 `FAILURE_KINDS`） */
+/** 该字符串是否为合格的七类值（闭集校验；清单唯一事实源 = `types.ts` 的 `FAILURE_KINDS`） */
 function isFailureKindValue(v: string): v is FailureKind {
   return (FAILURE_KINDS as readonly string[]).includes(v);
 }
 
 /**
  * **兜底映射**（v0.8.8 O1 起为本版唯一显式冗余，改造文档 §3.3）：machine 原生 `AcpError.kind`
- * → 六类**安全值**（`spawn` / `closed` ⇒ `agent`；其余 ⇒ `business`，即「不可重试」侧）。
+ * → 七类**安全值**（`spawn` / `closed` ⇒ `agent`；其余 ⇒ `business`，即「不可重试」侧）。
  *
- * ⚠️ **不是并行分类器**：唯一触发条件 = machine **未上报合格的六类值**（见
+ * ⚠️ **不是并行分类器**：唯一触发条件 = machine **未上报合格的七类值**（见
  * {@link resolveReportedFailureKind} 的缺键支）。闭集变更以 `PROTOCOL.md` 为准、orch 不主动扩展。
  *
  * 保守方向延续 v0.8.7：`timeout` / `rpc` / `protocol` 语义歧义（「排队」与「任务太大」都满窗，
@@ -210,10 +211,10 @@ export function mapAcpErrorKindToFailureKind(acpErrorKind: unknown): FailureKind
 
 /** {@link resolveReportedFailureKind} 的判据结果 */
 export interface FailureKindVerdict {
-  /** 实际落库的六类值 */
+  /** 实际落库的七类值 */
   kind: FailureKind;
   /**
-   * 兜底留痕用的**原值**：合格六类值 ⇒ `null`（未兜底、不 warn）；**缺键** ⇒ `"?"`；
+   * 兜底留痕用的**原值**：合格七类值 ⇒ `null`（未兜底、不 warn）；**缺键** ⇒ `"?"`；
    * 旧值（`infra` / `task`）/ 未知值 ⇒ 原样。warn 必须带它，供事后区分
    * 「真 `business`」与「兜底 `business`」。
    */
@@ -226,7 +227,7 @@ export interface FailureKindVerdict {
  *
  * 三条路径（版本握手只校验主版本 ⇒ 2.2 machine + 2.3 桥**必然混跑**；对旧值硬拒 = 旧机任务
  * 全部结不了账 = 丢单）：
- * 1. **合格六类值** ⇒ 原样采纳（machine 是分类事实源，orch 只校验 + 落库），不 warn；
+ * 1. **合格七类值** ⇒ 原样采纳（machine 是分类事实源，orch 只校验 + 落库），不 warn；
  * 2. **缺键** = machine 明说「判不出」（§2.3「判不出 ⇒ 不报该键」）⇒ 残余的唯一原生事实是
  *    `acpErrorKind` ⇒ 走 {@link mapAcpErrorKindToFailureKind}（载体类 ⇒ `agent`，否则 `business`）；
  * 3. **旧值 / 未知值** ⇒ 直接落安全兜底类 `business`，**不走** 2 的映射：2.2 的 `infra` / `task`
@@ -306,14 +307,14 @@ export interface RunnerDispatchCommand {
   /**
    * **只读档声明**（v0.8.10 O-N4，来源 `tasks.lane`）：仅 `lane === "read"` 时带（`= true`）；
    * 缺省（undefined）= 按写档。**纯可选**：未升级对端忽略该键 ⇒ 行为退回改前现状（按写），
-   * 故 `PROTOCOL_VERSION` 保持 2.3 不升。⚠️ 只挂在命令顶层，**不进 `payload`**。
+   * 该键**不驱动**版本升级（现值 `PROTOCOL_VERSION` = 2.4，其升版另有因，见 `types.ts` 版本记录）。⚠️ 只挂在命令顶层，**不进 `payload`**。
    */
   readOnly?: true;
   /**
    * **职责位声明**（v0.10.2 O-2，来源 `tasks.task_type`）：**仅非缺省**（≠ `unit_agent`）时带；
    * 缺省（undefined）= 未声明 ⇒ 对端按 `unit_agent` 处理（= 本字段引入前的唯一行为）。
    * **逐字照 `readOnly?: true` 形制**：只挂在命令顶层、**不进 `payload`**；缺省**不带键**。
-   * 可选 ∧ 缺省即现状 ⇒ `PROTOCOL_VERSION` 保持 2.3 不升（同 `readOnly` 判据）。
+   * 可选 ∧ 缺省即现状 ⇒ **不驱动**版本升级（现值 `PROTOCOL_VERSION` = 2.4，同 `readOnly` 判据）。
    */
   taskType?: TaskType;
 }
@@ -368,8 +369,6 @@ export interface RunnerStorePort {
   listOrphanedTasks: (claimedBefore: string) => QueuedTaskRecord[];
   /** O2：墙钟判死 CAS（`claimed`/`running` → `failed`+`settled`+`failure_kind='runner'`；不清 claim 三字段） */
   failOrphanedTask: (taskId: string) => boolean;
-  /** O3：失败分类写口（仅当行当前为 `failed` 才写；迟到 / 重复上报 ⇒ 零写入） */
-  setTaskFailureKind: (taskId: string, kind: FailureKind) => boolean;
 }
 
 /** 缺省存储端口：绑定 `session/store` 模块级默认单例 */
@@ -389,7 +388,6 @@ const defaultStorePort: RunnerStorePort = {
   markRunnerOffline,
   listOrphanedTasks,
   failOrphanedTask,
-  setTaskFailureKind,
 };
 
 /** 一次心跳超期清算的结果摘要（可观测 + 确定性单测断言用） */
@@ -1141,12 +1139,57 @@ class RunnerEndpoints implements RunnerEndpointHandle {
         `Runner 补结算窄口受理（无 claimToken 的迟到 failed）：machineId=${machineId} taskId=${taskId} 距 claimed_at ${Number.isFinite(elapsedMs) ? `${elapsedMs}ms` : "未知"}`,
       );
     }
+    // **写前翻态**（v0.11.0 O3 · 修假完成-provider错误结算）：provider 错误短回执（如
+    // `402 Insufficient Balance`）被 machine 当作 `completed` 正文结算 ⇒ 判定命中时**改判
+    // `failed` 进同一次** `upsertTaskResult` UPDATE（不做事后二次写），`text` 原文逐字保留。
+    // **只在 completed 支兜底**：machine 自报的 `failed` 及其 `failureKind` 一律不动。
+    const providerReceipt =
+      stateRaw === "completed" && typeof body["text"] === "string"
+        ? detectProviderFailureReceipt(body["text"])
+        : null;
+    const settleState: TaskState = providerReceipt !== null ? "failed" : stateRaw;
+    if (providerReceipt !== null) {
+      bridgeLog.warn(
+        "a2a-runner",
+        `Runner 上报 completed 命中 provider 错误短回执 ⇒ 写前改判 failed（taskId=${taskId} marker=${providerReceipt.marker} snippet=${providerReceipt.snippet}）`,
+      );
+    }
+    // **结算前分类**（v0.11.0 O4 · 改造文档 §3.2「事件需前移分类才带 failureKind」）：
+    // 分类与终态**同一条 UPDATE** 经 `upsertTaskResult` 入参落库并随 `task.settled` 事件随附
+    // —— 后置 `setTaskFailureKind` 晚于事件 ⇒ 新结 failed 的事件不带分类，该口径退役。
+    // **machine 上报的 `failureKind` 仍是分类事实源**：orch 只做闭集校验 + 落库；未上报合格
+    // 七类值时才落兜底（缺键 ⇒ 原生 `AcpError.kind` 映射；旧值 / 未知值 ⇒ `business`），并
+    // warn 带上原值留痕（D2：混跑期不得据此区分「真 business」与「兜底 business」之外的信息，
+    // **不得因取值非法而整包拒收**）。**写前翻态支**（O3）：machine 无失败分类主张可校验，
+    // 直接落 `provider` + 脱敏片段（判定事实源 = `detectProviderFailureReceipt`）。
+    // 迟到 / 重复上报不再改写既有分类：由 `upsertTaskResult` 的「首个终态胜出」WHERE 整条挡下
+    // （与旧后置写口的 `AND state='failed'` 门同语义，且连墙钟 O2 已置的 `runner` 一起护住）。
+    let settleFailureKind: FailureKind | null = null;
+    let settleFailureSnippet: string | null = null;
+    if (settleState === "failed") {
+      if (providerReceipt !== null) {
+        settleFailureKind = "provider";
+        settleFailureSnippet = providerReceipt.snippet;
+      } else {
+        const verdict = resolveReportedFailureKind(
+          body["failureKind"],
+          readReportedAcpErrorKind(body["diagnostics"]),
+        );
+        settleFailureKind = verdict.kind;
+        if (verdict.fallbackFrom !== null) {
+          bridgeLog.warn(
+            "a2a-runner",
+            `Runner 上报的 failureKind 不合 2.4 七类闭集 ⇒ 兜底落 ${verdict.kind}（failure_kind_fallback=${verdict.fallbackFrom}，混跑期存量由 §2.1 迁移脚本清理）：machineId=${machineId} taskId=${taskId}`,
+          );
+        }
+      }
+    }
     const stored = this.store.upsertTaskResult({
       machineId,
       taskId,
       projectId: asNonEmptyString(body["projectId"]) ?? existing.projectId,
       contextId: asNonEmptyString(body["contextId"]) ?? existing.contextId,
-      state: stateRaw,
+      state: settleState,
       artifactsJson: artifactsRes.artifactsJson,
       text: typeof body["text"] === "string" ? body["text"] : null,
       featureId: existing.featureId,
@@ -1155,27 +1198,10 @@ class RunnerEndpoints implements RunnerEndpointHandle {
       // `diagnostics` 对象原样交给既有结果写口（**不新增写口 / 端点**），由 store 序列化落
       // `tasks.diagnostics_json` 并据 `continueAttempts` 派生事件。**不落派生布尔**（返工红线）。
       diagnostics: body["diagnostics"],
+      // **结算前分类两键**（v0.11.0 O4，见上；非 failed 恒 null）
+      failureKind: settleFailureKind,
+      failureSnippet: settleFailureSnippet,
     });
-    // **失败分类写口**（v0.8.7 O3 建口；v0.8.8 O1 改口径 · §2.1 写口 (i)）：**machine 上报的
-    // `failureKind` 是分类事实源**，orch 只做闭集校验 + 落库；未上报合格六类值时才落兜底
-    // （缺键 ⇒ 原生 `AcpError.kind` 映射；旧值 / 未知值 ⇒ `business`），并 warn 带上原值留痕
-    // （D2：混跑期不得据此区分「真 business」与「兜底 business」之外的信息）。
-    // **判据**：本次上报**胜出**了 `failed` 终态 —— 行此前非 `failed`（`existing.state !== "failed"`）
-    // 才写 ⇒ 迟到 / 重复上报**不得改写**既有分类（尤其不得把墙钟 O2 已置的 `runner` 覆盖掉），
-    // 与 `upsertTaskResult`「首个终态胜出」同语义。**不得因取值非法而整包拒收**（丢单）。
-    if (stateRaw === "failed" && stored.state === "failed" && existing.state !== "failed") {
-      const verdict = resolveReportedFailureKind(
-        body["failureKind"],
-        readReportedAcpErrorKind(body["diagnostics"]),
-      );
-      this.store.setTaskFailureKind(taskId, verdict.kind);
-      if (verdict.fallbackFrom !== null) {
-        bridgeLog.warn(
-          "a2a-runner",
-          `Runner 上报的 failureKind 不合 2.3 六类闭集 ⇒ 兜底落 ${verdict.kind}（failure_kind_fallback=${verdict.fallbackFrom}，混跑期存量由 §2.1 迁移脚本清理）：machineId=${machineId} taskId=${taskId}`,
-        );
-      }
-    }
     // **契约 3 的可观测面**（v0.8.7 O5）：迟到 / 重复上报的终态与**已落终态不一致** ⇒ 只留 warn
     // 痕迹（零写入由 `upsertTaskResult` 的 WHERE 保证）；**不改回执、不改落库**。
     if (SETTLED_TERMINAL_STATES.includes(existing.state) && stateRaw !== existing.state) {
@@ -1185,6 +1211,18 @@ class RunnerEndpoints implements RunnerEndpointHandle {
       );
     }
     bridgeLog.info("a2a-runner", `Runner 回传结果：machineId=${machineId} taskId=${taskId} state=${stored.state}`);
+    // **结算后区 · 阶段轮回执结算钩子第一触发点**（R1 · v0.11.0 orch-N4；改造文档 §3.1「不用
+    // RunnerStorePort 装饰器」——本行只消费「本次回传已落结算态」这一事实，其余门（mode/态/
+    // answer_state/重派 CAS）全在共享件内以**库中重读行**为准 ⇒ 与看护第二触发点幂等互换）。
+    // 非阶段行零副作用；异常**绝不反噬 200 ack**（machine outbox 对非 2xx 无限退避，§2.9 契约 3）。
+    try {
+      settleStageTaskOnSettled(taskId);
+    } catch (err) {
+      bridgeLog.error(
+        "a2a-runner",
+        `阶段行结算钩子失败（不影响 ack，taskId=${taskId}）：${toMessage(err)}`,
+      );
+    }
     // **契约 3（迟到 / 重复终态 = 2xx-with-ignore）**：`upsertTaskResult` 的
     // `WHERE state NOT IN ('completed','failed','blocked')` 使**重复 / 迟到终态整条 UPDATE
     // 零写入**（首个终态胜出），故回执**必须恒为 200 + `ack:true`**（不一致时另 warn 留痕，见上）。

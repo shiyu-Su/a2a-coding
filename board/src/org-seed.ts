@@ -25,9 +25,9 @@
 import { existsSync, readFileSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
-import { writeFileAtomic } from "./host-bridge-ledger.js";
+import { writeFileAtomic } from "./atomic-write.js";
 import { defaultRepoRoot } from "./docs-read.js";
-import { statDirKind } from "./host-runtime.js";
+import { statDirKind } from "./org-workspace.js";
 import { readVersion } from "./version.js";
 
 /** 组织版 `AGENTS.md` 的模板文件名（板侧资产，来源与占位符总表见 `templates/org/README.md`）。 */

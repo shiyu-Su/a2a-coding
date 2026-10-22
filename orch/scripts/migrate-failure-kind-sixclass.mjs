@@ -2,13 +2,14 @@
 /**
  * 存量 `failure_kind` 二分旧值清零（REQ-v0.8.8-2026-09-22-01，Step 2 · 节点 O8）。
  *
- * 背景：v0.8.8 O1 把 `tasks.failure_kind` 的取值闭集从二分 `{infra, task}` 硬切为六类
- * `{agent, transport, runner, model_queue, timeout, business}`（事实源 `PROTOCOL.md` 2.3）。
+ * 背景：v0.8.8 O1 把 `tasks.failure_kind` 的取值闭集从二分 `{infra, task}` 硬切为 6 成员闭集
+ * `{agent, transport, runner, model_queue, timeout, business}`；v0.11.0 O1 加成员 `provider`
+ * 扩为七类（现值清单以 `types.ts` 的 `FAILURE_KINDS` 为准，事实源 `PROTOCOL.md` 2.4 条文）。
  * 二分时代写入的存量行仍留在库里，读侧虽已放宽为「非法值 ⇒ 兜底 `business` + warn 留原值」
  * （`session/store.ts` 的 `coerceStoredFailureKind`），但那只是**混跑期的安全网**，不是终态：
  * 每次列表读路径都会 warn，且「兜底 business」与「真 business」在账面上混成一坨。
  *
- * **口径 = 归未分类（NULL），不伪造近似六类**：2→6 是有损映射，旧 `task` 桶里混着
+ * **口径 = 归未分类（NULL），不伪造近似分类**：2→6 是有损映射（且当前闭集已是七类），旧 `task` 桶里混着
  * rpc / protocol / timeout / 未知，旧 `infra` 桶里混着 agent / transport / runner ——
  * 任何映射都是在造证据。置 NULL 后这些任务回到「未分类」，与从未分类的任务同口径。
  *
@@ -17,7 +18,7 @@
  *   - `--apply` 才写：每个旧值一条参数化 `UPDATE ... SET failure_kind = NULL WHERE failure_kind = ?`，
  *     **只碰 `failure_kind` 这一列**、**只动命中旧值的行**，打印改前/改后计数。
  *   - **可重入**：迁移完后再跑 ⇒ 命中 0 行 / `changes=0`。
- *   - 六类合法值与 NULL 行**一律不动**（脚本不做任何 schema 变更；列由 `store.ts` ctor 的
+ *   - 合法七类值与 NULL 行**一律不动**（脚本不做任何 schema 变更；列由 `store.ts` ctor 的
  *     try-ALTER 幂等建立，老库若无此列会 fail-fast 提示先以新代码起桥一次）。
  *
  * ⚠ 执行时点：本脚本在改造期内**只产出、只做 dry-run 取证**；`--apply` 由宿主在验收期
@@ -33,7 +34,7 @@ import { existsSync } from "node:fs";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
-/** 二分时代（≤ v0.8.7）写入、自 2.3 起非法的取值 —— 待清零的对象 */
+/** 待清零的对象：二分时代（≤ v0.8.7）写入、自 2.3 起非法的取值（当前闭集 = 2.4 七类） */
 const LEGACY_VALUES = ["infra", "task"];
 
 const SCRIPT_DIR = dirname(fileURLToPath(import.meta.url));
@@ -89,7 +90,7 @@ function main() {
 
   console.log(`库：${resolve(DB_PATH)}`);
   console.log(`模式：${APPLY ? "--apply（写入）" : "dry-run（只读，不写入）"}`);
-  console.log(`口径：二分旧值 ${LEGACY_VALUES.map((v) => `'${v}'`).join(" / ")} ⇒ NULL（未分类，不伪造六类）`);
+  console.log(`口径：二分旧值 ${LEGACY_VALUES.map((v) => `'${v}'`).join(" / ")} ⇒ NULL（未分类，不伪造近似分类）`);
 
   const probe = open(true);
   try {

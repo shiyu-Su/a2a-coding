@@ -22,6 +22,12 @@
 //   atRestWithFailure = hasFailure && !anyActive
 //   failure-at-rest(10) 与 timeout(20) 互斥：每轮先判 at-rest；窗口内从未触发才退 20。
 //
+//   ★ 2026-10-18 修正：以上两条判据**只对 DAG 节点**（`mode !== 'inquiry'`；`mode` 缺省/为空按 DAG 解释，
+//     与引擎 `readMode` 的归一一致）计算 —— 与引擎收敛判据（`isDagNode` + `every(state === 'completed')`）**同源**。
+//   起因：v0.10.8 起「询问任务也归集进 `tasks[]`」，而询问行会长期停在 `input-required`（等宿主答复）；
+//   若把它计入 `anyActive`，`failure-at-rest` **永远不成立**（假阴性）⇒ 脚本只能一路跑到窗口耗尽退 20，
+//   宿主收不到「DAG 已全静止且带失败」这个真正要处理的信号。询问行不参与本脚本的任何判定。
+//
 // 说明：
 //   - 只读：仅访问只读工作台 API `GET {base}/api/features/{featureId}`；不读 SQLite，不写任何状态 / 文件。
 //   - 本脚本不使用事件游标（/api/events 的 since=0 仅回最旧页 ⇒ 无法廉价取得「当前游标」）；
@@ -53,6 +59,11 @@ const EXIT_TIMEOUT = 20;
 
 const COMPLETED_FEATURE_STATES = new Set(["integrating", "testing", "reviewing", "completed"]);
 const SETTLED_TASK_STATES = new Set(["completed", "failed", "blocked", "cancelled"]);
+
+// DAG 节点判定：与引擎同源 —— `mode === 'inquiry'` 是询问行（不参与收敛），缺省/为空一律按 DAG 解释。
+function isDagTask(task) {
+  return task.mode !== "inquiry";
+}
 
 const USAGE = [
   "用法: node scripts/watch-feature.mjs <featureId> [--base <url>] [--interval <ms>] [--max <loops>]",
@@ -233,6 +244,7 @@ function isAtRestWithFailure(tasks) {
   let hasFailure = false;
   let anyActive = false;
   for (const task of tasks) {
+    if (!isDagTask(task)) continue; // 询问行不参与（见文件头 ★ 修正）
     if (task.state === "failed" || task.state === "blocked") {
       hasFailure = true;
     }

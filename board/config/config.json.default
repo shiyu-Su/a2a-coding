@@ -1,8 +1,6 @@
 {
   "port": 3400,
   "host": "127.0.0.1",
-  "hostKind": "claude",
   "bridgeUrl": "http://127.0.0.1:3300",
-  "mcpBaseUrl": "http://127.0.0.1:8787",
-  "turnTimeoutMs": 600000
+  "mcpBaseUrl": "http://127.0.0.1:8787"
 }

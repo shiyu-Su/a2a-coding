@@ -17,7 +17,7 @@
  * `version_planning` / `decomposing` 两态进入本文件的派生覆盖（定版中 / 拆任务中，同归 `brand` 色档）；
  * 引导行另有**两态专属档**（定版 / 拆任务工序，不说「自动接力」），卡滞判据的态集一并扩到新两态。
  */
-import type { TraceNode } from "./bridge-client.js";
+import type { StageRunSynthesisView, TraceNode } from "./bridge-client.js";
 
 // ---------------------------------------------------------------------------
 // 阶段派生（§2.2-9 / §2.2-4）
@@ -235,7 +235,7 @@ function actionTierBase(input: NextStepInput): ActionAffordance {
   const executing = input.state === "executing" || input.state === "integrating";
   return {
     kind: "turn",
-    label: "让 agent 继续",
+    label: "继续",
     enabled: true,
     note: "",
     quiet: executing,
@@ -629,9 +629,6 @@ function factsLine(input: NextStepInput): string {
  */
 export function deriveNextStepHint(input: NextStepInput): string {
   const facts = factsLine(input);
-  if (!input.hostFaceAssembled) {
-    return "下一步：宿主面未装配（本板进程未接宿主桥）⇒ 需先在 config.json 配 orgsDir，之后本页才会出现动作区入口。";
-  }
   if (isTerminalFeatureState(input.state)) {
     return terminalFeatureNote(input.state);
   }
@@ -660,7 +657,7 @@ export function deriveNextStepHint(input: NextStepInput): string {
         }
         return `下一步：等你 —— agent 已把产出落到本页 ⇒ 若链在监视中先点链状态行「停链」，看完后在回来的动作区补充框写明裁定，点「提交给 agent」。${facts}`;
       }
-      return "下一步：等你 —— 本卡尚无产出 ⇒ 点「让 agent 继续」开始需求访谈（产出需求确认单后进入改造方案）。";
+      return `下一步：等你 —— 当前未登记轮次产出 ⇒ 请按本页阶段任务中的下一步继续。${facts}`;
     }
     case APPROVAL_PENDING:
       return `下一步：等你 —— 改造文档已落文件 ⇒ 核对后点「确认改造文档 → 放行执行」（放不放行由 agent 核对后决定）。${facts}`;
@@ -671,12 +668,12 @@ export function deriveNextStepHint(input: NextStepInput): string {
         const process = STALL_PROCESS_LABEL[input.state ?? ""];
         if (process !== undefined) {
           // 新两态走独立分句：这两态上引擎本就不派发节点，「没接上」的说法不成立，只报「工序未推进」。
-          return `下一步：${process}工序已 ${formatElapsed(stalledMs)} 未推进 · 本页没有进行中的轮 ⇒ 这道工序等 agent 与你的动作（引擎在此不派发任何节点），在动作区点「让 agent 继续」手动接一轮。${facts}`;
+          return `下一步：${process}工序已 ${formatElapsed(stalledMs)} 未推进 ⇒ 请按本页阶段任务中的下一步继续。${facts}`;
         }
         return `下一步：agent 好像没接上？本页没有进行中的轮${sinceTurnLine(input)}⇒ 若链在监视中先点链状态行「停链」，动作区回来后手动接一轮。${facts}`;
       }
       if (input.state === "version_planning") {
-        return `下一步：等你 / agent 定版 —— 审批门已通过，本卡在 PjM 定版工序 ⇒ 等各 project 项目经理回版本规划结论、你确认后由宿主先建 Project Version 再写归属；要推进就在动作区点「让 agent 继续」。${facts}`;
+        return `下一步：等你 / agent 定版 —— 审批门已通过，本卡在 PjM 定版工序 ⇒ 等各 project 项目经理回版本规划结论、你确认后由宿主先建 Project Version 再写归属。${facts}`;
       }
       if (input.state === "decomposing") {
         return `下一步：等 agent 拆任务登记 DAG —— 归属已落，本卡在拆任务工序 ⇒ 等各 project 研发经理回传本侧任务清单、由 agent 收敛后登记节点（登记完毕才进 executing，之后才谈得上按节点跑）。${facts}`;
@@ -692,6 +689,35 @@ export function deriveNextStepHint(input: NextStepInput): string {
     default:
       return `下一步：等你 —— 请核对该需求的审批门值（当前 = ${input.approval ?? "缺失"}）。${facts}`;
   }
+}
+
+// ---------------------------------------------------------------------------
+// v0.11.0 B3：门① 确认三态 —— `confirmedDocHash` ⇄ `docHash` 比较的**唯一单点**
+// ---------------------------------------------------------------------------
+
+/**
+ * 门① 确认档位（板侧显示口径三值，**不是**引擎状态词汇的扩展 —— 宿主裁决 A8「不新增状态词汇」）：
+ * `absent` = 无可确认对象（合成对象缺位 / 未收口 / 现版哈希未下发）⇒ **不渲确认控件、不报错**；
+ * `pending` = 有现版但尚未确认（含 `confirmedDocHash` 为 `null`）⇒ 渲「待确认」+ 确认表单；
+ * `confirmed` = 已确认的正是现版 ⇒ 渲「已确认 v{round}」，**不渲**表单。
+ */
+export type Gate1ConfirmState = "absent" | "pending" | "confirmed";
+
+/**
+ * 门① 确认档判据（纯函数，**全板唯一一处比较** —— 视图层只消费结论，不再比第二次）：
+ * 只比较引擎**已下发**的两个值，板**不自判闸、不重算 `docHash`**（校验归引擎 N6/N7）；
+ * `state !== "done"` ⇒ `absent`（宿主裁决 A8：确认按钮显隐 = `state === 'done'` ∧ 哈希不等）；
+ * `docHash` 空白 ⇒ `absent`（无「当前文档版本」这一确认对象，不拿空哈希去比出个「已确认」）。
+ */
+export function deriveGate1ConfirmState(
+  synthesis: StageRunSynthesisView | null | undefined,
+): Gate1ConfirmState {
+  if (synthesis === null || synthesis === undefined) return "absent";
+  if (synthesis.state !== "done") return "absent";
+  const docHash = (synthesis.docHash ?? "").trim();
+  if (docHash === "") return "absent";
+  const confirmed = (synthesis.confirmedDocHash ?? "").trim();
+  return confirmed !== "" && confirmed === docHash ? "confirmed" : "pending";
 }
 
 // ---------------------------------------------------------------------------

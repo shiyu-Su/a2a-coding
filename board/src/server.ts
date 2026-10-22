@@ -55,12 +55,6 @@
  *   **REQ-2026-09-26-04 Q2 起为提需求的唯一入口**（契约不变）：表单宿主 = `/schedule` 弹窗（§9-b 起首页是门户，
  *   不再承载提需求；`NEW_REQUIREMENT_DIALOG_SCRIPT` fetch 提交），
  *   无 JS / fetch 失效时弹窗内表单仍走原生整页 POST；成功 303 跳详情页的既有口径原样保留；
- * - `POST /features/:id/turn`       —— 触发一轮（BD8，起桥 + 发轮，**不等排队轮**；该需求已有在飞 /
- *   排队轮 ⇒ **409 `board_turn_busy`** 不重复入队 —— 收口轨 14 服务端防重，confirm / answer 同；
- *   需求已入**引擎终态** ⇒ **409 `board_feature_terminal`** 直接拒单不烧轮 —— 收口轨 16 ③，三入口同）；
- * - `POST /host/:org/stop`          —— 停桥（BD8，与上两条同规格受写面守卫）；
- * - `POST /features/:id/confirm`    —— 人工确认指令（BD9，**投消息给 agent**：由 agent 核对后自行执行 approve，板不批准）；
- * - `POST /features/:id/answer`     —— 澄清回答（BD9，仅当最新轮 `awaiting_answer` ⇒ 同 `contextId` 续推）；
  * - `POST /features/:id/schedule`   —— 排期写（v0.9.2 M3，唯一放开的登记字段 `version` 写）：表单 `version` **必须显式传**
  *   （空串 = 删除排期；服务端发送前 `trim()`；**v0.9.4 N4 semver 收口**：非空必须 `x.y.z`，
  *   否则封装抛 `FeatureScheduleConfigError` ⇒ **400 `schedule_request_invalid`** 零出网），
@@ -73,6 +67,20 @@
  *   **改版自动善后（v0.9.3 B-T6）**：version 确实改动 ∧ decisions 含 `doc/{旧版}/` 登记 ⇒ 服务端受限 mv
  *   搬文档至 `doc/{新版}/` + 第二跳 advance 追加 decisions 新路径（仅源 A、仅登记路径、幂等；见 `docs-move.ts`）；
  *   读-写窗口态漂移被桥拒 ⇒ 如实弹错误浮层 + 表单值回填，**不自动重试**；
+ * - `POST /features/:id/stage-round-open` —— **开阶段轮**（v0.11.0 R1 · B2）：转发引擎同名写工具
+ *   `stage_round_open(featureId, stage, sources?, targetProjects?, basisRevInput?)`（板**不写状态机**，
+ *   幂等由引擎侧 partial 唯一索引保证；表单仅 `stage` 必填，闭集值域归引擎 fail-closed 拒并原样透出；
+ *   身份 = 该需求 `ownerGroup`，null ⇒ 结构化 503 不回落板级默认组）；
+ * - `POST /features/:id/doc-objection` —— **记段落异议 ⇒ 同请求内开新一轮**（v0.11.0 R1 · B2 + 836563b8）：
+ *   转发引擎同名写工具 `doc_objection(featureId, docVersion, sectionId, objectionText, targetType?, projectIds?)`
+ *   成功后，**同一请求内**续调 `stage_round_open`（② 只在 ① 成功之后；② 失败不回滚 ①，
+ *   渲染原卡片页 + 错误块 + 补救块）；同 `ownerGroup` 身份口径；
+ * - `POST /features/:id/gate1-confirm` —— **门① 确认转发**（v0.11.0 B1 · 用户裁定 U3 + 宿主裁决 A9）：
+ *   转发引擎同名写工具 `gate1_confirm(featureId, docVersion, docHash, round, version?)`
+ *   （前三枚隐藏字段取自本轮 `stageRuns.synthesis` / 轮格，`version` 取引擎版本台账 open 下拉）；
+ *   板**只转发、不写状态机、不自判闸、不重算 docHash**（校验归引擎）；同 `ownerGroup` 身份口径；
+ * - `POST /versions`              —— **版本台账写（v0.9.4 N1）**：一条路由靠表单 `action` 三值闭集 create/remove/setStatus 分流；
+ *   **v0.10.0 B2 起改道引擎**（`ctx.write.versions` 打 `/api/versions*`），板不判闸、引擎错误码原样透出、无本地兜底写；
  * - `POST /orgs`                    —— **组织写（v0.9.4 A 档 · BD1 建 + BD3 停用，一条路由靠 `action` 分流）**：
  *   板侧组织台账 `.data/orgs.json` 的本地写（**不触桥、不写状态机、不写 machine 配置**；ownerGroup 不是板可写数据）；
  *   · **建（缺省 / `action=create`）**：CSRF 同规格 → 组织名单一纯函数校验（`write-guard.validateOrgName`，字符集闭集）
@@ -98,7 +106,8 @@
  *   不经 CSRF 写面守卫（它是运维停机口，不是业务写面），来源门 = `socket.remoteAddress` 必须 loopback，
  *   非 loopback 一律 403 `loopback_only`（负向用例钉住）。
  *
- * **方法门**：读面仅 GET；写面只放开上面十条业务路径（白名单 = `write-guard.parseWriteRoute`）+
+ * **方法门**：读面仅 GET；写面只放开上面八条业务路径（白名单 = `write-guard.parseWriteRoute`，条数以
+ * `WRITE_ROUTES` 单点为准 = **8**）+
  * `/shutdown` 一条运维路径（本文件内处理），其余路径的非 GET 一律 405。写端点另受 CSRF 守卫（自定义头或同源 Origin/Referer，见 `write-guard.ts`）。
  * 板**不写状态机迁移**：approve / cancel 与「advance 到非当前态」的主链推进均无路径（确认与回答都只是给宿主 agent 的一轮消息，推进归 agent）；唯一放开的是 `version` 排期写（经 `feature-schedule.ts` 用 advance「`to` = 当前态」特例，M3 已接线 `POST /features/:id/schedule`）。
  *
@@ -123,7 +132,6 @@ import {
   createBridgeClient,
   createEngineVersionsFetcher,
   DEFAULT_BRIDGE_BASE_URL,
-  type AcceptanceView,
   type BridgeClient,
   type BridgeClientOptions,
   type EngineVersionsFetcher,
@@ -132,14 +140,10 @@ import {
   type ProjectVersionsField,
   projectVersionsOf,
 } from "./bridge-client.js";
-import { dispositionHttpStatus, terminalTurnRejection, diagnoseOrgsDir, ORGS_DIR_NOT_CONFIGURED, ORG_DISABLED, type BoardHostFace, type TriggerTurnOutcome } from "./host-face.js";
+import { diagnoseOrgsDir, ORGS_DIR_NOT_CONFIGURED, ORG_DISABLED, statDirKind } from "./org-workspace.js";
+import { dispositionHttpStatus, terminalTurnRejection, type BoardHostFace, type TriggerTurnOutcome } from "./host-face.js";
 import {
-  deriveChainStateLine,
-  deriveTurnProgress,
   isTerminalFeatureState,
-  type ChainStateSnapshot,
-  type NextStepInput,
-  type NextStepTaskCounts,
 } from "./derive.js";
 import {
   createRequirement,
@@ -155,6 +159,12 @@ import {
   type ScheduleOutcome,
   FeatureScheduleConfigError,
 } from "./feature-schedule.js";
+import {
+  createStageRoundWriteClient,
+  type StageRoundWriteClient,
+  type StageRoundOpenSuccess,
+  type StageWriteFailure,
+} from "./stage-round-write.js";
 import {
   checkWriteAuth,
   findOrgNameConflict,
@@ -179,6 +189,10 @@ import {
   VERSION_ACTION_SET_STATUS,
   VERSION_FORM_INVALID_CODE,
   SUSPEND_TURN_MISMATCH_CODE,
+  parseStageRoundOpenForm,
+  parseDocObjectionForm,
+  parseGate1ConfirmForm,
+  STAGE_WRITE_FORM_INVALID_CODE,
   ScheduleFormProgrammingError,
   type OrgNameConflictSource,
 } from "./write-guard.js";
@@ -204,7 +218,6 @@ import { OrgsLedgerStore, defaultOrgsLedgerFile, enabledOrgNames, findOrgRecord,
 import { VersionsLedgerStore, defaultVersionsLedgerFile, ledgerVersionNames, releasedVersionNames, type VersionOrgFilter, type VersionsLedger } from "./versions-ledger.js";
 import { createVersionsWriteClient, describeVersionWriteError, type VersionsWriteClient } from "./versions-write.js";
 import { SuspendLedgerStore, defaultSuspendLedgerFile, type SuspendedEntry } from "./suspend-ledger.js";
-import { statDirKind } from "./host-runtime.js";
 import { readVersion } from "./version.js";
 import { isVersionLocked } from "./version-status.js";
 import { normalizeVersion, sortPoolEntries } from "./version-order.js";
@@ -281,34 +294,27 @@ import {
   projectionLedgerOf,
   projectionVersionNames,
   renderAcceptanceSection,
-  renderActionArea,
   renderAgentsPage,
-  renderAnswerForm,
   renderFeatureDetail,
-  renderHostNotice,
-  renderChainStateLine,
   renderMemberWriteCard,
-  renderHostPage,
   renderNewRequirementDialog,
   renderNewVersionDialog,
   renderOrgPortal,
-  renderNextStepGuide,
   renderOrgSpaceManagePage,
   renderProjects,
   renderDocPage,
   renderSchedule,
   renderTasks,
-  resolveStageSelection,
   renderTurnOutcome,
-  renderTurnProgress,
-  renderTurnTrace,
+  currentStageBucketOf,
+  openVersionOptions,
+  resolveStageSelection,
   registeredDecisionDocFiles,
   registeredDecisionDocRefs,
   resolveDocDirFromRegistrations,
   selectRequirementPool,
-  stopBridgeErrorOverlay,
-  type RegisteredDocExists,
   turnOutcomeErrorOverlay,
+  type RegisteredDocExists,
 } from "./web/views.js";
 
 export interface BoardServerHandle {
@@ -380,18 +386,18 @@ export interface CreateBoardServerOptions {
    */
   versionsWriteImpl?: VersionsWriteClient;
   /**
+   * **阶段面两写口注入**（v0.11.0 R1 · B2 · 改造文档 §2.5）。缺省用 `stage-round-write.js` 的
+   * {@link createStageRoundWriteClient}（打 `mcpBaseUrl` = 引擎可写面 MCP，同名工具 `stage_round_open` /
+   * `doc_objection`）。两写面**只经本客户端向引擎转发意图**；板无本地下沉兜底写（引擎不可达 ⇒ 硬失败）。
+   */
+  stageWriteImpl?: StageRoundWriteClient;
+  /**
    * **版本台账读投影注入**（v0.10.0 B4 · 改造文档 §2.3(1)）：已发版锁的**唯一数据源**。
    * 缺省 = 按 `mcpBaseUrl`（引擎可写面）打 `GET /api/versions`；测试注入假端点。
    * 读不到投影 ⇒ 写口 **fail-closed 挡排期写**（503），**不回落本地台账、绝不当作「零个已发版」**；
    * 读面（版本列 / 详情页锁样式）用**本进程最后一次成功投影**（锁只紧不松）。
    */
   engineVersionsFetcher?: EngineVersionsFetcher;
-  /**
-   * **宿主面**（BD8）：触发一轮 / 桥状态 / 停桥的唯一入口，缺省 `null` ⇒ 宿主面不可用
-   * （`GET /host` 如实显示「未装配」，写端点结构化 503 `host_face_disabled`，**不假数据**）。
-   * 名字与 `host`（绑定地址）区分 —— 绑定地址仍是 `host: string`。
-   */
-  hostFace?: BoardHostFace | null;
   /**
    * **优雅停机回调**（BD13″）：`POST /shutdown` 命中 loopback 来源时，先回 200（= 仅「受理」），
    * 再经 `setImmediate` 调用本回调（响应不被停机路径的 close 截断）。未注入 ⇒ 返回 501
@@ -564,9 +570,12 @@ interface Ctx extends PageCtx {
      * 板不判闸、不本地兜底（引擎不可达 ⇒ 硬失败）。
      */
     versions: VersionsWriteClient;
+    /**
+     * 阶段面两写口（v0.11.0 R1 · B2）：开轮 / 异议两支的**唯一出口**，转发引擎同名 MCP 工具；
+     * 板不写状态机、不判幂等、不本地兜底（幂等与闭集判据归引擎）。
+     */
+    stageWrite: StageRoundWriteClient;
   };
-  /** BD8 宿主面（`null` ⇒ 未装配，写端点结构化 503、状态页如实显示）。 */
-  host: BoardHostFace | null;
   /** BD13″ 优雅停机回调（`null` ⇒ 未接停机链，`POST /shutdown` 返回 501）。 */
   shutdown: (() => void) | null;
   /** BD11 读文档面根（源 A / 可选源 B）；BD14 增 vendored 静态资产根。 */
@@ -730,13 +739,11 @@ function bridgeDownPage(
 
 /**
  * 提需求 / 建组织表单旁的 orgsDir 三档结论（REQ-v0.9.2 N3 · 纯呈现）：
- * 未装配宿主面 / 装配了但根未配置或目录不可用（code 沿用 host-face 闭集）/ 就绪。
+ * 组织目录根未配置 / 已配置但目录不可用 / 就绪。
  */
-function orgsStatusOf(host: BoardHostFace | null): OrgsDirStatus {
-  if (host === null) return { tier: "not_configured" };
-  const configured = host.configView().orgsDir;
+function orgsStatusOf(configured: string | null): OrgsDirStatus {
   if (configured === null) return { tier: "not_configured" };
-  const problem = host.orgsDirProblem();
+  const problem = diagnoseOrgsDir(configured, statDirKind(configured));
   if (problem !== null) return { tier: "problem", code: problem.code, message: problem.message };
   return { tier: "ready", orgsDir: configured };
 }
@@ -980,7 +987,7 @@ async function renderScheduleBoard(
   return (
     renderSchedule(groupFeaturesByVersion(features, ledgerColumnVersions, engineColumnVersions), selectRequirementPool(features), lockedVersions, ledger, org, deletableVersions) +
     // 提需求弹窗骨架（表单原样复用；orgsDir 三档提示与锁版警示随表单呈现）
-    renderNewRequirementDialog(ctx.write.defaultGroup, orgsStatusOf(ctx.host), lockedVersions, spaceOrg) +
+    renderNewRequirementDialog(ctx.write.defaultGroup, orgsStatusOf(ctx.docs.orgsDir), lockedVersions, spaceOrg) +
     (spaceOrg !== null ? renderNewVersionDialog(spaceOrg) : "")
   );
 }
@@ -1038,7 +1045,7 @@ async function pageOrgPortal(ctx: Ctx): Promise<Page> {
     // B6 的「顶栏切换器摘除」随件1 外壳退役：全站只有一处侧栏项目组菜单，门户页不再单独摘挂。
     // orgNav 装配照旧保留 —— 门户卡数据源就是 orgNav.orgs。
     headerActions: '<button type="button" id="new-org-open" class="header-actions" hidden>＋ 建项目组</button>',
-    bodyHtml: renderOrgPortal(buildOrgPortalCards(orgNav.orgs, view.features, summaryLedger), orgsStatusOf(ctx.host)),
+    bodyHtml: renderOrgPortal(buildOrgPortalCards(orgNav.orgs, view.features, summaryLedger), orgsStatusOf(ctx.docs.orgsDir)),
     extraScripts: NEW_REQUIREMENT_DIALOG_SCRIPT,
   };
 }
@@ -1050,7 +1057,7 @@ async function pageOrgPortal(ctx: Ctx): Promise<Page> {
  * **v0.10.8 B-10**：`stageQuery` = URL `?stage=` 原值（调用点从 `url.searchParams` 直读，不 trim ——
  * 回落判据在 `views.resolveStageSelection` 单点），选中结论下传 `extras.selectedStage`。
  */
-async function pageFeatureDetail(ctx: Ctx, featureId: string, stageQuery: string | null = null): Promise<Page> {
+async function pageFeatureDetail(ctx: Ctx, featureId: string, stageQuery: string | null = null, noticeQuery: string | null = null): Promise<Page> {
   const detail = await ctx.client.getFeature(featureId);
   let trace = null;
   let traceError: string | null = null;
@@ -1059,57 +1066,8 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string, stageQuery: string
   } catch (err) {
     traceError = errText(err);
   }
-  // BD9：宿主面装配了才显示动作区；回答框**仅在存在 `awaiting_answer` 轮时出现**。
-  // v0.9.5 C1/C5：引导行与动作区**共用同一份事实**（`nextStepInput`）—— 档位规则源在 `derive.ts`，
-  // 服务端只归一输入，不在这里判档（收口轨 16 ①/② 的终态优先口径不变：终态不渲染回答框）。
+  // v0.11.0 B1：板不再打 host agent 轮次；详情页不渲染 turn / confirm / answer 入口。
   const f = detail.feature;
-  const terminal = isTerminalFeatureState(f.state);
-  const awaiting = ctx.host === null || terminal ? null : ctx.host.awaitingTurnOf(f.featureId);
-  const busy = ctx.host === null ? null : ctx.host.busyTurnOf(f.featureId);
-  // C6：最近一轮留痕（宿主面未装配 ⇒ 缺席不渲染、不带崩；`at` = 该轮最近一次时刻）。
-  // v0.9.6 N4：`receipt` 必须在此**显式透传** —— 本处是逐字段重构（与台账 parseTurnRecord 同构的
-  // 静默丢失点）：漏一行 ⇒ 详情页回执卡永不出现且无任何告警。
-  const latest = ctx.host === null ? null : ctx.host.latestTurnOf(f.featureId);
-  const latestTurn =
-    latest === null
-      ? null
-      : {
-          turnId: latest.turnId,
-          state: latest.state,
-          summary: latest.summary,
-          at: latest.finishedAt ?? latest.updatedAt,
-          errorCode: latest.error?.code ?? null,
-          receipt: latest.receipt ?? null,
-        };
-  // REQ-v0.9.2 N7：轮次进度行 —— 排队位次取该桥队列可见面（在飞不查、查不到 ⇒ 不显示位次，
-  // 队列面异常也不该把详情页带崩 ⇒ 兜成 null）。
-  const queuePosition =
-    busy !== null && busy.state === "queued" ? hostQueuePositionOf(ctx, busy.org, busy.turnId) : null;
-  // v0.9.5 增补二 · D2 + REQ-2026-09-30-04：链状态快照**单点派生一次**（零二次触桥）——
-  // 同一份 `chainLine` 既喂档位判据（`chainMonitoring` / `chainPendingCount`，判据复用闭集校验、
-  // 不在原始快照上另开第二条链态判据），又喂详情页的链状态行（含停链表单入口）。
-  // 快照缺席（宿主面未装配 / 假面未实现该方法 / 取值抛错）⇒ `null` ⇒ 判据 fail-open 取 false、
-  // 整行不渲染，绝不带崩详情页。
-  const chainLine = deriveChainStateLine(hostChainSnapshotOf(ctx, f.featureId));
-  const nextStepInput: NextStepInput = {
-    hostFaceAssembled: ctx.host !== null,
-    awaitingAnswer: awaiting !== null,
-    approval: f.approval,
-    state: f.state,
-    registeredDocs: registeredDecisionDocFiles(f.decisions),
-    taskCounts: taskCountsOf(detail.acceptance),
-    latestTurn: latest === null ? null : { state: latest.state, summary: latest.summary, at: latest.finishedAt ?? latest.updatedAt },
-    turnBusy: busy !== null,
-    busyTurn: busy,
-    nowMs: ctx.now(),
-    // v0.9.6 N5：回执卡在场判据 = 最新轮带结构化 receipt（与 views 渲染回执卡同一条件）。
-    receiptPresent: latest !== null && (latest.receipt ?? null) !== null,
-    chainMonitoring: chainLine?.state === "monitoring",
-    chainPendingCount: chainLine?.pendingCount ?? null,
-  };
-  const turnProgress = renderTurnProgress(deriveTurnProgress(busy, queuePosition));
-  const chainState = renderChainStateLine(chainLine, f.featureId, awaiting !== null);
-  const answerForm = awaiting === null ? "" : renderAnswerForm(f.featureId, awaiting.question);
   // T2 依赖图（v0.10.3 N2c 起 = 管道制自绘 DOM/CSS）：区块**零脚本** ⇒ 详情页整页档不再注入
   // mermaid 资产与渲染脚本。排期页 `schedulePageScripts` 的那一枚**保留**（浮层内点开的文档页
   // 仍要渲染 mermaid —— 摘错 ⇒ 浮层里 mermaid 退化成源文本）。
@@ -1124,6 +1082,12 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string, stageQuery: string
     versionProjectionLedgerOf(detailProjection),
     (f.ownerGroup ?? "").trim(),
   );
+  const selectedStage = resolveStageSelection(detail, stageQuery);
+  const currentStage = currentStageBucketOf(detail);
+  // 只有 URL 显式切到非当前阶段才进入历史只读档；未带 `?stage=` 的缺省选中仍可写。
+  const stageReadOnly = stageQuery !== null && selectedStage !== currentStage;
+  const versionOptions =
+    detailProjection === null ? null : openVersionOptions(detailProjection, f.ownerGroup);
   return {
     title: `需求 ${featureId.slice(0, 8)}`,
     active: "features",
@@ -1135,62 +1099,25 @@ async function pageFeatureDetail(ctx: Ctx, featureId: string, stageQuery: string
       true,
       lockedVersions,
       {
-        nextStepHtml: renderNextStepGuide(nextStepInput),
-        actionAreaHtml: renderActionArea(f.featureId, nextStepInput),
-        turnTraceHtml: renderTurnTrace(latestTurn),
-        turnProgressHtml: turnProgress,
-        chainStateHtml: chainState,
-        answerFormHtml: answerForm,
         graphHtml: graph.html,
         acceptanceHtml: renderAcceptanceSection(detail.acceptance),
         // N6：失联警示判据 = 登记路径在盘上是否存在（server 侧预算，视图不碰 fs）
         docExists: registeredDocExistenceOf(ctx, f),
         // v0.10.8 B-10 切换侧：URL `?stage=` 经三级回落后下传**结论**（步条 `on` 与表侧过滤同值）——
         // 选中态必须落 URL：详情页活刷按 `pathname + search` 重取，不落 URL 的选择每拍被打回默认。
-        selectedStage: resolveStageSelection(detail, stageQuery),
+        selectedStage,
+        versionOptions,
+        versionSourceError:
+          ctx.engineVersionsFailure ??
+          (detailProjection === null ? "引擎版本台账投影不可读（原因未知）" : null),
+        stageReadOnly,
+        stageNotice: noticeQuery,
       },
     ),
     // v0.10.4 REQ-2026-10-11-03 N5：详情页整页档收第八枚（单档盖 `/features/:id` 与空间档两入口）。
     // 文档页 `/features/:id/docs` 走 `renderDocPage` 的 `extraScripts`，**不经本路** ⇒ 不收（bd14 既有负钉）。
     extraScripts: PAGE_LIVE_SCRIPT,
   };
-}
-
-/** C1 引导行的任务计数事实（取自桥详情顶层 `acceptance.stateCounts`，板不重算；老桥 / 缺块 ⇒ 不说）。 */
-function taskCountsOf(acceptance: AcceptanceView | null | undefined): NextStepTaskCounts | undefined {
-  if (acceptance === null || acceptance === undefined) return undefined;
-  const counts = acceptance.stateCounts;
-  return {
-    total: Object.values(counts).reduce((a, b) => a + b, 0),
-    completed: counts["completed"] ?? 0,
-    failed: counts["failed"] ?? 0,
-  };
-}
-
-/** 该桥队列里这条排队轮的位次（1 起）；队列面里没有它 / 取不到 ⇒ `null`（不臆造位次）。 */
-function hostQueuePositionOf(ctx: Ctx, org: string, turnId: string): number | null {
-  const face = ctx.host;
-  if (face === null) return null;
-  try {
-    const index = face.queueView(org).waiting.findIndex((w) => w.turnId === turnId);
-    return index < 0 ? null : index + 1;
-  } catch {
-    return null;
-  }
-}
-
-/**
- * 详情页链状态快照（v0.9.5 增补二 · D2）：**只读取**宿主面的内存态；宿主面未装配 /
- * 未提供该口 / 取值抛错 ⇒ `null`（该行不渲染，口径同上「队列面异常也不该把详情页带崩」）。
- */
-function hostChainSnapshotOf(ctx: Ctx, featureId: string): ChainStateSnapshot | null {
-  const face = ctx.host;
-  if (face === null) return null;
-  try {
-    return face.chainSnapshotOf(featureId) ?? null;
-  } catch {
-    return null;
-  }
 }
 
 /**
@@ -1293,39 +1220,6 @@ async function handleFeatureDoc(
     return;
   }
   respondText(res, 200, result.truncated ? `${result.content}\n\n…（超过读取上限，已截断）` : result.content);
-}
-
-/** 宿主桥状态页（BD8）：本板进程的桥事实 + 轮队列；**不触桥**（宿主面故障与编排桥故障分开显示）。 */
-async function pageHost(ctx: Ctx, notice: string | null): Promise<Page> {
-  if (ctx.host === null) {
-    return {
-      title: "宿主桥",
-      active: "host",
-      bodyHtml: renderHostPage({
-        entries: [],
-        config: { orgsDir: null, defaultOrg: null, kind: "（宿主面未装配）" },
-        notice: HOST_FACE_DISABLED_DISPLAY,
-      }),
-      // REQ-v0.9.2 N2：503 降级档整页套 BD2 浮层版式（与写门 POST 的 errorPage 同码同文案；只加样式面，不动信息架构）。
-      errorOverlay: {
-        family: errorFamilyLabel(HOST_FACE_DISABLED_CODE),
-        error: HOST_FACE_DISABLED_DISPLAY,
-        code: HOST_FACE_DISABLED_CODE,
-      },
-    };
-  }
-  const entries = await ctx.host.statusView();
-  return {
-    title: "宿主桥",
-    active: "host",
-    // BD14：组织目录根坏了是**根因**，要在还没有任何桥的时候就能看见（否则本页只会一片「无桥可显示」）。
-    bodyHtml: renderHostPage({
-      entries,
-      config: ctx.host.configView(),
-      notice,
-      orgsDirProblem: ctx.host.orgsDirProblem(),
-    }),
-  };
 }
 
 /**
@@ -1465,8 +1359,9 @@ export function createBoardServer(options: CreateBoardServerOptions): Promise<Bo
       releaseOrgGroup: options.releaseOrgGroupImpl ?? releaseOrgGroup,
       // v0.10.0 B2：版本写面改道引擎（`/api/versions*`，同 `mcpBaseUrl` = 可写面 8787）；无本地兜底。
       versions: options.versionsWriteImpl ?? createVersionsWriteClient({ baseUrl: options.mcpBaseUrl ?? DEFAULT_MCP_BASE_URL }),
+      // v0.11.0 R1 B2：阶段面两写口转发引擎（同名 MCP 工具，同 `mcpBaseUrl`）；无本地兜底。
+      stageWrite: options.stageWriteImpl ?? createStageRoundWriteClient({ baseUrl: options.mcpBaseUrl ?? DEFAULT_MCP_BASE_URL }),
     },
-    host: options.hostFace ?? null,
     shutdown: options.onShutdown ?? null,
     docs: {
       repoRoot: options.docs?.repoRoot ?? defaultRepoRoot(),
@@ -1602,7 +1497,6 @@ function matchPage(pathname: string): PageRoute {
   //（GET 303 回门户在 handle 先行处理；POST /orgs 写口照旧 = parseWriteRoute 白名单）。
   // REQ-2026-09-26-02 B-T3：Agent View（机器表 + 逐项目在飞任务 + 3300 收编的桥身份头）。
   if (pathname === "/agents") return { kind: "agents" };
-  if (pathname === "/host") return { kind: "host" };
   if (pathname.startsWith("/features/")) {
     const raw = pathname.slice("/features/".length);
     const isDocs = raw.endsWith(DOCS_SUFFIX);
@@ -1678,7 +1572,7 @@ async function handle(
     });
     return;
   }
-  /** 方法门 = 读面白名单 ∪ 写面白名单（十条 POST，见 `write-guard.parseWriteRoute`）；其余非 GET 一律 405 */
+  /** 方法门 = 读面白名单 ∪ 写面白名单（八条 POST = `WRITE_ROUTES.length`，见 `write-guard.parseWriteRoute`）；其余非 GET 一律 405 */
   // v0.9.4 D 档（BD6）归一层：`/org/<名>/…` 前缀在方法门**之前**识别、剥离并校验
   // （组织不存在 404 / 已停用 410）；写路由保持全局唯一集合 —— 剥前缀后原样过
   // parseWriteRoute，空间组织经 spaceOrg 注入 handler（提需求的 mismatch 409 见 handleWriteRequirement）。
@@ -1745,7 +1639,7 @@ async function handle(
       }
       if (spaceRoute.kind === "feature_detail") {
         try {
-          sendPage(res, { ...(await pageFeatureDetail(ctx, spaceRoute.featureId, url.searchParams.get("stage"))), orgNav: spaceNav });
+          sendPage(res, { ...(await pageFeatureDetail(ctx, spaceRoute.featureId, url.searchParams.get("stage"), url.searchParams.get("notice"))), orgNav: spaceNav });
         } catch (err) {
           sendPage(res, bridgeDownPage(`目标 = ${url.pathname}`, err, "features", spaceNav));
         }
@@ -1776,16 +1670,12 @@ async function handle(
   if (writeRoute !== null) {
     if (writeRoute.kind === "requirement") {
       await handleWriteRequirement(req, res, ctx, spaceOrg, spaceOrg !== null ? orgNavOf(ctx, spaceOrg) : undefined);
-    } else if (writeRoute.kind === "turn") {
-      await handleWriteTurn(req, res, ctx, writeRoute.featureId, "trigger");
-    } else if (writeRoute.kind === "confirm") {
-      await handleWriteTurn(req, res, ctx, writeRoute.featureId, "confirm");
-    } else if (writeRoute.kind === "answer") {
-      await handleWriteAnswer(req, res, ctx, writeRoute.featureId);
-    } else if (writeRoute.kind === "stop_chain") {
-      await handleWriteStopChain(req, res, ctx, writeRoute.featureId);
-    } else if (writeRoute.kind === "suspend") {
-      await handleWriteSuspend(req, res, ctx, writeRoute.featureId);
+    } else if (writeRoute.kind === "stage_round_open") {
+      await handleWriteStageRoundOpen(req, res, ctx, writeRoute.featureId);
+    } else if (writeRoute.kind === "doc_objection") {
+      await handleWriteDocObjection(req, res, ctx, writeRoute.featureId);
+    } else if (writeRoute.kind === "gate1_confirm") {
+      await handleWriteGate1Confirm(req, res, ctx, writeRoute.featureId);
     } else if (writeRoute.kind === "schedule") {
       await handleWriteSchedule(req, res, ctx, writeRoute.featureId);
     } else if (writeRoute.kind === "orgs") {
@@ -1794,8 +1684,6 @@ async function handle(
       await handleWriteOrgMembers(req, res, ctx, writeRoute.org);
     } else if (writeRoute.kind === "versions") {
       await handleWriteVersions(req, res, ctx, spaceOrg);
-    } else {
-      await handleWriteHostStop(req, res, ctx, writeRoute.org);
     }
     return;
   }
@@ -1888,11 +1776,9 @@ async function handle(
   }
   try {
     if (route.kind === "feature") {
-      sendPage(res, { ...(await pageFeatureDetail(ctx, route.id, url.searchParams.get("stage"))), orgNav: globalNav });
+      sendPage(res, { ...(await pageFeatureDetail(ctx, route.id, url.searchParams.get("stage"), url.searchParams.get("notice"))), orgNav: globalNav });
     } else if (route.kind === "feature-docs") {
       await handleFeatureDoc(ctx, res, req, route.id, url.searchParams);
-    } else if (route.kind === "host") {
-      sendPage(res, { ...(await pageHost(ctx, null)), orgNav: globalNav });
     } else if (route.kind === "home") {
       sendPage(res, await pageOrgPortal(ctx));
     } else if (route.kind === "agents") {
@@ -1999,7 +1885,7 @@ function orgNavOf(ctx: Ctx, specificOrg?: string, featureGroups: readonly string
   return {
     org: specificOrg ?? null,
     orgs: portalOrgNames({
-      ledger: [...enabledOrgNames(ledger), ...(ctx.host?.managedOrgs?.() ?? [])],
+      ledger: enabledOrgNames(ledger),
       featureGroups,
       defaultGroup: ctx.write.defaultGroup,
       disabled: disabledOrgNames(ledger),
@@ -2189,9 +2075,8 @@ async function pageOrgSpaceManage(
   const poolOutcome = computeProjectPool(snapshot, groups);
   // ④ 第三行的三档原料：project 档归一 + 降级文案单点（两者都不落库、不留缓存，纯本次渲染派生）。
   const versionField = projectVersionTierOf(projection);
-  // v0.9.8 按项目组配 agent：配置卡数据源 = 本次已读台账记录 + configView（零新读面；宿主面未装配 ⇒ 全局两键 null）
+  // 全局 agent 启动配置已退役；组织台账中的历史字段仍只读展示，不再触发起桥。
   const orgRec = findOrgRecord(ctx.orgsLedger.load().ledger, org);
-  const faceConfig = ctx.host === null ? null : ctx.host.configView();
   // ⑨ 需求表分页（REQ-2026-10-11-05 N11）：**先排全量、再切页** —— 排序复用需求池**同一把尺**
   // （`version-order.sortPoolEntries` → `comparePoolEntry`：createdAt 降序、缺值沉底、同值 featureId
   // 字典序兜底 ⇒ 全序、与输入顺序无关）；**不新建比较器、不引入新排序键**。
@@ -2227,8 +2112,8 @@ async function pageOrgSpaceManage(
         hostAgent: {
           orgKind: orgRec?.agentKind ?? null,
           orgModel: orgRec?.agentModel ?? null,
-          globalKind: faceConfig?.kind ?? null,
-          globalModel: faceConfig?.hostModel ?? null,
+          globalKind: null,
+          globalModel: null,
         },
         // 页头「核对源健康度」短条第三档（④）：三档判据的原料一次给全 —— 投影本体（null = 从未读到）、
         // 本次读失败根因（非 null = stale，值取最后一次投影）、`absent` 档降级文案单点。
@@ -2418,9 +2303,6 @@ async function handleWriteRequirement(
     );
     return;
   }
-  // ④b v0.9.5 增补三「建卡即自动首轮」：建卡成功后**只点火、不等收口**（见 {@link fireAutoFirstTurn}）
-  //     —— 落在 ⑤ 两条回显档之前点火，JSON 档 201 与表单档 303 共用同一次点火。
-  fireAutoFirstTurn(ctx, outcome.featureId, form.group, form.version);
   // ⑤ 回显：浏览器表单 ⇒ 303 跳详情页（PRG，刷新不重复建）；声明 accept: application/json ⇒ 201 JSON
   const accept = headers.accept ?? "";
   if (accept.includes("application/json")) {
@@ -2438,46 +2320,6 @@ async function handleWriteRequirement(
   }
   res.writeHead(303, { location: `/features/${encodeURIComponent(outcome.featureId)}`, "cache-control": "no-store" });
   res.end();
-}
-
-/** 自动首轮的留痕标签（可 grep 前缀；建卡日志里点名是这条轨点的火，不是人工触发）。 */
-const AUTO_FIRST_TURN_TAG = "[auto-first-turn]";
-
-/**
- * **建卡即自动首轮**（v0.9.5 增补三）：以本条实际生效的组织名为 {@link BoardHostFace.triggerTurn}
- * 点一发**纯触发**（无补充文本 ⇒ 提示词与动作区「留空 = 只说『继续』」同档；不扩表单字段）。
- *
- * - **不等收口**：`triggerTurn` 对在飞轮要等 `submitted.done`（至多 `turnTimeoutMs` = 10 分钟）⇒
- *   本函数**不 await**，建卡响应的时延与语义（201 / 303）与点火成败无关；收口结论迟到即日志。
- * - **不污染建卡**：宿主面未装配 / 桥不可达 / 起桥抛错一律留一行结构化日志后吞掉，绝不上抛。
- * - **防重**：复用宿主面既有同需求 occupant 判定（在飞 / 排队轮 ⇒ `disposition=busy`，不入队），
- *   故连点与「先手工点过再建卡」都不产生两轮并发。
- */
-function fireAutoFirstTurn(ctx: Ctx, featureId: string, org: string, version: string): void {
-  const face = ctx.host;
-  if (face === null) {
-    process.stderr.write(
-      `${timestampPrefix("board")}${AUTO_FIRST_TURN_TAG} 放弃 featureId=${featureId} org=${org} 结果=未点火 :: 宿主面未装配（hostFace=null，无桥可起）\n`,
-    );
-    return;
-  }
-  void face
-    .triggerTurn({ featureId, org, version })
-    .then((outcome) => {
-      const verb = outcome.disposition === "busy" ? "放弃" : outcome.ok ? "已点火" : "失败";
-      const reason = outcome.error === null ? "" : ` :: ${outcome.error.code} ${outcome.error.message}`;
-      // 「放弃」是防重命中的正常分流（不是故障）⇒ 与成功同用 board 档，仅真失败落 error 档
-      const tag = outcome.ok || outcome.disposition === "busy" ? "board" : "error";
-      process.stderr.write(
-        `${timestampPrefix(tag)}${AUTO_FIRST_TURN_TAG} ${verb} featureId=${featureId} org=${org}` +
-          ` 结果=${outcome.disposition} 轮=${outcome.turnId ?? "-"}${reason}\n`,
-      );
-    })
-    .catch((err: unknown) => {
-      process.stderr.write(
-        `${timestampPrefix("error")}${AUTO_FIRST_TURN_TAG} 失败 featureId=${featureId} org=${org} 结果=throw :: ${errText(err)}\n`,
-      );
-    });
 }
 
 // ---------------------------------------------------------------------------
@@ -2680,20 +2522,6 @@ async function handleDisableOrg(
   name: string,
   body: string,
 ): Promise<void> {
-  const active = ctx.host?.activeBridgesFor(name) ?? [];
-  if (active.length > 0) {
-    const states = active.map((s) => s.state).join("、");
-    respondError(
-      res,
-      headers.accept,
-      409,
-      ORG_HAS_ACTIVE_BRIDGE,
-      `组织 ${name} 名下仍有 ${String(active.length)} 个活跃宿主桥（${states}）⇒ 不隐式连带停桥。请先逐桥 stop（宿主桥页 POST /host/${name}/stop）再删除（停用）。`,
-      undefined,
-      orgBackfillFields(body),
-    );
-    return;
-  }
   // ② 同步摘除编排成员登记（§9.4-①）：O1 `group.remove` 先于台账标记 —— 失败即整体失败（原子，不留半态）。
   //    组身份 = 目标组织名（O1 是全组面工具，但连接仍需显式身份）。
   const release = await ctx.write.releaseOrgGroup(
@@ -2851,7 +2679,7 @@ async function handleWriteVersions(
   spaceOrg: string | null = null,
 ): Promise<void> {
   const headers = lowerHeaders(req);
-  // ① CSRF 守卫先于一切（与其余八条写径同规格：未认证请求不消耗 body 读取）
+  // ① CSRF 守卫先于一切（与其余七条写径同规格：未认证请求不消耗 body 读取）
   const auth = checkWriteAuth({ method: req.method, headers, proto: "http" });
   if (!auth.ok) {
     respondError(res, headers.accept, 403, auth.code, auth.error);
@@ -3178,26 +3006,10 @@ async function handleWriteOrgMembers(
 async function hostWriteGate(
   req: IncomingMessage,
   res: ServerResponse,
-  ctx: Ctx,
+  _ctx: Ctx,
 ): Promise<{ face: BoardHostFace; body: string } | null> {
-  const headers = lowerHeaders(req);
-  const auth = checkWriteAuth({ method: req.method, headers, proto: "http" });
-  if (!auth.ok) {
-    respondError(res, headers.accept, 403, auth.code, auth.error);
-    return null;
-  }
-  try {
-    const body = await readBodyCapped(req, MAX_REQUIREMENT_BODY_BYTES);
-    if (ctx.host === null) {
-      respondError(res, headers.accept, 503, HOST_FACE_DISABLED_CODE, HOST_FACE_DISABLED_DISPLAY);
-      return null;
-    }
-    return { face: ctx.host, body };
-  } catch (err) {
-    const code = errText(err) === "payload_too_large" ? "payload_too_large" : "body_read_failed";
-    respondError(res, headers.accept, code === "payload_too_large" ? 413 : 400, code, errText(err));
-    return null;
-  }
+  respondError(res, lowerHeaders(req).accept, 410, "host_agent_retired", "板侧 self-run agent 已退役");
+  return null;
 }
 
 /**
@@ -3468,30 +3280,358 @@ async function handleWriteSuspend(
 }
 
 // ---------------------------------------------------------------------------
-// BD8 写面 ②：POST /host/:org/stop（停桥；停后立即重探活并渲染状态页）
+// v0.11.0 R1 · B2 写面：POST /features/:id/stage-round-open 与 /doc-objection（转发引擎两同名写口）
 // ---------------------------------------------------------------------------
 
-async function handleWriteHostStop(
+/** 阶段写「归属组织缺失」的结构化错误码（503）—— 与排期写 `board_schedule_owner_group_missing` 同款口径：**绝不回落板级默认组**。 */
+const STAGE_WRITE_OWNER_GROUP_MISSING_CODE = "board_stage_write_owner_group_missing";
+
+/** 引擎传输 / 信封类错误码（板侧归一码）→ HTTP 状态；其余一律视为引擎业务拒 ⇒ 400 原样透出。 */
+const STAGE_WRITE_TRANSPORT_STATUS: Readonly<Record<string, number>> = {
+  transport_error: 502,
+  no_fetch: 502,
+  http_503: 502,
+  response_invalid: 502,
+  jsonrpc_error: 502,
+};
+
+/**
+ * 阶段写失败档的状态码映射：**未知码不 fail-closed**（照 v0.10.0 B2 版本写面口径）——
+ * 业务判据（成员集 / 闭集 stage / 幂等键）归引擎，板只透传错误码与原文。
+ */
+function stageWriteErrorStatus(out: StageWriteFailure): number {
+  if (out.code.startsWith("http_5")) return 502;
+  if (out.code.startsWith("http_4")) return 400;
+  return STAGE_WRITE_TRANSPORT_STATUS[out.code] ?? 400;
+}
+
+/** 阶段写两表单的失败回填（口径同 memberBackfillFields：只回显非空提交值）。 */
+function stageWriteBackfill(body: string, keys: readonly string[]): ErrorOverlayField[] {
+  const f = new URLSearchParams(body);
+  const fields: ErrorOverlayField[] = [];
+  for (const key of keys) {
+    const value = (f.get(key) ?? "").trim();
+    if (value !== "") fields.push({ label: key, value });
+  }
+  return fields;
+}
+
+/** 阶段写出网前的身份与阶段锚（同一次 `getFeature` 取两枚事实）。 */
+interface StageWriteOwner {
+  /** 组身份 = 需求 `ownerGroup`（已 trim、非空）。 */
+  group: string;
+  /** 当前阶段 = 需求 `stage` 原值（可能是空串：板不猜阶段，交引擎结构化拒）。 */
+  stage: string;
+}
+
+/**
+ * 归属组织 = 需求 ownerGroup（身份链 S1）+ 当前阶段（836563b8 的 ② 开轮入参），**同一次读面**；
+ * 读面失败 / 归属缺失 ⇒ 结构化应答并返回 null（**不猜、不回落**）。
+ */
+async function stageWriteOwnerOf(
+  res: ServerResponse,
+  headers: Record<string, string | undefined>,
+  ctx: Ctx,
+  featureId: string,
+  backfill: readonly ErrorOverlayField[],
+): Promise<StageWriteOwner | null> {
+  let ownerGroup: string | null | undefined;
+  let stage = "";
+  try {
+    const detail = await ctx.client.getFeature(featureId);
+    ownerGroup = detail.feature.ownerGroup;
+    stage = (detail.feature.stage ?? "").trim();
+  } catch (err) {
+    respondError(
+      res,
+      headers.accept,
+      502,
+      BRIDGE_UNREACHABLE_CODE,
+      `需求数据读取失败，无法确定归属组织：${errText(err)}`,
+      undefined,
+      backfill,
+    );
+    return null;
+  }
+  if (ownerGroup === null || ownerGroup === undefined || ownerGroup.trim() === "") {
+    respondError(
+      res,
+      headers.accept,
+      503,
+      STAGE_WRITE_OWNER_GROUP_MISSING_CODE,
+      "该需求无归属组织（ownerGroup 缺失）⇒ 阶段写拒绝出网：不回落板级默认组（会把写打到别的组织目录）",
+      undefined,
+      backfill,
+    );
+    return null;
+  }
+  return { group: ownerGroup.trim(), stage };
+}
+
+/**
+ * 开轮回执文案（0cb2d1db 缺陷二 · A3）：`replayed=true` ⇒ 引擎按同 `basisRev` 命中既有轮、**未新开**，
+ * 板不得静默 303，须同时给出「未新开」与「仍是第 N 轮」两句；`replayed=false` ⇒ 「已新开第 N 轮」。
+ * 载体 = 303 `?notice=` 查询串 → 详情页顶部 `.stage-notice` 一行（零 JS）。
+ */
+function stageRoundOpenNotice(out: StageRoundOpenSuccess): string {
+  const round = out.round === null ? "?" : String(out.round);
+  return out.replayed
+    ? `本轮未新开：口径未变，仍是第 ${round} 轮。`
+    : `已新开第 ${round} 轮。`;
+}
+
+/**
+ * **开阶段轮**（v0.11.0 R1 · B2）：转发引擎同名写工具 `stage_round_open`（一次 `tools/call`，
+ * 组身份 = 需求 ownerGroup）。板**不写状态机、不判幂等**——幂等由引擎 partial 唯一索引保证，
+ * 重复调用 ⇒ 引擎返回既有轮，板原样透出。表单判据 = `write-guard.parseStageRoundOpenForm`
+ * （仅 `stage` 必填；闭集值域归引擎，越界结构化拒）。
+ * 成功 = PRG 303 回详情页（停链成功档先例）；`Accept: application/json` ⇒ 结构化载荷
+ * `{ok, round, basisRev, created}`（B3/B4 视图消费；`created` 行只透传不解读）。
+ */
+async function handleWriteStageRoundOpen(
   req: IncomingMessage,
   res: ServerResponse,
   ctx: Ctx,
-  org: string,
+  featureId: string,
 ): Promise<void> {
   const headers = lowerHeaders(req);
-  const gate = await hostWriteGate(req, res, ctx);
-  if (gate === null) return;
-  const outcome = await gate.face.stopBridge(org);
-  const status = outcome.ok ? 200 : 502;
-  if (wantsJson(headers.accept)) {
-    respondJson(res, status, outcome);
+  // ① CSRF 守卫先于一切（与其余写径同规格：未认证请求不消耗 body 读取）
+  const auth = checkWriteAuth({ method: req.method, headers, proto: "http" });
+  if (!auth.ok) {
+    respondError(res, headers.accept, 403, auth.code, auth.error);
     return;
   }
-  const page = await pageHost(ctx, renderHostNotice(outcome));
-  sendPage(res, {
-    ...page,
-    status,
-    errorOverlay: stopBridgeErrorOverlay(outcome) ?? undefined,
+  let body: string;
+  try {
+    body = await readBodyCapped(req, MAX_REQUIREMENT_BODY_BYTES);
+  } catch (err) {
+    const code = errText(err) === "payload_too_large" ? "payload_too_large" : "body_read_failed";
+    respondError(res, headers.accept, code === "payload_too_large" ? 413 : 400, code, errText(err));
+    return;
+  }
+  const form = parseStageRoundOpenForm(body, Number(headers["content-length"] ?? NaN));
+  if (!form.ok) {
+    respondError(res, headers.accept, form.status, form.code, form.error, undefined, stageWriteBackfill(body, ["stage", "sources", "targetProjects", "basisRevInput"]));
+    return;
+  }
+  const owner = await stageWriteOwnerOf(res, headers, ctx, featureId, stageWriteBackfill(body, ["stage"]));
+  if (owner === null) return;
+  const out = await ctx.write.stageWrite.openStageRound(
+    {
+      featureId,
+      stage: form.stage,
+      sources: form.sources,
+      targetProjects: form.targetProjects,
+      basisRevInput: form.basisRevInput,
+    },
+    { group: owner.group, baseUrl: ctx.write.mcpBaseUrl },
+  );
+  if (!out.ok) {
+    respondError(res, headers.accept, stageWriteErrorStatus(out), out.code, out.error, undefined, stageWriteBackfill(body, ["stage"]));
+    return;
+  }
+  if (wantsJson(headers.accept)) {
+    respondJson(res, 200, { ok: true, featureId, stage: out.stage ?? form.stage, round: out.round, basisRev: out.basisRev, created: out.created, replayed: out.replayed });
+    return;
+  }
+  // 0cb2d1db 缺陷二 · A3：开轮回执不得静默——无论新开 / 回放，都带一句可见提示回详情页顶部。
+  const notice = stageRoundOpenNotice(out);
+  res.writeHead(303, {
+    location: `/features/${encodeURIComponent(featureId)}?notice=${encodeURIComponent(notice)}`,
+    "cache-control": "no-store",
   });
+  res.end();
+}
+
+/**
+ * ② 开轮失败档的落点（836563b8 B4）：**回渲染原卡片页 + 可见错误块**（引擎错误码 + 原文），
+ * **不静默 303**、**不回滚 ①**（引擎无删除口 ⇒ 允许半成品态，出路是卡面的补救块）。
+ * 补救块不需要板额外传参：重渲染读到的本轮格已带那条 `disposed=false` 异议，视图按判据自渲。
+ * 卡片页自身读面失败 ⇒ 回落结构化错误页（错误信息不丢）。
+ */
+async function respondStageOpenFailure(
+  res: ServerResponse,
+  ctx: Ctx,
+  featureId: string,
+  out: StageWriteFailure,
+): Promise<void> {
+  const status = stageWriteErrorStatus(out);
+  const hint = "异议已留痕（引擎无删除口 ⇒ 板不回滚）；卡面「补救」块只重调开轮，不会重复记异议。";
+  try {
+    const page = await pageFeatureDetail(ctx, featureId);
+    sendPage(res, {
+      ...page,
+      status,
+      errorOverlay: { family: errorFamilyLabel(out.code), error: out.error, code: out.code, hint },
+    });
+  } catch (err) {
+    respondError(res, "text/html", status, out.code, `${out.error}；卡片页重渲染失败：${errText(err)}`, hint);
+  }
+}
+
+/**
+ * **记段落异议 ⇒ 同请求内开新一轮**（v0.11.0 R1 · B2 + 836563b8）：一笔请求串两枚引擎写口，
+ * 顺序是硬约束 ——
+ * ① `doc_objection(featureId, docVersion, sectionId, objectionText, targetType?, projectIds?)`
+ *    （表单判据 = `write-guard.parseDocObjectionForm`，三必填缺失 400 点名缺项；① 失败 ⇒ **不触发 ②**）；
+ * ② ① 成功后调 `stage_round_open(featureId, stage=当前阶段, sources=[「用户对 <sectionId> 段提出异议」],
+ *    basisRevInput=synthesis.docVersion)`，**targetProjects 不出键**（引擎按本组全员物化）、
+ *    **不再发第二次 HTTP**（复用 `stage-round-write.ts` 的开轮封装）。
+ * 反序会让刚提的异议被自己这一轮判成已处置、且不会被并入 `sources`。
+ * ② 成功 = PRG 303 回详情页（带「已新开第 N 轮 / 未新开」回执，落既有 awaiting 渲染）；
+ * ② 失败 = {@link respondStageOpenFailure}（原卡片页 + 错误块 + 补救块）。
+ * JSON 档 ⇒ `{ok, staleRevPending, round, basisRev, replayed}`；② 失败档出 `{ok:false, code, error}`。
+ */
+async function handleWriteDocObjection(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: Ctx,
+  featureId: string,
+): Promise<void> {
+  const headers = lowerHeaders(req);
+  const auth = checkWriteAuth({ method: req.method, headers, proto: "http" });
+  if (!auth.ok) {
+    respondError(res, headers.accept, 403, auth.code, auth.error);
+    return;
+  }
+  let body: string;
+  try {
+    body = await readBodyCapped(req, MAX_REQUIREMENT_BODY_BYTES);
+  } catch (err) {
+    const code = errText(err) === "payload_too_large" ? "payload_too_large" : "body_read_failed";
+    respondError(res, headers.accept, code === "payload_too_large" ? 413 : 400, code, errText(err));
+    return;
+  }
+  const backfillKeys = ["docVersion", "sectionId", "objectionText", "targetType", "projectIds"];
+  const form = parseDocObjectionForm(body, Number(headers["content-length"] ?? NaN));
+  if (!form.ok) {
+    respondError(res, headers.accept, form.status, form.code, form.error, undefined, stageWriteBackfill(body, backfillKeys));
+    return;
+  }
+  const owner = await stageWriteOwnerOf(res, headers, ctx, featureId, stageWriteBackfill(body, ["docVersion", "sectionId"]));
+  if (owner === null) return;
+  const options = { group: owner.group, baseUrl: ctx.write.mcpBaseUrl };
+  const out = await ctx.write.stageWrite.recordDocObjection(
+    {
+      featureId,
+      docVersion: form.docVersion,
+      sectionId: form.sectionId,
+      objectionText: form.objectionText,
+      targetType: form.targetType,
+      projectIds: form.projectIds,
+    },
+    options,
+  );
+  if (!out.ok) {
+    respondError(res, headers.accept, stageWriteErrorStatus(out), out.code, out.error, undefined, stageWriteBackfill(body, backfillKeys));
+    return;
+  }
+  // ②：同一请求内续开新一轮（异议已锚定的 docVersion 即本轮 basisRev 输入；阶段取需求当前阶段，
+  // 板不自判值域、不猜阶段 —— 空阶段原样出网，由引擎结构化拒绝并落 ② 失败档）。
+  const open = await ctx.write.stageWrite.openStageRound(
+    {
+      featureId,
+      stage: owner.stage,
+      sources: [`用户对 ${form.sectionId} 段提出异议`],
+      basisRevInput: form.docVersion,
+    },
+    options,
+  );
+  if (!open.ok) {
+    if (wantsJson(headers.accept)) {
+      respondError(res, headers.accept, stageWriteErrorStatus(open), open.code, `异议已留痕，但开新一轮失败：${open.error}`, undefined, stageWriteBackfill(body, backfillKeys));
+      return;
+    }
+    await respondStageOpenFailure(res, ctx, featureId, open);
+    return;
+  }
+  if (wantsJson(headers.accept)) {
+    respondJson(res, 200, {
+      ok: true,
+      featureId,
+      docVersion: form.docVersion,
+      sectionId: form.sectionId,
+      staleRevPending: out.staleRevPending,
+      round: open.round,
+      basisRev: open.basisRev,
+      replayed: open.replayed,
+    });
+    return;
+  }
+  res.writeHead(303, {
+    location: `/features/${encodeURIComponent(featureId)}?notice=${encodeURIComponent(`异议已提交；${stageRoundOpenNotice(open)}`)}`,
+    "cache-control": "no-store",
+  });
+  res.end();
+}
+
+// ---------------------------------------------------------------------------
+// v0.11.0 B1 写面：POST /features/:id/gate1-confirm（门① 确认 —— 板只转发、不自判闸）
+// ---------------------------------------------------------------------------
+
+/**
+ * **门① 确认转发**（v0.11.0 B1）：转发引擎同名写工具 `gate1_confirm`（一次 `tools/call`，
+ * 组身份 = 需求 ownerGroup）。用户裁定 U3 + 宿主裁决 A9：确认动作由板转发，板**只转发、
+ * 不写状态机、不自判闸、不重算 docHash**（校验归引擎 N6/N7）。表单判据 =
+ * `write-guard.parseGate1ConfirmForm`（`docVersion` / `docHash` 必填单值、`round` 必填正整数，
+ * `version` 可选排期版号；前两枚原样透传）。成功 = PRG 303 回详情页；JSON 档 ⇒ `{ok, confirmed}`。
+ */
+async function handleWriteGate1Confirm(
+  req: IncomingMessage,
+  res: ServerResponse,
+  ctx: Ctx,
+  featureId: string,
+): Promise<void> {
+  const headers = lowerHeaders(req);
+  const auth = checkWriteAuth({ method: req.method, headers, proto: "http" });
+  if (!auth.ok) {
+    respondError(res, headers.accept, 403, auth.code, auth.error);
+    return;
+  }
+  let body: string;
+  try {
+    body = await readBodyCapped(req, MAX_REQUIREMENT_BODY_BYTES);
+  } catch (err) {
+    const code = errText(err) === "payload_too_large" ? "payload_too_large" : "body_read_failed";
+    respondError(res, headers.accept, code === "payload_too_large" ? 413 : 400, code, errText(err));
+    return;
+  }
+  const backfillKeys = ["docVersion", "docHash", "round", "version"];
+  const form = parseGate1ConfirmForm(body, Number(headers["content-length"] ?? NaN));
+  if (!form.ok) {
+    respondError(res, headers.accept, form.status, form.code, form.error, undefined, stageWriteBackfill(body, backfillKeys));
+    return;
+  }
+  const owner = await stageWriteOwnerOf(res, headers, ctx, featureId, stageWriteBackfill(body, backfillKeys));
+  if (owner === null) return;
+  const out = await ctx.write.stageWrite.openGate1Confirm(
+    {
+      featureId,
+      docVersion: form.docVersion,
+      docHash: form.docHash,
+      round: form.round,
+      ...(form.version === null ? {} : { version: form.version }),
+    },
+    { group: owner.group, baseUrl: ctx.write.mcpBaseUrl },
+  );
+  if (!out.ok) {
+    respondError(res, headers.accept, stageWriteErrorStatus(out), out.code, out.error, undefined, stageWriteBackfill(body, backfillKeys));
+    return;
+  }
+  if (wantsJson(headers.accept)) {
+    respondJson(res, 200, {
+      ok: true,
+      featureId,
+      docVersion: form.docVersion,
+      docHash: form.docHash,
+      round: form.round,
+      version: form.version,
+      confirmed: out.confirmed,
+    });
+    return;
+  }
+  res.writeHead(303, { location: `/features/${encodeURIComponent(featureId)}`, "cache-control": "no-store" });
+  res.end();
 }
 
 // ---------------------------------------------------------------------------

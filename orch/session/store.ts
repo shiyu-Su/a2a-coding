@@ -28,6 +28,9 @@ import type {
   InputArtifactRef,
   RiskLevel,
   SessionRecord,
+  StageAnswerState,
+  StageDecision,
+  StageRelevance,
   TaskLane,
   TaskMode,
   TaskRecord,
@@ -46,6 +49,10 @@ import {
   isFeatureStage,
   isVersionLedgerStatus,
   ORPHAN_FAILURE_KIND,
+  STAGE_ANSWER_STATES,
+  STAGE_DECISIONS,
+  STAGE_RELEVANCES,
+  SYNTHESIS_TASK_KEY,
   TASK_LANES,
   TASK_MODES,
   TASK_TYPES,
@@ -126,9 +133,9 @@ export const FEATURE_STATE_VALUES: readonly FeatureState[] = FEATURE_STATES;
 const RETIRED_FEATURE_STATES: readonly string[] = ["discussing", "analyzing", "planning"];
 
 /**
- * 失败分类清单 = `types.ts` 的 `FAILURE_KINDS`（**六类闭集**，事实源 `PROTOCOL.md` 2.3 条文；
- * v0.8.8 O1 起**不在此另立清单**）。落库值只能是这六者；旧二分 `infra` / `task` 与任何脏值
- * 在**读侧**按 `readFailureKind` 兜底，不再抛错。
+ * 失败分类清单 = `types.ts` 的 `FAILURE_KINDS`（**七类闭集**，事实源 `PROTOCOL.md` 2.4 条文；
+ * v0.8.8 O1 起**不在此另立清单**）。落库值只能是 `FAILURE_KINDS` 的七者；旧二分 `infra` / `task`
+ * 与任何脏值在**读侧**按 `readFailureKind` 兜底，不再抛错。
  */
 
 /** 事件 kind：任务结算（completed / failed / input-required） */
@@ -369,6 +376,20 @@ export interface TaskResultUpsertInput {
    * 并据其 `continueAttempts` 派生 `task.continued` 事件。**不落派生布尔、不丢原料**。
    */
   diagnostics?: unknown;
+  /**
+   * **结算前分类**（v0.11.0 O4 · 改造文档 §3.2「事件需前移分类才带 `failureKind`」）：
+   * 与终态**同一条 UPDATE** 落 `tasks.failure_kind`，并随附 `task.settled` 事件原文。
+   * 闭集校验 / 混跑兜底在调用方（`bridge/runner.ts`）完成 ⇒ 本口**原样落、不改写上报取值**；
+   * 仅本次 `state='failed'` 时有意义（非 failed 一律忽略）。取代后置 `setTaskFailureKind`
+   * 晚于事件的旧口径（v0.8.7 O3 写口 (i)）。
+   */
+  failureKind?: FailureKind | null;
+  /**
+   * **失败命中片段**（v0.11.0 O4）：≤120 码点、**已脱敏**（截断与脱敏是生产方职责，
+   * provider 支 = `bridge/provider-receipt.ts` 的 `snippet`）。**不落列**，只写进
+   * `task.settled` 事件 payload（`failureSnippet` 键）⇒ 事件原文可取证。
+   */
+  failureSnippet?: string | null;
   /** 上报 / 结算时刻（缺省 now；重复上报时**不覆盖**已结算行） */
   updatedAt?: string;
 }
@@ -447,6 +468,67 @@ export interface TaskCreateInput {
    * 阶段而是 NULL，正是为了「不带快照的重登记不会把已摄快照覆盖掉」。要显式改值必须**显式传值**。
    */
   stage?: FeatureStage | null;
+  /**
+   * **阶段轮命名键**（R1 · v0.11.0 orch-N4，落 `tasks.task_key`；缺省 `undefined` = 落库 NULL）。
+   * 入参面此前属 N1「只扩列」未动的登记缺口（§2.1 写入者=物化）：本节点集成测试需物化同形种子行，
+   * 逐列补入。**七列一律 `COALESCE(excluded.x, x)` 首值保留**（同 `lane`/`mode`/`stage` 纪律 ⇒
+   * 重登记/重派不得改写轮身份键，`task_key` 首值即 partial 唯一索引键）。
+   */
+  taskKey?: string | null;
+  /** **轮次**（落 `tasks.round`；正整数。非正整数 = 写侧越界，读侧 `readTaskRound` fail-fast） */
+  round?: number | null;
+  /** 参与性三值（落 `tasks.relevance`；开轮物化缺省写 `pending`，值域执法 = 读侧 fail-fast） */
+  relevance?: StageRelevance | null;
+  /** 决定三值（落 `tasks.decision`；**仅 `involved` 行有值**，其余 NULL） */
+  decision?: StageDecision | null;
+  /** 理由自由文本（落 `tasks.reason`；写侧截断口径见 `stage-parse.ts` 的 200 码点上限） */
+  reason?: string | null;
+  /** 口径指纹（落 `tasks.based_on_rev`；物化写本轮值，§2.1） */
+  basedOnRev?: string | null;
+  /** 回执态三值（落 `tasks.answer_state`；物化缺省 `pending`） */
+  answerState?: StageAnswerState | null;
+}
+
+/**
+ * {@link SessionStore.updateStageRow} 入参（R1 · v0.11.0 orch-N4）：阶段行结算五列。
+ * **键缺位（`undefined`）= 不触碰该列；显式 `null` = 写 NULL**（两态可区分是「不落默认值」的
+ * 机制前提——`invalid` 收口只动 `answer_state`，不得把 NULL 盖进 `based_on_rev` 抹掉物化指纹）。
+ */
+export interface StageRowPatch {
+  relevance?: StageRelevance | null;
+  decision?: StageDecision | null;
+  reason?: string | null;
+  basedOnRev?: string | null;
+  answerState?: StageAnswerState | null;
+}
+
+/**
+ * {@link SessionStore.writeStageSynthesisOutcome} 入参（v0.11.0 orch-N4）：合成行结果四列。
+ * **`undefined` = 不触碰该列**（同 {@link StageRowPatch} 的 null/undefined 二态纪律）。
+ */
+export interface StageSynthesisOutcomePatch {
+  synthesisJson?: string | null;
+  docHash?: string | null;
+  text?: string | null;
+  state?: TaskState | null;
+}
+
+/**
+ * 合成行（`task_key='synthesis'` + `project_id='__engine__'`）的**读面投影**（R1 · orch-N5）：
+ * 承载四列 + 定位坐标。**刻意不是 `TaskRecord`** —— 四列不进 `TASK_COLUMNS`（N1 判据 5），
+ * 故另立一枚窄投影，只喂读面 `stageRuns[].synthesis`。
+ */
+export interface StageSynthesisRecord {
+  taskId: string;
+  stage: FeatureStage;
+  round: number;
+  /** 合成行的任务态（读面四值态由此映射，映射单点在 `bridge/stage-round.ts`） */
+  state: TaskState;
+  /** `{docVersion, sections[]}` 的 JSON 原文（未产出 ⇒ null；解析归读面单点） */
+  synthesisJson: string | null;
+  docHash: string | null;
+  confirmedDocHash: string | null;
+  confirmedAt: string | null;
 }
 
 /** `listTasks` 入参：按项目（可选状态）取最近任务 */
@@ -459,6 +541,11 @@ export interface ListTasksOptions {
 /** `listFeatureTasks` 入参：按 Feature 取任务节点（本地 id） */
 export interface ListFeatureTasksOptions {
   limit?: number;
+  /**
+   * 是否把阶段成员行纳入任务清单。缺省 false，保持列表 / 调度等既有消费方原行为；
+   * `a2a_feature_status` 单查显式缺省为 true。合成行（`task_key=synthesis`）始终排除。
+   */
+  includeStageTasks?: boolean;
 }
 
 /** `listFeatures` 入参：可选状态 / 版号 / 条数上限 / 归属组过滤 */
@@ -944,6 +1031,13 @@ export interface EventAppendInput {
   state?: string | null;
   payload?: string | null;
   createdAt?: string;
+  /**
+   * **索引级幂等键**（R1 · v0.11.0 orch-N7，落 `events.idempotency_key`）：
+   * 缺省 / `null` = 普通事件（既有全部调用点逐字不变，NULL 被 partial 唯一索引整体排除）；
+   * 非空 = 本事件参与唯一集 ⇒ 同键重复 `appendEvent` **撞 `idx_events_idempotency_key` 抛出**
+   * （调用方据 {@link isUniqueConstraintError} 转结构化幂等出口，不吞真错误）。
+   */
+  idempotencyKey?: string | null;
 }
 
 /**
@@ -1036,6 +1130,21 @@ function isTaskMode(v: string): v is TaskMode {
   return (TASK_MODES as readonly string[]).includes(v);
 }
 
+/** 阶段轮参与性闭集判定（R1 · orch-N1；值域源 = `types.ts` 的 `STAGE_RELEVANCES`） */
+function isStageRelevance(v: string): v is StageRelevance {
+  return (STAGE_RELEVANCES as readonly string[]).includes(v);
+}
+
+/** 阶段轮决定闭集判定（R1 · orch-N1；值域源 = `types.ts` 的 `STAGE_DECISIONS`） */
+function isStageDecision(v: string): v is StageDecision {
+  return (STAGE_DECISIONS as readonly string[]).includes(v);
+}
+
+/** 阶段轮回执态闭集判定（R1 · orch-N1；值域源 = `types.ts` 的 `STAGE_ANSWER_STATES`） */
+function isStageAnswerState(v: string): v is StageAnswerState {
+  return (STAGE_ANSWER_STATES as readonly string[]).includes(v);
+}
+
 /**
  * **写档 SQL 片段**（v0.8.10 O-N1；忙集谓词与 `claimTask` 写优先排序**共用同一片段**）。
  *
@@ -1045,6 +1154,82 @@ function isTaskMode(v: string): v is TaskMode {
  * 一旦在排序里漏掉 NULL，**迁移前的存量行整体沉底**（永远领不到）。
  */
 const WRITE_LANE_SQL = "(lane IS NULL OR lane = 'write')";
+
+/**
+ * **Feature 任务读面的 mode 归属谓词**（R1 · v0.11.0 orch-N6；SQL `WHERE` 片段，**零绑定参数**）
+ * = 「这一行属不属于既有 Feature 任务读面」判据的**唯一事实源**，供以下两处拼接（同一口径）：
+ * {@link SessionStore.featureTaskStateCounts} 的聚合（`taskCount` / `stateCounts`）与
+ * {@link SessionStore.listFeatureTasks} 的 `LIMIT` 选取 + `COUNT(*)` 总量。
+ *
+ * 背景：R1 的 `mode='stage'` 阶段轮行**同样带 `feature_id`**（归属声明，与 `inquiry` 同形，
+ * 见 `types.ts` 的 `TASK_MODES`）⇒ 它天然落进一切「按 Feature 取节点」的读集。补批前两处读面
+ * 各中一条：聚合侧把阶段行**抬进** `taskCount` / `stateCounts`（板列表每行计数虚高）；列表侧
+ * 阶段行**挤占** `LIMIT 1000` 并把 `COUNT(*)` 的 `total` 一并抬高 ⇒ 误报 {@link EVENT_LIST_TRUNCATED}。
+ *
+ * ⚠️ **口径 = 「只剔阶段行，其余逐字不变」**，不是「只留 DAG 节点」：
+ * - `inquiry` 行**照旧计入**（v0.10.8 O-2 起它就带 `feature_id`、本就在读面里；剔它不属于本卡）
+ *   ⇒ 改造前后的读面语义「该 Feature 名下除阶段行以外的全部行」**逐行相等**（判据 1 的对照面）；
+ * - **不写成肯定式枚举** `(mode = 'dag' OR mode = 'inquiry')`：那会把**闭集外的脏 `mode` 行**
+ *   也在 SQL 侧一并剔掉 ⇒ 绕开 {@link readMode} 的 fail-fast（脏值本该抛「数据损坏」），
+ *   把「数据损坏」静默降级成「少一行」。取反式 + 显式 `IS NULL` 只改「阶段行」这一类的命运，
+ *   其余行与改造前逐字同。值域再扩张（第四档）时**只改本常量这一处** —— 改造文档 §4.2
+ *   「判据取肯定式」针对的是**散在 11 个调用点**的取反式，本片段是单点事实源，不属该风险面。
+ * - ⚠️ **`mode IS NULL` 必须算读面内**（与 {@link WRITE_LANE_SQL} 的 `lane IS NULL` 同一条纪律）：
+ *   `tasks.mode` 存量行**零回填**、NULL 由 {@link readMode} 归一成 `dag` ⇒ SQL 里漏掉 `IS NULL`
+ *   等于把**全部存量 DAG 行**剔出计数与列表（静默清空既有 Feature 的任务面）。
+ *
+ * ★ **唯一事实源**：两处拼接一律 `${NON_STAGE_MODE_SQL}`，**不得另写字面量** —— 另写一份 =
+ * 两份归属判据漂移（照 {@link featureOwnershipCondition} / `WRITE_LANE_SQL` 先例；验收锚见
+ * `test/v0110-n6-read-face-mode-sql.test.ts` 的源码断言）。
+ *
+ * ⚠️ **与调度面判据 `isDagNode`（`bridge/scheduler.ts`）是两枚视野不同的谓词，不得合并**：
+ * `isDagNode` = 肯定式 `mode === "dag"`，管「**DAG 节点集合**」（连 `inquiry` 都不进）；本片段管
+ * 「**Feature 任务读面**」（`inquiry` 照进）。二者同以 `tasks.mode` 为源，但合并任一侧都会改掉
+ * 另一侧的行为。store 侧亦**不可** import scheduler（`bridge/scheduler.ts` 已 import
+ * `session/store.js`，反向引用成环）⇒ 读面判据只能在 store 侧单点定义。
+ */
+const NON_STAGE_MODE_SQL = "(mode IS NULL OR mode <> 'stage')";
+
+/**
+ * **阶段行写口的模式锚（走绑定参数，不走 SQL 字面量）**（R1 · v0.11.0 orch-N4）：
+ * `updateStageRow` / `rearmStageForRetry` 的 `WHERE … mode = ?` 一律绑本值。
+ *
+ * ⚠️ **为何参数化而非拼接**：{@link NON_STAGE_MODE_SQL} 的验收锚（N6 判据 2）禁本文件出现第二处
+ * `mode = 'stage'` **字面量** —— 归属判据写两份必漂移。参数化后 SQL 里无该字面量，写面模式锚
+ * 同样单点（与读面同源同一条纪律，只是形态从片段常量换成绑定值）。
+ */
+const STAGE_MODE_SQL_PARAM: TaskMode = "stage";
+
+/**
+ * **合成行的应收集排除谓词**（R1 · v0.11.0 orch-N1 补批；SQL `WHERE` 片段，**零绑定参数**）
+ * = 「这一行不是引擎综合分析的合成行」判据的**唯一事实源**（store 侧），供
+ * {@link SessionStore.listStageRoundRows} 与 {@link SessionStore.listStageRows} 两处拼接。
+ *
+ * 背景（冻结口径）：综合分析改由引擎内部执行，结果落一枚合成行
+ * （`mode='stage'` + `task_key=${SYNTHESIS_TASK_KEY}` + `project_id='__engine__'` + 同本轮
+ * `(feature, stage, round)`）⇒ 它与成员行**住在同一张轮格里**，而这两条读口的既有谓词只认
+ * `task_key IS NOT NULL`（= 「本行由开轮物化产生」）⇒ **合成行天然满足它**，补批前会被组进本轮应收集。
+ *
+ * ★ **不补即自锁**（本片段存在的全部理由）：合成行进了应收集 ⇒ `expected` 凭空 +1，而它
+ * **永不带 `answer_state`**（不是成员回执，没有 §2.2 三条件可走）⇒ 读侧归一为 `null` ⇒
+ * 应用层分类（`bridge/stage-round.ts` 的 `classifyStageRow`）判 `pending` ⇒ 该轮 `sealed` 恒
+ * `false` ⇒ **收口永不成立**，整条阶段链卡在「最后一行永远没收齐」。三处读侧谓词（本两条 +
+ * `bridge/stage-round.ts` 的 `groupStageRoundRows` 的 JS 侧同一条）**每一处都必须补**，
+ * 漏一处就锁死一条路径（收口面 / 读面）。
+ *
+ * ⚠️ **取反式而非肯定式枚举**（与 {@link NON_STAGE_MODE_SQL} 同一条纪律）：不写成
+ * `task_key = 'pm-relevance'`——那是把「物化键」当成闭集白名单，将来每加一枚引擎命名键
+ * （第三枚、第四枚）就得改一次谓词，漏改即静默少收一行。
+ * ⚠️ **`task_key` 为 NULL 的行本已被前一条 `IS NOT NULL` 挡下**，片段单独使用会因
+ * `NULL <> 'synthesis'` 三值逻辑得 `NULL`（= 不成立）而误剔存量行 ⇒ **只能拼接在
+ * `task_key IS NOT NULL` 之后**，不得独立成一扇 WHERE 门。
+ * ⚠️ 键名用**字面插值**自 `types.ts` 的 `SYNTHESIS_TASK_KEY`（值唯一事实源）⇒ 本单元内不存在
+ * 第二枚 `'synthesis'` 字面量（与 `STAGE_MODE_SQL_PARAM` 参数化同理，只是本片段须零绑定才能拼接）。
+ */
+const EXCLUDE_SYNTHESIS_ROW_SQL = `task_key <> '${SYNTHESIS_TASK_KEY}'`;
+
+/** 上一条的**正向对偶**（N5 合成行读口）：同样零绑定、同样从 `SYNTHESIS_TASK_KEY` 取字面 ⇒ 「排除」与「只取」不会漂成两份归属判据 */
+const ONLY_SYNTHESIS_ROW_SQL = `task_key = '${SYNTHESIS_TASK_KEY}'`;
 
 /** 该任务态是否算「已完成」（`finished_at` 的唯一写入判据；口径见 `FINISHED_TASK_STATES`） */
 function isFinishedState(state: TaskState): boolean {
@@ -1101,7 +1286,7 @@ function readInteger(row: Record<string, unknown>, key: string): number {
  * 解析 `failure_kind` 列（可空）。
  *
  * **v0.8.8 O1：非法值 ⇒ 兜底 + warn，不再 fail-fast**。口径来自改造文档 §2.1「读侧安全」：
- * 二分时代（v0.8.7）写入的 `infra` / `task` 自 2.3 起非法，而存量行由 §2.1 的**迁移脚本**
+ * 二分时代（v0.8.7）写入的 `infra` / `task` 自 2.3 起非法（当前闭集 = 2.4 七类），而存量行由 §2.1 的**迁移脚本**
  * 置 NULL —— 迁移前若桥先启动，读侧撞旧枚举会**每次启动即抛**（`rowToTask` 在列表读路径上，
  * 一处脏值 ⇒ `recover` / trace / feature_status 全停）。故读侧放宽为落安全类 `business`
  * （「不可重试」侧）并 warn 留原值，供事后区分「真 business」与「兜底 business」。
@@ -1114,7 +1299,7 @@ function readFailureKind(row: Record<string, unknown>): FailureKind | null {
   return coerceStoredFailureKind(raw);
 }
 
-/** 库中原样存着但已不合 2.3 六类闭集的取值 ⇒ 兜底 `business` + warn 留原值（可重入，无副作用） */
+/** 库中原样存着但已不合 2.4 七类闭集的取值 ⇒ 兜底 `business` + warn 留原值（可重入，无副作用） */
 function coerceStoredFailureKind(raw: string): FailureKind {
   if (isFailureKind(raw)) return raw;
   console.error(
@@ -1283,6 +1468,13 @@ function rowToSession(row: Record<string, unknown>): SessionRecord {
  * 不进 `TASKS_DDL`、存量不回填**；但读侧与 `mode` **相反** —— NULL 照实读出 `null`、**不归一、
  * 不兜底**（本列没有默认档；改造文档 §2.2 O-9「NULL 一律显 `—`、不得兜底成「需求分析」」）。
  * ⚠️ `stage` **刻意不进队列视角**：队列行无 `stage` 键 ⇒ 读侧恒 `null`，`/api/tasks` 出参不动。
+ *
+ * R1 · v0.11.0（orch-N1）：加**阶段轮载体七列** `task_key`/`round`/`relevance`/`decision`/
+ * `reason`/`based_on_rev`/`answer_state`（改造文档 §2.1「零新表」= 只扩 `tasks`）。
+ * **同一条纪律**：列只加在迁移段（段 1g）、不进 `TASKS_DDL`、**存量不回填**（尤其 `task_key`
+ * ⇒ **回填永禁**，见 `TaskRecord.taskKey` 注记）；读侧照 `readTaskStage` 的**无缺省档**口径 ——
+ * NULL 读出 `null`、闭集外非 NULL fail-fast。⚠️ 七列**一律刻意不进 `QUEUE_TASK_COLUMNS`**
+ * （改造文档 §4.1「队列读面零变」）⇒ `/api/tasks` 出参逐字节不变、队列行七字段恒 `null`。
  */
 const TASK_COLUMNS_CORE =
   "task_id, project_id, context_id, state, lane, task_type, artifacts_json, text, prompt, " +
@@ -1290,7 +1482,15 @@ const TASK_COLUMNS_CORE =
   "retry_count, failure_kind, diagnostics_json, " +
   "created_at, started_at, finished_at";
 
-const TASK_COLUMNS = `${TASK_COLUMNS_CORE}, mode, stage`;
+const TASK_COLUMNS = `${TASK_COLUMNS_CORE}, mode, stage, task_key, round, relevance, decision, reason, based_on_rev, answer_state`;
+
+/**
+ * 合成行读口的列清单（R1 · orch-N5）：定位两枚 + 身份/态两枚 + **承载四列**。
+ * ⚠️ 承载四列**只**进本清单，**不进** `TASK_COLUMNS` / `QUEUE_TASK_COLUMNS`（N1 判据 5
+ * ⇒ `/api/tasks` 与既有阶段读面逐字节不变）。
+ */
+const STAGE_SYNTHESIS_COLUMNS =
+  "task_id, state, stage, round, synthesis_json, doc_hash, confirmed_doc_hash, confirmed_at";
 
 /** features 表全列清单（SELECT 单一事实源；新增列时同步此处 + rowToFeature） */
 const FEATURE_COLUMNS =
@@ -1357,6 +1557,14 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     taskType: readTaskType(row),
     mode: readMode(row),
     stage: readTaskStage(row),
+    // R1 · v0.11.0 orch-N1：阶段轮载体七列（NULL = 非阶段轮行 / 建行早于本列；**一律不归一**）
+    taskKey: readNullableString(row, "task_key"),
+    round: readTaskRound(row),
+    relevance: readRelevance(row),
+    decision: readDecision(row),
+    reason: readNullableString(row, "reason"),
+    basedOnRev: readNullableString(row, "based_on_rev"),
+    answerState: readAnswerState(row),
     artifactsJson: readNullableString(row, "artifacts_json"),
     text: readNullableString(row, "text"),
     prompt: readNullableString(row, "prompt"),
@@ -1383,6 +1591,31 @@ function rowToTask(row: Record<string, unknown>): TaskRecord {
     exhausted: false,
     notBefore: null,
     lastPollAt: null,
+  };
+}
+
+/**
+ * 合成行投影（R1 · v0.11.0 orch-N5）：`state` 照 `rowToTask` 的 fail-fast 口径，四枚承载列
+ * 一律 `readNullableString`（NULL = 该事实未落，不归一成空串）。
+ * 缺 `stage`/`round` 的合成行**不属于任何轮格** ⇒ 读成 `null` 由调用侧剔除（不臆造轮坐标）。
+ */
+function rowToStageSynthesis(row: Record<string, unknown>): StageSynthesisRecord | null {
+  const state = readString(row, "state");
+  if (!isTaskState(state)) {
+    throw new Error(`[session-store] 列 state 数据损坏：非法任务态 ${state}`);
+  }
+  const stage = readTaskStage(row);
+  const round = readTaskRound(row);
+  if (stage === null || round === null) return null;
+  return {
+    taskId: readString(row, "task_id"),
+    stage,
+    round,
+    state,
+    synthesisJson: readNullableString(row, "synthesis_json"),
+    docHash: readNullableString(row, "doc_hash"),
+    confirmedDocHash: readNullableString(row, "confirmed_doc_hash"),
+    confirmedAt: readNullableString(row, "confirmed_at"),
   };
 }
 
@@ -1550,6 +1783,8 @@ function rowToEvent(row: Record<string, unknown>): EventRecord {
     state: readNullableString(row, "state"),
     payload: readNullableString(row, "payload"),
     createdAt: readString(row, "created_at"),
+    // R1 · orch-N7：NULL = 普通事件（既有行 / 既有调用点），不归一、不兜底
+    idempotencyKey: readNullableString(row, "idempotency_key"),
   };
 }
 
@@ -1632,6 +1867,77 @@ function readTaskStage(row: Record<string, unknown>): FeatureStage | null {
   if (raw === null) return null;
   if (!isFeatureStage(raw)) {
     throw new Error(`[session-store] 列 stage 数据损坏：非法值 ${raw}`);
+  }
+  return raw;
+}
+
+/**
+ * 解析 `tasks.round` 列（R1 · v0.11.0 orch-N1）：轮次 = **正整数**，NULL 照实读出 `null`
+ * （= 非阶段轮行 / 建行早于本列，与 `stage` 同一条「无缺省档」纪律）。
+ *
+ * ⚠️ 值域校验放在读侧而不是靠 DB 约束：本列与其余六列一样**只加列、不带 CHECK、不带默认值**
+ * （照既有 try-ALTER 纪律）。`0` / 负数 / 非整数 = 写侧越界 ⇒ 数据损坏 fail-fast，
+ * 不得静默归一成 `1`（轮次是「上一轮原样留痕」的唯一依据，猜一轮就等于改写轮史）。
+ */
+function readTaskRound(row: Record<string, unknown>): number | null {
+  const v = row["round"];
+  if (v === null || v === undefined) return null;
+  if (typeof v !== "number" || !Number.isInteger(v) || v <= 0) {
+    throw new Error(`[session-store] 列 round 数据损坏：期望正整数，实为 ${String(v)}`);
+  }
+  return v;
+}
+
+/**
+ * 解析 `tasks.relevance` 列（R1 · v0.11.0 orch-N1）：**NULL ⇒ `null`、闭集外 ⇒ throw**
+ * （形制照 {@link readTaskStage}，**不照** {@link readMode} 的 NULL→缺省档兜底）。
+ *
+ * ⚠️ 兜底方向是本列的红线：NULL 若归一成 `not_involved` = **替答复人宣布「本 project 不涉及」**
+ * ⇒ 直接造出假收口（R1 核心原则「未收口就是未收口，永远不静默降级」）。
+ * 三值本身**没有缺省档**，「回执与否」是 `answer_state` 的语义，两列不得互相代偿。
+ */
+function readRelevance(row: Record<string, unknown>): StageRelevance | null {
+  const raw = readNullableString(row, "relevance");
+  if (raw === null) return null;
+  if (!isStageRelevance(raw)) {
+    throw new Error(`[session-store] 列 relevance 数据损坏：非法值 ${raw}`);
+  }
+  return raw;
+}
+
+/**
+ * 解析 `tasks.decision` 列（R1 · v0.11.0 orch-N1）：口径同 {@link readRelevance}
+ * （NULL ⇒ `null`、闭集外 ⇒ throw）。
+ *
+ * ⚠️ 本列的 NULL 是**合法形状的一部分**而非「未答」：改造文档 §2.1 定死「**仅 `involved` 行有值**」
+ * ⇒ `not_involved` 行的 NULL 是「无需决定」，`pending` 行的 NULL 是「尚未回执」—— 两种事实
+ * 由 `relevance`/`answer_state` 区分，读侧**不得**在此合并语义、更不得兜底成 `pending`
+ * （兜底会让 `involved` 行看起来「已答但还没决定」，把收口判据第三条件 `decision ≠ 'pending'` 顶掉）。
+ */
+function readDecision(row: Record<string, unknown>): StageDecision | null {
+  const raw = readNullableString(row, "decision");
+  if (raw === null) return null;
+  if (!isStageDecision(raw)) {
+    throw new Error(`[session-store] 列 decision 数据损坏：非法值 ${raw}`);
+  }
+  return raw;
+}
+
+/**
+ * 解析 `tasks.answer_state` 列（R1 · v0.11.0 orch-N1）：口径同 {@link readRelevance}
+ * （NULL ⇒ `null`、闭集外 ⇒ throw）。改造文档 §2.1 逐列点名：本列读侧 = **fail-fast**，
+ * 「照 `stage` 纪律，不照 `mode` 的缺省档」。
+ *
+ * ⚠️ 闭集里**没有 `stale`**（stale = 行 `based_on_rev` ≠ 本轮 `basisRev` 的**读时派生**，不落列）
+ * ⇒ 库里出现 `stale` 只能是脏写 ⇒ 抛出，不得就地当成一个档位读回（那会让「stale 不进 SQL」
+ * 这条口径悄悄退化成「stale 是落库态」）。
+ * NULL 也不兜底成 `pending`：物化写入前本列不存在，兜底等于给全部存量行赋「本轮应收」语义。
+ */
+function readAnswerState(row: Record<string, unknown>): StageAnswerState | null {
+  const raw = readNullableString(row, "answer_state");
+  if (raw === null) return null;
+  if (!isStageAnswerState(raw)) {
+    throw new Error(`[session-store] 列 answer_state 数据损坏：非法值 ${raw}`);
   }
   return raw;
 }
@@ -1875,7 +2181,7 @@ CREATE TABLE IF NOT EXISTS artifacts (
   created_at       TEXT NOT NULL
 )`;
 
-/** 事件收件箱表（v0.4.0 §2.6） */
+/** 事件收件箱表（v0.4.0 §2.6；R1 · v0.11.0 orch-N7 加 `idempotency_key` 列） */
 const EVENTS_DDL = `
 CREATE TABLE IF NOT EXISTS events (
   event_id   INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -1884,7 +2190,8 @@ CREATE TABLE IF NOT EXISTS events (
   kind       TEXT NOT NULL,
   state      TEXT,
   payload    TEXT,
-  created_at TEXT NOT NULL
+  created_at TEXT NOT NULL,
+  idempotency_key TEXT
 )`;
 
 /**
@@ -2256,6 +2563,7 @@ export class SessionStore {
     //   段 1c：`tasks.task_type`（v0.10.2 O-1，存量**不回填**）；
     //   段 1d：`tasks.mode`（v0.10.8 O-4 · orch-N1，存量**不回填**）；
     //   段 1e：`tasks.stage`（v0.10.8 O-9 · orch-N2，存量**不回填**）；
+    //   段 1g：`tasks` 阶段轮载体七列（R1 · v0.11.0 orch-N1，存量**零回填** + partial 唯一索引同批）；
     //   段 2：`runners` 表；段 3：`runner_projects` 表；段 4：队列 / 注册表索引。
     // 段 1：`tasks` 队列列。老行一律留 NULL（`queue_state` NULL ⇒ 读侧视为 `settled`，**不回填**）。
     for (const column of [
@@ -2349,6 +2657,96 @@ export class SessionStore {
     } catch {
       // 列已存在（幂等）
     }
+    // 段 1g（R1 · v0.11.0 · orch-N1 · 改造文档 §2.1 / §4.1）：`tasks` **阶段轮载体七列** ——
+    // `task_key` / `round` / `relevance` / `decision` / `reason` / `based_on_rev` / `answer_state`。
+    // 口径 = **零新表 + 零数据迁移**：阶段实例由 `(feature_id, stage, round)` **派生**，
+    // 「一轮 N 行」直接挂在既有 `tasks` 行上（`pending` 不落行 = 开轮时一事务物化，写侧归后续节点）。
+    //
+    // 逐列点名（**不写死数字**，改造文档 A8）：
+    //   `task_key`     TEXT     引擎/宿主命名键；**非空才有索引意义**（partial 唯一索引的 WHERE 键）
+    //   `round`        INTEGER  正整数轮次
+    //   `relevance`    TEXT     `pending | involved | not_involved`
+    //   `decision`     TEXT     `pending | accepted | rejected`（仅 `involved` 行有值）
+    //   `reason`       TEXT     自由文本（写侧截断 200 字）
+    //   `based_on_rev` TEXT     口径指纹（sha256 串；`stale` 的唯一原料）
+    //   `answer_state` TEXT     `pending | valid | invalid`（`stale` **不落列**）
+    //
+    // ⚠️ **七列一律必可空、无 CHECK、无列缺省值**（照段 1c~1f 纪律）：值域执法放在读侧
+    // （`readRelevance`/`readDecision`/`readAnswerState`/`readTaskRound` fail-fast），
+    // 不在 DDL 里加约束 = 老库升级路径不变、也不会因一条脏值让 `ALTER` 直接失败。
+    //
+    // ⚠️ **零回填**，且 `task_key` **回填永禁**（改造文档 §4.1）：回填把存量行整体拉进唯一集 ⇒
+    // 同一 Feature/阶段/项目/轮下本就有多枚行 ⇒ 下方 partial 唯一索引**创建即失败**；
+    // 而那条建索引刻意不套 try/catch ⇒ 回填 = 把可幂等重启的迁移换成起不来的桥。
+    // 另：`NULL → 缺省档` 的归一在本段**一律不适用**（无缺省档可归；语义见各 read 函数注记）。
+    //
+    // ⚠️ `stage` 列**已存在**（段 1e，v0.10.8 O-9 · orch-N2）⇒ **不重复 ALTER**；阶段行的 `stage`
+    // 由开轮入参显式传入并落 `FEATURE_STAGES` 闭集原值（写侧不得自造阶段名，一个脏值会炸整条读口）。
+    for (const column of [
+      "task_key TEXT",
+      "round INTEGER",
+      "relevance TEXT",
+      "decision TEXT",
+      "reason TEXT",
+      "based_on_rev TEXT",
+      "answer_state TEXT",
+    ]) {
+      try {
+        this.db.exec(`ALTER TABLE tasks ADD COLUMN ${column}`);
+      } catch {
+        // 列已存在（幂等）
+      }
+    }
+    // 段 1g′（R1 · v0.11.0 · orch-N1 补批 · 改造文档 §2.1 / §2.3）：`tasks` **综合分析合成行四列**
+    // —— `synthesis_json` / `doc_hash` / `confirmed_doc_hash` / `confirmed_at`。
+    //
+    // 背景（冻结口径）：综合分析改成**引擎内部执行**，结果不建新表、**也不写 `text` /
+    // `artifacts_json`**（那两列既有写入者 = 派发正文与产物，再挂一套合成结果 = 两个写入者、
+    // 两套事实源），而是落一枚**合成行** = `mode='stage'` + `task_key='synthesis'`
+    // （`types.ts` 的 {@link SYNTHESIS_TASK_KEY}）+ `project_id='__engine__'` + 同本轮
+    // `(feature, stage, round)`。本段只加承载列，写侧与读侧归后续节点（N3 落库 / N5 读面）。
+    //
+    // 逐列点名（**不写死数字**）：
+    //   `synthesis_json`     TEXT  合成文档正文（`{docVersion, sections[{id,title,content,sources[]}]}` 的 JSON 串）
+    //   `doc_hash`           TEXT  该文档内容指纹（合成行的自证位：内容 ⇄ 哈希同源）
+    //   `confirmed_doc_hash` TEXT  门① 确认时**所指那份**文档的哈希（与 `doc_hash` 不等 ⇒ 确认后文档又变过）
+    //   `confirmed_at`       TEXT  门① 确认时刻（ISO 串）
+    //
+    // ⚠️ **四列一律必可空、无 CHECK、无列缺省值 + 零回填**（照段 1c~1g 同一条纪律）：段 1g 之前
+    // 的全部存量行（含既有阶段行）本就没有合成结果，NULL = 「本行不是合成行 / 尚未合成」这一事实，
+    // 不得兜底成空串或 `'{}'`（那会把「未合成」显示成「合成出一份空文档」= 伪造门① 前提）。
+    // ⚠️ 四列**刻意不进 `TASK_COLUMNS` / `QUEUE_TASK_COLUMNS` / `TaskRecord`**：本段是纯承载面
+    // ⇒ 既有全部读面（`/api/tasks`、Feature 任务面、阶段面 `stageRuns[]`）出参逐字节不变（判据 5）。
+    // ⚠️ 合成行与成员行**同住一张轮格** ⇒ 收口/读面谓词必须把它剔出应收集，落点见段 4 前后的
+    // `EXCLUDE_SYNTHESIS_ROW_SQL`（漏补批 = 该轮永不收口的自锁，机制见该常量注记）。
+    for (const column of [
+      "synthesis_json TEXT",
+      "doc_hash TEXT",
+      "confirmed_doc_hash TEXT",
+      "confirmed_at TEXT",
+    ]) {
+      try {
+        this.db.exec(`ALTER TABLE tasks ADD COLUMN ${column}`);
+      } catch {
+        // 列已存在（幂等）
+      }
+    }
+    // 段 1h（R1 · v0.11.0 · orch-N7）：`events.idempotency_key` —— 阶段面两枚「非物化」写口
+    // （`doc_objection` / `gate1_confirm`）的**索引级幂等键**（改造文档 §2.5：异议幂等按
+    // `(docVersion, sectionId, objectionId)`、门① 确认幂等按 `(featureId, stage, round, docHash)`）。
+    // **零新表**纪律的直接后果：R1 不许建 `stage_*` 表，而这两枚写口既无 `tasks` 列可挂
+    // （它们不是「一成员一行」的轮载体）、又必须能被**重复调用**（板 HTTP 重试 / 宿主重发），
+    // 故落 events（既有表）+ 本列（既有表加列，与段 1c~1g 同一条「只加列、必可空、零回填」纪律）。
+    //
+    // ⚠️ 值 = **内容定义串**（`kind:sha256(冻结输入序列)`，由 `bridge/stage-round.ts` 单点生成）：
+    // 同一逻辑事实必得同一串 ⇒ 这才是「幂等」的机制本体；随机值等于本列白加。
+    // ⚠️ 必可空 + **零回填**（照段 1c~1g）：既有全部事件行（`task.settled` / `feature.state` /
+    // 版本台账族…）本就无幂等语义，NULL = 「不参与唯一集」这一事实，不得兜底成任何串。
+    try {
+      this.db.exec("ALTER TABLE events ADD COLUMN idempotency_key TEXT");
+    } catch {
+      // 列已存在（幂等）
+    }
     // 段 2 / 段 3：注册表两张（运行态投影；IF NOT EXISTS = 幂等）
     this.db.exec(RUNNERS_DDL);
     this.db.exec(RUNNER_PROJECTS_DDL);
@@ -2375,6 +2773,30 @@ export class SessionStore {
     this.db.exec("CREATE INDEX IF NOT EXISTS idx_tasks_queue ON tasks(queue_state, queued_at)");
     // claim_token 唯一：SQLite 唯一索引允许多个 NULL ⇒ 未领取行不受限，领取行令牌唯一。
     this.db.exec("CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_claim_token ON tasks(claim_token)");
+    // R1 · v0.11.0（orch-N1）：阶段轮物化的**幂等键** —— 全仓**首枚 partial 唯一索引**
+    // （既有唯一索引只有上面那条非 partial 的 `idx_tasks_claim_token`）。
+    // 语义 = 「同一 Feature 同一阶段的同一轮里，某个 project 的某个 `task_key` 至多一行」⇒
+    // `stage_round_open` 重复调用必撞唯一冲突 ⇒ 据此返回既有轮（改造文档 §2.5 写口幂等判据）。
+    //
+    // ⚠️ **`WHERE task_key IS NOT NULL` 是本索引能「与加列同批、零回填」建立的前提**：
+    // 全部存量行 `task_key` 为 NULL ⇒ 被谓词整体排除在索引之外 ⇒ 老库升级零冲突，
+    // 且索引只承载阶段轮行（DAG / inquiry 行不进 = 零写放大）。
+    // 反过来若给存量行**回填** `task_key`：同一 Feature 同一阶段同一轮里本就存在多枚同
+    // `(feature_id, stage, task_key, project_id, round)` 的行 ⇒ **创建即失败**；而这条语句不在
+    // try-ALTER 的容错语义内 ⇒ 正是段 1g 写明「`task_key` 回填永禁」的落点。
+    // ⚠️ 本语句**刻意不套 try/catch**（与 try-ALTER 相反）：索引没建成 = 物化幂等键失守，
+    // 必须启动即抛、由人排查，不得静默降级成「无唯一约束的库」。
+    this.db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_tasks_stage_round ON tasks(feature_id, stage, task_key, project_id, round) WHERE task_key IS NOT NULL",
+    );
+    // R1 · v0.11.0（orch-N7）：events 侧**第二枚 partial 唯一索引**（与上面 `idx_tasks_stage_round`
+    // 同一条机制：非 NULL 才进唯一集）。语义 = 「同一幂等键的事件至多一条」⇒
+    // `doc_objection` / `gate1_confirm` 的重复调用**由索引真实拒绝**，不是应用层 `if` 的先查后写
+    // （判据 3 同形要求；应用层预查只用来把「撞索引」换成结构化幂等出口，不承担唯一性）。
+    // 存量行 `idempotency_key` 全 NULL ⇒ 零冲突；同样**刻意不套 try/catch**（索引失守必须启动即抛）。
+    this.db.exec(
+      "CREATE UNIQUE INDEX IF NOT EXISTS idx_events_idempotency_key ON events(idempotency_key) WHERE idempotency_key IS NOT NULL",
+    );
     this.db.exec(
       "CREATE INDEX IF NOT EXISTS idx_runner_projects_runner ON runner_projects(runner_id)",
     );
@@ -2484,10 +2906,10 @@ export class SessionStore {
     this.db
       .prepare(
         `INSERT INTO tasks
-           (task_id, project_id, context_id, state, lane, task_type, mode, stage, artifacts_json, text, prompt,
+           (task_id, project_id, context_id, state, lane, task_type, mode, stage, task_key, round, relevance, decision, reason, based_on_rev, answer_state, artifacts_json, text, prompt,
             feature_id, dependencies, input_artifacts, remote_task_id, dispatch_message, dispatch_rendered, updated_at,
             created_at, started_at, finished_at)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
          ON CONFLICT(task_id) DO UPDATE SET
            project_id = excluded.project_id,
            context_id = excluded.context_id,
@@ -2496,6 +2918,13 @@ export class SessionStore {
            task_type = COALESCE(excluded.task_type, task_type),
            mode = COALESCE(excluded.mode, mode),
            stage = COALESCE(excluded.stage, stage),
+           task_key = COALESCE(excluded.task_key, task_key),
+           round = COALESCE(excluded.round, round),
+           relevance = COALESCE(excluded.relevance, relevance),
+           decision = COALESCE(excluded.decision, decision),
+           reason = COALESCE(excluded.reason, reason),
+           based_on_rev = COALESCE(excluded.based_on_rev, based_on_rev),
+           answer_state = COALESCE(excluded.answer_state, answer_state),
            artifacts_json = excluded.artifacts_json,
            text = excluded.text,
            prompt = excluded.prompt,
@@ -2518,6 +2947,13 @@ export class SessionStore {
         rec.taskType ?? null,
         rec.mode ?? null,
         rec.stage ?? null,
+        rec.taskKey ?? null,
+        rec.round ?? null,
+        rec.relevance ?? null,
+        rec.decision ?? null,
+        rec.reason ?? null,
+        rec.basedOnRev ?? null,
+        rec.answerState ?? null,
         rec.artifactsJson ?? null,
         rec.text ?? null,
         prompt,
@@ -2832,6 +3268,270 @@ export class SessionStore {
     return Number(info.changes) > 0;
   }
 
+  /**
+   * **阶段行结算写口**（R1 · v0.11.0 orch-N4，改造文档 §2.1「写入者=结算解析」）：
+   * 把解析出的五列（`relevance`/`decision`/`reason`/`based_on_rev`/`answer_state`）落进行。
+   *
+   * 口径（逐条对冻结裁定）：
+   * - **`undefined` 的键 = 不触碰该列，`null` = 显式写 NULL**——两态必须可区分：`invalid` 收口只写
+   *   `answer_state` 一列，其余四列**保持物化/前次值**（「不落默认值」纪律：把 NULL 盖上去 = 抹掉
+   *   物化写进 `based_on_rev` 的本轮口径指纹，stale 派生态失去唯一原料）；
+   * - **写侧闭集 fail-fast**（照读侧 `readRelevance`/`readDecision`/`readAnswerState` 同一纪律）：
+   *   脏值响亮拒绝，不落库；`reason` 无闭集、原样落（200 码点截断在解析侧做，本口不重复裁）；
+   * - **`WHERE … mode = ?`（绑 {@link STAGE_MODE_SQL_PARAM}）**：本口只服务阶段轮行——DAG/inquiry
+   *   行即便撞同一写口也零写入（写面收窄，误用不伤人）；行不存在 / 非阶段行 ⇒ 返回 `null`。
+   *
+   * 幂等：绝对值写（非 CAS），同值重复写逐字段不变——两条触发路径（runner / watcher）先后到达
+   * 时落库结果**逐字段相同**（N4 判据 1 的机制本体）。
+   */
+  updateStageRow(
+    taskId: string,
+    patch: StageRowPatch,
+  ): TaskRecord | null {
+    const assignments: string[] = [];
+    const params: Array<string | number | null> = [];
+    if (patch.relevance !== undefined) {
+      if (patch.relevance !== null && !isStageRelevance(patch.relevance)) {
+        throw new Error(`[session-store] updateStageRow 非法 relevance：${String(patch.relevance)}`);
+      }
+      assignments.push("relevance = ?");
+      params.push(patch.relevance);
+    }
+    if (patch.decision !== undefined) {
+      if (patch.decision !== null && !isStageDecision(patch.decision)) {
+        throw new Error(`[session-store] updateStageRow 非法 decision：${String(patch.decision)}`);
+      }
+      assignments.push("decision = ?");
+      params.push(patch.decision);
+    }
+    if (patch.reason !== undefined) {
+      assignments.push("reason = ?");
+      params.push(patch.reason);
+    }
+    if (patch.basedOnRev !== undefined) {
+      assignments.push("based_on_rev = ?");
+      params.push(patch.basedOnRev);
+    }
+    if (patch.answerState !== undefined) {
+      if (patch.answerState !== null && !isStageAnswerState(patch.answerState)) {
+        throw new Error(
+          `[session-store] updateStageRow 非法 answer_state：${String(patch.answerState)}`,
+        );
+      }
+      assignments.push("answer_state = ?");
+      params.push(patch.answerState);
+    }
+    if (assignments.length === 0) {
+      throw new Error("[session-store] updateStageRow 要求至少一列");
+    }
+    assignments.push("updated_at = ?");
+    params.push(nowIso(), taskId, STAGE_MODE_SQL_PARAM);
+    const info = this.db
+      .prepare(
+        `UPDATE tasks SET ${assignments.join(", ")} WHERE task_id = ? AND mode = ?`,
+      )
+      .run(...params);
+    return Number(info.changes) > 0 ? this.getTask(taskId) : null;
+  }
+
+  /**
+   * **阶段行契约重派 CAS**（R1 · v0.11.0 orch-N4，改造文档 §2.3「解析失败 ⇒ 先自动重派一次」）：
+   * 单语句条件 UPDATE 把已结算的阶段行**重武装并直接回队**（`state` 终态 ∧ `retry_count = 0` 才命中），
+   * 一次命中即完成四事：① `retry_count+1`（「恰好一次」的可观测计数 + 天然上限闩）；
+   * ② `dispatch_message` 换成注入格式契约原文的新消息（**不得原样重发**，裁定 A3）；
+   * ③ `queue_state='queued'` + 清 `claim_token`/`claimed_at`（回队重领的令牌前提）；
+   * ④ 清 `finished_at`/`dispatch_guard`/`remote_task_id`（「有 `finished_at` ⇔ 已完成」不变量，
+   * 照 `rearmTask`/`rearmForRetry` 的清空点纪律）。
+   *
+   * ⚠️ **保留 `claimed_by`**（v0.8.7 O4 同一条）：行级领取者痕迹供补结算窄口绑定；
+   * 下次 `claimTask` 覆写，零涟漪。
+   *
+   * ⚠️ **不走 `rearmForRetry`**：那条 CAS 只认 `state='failed'`，而阶段行契约失败的态是
+   * `completed`/`input-required`——「解析问题绝不误判为失败」（§2.3 不变量），重派不得借道
+   * 失败重试的账单/收敛面。`retry_count = 0` 前置 ⇒ 两条触发路径竞速时**至多一条 UPDATE 命中**
+   * （落空者零写入），「首次解析失败 ⇒ 恰好 1 次重派（不是 0、不是 2）」由此单点保证。
+   *
+   * 返回是否命中（false = 非阶段行 / 非三结算态 / 已重派过 ⇒ 零写入）。
+   */
+  rearmStageForRetry(taskId: string, dispatchMessage: string): boolean {
+    const now = nowIso();
+    const info = this.db
+      .prepare(
+        `UPDATE tasks
+         SET state = 'working', queue_state = 'queued', queued_at = ?, claim_token = NULL,
+             claimed_at = NULL, retry_count = retry_count + 1, exhausted = 0,
+             dispatch_guard = NULL, remote_task_id = NULL, dispatch_message = ?, finished_at = NULL,
+             updated_at = ?
+         WHERE task_id = ? AND mode = ?
+           AND state IN ('completed', 'failed', 'input-required')
+           AND retry_count = 0`,
+      )
+      .run(now, dispatchMessage, now, taskId, STAGE_MODE_SQL_PARAM);
+    return Number(info.changes) > 0;
+  }
+
+  /**
+   * **本轮应收行集读口**（R1 · v0.11.0 orch-N8，改造文档 §2.2「本轮应收 = 本轮物化的行集」）：
+   * 取一格阶段轮 `(feature_id, stage, round)` 的**全部物化行**，按 `project_id` 字典序返回。
+   *
+   * 存在的理由 = 收口判据**只能在应用层跑**（宿主裁定 ⑤：`stale` 是读时派生态，SQL 算不了），
+   * 而本口是它的**原料单点**——既有 Feature 任务读面 {@link listFeatureTasks} 已被 orch-N6
+   * 用 {@link NON_STAGE_MODE_SQL} 把阶段行**整体剔出**（板列表计数不得被阶段行抬高），
+   * 故收口判定**没有别的取集路径**。本口与那条补批不冲突：一个「只取非阶段行」，一个「只取阶段行」。
+   *
+   * 四条 WHERE 门各自的必要性（缺一即错判一轮应收）：
+   * - `mode = ?`（绑 {@link STAGE_MODE_SQL_PARAM}）：与两个阶段行写口同一条 mode 归属守卫，
+   *   误撞同一 `(feature, stage, round)` 的 dag/inquiry 行**不进应收集**；
+   * - `task_key IS NOT NULL`：`task_key` 是「本行由开轮物化产生」的唯一凭据（§2.1 写入者=物化），
+   *   照 `bridge/stage-round.ts` 的 `groupStageRoundRows` 同一纪律——缺键的脏行/手写行不组入轮格，
+   *   否则凭空多出一行「永远收不齐」的假挡位；
+   * - `feature_id / stage / round` 三值等式：阶段实例**无独立表**（§2.1 零新表），
+   *   这三列的等式就是「哪一行属于本轮」的全部事实；
+   * - `task_key <> 'synthesis'`（走 {@link EXCLUDE_SYNTHESIS_ROW_SQL} 单点，N1 补批）：引擎内
+   *   综合分析的**合成行**也带 `mode='stage'` + `task_key` 非空 + 同轮坐标 ⇒ 不剔就会被组进
+   *   应收集，而它永不带成员回执 ⇒ `expected+1` 挡死收口（★ 自锁，机制见该常量注记）。
+   *
+   * ⚠️ 本口**不做任何判据**：不筛 `answer_state`、不比 `based_on_rev`、不数分子分母
+   * ⇒ 返回**原始行集**（含 `queued` 未派发行，它照样计入分母）。收口/挡位归类一律在应用层
+   * （`bridge/stage-seal.ts`）。SQL 里出现 `stale` 一词的任何谓词都是越权（验收锚见 N8 判据 3）。
+   */
+  listStageRoundRows(featureId: string, stage: FeatureStage, round: number): TaskRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${TASK_COLUMNS} FROM tasks
+         WHERE feature_id = ? AND stage = ? AND round = ? AND mode = ?
+           AND task_key IS NOT NULL AND ${EXCLUDE_SYNTHESIS_ROW_SQL}
+         ORDER BY project_id ASC`,
+      )
+      .all(featureId, stage, round, STAGE_MODE_SQL_PARAM) as Array<Record<string, unknown>>;
+    return rows.map(rowToTask);
+  }
+
+  /**
+   * 本 Feature **全部阶段轮行**（R1 · v0.11.0 orch-N7 读面 `stageRuns[]` 的行集原料；
+   * 谓词与 {@link listStageRoundRows} 逐字同一条，只是不钉 `(stage, round)`）。
+   *
+   * ★ **纯读承诺（判据 4 的落点）**：本口**刻意不接** {@link warnIfListTruncated} —— 那条在触顶时
+   * `appendEvent` 写一条 `list.truncated` 事件。读面带写 = 「读面无写副作用」断言直接破功，
+   * 且 `stageRuns` 是板每次心跳都拉的读面（写放大 + 事件噪声）。触顶风险的实话写在参数上：
+   * `limit` clamp 到 `[1, 2000]`（缺省 2000），超出者由读面的 `round` 分组照实少渲几格，
+   * **不静默改写任何账面**。
+   *
+   * ⚠️ `task_key IS NOT NULL` 是**分组前提**（不是装饰）：缺键的行不构成轮格里的一格
+   * （§2.1 写入者 = 物化），组进读面会凭空多出一行「应收」。
+   * ⚠️ 同一条理由还要求剔掉合成行（{@link EXCLUDE_SYNTHESIS_ROW_SQL}，N1 补批）：它带键、带轮坐标，
+   * 但**不是成员应收行**——留着它，板面每格 `stageRuns[]` 都会多出一位 `__engine__` 的「未回执」成员。
+   */
+  listStageRows(featureId: string, limit = 2000): TaskRecord[] {
+    const cap = Math.min(Math.max(Math.trunc(limit), 1), 2000);
+    const rows = this.db
+      .prepare(
+        `SELECT ${TASK_COLUMNS} FROM tasks
+         WHERE feature_id = ? AND mode = ? AND task_key IS NOT NULL AND ${EXCLUDE_SYNTHESIS_ROW_SQL}
+         ORDER BY stage ASC, round ASC, project_id ASC
+         LIMIT ?`,
+      )
+      .all(featureId, STAGE_MODE_SQL_PARAM, cap) as Array<Record<string, unknown>>;
+    return rows.map(rowToTask);
+  }
+
+  /**
+   * 本 Feature 的**全部合成行**（R1 · v0.11.0 orch-N5 读面 `stageRuns[].synthesis` 的原料；
+   * 纯读承诺与 {@link listStageRows} 同一条：不接 `warnIfListTruncated`、零写）。
+   *
+   * 定位口径 = 冻结四元组：`mode='stage'` + {@link ONLY_SYNTHESIS_ROW_SQL} + 同 `(feature, stage, round)`
+   * （改造文档 §2.1 / 宿主裁决 A2）。与成员行读口**恰为互补集**（一条 `<>`、一条 `=`）⇒
+   * 同一行不可能同时落进「本轮应收」与「本轮合成」两侧（判据 2：`expected` 不被合成行抬高）。
+   *
+   * ⚠️ `stage IS NOT NULL AND round IS NOT NULL`：轮坐标缺一即无格可挂 ⇒ 不发（读侧
+   * {@link rowToStageSynthesis} 同样返 `null` 兜底，不臆造归属轮）。
+   */
+  listStageSynthesisRows(featureId: string): StageSynthesisRecord[] {
+    const rows = this.db
+      .prepare(
+        `SELECT ${STAGE_SYNTHESIS_COLUMNS} FROM tasks
+         WHERE feature_id = ? AND mode = ? AND ${ONLY_SYNTHESIS_ROW_SQL}
+           AND stage IS NOT NULL AND round IS NOT NULL
+         ORDER BY stage ASC, round ASC`,
+      )
+      .all(featureId, STAGE_MODE_SQL_PARAM) as Array<Record<string, unknown>>;
+    return rows.map(rowToStageSynthesis).flatMap((r) => (r === null ? [] : [r]));
+  }
+
+  /**
+   * **门① 确认落列**（R1 · v0.11.0 orch-N6 · 裁决 A7/A9）：把「用户确认了哪一版」写进那一枚
+   * 合成行的 `confirmed_doc_hash` + `confirmed_at`，**同一条 UPDATE**（分两次写 = 中间崩溃留下
+   * 有哈希无时刻，板面「已确认」与台账对不上）。
+   *
+   * WHERE 三枚谓词各司其职：`mode` + `task_key` 把本口钉死在合成行上（成员行撞来零写入）；
+   * `doc_hash = ?` 让「读后写之间换了版」落空（不把确认盖到没被看过的版本上）；
+   * `confirmed_doc_hash IS NULL OR <> ?` 的同值守卫 ⇒ 重放不改行，`confirmed_at` 首次时刻不被刷新。
+   *
+   * @returns 本次是否**真改写了行**（`false` = 重放 / 未命中；幂等的两种既有结果，不报错）
+   */
+  confirmStageSynthesis(taskId: string, docHash: string, confirmedAt: string): boolean {
+    const info = this.db
+      .prepare(
+        `UPDATE tasks SET confirmed_doc_hash = ?, confirmed_at = ?, updated_at = ?
+         WHERE task_id = ? AND mode = ? AND ${ONLY_SYNTHESIS_ROW_SQL} AND doc_hash = ?
+           AND (confirmed_doc_hash IS NULL OR confirmed_doc_hash <> ?)`,
+      )
+      .run(docHash, confirmedAt, nowIso(), taskId, STAGE_MODE_SQL_PARAM, docHash, docHash);
+    return Number(info.changes) > 0;
+  }
+
+  /**
+   * **合成行结果落列**（v0.11.0 orch-N4 · 裁决 A3/A4/U4）：单条 UPDATE 保证「正文 ⇄ 哈希 ⇄ 任务态」
+   * 三枚同气。`undefined` 键 = 不触碰该列（失败路径不写 `synthesis_json`/`doc_hash` = 「不存中间态」，
+   * 成功路径不写 `text`）。WHERE 三枚谓词各司其职（口径同 {@link confirmStageSynthesis}）：
+   * `mode` + {@link ONLY_SYNTHESIS_ROW_SQL} 钉死合成行；`state <> ?` 同值守卫 ⇒ 重放不改行
+   * （判据 2 的机制本体）。@returns 是否真改写（`false` = 未命中 / 已是目标态 ⇒ 幂等不报错）。
+   */
+  writeStageSynthesisOutcome(taskId: string, patch: StageSynthesisOutcomePatch): boolean {
+    const assignments: string[] = [];
+    const params: Array<string | number | null> = [];
+    if (patch.synthesisJson !== undefined) {
+      assignments.push("synthesis_json = ?");
+      params.push(patch.synthesisJson);
+    }
+    if (patch.docHash !== undefined) {
+      assignments.push("doc_hash = ?");
+      params.push(patch.docHash);
+    }
+    if (patch.text !== undefined) {
+      assignments.push("text = ?");
+      params.push(patch.text);
+    }
+    const guardState = patch.state ?? null;
+    if (patch.state !== undefined) {
+      if (guardState !== null && !isTaskState(guardState)) {
+        throw new Error(
+          `[session-store] writeStageSynthesisOutcome 非法 state：${String(guardState)}`,
+        );
+      }
+      assignments.push("state = ?");
+      params.push(guardState);
+      // 终态同口气补 `finished_at`（照「有 `finished_at` ⇔ 已完成」不变量）；非终态 ⇒ 清 NULL
+      assignments.push("finished_at = ?");
+      params.push(guardState !== null && isFinishedState(guardState) ? nowIso() : null);
+    }
+    if (assignments.length === 0) {
+      throw new Error("[session-store] writeStageSynthesisOutcome 要求至少一列");
+    }
+    // `state <> ?` 同值守卫（判据 2 重放闩）：目标态与当前一致 ⇒ 零改行；未给 state ⇒ 不加此闩
+    const guard = guardState === null ? "" : ` AND state <> ?`;
+    assignments.push("updated_at = ?");
+    params.push(nowIso(), taskId, STAGE_MODE_SQL_PARAM);
+    if (guardState !== null) params.push(guardState);
+    const info = this.db
+      .prepare(
+        `UPDATE tasks SET ${assignments.join(", ")}
+         WHERE task_id = ? AND mode = ? AND ${ONLY_SYNTHESIS_ROW_SQL}${guard}`,
+      )
+      .run(...params);
+    return Number(info.changes) > 0;
+  }
+
   /** 按项目列出任务（updated_at 倒序；可选状态过滤；limit 默认 20，clamp 到 [1,100]） */
   listTasks(opts: ListTasksOptions): TaskRecord[] {
     const limit = Math.min(Math.max(opts.limit ?? 20, 1), 100);
@@ -2895,12 +3595,25 @@ export class SessionStore {
     }
   }
 
-  /** 按 Feature 列出任务节点（updated_at 升序 = 派发次序；limit 默认 100，clamp 到 [1,1000]） */
+  /**
+   * 按 Feature 列出任务节点（updated_at 升序 = 派发次序；limit 默认 100，clamp 到 [1,1000]）。
+   *
+   * R1 · v0.11.0 orch-N6：**`mode='stage'` 阶段行不进本列表**（归属谓词见 {@link NON_STAGE_MODE_SQL}，
+   * 单点定义、此处只拼接）。两处必须**同一片段**：选取段的 `LIMIT` 与 `COUNT(*)` 的 `total` ——
+   * 只在选取段补批则 `total` 仍含阶段行，触顶判据（{@link warnIfListTruncated} 的
+   * `returned === limit`）照旧被阶段行顶出来 = 误报截断，等于没修。
+   *
+   * ⚠️ 调度面「取本列表再 `filter(isDagNode)`」的口径不变（`inquiry` 行仍由列表返回、由调用侧
+   * `isDagNode` 剔除）；本卡只收窄「阶段行」这一类，`inquiry` 与存量 `dag` 行逐字不变。
+   */
   listFeatureTasks(featureId: string, opts: ListFeatureTasksOptions = {}): TaskRecord[] {
     const limit = Math.min(Math.max(opts.limit ?? 100, 1), 1000);
+    const visibility = opts.includeStageTasks === true
+      ? `(${NON_STAGE_MODE_SQL} OR (task_key IS NOT NULL AND ${EXCLUDE_SYNTHESIS_ROW_SQL}))`
+      : NON_STAGE_MODE_SQL;
     const rows = this.db
       .prepare(
-        `SELECT ${TASK_COLUMNS} FROM tasks WHERE feature_id = ?
+        `SELECT ${TASK_COLUMNS} FROM tasks WHERE feature_id = ? AND ${visibility}
          ORDER BY updated_at ASC LIMIT ?`,
       )
       .all(featureId, limit) as Array<Record<string, unknown>>;
@@ -2913,7 +3626,9 @@ export class SessionStore {
       limit,
       () => {
         const row = this.db
-          .prepare("SELECT COUNT(*) AS n FROM tasks WHERE feature_id = ?")
+          .prepare(
+            `SELECT COUNT(*) AS n FROM tasks WHERE feature_id = ? AND ${visibility}`,
+          )
           .get(featureId) as Record<string, unknown> | undefined;
         return Number(row?.["n"] ?? 0);
       },
@@ -3486,8 +4201,10 @@ export class SessionStore {
   }
 
   /**
-   * **失败分类写口**（v0.8.7 O3，改造文档 §2.3 写口 (i)）：把 `failure_kind` 落为
-   * **六类闭集**之一（清单见 `types.ts` 的 `FAILURE_KINDS`；v0.8.8 O1 硬切，取代旧二分 `{infra, task}`）。
+   * **失败分类后置写口**（v0.8.7 O3 建口；**v0.11.0 O4 起生产路径不再使用** —— `/runner/result`
+   * 的分类改经 {@link upsertTaskResult} 的入参 `failureKind` 与终态同语句落，本口保留给
+   * 测试/工具直连）：把 `failure_kind` 落为**七类闭集**之一（清单见 `types.ts` 的
+   * `FAILURE_KINDS`；v0.8.8 O1 硬切为 6 成员闭集，取代旧二分 `{infra, task}`；v0.11.0 O1 加 `provider` 扩为七类）。
    * 分类值由**调用方**给出 = machine 上报的 `failureKind`（**事实源**），仅在其不合闭集时
    * 才走 `bridge/runner.ts` 的**兜底映射**（**不是** orch 二次分类，改造文档 §3.3）。
    *
@@ -3515,7 +4232,8 @@ export class SessionStore {
    * 造成状态回退），返回既有行。返回值 = 落库后的**队列视角**记录。
    *
    * - 任务不存在 ⇒ 直接 INSERT 一行（`queue_state = 'settled'`，`created_at = 上报时刻`）。
-   * - 只写 `state` / artifacts / text / remote_task_id 与 `finished_at`（首次）/ `updated_at`；
+   * - 只写 `state` / artifacts / text / remote_task_id / `failure_kind`（O4 分类前移，仅本次
+   *   `failed` 胜出时携带）与 `finished_at`（首次）/ `updated_at`；
    *   **不动** `dependencies` / `dispatch_message` / `retry_count` 等既有编排列。
    *
    * v0.8.8 O2（§2.6）：本次写入胜出且新态为终态（`isFinishedState`）⇒ 补发结算事件
@@ -3524,10 +4242,16 @@ export class SessionStore {
    *
    * v0.8.8 O3（§2.2 / §2.5）：同一写口顺带落 `diagnostics_json`（宽 JSON **原文**）并派生
    * **`task.continued`** 事件 —— 落列与发事件都只在「**本次上报胜出首个终态**」时发生
-   * （与 `setTaskFailureKind` 的分类写口同一道门 ⇒ 迟到件既不改分类也不改诊断、不重发事件；
-   * 非终态的 `working` / `input-required` 进度更新照常刷新诊断）。派生判据只看
+   * （迟到件既不改分类也不改诊断、不重发事件；非终态的 `working` / `input-required` 进度
+   * 更新照常刷新诊断）。派生判据只看
    * `continueAttempts > 0`，**与该结果是否终态无关**（续跑后转 `input-required` 同样留痕；
    * 不发 `feature.failure_report` —— 续跑未收敛）。
+   *
+   * v0.11.0 O4（改造文档 §3.2「事件」条）：入参 `failureKind` 与终态**同一条 UPDATE** 落
+   * `failure_kind`（分类写口前移到本语句，取代后置 `setTaskFailureKind` 晚于事件的旧口径），
+   * `task.settled` payload 恒带 `failureKind` + `failureSnippet` 两键（前者 = 结算后行值读口径，
+   * 与列天然相等；后者 = 入参原文，缺 ⇒ `null`）。护栏：本次**胜出** `failed` 而列上无分类
+   * ⇒ warn 留痕（不代填分类、不改混跑兜底行为）。
    */
   upsertTaskResult(rec: TaskResultUpsertInput): QueuedTaskRecord {
     if (rec.machineId.length === 0 || rec.taskId.length === 0) {
@@ -3538,31 +4262,32 @@ export class SessionStore {
     }
     const now = rec.updatedAt ?? nowIso();
     const finishedAt = isFinishedState(rec.state) ? now : null;
-    // 结算前读记账列（本方法不动这三列，先读保证 payload 取「结算时点」值）：
-    // `retry_count` = `attempt` 口径；`failure_kind` 的分类写口（`setTaskFailureKind`）
-    // 晚于本调用点 ⇒ 未分类时键省略；`state` 供「首个终态胜出」门判据。
+    // 结算前读记账列（本方法除 `failure_kind` 前移写口外不动这些列，先读保证 payload 取
+    // 「结算时点」值）：`retry_count` = `attempt` 口径；`state` 供「首个终态胜出」门判据。
     const pre = this.db
-      .prepare(`SELECT state, retry_count, failure_kind FROM tasks WHERE task_id = ?`)
-      .get(rec.taskId) as
-      | { state: string; retry_count: number | null; failure_kind: string | null }
-      | undefined;
-    // 「首个终态胜出」门（与 `bridge/runner.ts` 写分类的同一条门）：行此前非终态 ⇒ 本次写入胜出；
-    // UPDATE 侧 WHERE 已保证迟到件零写入，这里另挡「迟到件携带的 diagnostics」不改写既有账。
+      .prepare(`SELECT state, retry_count FROM tasks WHERE task_id = ?`)
+      .get(rec.taskId) as { state: string; retry_count: number | null } | undefined;
+    // 「首个终态胜出」门（与写分类的前移支同一条门）：行此前非终态 ⇒ 本次写入胜出；
+    // UPDATE 侧 WHERE 已保证迟到件零写入，这里另挡「迟到件携带的 diagnostics / 分类」不改写既有账。
     const firstSettle = pre === undefined || !isFinishedState(pre.state as TaskState);
     const diagnosticsJson = serializeDiagnostics(rec.diagnostics);
+    // **分类前移**（O4）：仅本次上报为 `failed` 且胜出时携带；COALESCE ⇒ 无分类上报不清既有值。
+    const settleFailureKind =
+      firstSettle && rec.state === "failed" ? rec.failureKind ?? null : null;
     const info = this.db
       .prepare(
         `INSERT INTO tasks
            (task_id, project_id, context_id, state, artifacts_json, text, feature_id, remote_task_id,
-            diagnostics_json,
+            diagnostics_json, failure_kind,
             updated_at, created_at, started_at, finished_at, queue_state)
-         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'settled')
+         VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, 'settled')
          ON CONFLICT(task_id) DO UPDATE SET
            state = excluded.state,
            artifacts_json = COALESCE(excluded.artifacts_json, artifacts_json),
            text = COALESCE(excluded.text, text),
            remote_task_id = COALESCE(excluded.remote_task_id, remote_task_id),
            diagnostics_json = COALESCE(excluded.diagnostics_json, diagnostics_json),
+           failure_kind = COALESCE(excluded.failure_kind, failure_kind),
            queue_state = 'settled',
            updated_at = excluded.updated_at,
            finished_at = COALESCE(finished_at, excluded.finished_at)
@@ -3578,6 +4303,7 @@ export class SessionStore {
         rec.featureId ?? null,
         rec.remoteTaskId ?? null,
         firstSettle ? diagnosticsJson : null,
+        settleFailureKind,
         now,
         now,
         rec.state === "working" ? now : null,
@@ -3592,6 +4318,14 @@ export class SessionStore {
     const stored = rowToQueuedTask(row);
     // changes>0 =「本次上报确有胜出写入」（迟到 / 重复 ⇒ 零写入 ⇒ 零事件，与 ack 幂等同语义）。
     const written = Number(info.changes) > 0;
+    // **护栏**（v0.11.0 O4）：胜出结算为 `failed` 却无分类 ⇒ warn 留痕。`bridge/runner.ts`
+    // 的分类前移支（闭集校验 + 混跑兜底）接好后此处应零命中；直连本口的调用方漏分类时可见。
+    // **不代填分类、不改落库**（混跑兜底行为不变）。
+    if (written && stored.state === "failed" && stored.failureKind === null) {
+      console.error(
+        `[session-store] upsertTaskResult 结算 failed 但未携带 failureKind（machineId=${rec.machineId} taskId=${rec.taskId}）⇒ 分类写口前移支未接好，请核查调用方`,
+      );
+    }
     // 双门：`written` =「本次上报胜出终态」；isFinishedState = working 进度更新不发结算事件。
     if (written && isFinishedState(stored.state)) {
       const kind = stored.state === "blocked" ? EVENT_TASK_BLOCKED : EVENT_TASK_SETTLED;
@@ -3599,14 +4333,16 @@ export class SessionStore {
         taskId: stored.taskId,
         state: stored.state,
         attempt: pre?.retry_count ?? 0,
-        // 续跑口径 = 本次落库的 diagnostics 原文（O3 起有数据源；机侧未带 ⇒ 0，与 O2 口径一致）
+        // 续跑口径 = 本次落库的 diagnostics 原文（O3 起有数据源；机侧缺带 ⇒ 0，与 O2 口径一致）
         continueAttempts: readContinueAttempts(stored.diagnosticsJson ?? null),
         machineId: rec.machineId,
+        // **分类随附两键**（v0.11.0 O4，取代只读 `pre.failure_kind` 的旧口径）：
+        // `failureKind` = 本次结算后的**行值读口径**（与 `tasks.failure_kind` 列天然相等）；
+        // `failureSnippet` = 入参原文（≤120 码点、已脱敏；缺 ⇒ null）。两键**恒在**
+        // （completed / blocked ⇒ 双 null），事件消费面（看护 / board）不必再区分「键缺省」。
+        failureKind: stored.failureKind,
+        failureSnippet: rec.failureSnippet ?? null,
       };
-      if (pre?.failure_kind != null) {
-        // 与 `rowToTask` 同一读侧口径：存量旧值 ⇒ 兜底 + warn（账单不得带出闭集外的取值）
-        payload.failureKind = coerceStoredFailureKind(pre.failure_kind);
-      }
       this.appendEvent({
         featureId: stored.featureId,
         taskId: stored.taskId,
@@ -5093,7 +5829,13 @@ export class SessionStore {
    * 拿到每个 Feature 的各态节点数，替掉「每行 Feature 再查一次 `listFeatureTasks`」（1+N → O(1)）。
    *
    * ★ **归属谓词与 {@link listFeatures} 同源**（{@link featureOwnershipPredicate}）—— 视野判据
-   * 若另写一份，聚合会把不可见 Feature 的节点也算进计数（静默放宽可见性）。
+   * 若另写一份，聚合会把不可见 Feature 的节点也算进计数（静默放宽视野）。
+   *
+   * ★ **mode 归属与 {@link listFeatureTasks} 同源**（{@link NON_STAGE_MODE_SQL}，R1 · v0.11.0
+   * orch-N6）—— `mode='stage'` 阶段行带 `feature_id`，本会落进本聚合把 `taskCount` / `stateCounts`
+   * 抬高一截（改造文档 §2.1「未过滤消费点补批」· A5「阶段行不进 DAG 面」）。补批后计数口径 =
+   * 「该 Feature 名下除阶段行以外的全部行」= **改造前语义逐字不变**（`inquiry` 照计、存量 NULL
+   * 照计；判据 1 的对照断言锁这一条）。
    *
    * 返回 `Map<featureId, Partial<Record<TaskState, number>>>`：**无节点的 Feature 不出现在 map 里**
    * （调用方按空对象处理 ⇒ `taskCount = 0`，与旧「查回空数组」同语义）。
@@ -5105,10 +5847,12 @@ export class SessionStore {
     const owner = featureOwnershipPredicate(ownerGroup, false);
     const rows = this.db
       .prepare(
+        // 片段里的 `mode` 不带表限定：本 JOIN 只有 `tasks` 有该列（`features` 无）⇒ 解析唯一；
+        // 若将来 features 也加 `mode`，SQLite 直接报 ambiguous column 响亮失败，不会静默错算。
         `SELECT t.feature_id AS feature_id, t.state AS state, COUNT(*) AS n
          FROM tasks t
          JOIN features f ON f.feature_id = t.feature_id
-         WHERE t.feature_id IS NOT NULL${owner.clause}
+         WHERE t.feature_id IS NOT NULL AND ${NON_STAGE_MODE_SQL}${owner.clause}
          GROUP BY t.feature_id, t.state`,
       )
       .all(...owner.params) as Array<Record<string, unknown>>;
@@ -5280,10 +6024,11 @@ export class SessionStore {
   /** 追加事件，返回落库后的记录（`eventId` 由 AUTOINCREMENT 分配） */
   appendEvent(rec: EventAppendInput): EventRecord {
     const createdAt = rec.createdAt ?? nowIso();
+    const idempotencyKey = rec.idempotencyKey ?? null;
     const info = this.db
       .prepare(
-        `INSERT INTO events (feature_id, task_id, kind, state, payload, created_at)
-         VALUES (?, ?, ?, ?, ?, ?)`,
+        `INSERT INTO events (feature_id, task_id, kind, state, payload, created_at, idempotency_key)
+         VALUES (?, ?, ?, ?, ?, ?, ?)`,
       )
       .run(
         rec.featureId ?? null,
@@ -5292,6 +6037,7 @@ export class SessionStore {
         rec.state ?? null,
         rec.payload ?? null,
         createdAt,
+        idempotencyKey,
       );
     return {
       eventId: Number(info.lastInsertRowid),
@@ -5301,7 +6047,21 @@ export class SessionStore {
       state: rec.state ?? null,
       payload: rec.payload ?? null,
       createdAt,
+      idempotencyKey,
     };
+  }
+
+  /**
+   * 按**幂等键**取既有事件（R1 · v0.11.0 orch-N7；`idx_events_idempotency_key` 的等值读口）。
+   * 用途 = 撞唯一索引后回读那一行（把「已存在」换成结构化幂等出口，`created`/`confirmedAt`
+   * 取**首次落库时刻**而非本次），键空 ⇒ 直接 null（NULL 不在唯一集内，无意义）。
+   */
+  getEventByIdempotencyKey(idempotencyKey: string): EventRecord | null {
+    if (idempotencyKey.length === 0) return null;
+    const row = this.db
+      .prepare("SELECT * FROM events WHERE idempotency_key = ?")
+      .get(idempotencyKey);
+    return row === undefined ? null : rowToEvent(row as Record<string, unknown>);
   }
 
   /**
@@ -5499,6 +6259,52 @@ export function rearmForRetry(taskId: string, dispatchMessage: string): boolean 
   return getDefaultStore().rearmForRetry(taskId, dispatchMessage);
 }
 
+/** 阶段行结算写口（默认存储；R1 · orch-N4，口径见 {@link SessionStore.updateStageRow}） */
+export function updateStageRow(taskId: string, patch: StageRowPatch): TaskRecord | null {
+  return getDefaultStore().updateStageRow(taskId, patch);
+}
+
+/** 阶段行契约重派 CAS（默认存储；R1 · orch-N4，口径见 {@link SessionStore.rearmStageForRetry}） */
+export function rearmStageForRetry(taskId: string, dispatchMessage: string): boolean {
+  return getDefaultStore().rearmStageForRetry(taskId, dispatchMessage);
+}
+
+/** 本轮应收行集读口（默认存储；R1 · orch-N8，口径见 {@link SessionStore.listStageRoundRows}） */
+export function listStageRoundRows(featureId: string, stage: FeatureStage, round: number): TaskRecord[] {
+  return getDefaultStore().listStageRoundRows(featureId, stage, round);
+}
+
+/**
+ * 本 Feature 全部阶段轮行读口（默认存储；R1 · orch-N7 读面 `stageRuns[]` 原料，
+ * 纯读承诺与 limit 口径见 {@link SessionStore.listStageRows}）。
+ */
+export function listStageRows(featureId: string, limit = 2000): TaskRecord[] {
+  return getDefaultStore().listStageRows(featureId, limit);
+}
+
+/**
+ * 本 Feature 合成行读口（默认存储；R1 · orch-N5 读面 `stageRuns[].synthesis` 原料，
+ * 定位四元组与纯读口径见 {@link SessionStore.listStageSynthesisRows}）。
+ */
+export function listStageSynthesisRows(featureId: string): StageSynthesisRecord[] {
+  return getDefaultStore().listStageSynthesisRows(featureId);
+}
+
+/**
+ * 门① 确认落列（默认存储；R1 · v0.11.0 orch-N6，口径见 {@link SessionStore.confirmStageSynthesis}）。
+ */
+export function confirmStageSynthesis(taskId: string, docHash: string, confirmedAt: string): boolean {
+  return getDefaultStore().confirmStageSynthesis(taskId, docHash, confirmedAt);
+}
+
+/** 合成行结果落列（默认存储；v0.11.0 orch-N4，口径见 {@link SessionStore.writeStageSynthesisOutcome}） */
+export function writeStageSynthesisOutcome(
+  taskId: string,
+  patch: StageSynthesisOutcomePatch,
+): boolean {
+  return getDefaultStore().writeStageSynthesisOutcome(taskId, patch);
+}
+
 /** 写入 / 刷新 Runner 注册行（默认存储） */
 export function upsertRunner(rec: RunnerUpsertInput): RunnerRecord {
   return getDefaultStore().upsertRunner(rec);
@@ -5650,6 +6456,25 @@ export function appendEvent(rec: EventAppendInput): EventRecord {
 /** 按游标列出事件（默认存储；`opts.scope` = 案 B 组可见性过滤） */
 export function listEvents(opts?: ListEventsOptions): EventRecord[] {
   return getDefaultStore().listEvents(opts);
+}
+
+/** 按幂等键取既有事件（默认存储；R1 · orch-N7，口径见 {@link SessionStore.getEventByIdempotencyKey}） */
+export function getEventByIdempotencyKey(idempotencyKey: string): EventRecord | null {
+  return getDefaultStore().getEventByIdempotencyKey(idempotencyKey);
+}
+
+/**
+ * **唯一约束冲突判定**（R1 · v0.11.0 orch-N7）：`node:sqlite` 的 `SQLiteError` 在不同版本上
+ * `.code` 形态不稳（`ERR_SQLITE_CONSTRAINT_UNIQUE` / `SQLITE_CONSTRAINT_UNIQUE` 都出现过），
+ * 故判据取**消息里的英文字面**——SQLite 对唯一冲突的措辞是硬编码的
+ * `UNIQUE constraint failed: <表>.<列>`，不随 locale / 版本变。
+ *
+ * ⚠️ 本函数只用于「撞索引 ⇒ 转结构化幂等出口」这一处，**不得**当通用 `catch` 的静默吞口：
+ * 判不出唯一冲突的异常一律原样上抛（把真错误吞成幂等 = 数据损坏无声化）。
+ */
+export function isUniqueConstraintError(err: unknown): boolean {
+  const message = err instanceof Error ? err.message : String(err);
+  return message.includes("UNIQUE constraint failed");
 }
 
 /** 当前最大事件 id（默认存储；`scope` 给定 ⇒ 仅计本组可见事件） */

@@ -1,8 +1,8 @@
-# PROTOCOL — Runner ⇄ Bridge 线协议契约（2.3）
+# PROTOCOL — Runner ⇄ Bridge 线协议契约（2.4）
 
 本文件是 machine（Launcher 升格为 **Runner**，出站方）与 orch（**Bridge**，入站承载方）之间 HTTP 线协议的**单一事实源**。v0.7.0 起连接模型整体反转为 **pull**：**Runner 主动出站连桥**，桥不再向机器发起业务调用。线协议类型与版本常量在两侧各自声明（`orch/types.ts` / `machine/types.ts`），以本文件 + 契约测试（`.omo/skills/regression-test/tests/test-protocol-version.js`）保持一致；修改协议时**先改本文件**，再同步两侧实现。
 
-- 当前版本：**2.3**（两侧同名常量 `PROTOCOL_VERSION`）
+- 当前版本：**2.4**（两侧同名常量 `PROTOCOL_VERSION`；**2.3 → 2.4 = `failureKind` 取值集合加成员 `provider`，两侧同升同批重启**）
 - 主笔归属：**orch 主笔、machine 审阅**（仓根唯一单写面）。
 - 适用范围：仅 Runner ⇄ Bridge HTTP（`/runner/*`，挂载于桥的常驻 HTTP transport、复用 MCP 端口，不引第二接入面）。Runner ⇄ 本地 A2A 端点走标准 A2A 协议（自带版本）；MCP 工具面（`a2a_*` 工具出入参）不属本契约。约束：两部署单元自包含、无跨单元 import —— 因此协议以「文档 + 契约测试」对齐，不做共享 schema 包。
 
@@ -104,7 +104,7 @@ Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持�
 | `artifacts` | array \| string | 否 | 产物（数组或 JSON 字符串） |
 | `projectId` / `contextId` | string | 否 | 缺省沿用桥侧落库值 |
 | `remoteTaskId` | string | 否 | 远端任务句柄（观测用） |
-| `failureKind` | string | 否 | **机器侧失败大类**（**2.3 起六类闭集**：`"agent"` \| `"transport"` \| `"runner"` \| `"model_queue"` \| `"timeout"` \| `"business"`；v0.8.7 新增字段、v0.8.8 硬切取值集合）：由 **Runner** 判定（它是唯一同时看得见 `ensure` / transport / 自有超时的位置），**仅 `state="failed"` 时有值**；`timeout` 类**必带子键** `diagnostics.timeoutScope`。判不出 ⇒ **不报该键**（字段本有可选语义）。**旧值 `"infra"` / `"task"` 自 2.3 起非法但仍可被接收**（接收端兜底口径见下「失败分类」）。**桥不消费该字段做自动重试判据**（重试执行在 machine，orch 只登记策略白名单）—— 其存在是给桥记账、运维 / 观测读 |
+| `failureKind` | string | 否 | **机器侧失败大类**（**2.3 起六类闭集、2.4 起七类**：`"agent"` \| `"transport"` \| `"runner"` \| `"model_queue"` \| `"provider"` \| `"timeout"` \| `"business"`；v0.8.7 新增字段、v0.8.8 硬切取值集合、v0.11.0（2.4）加成员 `provider`）：由 **Runner** 判定（它是唯一同时看得见 `ensure` / transport / 自有超时的位置），**仅 `state="failed"` 时有值**；`timeout` 类**必带子键** `diagnostics.timeoutScope`。判不出 ⇒ **不报该键**（字段本有可选语义）。**旧值 `"infra"` / `"task"` 自 2.3 起非法但仍可被接收**（接收端兜底口径见下「失败分类」）。**桥不消费该字段做自动重试判据**（重试执行在 machine，orch 只登记策略白名单）—— 其存在是给桥记账、运维 / 观测读 |
 | `diagnostics` | object | 否 | **机器侧诊断**（**v0.8.7 新增**）：`{ acpErrorKind?, elapsedMs, chunkCount?, stage }`，`stage ∈ {"ensure","send","poll","wait"}`；`acpErrorKind ∈ {spawn, closed, timeout, rpc, protocol}`（桥内原生类别）。失败态必带；成功态仅在桥带了诊断时才带。**桥只读 `acpErrorKind` 用于失败分类映射**，其余键仅观测。v0.8.8 起该对象内的新增键（`timeoutScope` / `continueAttempts` / `acpErrorCode` / `acpErrorData` / `partialChars` / `updateCount` / `firstChunkElapsedMs` 等）**全部在「未知字段忽略」伞下，不单独触发版本变更** |
 
 响应 200：`{ "result": "ok", "data": { "ack": true, "taskId": string, "state": string, "idempotent": boolean }, "error": null }`
@@ -115,7 +115,7 @@ Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持�
 
 **迟到 / 重复终态 = 2xx-with-ignore（契约，v0.8.7 起显式落档）**：终态**首个胜出**（`WHERE state NOT IN ('completed','failed','blocked')`）⇒ 迟到 / 重复的终态回传**整条零写入**，回执**恒为 200 + `ack:true`**（`idempotent` 回显是否同值）；与**已落终态不一致**时另记一条 warn 留痕。**不得改成 4xx** —— Runner 侧 outbox 对**任何非 2xx 一律保留待重试**，改成 4xx 会让已落终态的迟到件**无限退避死循环**（`pending` 永不清、`.outbox` 文件永留）。该幂等口**同时兜住**「桥侧墙钟判死后的迟到件」与「Runner 启动补结算件」两类。
 
-**失败分类（事实归 Runner、闭集校验与记账归桥，2.3 起六类）**：Runner 只报**原生事实**（`diagnostics.acpErrorKind` 及下表信号来源），**不得预映射**成六类之外的自造 vocabulary（否则取值集合变更要动两端）；分类权在 machine（**报得出才报、判不出不报 `failureKind` 键**），桥侧做**闭集校验 + 落库**，并保留一个**兜底映射**（`mapAcpErrorKindToFailureKind` 改值域后；**唯一触发条件 = machine 未上报合格六类值**，不是并行分类器）。**machine 原生信号 → 六类的对应（清单）**：
+**失败分类（事实归 Runner、闭集校验与记账归桥，2.3 起六类、2.4 起七类）**：Runner 只报**原生事实**（`diagnostics.acpErrorKind` 及下表信号来源），**不得预映射**成六类之外的自造 vocabulary（否则取值集合变更要动两端）；分类权在 machine（**报得出才报、判不出不报 `failureKind` 键**），桥侧做**闭集校验 + 落库**，并保留一个**兜底映射**（`mapAcpErrorKindToFailureKind` 改值域后；**唯一触发条件 = machine 未上报合格六类值**，不是并行分类器）。**machine 原生信号 → 六类的对应（清单；2.4 起闭集为七类 = 下表其余六行 + 新增 `provider` 行，其余六行口径逐字沿用 2.3）**：
 
 | 六类 | machine 侧原生信号（判定来源） |
 |---|---|
@@ -125,6 +125,17 @@ Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持�
 | `model_queue` | **machine 恒不产出**（ACP 层无队列概念、无独立信号）—— 只能由桥侧跨任务视野**启发式推论**且**显式标注为启发式**；原料 = `updateCount` / `partialChars` / `firstChunkElapsedMs` / `acpErrorCode(+Data)` |
 | `timeout` | `acpErrorKind="timeout"` ⇒ **子键 `timeoutScope="acp-prompt"`**（桥 prompt 满窗）；launcher `timedOut` ⇒ **子键 `timeoutScope="runner-deadline"`** —— 两条路径同归本类、**靠子键分家**（否则 timeout 会在 `runner` 与 `timeout` 两处被重复认领） |
 | `business` | 后端正常收尾 ∧ 输出含失败结论块（`a2a-outcome` 约定）= 原 `"task"` 的直系继承 |
+| `provider` | **2.4 新增（本轮闭集唯一新成员）**：provider 侧账单 / 配额失败被后端当**正常输出**打印出来 ⇒ 曾出现「正文是 402 错误、却结算成 `completed`」的假完成。判定门名 **`providerReceipt`**，**两条入口满足其一即结本类**：① `AcpError.kind === "rpc"` ∧ `message` / `data` 命中「`provider` 门详规」五模式之一；② 回合**正常结束**（`end_turn`）∧ 回执正文命中五模式之一 ∧ **无有效结论块**（正文不存在合法 `a2a-outcome` 块）。**阈值**：入口 ② 仅当 `text.length < 300`（**UTF-16 长度**，两侧统一口径）时评估，**`updateCount` 不作 `providerReceipt` 的前置条件**。**优先级 `provider > business`**：同一条正文既命中五模式又含失败结论块 ⇒ 结 `provider`、不结 `business`。**与既有零产出启发式 `zeroOutput`（`partialChars < 200 ∧ updateCount < 5`）分开命名、不得合并** —— `zeroOutput` 保持自身零产出语义与阈值，同一「零产出」样本不得被 `provider` 与 `model_queue` 两边认领。**`acpErrorKind ∈ {spawn, closed}` 保持 `agent`**（进程死了不等于死于欠费，不因本行改判）。**识别权只归 machine**，桥侧不并行二次分类，只在 machine 未上报合格七类值时走既有兜底 |
+
+**`provider` 门详规（2.4 新增）**：五模式清单的**规范单源**落在本段，两侧实现与单测均以此处逐字为准。
+
+- **五模式（冻结清单，字面定稿权归宿主，实现期不得自行增删 / 改写）**：`402 Payment Required`、`Insufficient Balance`、`unexpected status`、`rate limit`、`insufficient_quota`。匹配口径 = 对入口 ① 的 `AcpError.message` / `data` 与入口 ② 的回合正文做**大小写不敏感子串**匹配，命中任一即成立。两侧各持**同名常量** `PROVIDER_ERROR_MARKERS`，并各加一条单测**读本文件**逐串比对下方锚点行（两包独立构建、不做跨包 import）。
+- **阈值 `<300`（UTF-16 长度，即 JS `string.length`）**：machine 入口 ② 与 orch 兜底门共用同一数值（兜底口按 `text.trim().length < 300`）；**>300 的长回执即使含五模式仍判 `completed`** —— 这是本卡**明示的未覆盖项**（负锚放行），不在本轮兜。
+- **不误伤**：正常短回执（如「在线」）仍 `completed` 且**不产出 `failureKind` 键**；正常长任务正文恰好含 `402` 或 rate-limit 字样（读日志、贴命令输出）仍 `completed`。
+- **原文保留**：结 `provider` 时失败文本仍**全文**写入回执正文（不改写、不截断）；命中片段只走 `diagnostics` 新键 `failureSnippet`（**≤120 码点、必须脱敏**，凭据不得回显），不进结果文本。
+- **机器可解析锚点（供 orch 侧单测逐串比对，七类值集合以本行为准）**：
+
+<!-- failure-kinds: agent,transport,runner,model_queue,provider,timeout,business -->
 
 **兜底口径（入站方向，硬契约）**：`/runner/result` 对 `failureKind` **不做整包 400 拒收** —— **缺键 / 旧值 `"infra"` / `"task"` / 未知值** ⇒ 一律落**安全兜底类 `business`**（「不可重试」侧），并**记一条 warn 且必须带上原值**（如 `failure_kind_fallback=<infra>`，供事后区分「真 business」与「兜底 business」）。理由：版本握手只校验主版本 ⇒ 2.2 机器 + 2.3 桥**必然存在混跑窗口**，若对旧值硬拒 = 混跑窗口内旧机任务全部结不了账 = **丢单**。**⚠ 入站宽容与存量库行读侧安全（非法值 ⇒ 兜底 + warn 的读侧放宽 + 存量迁移置 NULL）互补、不可互替**。`business` 不标 `model_queue` 之外的自动动作：`model_queue` 在策略表登记为**不自动重试**（后端还在排队，重跑还得排），只做可见面标注。
 
@@ -163,7 +174,7 @@ Runner 任务终态回传（**ack 语义**）。Runner 侧结果**先本地持�
 ## 版本规则
 
 - **加可选字段**（请求或响应）—— **以判据为准，不默认升版**：字段**可被对端完全忽略且不影响任何判定 / 消费语义** ⇒ **不升版**（主版本、minor 均不变，沿用当前版本）；**引入新可观测行为，或把原本可选 / 无约束项收紧为必填 / 闭集成员** ⇒ **minor +1**（主版本不变，旧对端可忽略未用部分）；
-- **变更必填字段的取值集合**（**新增 / 更名 / 移除成员**，如 `agentKind` 的成员增减或改名、`failureKind` 的合法取值集合更替（2.3：`{infra, task}` → 六类闭集））→ minor +1，主版本不变；旧对端仅在未使用变更取值时兼容；
+- **变更必填字段的取值集合**（**新增 / 更名 / 移除成员**，如 `agentKind` 的成员增减或改名、`failureKind` 的合法取值集合更替（2.3：`{infra, task}` → 六类闭集；2.4：六类 → 七类，加成员 `provider`））→ minor +1，主版本不变；旧对端仅在未使用变更取值时兼容；
   - ⚠ **更名与移除是「单向不兼容」**：变更后的取值对未升级对端会被拒，旧取值对已升级对端同样被拒；且拒绝发生在**整包项目级**（`projects[]` 结构校验失败 ⇒ 该 Runner 上报的**全部项目**一起被 `400 bad_request` 拒、该机对桥不可见），**不是只拒那一个项目**。
   - ⇒ 因此**版本号本身不构成兼容窗口**（`/runner/register` 的版本握手只校验**主版本**，枚举取值集合由闭集校验强制）⇒ **更名 / 移除必须由部署侧在同一切换窗口内完成（两侧同升）**，并**在本节下方演进记录表新增一行**登记；**不得跨版本混跑**（旧机与新机同时在线时，必有一侧整包被拒）。
 - **删字段 / 改字段语义 / 加必填请求体或必填参数** → major +1；
@@ -195,3 +206,4 @@ v0.7.0 发版即**硬切**：连接模型由 push（Bridge → Launcher 入站�
 | 2.2（v0.8.6） | agentKind 取值集合**更名**：`qoder` → `qoder-cn`（**旧值不再合法**）；实际强制来自 agentKind 闭集拒绝，版本握手只校验主版本（SUPPORTED_PEER_PROTOCOL_MAJORS=[2]） | 否（minor，沿 2.1 先例：取值集合变更 + 单向不兼容） | 使用 `qoder-cn` 的 Runner 要求 Bridge ≥ 2.2；**旧值 `qoder` 本版起于两侧均非法**（旧 Bridge 对新值同样 400 拒整包） |
 | 2.3（v0.8.8） | `failureKind` 合法取值 → **六类闭集** `agent` / `transport` / `runner` / `model_queue` / `timeout` / `business`；**旧值 `infra` / `task` 自 2.3 起非法但仍可被接收**（接收端兜底为 `business` 并 warn 留原值，见 `/runner/result`「失败分类」）；`timeout` 必带子键 `diagnostics.timeoutScope`（`acp-prompt` / `runner-deadline`）；`diagnostics` 新增计量键均在「未知字段忽略」伞下、不单独触发版本变更 | 否（minor；但**取值集合成员移除 ⇒ 单方不兼容 ⇒ 两侧须同升**——握手只校验主版本，旧值靠接收端兜底而非握手挡） | Runner ≥ 2.3 上报六类（未升级 2.2 Runner 上报 `infra`/`task` 被兜底为 `business` + warn 留原值，混跑期账面口径见改造文档 §6-9）；Bridge ≥ 2.3 闭集校验 + 兜底落库 |
 | —（沿用 2.3，v0.10.0） | `/runner/register` 注册载荷新增**可选字段 `repo`**（仓库标识，供版本面按仓库拓扑归一 —— 拓扑无关、polyrepo / monorepo 双支持）。该字段**可被对端完全忽略、不进入任何判定 / 消费语义** ⇒ 按版本规则一般判据（第一条）**不升版**（主版本、minor 均不变，沿用 2.3） | 否（新增可忽略的可选字段 ⇒ **不升版**，见版本规则第一条判据） | 无新要求（旧 Runner 不携 `repo` 仍合法，桥按缺省处理；新旧可混跑） |
+| 2.4（v0.11.0） | `failureKind` 合法取值 → **七类闭集**：在 2.3 六类基础上新增 `provider`（**取值集合加成员**，判据见 `/runner/result`「失败分类」`provider` 行 + 「`provider` 门详规」；五模式清单与机器可解析锚点的**规范单源落在本文件**）；其余六类口径逐字沿用 2.3；`model_queue` 保持**预留、本轮零产出**；`timeout` 子键要求不变 | 否（minor；但**取值集合加成员 ⇒ 单向不兼容 ⇒ 两侧同升、同一批次重启**——握手只校验主版本，未知值靠接收端兜底而非握手挡） | Runner ≥ 2.4 上报 `provider`；Bridge ≥ 2.4 做七类闭集校验。**混跑期**：未升级的一侧遇 `provider` ⇒ 按既有兜底口径落 `business` + **warn 留原值**（`failure_kind_fallback=provider`），**不整包拒收**（沿用 2.3 的入站宽容伞，硬拒 = 丢单）；`provider` 失败**不自动重派**（仍走宿主 `retryTaskIds`） |

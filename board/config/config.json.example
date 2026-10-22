@@ -3,11 +3,7 @@
   "host": "127.0.0.1",
   "orgsDir": "C:/demo/board-ws",
   "group": "",
-  "hostKind": "claude",
-  "hostModel": "",
   "bridgeUrl": "http://127.0.0.1:3300",
   "mcpBaseUrl": "http://127.0.0.1:8787",
-  "machineDist": "",
-  "repoRoot": "",
-  "turnTimeoutMs": 600000
+  "repoRoot": ""
 }

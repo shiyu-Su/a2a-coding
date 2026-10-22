@@ -25,12 +25,12 @@
  * 引擎导入载荷（全字段 `org/version/status/date/note/createdAt/updatedAt`；读-only、不改台账），
  * CLI 入口 = `scripts/export-versions-ledger.mjs`（一次性运维，供引擎侧迁移脚本消费）。
  *
- * 原子写复用 `host-bridge-ledger.ts` 的 {@link writeFileAtomic}（tmp + rename + 建父目录）；
+ * 原子写复用 `atomic-write.ts` 的 {@link writeFileAtomic}（tmp + rename + 建父目录）；
  * 板是单进程单写手，与其余台账同口径**不加文件锁**。
  */
 import { existsSync, readFileSync } from "node:fs";
 import { join, resolve, dirname } from "node:path";
-import { writeFileAtomic } from "./host-bridge-ledger.js";
+import { writeFileAtomic } from "./atomic-write.js";
 
 /** 台账 schema 版本（未来加字段时用于迁移判定；v0.9.6 B1 记录扩 `org` ⇒ 1 → 2）。 */
 export const VERSIONS_LEDGER_VERSION = 2;

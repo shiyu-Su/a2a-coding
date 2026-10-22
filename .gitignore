@@ -3,7 +3,8 @@ dist/
 *.log
 .env
 reports/
-**/.omo/run-continuation/
+# 本机工具状态：会话续跑标记 / watch 日志 / 单元级 .omo 探针产物（board 的 bn3·t4 等）—— 随本机走，不入库
+**/.omo/
 .codegraph/
 Thumbs.db
 
@@ -34,6 +35,8 @@ board/config/config.json.bak-*
 
 # ZCode 工作区配置（本机：编排宿主路径守卫 hook）
 /.zcode/
+# 单元级 ZCode 工作区配置（machine 下禁用 a2a MCP，仅本机生效）
+/machine/.zcode/
 
 # Qoder 本作用域配置（仅本机生效，不入库）
 /.qoder/settings.local.json
@@ -55,6 +58,9 @@ board/config/config.json.bak-*
 /board/test/
 /machine/test/
 /orch/test/
+# 宿主侧回归归档（2026-10-17 从 /.omo/skills/regression-test/tests/ 移出的 test-*.js 留档）⇒ 同上，不入库
+/._archive-*/
 
 # 部署验证打包产物（machine-0.8.3/0.8.4/0.8.5 曾按当时裁决入库；2026-10-16 用户裁定移出仓库 ⇒ 一律不入库，`machine` 侧 `zip` 脚本产物留盘即可）
 /*-validation.zip
+/machine/*.zip

@@ -1,6 +1,7 @@
 import { readFileSync } from "node:fs";
 import type {
   HttpTransportConfig,
+  LlmConfig,
   MachineRef,
   MachinesConfig,
   ProjectGroup,
@@ -274,6 +275,73 @@ export function parseRunner(v: unknown): RunnerConfig {
 }
 
 /**
+ * 正整数（非毫秒语义，与 `asPositiveMs` 同判据、文案不提「毫秒」）：供 `llm.maxTokens`
+ * 这类计数上限。非法一律 `fail()`，不静默降级。
+ */
+function asPositiveInt(v: unknown, ctx: string): number {
+  if (typeof v !== "number" || !Number.isInteger(v) || v < 1) {
+    fail(`${ctx} 必须是正整数（>=1）`);
+  }
+  return v;
+}
+
+/**
+ * `llm.apiKey`（v0.11.0 N1 可选凭据）：键缺省 / 非串 ⇒ `undefined` 与 fail-fast 分别处理；
+ * trim 后为空串 ⇒ 视为未配置（返回 `undefined`，不落键 ⇒ 无 key 时请求头与补凭据前等价）。
+ * 返回的原始值只在请求头消费，**不得**进任何 log / 错误文案。
+ */
+function asOptionalApiKey(v: unknown, ctx: string): string | undefined {
+  if (v === undefined) return undefined;
+  if (typeof v !== "string") fail(`${ctx} 必须是字符串`);
+  const trimmed = (v as string).trim();
+  return trimmed.length === 0 ? undefined : trimmed;
+}
+
+/**
+ * `llm` 段**写死缺省**（v0.11.0 N2，裁定 U1）：只跑通 `opencode go` 一型通路，多端点设计归
+ * R1.5；段可配只为离线注入留门。逐键语义见 `config/配置说明.md`「llm 键层」。
+ */
+const DEFAULT_LLM_BASE_URL = "http://127.0.0.1:9355/zen/go/v1";
+const DEFAULT_LLM_MODEL = "deepseek-v4.1-flash";
+const DEFAULT_LLM_TIMEOUT_MS = 60000;
+const DEFAULT_LLM_MAX_TOKENS = 4096;
+
+/** `llm` 段缺省构造（段缺失 / 空段时使用；唯一来源，禁第二套字面量） */
+export function defaultLlm(): LlmConfig {
+  return {
+    baseUrl: DEFAULT_LLM_BASE_URL,
+    model: DEFAULT_LLM_MODEL,
+    timeoutMs: DEFAULT_LLM_TIMEOUT_MS,
+    maxTokens: DEFAULT_LLM_MAX_TOKENS,
+  };
+}
+
+/**
+ * 解析顶层 `llm` 段（v0.11.0 N2；段可选，缺省字段补 {@link defaultLlm} 常量）。
+ * 非法（段非对象 / 端点或模型空串 / 阈值非正整数 / apiKey 非串）一律 fail-fast，不静默降级。
+ */
+export function parseLlm(v: unknown): LlmConfig {
+  const l = asRecord(v, "llm");
+  const baseUrlRaw = l["baseUrl"];
+  const modelRaw = l["model"];
+  const timeoutRaw = l["timeoutMs"];
+  const maxTokensRaw = l["maxTokens"];
+  const apiKey = asOptionalApiKey(l["apiKey"], "llm.apiKey");
+  return {
+    baseUrl: baseUrlRaw === undefined ? DEFAULT_LLM_BASE_URL : asString(baseUrlRaw, "llm.baseUrl"),
+    model: modelRaw === undefined ? DEFAULT_LLM_MODEL : asString(modelRaw, "llm.model"),
+    timeoutMs:
+      timeoutRaw === undefined ? DEFAULT_LLM_TIMEOUT_MS : asPositiveMs(timeoutRaw, "llm.timeoutMs"),
+    maxTokens:
+      maxTokensRaw === undefined
+        ? DEFAULT_LLM_MAX_TOKENS
+        : asPositiveInt(maxTokensRaw, "llm.maxTokens"),
+    // 未配置 ⇒ 不落键（与 defaultLlm() 同形状），保证下游「有键 ⇒ 必发 Authorization」单判据
+    ...(apiKey === undefined ? {} : { apiKey }),
+  };
+}
+
+/**
  * 成员 key 分隔符（v0.6.0）。取 NUL：配置 id 中不可能出现，保证
  * `memberKey` 对 `(machineId, projectId)` **单射** —— 用 `":"` / `"/"` 拼接会让
  * `("a", "b:c")` 与 `("a:b", "c")` 碰撞（§2.3-I1 单一判据的前提）。
@@ -449,7 +517,7 @@ function parseLauncherUrl(v: unknown, index: number): string {
   return "";
 }
 
-/** 加载并校验「orch 侧机器清单」（含桥 transport / 网页端只读工作台 / runner 阈值配置） */
+/** 加载并校验「orch 侧机器清单」（含桥 transport / 网页端只读工作台 / runner 阈值 / llm 通路配置） */
 export function loadMachinesConfig(path: string): MachinesConfig {
   const raw = JSON.parse(readFileSync(path, "utf8")) as unknown;
   const o = asRecord(raw, "machines config");
@@ -463,6 +531,8 @@ export function loadMachinesConfig(path: string): MachinesConfig {
   const web = parseWeb(webRaw === undefined ? {} : webRaw);
   const runnerRaw = o["runner"];
   const runner = runnerRaw === undefined ? defaultRunner() : parseRunner(runnerRaw);
+  const llmRaw = o["llm"];
+  const llm = llmRaw === undefined ? defaultLlm() : parseLlm(llmRaw);
   const machineRefs = machines.map((m, i): MachineRef => {
     const r = asRecord(m, `machines[${i}]`);
     if (r["pushCallback"] !== undefined)
@@ -508,6 +578,7 @@ export function loadMachinesConfig(path: string): MachinesConfig {
     transport,
     web,
     runner,
+    llm,
     groups,
     projectGroup: aggregateProjectGroup(groups),
   };

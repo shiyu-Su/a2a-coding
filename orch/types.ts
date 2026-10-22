@@ -17,10 +17,12 @@
  * （实际强制来自 `agentKind` 闭集拒绝，版本握手只校验主版本）。
  * v0.8.x（req03 硬切）：agentKind 取值 `qoder` 更名为 `qoder-cn`，字段 / 形状不变但**取值集合变更、
  * 旧值 `qoder` 不再合法** ⇒ minor bump `2.1 → 2.2`（同由 `agentKind` 闭集拒绝强制，握手只校验主版本）。
- * v0.8.8（O1 硬切）：`failureKind` 取值集合由二分 `{infra, task}` 换为六类闭集（成员移除 = 单向不兼容）
+ * v0.8.8（O1 硬切）：`failureKind` 取值集合由二分 `{infra, task}` 换为 6 成员闭集（成员移除 = 单向不兼容）
  * ⇒ minor bump `2.2 → 2.3`（须两侧同升；握手仍只校验主版本）。
+ * v0.11.0（O1）：`failureKind` 取值集合加成员 `provider`（6 成员 → 七类）⇒ minor bump `2.3 → 2.4`
+ * （取值集合变更须两侧同升同批重启；握手仍只校验主版本，`SUPPORTED_PEER_PROTOCOL_MAJORS` 不动）。
  */
-export const PROTOCOL_VERSION = "2.3";
+export const PROTOCOL_VERSION = "2.4";
 
 /**
  * 桥可支持的对端（Runner）主版本清单。主版本升级时按 PROTOCOL.md 维护流程
@@ -89,22 +91,94 @@ export type TaskLane = (typeof TASK_LANES)[number];
  *
  * - `dag`：Feature DAG 节点（本列引入前的**唯一通道**）；
  * - `inquiry`：询问型派发（Step 0/1）—— 不进 DAG 节点集合、不进挂载白名单，
- *   prune 按 `mode='inquiry'` 年龄裁（判据面归 O-4 后续节点）。
+ *   prune 按 `mode='inquiry'` 年龄裁（判据面归 O-4 后续节点）；
+ * - `stage`：**阶段轮行**（R1 · v0.11.0 orch-N1 引入）—— 引擎随阶段轮物化的「一成员项目一行」，
+ *   同样**不进** DAG 节点集合。
+ *
+ * ⚠️ 为什么**不复用** `inquiry`（改造文档 §2.1 实证）：`inquiry` 已被 v0.10.8「待澄清收口」谓词
+ * （`store.ts` 的 `mode='inquiry' AND state='input-required' AND context_id=?`）与同族 GC 段牵连
+ * ⇒ 新一轮派发会把上一轮挂起的行**自动置 `completed` + `settled_by`**，直接击穿 R1 的
+ * 「长期 `pending` 可见、被指名」。
  *
  * ⚠️ 与 `TASK_LANES`/`TASK_TYPES` 同形纪律：**落库列 `tasks.mode` 的 NULL 一律归一为 `dag`**
  * （读侧 `readMode`，存量不回填）—— 反向（NULL 当 inquiry）等于把全部存量节点剔出 DAG 判据集。
  * 本清单是 **orch 本地语义**（machine 零触达、非协议镜像，`PROTOCOL.md` 不动，见改造文档 O-7）。
  */
-export const TASK_MODES = ["dag", "inquiry"] as const;
+export const TASK_MODES = ["dag", "inquiry", "stage"] as const;
 
 /** 任务执行通道（由 `TASK_MODES` 派生；勿另立第二份清单） */
 export type TaskMode = (typeof TASK_MODES)[number];
 
 /**
- * 任务失败分类**六类闭集**（v0.4.1 引入；v0.6.1 REQ-05 起休眠；v0.8.7 O3 按二分恢复；
- * **v0.8.8 O1 硬切为六类**）。
+ * 阶段轮「参与性」取值集合（**R1 · v0.11.0 orch-N1 引入；orch 单元内唯一枚举源**，
+ * 落 `tasks.relevance`）。值 = 该 project 的 PM 对本阶段「是否涉及本 project」的三值结论。
  *
- * ⚠️ **事实源 = `PROTOCOL.md` `/runner/result`「失败分类」条文（2.3 起）**：本清单是协议的
+ * ⚠️ 与 `TASK_MODES`/`FEATURE_STAGES` **相反的第二段纪律**：本列**没有缺省档** ⇒ 读侧
+ * `readRelevance` 对 NULL 照实读出 `null`（= 「本轮尚未回执 / 建行早于本列」这一事实），
+ * 非 NULL 但闭集外 = 数据损坏 fail-fast。**不得**把 NULL 归一成 `not_involved`
+ * （那等于替答复人宣布「不涉及」= 静默收口，直接违背 R1 核心原则）。
+ *
+ * R2 映射表（flow `引擎映射.md` 唯一登记）：`pending` ⇒ 待确认 · `involved`+`accepted` ⇒
+ * 必需参与 · `not_involved`(+`reason`) ⇒ 已确认不参与 · `involved`+`rejected` ⇒ 悬置。
+ */
+export const STAGE_RELEVANCES = ["pending", "involved", "not_involved"] as const;
+
+/** 阶段轮参与性（由 `STAGE_RELEVANCES` 派生；勿另立第二份清单） */
+export type StageRelevance = (typeof STAGE_RELEVANCES)[number];
+
+/**
+ * 阶段轮「决定」取值集合（**R1 · v0.11.0 orch-N1 引入；orch 单元内唯一枚举源**，
+ * 落 `tasks.decision`）。
+ *
+ * ⚠️ **只有 `relevance = 'involved'` 的行才有值**，其余一律 NULL（改造文档 §2.1 列表）⇒
+ * 本列的 NULL 是**合法缺省形状**而非「未回执」；「是否回执」由 {@link STAGE_ANSWER_STATES} 承载。
+ * 闭集外非 NULL = 数据损坏 fail-fast（同 `readRelevance` 纪律）。
+ */
+export const STAGE_DECISIONS = ["pending", "accepted", "rejected"] as const;
+
+/** 阶段轮决定（由 `STAGE_DECISIONS` 派生；勿另立第二份清单） */
+export type StageDecision = (typeof STAGE_DECISIONS)[number];
+
+/**
+ * 阶段轮「回执态」取值集合（**R1 · v0.11.0 orch-N1 引入；orch 单元内唯一枚举源**，
+ * 落 `tasks.answer_state`）= 收口判据的三条件合克里第一枚。
+ *
+ * - `pending`：行已物化、尚无合格回执（**计入应收集分母**，离线成员长期停在此档是合法停靠形态）；
+ * - `valid`：正文里的标记块解析合格，三值已落 `relevance`/`decision`/`reason`；
+ * - `invalid`：解析失败且**已自动重派一次**（注入格式契约）仍不合规则 ⇒ 挡收口且被指名；
+ *   ⚠️ `invalid` **不等于**任务 `state = 'failed'`（改造文档 §2.3 不变量「解析问题绝不误判为失败」）。
+ *
+ * 第四枚可见档 `stale` **不落列、读时派生**（行 `based_on_rev` ≠ 本轮 `basisRev`）⇒ 本闭集里
+ * 没有 `stale`，谁把它写进这一列就是脏值（读侧 fail-fast）。
+ */
+export const STAGE_ANSWER_STATES = ["pending", "valid", "invalid"] as const;
+
+/** 阶段轮回执态（由 `STAGE_ANSWER_STATES` 派生；勿另立第二份清单） */
+export type StageAnswerState = (typeof STAGE_ANSWER_STATES)[number];
+
+/**
+ * **合成行的 `task_key`**（R1 · v0.11.0 orch-N1 补批；落 `tasks.task_key`）：综合分析改由引擎内部
+ * 执行后，其结果**不建新表、不写 `text`/`artifacts_json`**，而是落一枚合成行 —— 冻结口径四元组
+ * `mode='stage'` + `task_key='synthesis'` + `project_id='__engine__'` + 同本轮 `(feature, stage, round)`。
+ *
+ * ⚠️ 本常量存在的理由是**收口判据**，不是为了命名：合成行与成员行住在同一张轮格里，
+ * 而「本轮应收」的行集谓词（`store.ts` 的 `listStageRoundRows` / `listStageRows` 与
+ * `stage-round.ts` 的 `groupStageRoundRows`）原先只认 `task_key IS NOT NULL` ⇒ 补批前合成行会被
+ * 组进应收集 ⇒ `expected+1` 且其 `answer_state` 为 NULL ⇒ 判 `pending` ⇒ **该轮永不收口**（自锁）。
+ * 三处谓词各加 `task_key <> 'synthesis'` 是**必做项**，漏一处即锁死一条阶段链（验收锚见
+ * `test/v0110-n1b-synthesis-carrier.test.ts`）。
+ *
+ * ⚠️ 值域执法：本键**非空** ⇒ 合成行照旧落 partial 唯一索引 `idx_tasks_stage_round` 的唯一集，
+ * 同 `(feature, stage, 'synthesis', '__engine__', round)` 二次插入由**索引真拒**（不是应用层 `if`）。
+ */
+export const SYNTHESIS_TASK_KEY = "synthesis";
+
+/**
+ * 任务失败分类**七类闭集**（v0.4.1 引入；v0.6.1 REQ-05 起休眠；v0.8.7 O3 按二分恢复；
+ * **v0.8.8 O1 硬切为 6 成员闭集**；**v0.11.0 O1 加成员 `provider` 扩为七类**）。
+ *
+ * ⚠️ **事实源 = `PROTOCOL.md` `/runner/result`「失败分类」条文（2.3 起 6 成员、2.4 起七类，
+ * 机器可解析 `failure-kinds` 锚点）**：本清单是协议的
  * 镜像，**orch 不主动扩展** —— 闭集成员变更（增 / 更名 / 移除）必须先改 `PROTOCOL.md` 并
  * **两侧同升**（取值集合成员移除 = 单向不兼容），再同步到这里。
  *
@@ -112,6 +186,9 @@ export type TaskMode = (typeof TASK_MODES)[number];
  * - `transport`：launcher ↔ 编排桥的 HTTP 传输层失败（`send` / `poll` 阶段）；
  * - `runner`：**载体侧事实**（launcher deadline 抛错 / `ensure` 抛错 / 启动补结算与墙钟孤儿）；
  * - `model_queue`：疑似模型侧排队 / 配额限流 —— **machine 恒不产出**，只由 orch 侧启发式**标注**；
+ * - `provider`：模型供给侧错误（如 402 余额不足 / 429 限流被 provider 侧硬拒）—— **2.4 新增**，
+ *   由 machine 按 `PROTOCOL.md`「`provider` 门」条文判定产出、orch 消费（本轮只加成员，
+ *   判定与消费逻辑见后续节点）；
  * - `timeout`：满窗，**必带子键** `diagnostics.timeoutScope`（`acp-prompt` / `runner-deadline` 分家）；
  * - `business`：后端正常收敛但业务失败 —— 亦是**安全兜底类**（落在「不可重试」侧）。
  *
@@ -124,6 +201,7 @@ export const FAILURE_KINDS = [
   "transport",
   "runner",
   "model_queue",
+  "provider",
   "timeout",
   "business",
 ] as const;
@@ -442,6 +520,28 @@ export interface RunnerConfig {
   orphanTimeoutMs: number;
 }
 
+/**
+ * 顶层 `llm` 段（v0.11.0 N2；**配置可选**，解析后恒补齐为完整对象）。
+ * 内置轻量分析 Agent 的 LLM 通路参数（唯一消费方 = `bridge/llm-client.ts`）；当前版本口径
+ * **写死**（`opencode go` / `deepseek-v4.1-flash` / loopback `:9355`，多端点设计归 R1.5），
+ * 段可配只为离线注入留门。逐键取值细则见 `config/配置说明.md`「llm 键层」。
+ */
+export interface LlmConfig {
+  /** chat completions 端点的 API base（client 侧拼 `/chat/completions`） */
+  baseUrl: string;
+  model: string;
+  /** 单次请求墙钟上限（毫秒） */
+  timeoutMs: number;
+  /** 请求体 `max_tokens` 上限 */
+  maxTokens: number;
+  /**
+   * 端点凭据（v0.11.0 N1：合成通路补凭据）。**可选且缺省不落键** ⇒ 有值（trim 后非空）时
+   * client 才发 `authorization: Bearer <值>`，未配置时请求头与补凭据前逐字等价。
+   * 值只进请求头，**禁止**进任何 log / 失败原因 / 回显面。
+   */
+  apiKey?: string;
+}
+
 /** orch 侧：机器清单 */
 export interface MachinesConfig {
   machines: MachineRef[];
@@ -451,6 +551,12 @@ export interface MachinesConfig {
   web: WebConfig;
   /** Runner 阈值（v0.7.0；v0.8.7 O2 起含墙钟；配置缺省时解析为 `{ holdMs: 25000, heartbeatTimeoutMs: 60000, orphanTimeoutMs: 1800000 }`） */
   runner: RunnerConfig;
+  /**
+   * LLM 通路（v0.11.0 N2；`llm` 段，段缺省时解析为写死缺省见 {@link defaultLlm}，由
+   * `loadMachinesConfig()` 恒补齐）。字段可选仅为兼容既有 `MachinesConfig` 字面量夹具（同 `groups`），
+   * 生产路径恒有值；消费方 = `bridge/llm-client.ts`。
+   */
+  llm?: LlmConfig;
   /**
    * 静态项目组数组（v0.8.6 一桥多组 §2.1；`projectGroup` 段，**段缺省 / 未配任何组 ⇒ `[]` = 全量接纳**，
    * 由 `loadMachinesConfig()` **恒填充** —— 运行时不会出现 `undefined`；组间成员互斥 ⇒ 配置期 fail-fast）。
@@ -584,6 +690,41 @@ export interface TaskRecord {
    * 且快照**不可回改**（它是派发当刻的事实）。
    */
   stage: FeatureStage | null;
+  // ── R1 · v0.11.0 orch-N1「阶段轮载体」七列（**只扩列、零新表、零回填**，改造文档 §2.1）──────
+  // 阶段实例不落独立行：由 `(feature_id, stage, round)` **派生** ⇒ 这七枚是**挂在既有 tasks 行上**
+  // 的阶段轮字段。⚠️ **一律不进 `QUEUE_TASK_COLUMNS`** ⇒ `/api/tasks` 出参不变（§4.1）；
+  // 队列视角行读回时七字段全为 `null`（键缺位 = `readNullableString` 的合法 NULL，不是脏值）。
+  /**
+   * **阶段轮内命名键**（落 `tasks.task_key`，如 `pm-relevance`）= partial 唯一索引的**存在前提**：
+   * 索引带 `WHERE task_key IS NOT NULL` ⇒ **非空才有幂等意义**，NULL（= 非阶段轮行，全部存量行）
+   * 被索引整体排除。
+   *
+   * ⚠️ **回填永禁**（改造文档 §2.1 / §4.1）：回填会把存量行整体拉进唯一集 ⇒ 五键同值的既有行
+   * 让索引创建**直接失败**（该语句刻意不套 try/catch ⇒ 启动即抛，且不受 try-ALTER 的容错语义保护）
+   * ⇒ 本字段只由**开轮物化**写入。
+   */
+  taskKey: string | null;
+  /**
+   * **轮次**（落 `tasks.round`；正整数，1 起）。与 `feature_id`/`stage` 合成「阶段实例」的派生键；
+   * 「上一轮原样留痕」靠轮次递增而非覆盖 ⇒ 本字段**不参与任何归一**，NULL = 非阶段轮行。
+   */
+  round: number | null;
+  /** 参与性三值（落 `tasks.relevance`；取值见 {@link STAGE_RELEVANCES}，**NULL 不归一**） */
+  relevance: StageRelevance | null;
+  /** 决定三值（落 `tasks.decision`；取值见 {@link STAGE_DECISIONS}，**仅 `involved` 行有值**） */
+  decision: StageDecision | null;
+  /**
+   * **理由自由文本**（落 `tasks.reason`）：`not_involved` / `rejected` 必填（判据面归解析器节点）。
+   * 上限 200 字 ⇒ **超长由写侧截断并标记**（§2.1），读侧只照实透出、不做长度判断。
+   */
+  reason: string | null;
+  /**
+   * **口径指纹**（落 `tasks.based_on_rev`；= 引擎按 §2.4 输入序列表现算的 sha256）。
+   * 行值 ≠ 本轮 `basisRev` ⇒ 该行 `stale`（**读时派生、不落列**）⇒ 本字段是 stale 的唯一原料。
+   */
+  basedOnRev: string | null;
+  /** 回执态三值（落 `tasks.answer_state`；取值见 {@link STAGE_ANSWER_STATES}，**NULL 不归一**、脏值 fail-fast） */
+  answerState: StageAnswerState | null;
   artifactsJson: string | null;
   /** 任务结果纯文本（成功 = artifacts 文本；失败 = status.message 错误原因）；旧记录可能为 null */
   text: string | null;
@@ -668,13 +809,15 @@ export interface TaskRecord {
   retryCount: number;
   /**
    * 失败分类（v0.4.1 引入；v0.6.1 REQ-05 起随五层删除**停止写入**；v0.8.7 O3 恢复写入；
-   * **v0.8.8 O1 起取值为六类闭集**，见 {@link FAILURE_KINDS}）。
+   * **v0.8.8 O1 起取值为 6 成员闭集、v0.11.0 O1 起为七类闭集**，见 {@link FAILURE_KINDS}）。
    *
-   * 现行两处写口（改造文档 §2.1）：
-   * - `/runner/result` 回传 ⇒ `setTaskFailureKind`（**分类事实源 = machine 上报的 `failureKind`**，
-   *   orch 只做**闭集校验 + 落库**；未上报合格六类值时才落兜底：缺键 ⇒ 由原生 `AcpError.kind`
+   * 现行两处写口（改造文档 §2.1；v0.11.0 O4 分类前移后形态）：
+   * - `/runner/result` 回传 ⇒ `upsertTaskResult` 入参 `failureKind` **与终态同一条 UPDATE** 落
+   *   `failure_kind`（**分类事实源 = machine 上报的 `failureKind`**，
+   *   orch 只做**闭集校验 + 落库**；未上报合格七类值时才落兜底：缺键 ⇒ 由原生 `AcpError.kind`
    *   经 `mapAcpErrorKindToFailureKind` 取安全值（`spawn`/`closed` ⇒ `agent`），旧值 / 未知值 ⇒
-   *   `business`；两条兜底路径均 warn 留原值）；
+   *   `business`；两条兜底路径均 warn 留原值）；后置 `setTaskFailureKind` 写口退役（晚于事件 ⇒
+   *   新结 `failed` 的 `task.settled` 不带分类），该方法保留供测试 / 工具直连；
    * - 孤儿墙钟判死 ⇒ `failOrphanedTask` 自置 `runner`（载体侧事实、**不可续跑**；v0.8.7 的
    *   `infra` 直写口径废止）。
    *
@@ -752,6 +895,14 @@ export interface EventRecord {
   /** 附加载荷（JSON 字符串；可空） */
   payload: string | null;
   createdAt: string;
+  /**
+   * **索引级幂等键**（R1 · v0.11.0 orch-N7，落 `events.idempotency_key`）：
+   * `null` = 普通事件（既有全部 kind 恒为此值 = 改造前行为，NULL **不参与** partial 唯一索引）；
+   * 非空 = 同键至多一条（`doc_objection` / `gate1_confirm` 两枚写口用）。
+   * ⚠️ 读侧**不归一、不兜底**（照 `tasks.stage` 的「无缺省档」纪律）：本键的存在与否就是
+   * 「这条事件是不是幂等写口的产出」这一事实，兜底等于给全部存量行赋幂等语义。
+   */
+  idempotencyKey: string | null;
 }
 
 /** `a2a_tasks` 列表项：本地任务记录 + 陈旧标记 */

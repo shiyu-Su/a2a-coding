@@ -541,14 +541,27 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
           "**`pending` = 登记欠账按固定序（确认单 → 排期 `version` → 门① 抬 `stage` → 改造文档 → `approval` 待审批）逐项扫描后报的欠账清单，不按当前格过滤**（`executing` 格上确认单未登记 ⇒ 仍报 `requirement-doc`；当前各行至多 1 枚 = 首个未清项，数组形态为「两件事同时等」预留）；异常 / 终态四格恒 `[]`。其语义 = **登记事实**（`decisions` 里有没有那个档名），**不证文件存在** —— `decisions` 是宿主自报自由文本且**整值替换**，漏重发会让明细倒退，属正常后果。" +
           "**`actor` = 本阶段（推进后）的推动方 / 执行方**（`host` / `user` / `engine`；终态 ⇒ `null` = 本阶段无推动方，**不得读成「卡住」**），**不是「此刻谁在等」**；派生四枚是 flow `引擎映射.md` §2 表「驱动方」列的**同源投影**（单值投影 ⇒ 不得当等价替身读）。" +
           "**静止与失败由 `tasks[]` / `a2a_feature_trace` 承载** ⇒ `actor` 不得当作「谁卡住了」的凭据（`executing` 格的 `engine` 不表示「现在有在跑」）。" +
-          "另注：异常 / 终态四格（`needs_input` / `completed` / `failed` / `cancelled`）的 `stage` **保持当时值、不参与推导** ⇒ 本工具照读回显、不臆造、也不另存一枚标记「陈旧 `stage`」。",
+          "另注：异常 / 终态四格（`needs_input` / `completed` / `failed` / `cancelled`）的 `stage` **保持当时值、不参与推导** ⇒ 本工具照读回显、不臆造、也不另存一枚标记「陈旧 `stage`」。" +
+          "**v0.11.0 R1 · N7 新增顶层 `stageRuns[]`（仅单查分支；纯读、零写副作用）** = 每格 `(stage, round)` 一枚，字段 `stage / round / basisRev / docVersion / settled / " +
+          "completeness{expected, settledCount, pendingCount, invalidCount, staleCount} / unanswered[] / projects[{projectId, taskId, relevance, decision, reason, answerState, basedOnRev, stale, reachability, taskState}] / allowedActions[] / sections[]`。" +
+          "**分子/分母由引擎直出**（板不重演判据；四计数是恰好一次的划分 ⇒ 相加恒等 `expected`），`settled` 三态（`true` / `false` / `null` = 本轮零行，**不得读成 `false`**）。" +
+          "`reachability` 闭集 `dispatchable` / `no_runner` / `unknown`（注册表为空 ⇒ `unknown`，**不得据此断言「派不出去」**）；`stale` = 行 `basedOnRev` 非空且 ≠ 本轮 `basisRev`，**读面现算、不落列**。" +
+          "`allowedActions[]` 是板侧门闩词元（`stage_round_open` / `doc_objection`）⇒ 控件渲不渲只看法、不再自判。" +
+          "⚠️ 三枚 `stage` 形**不同物**：顶层单数 `stage`（Feature 登记位）、`stageRuns[].stage`（轮所在阶段）、`acceptance.stages[]`（主链轨迹）—— 后两者零改动、本键不撞名；**列表分支不带 `stageRuns[]`**。",
       inputSchema: {
         featureId: z.string().optional().describe("Feature ID；省略则列出全部"),
+        includeStageTasks: z
+          .boolean()
+          .optional()
+          .describe("单查任务清单是否包含阶段成员行；缺省 true，列表分支行为不变"),
       },
     },
     async (args) => {
       try {
-        const outcome = core.featureStatus({ featureId: args.featureId });
+        const outcome = core.featureStatus({
+          featureId: args.featureId,
+          includeStageTasks: args.includeStageTasks,
+        });
         return outcome.ok ? textResult(outcome) : errorResult(outcome);
       } catch (err) {
         return internalError(err);
@@ -560,7 +573,7 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     "a2a_feature_advance",
     {
       description:
-        "orch agent 驱动 Feature 主链推进（如 integrating→testing→reviewing→completed）；状态机校验合法后继，非法流转被拒。**waiting_approval 出格须改走 a2a_feature_approve**（它是唯一准入，拒 ⇒ feature_approval_required；**守卫泛化**：按行前提把关、不按 to 取值点名 —— 从该态出发凡改动 state 的前进边一律拒，归档边 cancelled/failed 放行；非法目标仍先报 feature_transition_invalid）。needs_input 恢复用 to=executing 并携带 answer。**重派失败节点**用 retryTaskIds（须显式 to=executing，与 answer 互斥；重派 + 解冻闭包外 blocked 下游，不改 Feature 态）。**登记字段**用 stage / version / approval（`to` = 当前态时 = 只写登记、不动主链；无终态守卫，completed 后仍可写「发版」）。**门① 两前提（v0.10.5 O4 · 增补 bbc7ea28 O3）**：stage 由「需求分析」外迁（= 登记需求确认动作）要求 ① features.version **非空**，未排期 ⇒ feature_group_version_required；② 可见 decisions（已落库 ∪ 本单同写）已登记本需求的《需求确认单》路径，未登记 ⇒ feature_confirmation_doc_required。**缺哪报哪**（两枚独立码、不合并）、整单拒绝零写入（拒后卡仍「需求分析 ∧ 未发起」⇒ 排期锁仍开，善后后重试同一迁移）；②的唯一豁免 = retryTaskIds 重派路径（那是派发语义操作、不是过门；①三路同受）。**归属（承诺集）**用 projectVersions（v0.10.1 O3 **独立分支**：非空即写全量归属、同值幂等可重发；`to` = 当前态时只补归属、主链零变更，与合法流转同单则归属 + 迁移同单生效；判据不过 ⇒ 整单拒绝且主链零迁移）。**归属门双挂（v0.10.5 O4）**：version_planning→decomposing 与 decomposing→executing 两枚转移要求本需求**归属非空**（已落库或本单同写），空 ⇒ feature_attribution_required、主链零迁移。**四条成功出口（登记特例 / 只补归属 / 合法流转 / retryTaskIds 重派）各带「本阶段明细」七枚**（增补 `6cc46dd2` · **平铺在顶层**，与 `state`/`note` 同级、无包装对象）= 回显三枚 `stage`/`approval`/`version`（引擎已存值**原样**回显，不翻译、不重新推导）+ 派生四枚 `pending`/`gate`/`actor`/`action`（本阶段还差哪件**登记欠账** / 奔哪道用户门 / 本阶段推动方 / 该做什么的能力陈述）。明细按**写后重读**的那一行算 ⇒ `actor` 报的是**推进后**那一格的人，不是「被离开的那一格」；出口**非事务**（重读与写是同函数不同语句，**不追求**快照一致性）。**`actor` = 本阶段（推进后）的推动方 / 执行方**（`host` / `user` / `engine`；终态 ⇒ `null` = 本阶段无推动方，**不得读成「卡住」**），**不是「此刻谁在等」**；派生四枚是 flow `引擎映射.md` §2 表「驱动方」列的**同源投影**（单值投影 ⇒ 该列的复合值「宿主（+ 用户确认）」在此有损，不得当等价替身读）。**静止与失败由 `tasks[]` / `a2a_feature_trace` 承载** ⇒ `actor` 不得当作「谁卡住了」的凭据（`executing` 格的 `engine` 不表示「现在有在跑」）。",
+        "orch agent 驱动 Feature 主链推进（如 integrating→testing→reviewing→completed）；状态机校验合法后继，非法流转被拒。**waiting_approval 出格须改走 a2a_feature_approve**（它是唯一准入，拒 ⇒ feature_approval_required；**守卫泛化**：按行前提把关、不按 to 取值点名 —— 从该态出发凡改动 state 的前进边一律拒，归档边 cancelled/failed 放行；非法目标仍先报 feature_transition_invalid）。needs_input 恢复用 to=executing 并携带 answer。**重派失败节点**用 retryTaskIds（须显式 to=executing，与 answer 互斥；重派 + 解冻闭包外 blocked 下游，不改 Feature 态）。**登记字段**用 stage / version / approval（`to` = 当前态时 = 只写登记、不动主链；无终态守卫，completed 后仍可写「发版」）。**门① 三前提（v0.10.5 O4 · 增补 bbc7ea28 O3 · v0.11.0 O1）**：stage 由「需求分析」外迁（= 登记需求确认动作）要求 ① features.version **非空**，未排期 ⇒ feature_group_version_required；② 可见 decisions（已落库 ∪ 本单同写）已登记本需求的《需求确认单》路径，未登记 ⇒ feature_confirmation_doc_required；③ 本需求在「需求分析」**至少存在一轮 `settled=true` 的阶段轮**（判据 = a2a_feature_status 的 stageRuns[] 同口径、读面同源，零格 / 零行格（settled=null）/ 未收口都不算一轮），没有 ⇒ feature_stage_round_required（**不可跳步**：先经 a2a_stage_round_open 开轮并等回执收齐；**无豁免名单**）。**缺哪报哪**（三枚独立码、不合并；序 ①→②→③）、整单拒绝零写入（拒后卡仍「需求分析 ∧ 未发起」⇒ 排期锁仍开，善后后重试同一迁移）；②③ 的唯一豁免 = retryTaskIds 重派路径（那是派发语义操作、不是过门；①三路同受）。**归属（承诺集）**用 projectVersions（v0.10.1 O3 **独立分支**：非空即写全量归属、同值幂等可重发；`to` = 当前态时只补归属、主链零变更，与合法流转同单则归属 + 迁移同单生效；判据不过 ⇒ 整单拒绝且主链零迁移）。**归属门双挂（v0.10.5 O4）**：version_planning→decomposing 与 decomposing→executing 两枚转移要求本需求**归属非空**（已落库或本单同写），空 ⇒ feature_attribution_required、主链零迁移。**四条成功出口（登记特例 / 只补归属 / 合法流转 / retryTaskIds 重派）各带「本阶段明细」七枚**（增补 `6cc46dd2` · **平铺在顶层**，与 `state`/`note` 同级、无包装对象）= 回显三枚 `stage`/`approval`/`version`（引擎已存值**原样**回显，不翻译、不重新推导）+ 派生四枚 `pending`/`gate`/`actor`/`action`（本阶段还差哪件**登记欠账** / 奔哪道用户门 / 本阶段推动方 / 该做什么的能力陈述）。明细按**写后重读**的那一行算 ⇒ `actor` 报的是**推进后**那一格的人，不是「被离开的那一格」；出口**非事务**（重读与写是同函数不同语句，**不追求**快照一致性）。**`actor` = 本阶段（推进后）的推动方 / 执行方**（`host` / `user` / `engine`；终态 ⇒ `null` = 本阶段无推动方，**不得读成「卡住」**），**不是「此刻谁在等」**；派生四枚是 flow `引擎映射.md` §2 表「驱动方」列的**同源投影**（单值投影 ⇒ 该列的复合值「宿主（+ 用户确认）」在此有损，不得当等价替身读）。**静止与失败由 `tasks[]` / `a2a_feature_trace` 承载** ⇒ `actor` 不得当作「谁卡住了」的凭据（`executing` 格的 `engine` 不表示「现在有在跑」）。",
       inputSchema: {
         featureId: z.string().min(1).describe("Feature ID"),
         to: z
@@ -730,6 +743,158 @@ export function registerTools(server: McpServer, core: BridgeCore): void {
     async (args) => {
       try {
         const outcome = core.featureTrace({ featureId: args.featureId });
+        return outcome.ok ? textResult(outcome) : errorResult(outcome);
+      } catch (err) {
+        return internalError(err);
+      }
+    },
+  );
+
+  // -------------------------------------------------------------------------
+  // R1 阶段轮工具组（v0.11.0 N7；**三枚写口均不改主链状态机** —— 零 canTransition / 零 features.state 写）
+  // -------------------------------------------------------------------------
+
+  server.registerTool(
+    "a2a_stage_round_open",
+    {
+      description:
+        "**开一格阶段轮**（R1 §2.5 写口 1）：为 `(featureId, stage, round)` 的本组成员物化 PM 涉及性回执**行**（写 `tasks` 的 R1 列，**零新表**）。" +
+        "**不改主链**：不调 `canTransition`、不写 `features.state`、不发状态事件 ⇒ 与 `a2a_feature_advance` 的登记特例互不替代。" +
+        "**`stage` 必填且取闭集原值**（需求分析 / 改造方案 / 改造 / 回归 / 验收 / 发版；非法 ⇒ `stage_round_invalid_stage`）——" +
+        "**不得**改从 `a2a_feature_status` 的派生 `stage` 取（该值在 `waiting_approval` 为 `null`），脏值会炸掉整条读面。" +
+        "**幂等 = 两道索引闩**（不是应用层 `if`）：① 开轮事件键 = `(featureId, stage, basisRev)` ⇒ **同一口径 = 同一轮**，" +
+        "重放拿到既有 `round` 且 `replayed=true`、`created=[]`；② 行键 `(feature_id, stage, task_key, project_id, round)` 撞 partial 唯一索引 ⇒ " +
+        "已存在的行由**索引**拒、读回后计入 `existing[]`。要**新开一轮**须换 `basisRevInput`（口径修订标识，进 `basisRev` 哈希；缺省记字面 `-`）。" +
+        "**应收集**：`targetProjects` 缺省 ⇒ 本组**全员**（含上轮答 `not_involved` 者，**不预筛**）；给定 ⇒ 只物化那几位（定向轮），非成员 ⇒ `stage_round_target_not_member` **整单拒绝、零写入**；" +
+        "本组无成员 ⇒ `stage_round_no_members`。本轮应收集 = 本轮物化行（离线成员照样建行、照样计入分母）。" +
+        "成功出参 `{ok, featureId, stage, round, basisRev, docVersion, created[{projectId,taskId}], existing[…], replayed}`；" +
+        "**自动带异议**：给定 `basisRevInput`（即本轮 docVersion）时，该版本上尚未被后续开轮接续的 `stage.doc_objection` 会逐条以「段落 id：正文」并入 `sources`，再写入每条 PM 消息；" +
+        "`basisRev` = 引擎按 §2.4 现算的口径指纹（回执须原样带回）。**入队即派发候选**（唤起 Runner 为最佳努力，无在线 Runner 照常入队）。" +
+        "读侧回看请用 `a2a_feature_status` 的 `stageRuns[]`。",
+      inputSchema: {
+        featureId: z.string().min(1).describe("Feature ID"),
+        stage: z
+          .string()
+          .min(1)
+          .describe(
+            "阶段（闭集原值：需求分析 / 改造方案 / 改造 / 回归 / 验收 / 发版）；**必填**，不接受派生 `stage` 的 null",
+          ),
+        sources: z
+          .array(z.string())
+          .optional()
+          .describe("本轮口径材料（自由文本清单，逐条注入行正文；不参与 basisRev 哈希）"),
+        targetProjects: z
+          .array(z.string().min(1))
+          .optional()
+          .describe("定向轮成员子集（须为本组成员）；缺省 = 本组全量物化"),
+        basisRevInput: z
+          .string()
+          .optional()
+          .describe("口径修订标识（进 basisRev 哈希）；**换它才新开一轮**，缺省按字面 `-` 计入"),
+      },
+    },
+    async (args) => {
+      try {
+        const outcome = core.stageRoundOpen({
+          featureId: args.featureId,
+          stage: args.stage,
+          sources: args.sources,
+          targetProjects: args.targetProjects,
+          basisRevInput: args.basisRevInput,
+        });
+        if (!outcome.ok) return errorResult(outcome);
+        core.kickScheduler();
+        return textResult(outcome);
+      } catch (err) {
+        return internalError(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "a2a_doc_objection",
+    {
+      description:
+        "**记一段口径异议**（R1 §2.5 写口 2）：落一枚 `stage.doc_objection` 留痕事件，**只标记、不开轮** —— " +
+        "不物化任何行、不改任何行的 `answer_state`、不触主链。" +
+        "`docVersion` / `sectionId` / `objectionText` 三枚必填非空（缺一 ⇒ `stage_objection_field_required`）：确认对象是**具体版本的具体段落**。" +
+        "`targetType` 闭集 `basis`（口径整体待重定）/ `project`（定向重评某几位）；**缺省由 `projectIds` 推导**（非空 ⇒ `project`，否则 `basis`）；" +
+        "闭集外值 ⇒ `stage_objection_invalid_target`（板侧把 `targetType` 当**不透明值**透传，值域归本口）。" +
+        "幂等 = `(docVersion, sectionId, objectionId)`，`objectionId` 由**异议正文内容**派生 ⇒ 同段同文重放命中同一留痕（`replayed=true`，不双写）。" +
+        "成功出参 `staleRevPending` = 被异议的那个 `docVersion` 上**是否已有一轮在答**（口径漂移提示位）：`true` ⇒ 宿主该在新口径上重开一轮，本口**不代开**。",
+      inputSchema: {
+        featureId: z.string().min(1).describe("Feature ID"),
+        docVersion: z.string().describe("被异议的文档版本（必填非空，trim 后判空）"),
+        sectionId: z.string().describe("被异议的段落标识（必填非空）"),
+        objectionText: z.string().describe("异议正文（必填非空；objectionId 由它派生 ⇒ 同文重放幂等）"),
+        targetType: z
+          .string()
+          .optional()
+          .describe("闭集 basis / project；缺省由 projectIds 推导（非空⇒project，否则⇒basis）"),
+        projectIds: z
+          .array(z.string().min(1))
+          .optional()
+          .describe("定向重评的 project 清单（去重排序后入 payload；basis 异议省略）"),
+      },
+    },
+    async (args) => {
+      try {
+        const outcome = core.docObjection({
+          featureId: args.featureId,
+          docVersion: args.docVersion,
+          sectionId: args.sectionId,
+          objectionText: args.objectionText,
+          targetType: args.targetType,
+          projectIds: args.projectIds,
+        });
+        return outcome.ok ? textResult(outcome) : errorResult(outcome);
+      } catch (err) {
+        return internalError(err);
+      }
+    },
+  );
+
+  server.registerTool(
+    "a2a_gate1_confirm",
+    {
+      description:
+        "**门① 确认**（R1 §2.5 写口 3）：省略 `version` 时只留痕、不流转；传入 `version` 时在同一事务内写 `features.version`、确认列并迁 `需求分析→改造方案`。" +
+        "调用链始终**零 `canTransition`、零 `features.state` 写**；确认只改登记阶段，主链仍由 `a2a_feature_approve` 推进。" +
+        "传入 `version` 须在版本台账且非 released；未建版 ⇒ `orch_version_unknown`，released ⇒ `orch_version_released_locked`，均零写入。" +
+        "同 `docVersion` 有未处置异议 ⇒ `stage_objection_pending`、零写入；缺轮封口 / 确认单 / 非空版本时返回 `stageAdvanced=false` 与结构化 `reason`。" +
+        "`round` 须为**正整数**（阶段轮次从 1 起；0 / 负数 / 小数 ⇒ `stage_gate1_invalid_round`），`docHash` 必填非空" +
+        "（空 ⇒ `stage_objection_field_required`）—— 确认对象是**具体版本**的哈希，不是「某份不存在的文档」。" +
+        "**三枚校验**（v0.11.0 N6 · 裁决 A9）：本轮必须有在册合成行（无 ⇒ `stage_gate1_round_not_found`）、" +
+        "`docHash` 必等于该在册行的 `doc_hash`（不符 ⇒ `stage_gate1_doc_hash_mismatch`）、" +
+        "`docVersion`（可缺省 = 按 `v{round}` 归一）必等于该在册行正文的版本（不符 ⇒ `stage_gate1_doc_version_mismatch`）" +
+        "—— 三种不符都是**结构化拒**，不留痕、不落列。" +
+        "校验通过 ⇒ 留痕之外把确认落到那一枚合成行的 `confirmed_doc_hash` / `confirmed_at`（同一条 UPDATE）。" +
+        "payload 带 `featureState` = **当场 Feature 态快照**（观测用，本口不改它）。" +
+        "幂等 = `(featureId, round, docHash)` ⇒ 同一版确认两次得同一串、索引拒重，`confirmedAt` 返回**首次**时刻（重放不刷新）；已迁入改造方案后不重复迁移。" +
+        "与 `a2a_feature_advance` / `a2a_feature_approve` 的错误码**刻意不复用**（两口语义不同，防执行侧混用）。",
+      inputSchema: {
+        featureId: z.string().min(1).describe("Feature ID"),
+        round: z.number().describe("被确认的阶段轮次（正整数，从 1 起）"),
+        docHash: z.string().describe("被确认的文档哈希（必填非空，且须等于当轮在册合成行的 doc_hash）"),
+        docVersion: z
+          .string()
+          .optional()
+          .describe("被确认的确认单版本（缺省 = 引擎按冻结口径 v{round} 归一；给了就须与在册那份一致）"),
+        version: z
+          .string()
+          .optional()
+          .describe("可选 Group Version；传入即同事务排期 + 确认 + 迁入改造方案，省略则保持只确认不流转"),
+      },
+    },
+    async (args) => {
+      try {
+        const outcome = core.gate1Confirm({
+          featureId: args.featureId,
+          round: args.round,
+          docHash: args.docHash,
+          docVersion: args.docVersion,
+          version: args.version,
+        });
         return outcome.ok ? textResult(outcome) : errorResult(outcome);
       } catch (err) {
         return internalError(err);

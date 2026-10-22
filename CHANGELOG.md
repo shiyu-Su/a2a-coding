@@ -2,6 +2,35 @@
 
 本项目的所有重要变更都记录在此文件。格式参考 [Keep a Changelog](https://keepachangelog.com/zh-CN/1.1.0/)，版本号遵循 [语义化版本](https://semver.org/lang/zh-CN/)。
 
+## [v0.11.0] - 2026-10-22
+
+> 主题：**引擎内建阶段轮与综合分析（R1 主轨 + 需求确认单在册）** + **异议处置面闭环** + **板侧自跑 agent 退役** + **假完成修复（provider 分类）**。主需求 `e23194a1`（引擎内建轻量分析 Agent）· R1 `6bd1cb6a`（+增补 `52ff537d`）· `3be3d433`（确认即过门/异议带轮）· `870c84ba`（退役板侧自跑 agent）· `7133d445`（provider 假完成，+增补 `6d0513cf`）；其余异议面与收尾 13 张。**触达面 = board / orch / machine / flow 四侧**；board `0.13.1 → 0.14.0` · orch `0.12.1 → 0.13.0` · flow 四戳 `v0.10.8 → v0.11.0` · machine Project Version `0.11.0`（载体保持 `0.10.2`）；**协议 `2.3 → 2.4`**（`failureKind` 取值集合加成员 `provider`，两侧同升同批重启）。根回归见 `reports/v0.11.0/`。tag `board/v0.14.0` + `orch/v0.13.0` + `flow/v0.11.0` + `machine/v0.11.0` + 组列车 tag `v0.11.0`。
+
+### Added
+
+- **阶段轮（Stage Run / Stage Task）模型 + Step 0 全量广播 + 综合分析任务化**（R1 `6bd1cb6a`，增补 `52ff537d`）——阶段行统一进 `tasks`（`task_key` / `round` / `relevance` / `decision` / `reason` / `based_on_rev` + partial 唯一索引，零新表）；Step 0 由引擎按本组全员物化并广播、不预筛；收口后由引擎自动生成综合分析。
+- **引擎内建轻量分析 Agent + 需求确认单在册**（`e23194a1`）——确认单改为**引擎侧结构化在册**（`docVersion` + `sections` + `docHash`），门① 三前提（version 非空 ∧ 现版在册 ∧ 经板 `gate1_confirm` 确认）；板侧宿主综合分析链退休。
+- **综合分析 LLM 生产装配与凭据**（`9099d5da` / `6b398536`）——`setStageSynthesisLlmProvider` 接线补齐；`LlmConfig` 支持 `apiKey`（有值才发 `Authorization`）。
+- **确认即过门（含排期）+ 异议带轮 + 任务清单含阶段任务**（`3be3d433`）；**异议处置面**：逐段展开填写、未处置异议清单、确认与开轮同区、一部分歧义按 `synthesis.docVersion` 锚定（`693cad87` / `33c3e399` / `08026d4f` / `0cb2d1db` / `836563b8` / `d6772066` / `f919e485` / `2c50f39e`）。
+- **`failureKind` 新增 `provider`**（PROTOCOL 2.4）——machine 源头（ACP `rpc` 错误 + 回合文本两条入口）+ orch 短回执兜底双层识别；`task.settled` payload 携带 `failureKind` 与命中片段；五模式清单与机器可解析锚点落 `PROTOCOL.md`。
+
+### Changed
+
+- **板侧自跑 agent 路径退役**（`870c84ba`）——建卡 == `a2a_feature_create`；`host-bridge` / `host-turn` / `host-relay` / `heartbeat` 删除，板不再拉起 agent、也不再有「让 agent 继续」入口。
+- **依赖图判据只认 DAG**（`89666b60`）——阶段行与 inquiry 行不再被画进依赖图。
+- **版本**：根 `0.10.8 → 0.11.0`；board `0.13.1 → 0.14.0`；orch `0.12.1 → 0.13.0`；flow 四戳 `v0.11.0`；machine 载体保持 `0.10.2`（Project Version `0.11.0`）。
+
+### Fixed
+
+- **假完成：provider 错误被结算为 `completed`**（`7133d445`）——真实 402（欠费/限流/鉴权）与短回执错误文本一律结 `failed` + `failureKind=provider`，正文原文保留。
+- **provider 门入口② 长度口径**（`6d0513cf`）——`<300` 改为量回执正文而非 `text + artifacts` 拼接体；修复「codex 把同一段 402 同时写进 text 与 artifact ⇒ 拼接 ≥300 ⇒ 门被跳过」导致的源头误报 `completed`。
+- **迁移退役后残留断言**（`a4bd013d`）——板侧回到 0 fail。
+
+### Notes
+
+- **发版轮 pin 更新**：协议 `2.3 → 2.4`（含六类→七类断言）、版本字面（根 `0.11.0` / board `0.14.0` / orch `0.13.0` / flow 四戳 `v0.11.0`）、文档模板章节锚；**退役面锚改负向**（host-bridge / host-relay / heartbeat / host-turn-ledger 不在盘）。
+- **根回归 1441/1441 全绿**（`reports/v0.11.0/regression-report.json`）；单元侧 machine 649/649 · orch 1146 · board 1457（含已知并发瞬态 `BD19-①`，单跑即绿）。
+
 ## [v0.10.8] - 2026-10-19
 
 > 主题：**单元 README 收窄（三段形态 + 配置语义外置 `config/配置说明.md`，并在测试期两轮再收窄）** + **任务展示收进需求卡片（移除独立任务页）** + **询问任务「待澄清」收口**。主需求 `e3e9b761`（四单元 README 重排 · 23 节点）⇒ 增补 `be7eb261`（再收窄；board 由用户自办）⇒ `79a6fa65`（orch 重做 · 前节点假完成）⇒ `52fdaaf0`（orch 行级锚补正）；`d78b74f5`（任务收进卡片 · 移除任务页）⇒ 增补 `513b58f3` / `43af0790`；`849445f3`（待澄清收口）· `1130e9a4`（项目组空间任务页 chip 切换）。**触达面 = board / orch / flow（代码）+ machine（仅文档面）**；**停同升分组第九次实操**：board `0.13.0 → 0.13.1` · orch `0.12.0 → 0.12.1` · flow 四戳 `v0.10.7 → v0.10.8`；**machine 载体保持 `0.10.2`**（本列车仅动其 README / 配置说明，无代码变更），其 Project Version `0.10.8` 按台账在册、载体不抬；**协议 2.3 不动**。根回归见 `reports/v0.10.8/`。tag `board/v0.13.1` + `orch/v0.12.1` + `flow/v0.10.8` + 组列车 tag `v0.10.8`。

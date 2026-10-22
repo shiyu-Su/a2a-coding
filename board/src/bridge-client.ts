@@ -136,6 +136,10 @@ export interface FeatureTaskItem {
   mode: string | null;
   /** 任务阶段原样透传（值域归桥，口径同 `taskType`）。缺键 ⇒ null，**不回落「需求分析」**；与 Feature 顶层 `stage` 不同源。 */
   stage: string | null;
+  /** 阶段成员行的命名键（仅引擎 `mode=stage` 行下发；其它行缺键 ⇒ null）。 */
+  taskKey: string | null;
+  /** 阶段成员行的轮次（仅引擎 `mode=stage` 行下发；其它行缺键 ⇒ null）。 */
+  round: number | null;
 }
 
 /**
@@ -164,6 +168,132 @@ export interface AcceptanceView {
   stages: AcceptanceStageView[];
   failures: AcceptanceFailureView[];
   stateCounts: StateCounts;
+}
+
+/**
+ * `stageRuns[].reachability` 的闭集（引擎自报「该 project 当前是否可派发」）。
+ * **闭集外值一律 fail-closed 收敛为 `unknown`**（宿主已裁：不猜「可派发」）——
+ * 解析层的值域即这三枚，缺键 / 脏值 / 蛇形键都落 `unknown`，渲染侧据 `unknown` 显「未知」而非「可派发」。
+ */
+export type StageRunReachability = "dispatchable" | "no_runner" | "unknown";
+
+/**
+ * 一格阶段轮的**完成度四计数 + 分母**（引擎直出）。**板不得重演收口 / 完成度判据** ——
+ * 逐键 `num` 直透（缺键 / 非数字 ⇒ `null`，不臆造、不互校），口径同 {@link EngineProjectVersionEntry} 的计数。
+ */
+export interface StageRunCompleteness {
+  /** 分母（应答题数）。 */
+  expected: number | null;
+  settledCount: number | null;
+  pendingCount: number | null;
+  invalidCount: number | null;
+  staleCount: number | null;
+}
+
+/**
+ * 一格阶段轮内**一个 project 的应答行**（`stageRuns[].projects[]`）。
+ * 除 {@link StageRunProjectView.reachability} 外全部**原样透传**（值域归引擎，板不译写 / 不校验 / 不设闭集假设，
+ * 口径同 `taskType` / `queueState`）；**camelCase 单形，不做蛇形双形容错** ⇒ 蛇形键 ⇒ 对应字段 `null`。
+ */
+export interface StageRunProjectView {
+  projectId: string | null;
+  taskId: string | null;
+  relevance: string | null;
+  decision: string | null;
+  reason: string | null;
+  answerState: string | null;
+  /** 闭集三值；闭集外 / 缺键 ⇒ `unknown`（fail-closed，见 {@link StageRunReachability}）。 */
+  reachability: StageRunReachability;
+  taskState: string | null;
+}
+
+/**
+ * 一格阶段轮的**合成确认单段落**（改造文档 §2.2 A2/A6 冻结形态 `sections[{ id, title, content, sources }]`，
+ * R1 B4 交互面的唯一事实源；v0.11.0 B2 起**填充源换为引擎合成行**，字段名不变 ⇒ 既有渲染不破）。
+ * **整节缺键 / 非数组 ⇒ `[]`**（= 本轮尚无合成产出 ⇒ 确认单不渲段落，板不自行归纳段落、
+ * 不回落逐 project 结论冒充）。`title` = 节标题（**缺位 ⇒ 空串，不丢整节**）。
+ * `sources` = 该段的**来源清单**（引擎直出；异议后由**宿主**据此反解 `projectIds` ⇒ **板不在此判范围**）。
+ * 条目形态**单向归一**（只取标识、不重组结构）：字符串条目原样；对象条目按 `projectId` → `id`
+ * 首命中取标识，取不到 ⇒ 丢该条目（不猜、不造占位）。逐键 camelCase 单形，**不做蛇形双形容错**。
+ */
+export interface StageSectionView {
+  id: string | null;
+  title: string;
+  content: string | null;
+  sources: string[];
+}
+
+/**
+ * 引擎挂在 `stageRuns[].objections[]` 的段落异议投影（v0.11.0 流程闭环）。
+ * `disposed` 由引擎按「其后是否已有 `stage.round_open`」给出；板只消费该事实，
+ * 不重放事件、不再算第二套「未处置」定义。
+ */
+export interface StageRunObjectionView {
+  objectionId: string | null;
+  sectionId: string | null;
+  sectionTitle: string | null;
+  text: string;
+  docVersion: string | null;
+  createdAt: string | null;
+  disposed: boolean;
+}
+
+/**
+ * 合成行态的**四值闭集**（宿主裁决 A8：**不新增状态词汇**）。
+ * 闭集外 / 缺键 ⇒ `null`（不造第五枚词元、不猜档位；显示口径归消费侧）。
+ */
+export type StageRunSynthesisState = "pending" | "working" | "done" | "failed";
+
+/**
+ * 轮格上的**合成对象**（宿主裁决 A8 读面形态，v0.11.0 B2）：引擎收口后物化的合成行
+ * （`task_key='synthesis'`，`project_id='__engine__'`）对板的唯一投影面；`docVersion`/`docHash`
+ * 承自落库列 `synthesis_json`/`doc_hash`，`confirmedDocHash`/`confirmedAt` = 「用户确认了哪一版」（A2 四列）。
+ * **板不自判闸、不比较哈希**（`confirmedDocHash` ⇄ `docHash` 的比较在派生层单点，另节点）。
+ * 逐键容错展开（缺键 / 脏值 ⇒ `null`），camelCase 单形，蛇形键 ⇒ 对应字段 `null`（不回落）。
+ */
+export interface StageRunSynthesisView {
+  state: StageRunSynthesisState | null;
+  taskId: string | null;
+  docVersion: string | null;
+  docHash: string | null;
+  confirmedDocHash: string | null;
+  confirmedAt: string | null;
+  /** 轮次（值域归引擎，`num` 直透不重算；缺键 / 非数字 ⇒ `null`，不猜）。 */
+  rounds: number | null;
+}
+
+/**
+ * 引擎 `a2a_feature_status` 顶层 `stageRuns[]` 的一格（**不动** `feature.stage`、**不动** `acceptance.stages[]`）。
+ * 容错口径对齐 {@link parseAcceptance}：**整节缺键 / 非数组 ⇒ `null`**（= 不渲的现行为，见
+ * {@link FeatureDetailView.stageRuns}）；非 null ⇒ 逐键容错展开（缺键 ⇒ `null` / `[]`，不抛、不臆造）。
+ */
+export interface StageRunView {
+  stage: string | null;
+  round: number | null;
+  basisRev: string | null;
+  docVersion: string | null;
+  /** 三态布尔（`boolean | null`）：非真非假 ⇒ `null`，板不替引擎猜缺省（口径同 `releasable`）。 */
+  settled: boolean | null;
+  completeness: StageRunCompleteness;
+  unanswered: string[];
+  projects: StageRunProjectView[];
+  /**
+   * 合成《需求确认单》段落（R1 B4 交互面事实源，改造文档 §2.2 `sections[{ id, title, content, sources }]`）：
+   * 引擎直出，板不自行归纳段落。缺键 / 非数组 ⇒ `[]`（= 本轮无合成产出 ⇒ 确认单不渲）。
+   */
+  sections: StageSectionView[];
+  /**
+   * 本轮**合成对象**（宿主裁决 A8，v0.11.0 B2）：**整节缺键 / 非对象 ⇒ `null`**
+   * （不臆造；引擎合成行未出时板即现行为「无合成」，容错口径对齐 `settled` 三态 ——
+   * 缺位与非法形状都不猜）；对象 ⇒ 逐键 {@link StageRunSynthesisView}。
+   */
+  synthesis: StageRunSynthesisView | null;
+  /**
+   * 本格对应 `docVersion` 上的段落异议。整节缺键 / 非数组 ⇒ `[]`
+   * （老桥无该投影）；条目缺 `text` / 正文空白 ⇒ 丢该条，不造占位。
+   */
+  objections: StageRunObjectionView[];
+  allowedActions: string[];
 }
 
 export interface FeatureDetailView {
@@ -199,6 +329,13 @@ export interface FeatureDetailView {
    * `[]` ⇒ 空数组 = 合法事实「该需求未归属任何 project」（与 null 的「面不可读」必须可区分）。
    */
   projects: { projectId: string; version: string }[] | null;
+  /**
+   * 详情出参**顶层** `stageRuns[]`（R1 B1 读面：阶段工作可追踪，v0.11.0）：
+   * 数组 ⇒ 逐格 {@link StageRunView}（引擎直出完成度，板不重演判据）；
+   * **键缺位 / 非数组 ⇒ `null`**（= 整节不渲的现行为，容错口径对齐 {@link acceptance}，缺面 ≠ 空面）；
+   * `[]` ⇒ 合法零轮次（与 null 的「面不可读」必须可区分）。
+   */
+  stageRuns: StageRunView[] | null;
 }
 
 /** `GET /api/projects` 归一视图（快照语义：`observedAt` + note，非实时在线） */
@@ -312,7 +449,8 @@ export interface EngineVersionEntry {
   org: string;
   version: string;
   /**
-   * 版本状态（三态 `notstart / active / released`）。值域**不归一、不校验、不回落** —— 非字符串 ⇒
+   * 版本状态（流程闭环新面 `open / released`；存量 Group 台账 `notstart / active / released`）。
+   * 值域**不归一、不校验、不回落** —— 非字符串 ⇒
    * `null`，由消费侧按**白名单** `{notstart, active}` 处理（REQ-2026-10-15-05 N1 / N8）：
    * **脏值 / `null` ⇒ 拒删侧**（可删版号集合只认两枚字面取值，未知状态一律不入集 —— 只紧不松）。
    * 旧句式「按非 `released` 处理」**已作废** —— 黑名单会把缺键 / 脏值当成可删。
@@ -464,6 +602,11 @@ function bool(v: unknown): boolean {
   return v === true;
 }
 
+/** 三态布尔：`true`/`false` 原样，其余（缺键 / 脏值）⇒ `null`（板不替引擎猜缺省，口径同 `releasable`）。 */
+function triBool(v: unknown): boolean | null {
+  return v === true ? true : v === false ? false : null;
+}
+
 function strArray(v: unknown): string[] {
   return Array.isArray(v) ? v.filter((x): x is string => typeof x === "string") : [];
 }
@@ -559,6 +702,8 @@ export function parseFeatureDetail(json: unknown): FeatureDetailView {
       taskType: str(t.taskType),
       mode: str(t.mode),
       stage: str(t.stage),
+      taskKey: str(t.taskKey),
+      round: num(t.round),
     };
   });
   return {
@@ -581,6 +726,7 @@ export function parseFeatureDetail(json: unknown): FeatureDetailView {
     tasks,
     acceptance: parseAcceptance(body.acceptance),
     projects: parseFeatureProjects(body.projects),
+    stageRuns: parseStageRuns(body.stageRuns),
   };
 }
 
@@ -626,6 +772,151 @@ function parseAcceptance(v: unknown): AcceptanceView | null {
     return { eventId: num(fl.eventId), at: str(fl.at), payload: str(fl.payload) };
   });
   return { stages, failures, stateCounts: parseStateCounts(v.stateCounts) ?? {} };
+}
+
+/**
+ * 顶层 `stageRuns[]`（R1 B1 读面，v0.11.0）→ {@link StageRunView} 数组（**纯函数**）。
+ *
+ * 容错口径对齐 {@link parseAcceptance}：
+ * - 键**缺位 / 非数组** ⇒ `null`（整节不渲的现行为；**缺面 ≠ 空面**）；
+ * - `[]` ⇒ 空数组（合法零轮次，与 null 可区分）；
+ * - 数组 ⇒ 逐格 {@link parseStageRun}（非对象条目归一成 null-字段行，不整条丢弃、不抛）。
+ * **不动** `feature.stage`、**不动** `acceptance.stages[]` —— 本函数只消费新增顶层键。
+ */
+export function parseStageRuns(v: unknown): StageRunView[] | null {
+  if (!Array.isArray(v)) return null;
+  return v.map(parseStageRun);
+}
+
+/** 单格阶段轮：逐键容错展开（缺键 ⇒ `null` / `[]`）；分子/分母由引擎直出，板不重演收口判据。 */
+function parseStageRun(entry: unknown): StageRunView {
+  const s = isRecord(entry) ? entry : {};
+  return {
+    stage: str(s.stage),
+    round: num(s.round),
+    basisRev: str(s.basisRev),
+    docVersion: str(s.docVersion),
+    settled: triBool(s.settled),
+    completeness: parseStageRunCompleteness(s.completeness),
+    unanswered: strArray(s.unanswered),
+    projects: Array.isArray(s.projects) ? s.projects.map(parseStageRunProject) : [],
+    sections: Array.isArray(s.sections) ? s.sections.map(parseStageSection) : [],
+    synthesis: parseStageRunSynthesis(s.synthesis),
+    objections: parseStageRunObjections(s.objections),
+    allowedActions: strArray(s.allowedActions),
+  };
+}
+
+/** 异议逐条容错：正文是唯一必需字段；`disposed` 非真即按未处置保守挡确认。 */
+function parseStageRunObjections(v: unknown): StageRunObjectionView[] {
+  if (!Array.isArray(v)) return [];
+  const out: StageRunObjectionView[] = [];
+  for (const item of v) {
+    if (!isRecord(item)) continue;
+    const text = str(item.text);
+    if (text === null || text.trim() === "") continue;
+    out.push({
+      objectionId: str(item.objectionId),
+      sectionId: str(item.sectionId),
+      sectionTitle: str(item.sectionTitle),
+      text,
+      docVersion: str(item.docVersion),
+      createdAt: str(item.createdAt),
+      disposed: item.disposed === true,
+    });
+  }
+  return out;
+}
+
+/**
+ * 合成确认单单段（v0.11.0 B2 增 `title`：**缺位 / 脏值 ⇒ 空串**，不丢整节）；其余逐键容错展开
+ * （缺键 ⇒ `null` / `[]`），口径同 {@link parseStageRunProject}，不抛、不整条丢弃。
+ */
+function parseStageSection(item: unknown): StageSectionView {
+  const x = isRecord(item) ? item : {};
+  return { id: str(x.id), title: str(x.title) ?? "", content: str(x.content), sources: normalizeSectionSources(x.sources) };
+}
+
+/**
+ * 轮格 `synthesis` 对象（宿主裁决 A8 读面）：**整节缺键 / 非对象 ⇒ `null`**（不臆造 ——
+ * 引擎合成行未出时板即现行为「无合成」，口径同 {@link parseAcceptance} 的缺面 ≠ 空面）；
+ * 对象 ⇒ 逐键容错展开。板**不比较 `docHash` ⇄ `confirmedDocHash`**（比较在派生层单点，另节点）。
+ */
+function parseStageRunSynthesis(v: unknown): StageRunSynthesisView | null {
+  if (!isRecord(v)) return null;
+  return {
+    state: parseStageRunSynthesisState(v.state),
+    taskId: str(v.taskId),
+    docVersion: str(v.docVersion),
+    docHash: str(v.docHash),
+    confirmedDocHash: str(v.confirmedDocHash),
+    confirmedAt: str(v.confirmedAt),
+    rounds: num(v.rounds),
+  };
+}
+
+/** 四值闭集单点：闭集外 / 缺键 / 脏值 ⇒ `null`（不新增第五枚状态词元、不猜档位）。 */
+function parseStageRunSynthesisState(v: unknown): StageRunSynthesisState | null {
+  return v === "pending" || v === "working" || v === "done" || v === "failed" ? v : null;
+}
+
+/**
+ * `sources` 条目归一（**单向**：只取标识、不重组结构）：字符串条目 trim 后非空即收；
+ * 对象条目按 `projectId` → `id` 首命中；其余形态 ⇒ 丢该条目（不造占位、不猜来源）。
+ * 收齐后保序去重（同段同源重复下发不得重复成行）。
+ */
+function normalizeSectionSources(v: unknown): string[] {
+  if (!Array.isArray(v)) return [];
+  const out: string[] = [];
+  for (const item of v) {
+    const direct = typeof item === "string" ? item.trim() : "";
+    const id = direct !== "" ? direct : firstStrField(item, ["projectId", "id"]);
+    if (id === null || id === "" || out.includes(id)) continue;
+    out.push(id);
+  }
+  return out;
+}
+
+/** 对象条目里**首个非空字符串字段**（值域归引擎，板不校验；取不到 ⇒ null）。 */
+function firstStrField(item: unknown, keys: readonly string[]): string | null {
+  if (!isRecord(item)) return null;
+  for (const key of keys) {
+    const v = str(item[key]);
+    if (v !== null && v.trim() !== "") return v.trim();
+  }
+  return null;
+}
+
+/** 完成度四计数 + 分母：逐键 `num` **直透不重算**（缺 completeness / 非对象 ⇒ 五键全 `null`）。 */
+function parseStageRunCompleteness(v: unknown): StageRunCompleteness {
+  const c = isRecord(v) ? v : {};
+  return {
+    expected: num(c.expected),
+    settledCount: num(c.settledCount),
+    pendingCount: num(c.pendingCount),
+    invalidCount: num(c.invalidCount),
+    staleCount: num(c.staleCount),
+  };
+}
+
+/** 一个 project 的应答行：除 `reachability` 外全部原样透传；camelCase 单形，蛇形键 ⇒ `null`（不回落）。 */
+function parseStageRunProject(item: unknown): StageRunProjectView {
+  const p = isRecord(item) ? item : {};
+  return {
+    projectId: str(p.projectId),
+    taskId: str(p.taskId),
+    relevance: str(p.relevance),
+    decision: str(p.decision),
+    reason: str(p.reason),
+    answerState: str(p.answerState),
+    reachability: parseStageRunReachability(p.reachability),
+    taskState: str(p.taskState),
+  };
+}
+
+/** `reachability` 闭集三值；**闭集外 / 缺键 / 脏值一律 fail-closed 收敛为 `unknown`**（不猜「可派发」）。 */
+function parseStageRunReachability(v: unknown): StageRunReachability {
+  return v === "dispatchable" || v === "no_runner" ? v : "unknown";
 }
 
 /** `GET /api/features/:featureId/trace` → 进展三面视图（纯函数）。 */

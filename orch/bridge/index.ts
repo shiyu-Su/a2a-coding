@@ -20,7 +20,7 @@ import { randomUUID } from "node:crypto";
 import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 import { appRootFromModule } from "../app-root.js";
-import { aggregateProjectGroup, loadMachinesConfig, memberKey } from "../config.js";
+import { aggregateProjectGroup, defaultLlm, loadMachinesConfig, memberKey } from "../config.js";
 import { BRIDGE_VERSION } from "../version.js";
 import {
   BridgeRuntime,
@@ -72,13 +72,13 @@ import {
   listTasks,
   pruneTasks,
   truncatePrompt,
-  updateTaskState,
   close as closeSessionStore,
   type EventVisibilityScope,
   type RunnerProjectRecord,
   type RunnerRecord,
 } from "../session/store.js";
 import { bridgeLog } from "./bridge-log.js";
+import { detectProviderFailureReceipt } from "./provider-receipt.js";
 import {
   isTaskWatched,
   setTaskWatcherDegradationSink,
@@ -92,6 +92,10 @@ import {
  */
 import { resolveTaskLookup } from "./task-lookup.js";
 import { createRunnerEndpoints, type RunnerEndpointHandle } from "./runner.js";
+import { settleStageTaskOnSettled } from "./stage-settle.js";
+import { persistWatchedTaskTerminal } from "./watcher-persist.js";
+import { createLlmClient } from "./llm-client.js";
+import { setStageSynthesisLlmProvider } from "./stage-synthesis.js";
 import { createVersionsEndpoints } from "./versions-endpoints.js";
 import { createProjectVersionsEndpoints } from "./project-versions-endpoints.js";
 import { activateVersionForFeature } from "./versions-activation.js";
@@ -102,14 +106,19 @@ import {
   type FeatureDispatchResult,
 } from "./scheduler.js";
 import {
+  handleDocObjection,
   handleFeatureAdvance,
   handleFeatureApprove,
   handleFeatureCancel,
   handleFeatureCreate,
   handleFeatureStatus,
   handleFeatureTrace,
+  handleGate1Confirm,
+  handleStageRoundOpen,
   ownershipFailure,
   projectTaskVisibility,
+  type DocObjectionArgs,
+  type DocObjectionExit,
   type FeatureAdvanceArgs,
   type FeatureAdvanceSuccess,
   type FeatureApproveArgs,
@@ -123,6 +132,10 @@ import {
   type FeatureToolFailure,
   type FeatureTraceArgs,
   type FeatureTraceSuccess,
+  type Gate1ConfirmArgs,
+  type Gate1ConfirmExit,
+  type StageRoundOpenArgs,
+  type StageRoundOpenExit,
   type TaskDiagnosticsView,
 } from "./feature-tools.js";
 import {
@@ -867,10 +880,7 @@ function startLocalTaskWatcher(taskId: string): void {
     taskId,
     poll: () => watchedTaskView(taskId),
     isSettled: isSettledView,
-    persist: (task) => {
-      // 复用 updateTaskState 路径（CAS；已终态行不覆盖、不重复写 `task.settled` 事件）
-      updateTaskState(task.taskId, task.state, task.artifactsJson, task.text);
-    },
+    persist: persistWatchedTaskTerminal,
     isClaimStale: isClaimHeartbeatStale,
     reclaimStale: () => {
       const handle = runnerEndpoints;
@@ -907,6 +917,22 @@ function startLocalTaskWatcher(taskId: string): void {
        */
       if (featureId !== null) {
         scheduler.notifyTaskSettled(featureId, taskId, { state: task.state, text: task.text });
+      }
+      /**
+       * **结算后区 · 阶段轮回执结算钩子第二触发点**（R1 · v0.11.0 orch-N4）：
+       * `mode='stage'` 行被 `isDagNode` 排除、不进 DAG 续推面 ⇒ 其结算落库不能只指望
+       * `/runner/result` 一次到达（orphan 墙钟终态、回传与看护竞速等场景只剩本路径可见）。
+       * 与 runner 第一触发点共用 `settleStageTaskOnSettled`——**以库中重读行为准**，
+       * 后到者幂等早退（`already-valid` / 重派 CAS `retry_count=0` 前置闩）。
+       * 异常仅 warn：终态落库与上面的续推通知都不反噬。
+       */
+      try {
+        settleStageTaskOnSettled(task.taskId);
+      } catch (err) {
+        bridgeLog.warn(
+          "a2a-bridge",
+          `看护结算后区阶段行结算钩子失败（不影响收尾，taskId=${taskId}）：${toMessage(err)}`,
+        );
       }
     },
     pollIntervalMs: TASK_WATCHER_POLL_INTERVAL_MS,
@@ -991,7 +1017,24 @@ export async function dispatchTask(input: DispatchTaskInput): Promise<DispatchOu
       // 「已结算未记账」中间态）；同 context 多命中时只结算最新一枚，其余留给清理脚本（M3）。
       const predecessor = store.findOpenInquiryPredecessor(contextId, taskId);
       if (predecessor !== null) {
-        store.updateTaskState(predecessor.taskId, "completed", null, null, taskId);
+        // v0.11.0 O6（写前翻态，与 O3 `bridge/runner.ts` / O5 `bridge/watcher-persist.ts` 同口径）：
+        // predecessor 正文 = provider 错误短回执 ⇒ 改判 `failed` + `failure_kind='provider'`；
+        // **未命中 ⇒ 逐字走原 `completed` 路径**（两支同一条 `updateTaskState` 形参面：
+        // `settledBy` 语义、归档口径、`text`/`artifacts` 原文一律不动）。
+        const providerReceipt =
+          typeof predecessor.text === "string"
+            ? detectProviderFailureReceipt(predecessor.text)
+            : null;
+        if (providerReceipt !== null) {
+          bridgeLog.warn(
+            "a2a-bridge",
+            `predecessor 结算 completed 命中 provider 错误短回执 ⇒ 写前改判 failed（taskId=${predecessor.taskId} marker=${providerReceipt.marker} snippet=${providerReceipt.snippet}）`,
+          );
+          store.updateTaskState(predecessor.taskId, "failed", null, null, taskId);
+          store.setTaskFailureKind(predecessor.taskId, "provider");
+        } else {
+          store.updateTaskState(predecessor.taskId, "completed", null, null, taskId);
+        }
       }
     });
   }
@@ -1377,15 +1420,19 @@ function registerFeatureNode(
   const deps = dependencies.length > 0 ? Array.from(new Set(dependencies)) : null;
   /**
    * **dep 双闸 · 闸①（v0.10.8 orch-N7 · 改造文档 §2.1 O-4）**：`dependencies` 命中
-   * `mode="inquiry"` 的行 ⇒ **即时结构化拒**（仍置于 `createTask` **之前** ⇒ 零脏行）。
+   * **非 DAG 节点**的行（`mode="inquiry"` / R1 · v0.11.0 起的 `mode="stage"`）⇒ **即时结构化拒**
+   * （仍置于 `createTask` **之前** ⇒ 零脏行）。
    * 判据与闸②（`validateDag`）同源，共用 {@link isDagNode}，不开第三口子
-   * （MCP 工具面与网页直调都经本口）。
+   * （MCP 工具面与网页直调都经本口；判据本卡翻正为 `mode === "dag"`，闸的位置与形状不动）。
    *
    * 为什么必须拦：inquiry 行自 O-2 起亦携带 `featureId` ⇒ 会落进同一 Feature 的任务集，
    * `validateDag` 的悬空引用判据**放行**它；而它不由调度器派发，`depStateOf` 于是让下游
    * 按一个只读行的态做 gating（该行 `failed` / `blocked` ⇒ 下游恒 `upstreamFailed`、永不派发）。
    *
    * 悬空引用（`getTask` 未命中）照旧不在此处判 —— 留给 `validateDag`，本闸不扩权。
+   *
+   * ⚠️ 码字面 `dependency_is_inquiry` **不改**（板 / 回归锚定它）；文案里的 mode 值取自行本身
+   * ⇒ 拒 `stage` 行时不会谎报 `inquiry`。
    */
   if (deps !== null) {
     for (const dep of deps) {
@@ -1395,7 +1442,7 @@ function registerFeatureNode(
           ok: false,
           code: "dependency_is_inquiry",
           error:
-            `依赖 ${dep} 是只读询问节点（mode="inquiry"），不可作为 DAG 前置：` +
+            `依赖 ${dep} 不是 DAG 节点（mode="${depNode.mode}"），不可作为 DAG 前置：` +
             `它不参与调度器派发。需要前置关系请改用 mode="execute" 登记该节点。`,
           contextId,
         };
@@ -2100,6 +2147,19 @@ export interface BridgeCore {
    */
   featureTrace(args: FeatureTraceArgs): FeatureTraceSuccess | FeatureToolFailure;
   /**
+   * **R1 阶段轮 · 开轮**（v0.11.0 N7 · 改造文档 §2.5 写口 1）：物化一格 `(feature, stage, round)`
+   * 的 PM 回执行（**零新表**：写 `tasks` 的七枚 R1 列）。
+   * 本口是 `createCore` 的**唯一 R1 派生装配点** —— 成员清单在此经 machines 配置按连接身份解析后
+   * **注入** `handleStageRoundOpen`（`feature-tools.ts` 是纯数据层、不读配置面），成功出口对
+   * `created[]` 逐行做一次**最佳努力**唤起（时延优化，非投递保证；离线成员照常建行、入队待领）。
+   * ★ **不改主链状态机**：零 `canTransition`、零 `features.state` 写。
+   */
+  stageRoundOpen(args: StageRoundOpenArgs): StageRoundOpenExit;
+  /** **R1 阶段轮 · 口径异议**（§2.5 写口 2）：只留痕（`events` + 幂等键），**不开轮、不动行** */
+  docObjection(args: DocObjectionArgs): DocObjectionExit;
+  /** **R1 阶段轮 · 门① 确认留痕**（§2.5 写口 3）：只留痕，**不触 `canTransition`、不流转** */
+  gate1Confirm(args: Gate1ConfirmArgs): Gate1ConfirmExit;
+  /**
    * **O1 受控写**（v0.9.4 REQ-2026-09-26-01 §2.3）：`config.json` 的 `projectGroup` 段
    * 单组操作（五操作闭集；拒绝整文档替换）。**全组面工具**：配置面写**不受**调用方组
    * 可见性限制（identity=null 运维连接语义，边界 R2 冻结口径）⇒ 装配**不吃身份**。
@@ -2107,6 +2167,29 @@ export interface BridgeCore {
   configWriteGroup(args: ConfigWriteGroupArgs): Promise<ConfigWriteGroupOutcome>;
   /** 工具返回后统一 kick 调度器（Feature 工具组用） */
   kickScheduler(): void;
+}
+
+/**
+ * **开轮物化行的最佳努力唤起**（v0.11.0 N7）：`handleStageRoundOpen` 已逐行 `enqueueTask`
+ * （建队 = 投递保证），本函数只做「立即下发」这一层**时延优化** ⇒ 任何失败一律静默吞掉，
+ * 绝不影响开轮成功出口（与 `dispatchTask` ④ 的 `wakeRunner` 同一语义）。
+ *
+ * 逐行 `locateProject` 现读注册表投影（零出站）；解析失败 = 该 project 此刻无在线落点
+ * （离线成员 ⇒ `reachability='no_runner'`）⇒ 行仍留队列，Runner 下轮轮询照常领取。
+ */
+function wakeForStageRows(
+  created: readonly { projectId: string; taskId: string }[],
+  identity: string | null,
+): void {
+  for (const row of created) {
+    void locateProject(row.projectId, identity)
+      .then((located) => {
+        if (located.ok) wakeRunner(located.machine.machineId);
+      })
+      .catch(() => {
+        // 唤起是时延优化：解析异常同样不改变「行已入队」的事实
+      });
+  }
 }
 
 /**
@@ -2147,6 +2230,25 @@ export function createCore(identity: string | null = null): BridgeCore {
     // 只读面同样按身份做归属校验（他组 Feature 不可见）；无身份 ⇒ 全量放行（与五口同判据）
     featureTrace: (args): FeatureTraceSuccess | FeatureToolFailure =>
       handleFeatureTrace(args, identity),
+    // R1 阶段轮三写口（v0.11.0 N7）：**成员清单在此解析后注入**（feature-tools 不读配置面），
+    // 解析路径与 `resolveEventScope` 同一条（identity → group → 去重排序的 projectId 清单）。
+    stageRoundOpen: (args): StageRoundOpenExit => {
+      const config = loadMachines();
+      if (!config.ok) {
+        return {
+          ok: false,
+          code: "machines_config_error",
+          error: config.error,
+        };
+      }
+      const group = resolveGroup(identity, config.groups);
+      const members = Array.from(new Set(group.members.map((m) => m.projectId))).sort();
+      const outcome = handleStageRoundOpen(args, members, identity);
+      if (outcome.ok) wakeForStageRows(outcome.created, identity);
+      return outcome;
+    },
+    docObjection: (args): DocObjectionExit => handleDocObjection(args, identity),
+    gate1Confirm: (args): Gate1ConfirmExit => handleGate1Confirm(args, identity),
     // O1 配置面写：**全组面**，刻意不吃 identity（R2 冻结：配置面写不受组可见性限制）
     configWriteGroup: (args): Promise<ConfigWriteGroupOutcome> =>
       writeGroupConfig(MACHINES_CONFIG_PATH, args),
@@ -2381,6 +2483,16 @@ async function startHttpBridge(): Promise<void> {
   });
   // O5：看护 owner 门闩接入登记表（follower 停用 ⇒ /health `degraded[]` 增一项）
   setTaskWatcherDegradationSink(degradations);
+  /**
+   * 合成 LLM 生产接线（v0.11.0 N1）：provider 为**延迟构造闭包**——启动期零网络，每次合成
+   * 现读 `machines.json` 的 `llm` 段（段缺省回落 `defaultLlm()`，配置热改即时生效）；
+   * 读取失败也照常回落缺省构造，不因端点未起 / 配置异常拖垮桥启动。
+   */
+  setStageSynthesisLlmProvider(() => {
+    const cfg = loadMachines();
+    const llmCfg = cfg.ok ? loadMachinesConfig(MACHINES_CONFIG_PATH).llm : undefined;
+    return createLlmClient(llmCfg ?? defaultLlm());
+  });
   /**
    * 版本台账端点（v0.10.0 O2a）：仅常驻 http 形态创建，**委托形态照 `/runner/*` 先例**。
    * `role` 用惰性闭包（同上，角色在 `runtime.start()` 才定）；写路的 owner 门闩由处理器自检。

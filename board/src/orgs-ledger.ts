@@ -6,12 +6,12 @@
  * board R1 ①(2)）；建组织（BD1）= 纯新建 `disabledAt = null`，停用（= 板上的「删除」，BD3 A3）
  * 经 {@link disableOrg} 写 `disabledAt`；**不物理删目录** ⇒ 同名重建 = 复活该条记录（零迁移，见 {@link addOrg}）。
  *
- * 原子写复用 `host-bridge-ledger.ts` 的 {@link writeFileAtomic}（tmp + rename + 建父目录）；
+ * 原子写复用 `atomic-write.ts` 的 {@link writeFileAtomic}（tmp + rename + 建父目录）；
  * 板是单进程单写手，与宿主桥台账同口径**不加文件锁**。
  */
 import { readFileSync } from "node:fs";
 import { join, resolve } from "node:path";
-import { writeFileAtomic } from "./host-bridge-ledger.js";
+import { writeFileAtomic } from "./atomic-write.js";
 
 /** 台账 schema 版本（v0.9.8：记录扩 `agentKind`/`agentModel` 两键 ⇒ 1→2。**零迁移** —— 读侧不设版本门、
  * 不做读时升级（{@link parseOrgsLedger} 保留文件自带 version，{@link serializeOrgsLedger} 恒写本常量

@@ -1,8 +1,8 @@
 /**
  * 板写面守卫与入参解析（BD7 · BD8 扩两条 · BD9 再扩两条 · BD16 修「来源不可知」误判 · v0.9.2 M3 再扩一条 ·
- * v0.9.4 A1/A3 再扩一条 · BD4 再扩一条）—— **纯函数**（不依赖 http 类型，便于离线单测）。
+ * v0.9.4 A1/A3 再扩一条 · BD4 再扩一条 · v0.11.0 R1 B2 再扩两条）—— **纯函数**（不依赖 http 类型，便于离线单测）。
  *
- * 放开的写路径共十一条，方法**恒为 POST**： * - `POST /requirements`          —— 提需求（BD7）；
+ * 放开的写路径共十四条，方法**恒为 POST**： * - `POST /requirements`          —— 提需求（BD7）；
  * - `POST /features/:id/turn`     —— 触发宿主桥的一轮（BD8）；
  * - `POST /host/:org/stop`        —— 停桥（BD8，**与上两条同规格**：守卫头 / 同源校验）；
  * - `POST /features/:id/confirm`  —— 人工确认指令（BD9，投消息给 agent，**板不批准**）；
@@ -16,7 +16,17 @@
  * - `POST /orgs/{org}/members`    —— 成员写（v0.9.4 B 档 / BD4，**一条路由**靠 `action` 分「增 / 删」）：经 `group-admin.ts`
  *   以组身份调 O1 的受控写工具（配置面组写），**板绝不直写 orch/config.json**；
  * - `POST /versions`              —— 版本台账写（v0.9.4 N1，`action` 三值闭集 create/remove/setStatus 分流；
- *   写板侧版本台账 `.data/versions.json`；**不触桥、不写状态机**）。
+ *   写板侧版本台账 `.data/versions.json`；**不触桥、不写状态机**）；
+ * - `POST /features/{id}/stage-round-open` —— **开阶段轮**（v0.11.0 R1 · B2）：转发引擎同名写工具
+ *   `stage_round_open(featureId, stage, sources?, targetProjects?, basisRevInput?)`；板**不写状态机**，
+ *   幂等由引擎侧 partial 唯一索引保证（重复调用 ⇒ 返回既有轮）；
+ * - `POST /features/{id}/doc-objection` —— **记段落异议**（v0.11.0 R1 · B2 + 836563b8）：转发引擎同名写工具
+ *   `doc_objection(featureId, docVersion, sectionId, objectionText, targetType?, projectIds?)`；
+ *   **引擎口本身不自动开轮**，是**板路由**在 ① 成功后同一请求内串 `stage_round_open`（见 `server.ts`）。
+ *   **`gate1_confirm` 由用户裁定 U3 + 宿主裁决 A9 获准进板写白名单**（板转发，见下一条）；
+ * - `POST /features/{id}/gate1-confirm` —— **门① 确认转发**（v0.11.0 B1）：转发引擎同名写工具
+ *   `gate1_confirm(featureId, docVersion, docHash)`；板**只转发、不写状态机、不自判闸、不重算 docHash**
+ *   （校验归引擎）。
  * 三件事收敛在这里：
  * - {@link parseWriteRoute}：方法门的放行白名单（含路径参数提取；其余路径的非 GET 仍 405，负向用例钉住）；
  * - {@link checkWriteAuth}：CSRF 防线（自定义头优先；无 JS 的表单退而求 Origin/Referer 同源，
@@ -39,6 +49,9 @@
  * - {@link parseSuspendForm}：`POST /features/:id/suspend` 表单（v0.9.5 C7 · T7）—— `turnId` 必填 +
  *   `pending[]` 清单（可重复键，逐项非空；空 = 纯 DAG 监视）+ 可选 `wakeCond`（有界不透明串）。
  *   **归属校验（turnId 必须等于该需求最新板发轮）不在本函数**，落 handler（需读轮管理器）。
+ * - {@link parseStageRoundOpenForm} / {@link parseDocObjectionForm}：阶段面两写口表单（v0.11.0 R1 · B2）——
+ *   必填键 trim 后非空、可选键 carried-only、异议文本单字段上限 {@link MAX_OBJECTION_TEXT_BYTES}；
+ *   **闭集 stage / 幂等判据不在板侧**（值域归引擎，越界由引擎结构化拒绝原样透出）。
  *
  * **组织名的校验点在请求期，不在启动期**（BD11 反转 BD10）：组织名由**用户在前台创建/指定**
  * （提需求表单 `group` 字段），板级 `config.json` 的 `group` 只是**可选默认组织**（BD12″ 起无 argv/env 通道）。
@@ -82,6 +95,26 @@ export const STOP_CHAIN_WRITE_PATH_TEMPLATE = "/features/{id}/stop-chain";
  */
 export const SUSPEND_WRITE_PATH_TEMPLATE = "/features/{id}/suspend";
 
+/**
+ * v0.11.0 R1 · B2 写路径模板（**开阶段轮**）：转发引擎同名写工具 `stage_round_open`；
+ * 幂等归引擎（partial 唯一索引），板不写状态机 ⇒ `WRITE_ROUTES` 十一→十二（与下一条同节点交付，
+ * 两条齐落即十三；宿主已裁「按实际条数 +2、注释同步改准」，文档早期的「10→12」是滞后计数）。
+ */
+export const STAGE_ROUND_OPEN_WRITE_PATH_TEMPLATE = "/features/{id}/stage-round-open";
+
+/**
+ * v0.11.0 R1 · B2 写路径模板（**记段落异议**）：转发引擎同名写工具 `doc_objection`，**不自动开轮**。
+ */
+export const DOC_OBJECTION_WRITE_PATH_TEMPLATE = "/features/{id}/doc-objection";
+
+/**
+ * v0.11.0 B1 写路径模板（**门① 确认转发**）：转发引擎同名写工具 `gate1_confirm`。
+ * 用户裁定 U3 + 宿主裁决 A9：确认动作**由板转发**，flow 侧纪律「宿主 → MCP 直调、进板即违约」
+ * 由本卡明文解除 ⇒ `gate1_confirm` **获准进板写白名单**。板只转发、不写状态机、不自判闸
+ * （校验归引擎 N6/N7）。⇒ `WRITE_ROUTES` 十三→十四。
+ */
+export const GATE1_CONFIRM_WRITE_PATH_TEMPLATE = "/features/{id}/gate1-confirm";
+
 /** v0.9.2 M3 写路径模板（排期写 = 唯一放开的登记字段 `version` 写，按需求定位）。 */
 export const SCHEDULE_WRITE_PATH_TEMPLATE = "/features/{id}/schedule";
 
@@ -105,12 +138,9 @@ export const VERSIONS_WRITE_PATH = "/versions";
 /** 写路径清单（405 文案与 README 共用此单点）。 */
 export const WRITE_ROUTES: readonly string[] = [
   "POST " + REQUIREMENTS_WRITE_PATH,
-  `POST ${TURN_WRITE_PATH_TEMPLATE}`,
-  `POST ${HOST_STOP_WRITE_PATH_TEMPLATE}`,
-  `POST ${CONFIRM_WRITE_PATH_TEMPLATE}`,
-  `POST ${ANSWER_WRITE_PATH_TEMPLATE}`,
-  `POST ${STOP_CHAIN_WRITE_PATH_TEMPLATE}`,
-  `POST ${SUSPEND_WRITE_PATH_TEMPLATE}`,
+  `POST ${STAGE_ROUND_OPEN_WRITE_PATH_TEMPLATE}`,
+  `POST ${DOC_OBJECTION_WRITE_PATH_TEMPLATE}`,
+  `POST ${GATE1_CONFIRM_WRITE_PATH_TEMPLATE}`,
   `POST ${SCHEDULE_WRITE_PATH_TEMPLATE}`,
   "POST " + ORGS_WRITE_PATH,
   `POST ${ORG_MEMBERS_WRITE_PATH_TEMPLATE}`,
@@ -120,12 +150,9 @@ export const WRITE_ROUTES: readonly string[] = [
 /** 已放开的写路由（携路径参数）。 */
 export type WriteRoute =
   | { kind: "requirement" }
-  | { kind: "turn"; featureId: string }
-  | { kind: "host_stop"; org: string }
-  | { kind: "confirm"; featureId: string }
-  | { kind: "answer"; featureId: string }
-  | { kind: "stop_chain"; featureId: string }
-  | { kind: "suspend"; featureId: string }
+  | { kind: "stage_round_open"; featureId: string }
+  | { kind: "doc_objection"; featureId: string }
+  | { kind: "gate1_confirm"; featureId: string }
   | { kind: "schedule"; featureId: string }
   | { kind: "orgs" }
   | { kind: "org_members"; org: string }
@@ -157,20 +184,15 @@ export function parseWriteRoute(method: string | undefined, pathname: string): W
   // 字符集闭集在 handler 经 validateOrgName 判定 —— 路由层不立第二套规则）。
   const memberOrg = paramSegment(pathname, "/orgs/", "/members");
   if (memberOrg !== null) return { kind: "org_members", org: memberOrg };
-  const featureId = paramSegment(pathname, "/features/", "/turn");
-  if (featureId !== null) return { kind: "turn", featureId };
-  const confirmId = paramSegment(pathname, "/features/", "/confirm");
-  if (confirmId !== null) return { kind: "confirm", featureId: confirmId };
-  const answerId = paramSegment(pathname, "/features/", "/answer");
-  if (answerId !== null) return { kind: "answer", featureId: answerId };
-  const stopChainId = paramSegment(pathname, "/features/", "/stop-chain");
-  if (stopChainId !== null) return { kind: "stop_chain", featureId: stopChainId };
-  const suspendId = paramSegment(pathname, "/features/", "/suspend");
-  if (suspendId !== null) return { kind: "suspend", featureId: suspendId };
+  // v0.11.0 R1 · B2 两枚（后缀精确匹配；未知 action 形态走到函数末尾 ⇒ fail-closed 返 null）
+  const stageRoundId = paramSegment(pathname, "/features/", "/stage-round-open");
+  if (stageRoundId !== null) return { kind: "stage_round_open", featureId: stageRoundId };
+  const objectionId = paramSegment(pathname, "/features/", "/doc-objection");
+  if (objectionId !== null) return { kind: "doc_objection", featureId: objectionId };
+  const gate1ConfirmId = paramSegment(pathname, "/features/", "/gate1-confirm");
+  if (gate1ConfirmId !== null) return { kind: "gate1_confirm", featureId: gate1ConfirmId };
   const scheduleId = paramSegment(pathname, "/features/", "/schedule");
   if (scheduleId !== null) return { kind: "schedule", featureId: scheduleId };
-  const org = paramSegment(pathname, "/host/", "/stop");
-  if (org !== null) return { kind: "host_stop", org };
   return null;
 }
 
@@ -453,6 +475,220 @@ export function parseTurnForm(raw: string, contentLength?: number): TurnFormResu
     };
   }
   return { ok: true, supplement };
+}
+
+// ---------------------------------------------------------------------------
+// v0.11.0 R1 · B2：阶段面两写口表单（POST /features/:id/stage-round-open · /doc-objection）
+// ---------------------------------------------------------------------------
+
+/** 开轮表单的字段（必填仅 `stage`；其余可选，闭集值域归引擎，板不立第二套规则）。 */
+export const STAGE_ROUND_OPEN_FORM_STAGE_FIELD = "stage";
+export const STAGE_ROUND_OPEN_FORM_SOURCES_FIELD = "sources";
+export const STAGE_ROUND_OPEN_FORM_TARGET_PROJECTS_FIELD = "targetProjects";
+export const STAGE_ROUND_OPEN_FORM_BASIS_REV_INPUT_FIELD = "basisRevInput";
+
+/** 异议表单的字段（`docVersion` / `sectionId` / `objectionText` 必填）。 */
+export const DOC_OBJECTION_FORM_DOC_VERSION_FIELD = "docVersion";
+export const DOC_OBJECTION_FORM_SECTION_ID_FIELD = "sectionId";
+export const DOC_OBJECTION_FORM_TEXT_FIELD = "objectionText";
+export const DOC_OBJECTION_FORM_TARGET_TYPE_FIELD = "targetType";
+export const DOC_OBJECTION_FORM_PROJECT_IDS_FIELD = "projectIds";
+
+/** 两表单共用的字段缺失错误码（400）—— fail-closed，必填键不得静默省略。 */
+export const STAGE_WRITE_FORM_INVALID_CODE = "board_stage_write_form_invalid";
+
+/**
+ * 异议正文的**独立上限**（8 KiB，utf8 字节计，同 `parseTurnForm` 补充文本口径）：
+ * 超的是这一个字段（400），不是 body（body 级 256 KiB 由 `readBodyCapped` 提前收 413）。
+ */
+export const MAX_OBJECTION_TEXT_BYTES = MAX_TURN_SUPPLEMENT_BYTES;
+
+export type StageRoundOpenFormOk = {
+  ok: true;
+  stage: string;
+  /** 逗号分隔清单（可重复键全取）；逐项 trim、去空、去重保序；空 = 引擎默认全量物化。 */
+  sources: string[];
+  targetProjects: string[];
+  /** 可选口径修订标识；缺省 / 空白 ⇒ null（引擎记字面 `-`）。 */
+  basisRevInput: string | null;
+};
+export type StageRoundOpenFormFail = { ok: false; status: 400 | 413; code: string; error: string };
+export type StageRoundOpenFormResult = StageRoundOpenFormOk | StageRoundOpenFormFail;
+
+/**
+ * 清单字段归一（**v0.11.0 B3 起：换行与逗号同为分隔符**，供开轮 `sources` 的多行文本框使用）：
+ * - 整键空白（留空的 textarea 仍会提交 `sources=`）⇒ **视作不给该键**（= 空清单，与「不带」同语义，
+ *   对齐 `parseTurnForm`「留空 = 纯触发」的既有口径）；
+ * - 结尾换行先剥（文本框末尾回车是书写习惯，不是空白项）；
+ * - **中间的空白项**（`p1,,p2` / `a\n\nb`）⇒ `null` = 清单书写错误，由调用方判 400（不静默剔除）；
+ * - 逐项 trim、去重保序。
+ */
+function splitListField(f: URLSearchParams, key: string): string[] | null {
+  const items: string[] = [];
+  for (const raw of f.getAll(key)) {
+    if (raw.trim() === "") continue;
+    for (const piece of raw.replace(/[\r\n]+$/, "").split(/[\n\r,]/)) {
+      const v = piece.trim();
+      if (v === "") return null; // 空白项 = 清单书写错误（不静默剔除）
+      if (!items.includes(v)) items.push(v);
+    }
+  }
+  return items;
+}
+
+/**
+ * urlencoded 表单 → 开轮入参（判别联合同 {@link parseSuspendForm}）：
+ * - `stage` **必须显式给出**且 trim 后非空（闭集值域**归引擎**，板不校验、越界由引擎结构化拒绝原样透出）；
+ * - `sources` / `targetProjects` 可选（**换行或逗号分隔** + 可重复键；留空 = 不给；**中间空白项 ⇒ 400**，
+ *   空清单 = 引擎默认全量）；
+ * - `basisRevInput` 可选（trim 后空 ⇒ null）。
+ */
+export function parseStageRoundOpenForm(raw: string, contentLength?: number): StageRoundOpenFormResult {
+  if (
+    (contentLength !== undefined && contentLength > MAX_REQUIREMENT_BODY_BYTES) ||
+    Buffer.byteLength(raw, "utf8") > MAX_REQUIREMENT_BODY_BYTES
+  ) {
+    return { ok: false, status: 413, code: "payload_too_large", error: "请求体超过板写面上限（256 KiB）" };
+  }
+  const f = new URLSearchParams(raw);
+  const stage = (f.get(STAGE_ROUND_OPEN_FORM_STAGE_FIELD) ?? "").trim();
+  if (stage === "") {
+    return {
+      ok: false,
+      status: 400,
+      code: STAGE_WRITE_FORM_INVALID_CODE,
+      error: "stage 缺失或空白：开轮必须显式给出阶段（闭集原值归引擎校验，板不猜阶段）",
+    };
+  }
+  const sources = splitListField(f, STAGE_ROUND_OPEN_FORM_SOURCES_FIELD);
+  if (sources === null) {
+    return { ok: false, status: 400, code: STAGE_WRITE_FORM_INVALID_CODE, error: "sources 清单含空白项（换行 / 逗号分隔逐项须非空；留空 = 不给该键）" };
+  }
+  const targetProjects = splitListField(f, STAGE_ROUND_OPEN_FORM_TARGET_PROJECTS_FIELD);
+  if (targetProjects === null) {
+    return { ok: false, status: 400, code: STAGE_WRITE_FORM_INVALID_CODE, error: "targetProjects 清单含空白项（不给 = 引擎按本组全员物化，不预筛）" };
+  }
+  const basis = (f.get(STAGE_ROUND_OPEN_FORM_BASIS_REV_INPUT_FIELD) ?? "").trim();
+  return { ok: true, stage, sources, targetProjects, basisRevInput: basis === "" ? null : basis };
+}
+
+export type DocObjectionFormOk = {
+  ok: true;
+  docVersion: string;
+  sectionId: string;
+  objectionText: string;
+  /** 可选异议对象类型（值域归引擎）；缺省 / 空白 ⇒ null。 */
+  targetType: string | null;
+  projectIds: string[];
+};
+export type DocObjectionFormFail = { ok: false; status: 400 | 413; code: string; error: string };
+export type DocObjectionFormResult = DocObjectionFormOk | DocObjectionFormFail;
+
+/**
+ * urlencoded 表单 → 段落异议入参（**不自动开轮**，开轮是另一条写口）：
+ * - `docVersion` / `sectionId` / `objectionText` **必须显式给出**且 trim 后非空；
+ * - `objectionText` 独立上限 {@link MAX_OBJECTION_TEXT_BYTES}（超字段 ⇒ 400，非 413）；
+ * - `targetType` 可选（值域归引擎）；`projectIds` 可选清单（同款逗号分隔，空白项 ⇒ 400）。
+ */
+export function parseDocObjectionForm(raw: string, contentLength?: number): DocObjectionFormResult {
+  if (
+    (contentLength !== undefined && contentLength > MAX_REQUIREMENT_BODY_BYTES) ||
+    Buffer.byteLength(raw, "utf8") > MAX_REQUIREMENT_BODY_BYTES
+  ) {
+    return { ok: false, status: 413, code: "payload_too_large", error: "请求体超过板写面上限（256 KiB）" };
+  }
+  const f = new URLSearchParams(raw);
+  const docVersion = (f.get(DOC_OBJECTION_FORM_DOC_VERSION_FIELD) ?? "").trim();
+  const sectionId = (f.get(DOC_OBJECTION_FORM_SECTION_ID_FIELD) ?? "").trim();
+  const objectionText = (f.get(DOC_OBJECTION_FORM_TEXT_FIELD) ?? "").trim();
+  const missing = [
+    docVersion === "" ? DOC_OBJECTION_FORM_DOC_VERSION_FIELD : null,
+    sectionId === "" ? DOC_OBJECTION_FORM_SECTION_ID_FIELD : null,
+    objectionText === "" ? DOC_OBJECTION_FORM_TEXT_FIELD : null,
+  ].filter((x): x is string => x !== null);
+  if (missing.length > 0) {
+    return {
+      ok: false,
+      status: 400,
+      code: STAGE_WRITE_FORM_INVALID_CODE,
+      error: `异议必填字段缺失或空白：${missing.join(" / ")}（不得静默提交空异议；异议定位 = docVersion + sectionId）`,
+    };
+  }
+  const bytes = Buffer.byteLength(objectionText, "utf8");
+  if (bytes > MAX_OBJECTION_TEXT_BYTES) {
+    return {
+      ok: false,
+      status: 400,
+      code: STAGE_WRITE_FORM_INVALID_CODE,
+      error: `objectionText 超过单字段上限：${String(bytes)} 字节 > ${String(MAX_OBJECTION_TEXT_BYTES)} 字节（约 8 KiB）⇒ 请精简异议正文`,
+    };
+  }
+  const projectIds = splitListField(f, DOC_OBJECTION_FORM_PROJECT_IDS_FIELD);
+  if (projectIds === null) {
+    return { ok: false, status: 400, code: STAGE_WRITE_FORM_INVALID_CODE, error: "projectIds 清单含空白项（不给 = 宿主按该段 sources 反解处理范围）" };
+  }
+  const targetType = (f.get(DOC_OBJECTION_FORM_TARGET_TYPE_FIELD) ?? "").trim();
+  return { ok: true, docVersion, sectionId, objectionText, targetType: targetType === "" ? null : targetType, projectIds };
+}
+
+// ---------------------------------------------------------------------------
+// v0.11.0 B1：门① 确认写口表单（POST /features/:id/gate1-confirm）
+// ---------------------------------------------------------------------------
+
+/** 确认表单的字段（`docVersion` / `docHash` 必填单值，`round` 必填正整数；featureId 从路径取、不进表单）。 */
+export const GATE1_CONFIRM_FORM_DOC_VERSION_FIELD = "docVersion";
+export const GATE1_CONFIRM_FORM_DOC_HASH_FIELD = "docHash";
+export const GATE1_CONFIRM_FORM_ROUND_FIELD = "round";
+export const GATE1_CONFIRM_FORM_VERSION_FIELD = "version";
+
+export type Gate1ConfirmFormOk = {
+  ok: true;
+  docVersion: string;
+  docHash: string;
+  round: number;
+  /** 排期版号（引擎 gate1 新可选参数）；缺省 / 空白 ⇒ null，保持既有只确认不推进调用兼容。 */
+  version: string | null;
+};
+export type Gate1ConfirmFormFail = { ok: false; status: 400 | 413; code: string; error: string };
+export type Gate1ConfirmFormResult = Gate1ConfirmFormOk | Gate1ConfirmFormFail;
+
+/**
+ * urlencoded 表单 → 门① 确认入参（判别联合同 {@link parseDocObjectionForm}）：
+ * - `docVersion` / `docHash` **必须显式给出**且 trim 后非空（缺键 / 空白 ⇒ 400，fail-closed 不静默确认）；
+ * - `round` **必须显式给出**且为正整数（v0.11.0 B1：引擎 `gate1_confirm` 必填 `round`，
+ *   缺失 / 0 / 负 / 非数 ⇒ 同拒，错误文案点名 `round`）；
+ * - 三者均为**单值**（取自本轮 `stageRuns` 的 `synthesis` 对象与轮格 `round`，隐藏字段透传）；
+ * - **板不重算 `docHash`、不自判闸**——校验归引擎（N6/N7），此处只做表单形状。
+ */
+export function parseGate1ConfirmForm(raw: string, contentLength?: number): Gate1ConfirmFormResult {
+  if (
+    (contentLength !== undefined && contentLength > MAX_REQUIREMENT_BODY_BYTES) ||
+    Buffer.byteLength(raw, "utf8") > MAX_REQUIREMENT_BODY_BYTES
+  ) {
+    return { ok: false, status: 413, code: "payload_too_large", error: "请求体超过板写面上限（256 KiB）" };
+  }
+  const f = new URLSearchParams(raw);
+  const docVersion = (f.get(GATE1_CONFIRM_FORM_DOC_VERSION_FIELD) ?? "").trim();
+  const docHash = (f.get(GATE1_CONFIRM_FORM_DOC_HASH_FIELD) ?? "").trim();
+  const roundRaw = (f.get(GATE1_CONFIRM_FORM_ROUND_FIELD) ?? "").trim();
+  const version = (f.get(GATE1_CONFIRM_FORM_VERSION_FIELD) ?? "").trim();
+  // 纯十进制数字串才接 `Number.parseInt`（"1.5" / "1e2" / "+2" 这类 parseInt 会前缀截断的脏值 ⇒ 直接判非法）
+  const roundParsed = /^\d+$/.test(roundRaw) ? Number.parseInt(roundRaw, 10) : Number.NaN;
+  const round = Number.isInteger(roundParsed) && roundParsed > 0 ? roundParsed : null;
+  if (docVersion === "" || docHash === "" || round === null) {
+    const missing = [
+      docVersion === "" ? GATE1_CONFIRM_FORM_DOC_VERSION_FIELD : null,
+      docHash === "" ? GATE1_CONFIRM_FORM_DOC_HASH_FIELD : null,
+      round === null ? GATE1_CONFIRM_FORM_ROUND_FIELD : null,
+    ].filter((x): x is string => x !== null);
+    return {
+      ok: false,
+      status: 400,
+      code: STAGE_WRITE_FORM_INVALID_CODE,
+      error: `门① 确认必填字段缺失 / 空白 / 非正整数：${missing.join(" / ")}（取自本轮 synthesis，不得静默提交空确认）`,
+    };
+  }
+  return { ok: true, docVersion, docHash, round, version: version === "" ? null : version };
 }
 
 // ---------------------------------------------------------------------------

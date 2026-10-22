@@ -66,7 +66,7 @@ export function escapeHtml(value: unknown): string {
     .replace(/'/g, "&#39;");
 }
 
-export type NavKey = "home" | "features" | "schedule" | "tasks" | "projects" | "agents" | "host";
+export type NavKey = "home" | "features" | "schedule" | "tasks" | "projects" | "agents";
 
 /**
  * **组织上下文（v0.9.4 D 档 · BD7；REQ-2026-09-30-04 件1 起 = 侧栏二级菜单的唯一输入）**：
@@ -1641,6 +1641,93 @@ export function renderPage(params: PageParams): string {
   .b-badge.warn { border-color: var(--b-warn-line); background: var(--b-warn-bg); color: var(--b-warn); }
   .b-badge.danger { border-color: var(--b-danger-line); background: var(--b-danger-bg); color: var(--b-danger); }
   .b-badge.mute { color: var(--b-text-4); }
+  /* ── R1 B3（v0.11.0）：卡面「阶段任务」区（本轮主表 + 旧轮折叠 + chip 词表）──
+     chip 基元 =「.sr-chip」（白名单单一词表，views.ts ANSWER_STATE_CHIPS / RELEVANCE_CHIPS 同源）；
+     **反置灰纪律**：sr-not-involved = 中性描边 + 正常字色（--b-text），
+     与 .muted / 空态「不渲」在观感上必须可分（冻结口径：读者不得混淆「答了不涉及」与「没渲出来」）。 */
+  .stage-run-current { margin: 0 0 var(--b-sp-8); }
+  /* 回落态（仅 selectedStage 为空时出现）：左边加一描警示，提示「这是全局最新轮、非当前所选阶段」 */
+  .stage-run-current.sr-fallback { border-left: 3px solid var(--b-warn); padding-left: var(--b-sp-8); }
+  .sr-head { font-size: var(--b-fs-12); color: var(--b-text-2); margin: 0 0 var(--b-sp-4); display: flex; flex-wrap: wrap; gap: var(--b-sp-4) var(--b-sp-8); align-items: baseline; }
+  .sr-head .sr-stage { color: var(--b-brand-ink); }
+  .sr-settled { font-weight: 600; }
+  .sr-chip { display: inline-block; padding: 0 var(--b-sp-6); border: 1px solid var(--b-line); border-radius: var(--b-r-3); background: var(--b-surface); color: var(--b-text); font-size: var(--b-fs-11); white-space: nowrap; }
+  .sr-chip.sr-answer-pending { border-color: var(--b-warn-line); background: var(--b-warn-bg); color: var(--b-warn); }
+  .sr-chip.sr-answer-settled { border-color: var(--b-ok-line); background: var(--b-ok-bg); color: var(--b-ok); }
+  .sr-chip.sr-answer-valid { border-color: var(--b-ok-line); background: var(--b-ok-bg); color: var(--b-ok); }
+  .sr-chip.sr-answer-invalid { border-color: var(--b-danger-line); background: var(--b-danger-bg); color: var(--b-danger); }
+  .sr-chip.sr-answer-stale { border-color: var(--b-warn-line); background: var(--b-warn-bg); color: var(--b-warn); }
+  .sr-chip.sr-involved { border-color: var(--b-brand-line); background: var(--b-brand-soft); color: var(--b-brand-ink); }
+  /* 冻结口径：不参与 = 中性描边 + 正常字色 —— 严禁复用置灰类（判据 4 的白名单核） */
+  .sr-chip.sr-not-involved { border: 1px solid var(--b-line); background: var(--b-surface); color: var(--b-text); }
+  .sr-chip.sr-decision { color: var(--b-text-2); }
+  .sr-chip.sr-reach { color: var(--b-text-2); }
+  .sr-chip.sr-other { color: var(--b-text-2); }
+  .completeness { font-size: var(--b-fs-12); color: var(--b-text-2); margin: var(--b-sp-4) 0; }
+  .completeness .sr-frac { color: var(--b-brand-ink); }
+  .stage-run-unanswered { margin: var(--b-sp-4) 0; }
+  .stage-run-unanswered .sr-label { font-size: var(--b-fs-12); color: var(--b-warn); font-weight: 600; }
+  .sr-unanswered-list { margin: var(--b-sp-4) 0 var(--b-sp-4) var(--b-sp-16); padding: 0; }
+  .sr-unanswered-list .named-item { font-size: var(--b-fs-12); color: var(--b-text); }
+  .sr-project-list { margin: var(--b-sp-4) 0 0 var(--b-sp-16); padding: 0; }
+  .sr-project-row { font-size: var(--b-fs-12); margin: 2px 0; }
+  .sr-project-row .sr-pid { font-weight: 600; }
+  .sr-archive-row { border-top: 1px dashed var(--b-line); padding: var(--b-sp-4) 0; }
+  /* ── R1 B4（v0.11.0）：合成《需求确认单》默认视图（段落 + 段落异议 + 依据抽屉 + 版本记录）──
+     默认面 = **一份合成单**（段落正文 + 来源 chip）；逐 project 明细收进 .stage-basis-drawer
+     （原生 details 折叠、默认不展开，零脚本）；两枚写控件的渲不渲由 views.ts 的 allowedActions 门闩决定
+     —— **本块不得给它们加「不可用」外观**（缺席 = 不渲，不是渲出来置灰）。取色一律引既有 --b- token。 */
+  .stage-confirm-sheet { margin: 0 0 var(--b-sp-8); }
+  /* 回落态（仅 selectedStage 为空时出现）：与 B3 同款左描警示 = 「这是全局最近一轮，非当前所选阶段」 */
+  .stage-confirm-sheet.cs-fallback { border-left: 3px solid var(--b-warn); padding-left: var(--b-sp-8); }
+  .cs-anchor { font-size: var(--b-fs-12); color: var(--b-text-2); margin: 0 0 var(--b-sp-4); display: flex; flex-wrap: wrap; gap: var(--b-sp-4) var(--b-sp-8); align-items: baseline; }
+  .cs-anchor .cs-stage { color: var(--b-brand-ink); }
+  .cs-settled { font-weight: 600; }
+  .cs-h { font-size: var(--b-fs-13); font-weight: 600; color: var(--b-text); margin: var(--b-sp-8) 0 var(--b-sp-4); }
+  .cs-section { border: 1px solid var(--b-line); border-radius: var(--b-r-3); background: var(--b-surface); padding: var(--b-sp-6) var(--b-sp-8); margin: 0 0 var(--b-sp-6); }
+  .cs-section-h { font-size: var(--b-fs-12); font-weight: 600; color: var(--b-text-2); margin: 0 0 var(--b-sp-4); }
+  .cs-section-body { font-size: var(--b-fs-13); color: var(--b-text); margin: 0 0 var(--b-sp-4); white-space: pre-line; }
+  .cs-sources { font-size: var(--b-fs-11); color: var(--b-text-2); margin: 0 0 var(--b-sp-4); }
+  .sr-chip.cs-source { color: var(--b-text-2); }
+  /* 每段异议块 = 原生 details（零脚本）；展开后才出现正文框与提交按钮。 */
+  .cs-objection { margin: var(--b-sp-4) 0; }
+  .cs-objection > summary { width: fit-content; font-size: var(--b-fs-11); color: var(--b-warn); cursor: pointer; }
+  .cs-objection form, .stage-round-open-form { border: 1px solid var(--b-line); border-radius: var(--b-r-3); background: var(--b-surface-2); padding: var(--b-sp-6) var(--b-sp-8); margin: var(--b-sp-6) 0; }
+  details.cs-objection > form { display:block; margin-top:6px; }
+  details.cs-objection label { display:block; }
+  details.cs-objection textarea { display:block; width:100%; box-sizing:border-box; min-height:4.5em; resize:vertical; margin:4px 0 8px; font-size: var(--b-fs-12); }
+  details.cs-objection button { display:block; }
+  .cs-pending-objections { border:1px solid var(--b-warn); border-radius:var(--b-r-3); background:var(--b-surface-2); padding:var(--b-sp-6) var(--b-sp-8); margin:var(--b-sp-6) 0; }
+  .cs-pending-objection-list { margin:var(--b-sp-4) 0; padding-left:1.5em; }
+  .cs-pending-objection { margin:var(--b-sp-4) 0; }
+  .cs-pending-objection p { margin:2px 0 0; color:var(--b-ink-2); }
+  .cs-count-badge { display:inline-block; min-width:1.5em; padding:0 .35em; margin-left:var(--b-sp-4); border-radius:999px; background:var(--b-warn); color:var(--b-surface); font-size:var(--b-fs-11); text-align:center; }
+  .cs-stage-action-area { margin:var(--b-sp-6) 0; }
+  .cs-synthesis-unavailable { margin:0 0 var(--b-sp-6); }
+  .cs-objection-round-form { margin:var(--b-sp-4) 0 0; }
+  .cs-version-source { margin:var(--b-sp-4) 0; }
+  .cs-field { display: block; font-size: var(--b-fs-12); color: var(--b-text-2); margin: 0 0 var(--b-sp-4); }
+  .cs-field input, .cs-field textarea { display: block; width: 100%; font-size: var(--b-fs-12); }
+  /* ── R1 B3（v0.11.0）：门① 确认节（确认对象 = 当前文档版本）+ 首轮空态卡 ──
+     三态取档只在 derive.ts 的 deriveGate1ConfirmState 单点：absent ⇒ 整节零字节（本块无需「不可用」外观），
+     confirmed = **事实档**（成功色字 —— 不是不可点档，严禁借用 muted / disabled 观感），
+     pending ⇒ 「待确认」+ 确认表单。 */
+  .gate1-confirm { border: 1px solid var(--b-line); border-radius: var(--b-r-3); background: var(--b-surface); padding: var(--b-sp-6) var(--b-sp-8); margin: 0 0 var(--b-sp-6); }
+  .cs-gate1 { font-size: var(--b-fs-12); font-weight: 600; margin: 0 0 var(--b-sp-4); }
+  .cs-gate1-confirmed { color: var(--b-ok); }
+  .cs-gate1-pending { color: var(--b-warn); }
+  .stage-empty-first { margin: 0; }
+  .stage-basis-drawer { border-top: 1px dashed var(--b-line); margin: var(--b-sp-6) 0 0; padding-top: var(--b-sp-4); }
+  .stage-basis-drawer > summary { font-size: var(--b-fs-12); color: var(--b-text-2); cursor: pointer; }
+  .cs-basis-line { font-size: var(--b-fs-11); color: var(--b-text-2); margin: var(--b-sp-4) 0; }
+  .cs-basis-list { margin: var(--b-sp-4) 0 0 var(--b-sp-16); padding: 0; }
+  .cs-basis-reason { font-size: var(--b-fs-12); margin: 2px 0; }
+  .cs-basis-reason .cs-basis-pid { font-weight: 600; }
+  .cs-reason { color: var(--b-text-2); }
+  .cs-versions { margin: 0 0 0 var(--b-sp-16); padding: 0; }
+  .cs-version-row { font-size: var(--b-fs-12); color: var(--b-text-2); margin: 2px 0; }
+  .cs-version-row.cs-version-current { font-weight: 600; color: var(--b-brand-ink); }
+  .cs-version-file { margin-right: var(--b-sp-4); }
   /* ── REQ-2026-10-11-03 件E：页级就地刷新的恒在壳 / 「上次更新」条 ──
      壳恒在、内容可空（0→N 首现也能刷出）；取色一律引既有 --b- token，**零新色值**；
      零新脚本（交互面 = 页面脚本闭集第八枚 {@link PAGE_LIVE_SCRIPT}）。 */

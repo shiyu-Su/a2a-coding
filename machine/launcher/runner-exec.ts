@@ -31,7 +31,8 @@
  *   （否则桥写了 launcher 也丢）；
  * - **`classifyFailure` 改值域、不删**：{@link RunnerFailureKind} 硬切为协议 2.3 六类闭集
  *   （`agent` / `transport` / `runner` / `model_queue` / `timeout` / `business`），
- *   **判不出 ⇒ 不报 `failureKind` 键**（不造第 7 值）；`model_queue` 本版恒不产出（判定归 orch 启发式）；
+ *   **判不出 ⇒ 不报 `failureKind` 键**（沿用字段本来的「可选」语义，闭集外不造值；
+ *   v0.11.0 · M4 起闭集扩七类，新增 `provider`）；`model_queue` 本版恒不产出（判定归 orch 启发式）；
  * - **启动补结算路径带 `failureKind = "runner"`**（{@link RECONCILE_FAILURE_KIND}，
  *   本机已无执行体 = 载体侧事实）；
  * - **只读工作树指纹**：{@link captureWorkspaceFingerprint} 在 `executeDispatch` 起止各取一次
@@ -65,14 +66,25 @@
  * - {@link DispatchCommand.taskType}：**可选职责位单键**（orch → machine 段载体 = dispatch 顶层，
  *   逐字照 `readOnly` 先例 ⇒ 协议 2.3 **不升**；取值闭集见 `task-types.ts`）；
  * - **未知 / 非法职责位硬拒（F-C11 三条）**：拒的落点 = **intake**（`handle` 的 dispatch 分支、
- *   `startDispatch` 台账登记**之前**）——(a) **不新增 `failureKind` 第 7 值**，复用既有 `agent` 类；
+ *   `startDispatch` 台账登记**之前**）——(a) **不新增 `failureKind` 闭集外的值**，复用既有 `agent` 类；
  *   (b) 硬拒**必须经既有 outbox 回传该 `taskId` 的 `failed` 终态**（静默丢弃 ⇒ orch 只能等孤儿墙钟，
  *   因为台账在 `startDispatch` 内才登记）；(c) 原因 = 稳定可断言 token `unknown_task_type=<原值>`；
  * - **machine → 后端 agent 段的新载体** = `message/send` 的 **A2A `message.metadata`**（仓内**首个**
  *   出现点，无既有先例）：`taskType` 存在才落 `metadata` 对象、键才写；**不传 ⇒ 载荷逐字现状**。
+ *
+ * v0.11.0 · 节点 M4（REQ-v0.11.0）本模块承担 **provider 结算接入**（PROTOCOL 2.4 / 改造文档）：
+ * - {@link RunnerFailureKind} 六类闭集**扩七类**（新增 `provider`），`classifyFailure` 分支序
+ *   `provider > business`；未知职责位硬拒路径**取值不变**（仍 `agent`）；
+ * - provider 不纳入自动重试 / 续跑闭集（{@link RERUNNABLE_ACP_KINDS}、{@link shouldContinueOn} 不动）。
+ *
+ * v0.11.0 · 节点 M6（REQ-v0.11.0）本模块承担 **diagnostics provider 取证三键**：{@link RunnerTaskDiagnostics}
+ * 加 `providerFailure` / `providerMarker` / `providerSnippet`，在 {@link buildResult} 命中 provider 门时
+ * 经 `launcherExtras`/`mergeDiagnostics` 并入（片段由 {@link providerSnippetFor} 脱敏 + 窗口化到 ≤200 字，
+ * **只走诊断面、绝不进结果文本**）；走「未知字段忽略」伞，**不再单独升协议版**。
  */
 import { execFileSync } from "node:child_process";
 import { randomUUID } from "node:crypto";
+import { PROVIDER_ERROR_MARKERS, PROVIDER_RECEIPT_MAX_TEXT_CHARS } from "../provider-markers.js";
 import type { ProjectConfig } from "../types.js";
 import { isTaskType, type TaskType } from "../task-types.js";
 import { ROLE_CONFIG_KEYS } from "../agent-roles.js";
@@ -375,11 +387,12 @@ export interface RunnerCommandAck {
 export type RunnerTaskState = "completed" | "failed" | "input-required";
 
 /**
- * 失败大类（v0.8.7 · M3 引入，v0.8.8 · M2 硬切为协议 2.3 **六类闭集**，改造文档 §2.3）：
+ * 失败大类（v0.8.7 · M3 引入，v0.8.8 · M2 硬切协议 2.3 六类闭集，v0.11.0 · M4 起为协议 2.4
+ * **七类闭集**，改造文档 §2.3）：
  * **launcher 判定、orch 消费**。旧值 `"infra"` / `"task"` **自 2.3 起非法且不再产出**
  * （硬切不留别名）；**判不出 ⇒ 不报 `failureKind` 键**（沿用字段本来的「可选」语义，
- * **不造第 7 值**）。`model_queue` 本版**恒不产出**（无独立信号，判定归 orch 启发式）。
- * 映射以 `PROTOCOL.md` 2.3「失败分类」条文为准，machine 侧**不建第二张映射表**。
+ * **闭集外不造值**）。`model_queue` 本版**恒不产出**（无独立信号，判定归 orch 启发式，预留不动）。
+ * 映射以 `PROTOCOL.md` 2.4「失败分类」条文为准，machine 侧**不建第二张映射表**。
  */
 export type RunnerFailureKind =
   | "agent"
@@ -387,7 +400,8 @@ export type RunnerFailureKind =
   | "runner"
   | "model_queue"
   | "timeout"
-  | "business";
+  | "business"
+  | "provider";
 
 /**
  * `timeout` 类的**分家子键**（PROTOCOL 2.3）：两条路径同归 `timeout`、靠子键区分，
@@ -518,6 +532,20 @@ export interface RunnerTaskDiagnostics {
    * **同名不同面**（沿用既有先例，不新造别名）。
    */
   cancelUnsupported?: boolean;
+  // ---------- v0.11.0 · M6：provider 取证三键（纯诊断面，**绝不进结果文本 / resultText**）----------
+  /**
+   * provider 门命中标志（`true` 才报）；与 `failureKind = "provider"` 同源同批。
+   * 走 diagnostics「未知字段忽略」伞 ⇒ **不再单独升协议版**。
+   */
+  providerFailure?: boolean;
+  /** 命中的五模式**原串**（{@link PROVIDER_ERROR_MARKERS} 之一，小写；仅供取证，不改结果文本） */
+  providerMarker?: string;
+  /**
+   * 命中处**窗口化原文片段**（取 {@link matchesProviderReceipt} 回报的 snippet）：脱敏后
+   * **≤200 字**（含 `…(+N)` 溢出标记，UTF-16 长度），疑似凭据（`sk-…` / `Bearer …` / 长 base64）
+   * 落 `<redacted>`；**绝不进结果文本**（AC-S1 同规）。
+   */
+  providerSnippet?: string;
 }
 
 /**
@@ -933,18 +961,29 @@ export interface FailureSignals {
    * 无此信号且其余信号均不成立的失败 = **判不出**（不报键，不再默认归业务失败）。
    */
   businessFailure?: boolean;
+  /**
+   * 后端回执命中 **provider 门**（判据由调用方以 {@link matchesProviderReceipt} 检测后传入，
+   * 与 `businessFailure` 同形；入口 ① 需同时 `acpErrorKind === "rpc"`，入口 ② 与回合正文的
+   * 无结论块条件由判据自身把关）⇒ `provider`（优先级 **高于 `business`**）。
+   */
+  providerFailure?: boolean;
 }
 
 /**
- * 失败大类判定（纯函数；v0.8.8 · M2 改值为协议 2.3 六类闭集，映射条文见 `PROTOCOL.md`
- * 「失败分类」，**不建第二张映射表**）：**非失败态返回 null，判不出也返回 null**
- * （调用方据此**不报 `failureKind` 键**）。
+ * 失败大类判定（纯函数；v0.8.8 · M2 改值为协议 2.3 六类闭集，v0.11.0 · M4 起为协议 2.4
+ * **七类闭集**（新增 `provider`），映射条文见 `PROTOCOL.md`，**不建第二张映射表**）：
+ * **非失败态返回 null，判不出也返回 null**
+ * （调用方据此**不报 `failureKind` 键**，闭集外不造值）。
  *
  * 优先级：`timedOut` **最优先** —— launcher 自有预算耗尽是「等待预算」问题，与桥报的 kind
  * 无关（且 launcher **看不见**桥的 kind）。其后：
- * - `acpErrorKind ∈ {spawn, closed}` / `rpc` / `protocol` ⇒ `agent`（后端进程拉起即败 /
+ * - `acpErrorKind ∈ {spawn, closed}` / `protocol` ⇒ `agent`（后端进程拉起即败 /
  *   后端**语义**拒绝 —— **不是 transport**）；`acpErrorKind = "timeout"` ⇒ `timeout`
  *   （scope 由调用方填 `acp-prompt`，缺则本函数兜底）；
+ * - `acpErrorKind = "rpc"`：provider 门命中（`providerFailure`）⇒ `provider`，未命中 ⇒ `agent`
+ *   （进程死了不等于死于欠费：`spawn` / `closed` / `protocol` **不认领** provider）；
+ * - `providerFailure`（回合正常收尾入口）⇒ `provider`，**优先于 `business`**
+ *   （欠费假完成正是「无结论块 + 短正文」的 business 误结算面）；
  * - `ensure` 抛错 ⇒ `runner`（载体侧事实）；`send`/`poll` 相位传输层抛错 ⇒ `transport`；
  * - 输出含失败结论块 ⇒ `business`（旧 `"task"` 的直系继承）；
  * - `model_queue` **恒不产出**（无独立信号，判定归 orch 启发式）。
@@ -952,6 +991,7 @@ export interface FailureSignals {
 export function classifyFailure(signals: FailureSignals): RunnerFailureKind | null {
   if (signals.state !== "failed") return null;
   if (signals.timedOut) return "timeout"; // scope = runner-deadline（调用方派生）
+  if (signals.acpErrorKind === "rpc" && signals.providerFailure === true) return "provider";
   switch (signals.acpErrorKind) {
     case "spawn":
     case "closed":
@@ -963,6 +1003,7 @@ export function classifyFailure(signals: FailureSignals): RunnerFailureKind | nu
     default:
       break;
   }
+  if (signals.providerFailure === true) return "provider";
   if (signals.threwInEnsure) return "runner";
   if (signals.threwInTransport === true) {
     const stage = signals.stage;
@@ -1239,6 +1280,142 @@ function outcomeScanText(viewText: string, viewStatusText: string, artifacts: un
   return chunks.join("\n\n");
 }
 
+// ---------- v0.11.0 · M3：provider 判据纯函数（PROTOCOL 2.4「provider 门详规」，REQ-v0.11.0） ----------
+
+/** {@link matchesProviderReceipt} 命中回报（`marker` = 五模式清单里的**原串**，`snippet` = 取证片段） */
+export interface ProviderReceiptMatch {
+  marker: string;
+  snippet: string;
+}
+
+/**
+ * {@link matchesProviderReceipt} 的输入面（**两入口二选一**，判别式联合）：
+ * - `"acp-error"` = 入口 ①：桥内 ACP 结构化错误。`acpErrorKind` 是**字符串**而非 `AcpError` 实例
+ *   —— 分层红线反向（launcher 不 import 桥的 class），原料取 diagnostics 同形键
+ *   （`acpErrorKind` / `acpErrorData`），由调用方透传。**本入口不受 `<300` 阈值约束**
+ *   （PROTOCOL 2.4 的阈值只挂在入口 ②）。
+ * - `"turn-text"` = 入口 ②：回合**正常结束**（`end_turn`）后的回执正文
+ *   （调用方喂 {@link outcomeScanText} 的产物）。**「回合正常结束」由入口选择本身承担** ——
+ *   异常收尾请走 `"acp-error"`，不要把正文塞进来（否则会双记）。
+ *   `gateText`（可选）= **长度门专用的回执正文**（后端原始 `text` / `statusText`）。拼接体可能因
+ *   后端把同一段正文既写进 `text` 又写进 artifact 而成倍变长（真实 402 短回执被量成长正文、
+ *   门跳过 ⇒ 假完成），故长度门量 `gateText`；不给则维持原行为（量 `text`）。
+ *   **模式匹配与有效结论块判定仍扫 `text`（拼接体）**，`gateText` 只影响长度门。
+ */
+export type ProviderReceiptInput =
+  | { entry: "acp-error"; acpErrorKind: string; message?: string; data?: string }
+  | { entry: "turn-text"; text: string; gateText?: string };
+
+/** `snippet` 的码点上限（PROTOCOL 2.4「原文保留」段：`failureSnippet` ≤120 码点） */
+const PROVIDER_SNIPPET_MAX_CODEPOINTS = 120;
+
+/**
+ * 文本是否存在**结构有效**的 `a2a-outcome` 块（围栏在且 JSON 可解析为**非数组对象**）。
+ * 与桥 `countValidOutcomeBlocks` 同判据（此处**不 import 桥**，按 {@link OUTCOME_BLOCK_RE} 就地重算）；
+ * 与 {@link containsFailedOutcomeBlock} 分家：本函数问「有没有**任何**有效块」，
+ * 后者问「末块是否 `state:"failed"`」—— 入口 ② 要的是前者（PROTOCOL 2.4 = 「正文不存在合法
+ * `a2a-outcome` 块」），非法 JSON 的残缺块**不算**（解析问题不得反向掩护假完成）。
+ */
+export function containsValidOutcomeBlock(text: string): boolean {
+  for (const match of text.matchAll(OUTCOME_BLOCK_RE)) {
+    try {
+      const parsed: unknown = JSON.parse((match[1] ?? "").trim());
+      if (typeof parsed === "object" && parsed !== null && !Array.isArray(parsed)) return true;
+    } catch {
+      // 残缺 / 非法 JSON ⇒ 不算有效块，继续看下一块
+    }
+  }
+  return false;
+}
+
+/** 大小写不敏感子串匹配：命中返回 `{ marker, snippet }`，否则 null（五模式 = 清单顺序优先） */
+function matchMarker(haystack: string): ProviderReceiptMatch | null {
+  const lower = haystack.toLowerCase();
+  for (const marker of PROVIDER_ERROR_MARKERS) {
+    const at = lower.indexOf(marker);
+    if (at < 0) continue;
+    return {
+      marker,
+      snippet: Array.from(haystack.slice(at)).slice(0, PROVIDER_SNIPPET_MAX_CODEPOINTS).join(""),
+    };
+  }
+  return null;
+}
+
+/**
+ * **纯函数**（PROTOCOL 2.4「`provider` 门详规」的 machine 侧落地，判据门名 `providerReceipt`）：
+ * 命中五模式之一 ⇒ 回报 `{ marker, snippet }`，否则 null。调用方据此结
+ * `failed` + `failureKind=provider`（接线在 M4/M5，本节点只给判据）。
+ *
+ * 两条入口，满足其一即命中：
+ * - 入口 ① `AcpError.kind === "rpc"` ∧ `message` / `data` 命中五模式。
+ *   **`spawn` / `closed` 明确不命中**（进程死了不等于死于欠费，仍归 `agent`）；
+ *   `timeout` / `protocol` 同理不认领（各有自己的类）。
+ * - 入口 ② 回合正常结束 ∧ 正文命中五模式 ∧ **无有效结论块**（有块 = 后端自己给了结论，让位
+ *   `business` 路径）。**阈值 = 未 trim 的 `gateText ?? text` 的 `.length < 300`**（UTF-16 长度，
+ *   {@link PROVIDER_RECEIPT_MAX_TEXT_CHARS}）：长正文即使含五模式字样也**不命中**
+ *   —— 这是本卡的**明示负锚放行**（改造文档 §5 未覆盖项：读日志 / 贴 curl 输出的正常长任务不误伤）。
+ *
+ * 不变式：**不改写、不截断正文**（返回的 `snippet` 只作 diagnostics 取证面，不进结果文本）；
+ * 不读 `updateCount` / `partialChars`（与零产出启发式 `zeroOutput` 分开命名，不合并）。
+ */
+export function matchesProviderReceipt(input: ProviderReceiptInput): ProviderReceiptMatch | null {
+  if (input.entry === "acp-error") {
+    if (input.acpErrorKind !== "rpc") return null;
+    return matchMarker(input.message ?? "") ?? matchMarker(input.data ?? "");
+  }
+  const text = input.text;
+  if ((input.gateText ?? text).length >= PROVIDER_RECEIPT_MAX_TEXT_CHARS) return null;
+  if (containsValidOutcomeBlock(text)) return null;
+  return matchMarker(text);
+}
+
+// ---------- v0.11.0 · M6：provider 取证三键的脱敏 + 窗口化（诊断面，绝不进结果文本） ----------
+
+/** `providerSnippet` 诊断面字符上限（**含 `…(+N)` 溢出标记在内**，UTF-16 长度） */
+const PROVIDER_SNIPPET_MAX_CHARS = 200;
+
+/**
+ * 疑似凭据脱敏：命中即整段替换为 `<redacted>`（口径同 `manager.ts` 的 `redactArgv`——
+ * 敏感取值不回显，逐字保留其余）。三类：
+ * - `sk-…`（OpenAI 风格密钥，含 `sk-proj-…`）；
+ * - `Bearer <token>`（保留 `Bearer` 前缀、仅遮蔽其后令牌，便于读日志者知是哪种鉴权头泄的）；
+ * - 长 base64 串（≥24 连续 base64 字符 + 可选 `=` 填充）。
+ * 顺序 = 先 sk / Bearer（其主体本身是 base64），再兜底扫残余长 base64。
+ */
+export function redactProviderSecrets(text: string): string {
+  return text
+    .replace(/\bsk-[A-Za-z0-9_-]{4,}\b/gi, "<redacted>")
+    .replace(/\bBearer\s+[A-Za-z0-9._~+/-]{4,}={0,2}\b/gi, "Bearer <redacted>")
+    .replace(/(?<![A-Za-z0-9+/])[A-Za-z0-9+/]{24,}={0,2}(?![A-Za-z0-9+/])/g, "<redacted>");
+}
+
+/**
+ * 截断到 `maxChars` 并以 `…(+N)` 标注溢出（**复用 `wideJson` 截断形态**：`…` 计 1 字、
+ * `N` = 被截掉的 UTF-16 字符数）。与 `wideJson` 的唯一差别：本函数保证**返回值含标记在内
+ * ≤ maxChars**（`wideJson` 不保证），故先按 `maxChars` 试切、再逐步回退 kept 直到不越界。
+ */
+export function truncateWithOverflow(text: string, maxChars: number): string {
+  if (text.length <= maxChars) return text;
+  let kept = maxChars;
+  for (;;) {
+    const marker = `…(+${String(text.length - kept)})`;
+    if (kept + marker.length <= maxChars) return text.slice(0, kept) + marker;
+    kept -= 1;
+  }
+}
+
+/**
+ * `providerSnippet` 单一拼装点：M3 回报的窗口片段 → 脱敏 → 窗口化截断到 200（含溢出标记）。
+ * **只在 diagnostics 面出现**；结果文本由调用方逐字保留（AC-S1 同规）。
+ */
+function providerSnippetFor(match: ProviderReceiptMatch): string {
+  return truncateWithOverflow(
+    redactProviderSecrets(match.snippet),
+    PROVIDER_SNIPPET_MAX_CHARS,
+  );
+}
+
 /** 文本侧 git 命令执行口：返回 stdout（trim 后）；失败一律抛错（调用方 fail-safe 吞掉） */
 export type GitTextRunner = (cwd: string, args: string[]) => string;
 
@@ -1470,7 +1647,7 @@ export class RunnerCommandExecutor {
   /**
    * 未知 / 非法职责位的硬拒回传（v0.10.2 · M-2 · F-C11 三条）。
    *
-   * - **(a) 不新增 `failureKind` 第 7 值** —— 复用既有 `agent` 类（「派发对象起不来 / 不认」是
+   * - **(a) 不新增 `failureKind` 闭集外的值** —— 复用既有 `agent` 类（「派发对象起不来 / 不认」是
    *   载体侧对该意图的归属；`classifyFailure` 的输入信号在这里一条都不成立，故**显式定类**而非走判定）；
    * - **(b) 必须经既有 outbox 回传该 `taskId` 的 `failed` 终态** —— 静默丢弃（返回 null / 只 warn）
    *   会让 orch 收不到任何结果、只能等孤儿墙钟：台账在 `startDispatch` 内才登记，本路径**不登记台账**，
@@ -2135,6 +2312,8 @@ export class RunnerCommandExecutor {
    * 否则诊断 JSON 会经 `resultText`（message + artifacts 拼接）混进结果文本。
    * v0.8.8 · M2：`timeoutScope` 派生（桥 timeout kind ⇒ `acp-prompt`；launcher timedOut ⇒
    * `runner-deadline`）+ `business` 判据（输出含失败结论块）+ 桥计量键逐键透传。
+   * v0.11.0 · M5：provider 门探测 + **假完成翻转**（completed 命中 ⇒ 上报 failed + `provider`；
+   * `text` / `artifacts` 逐字不动，翻转发生在 {@link mapTaskState} 之后，不改其语义）。
    */
   private buildResult(
     command: DispatchCommand,
@@ -2149,26 +2328,46 @@ export class RunnerCommandExecutor {
         ? settled
         : { ...(settled as Record<string, unknown>), artifacts: split.artifacts };
     const view: A2ATaskView = taskViewOf(body);
-    const state = mapTaskState(view.state, timedOut);
+    const mappedState = mapTaskState(view.state, timedOut);
     const text = view.text.length > 0 ? view.text : view.statusText;
     const timeoutScope: RunnerTimeoutScope | undefined = timedOut
       ? "runner-deadline"
       : bridge?.acpErrorKind === "timeout"
         ? "acp-prompt"
         : undefined;
+    const scan = outcomeScanText(view.text, view.statusText, split.artifacts);
+    // v0.11.0 · M5：provider 门探测（PROTOCOL 2.4）。入口选择由判据面把关：桥带 acpErrorKind =
+    // 异常收尾 ⇒ 只走 ① `acp-error`（正文不喂 ②，避免双记）；回合正常收尾（completed / 无 kind 的
+    // failed）⇒ 走 ② `turn-text`。`timedOut` 是预算侧事实、优先级盖过门 ⇒ 不探测。
+    // input-required 不参与结算 ⇒ 不探测。
+    const providerMatch =
+      timedOut || (mappedState !== "completed" && mappedState !== "failed")
+        ? null
+        : mappedState === "failed" && bridge?.acpErrorKind !== undefined
+          ? matchesProviderReceipt({
+              entry: "acp-error",
+              acpErrorKind: bridge.acpErrorKind,
+              message: view.statusText,
+              data: bridge.acpErrorData,
+            })
+          : matchesProviderReceipt({
+              entry: "turn-text",
+              text: scan,
+              // 长度门量回执正文本身：`scan` 拼接体可能因后端把同一段正文重复进 artifact 而成倍变长
+              gateText: view.text.trim().length > 0 ? view.text : view.statusText,
+            });
+    // 假完成翻转：completed ∧ 门命中 ⇒ 上报 failed（classifyFailure 随后据 providerFailure 给 `provider`）
+    const state: RunnerTaskState =
+      mappedState === "completed" && providerMatch !== null ? "failed" : mappedState;
     const businessFailure =
-      state === "failed" &&
-      !timedOut &&
-      containsFailedOutcomeBlock(
-        outcomeScanText(view.text, view.statusText, split.artifacts),
-        bridge,
-      );
+      state === "failed" && !timedOut && containsFailedOutcomeBlock(scan, bridge);
     const kind = classifyFailure({
       timedOut,
       state,
       threwInEnsure: false,
       ...(bridge?.acpErrorKind !== undefined ? { acpErrorKind: bridge.acpErrorKind } : {}),
       ...(businessFailure ? { businessFailure: true } : {}),
+      ...(providerMatch !== null ? { providerFailure: true } : {}),
     });
     const diagnostics = this.diagnosticsOf(
       state,
@@ -2176,6 +2375,15 @@ export class RunnerCommandExecutor {
       bridge,
       mergeDiagnostics({
         ...(timeoutScope !== undefined ? { timeoutScope } : {}),
+        // v0.11.0 · M6：provider 取证三键并入 diagnostics（三键同源，命中才报；
+        // 片段脱敏 + 窗口化后 ≤200 字，**只走诊断面**，结果文本 `text` 逐字不动）
+        ...(providerMatch !== null
+          ? {
+              providerFailure: true,
+              providerMarker: providerMatch.marker,
+              providerSnippet: providerSnippetFor(providerMatch),
+            }
+          : {}),
       }),
     );
     return {

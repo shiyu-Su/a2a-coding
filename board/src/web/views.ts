@@ -14,6 +14,11 @@ import type {
   ProjectTasksView,
   ProjectVersionsField,
   ProjectsView,
+  StageRunCompleteness,
+  StageRunProjectView,
+  StageRunSynthesisView,
+  StageRunView,
+  StageSectionView,
   TraceNode,
 } from "../bridge-client.js";
 import { projectVersionsOf } from "../bridge-client.js";
@@ -25,13 +30,14 @@ import {
   deriveActionAffordance,
   deriveCardColorTier,
   deriveDisplayStage,
+  deriveGate1ConfirmState,
   deriveNextStepHint,
   deriveScheduleGateOpen,
   formatDurationBetween,
   isTerminalFeatureState,
   traceWaitDisplay,
 } from "../derive.js";
-import type { ChainStateLine, DisplayStage, NextStepInput, TurnProgressView } from "../derive.js";
+import type { ChainStateLine, DisplayStage, Gate1ConfirmState, NextStepInput, TurnProgressView } from "../derive.js";
 import type { DocsSource } from "../docs-read.js";
 import type { Receipt } from "../receipt.js";
 import {
@@ -58,7 +64,30 @@ import { compareVersionOrder, isUnscheduled, normalizeVersion, sortFeatureCards,
 import { isVersionLocked } from "../version-status.js";
 import { isConfirmedCard } from "../version-transition.js";
 import { findVersionRecord, isVersionStatus, type VersionLedgerStatus, type VersionOrgFilter, type VersionsLedger } from "../versions-ledger.js";
-import { VERSION_ACTION_REMOVE } from "../write-guard.js";
+import {
+  DOC_OBJECTION_FORM_DOC_VERSION_FIELD,
+  DOC_OBJECTION_FORM_SECTION_ID_FIELD,
+  DOC_OBJECTION_FORM_TEXT_FIELD,
+  DOC_OBJECTION_WRITE_PATH_TEMPLATE,
+  GATE1_CONFIRM_FORM_DOC_HASH_FIELD,
+  GATE1_CONFIRM_FORM_DOC_VERSION_FIELD,
+  GATE1_CONFIRM_FORM_ROUND_FIELD,
+  GATE1_CONFIRM_FORM_VERSION_FIELD,
+  GATE1_CONFIRM_WRITE_PATH_TEMPLATE,
+  STAGE_ROUND_OPEN_FORM_BASIS_REV_INPUT_FIELD,
+  STAGE_ROUND_OPEN_FORM_SOURCES_FIELD,
+  STAGE_ROUND_OPEN_FORM_STAGE_FIELD,
+  STAGE_ROUND_OPEN_WRITE_PATH_TEMPLATE,
+  VERSION_ACTION_REMOVE,
+} from "../write-guard.js";
+import {
+  STAGE_STEP_ACTION_GATE1_CONFIRM,
+  STAGE_STEP_ACTION_ROUND_OPEN,
+  STAGE_STEP_REQUIREMENT_ANALYSIS,
+  decideStep,
+  registeredModificationDocFiles,
+} from "../stage-step.js";
+import type { StageStepDecision } from "../stage-step.js";
 import { emptyRow, escapeHtml } from "./layout.js";
 import type { ErrorOverlayParams } from "./layout.js";
 
@@ -613,6 +642,24 @@ export interface FeatureDetailExtras {
    * 桶外的值 ⇒ 该阶段 0 任务 ⇒ 走「区内空态行」（不猜、不静默回落全集）。
    */
   selectedStage?: string | null;
+  /**
+   * 确认表单排期下拉的数据源：引擎版本台账 `/api/versions` 中的 open 版号。
+   * `undefined` = 直接调用的老测试面未接线（保留既有表单结构）；`null` = 台账不可读
+   * （表单必须退场并明示数据源）；`[]` = 台账可读但零个 open 版号。
+   */
+  versionOptions?: readonly string[] | null;
+  /** 版本台账不可读时的原因；只在 `versionOptions === null` 时出现。 */
+  versionSourceError?: string | null;
+  /**
+   * 显式 `?stage=` 选了非当前阶段。整页进入纯读档：确认、开轮、异议、
+   * 回答、停链、排期等写表单均不渲染。
+   */
+  stageReadOnly?: boolean;
+  /**
+   * 写回执顶栏（0cb2d1db 缺陷二 · A3）：开轮 303 回详情页时经 `?notice=` 带一句可见回执，
+   * 页面顶部出 `.stage-notice` 一行（零 JS）。缺省 / 空串 ⇒ 该行零字节（不连坐字节一致判据）。
+   */
+  stageNotice?: string | null;
 }
 
 /**
@@ -779,6 +826,8 @@ const EXECUTION_COLUMNS: readonly string[] = [
   "重派",
   "依赖",
   "执行时长",
+  "mode",
+  "round",
 ] as const;
 
 /**
@@ -851,6 +900,893 @@ export function resolveStageSelection(detail: FeatureDetailView, queryStage: str
 }
 
 /**
+ * 当前可写阶段的桶键（与步条/执行明细共用 `displayStageToStep`）。
+ * `改造中 / 定版中 / 拆任务中` 等派生显示态先归到所在段再比较；
+ * 否则显式 `?stage=改造` 会被误判成历史阶段。未登记 `stage` ⇒ 需求分析。
+ */
+export function currentStageBucketOf(detail: FeatureDetailView): string {
+  const f = detail.feature;
+  const raw = (f.stage ?? "").trim();
+  if (STAGE_STEPS.includes(raw)) return raw;
+  return displayStageToStep(deriveDisplayStage(f.state, f.stage)) ?? (raw || STAGE_STEP_REQUIREMENT_ANALYSIS);
+}
+
+// ---------------------------------------------------------------------------
+// R1 B3（v0.11.0）：卡面「阶段任务」区 —— 渲染引擎直出的 `stageRuns[]`
+// ---------------------------------------------------------------------------
+
+/**
+ * 阶段任务区 chip 的**词表白名单**（本区类名唯一事实源 · 改造文档冻结口径）：
+ * chip 类名一律 `sr-chip sr-*`，**逐条命中本表取类**，命中不到 ⇒ 中性 `sr-other`（显原值、不猜）。
+ * **反置灰纪律**：本表**不含**任何「缺键不渲」类置灰钩子（`muted` / `dim` / `mute` / `dg-unknown` …）——
+ * 尤其 `not_involved` 走 {@link RELEVANCE_CHIPS} 的**中性描边 + 正常字色**，与「这块没渲出来」在
+ * 观感上必须可分（否则读者分不清「他答了不涉及」与「该面缺席」）。
+ */
+interface StageRunChip {
+  /** chip 类名后缀（`sr-chip` 之外的第二枚类，白名单内）。 */
+  cls: string;
+  /** 展示文字（引擎值不译写，只补中文助读，口径同 {@link label}）。 */
+  label: string;
+}
+
+/** 应答态 chip（词表须覆盖 pending / valid / invalid / stale；`settled` 为引擎既有合法态一并收录）。 */
+const ANSWER_STATE_CHIPS: Readonly<Record<string, StageRunChip>> = {
+  pending: { cls: "sr-answer-pending", label: "待答 pending" },
+  valid: { cls: "sr-answer-valid", label: "有效 valid" },
+  invalid: { cls: "sr-answer-invalid", label: "无效 invalid" },
+  stale: { cls: "sr-answer-stale", label: "陈旧 stale" },
+  settled: { cls: "sr-answer-settled", label: "已答 settled" },
+};
+
+/** 参与态 chip（词表须覆盖 involved / not_involved；`not_involved` 严禁复用置灰类）。 */
+const RELEVANCE_CHIPS: Readonly<Record<string, StageRunChip>> = {
+  involved: { cls: "sr-involved", label: "参与 involved" },
+  not_involved: { cls: "sr-not-involved", label: "不参与 not_involved" },
+};
+
+/** decision chip 固定走中性 {@link StageRunChip} 类 `sr-decision`（值域归引擎，板不枚举、只显原值）。 */
+const DECISION_CHIP_CLS = "sr-decision";
+
+/** 白名单外取中性类 + 原值（不置灰、不吞，口径同 `label` 的「未命中原样显示」）。 */
+function chip(cls: string, text: string): string {
+  return `<span class="sr-chip ${cls}">${escapeHtml(text)}</span>`;
+}
+
+function answerStateChip(state: string | null): string {
+  const hit = state === null ? undefined : ANSWER_STATE_CHIPS[state];
+  if (hit !== undefined) return chip(hit.cls, hit.label);
+  return chip("sr-other", `应答态 ${state ?? "—"}`);
+}
+
+function relevanceChip(relevance: string | null): string {
+  const hit = relevance === null ? undefined : RELEVANCE_CHIPS[relevance];
+  if (hit !== undefined) return chip(hit.cls, hit.label);
+  return chip("sr-other", `参与态 ${relevance ?? "—"}`);
+}
+
+function decisionChip(decision: string | null): string {
+  if (decision === null || decision === "") return "";
+  return chip(DECISION_CHIP_CLS, `决定 ${decision}`);
+}
+
+/** taskState：值域归引擎、板不枚举；文案走既有 `TASK_STATE_LABELS` 助读（未命中原样显示）。 */
+function taskStateChip(state: string | null): string {
+  return chip("sr-task", `任务态 ${state === null ? "—" : label(TASK_STATE_LABELS, state)}`);
+}
+
+/** reachability：闭集外已在 B1 解析层收敛为 `unknown`；此处只做显形（未知 ≠ 可派发，不猜）。 */
+function reachabilityChip(reachability: string): string {
+  const label =
+    reachability === "dispatchable" ? "可派发" : reachability === "no_runner" ? "无可达执行位" : "未知";
+  return chip("sr-reach", `${label}（${reachability}）`);
+}
+
+/** 直透一格的分母 + 四计数（**分子/分母** 只在「本轮」区出现；板不重算、缺值显 `—`，口径同 `label`）。 */
+function completenessCell(n: number | null): string {
+  return n === null ? "—" : String(n);
+}
+
+function renderCompleteness(c: StageRunCompleteness): string {
+  return (
+    `<p class="completeness">完成度 <b class="sr-frac">${completenessCell(c.settledCount)}/${completenessCell(c.expected)}</b>` +
+    ` · 待答 ${completenessCell(c.pendingCount)}` +
+    ` · 无效 ${completenessCell(c.invalidCount)}` +
+    ` · 陈旧 ${completenessCell(c.staleCount)}</p>`
+  );
+}
+
+/** 一格 `unanswered[]` 的具名行（逐条指名可见，**不是**只给计数；空数组 ⇒ 整块不渲）。 */
+function renderUnanswered(unanswered: readonly string[]): string {
+  if (unanswered.length === 0) return "";
+  const items = unanswered.map((q) => `<li class="named-item">${escapeHtml(q)}</li>`).join("");
+  return `<div class="stage-run-unanswered"><span class="sr-label">未收齐（${unanswered.length}）待答：</span><ul class="sr-unanswered-list">${items}</ul></div>`;
+}
+
+/** 一格的 project 应答行（逐 project 一 `<li>`；chip 词表白名单出，不 join、不排序、不译值域）。 */
+function renderStageRunProjects(projects: readonly StageRunProjectView[]): string {
+  if (projects.length === 0) {
+    return `<p class="hint muted sr-no-project">（本格无 project 应答行）</p>`;
+  }
+  const rows = projects
+    .map((p) => {
+      const chips = [
+        answerStateChip(p.answerState),
+        relevanceChip(p.relevance),
+        decisionChip(p.decision),
+        reachabilityChip(p.reachability),
+      ].join(" ");
+      return (
+        `<li class="sr-project-row">` +
+        `<span class="mono sr-pid" title="${escapeHtml(p.taskId ?? "")}">${escapeHtml(p.projectId ?? "—")}</span> ` +
+        chips +
+        `</li>`
+      );
+    })
+    .join("");
+  return `<ul class="sr-project-list">${rows}</ul>`;
+}
+
+/** 收口三态助读（B3 阶段任务区与 B4 确认单**共用同一措辞**；`settled` 值域归引擎，板不塌成两态）。 */
+function settledLabel(settled: boolean | null): string {
+  return settled === true ? "已收齐" : settled === false ? "未收齐" : "收齐未知";
+}
+
+/** 一格头部：阶段名 + 轮次 + 三枚追溯锚（basisRev / docVersion / settled 三态直显）。 */
+function renderStageRunHead(run: StageRunView): string {
+  const settledText = settledLabel(run.settled);
+  const parts = [
+    `<b class="sr-stage">${escapeHtml(run.stage ?? "—")}</b>`,
+    run.round === null ? "" : `<span class="sr-round">第 ${String(run.round)} 轮</span>`,
+    `<span class="sr-settled">收口：${escapeHtml(settledText)}</span>`,
+    run.basisRev === null ? "" : `<span class="sr-rev mono" title="${escapeHtml(run.basisRev)}">rev ${escapeHtml(shortId(run.basisRev))}</span>`,
+    run.docVersion === null ? "" : `<span class="sr-docv">${escapeHtml(run.docVersion)}</span>`,
+  ].filter((s) => s !== "");
+  return `<div class="sr-head">${parts.join(" ")}</div>`;
+}
+
+/** 一格正文（本轮 / 旧轮共用外壳；`showCompleteness` = 分子/分母只在本轮出，旧轮一律不带）。 */
+function renderStageRunBody(run: StageRunView, showCompleteness: boolean): string {
+  return `${renderStageRunHead(run)}${showCompleteness ? renderCompleteness(run.completeness) : ""}${renderUnanswered(run.unanswered)}${renderStageRunProjects(run.projects)}`;
+}
+
+/** 轮次序键：`round === null` ⇒ `-1`（缺轮次的格排到末位，不臆造 0、不与真值同键）。 */
+function stageRoundNum(run: StageRunView): number {
+  return run.round === null ? -1 : run.round;
+}
+
+/**
+ * 「本轮」选择结论（**单点判定**：B3 阶段任务区与 B4 合成确认单共用，防两处各算一份「本轮」）。
+ * 口径与 {@link renderStageRuns} 一致（宿主裁定 · 不跨阶段回落）：
+ * - 本轮 = **所选阶段内** `round` 最大的那一格（同值取末次出现）；
+ * - 旧轮 = 同一阶段内更早的 `round`；
+ * - 所选阶段无任何格 ⇒ `null`（整区不渲，**禁止**拿别阶段的格冒充）；
+ * - 唯一例外：`selectedStage` 本身为空（未接线 / 无可选阶段）⇒ 回落全局最大轮格并打 `isFallback`。
+ */
+interface StageRunPick {
+  current: StageRunView;
+  older: StageRunView[];
+  isFallback: boolean;
+}
+
+function pickStageRun(
+  stageRuns: StageRunView[] | null | undefined,
+  selectedStage: string | null,
+): StageRunPick | null {
+  if (stageRuns === null || stageRuns === undefined || stageRuns.length === 0) return null;
+
+  /** 同值取末次出现（口径同宿主裁的「同名键末次出现胜」）：`>=` 让后一格覆盖前一格。 */
+  const pickMaxRoundIndex = (pool: readonly StageRunView[]): number => {
+    let idx = 0;
+    for (let i = 1; i < pool.length; i += 1) {
+      if (stageRoundNum(pool[i]!) >= stageRoundNum(pool[idx]!)) idx = i;
+    }
+    return idx;
+  };
+
+  const selected = (selectedStage ?? "").trim();
+  // 本轮候选池：所选非空 ⇒ 只取同阶段的格（不跨阶段）；所选空 ⇒ 全局格（回落例外，稍后收敛到该格自身阶段）。
+  let pool: readonly StageRunView[];
+  let isFallback = false;
+  if (selected === "") {
+    pool = stageRuns;
+    isFallback = true;
+  } else {
+    const matching = stageRuns.filter((run) => run.stage === selected);
+    if (matching.length === 0) return null; // 裁定 3：所选阶段无格 ⇒ 整区不渲（不得拿别阶段冒充）
+    pool = matching;
+  }
+
+  const current = pool[pickMaxRoundIndex(pool)]!;
+  // 回落态把候选池收敛到「该格自身的阶段」，旧轮仍严格 = 同阶段更早的 round（不掺入别阶段）。
+  const sameStage = isFallback ? pool.filter((run) => run.stage === current.stage) : pool;
+  const currentIdx = pickMaxRoundIndex(sameStage);
+  return {
+    current: sameStage[currentIdx]!,
+    older: sameStage.filter((_, i) => i !== currentIdx),
+    isFallback,
+  };
+}
+
+/**
+ * 阶段任务区主入口（R1 B3）：把引擎直出的 `stageRuns[]` 分成「本轮」主表 + 「旧轮」折叠区。
+ *
+ * **本轮口径** = {@link pickStageRun} 单点判定（宿主裁定 · 不采用跨阶段回落）：
+ * - **本轮 = 所选阶段内 `round` 最大的那一格**（同阶段判定，**不跨阶段**，同值取末次出现）。
+ * - **旧轮 = 同一阶段内更早的 `round`** ⇒ 进 `.stage-run-archive` 折叠区、**不参与任何分子/分母展示**。
+ * - **所选阶段在 `stageRuns` 里没有任何格 ⇒ 整区不渲**（与 `stageRuns === null` 同义，返回空串），
+ *   **禁止**拿其它阶段的格冒充「本轮」。
+ * - **唯一例外**：`resolveStageSelection` 本身返回空（未接线 / 无可选阶段：`selectedStage` 为 null / 空白串）
+ *   ⇒ 回落「全局 `round` 最大格」，但**显式标出该格自身的 `stage` 名**（卡上打 `sr-fallback` 标记，
+ *   绝不冒充「当前所选阶段」——本区头部只取 `run.stage`，从不注入 `selectedStage`）。
+ *
+ * 其余冻结口径：
+ * - `stageRuns` 为 `null` / `undefined` ⇒ 整区不渲（判据 6 的字节一致由此保证）。
+ * - **未收齐 ≠ 不渲染**：`settled` 为 false / `pendingCount > 0` 照常渲整区（`settled=false` 是常态）。
+ * - 板**不重演**判据：`settled` 与完成度四计数**直透**引擎值。
+ */
+export function renderStageRuns(
+  stageRuns: StageRunView[] | null | undefined,
+  selectedStage: string | null,
+): string {
+  const pick = pickStageRun(stageRuns, selectedStage);
+  if (pick === null) return "";
+  const { current, older, isFallback } = pick;
+
+  const currentHtml = `<div class="stage-run-current${isFallback ? " sr-fallback" : ""}">${renderStageRunBody(current, true)}</div>`;
+  const archiveHtml =
+    older.length === 0
+      ? ""
+      : foldSection(
+          `旧轮（${older.length}）· 不参与完成度统计`,
+          `<div class="stage-run-archive">${older
+            .map((run) => `<div class="sr-archive-row">${renderStageRunBody(run, false)}</div>`)
+            .join("")}</div>`,
+        );
+  return `<h2>阶段任务</h2>\n${currentHtml}${archiveHtml}`;
+}
+
+// ---------------------------------------------------------------------------
+// R1 B4（v0.11.0）：合成《需求确认单》默认视图 + 段落异议 + 依据抽屉 + 版本记录
+// ---------------------------------------------------------------------------
+
+/**
+ * 两枚写控件的 `allowedActions` **门闩词元**（= 改造文档 §2.5 两枚板侧写口同名）。
+ * 判据是**交集**：本格 `allowedActions` 不含该词元 ⇒ 对应按钮 / 表单**不渲染**（不是渲出来点了报错）。
+ * **单点可调**：引擎实际词元若与此不同，只改这两枚常量，视图层不留第二处判断。
+ * **`gate1_confirm` 无门闩词元、但有控件**（v0.11.0 B3 改口径）：宿主裁决 A8 明写 `allowedActions`
+ * **不新增** `gate1_confirm` 词元（门闩单点在引擎 `buildStageRunCell`，板不得自判），确认控件的显隐
+ * **只由本轮 `synthesis` 派生**（{@link deriveGate1ConfirmState} 单点），与本表两枚词元无关。
+ */
+export const STAGE_ACTION_ROUND_OPEN = "stage_round_open";
+export const STAGE_ACTION_DOC_OBJECTION = "doc_objection";
+
+/**
+ * B2 写路径模板 → 表单 `action`（**单点展开**：板不另写第二份路径字面量，
+ * 「action 属性 = 模板展开值」的判据据此机械成立）。
+ */
+function stageWriteFormAction(template: string, featureId: string): string {
+  return escapeHtml(template.replace("{id}", encodeURIComponent(featureId)));
+}
+
+/** 门闩取数：精确匹配、不做别名宽容（板不立第二套值域，口径同 B3 的 chip 白名单外显原值）。 */
+function actionAllowed(run: StageRunView, action: string): boolean {
+  return run.allowedActions.includes(action);
+}
+
+/**
+ * 确认表单排期下拉的唯一取数口：引擎版本台账投影 → 本需求归属组织的 open 版号。
+ *
+ * 新台账状态字面 `open` 优先；当前 Group 台账仍使用 `notstart/active` 二态时作兼容回退。
+ * 只要投影里出现 `open`，就**不**混入旧态，避免两套值域同时喂下拉。
+ */
+export function openVersionOptions(
+  projection: EngineVersionsProjection | null,
+  ownerGroup: string | null | undefined,
+): string[] {
+  if (projection === null) return [];
+  const org = (ownerGroup ?? "").trim();
+  const sameOrg = projection.entries.filter((entry) => entry.org.trim() === org);
+  const exactOpen = sameOrg.filter((entry) => entry.status === "open").map((entry) => entry.version.trim());
+  const legacyOpen =
+    exactOpen.length > 0
+      ? []
+      : sameOrg
+          .filter((entry) => entry.status === "notstart" || entry.status === "active")
+          .map((entry) => entry.version.trim());
+  return [...new Set((exactOpen.length > 0 ? exactOpen : legacyOpen).filter((v) => v !== ""))].sort(
+    compareVersionOrder,
+  );
+}
+
+export interface StageConfirmSheetOptions {
+  /** 见 {@link FeatureDetailExtras.versionOptions}。 */
+  versionOptions?: readonly string[] | null;
+  versionSourceError?: string | null;
+  /** 非当前阶段的历史视图：保留数据，禁止任何阶段写表单。 */
+  readOnly?: boolean;
+}
+
+/** 本格仍未处置的异议；`disposed` 是引擎已按开轮事件序给出的事实，板不重算。 */
+function pendingObjectionsOf(run: StageRunView): readonly StageRunView["objections"][number][] {
+  const objections = Array.isArray(run.objections) ? run.objections : [];
+  return objections.filter((item) => !item.disposed);
+}
+
+function objectionExcerpt(text: string): string {
+  const flat = text.replace(/\s+/g, " ").trim();
+  const chars = Array.from(flat);
+  return chars.length > 60 ? `${chars.slice(0, 60).join("")}…` : flat;
+}
+
+function objectionSectionTitle(run: StageRunView, item: StageRunView["objections"][number]): string {
+  const provided = (item.sectionTitle ?? "").trim();
+  if (provided !== "") return provided;
+  const id = (item.sectionId ?? "").trim();
+  if (id === "") return "未标段落";
+  const section = sectionsOf(run).find((candidate) => (candidate.id ?? "").trim() === id);
+  const title = (section?.title ?? "").trim();
+  return title === "" ? id : title;
+}
+
+function renderPendingObjectionsList(run: StageRunView): string {
+  const pending = pendingObjectionsOf(run);
+  if (pending.length === 0) return "";
+  const rows = pending
+    .map(
+      (item, index) =>
+        `<li class="cs-pending-objection"><b>${String(index + 1)}. ${escapeHtml(
+          objectionSectionTitle(run, item),
+        )}</b><p>${escapeHtml(objectionExcerpt(item.text))}</p></li>`,
+    )
+    .join("");
+  return `<div class="cs-pending-objections">
+<h3 class="cs-h">待处置异议（${String(pending.length)}）<span class="cs-count-badge" title="未处置异议 ${String(
+    pending.length,
+  )} 条">${String(pending.length)}</span></h3>
+<ol class="cs-pending-objection-list">${rows}</ol>
+</div>`;
+}
+
+/**
+ * 半成品态**补救块**（836563b8「提交异议即开新一轮」B2）：提异议已改成「① 记异议 + ② 同请求内开轮」
+ * 一笔串写，② 失败时引擎不回滚 ①（无删除口）⇒ 卡面留下「有未处置异议、但没有接续的新一轮」。
+ * 本块是那条半成品的唯一出路：重试动作**只重调 `stage_round_open`**（异议已留痕，开轮幂等键
+ * 保证重复点击不重复开轮），**不重复记异议**。
+ *
+ * 渲染判据（常规路径 ⇒ 零字节）：存在 `disposed === false` 异议 ∧ 本轮 `synthesis` 仍是
+ * **已封口未推进**（`done` + `docVersion` 非空 ∧ 门① 未确认）∧ 开轮门闩开 ∧ 非历史只读档。
+ * 字段与 action 沿用原「带异议开轮」表单（开轮入参照旧：`basisRevInput` 只锚
+ * `synthesis.docVersion`，`sources` 逐条带未处置异议原文）。
+ * 「未推进」档吃 {@link deriveGate1ConfirmState} 的**既有单点结论**（`gate1State` 由调用方下传，
+ * 本文件不开第二处取档调用，口径同 B3-②e 的去重钉）。
+ */
+function renderObjectionRoundRetryBlock(
+  featureId: string,
+  run: StageRunView,
+  readOnly: boolean,
+  gate1State: Gate1ConfirmState,
+): string {
+  const pending = pendingObjectionsOf(run);
+  if (pending.length === 0 || readOnly) return "";
+  if (!actionAllowed(run, STAGE_ACTION_ROUND_OPEN)) return "";
+  // 开轮的依据版本只锚合成版本（与段落异议表单的 `docVersion` 同口径，**不回落到轮格 docVersion**——两者同名不同义）；
+  // 合成未 done / docVersion 为空 ⇒ 整块不渲（并入既有「无合成不渲」，不新增判据分支）。
+  const basisRev = (run.synthesis?.docVersion ?? "").trim();
+  if (run.synthesis?.state !== "done" || basisRev === "") return "";
+  // 已推进（门① 已确认当前版）⇒ 不是半成品态，不给补救入口
+  if (gate1State === "confirmed") return "";
+  const stage = (run.stage ?? "").trim() || STAGE_STEP_REQUIREMENT_ANALYSIS;
+  const sourceFields = pending
+    .map((item) => {
+      const sectionId = (item.sectionId ?? "").trim();
+      const source = sectionId === "" ? item.text : `${sectionId}：${item.text}`;
+      return `<input type="hidden" name="${STAGE_ROUND_OPEN_FORM_SOURCES_FIELD}" value="${escapeHtml(source)}">`;
+    })
+    .join("");
+  return `<div class="cs-objection-retry">
+<h3 class="cs-h">补救：${String(pending.length)} 条异议已留痕，新一轮未开</h3>
+<p class="hint err cs-objection-retry-note">上一笔「提交异议」的异议写入已成功、开新一轮失败（引擎无删除口 ⇒ 板不回滚异议）。下面这一钮**只重调开轮**，不会重复记异议。</p>
+<form class="stage-round-open-form cs-objection-round-form" method="post" action="${stageWriteFormAction(
+    STAGE_ROUND_OPEN_WRITE_PATH_TEMPLATE,
+    featureId,
+  )}" data-submit="已提交，重试开新一轮中…">
+<input type="hidden" name="${STAGE_ROUND_OPEN_FORM_STAGE_FIELD}" value="${escapeHtml(stage)}">
+<input type="hidden" name="${STAGE_ROUND_OPEN_FORM_BASIS_REV_INPUT_FIELD}" value="${escapeHtml(basisRev)}">
+${sourceFields}
+<button type="submit">重试开新一轮（异议已留痕）</button>
+</form>
+</div>`;
+}
+
+function renderSynthesisUnavailable(run: StageRunView): string {
+  if (run.synthesis?.state === "done" && sectionsOf(run).length > 0) return "";
+  const reason = "尚未生成";
+  return `<p class="hint warn cs-synthesis-unavailable">本轮合成未生成（原因：${reason}），请重开一轮。</p>`;
+}
+
+function renderStageActionArea(
+  featureId: string,
+  run: StageRunView,
+  confirmHtml: string,
+  pairRoundOpen: boolean,
+  readOnly: boolean,
+): string {
+  const pending = pendingObjectionsOf(run).length > 0;
+  const synthesisUnavailable = renderSynthesisUnavailable(run);
+  if (readOnly) {
+    const list = renderPendingObjectionsList(run);
+    return list === "" ? "" : `<section class="cs-stage-action-area cs-stage-action-area-readonly">${list}</section>`;
+  }
+  const roundOpenAllowed = actionAllowed(run, STAGE_ACTION_ROUND_OPEN);
+  // 未处置异议的出路**不在本区**（836563b8）：提异议即开轮，本区只列清单，补救块单独渲。
+  const actions = pending
+    ? ""
+    : synthesisUnavailable !== ""
+      ? roundOpenAllowed
+        ? renderStageRoundOpenForm(featureId, run.stage)
+        : ""
+      : confirmHtml === ""
+        ? ""
+        : `${confirmHtml}${pairRoundOpen && roundOpenAllowed ? renderStageRoundOpenForm(featureId, run.stage) : ""}`;
+  if (pending) {
+    return `<section class="cs-stage-action-area cs-stage-action-area-objections">${renderPendingObjectionsList(
+      run,
+    )}</section>`;
+  }
+  if (synthesisUnavailable !== "") {
+    return `<section class="cs-stage-action-area cs-stage-action-area-synthesis-missing">${
+      actions === "" ? synthesisUnavailable : `${synthesisUnavailable}${actions}`
+    }</section>`;
+  }
+  return actions === "" ? "" : `<section class="cs-stage-action-area">${actions}</section>`;
+}
+
+/**
+ * 合成《需求确认单》默认视图（R1 B4 主入口）：用户默认面对的是**一份合成确认单**，不是逐 project 结论。
+ *
+ * 冻结口径：
+ * - 内容**只由引擎直出字段拼装**（本轮格的 `stage` / `round` / `sections[]` / `docVersion` /
+ *   `basisRev` / `completeness`，逐 project 的 `reason`）—— 板**不自行归纳段落**、不重演收口判据、
+ *   不硬编码带具体项目名的文案；
+ * - **本轮格** = {@link pickStageRun} 单点判定（与 B3 阶段任务区同一张判定，不各算一份）；
+ *   `stageRuns` 为 `null` / `undefined` / 所选阶段无格 ⇒ **整区零字节**（判据 6 的字节一致同 B3）；
+ * - 段落级「有异议」⇒ B2 的 `doc-objection` 路径（**用户不需要选项目**）；该写口在**同一请求内**
+ *   串调 `stage_round_open`（836563b8「提交异议即开新一轮」），卡面**不再给「带着 N 条异议开新一轮」
+ *   常规表单**；「再开一轮」⇒ B2 的 `stage-round-open` 路径只留在首轮空态卡 / 无合成退路 /
+ *   确认档相邻选项三处，未处置异议只剩 {@link renderObjectionRoundRetryBlock} 的补救块；
+ * - 依据层（basisRev / docVersion / 逐 project reason）默认**折叠**；
+ * - 版本记录复用既有登记文档路径提取口径（{@link registeredDecisionDocRefs}）。
+ */
+export function renderStageConfirmSheet(
+  featureId: string,
+  stageRuns: StageRunView[] | null | undefined,
+  selectedStage: string | null,
+  decisions: string | null | undefined,
+  options: StageConfirmSheetOptions = {},
+): string {
+  const pick = pickStageRun(stageRuns, selectedStage);
+  if (pick === null) return "";
+  const run = pick.current;
+  const pendingObjections = pendingObjectionsOf(run);
+  const pending = pendingObjections.length > 0;
+  const readOnly = options.readOnly === true;
+  const synthesisReady = run.synthesis?.state === "done" && sectionsOf(run).length > 0;
+  // 异议必须锚定已完成的合成版本；合成未 done（含缺位）⇒ 本卡零异议入口。
+  const canObject = actionAllowed(run, STAGE_ACTION_DOC_OBJECTION) && synthesisReady;
+  // 步态仍只消费 `decideStep`：确认档是否成立不另判；本卡动作区只在确认档允许时同时陈列
+  // 「确认这一版」与既有开轮写口，二者是同一决策的两个相邻选项。
+  const stepDecision = decideStep({
+    stage: run.stage,
+    stageRuns: stageRuns ?? [],
+    synthesis: run.synthesis,
+    decisions,
+    allowedActions: run.allowedActions,
+  });
+  const pairRoundOpen = stepDecision.primaryAction === STAGE_STEP_ACTION_GATE1_CONFIRM;
+  // 门① 档位**单点取档**（B3-②e 的去重钉：本文件只这一处调用），确认块与补救块共用同一结论。
+  const gate1State = deriveGate1ConfirmState(run.synthesis);
+  const confirmBlock =
+    pending || readOnly || !synthesisReady
+      ? ""
+      : renderGate1ConfirmBlock(
+          featureId,
+          run,
+          pairRoundOpen,
+          gate1State,
+          options.versionOptions,
+          options.versionSourceError,
+        );
+  const actionArea = renderStageActionArea(featureId, run, confirmBlock, pairRoundOpen, readOnly);
+  const retryArea = renderObjectionRoundRetryBlock(featureId, run, readOnly, gate1State);
+  // 异议入口与确认按钮解绑（0cb2d1db 缺陷一）：本段是否已有未处置异议，不得抹掉**其余段落**的异议入口；
+  // 「有未处置异议 ⇒ 确认按钮退场」的耦合仍由上面 confirmBlock 的 `pending || readOnly || !synthesisReady` 独扛。
+  const sectionsHtml = renderConfirmSections(featureId, run, canObject && !readOnly);
+  const nextLine = pending
+    ? ""
+    : readOnly
+      ? `<p class="hint cs-step cs-step-readonly">历史阶段只读：当前展示数据，不提供阶段写入操作。</p>`
+      : synthesisReady
+        ? renderStageStepNextLine(stepDecision, featureId, decisions)
+        : "";
+  return `<h2>需求确认单</h2>
+<div class="stage-confirm-sheet${pick.isFallback ? " cs-fallback" : ""}">
+${renderConfirmAnchor(run, pick.isFallback)}
+${nextLine}
+${actionArea}
+${retryArea}
+${sectionsHtml}
+${renderStageBasisDrawer(run)}
+${renderConfirmVersionLog(featureId, stageRuns ?? [], decisions, run.docVersion)}
+</div>`;
+}
+
+/** 「下一步」五档固定文案；动态项只补未答项目或已登记文档链接。 */
+export const STEP_COPY = {
+  "first-round": "尚无阶段轮 ⇒ 先发起首轮",
+  awaiting: "本轮未收齐 ⇒ 等",
+  "confirm-round": "已封口未确认 ⇒ 点「确认这一版」",
+  "write-doc": "等宿主登记《改造文档》",
+  approve: "点「确认改造文档 → 放行执行」",
+} as const;
+
+/**
+ * 按步收口的卡面状态行：`decideStep` 结论的人话投影。
+ * 五档固定映射 first-round / awaiting / confirm-round / write-doc / approve；`done` 只陈述收口事实。
+ * 本函数不重判步态，只消费 {@link decideStep} 已给出的结论。
+ */
+export function renderStageStepNextLine(
+  step: StageStepDecision,
+  featureId: string,
+  decisions: string | null | undefined,
+  guide = false,
+): string {
+  const line = (kind: string, copy: string): string =>
+    `<p class="${guide ? "hint nextstep" : `hint cs-step cs-step-${kind}`}">${copy}</p>`;
+  if (step.step === "first-round") {
+    return line("first-round", `下一步：${STEP_COPY["first-round"]}。`);
+  }
+  if (step.step === "awaiting") {
+    const blockerCopy = step.blockers.map((b) => escapeHtml(b)).join("、");
+    if (/阶段|轮面/.test(step.blockers.join(" "))) {
+      return line("awaiting", `下一步：${blockerCopy}。`);
+    }
+    const names =
+      blockerCopy === ""
+        ? "未答项目（引擎未列明）"
+        : blockerCopy;
+    return line("awaiting", `下一步：${STEP_COPY.awaiting} ${names} 答复。`);
+  }
+  if (step.step === "confirm-round") {
+    return line("confirm-round", `下一步：${STEP_COPY["confirm-round"]}。`);
+  }
+  if (step.step === "write-doc") {
+    return line("write-doc", `下一步：已确认 ⇒ ${STEP_COPY["write-doc"]}。`);
+  }
+  if (step.step === "approve") {
+    const links = registeredModificationDocFiles(decisions)
+      .map((file) => `<a class="fl cs-step-doc" href="${escapeHtml(docHref(featureId, file, null))}">${escapeHtml(file)}</a>`)
+      .join(" ");
+    return line(
+      "approve",
+      `下一步：文档已登记${links === "" ? "" : `（${links}）`} ⇒ ${STEP_COPY.approve}。`,
+    );
+  }
+  if (step.step === "done") {
+    return line("done", "本阶段已收口并过门②（审批门已放行）⇒ 本卡不再给主操作。");
+  }
+  return "";
+}
+
+/** 确认单头部锚：本轮格的追溯值直透（板不加形容词、不改写轮次口径）。 */
+function renderConfirmAnchor(run: StageRunView, isFallback: boolean): string {
+  const parts = [
+    `<b class="cs-stage">${escapeHtml(run.stage ?? "—")}</b>`,
+    run.round === null ? "" : `<span class="cs-round">第 ${String(run.round)} 轮</span>`,
+    `<span class="cs-settled">收口：${escapeHtml(settledLabel(run.settled))}</span>`,
+    run.docVersion === null ? "" : `<span class="cs-docv">确认单 ${escapeHtml(run.docVersion)}</span>`,
+  ].filter((s) => s !== "");
+  // 回落态（未接线 / 无可选阶段）⇒ 显式声明本单取自「该格自身的阶段」，绝不冒充当前所选阶段（口径同 B3）。
+  const flag = isFallback
+    ? `<p class="hint warn cs-fallback-note">未选定阶段 ⇒ 本单取全局最近一轮（阶段名以该格自身为准）。</p>`
+    : "";
+  return `<p class="cs-anchor">${parts.join(" ")}</p>${flag}${renderCompleteness(run.completeness)}`;
+}
+
+/**
+ * 门① 确认节（v0.11.0 B3 · 冻结口径「确认对象 = 当前文档版本」；B1 起补 `round` 全链透传）：
+ * **档位只取 {@link deriveGate1ConfirmState} 的结论**（比较在派生层单点，本函数不再比第二次哈希）。
+ * - `absent`（合成对象缺位 / `state !== 'done'` / 现版哈希未下发）⇒ **整节零字节**：不渲确认控件、
+ *   不报错、不空渲节头（判据 1）；
+ * - `confirmed` ⇒ 只显「已确认 v{round}」，**不渲**确认表单（判据 2 正向）；
+ * - `pending` ⇒ 「待确认」+ 确认表单（**仅当按步收口判定主按钮就是 `gate1_confirm`**，
+ *   `allowForm=false` ⇒ 只显档位行、不渲表单），`action` = B1 路由模板展开值，隐藏字段取本轮
+ *   `synthesis` 的 `docVersion` / `docHash` 与轮格 `round` **原值透传**（板不重算、不自判闸，
+ *   校验归引擎 N6/N7）；`run.round` 非正整数（缺轮次号）⇒ **不渲该表单**（无 round 必 400，不给静默入口）。
+ * **不复用置灰类**表达「已确认」（B3 冻结口径：已确认是事实档，不是不可点档）。
+ */
+function renderGate1ConfirmBlock(
+  featureId: string,
+  run: StageRunView,
+  allowForm: boolean,
+  state: Gate1ConfirmState,
+  versionOptions?: readonly string[] | null,
+  versionSourceError?: string | null,
+): string {
+  const synthesis = run.synthesis;
+  if (state === "absent" || synthesis === null || synthesis === undefined) return "";
+  const version = (synthesis.docVersion ?? "").trim();
+  const versionBit = version === "" ? "" : ` ${escapeHtml(version)}`;
+  if (state === "confirmed") {
+    return `<p class="cs-gate1 cs-gate1-confirmed">已确认${versionBit}</p>`;
+  }
+  const round =
+    run.round !== null && Number.isInteger(run.round) && run.round > 0 ? String(run.round) : null;
+  if (!allowForm) {
+    return `<p class="cs-gate1 cs-gate1-pending">待确认${versionBit}</p>`;
+  }
+  if (round === null) {
+    return (
+      `<p class="cs-gate1 cs-gate1-pending">待确认${versionBit}</p>` +
+      `<p class="hint cs-gate1-noround">本轮格无轮次号 ⇒ 无法提交门① 确认（<code>round</code> 由引擎随轮格下发，板不代填）。</p>`
+    );
+  }
+  const sourceFailureNote =
+    (versionSourceError ?? "").trim() === ""
+      ? ""
+      : `<p class="hint warn cs-version-source">版本台账最近一次读取失败：${escapeHtml(
+          (versionSourceError ?? "").trim(),
+        )}；当前选项如有显示，来自板最后成功投影，提交仍由引擎校验。</p>`;
+  const versionSourceNote =
+    versionOptions === null
+      ? `<p class="hint err cs-version-source">排期数据源不可读：引擎版本台账 <code>GET /api/versions</code>${
+          (versionSourceError ?? "").trim() === "" ? "" : `（${escapeHtml((versionSourceError ?? "").trim())}）`
+        }。拿不到台账时板不手拼 / 不猜版号，确认表单暂不提供。</p>`
+      : versionOptions !== undefined && versionOptions.length === 0
+        ? `<p class="hint cs-version-source">排期数据源：引擎版本台账 <code>GET /api/versions</code> 当前没有状态为 open 的版本；板不手拼版号，确认表单暂不提供。</p>`
+        : versionOptions === undefined
+          ? `<p class="hint cs-version-source">排期数据源：等待引擎版本台账 <code>GET /api/versions</code> 接线。</p>`
+          : sourceFailureNote;
+  if (versionOptions === null || (versionOptions !== undefined && versionOptions.length === 0)) {
+    return `<p class="cs-gate1 cs-gate1-pending">待确认${versionBit}</p>${versionSourceNote}`;
+  }
+  const versionSelectOptions = (versionOptions ?? [])
+    .map((item) => `<option value="${escapeHtml(item)}">${escapeHtml(item)}</option>`)
+    .join("");
+  // `docVersion` 空白（引擎未随合成行下发）⇒ 不给静默空 hidden，改可填字段（口径同段落异议表单）
+  const versionField =
+    version === ""
+      ? `<label class="cs-field">确认单版本<input type="text" name="${GATE1_CONFIRM_FORM_DOC_VERSION_FIELD}" value="" placeholder="必填：本轮引擎未下发 docVersion，请手工给出（如 v1）"></label>`
+      : `<input type="hidden" name="${GATE1_CONFIRM_FORM_DOC_VERSION_FIELD}" value="${escapeHtml(version)}">`;
+  return `<div class="gate1-confirm">
+<p class="cs-gate1 cs-gate1-pending">待确认${versionBit}</p>
+<form class="gate1-confirm-form" method="post" action="${stageWriteFormAction(
+    GATE1_CONFIRM_WRITE_PATH_TEMPLATE,
+    featureId,
+  )}" data-submit="已提交，门① 确认登记中…">
+${versionField}
+<input type="hidden" name="${GATE1_CONFIRM_FORM_DOC_HASH_FIELD}" value="${escapeHtml((synthesis.docHash ?? "").trim())}">
+<input type="hidden" name="${GATE1_CONFIRM_FORM_ROUND_FIELD}" value="${round}">
+<label class="cs-field">排期<select name="${GATE1_CONFIRM_FORM_VERSION_FIELD}" required>${versionSelectOptions}</select></label>
+${versionSourceNote}
+<p class="hint">确认对象 = <b>当前文档版本</b>（<code>${escapeHtml(
+    GATE1_CONFIRM_FORM_DOC_VERSION_FIELD,
+  )}</code> + <code>${escapeHtml(
+    GATE1_CONFIRM_FORM_DOC_HASH_FIELD,
+  )}</code> + <code>${escapeHtml(GATE1_CONFIRM_FORM_ROUND_FIELD)}</code> 原样透传；排期 <code>${escapeHtml(
+    GATE1_CONFIRM_FORM_VERSION_FIELD,
+  )}</code> 取自版本台账。板不重算、不自判闸；文档再变 ⇒ 本次确认一律失效、本卡回到「待确认」。</p>
+<button type="submit">确认这一版</button>
+</form>
+</div>`;
+}
+
+/** 段落取数（**容错单点**：`sections` 由 B4 上收到解析层，未接线的老调用方 / 老夹具给 `undefined` ⇒ 视作无段落，不抛）。 */
+function sectionsOf(run: StageRunView): readonly StageSectionView[] {
+  return run.sections ?? [];
+}
+
+/**
+ * 段落清单 + 每段自带的可展开异议表单（原生 `<details>`，零脚本）。
+ * `canObject=false` 或无可用 `sectionId` ⇒ 该段零 form；整份 `sections` 为空 ⇒ 整区零 form。
+ */
+function renderConfirmSections(featureId: string, run: StageRunView, canObject: boolean): string {
+  const sections = sectionsOf(run);
+  if (sections.length === 0) {
+    return `<p class="hint cs-none">（本轮尚无合成段落：确认单由引擎内部综合分析产出，板不自行归纳段落，也不拿逐 project 结论冒充段落）</p>`;
+  }
+  const rows = sections
+    .map((s, i) => {
+      const id = (s.id ?? "").trim();
+      // 版本锚只取合成对象，不回落到轮格 docVersion / basisRevInput。
+      const docVersion = (run.synthesis?.docVersion ?? "").trim();
+      const objection =
+        canObject && id !== ""
+          ? `<details class="cs-objection">
+<summary>有异议</summary>
+<form method="post" action="${stageWriteFormAction(DOC_OBJECTION_WRITE_PATH_TEMPLATE, featureId)}">
+<input type="hidden" name="${DOC_OBJECTION_FORM_DOC_VERSION_FIELD}" value="${escapeHtml(docVersion)}">
+<input type="hidden" name="${DOC_OBJECTION_FORM_SECTION_ID_FIELD}" value="${escapeHtml(id)}">
+<label>异议正文<textarea name="${DOC_OBJECTION_FORM_TEXT_FIELD}" rows="3" placeholder="对这一段结论/表述的不同意见（空文服务端拒收）"></textarea></label>
+<button type="submit">提交异议</button>
+</form>
+</details>`
+          : "";
+      // B1 渲染修补：段落标题用引擎直出 `title`，`id` 降为角标；缺 title 才回落「段落 N」。
+      const title = (s.title ?? "").trim();
+      const heading = title === "" ? `段落 ${String(i + 1)}` : escapeHtml(title);
+      return `<article class="cs-section">
+<h3 class="cs-section-h">${heading} <span class="mono cs-section-id">${escapeHtml(id === "" ? "—" : id)}</span></h3>
+<div class="cs-section-body">${s.content === null ? "（引擎未随段落下发正文）" : escapeHtml(s.content)}</div>
+${renderSectionSources(s)}
+${objection}
+${canObject && id === "" ? `<p class="hint cs-no-entry">本段无段落标识 ⇒ 不可提异议（板不代填 sectionId、不猜段落）</p>` : ""}
+</article>`;
+    })
+    .join("");
+  return `<div class="cs-sections">${rows}</div>`;
+}
+
+/** 段落来源清单（引擎直出标识，只做显形：范围反解归宿主，板不在此判 relevance）。 */
+function renderSectionSources(section: StageSectionView): string {
+  if (section.sources.length === 0) {
+    return `<p class="hint cs-sources">来源：引擎未下发</p>`;
+  }
+  const chips = section.sources
+    .map((src) => `<span class="sr-chip cs-source">${escapeHtml(src)}</span>`)
+    .join(" ");
+  return `<p class="cs-sources">来源：${chips}</p>`;
+}
+
+/**
+ * 开轮表单（B2 的 `stage-round-open` 路径；v0.11.0 B3 起同形复用于首轮空态卡）。
+ * v0.11.0 B1 渲染修补：
+ * - **标题只出现一次** —— 表单内不再带 `<h3 class="cs-h">`，节标题由调用方（首轮卡 h2）出面；
+ * - **阶段 = 闭集六值下拉**（`STAGE_STEPS`：需求分析 / 改造方案 / 改造 / 回归 / 验收 / 发版），
+ *   默认选中 `需求分析`；不再是自由文本输入（过闸与值域校验仍归引擎，板不猜阶段）。
+ *
+ * 字段口径：
+ * - `sources`（B3 新增）：**自由文本补充 / 澄清材料**，逐行一条进 `sources` 清单（第 3 轮实证：
+ *   `sources` 就是注入口，逐条原文进 PM 提示词、不参与 `basisRev` 哈希）；留空 = 不带该键；
+ * - `basisRevInput`：仍可选，留空 = 引擎记字面 `-`；
+ * - `targetProjects` **不渲控件**：空白清单会被服务端按「清单含空白项」拒收，不给 = 引擎按本组全员物化。
+ */
+function renderStageRoundOpenForm(
+  featureId: string,
+  stage: string | null,
+  firstRound = false,
+): string {
+  const current = (stage ?? "").trim();
+  const selected = STAGE_STEPS.includes(current) ? current : STAGE_STEP_REQUIREMENT_ANALYSIS;
+  const options = STAGE_STEPS.map(
+    (name) => `<option value="${escapeHtml(name)}"${name === selected ? " selected" : ""}>${escapeHtml(name)}</option>`,
+  ).join("");
+  return `<form class="stage-round-open-form" method="post" action="${stageWriteFormAction(
+    STAGE_ROUND_OPEN_WRITE_PATH_TEMPLATE,
+    featureId,
+  )}" data-submit="已提交，开轮写入中…">
+<label class="cs-field">阶段<select name="${STAGE_ROUND_OPEN_FORM_STAGE_FIELD}">${options}</select></label>
+<label class="cs-field">补充 / 澄清材料（可选 · 逐行一条）<textarea name="${STAGE_ROUND_OPEN_FORM_SOURCES_FIELD}" rows="3" placeholder="每行一条，随本轮发给各 project（例：第 3 条裁定的口径是……）；留空 = 不带来源"></textarea></label>
+<label class="cs-field">口径修订标识（可选）<input type="text" name="${STAGE_ROUND_OPEN_FORM_BASIS_REV_INPUT_FIELD}" value="" placeholder="如确认单版本号；留空 = 引擎记字面 -"></label>
+<p class="hint">不带 <code>targetProjects</code> ⇒ 引擎按本组全员物化（不预筛）；幂等归引擎，重复提交返回既有轮；轮次不设上限，开不开由你定。</p>
+<button type="submit">${firstRound ? "开第一轮" : "开新一轮"}</button>
+</form>`;
+}
+
+/**
+ * 首轮空态卡（A14 · v0.11.0 B3）：**仅在 `stageRuns` 为合法零轮次（`[]`）时渲** ——
+ * 缺面（`null` / 键缺席）与空面必须可区分（口径同 {@link FeatureDetailView.stageRuns}），
+ * 缺面 ⇒ 零字节、不拿一张无事实依据的卡冒充「引擎说你可以开轮」。
+ * v0.11.0 B1 按步收口：**`stage` 非「需求分析」⇒ 整块不渲**（过了需求分析首轮即消失；
+ * 用户裁定「板也不允许跳步」，不给别阶段一个名为「发起首轮」的入口）。
+ */
+export function renderStageEmptyFirstRound(featureId: string, stage: string | null): string {
+  const step = decideStep({
+    stage,
+    stageRuns: [],
+    synthesis: null,
+    decisions: null,
+    allowedActions: null,
+  });
+  if (step.primaryAction !== STAGE_STEP_ACTION_ROUND_OPEN) return "";
+  return `<h2>发起首轮</h2>
+<div class="stage-empty-first">
+<p class="hint">本需求尚无阶段轮 ⇒ 要开始需求访谈就开第一轮；有要交代的口径 / 澄清材料，先写进下面<b>补充</b>框（逐行一条，随本轮发给各 project）。</p>
+${renderStageStepNextLine(step, featureId, null)}
+${renderStageRoundOpenForm(featureId, stage, true)}
+</div>`;
+}
+
+/**
+ * 依据抽屉：追溯三锚原文 + 逐 project 应答明细（`reason` / relevance / decision / taskState 具名）。
+ * **`basisRev` 出原文**（不截断，与 B3 头部的短锚互补）。
+ * v0.11.0 B1 渲染修补：`details[open]` **默认展开**（用户裁定「明细折起来看着像任务没了」⇒ 默认可见）。
+ */
+function renderStageBasisDrawer(run: StageRunView): string {
+  const anchors = [
+    `<p class="cs-basis-line">basisRev：<span class="mono cs-basis-rev">${
+      run.basisRev === null ? "—" : escapeHtml(run.basisRev)
+    }</span></p>`,
+    `<p class="cs-basis-line">docVersion：<span class="cs-basis-docv">${
+      run.docVersion === null ? "—" : escapeHtml(run.docVersion)
+    }</span></p>`,
+  ].join("");
+  const rows = run.projects
+    .map(
+      (p) =>
+        `<li class="cs-basis-reason">` +
+        `<span class="mono cs-basis-pid">${escapeHtml(p.projectId ?? "—")}</span> ` +
+        `${p.reason === null || p.reason === "" ? "—" : escapeHtml(p.reason)}` +
+        `</li>`,
+    )
+    .join("");
+  const detail =
+    run.settled !== true
+      ? ""
+      : run.projects.length === 0
+      ? `<p class="hint">（本轮无 project 应答行 ⇒ 无 reason 可展）</p>`
+      : `<ul class="cs-basis-list">${rows}</ul>`;
+  return `<details class="stage-basis-drawer" open><summary>查看依据（basisRev · docVersion · reason）</summary>${anchors}${detail}</details>`;
+}
+
+/** 版本记录的一行：版号 + 该版登记在案的确认单文档。 */
+function renderVersionRow(
+  featureId: string,
+  version: string,
+  files: readonly string[],
+  currentDocVersion: string | null,
+): string {
+  const isCurrent = currentDocVersion !== null && currentDocVersion.trim() === version;
+  const links =
+    files.length === 0
+      ? `<span class="hint">（本版暂无登记文档）</span>`
+      : files
+          .map((file) => `<a class="fl cs-version-file" href="${escapeHtml(docHref(featureId, file, null))}">${escapeHtml(file)}</a>`)
+          .join(" ");
+  return `<li class="cs-version-row${isCurrent ? " cs-version-current" : ""}"><b class="cs-version mono">${escapeHtml(
+    version === "" ? "（登记未带目录段）" : version,
+  )}</b> ${links}</li>`;
+}
+
+/**
+ * 确认单版本记录：版号 = 各轮 `docVersion`（引擎事实）∪ 登记文档的目录段
+ * （**复用既有提取口径** {@link registeredDecisionDocRefs}，板不自立第二套路径正则）；
+ * 序 = **引擎轮次序**（新轮在前）再列登记目录段（登记序）—— `docVersion` 值域归引擎
+ * （`v1` / `v1.1` / `v2` 非三段版号），套 {@link compareVersionOrder} 会把可析与不可析异质混排 ⇒ 板不排序判据；
+ * 本轮确认的版号打 `cs-version-current`。两源皆空 ⇒ 整节不渲。
+ */
+function renderConfirmVersionLog(
+  featureId: string,
+  stageRuns: readonly StageRunView[],
+  decisions: string | null | undefined,
+  currentDocVersion: string | null,
+): string {
+  const filesByVersion = new Map<string, string[]>();
+  const order: string[] = [];
+  const touch = (version: string): string[] => {
+    if (!filesByVersion.has(version)) {
+      filesByVersion.set(version, []);
+      order.push(version);
+    }
+    return filesByVersion.get(version)!;
+  };
+  const newestFirst = [...stageRuns].sort((a, b) => stageRoundNum(b) - stageRoundNum(a));
+  for (const run of newestFirst) {
+    const version = (run.docVersion ?? "").trim();
+    if (version !== "") touch(version);
+  }
+  for (const ref of registeredDecisionDocRefs(decisions)) {
+    const files = touch((ref.dir ?? "").trim());
+    if (!files.includes(ref.file)) files.push(ref.file);
+  }
+  if (order.length === 0) return "";
+  const rows = order
+    .map((version) => renderVersionRow(featureId, version, filesByVersion.get(version) ?? [], currentDocVersion))
+    .join("");
+  return `<h3 class="cs-h">确认单版本记录（${order.length}）</h3><ul class="cs-versions">${rows}</ul>`;
+}
+
+
+/**
  * 执行明细单表的行（v0.10.3 N3）：一行一任务，**按 `taskOrdinalMap` 升序**（与图上 chip 同一张编号表 ——
  * 键 = `createdAt` 登记时刻，不在本处第二处派生）；`taskId` 去重口径同 {@link taskOrdinalMap}（首见即留）。
  * trace 命中 ⇒ 填「为什么没跑」，终态 / 无 trace ⇒ `—`；在飞不做「至 now」推算（时长函数照用）。
@@ -908,9 +1844,62 @@ function renderExecutionRows(
       `<td>${t.retryCount === null ? "—" : String(t.retryCount)}</td>` +
       `<td>${escapeHtml(deps.length === 0 ? "—" : deps.join("、"))}</td>` +
       `<td>${escapeHtml(formatDurationBetween(t.startedAt, t.finishedAt))}</td>` +
+      `<td>${escapeHtml(t.mode ?? "—")}</td>` +
+      `<td>${t.round === null || t.round === undefined ? "—" : escapeHtml(String(t.round))}</td>` +
       "</tr>"
     );
   });
+}
+
+/**
+ * 详情页顶部的阶段步态投影。`decideStep` 仍是唯一六态判据；
+ * 这里仅补「已过需求分析但本阶段尚无轮」的展示组合态：上游已确认时，
+ * 按《改造文档》是否登记落到 write-doc / approve，不另造主按钮。
+ */
+function renderFeatureStageNextStep(
+  detail: FeatureDetailView,
+  selectedStage: string | null,
+): string {
+  const feature = detail.feature;
+  const stage = (selectedStage ?? feature.stage ?? "").trim() || null;
+  const pick = pickStageRun(detail.stageRuns, stage);
+  const decision = decideStep({
+    stage,
+    stageRuns: detail.stageRuns,
+    synthesis: pick?.current.synthesis ?? null,
+    decisions: feature.decisions,
+    allowedActions: pick?.current.allowedActions ?? null,
+  });
+  const decidedStep = decision.step;
+
+  let shown: StageStepDecision = decision;
+  const runs = detail.stageRuns;
+  const stageKey = (stage ?? "").trim();
+  const stageRunCount =
+    runs === null || runs === undefined
+      ? null
+      : runs.filter((run) => (run.stage ?? "").trim() === stageKey).length;
+  if (stageKey !== STAGE_STEP_REQUIREMENT_ANALYSIS && stageRunCount === 0) {
+    const docs = registeredModificationDocFiles(feature.decisions);
+    const confirmed = runs
+      ?.filter((run) => (run.synthesis?.confirmedDocHash ?? "").trim() !== "")
+      .reduce<StageRunView | null>(
+        (latest, run) => (latest === null || (run.round ?? -1) > (latest.round ?? -1) ? run : latest),
+        null,
+      );
+    if (docs.length > 0) {
+      shown = { step: "approve", primaryAction: decision.primaryAction, blockers: [] };
+    } else if (confirmed !== null && confirmed !== undefined) {
+      shown = { step: "write-doc", primaryAction: decision.primaryAction, blockers: [] };
+    } else {
+      shown = {
+        step: decidedStep,
+        primaryAction: decision.primaryAction,
+        blockers: [`当前阶段「${stageKey}」尚无轮次；先按本阶段任务要求推进`],
+      };
+    }
+  }
+  return renderStageStepNextLine(shown, feature.featureId, feature.decisions, true);
 }
 
 export function renderFeatureDetail(
@@ -924,6 +1913,10 @@ export function renderFeatureDetail(
 ): string {
   const f = detail.feature;
   const d = deriveDisplayStage(f.state, f.stage);
+  const stageReadOnly = extras.stageReadOnly === true;
+  // 写回执顶栏（0cb2d1db A3）：非空才落一行 `.stage-notice`；空 / 缺省 ⇒ 零字节（既有逐字一致钉不被连坐）。
+  const stageNotice = (extras.stageNotice ?? "").trim();
+  const noticeLine = stageNotice === "" ? "" : `<p class="hint stage-notice">${escapeHtml(stageNotice)}</p>`;
   // 件N1 锚 1/5 `steps`：详情页第一枚锚 ⇒ 页面周期属性挂它（`.b-steps` 本体逐字不动）。
   // 件D 第三档（REQ-2026-10-11-05 增补 N3）：头部「整页打开」链带 `target="_blank"` ⇒ 浮层导航分支
   // （`layout.ts` 的 `hasAttribute("target")` 放行）原样交回浏览器原生开新标签；链在 head 不在锚内
@@ -967,12 +1960,35 @@ export function renderFeatureDetail(
   // v0.10.8 B-10 图侧闸（REQ-2026-10-17-01 · 改造文档 §2.3 B-10 · 用户指定）：**仅选中阶段 === 「改造」才渲图卡**；
   // 其余五格与 `—` / 未接线（null）一律不渲。锚壳不连坐（第八枚活刷按 `data-live="graph"` 定位，壳必须恒在）。
   const graphCard = `<div class="live-slot" data-live="graph" data-live-lock>${selectedStage === "改造" ? featCard(extras.graphHtml ?? "", "feat-graph") : ""}</div>`;
+  // R1 B3：阶段任务区（本轮主表 + 旧轮折叠）。`stageRuns` 为 null/undefined ⇒ renderStageRuns 出空串
+  // ⇒ featCard 空正文短路 ⇒ 本行零字节（判据 6 的字节一致据此成立）；非空才落一张卡，且 `${...}${folds}`
+  // 同行拼接（不新增独立换行），保证空态相对改造前逐字不动。
+  // R1 B4：合成确认单卡**紧贴 B3 卡之前**（默认面对物 = 合成单，逐 project 明细在其后）；同一行拼接、
+  // 同样空正文短路 ⇒ `stageRuns` 缺席 / 为 null 时整块零字节，B3 判据 6 的逐字节一致不被连坐。
+  // **B3 顺带修复（宿主已确认保留）**：本变量此前算出来了却没进页体装配（`${...}` 里漏一枚）⇒ 确认单卡
+  // 只存在于纯函数、上不了页面；回归由 `test/v0110-b3-confirm-sources-firstround.test.mjs` 的挂载 + DOM 序锚把守。
+  const confirmSheetCard = featCard(
+    renderStageConfirmSheet(f.featureId, detail.stageRuns, selectedStage, f.decisions, {
+      versionOptions: extras.versionOptions,
+      versionSourceError: extras.versionSourceError,
+      readOnly: stageReadOnly,
+    }),
+    "feat-confirmsheet",
+  );
+  const stageRunsCard = featCard(renderStageRuns(detail.stageRuns, selectedStage), "feat-stageruns");
+  // A14 首轮空态卡（v0.11.0 B3）：**只认合法零轮次 `[]`** ⇒ 给一张「发起首轮」卡（补充材料即 `sources`，
+  // 不设第三入口）；`null` / 键缺席 = 面不可读 ⇒ 零字节（缺面 ≠ 空面，与 B3/B4 的字节一致钉同口径）。
+  const emptyFirstRound =
+    !stageReadOnly && detail.stageRuns !== null && detail.stageRuns !== undefined && detail.stageRuns.length === 0
+      ? featCard(renderStageEmptyFirstRound(f.featureId, f.stage), "feat-emptyfirstround")
+      : "";
   const execution = `<div class="live-slot" data-live="exec">${
     executionBody === "" ? "" : foldSection("执行明细（任务 / 为什么没跑）", executionBody)
   }</div>`;
   const stageOutputsSection = renderStageOutputs(f.featureId, f.decisions, extras.docExists);
   // M6：排期表单上详情页（GET 面）；缺省不渲染 ⇒ 未接线的调用方保持旧行为。
-  const scheduleForm = withScheduleForm ? renderScheduleForm(f.featureId, f.version, releasedVersions) : "";
+  const scheduleForm =
+    withScheduleForm && !stageReadOnly ? renderScheduleForm(f.featureId, f.version, releasedVersions) : "";
   // C5 终态墓碑：终态需求**不出动作区与回答框**（调用方误传也不渲染）—— 一行结论摘要 = 引导行 +
   // 最近一轮留痕，其余区块本就默认折叠。
   const terminal = isTerminalFeatureState(f.state);
@@ -983,11 +1999,21 @@ export function renderFeatureDetail(
   // **DOM 序即契约**：轮次进度行与链状态行必须**早于**动作区与回答框 —— 件B 有界轮询按
   // 「`.turn-progress` 在回答表单之前」定位刷新面，停链表单同样须早于动作区锚点。
   // ⇒ 依赖图卡只能插在 `turnCard` **之后**（不得提到 `statusLines` 之前，否则顶掉件B 的刷新面定位）。
-  const guide = featGuideCard(extras.nextStepHtml ?? "");
+  // 「下一步」跟随详情页真实阶段/轮格，由 `decideStep().step` 单点投影。
+  // 兼容位 `extras.nextStepHtml` 仍可供独立调用方装配，但不再覆盖详情页这条状态行。
+  const guide =
+    terminal && (extras.nextStepHtml ?? "").trim() !== ""
+      ? featGuideCard(extras.nextStepHtml ?? "")
+      : featGuideCard(renderFeatureStageNextStep(detail, selectedStage));
   // 件N1 锚 2/5 `turn-prog`：`statusLines` 拆两枚 —— 轮次进度行进恒在壳，链状态行**不进锚**
   // （含停链 `form`+`button`，属输入/动作面）；两行相对顺序不变（上注「DOM 序即契约」逐字保留）。
-  const statusLines = `<div class="live-slot" data-live="turn-prog">${extras.turnProgressHtml ?? ""}</div>${extras.chainStateHtml ?? ""}`;
-  const actionCard = featCard(terminal ? "" : `${extras.actionAreaHtml ?? ""}${extras.answerFormHtml ?? ""}`, "feat-action");
+  const statusLines = `<div class="live-slot" data-live="turn-prog">${extras.turnProgressHtml ?? ""}</div>${
+    stageReadOnly ? "" : extras.chainStateHtml ?? ""
+  }`;
+  const actionCard = featCard(
+    terminal || stageReadOnly ? "" : `${extras.actionAreaHtml ?? ""}${extras.answerFormHtml ?? ""}`,
+    "feat-action",
+  );
   // 件N1 锚 3/5 `turn`：最近一轮卡（`featCard` 空正文短路 ⇒ 壳恒在，0→N 首现那拍摘得到）。
   const turnCard = `<div class="live-slot" data-live="turn">${featCard(extras.turnTraceHtml ?? "", "feat-turn")}</div>`;
   const folds = `${foldSection("需求原文", renderRequirementOrigin(f.requirement))}${execution}${foldSection("验收轨迹", extras.acceptanceHtml ?? "")}`;
@@ -996,12 +2022,13 @@ export function renderFeatureDetail(
 <div class="feat-cols">
 <div class="feat-main">
 ${renderLiveBar(LIVE_INTERVALS.feature)}
+${noticeLine}
 ${guide}
 ${statusLines}
 ${actionCard}
 ${turnCard}
 ${graphCard}
-${folds}
+${confirmSheetCard}${stageRunsCard}${emptyFirstRound}${folds}
 </div>
 <div class="feat-side">
 ${side}
@@ -2436,40 +3463,9 @@ ${pool.length === 0 ? `<p class="hint">（无未排期的在途需求 · 终态�
 // 动作区（v0.9.5 C5 · 档位化意图按钮；同源 POST，服务器端渲染）
 // ---------------------------------------------------------------------------
 
-/**
- * 详情页**单动作区**（v0.9.5 C5 · 合并原「触发一轮」与「人工确认」两个表单）。
- *
- * **档位化口径（定向推翻 BD18 / 收口轨 14 ② / 收口轨 17 的「禁用不隐藏」旧写法）**：按钮文案与
- * 提交去向由 {@link deriveActionAffordance} 按「用户此刻想做什么」给唯一档位 ——
- * agent 闲置 = 「让 agent 继续」· 有待裁待答 = 「提交给 agent」· `approval` = 待审批 =
- * 「确认改造文档 → 放行执行」（**唯一**出现确认档的地方）；**终态 / 宿主面未装配 ⇒ 整个动作区不渲染**
- * （不再摆三个 573 字灰态按钮让人猜哪个能点）。轮占用仍渲染但 disabled + 原因（点了会白点，入口须可见）。
- * **写路由与语义零改动**：`form action` 仍一对一指 `/features/:id/turn` 与 `/features/:id/confirm`；
- * 服务端 409 硬闸（`board_turn_busy` / `board_feature_terminal`）全保留 —— 本区只控**显示**。
- */
-export function renderActionArea(featureId: string, input: NextStepInput): string {
-  const a = deriveActionAffordance(input);
-  if (a === null) return "";
-  const target =
-    a.kind === "confirm"
-      ? `/features/${encodeURIComponent(featureId)}/confirm`
-      : `/features/${encodeURIComponent(featureId)}/turn`;
-  const submitNote = a.kind === "confirm" ? "已提交，处理中…" : "已提交，本轮可能跑数分钟…";
-  // 补充框只随 turn 档走（confirm 档是固定指令模板通道，不掺自由文本）。
-  const supplementField =
-    a.kind === "confirm"
-      ? ""
-      : `<label class="hint">补充（可选 · 随本轮一起发给 agent；留空 = 只说「继续」）<textarea name="supplement" rows="3" placeholder="例：需求里那点理解不对，应该是…"></textarea></label>`;
-  const cls = a.quiet ? ' class="quiet"' : "";
-  const button = a.enabled
-    ? `<button type="submit"${cls}>${escapeHtml(a.label)}</button>`
-    : `<button type="submit"${cls} disabled aria-disabled="true">${escapeHtml(a.label)}</button>`;
-  const reasonLine = a.enabled ? "" : `<p class="hint warn">${escapeHtml(a.note)}</p>`;
-  return `<h2>动作</h2>
-${reasonLine}<form method="post" action="${target}" class="w" data-submit="${escapeHtml(submitNote)}">
-${supplementField}
-${button}
-</form>`;
+/** v0.11.0 B1：板侧 host agent 已退役，详情页不渲染会话动作区。 */
+export function renderActionArea(_featureId: string, _input: NextStepInput): string {
+  return "";
 }
 
 /**
@@ -2907,7 +3903,7 @@ ${notice}
         ? "—"
         : `<span class="err">${escapeHtml(s.error.code)}</span> ${escapeHtml(s.error.message)}`;
     const waiting = e.queue.waiting
-      .map((w) => `${escapeHtml(w.requirementId)} <span class="muted">${escapeHtml(w.turnId)}</span>`)
+      .map((w: any) => `${escapeHtml(w.requirementId)} <span class="muted">${escapeHtml(w.turnId)}</span>`)
       .join("、");
     const runningTurn =
       e.queue.running === null

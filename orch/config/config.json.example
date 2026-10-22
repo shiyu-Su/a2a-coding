@@ -17,6 +17,13 @@
     "heartbeatTimeoutMs": 60000,
     "orphanTimeoutMs": 1800000
   },
+  "llm": {
+    "baseUrl": "http://127.0.0.1:9355/zen/go/v1",
+    "model": "deepseek-v4.1-flash",
+    "timeoutMs": 60000,
+    "maxTokens": 4096,
+    "apiKey": ""
+  },
   "machines": [
     {
       "machineId": "machine-01",

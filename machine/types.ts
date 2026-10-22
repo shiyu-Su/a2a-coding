@@ -24,8 +24,11 @@ import type { TaskType } from "./task-types.js";
  *      （混跑期未升级侧上报的旧值只会被兜底归类，不会被拒收）。
  * v0.10.0：`/runner/register` 载荷新增**可忽略的可选字段 `repo`**（项目仓库标识，观测用、不进任何
  *      判定 / 消费语义）⇒ 按上述判据式规则第一条**不升版**（沿用 2.3，本常量不动）。
+ * v0.11.0：minor 升到 2.4（`failureKind` 必填字段取值集合**成员新增** —— 六类闭集扩七类，
+ *      新增 `provider`：provider 侧账单 / 配额失败被后端当正常输出打印的假完成结算类；
+ *      machine 产出、orch 消费 ⇒ **两侧同升同批重启**，五模式清单单源 = PROTOCOL.md 2.4）。
  */
-export const PROTOCOL_VERSION = "2.3";
+export const PROTOCOL_VERSION = "2.4";
 
 /**
  * 执行层 Agent 类型（决定执行层适配器与 CLI 参数）。

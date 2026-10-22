@@ -31,10 +31,11 @@
  *                          **归属门双挂（v0.10.5 O4）**：`version_planning → decomposing` 与
  *                          `decomposing → executing` 两枚转移以「本需求归属非空」为出格凭据，
  *                          空 ⇒ {@link ERR_FEATURE_ATTRIBUTION_REQUIRED}、主链零迁移；
- *                          **门① 两前提（v0.10.5 O4 · 增补 `bbc7ea28` O3）**：`stage` 由「需求分析」
- *                          外迁以「`version` 非空 ∧ 可见 `decisions` 已登记《需求确认单》路径」为前提，
- *                          缺哪报哪（{@link ERR_GROUP_VERSION_REQUIRED} / {@link ERR_CONFIRMATION_DOC_REQUIRED}）、
- *                          整单拒绝零写入
+ *                          **门① 三前提（v0.10.5 O4 · 增补 `bbc7ea28` O3 · v0.11.0 O1）**：`stage` 由
+ *                          「需求分析」外迁以「`version` 非空 ∧ 可见 `decisions` 已登记《需求确认单》路径
+ *                          ∧ 「需求分析」至少一轮 `settled=true`」为前提，
+ *                          缺哪报哪（{@link ERR_GROUP_VERSION_REQUIRED} / {@link ERR_CONFIRMATION_DOC_REQUIRED} /
+ *                          {@link ERR_STAGE_ROUND_REQUIRED}）、整单拒绝零写入；第三前提**无豁免名单**
  * - `handleFeatureApprove` 审批门（**唯一准入**）：**目标态按父链分流**（v0.10.5 O4）——
  *                          无父卡（主轨）`waiting_approval → version_planning`；有父卡（增补 / 承接轨）
  *                          直接 `→ decomposing`（不重走 PjM 工序 ⇒ 跳过 `version_planning` 格）。
@@ -68,8 +69,11 @@ import { randomUUID } from "node:crypto";
 import {
   appendEvent,
   aggregateFeaturesByVersion,
+  confirmStageSynthesis,
   countQueuedBefore,
   createFeature,
+  createTask,
+  enqueueTask,
   ERR_PROJECT_VERSION_SHAPE,
   ERR_PROJECT_VERSION_UNKNOWN,
   EVENT_FEATURE_STATE,
@@ -79,14 +83,22 @@ import {
   featureProjectStateCounts,
   featureProjectUpsert,
   featureTaskStateCounts,
+  getEventByIdempotencyKey,
+  getDefaultStore,
   getFeature,
   getQueuedTask,
+  isUniqueConstraintError,
   listArtifactsByFeature,
   listBusyTasksForProject,
   listEvents,
   listFeatureTasks,
   listFeatures,
   listReadLaneTasksForProject,
+  listRunnerProjects,
+  listRunners,
+  listStageRoundRows,
+  listStageRows,
+  listStageSynthesisRows,
   projectVersionGet,
   rearmForRetry,
   rearmTask,
@@ -98,6 +110,33 @@ import {
   versionLedgerStatus,
 } from "../session/store.js";
 import { EVENT_FAILURE_REPORT, isDagNode, planResume } from "./scheduler.js";
+import { resolveStageRoundBasisRev } from "./stage-seal.js";
+import {
+  buildStageRowMessage,
+  buildStageRunCell,
+  computeBasisRev,
+  EVENT_STAGE_DOC_OBJECTION,
+  EVENT_STAGE_GATE1_CONFIRM,
+  EVENT_STAGE_ROUND_OPEN,
+  groupStageRoundRows,
+  maxStageRound,
+  parseStageRoundOpenPayload,
+  parseStageSynthesisDocVersion,
+  projectStageReachability,
+  stageDocObjectionKey,
+  stageGate1ConfirmKey,
+  stageObjectionIdOf,
+  stageRoundKey,
+  stageRoundOpenKey,
+  stageRoundOpenPayload,
+  STAGE_OBJECTION_TARGETS,
+  STAGE_ROUND_TASK_KEY,
+  toStageSynthesisCell,
+  type StageObjectionTarget,
+  type StageRunCellView,
+  type StageRoundOpenPayload,
+} from "./stage-round.js";
+import { synthesisDocVersion } from "./synthesis.js";
 import { activateVersionForFeature, versionActivator } from "./versions-activation.js";
 import type {
   FeatureContextPatch,
@@ -203,6 +242,10 @@ export interface FeatureTaskSummary {
    * 兜底成任何一档 = 给存量行凭空赋阶段语义），故本字段**可 null**（展示侧 `null` 显 `—`）。
    */
   stage: FeatureStage | null;
+  /** 阶段成员行的命名键（仅 `mode=stage` 时下发，普通 DAG / inquiry 行保持既有形状）。 */
+  taskKey?: string | null;
+  /** 阶段成员行的轮次（仅 `mode=stage` 时下发）。 */
+  round?: number | null;
   prompt: string | null;
   remoteTaskId: string | null;
   dependencies: string[] | null;
@@ -214,8 +257,10 @@ export interface FeatureTaskSummary {
    * **只增字段**，既有字段语义不变。
    *
    * ✅ v0.8.7 起本字段已有**真实值**（不再是 v0.6.1「删五层」后的语义休眠恒 `null`）：
-   * 写口 = `setTaskFailureKind`（仅当行当前为 `failed` 才写入）与 `failOrphanedTask`（孤儿补结算落
-   * `runner`）；v0.8.8 起任务失败在账面携带六类闭集 `failureKind`（事实源 = `PROTOCOL.md`），
+   * 写口 = `upsertTaskResult`（v0.11.0 O4 结算前分类：与终态**同一条 UPDATE** 落，仅本次
+   * `failed` 胜出时携带）与 `failOrphanedTask`（孤儿补结算落
+   * `runner`）；v0.8.8 起任务失败在账面携带闭集 `failureKind`（v0.11.0 O1 起七类，事实源 =
+   * `PROTOCOL.md`），
    * 可据此判断失败类型（网页工作台已渲染该列，O6）。
    */
   failureKind: FailureKind | null;
@@ -413,6 +458,8 @@ function summarizeTask(rec: TaskRecord): FeatureTaskSummary {
     mode: rec.mode,
     // 派发当刻阶段快照：读侧 NULL 照实为 null，**不归一 / 不兜底**（v0.10.8 O-9）
     stage: rec.stage,
+    // 阶段任务需可定位到具体一轮；非阶段行不追加两键，既有摘要逐字兼容。
+    ...(rec.mode === "stage" ? { taskKey: rec.taskKey, round: rec.round } : {}),
     prompt: rec.prompt,
     remoteTaskId: rec.remoteTaskId,
     dependencies: rec.dependencies,
@@ -448,6 +495,16 @@ export const ERR_FEATURE_ATTRIBUTION_REQUIRED = "feature_attribution_required";
  * 不合并成一个错误（version 缺失与确认单未登记是两笔不同的善后动作）。
  */
 export const ERR_CONFIRMATION_DOC_REQUIRED = "feature_confirmation_doc_required";
+
+/**
+ * **门① 第三前提（「需求分析」至少收口一轮）拒绝码**（v0.11.0 O1 / 用户裁定 2026-10-20
+ * 「未来一律通过板操作、**板也不允许跳步**」/ 改造文档 §3 门表）。
+ * 与前两枚同族、**独立成码**（缺哪报哪，不合并）—— 三笔善后是三件不同的事：排期 /
+ * 登记《需求确认单》/ **开一轮并等回执收齐**。语义 = 「本需求在 `需求分析` 阶段**不存在任何
+ * 一轮 `settled=true`**」⇒ 抬 `stage` 即拒（判据单点 {@link gate1SettledRound}，**无豁免名单**：
+ * 补丁卡同样要开轮，历史已跳步的卡只登记不回填）。
+ */
+export const ERR_STAGE_ROUND_REQUIRED = "feature_stage_round_required";
 
 /**
  * **门②（改造文档确认）条件 ⑤ 拒绝码**（增补 `ec93e1bd` / 引擎映射 §3 门②行「过门判据 = 六条」）。
@@ -493,6 +550,36 @@ export function docRegistered(
   marker: string,
 ): boolean {
   return (persisted ?? "").includes(marker) || (pending ?? "").includes(marker);
+}
+
+/**
+ * 门①「《需求确认单》在册」的**命中档**（v0.11.0 orch-N7 / 宿主裁决 A10）。
+ * 仅用于错误信息与排查 —— 对外错误码语义**不因它分叉**。
+ */
+export type Gate1DocTier = "file" | "synthesis";
+
+/**
+ * **门①「确认单在册」双档判据单点**（v0.11.0 orch-N7 / 宿主裁决 A10）：
+ * `docRegistered(decisions 含确认单档名) ∨ 本轮合成行在册且 sections 非空`。
+ * - **旧档 `file` 必须保留** —— 存量 Feature 的 `decisions` 只有文件路径，删档即打死存量；
+ * - **新档 `synthesis`** = 引擎内综合分析那一档：本轮 = {@link maxStageRound} 指「需求分析」
+ *   （与开轮取轮同一条判据），合成行正文经读面解析单点 {@link toStageSynthesisCell} 严格解析
+ *   ⇒ 脏正文 / 缺节只落 `sections: []`（不命中），不许出现第二套「算 sections」的解析。
+ * 三处引用**同源**（advance 门① 守卫 / approve 门② 条件 ④ / derivePendingItems 确认单欠项）
+ * ⇒ 文件名子串判断在本文件**只允许出现在本函数内**。
+ */
+export function gate1DocPresent(
+  feature: Pick<FeatureRecord, "featureId" | "decisions">,
+  pendingDecisions?: string,
+): Gate1DocTier | null {
+  if (docRegistered(feature.decisions, pendingDecisions, CONFIRMATION_DOC_MARKER)) return "file";
+  const round = maxStageRound(listStageRows(feature.featureId), "需求分析");
+  if (round === 0) return null;
+  const row = listStageSynthesisRows(feature.featureId).find(
+    (r) => r.stage === "需求分析" && r.round === round,
+  );
+  if (row === undefined) return null;
+  return toStageSynthesisCell({ row, rounds: 0 }).sections.length > 0 ? "synthesis" : null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1275,6 +1362,8 @@ export function handleFeatureCreate(
 
 export interface FeatureStatusArgs {
   featureId?: string;
+  /** 单查任务清单是否包含阶段成员行；缺省 true，列表分支不受影响。 */
+  includeStageTasks?: boolean;
 }
 
 /**
@@ -1359,6 +1448,22 @@ export interface FeatureStatusSuccess extends Partial<FeatureStageDetail> {
    */
   projects?: FeatureProjectAttributionItem[];
   /**
+   * **阶段轮读面**（R1 · v0.11.0 orch-N7 / 改造文档 §2.5；**仅单 Feature 查询返回**，
+   * 列表分支出参逐字不变）—— 一格 = 一个派生实例 `(stage, round)`，**零新表**（行集来自
+   * `tasks` 的 `mode='stage'` 物化行，口径来自 `stage.round_open` 事件）。
+   *
+   * ⚠️ **三处同名 `stage` 互不覆盖（判据 4 的键名纪律）**：本键是**顶层复数** `stageRuns[]`，
+   * 其**每格内部**的 `stage` 是阶段轮所属阶段名；它与
+   * ① 顶层单数 `stage`（{@link FeatureStageDetail} 的 Feature 登记字段）
+   * ② `acceptance.stages[]`（**主链状态段轨迹**，`feature.state` 事件回放）
+   * 是三个不同的东西，**两枚既有键一字未改**（本卡只加这枚新键）。
+   *
+   * 出参口径全部在 `bridge/stage-round.ts` 单点实现（分子/分母、`settled` 三态、
+   * `unanswered[]`、`reachability` 观测位）；**本读面无写副作用**（纯读，见
+   * {@link buildStageRuns} 的读口清单）。排序 = `(stage, round)` 升序 ⇒ 旧轮在前、本轮在末位。
+   */
+  stageRuns?: StageRunCellView[];
+  /**
    * 列表分支出参（v0.9.0 B3″ 起 **additive** 增 `stateCounts`）。
    *
    * - `stateCounts`：各**任务态**的节点数（事实源 = 一条 `GROUP BY feature_id, state` 聚合 SQL）；
@@ -1426,6 +1531,59 @@ function readAllFeatureEvents(featureId: string): EventRecord[] {
   }
 }
 
+/** 异议事件正文投影（仅读已落库事件；写侧附加字段不参与本判据）。 */
+export interface UnresolvedDocObjection {
+  eventId: number;
+  docVersion: string;
+  sectionId: string;
+  objectionText: string;
+}
+
+/**
+ * **未处置异议判据单点**。
+ *
+ * 最小可核验口径：某条 `stage.doc_objection` 的目标 `docVersion` 与查询版本相同，
+ * 且它之后没有新的 `stage.round_open` 事件。新一轮开轮即视为旧口径已交给新轮处置；
+ * `stage.round_open` 的 payload 已同时携带 `basisRev` / `docVersion`，无需另加表或持久化“已读”位。
+ * 事件按 `eventId` 升序，先后关系不依赖 wall-clock。
+ */
+export function unresolvedDocObjections(
+  events: readonly EventRecord[],
+  docVersion?: string,
+): UnresolvedDocObjection[] {
+  const opens = events
+    .filter((event) => event.kind === EVENT_STAGE_ROUND_OPEN)
+    .map((event) => event.eventId);
+  const pending: UnresolvedDocObjection[] = [];
+  for (const event of events) {
+    if (event.kind !== EVENT_STAGE_DOC_OBJECTION || event.payload === null) continue;
+    let parsed: Record<string, unknown>;
+    try {
+      const value: unknown = JSON.parse(event.payload);
+      if (typeof value !== "object" || value === null || Array.isArray(value)) continue;
+      parsed = value as Record<string, unknown>;
+    } catch {
+      continue;
+    }
+    if (typeof parsed["docVersion"] !== "string") continue;
+    if (docVersion !== undefined && parsed["docVersion"] !== docVersion) continue;
+    if (opens.some((openEventId) => openEventId > event.eventId)) continue;
+    if (
+      typeof parsed["sectionId"] !== "string" ||
+      typeof parsed["objectionText"] !== "string"
+    ) {
+      continue;
+    }
+    pending.push({
+      eventId: event.eventId,
+      docVersion: parsed["docVersion"],
+      sectionId: parsed["sectionId"],
+      objectionText: parsed["objectionText"],
+    });
+  }
+  return pending;
+}
+
 /**
  * 构造 acceptance 聚合块（只读；不触任何写口 / 门）。
  *
@@ -1466,7 +1624,10 @@ export function handleFeatureStatus(
     const denied = ownershipFailure(feature, identity);
     if (denied !== null) return denied;
     const limit = 1000;
-    const nodes = listFeatureTasks(feature.featureId, { limit });
+    const nodes = listFeatureTasks(feature.featureId, {
+      limit,
+      includeStageTasks: args.includeStageTasks ?? true,
+    });
     const tasks = nodes.map(summarizeTask);
     // 表截断标记（v0.10.8 O-5）：nodes 触顶 limit ⇒ 表被截断而 `stateCounts`/`taskCount` 计数不截断
     const tasksTruncated = nodes.length === limit;
@@ -1485,6 +1646,8 @@ export function handleFeatureStatus(
       // v0.10.1 O7 / C-19：归属按 feature_id 单查（详情路径只有一个 Feature，无 1+N 之虞）；
       // 可见性已由上面的 ownershipFailure 把关 ⇒ store 读口不必再带组过滤。无归属 ⇒ 空数组。
       projects: toAttributionView(featureProjectListByFeature(feature.featureId)),
+      // R1 · orch-N7：阶段轮读面（纯读装配，见 {@link buildStageRuns}）
+      stageRuns: buildStageRuns(feature),
       ...deriveStageDetail(feature),
     };
     return success;
@@ -1515,6 +1678,782 @@ export function handleFeatureStatus(
     }),
     attributionsByFeature,
   };
+}
+
+// ---------------------------------------------------------------------------
+// 阶段轮（R1 · v0.11.0 orch-N7）：三枚写口 + 读面 `stageRuns[]`
+// ---------------------------------------------------------------------------
+
+/**
+ * **阶段轮写口错误码**（六枚，全部 `stage_*` 前缀）。
+ *
+ * ⚠️ 与主链五口**双重区隔**（改造文档 §2.5 门① 条：「错误码与描述须与既有 `approve` 双重区隔，
+ * 防执行侧混用真推状态机」）：本组码**既不复用** `feature_approval_required` /
+ * `feature_transition_invalid` / `feature_invalid_stage`，文案也**不出现**「审批 / 流转」字样 ——
+ * 阶段面三枚写口一律**不改主链**，撞见主链码会让宿主误以为「这是那道门没开」。
+ */
+export const ERR_STAGE_ROUND_INVALID_STAGE = "stage_round_invalid_stage";
+export const ERR_STAGE_ROUND_NO_MEMBERS = "stage_round_no_members";
+export const ERR_STAGE_ROUND_TARGET_NOT_MEMBER = "stage_round_target_not_member";
+export const ERR_STAGE_ROUND_OPEN_DIRTY = "stage_round_open_record_dirty";
+export const ERR_STAGE_OBJECTION_FIELD_REQUIRED = "stage_objection_field_required";
+export const ERR_STAGE_OBJECTION_INVALID_TARGET = "stage_objection_invalid_target";
+export const ERR_STAGE_GATE1_INVALID_ROUND = "stage_gate1_invalid_round";
+/**
+ * **门① 确认的三枚校验码**（v0.11.0 orch-N6 · 裁决 A9：签名早已含 `docHash`，本节点补的是校验）：
+ * 确认对象 = **当前文档版本** ⇒「本轮无格」「哈希对不上在册那枚」「版本对不上那枚」三种情形一律
+ * **结构化拒**（不静默放过）。
+ */
+export const ERR_STAGE_GATE1_ROUND_NOT_FOUND = "stage_gate1_round_not_found";
+export const ERR_STAGE_GATE1_DOC_HASH_MISMATCH = "stage_gate1_doc_hash_mismatch";
+export const ERR_STAGE_GATE1_DOC_VERSION_MISMATCH = "stage_gate1_doc_version_mismatch";
+
+/** 阶段轮行的 `contextId` 形态：一项目一轮一枚上下文（同轮续接、跨轮不复用） */
+export function stageRowContextId(featureId: string, stage: FeatureStage, round: number, projectId: string): string {
+  // 阶段名取 `FEATURE_STAGES` 序号（1..6）而非原值：`contextId` 会跨进程进机器侧的会话映射，
+  // 全 ASCII 的键形免去「中文进文件名 / 日志检索」这一族不确定性，且值本身可由 `stage` 复原。
+  const stageNo = FEATURE_STAGES.indexOf(stage) + 1;
+  return `stage-${featureId}-s${String(stageNo)}-r${String(round)}-${projectId}`;
+}
+
+/** 物化落库的单行回执（`created` / `existing` 两栏共用形：本轮该成员的行 + 其 taskId） */
+export interface StageRoundRowRef {
+  projectId: string;
+  taskId: string;
+}
+
+/** `stage_round_open` 入参（§2.5 签名五枚，`stage` 必填） */
+export interface StageRoundOpenArgs {
+  featureId: string;
+  /** **闭集原值**（`FEATURE_STAGES`）；不得取 Feature 派生 `stage`（`waiting_approval` 派生为 null） */
+  stage: string;
+  sources?: readonly string[];
+  targetProjects?: readonly string[];
+  basisRevInput?: string | null;
+}
+
+/**
+ * `stage_round_open` 成功出参（§2.5 四枚 + 两枚可观测附加）。
+ *
+ * - `created` = **本次真落库**的行（新 taskId 走完了 INSERT）；
+ * - `existing` = 撞 `idx_tasks_stage_round` 后**读回**的既有行 ⇒ 纯重放时 `created=[]` /
+ *   `existing=全员`，这两栏的分工就是判据 3 的证据形（「索引真拒重」而非「应用层跳过」）；
+ * - `replayed` = 开轮事件本已在册（`idx_events_idempotency_key` 命中）⇒ 本轮**未新开**。
+ */
+export interface StageRoundOpenSuccess {
+  ok: true;
+  featureId: string;
+  stage: FeatureStage;
+  round: number;
+  basisRev: string;
+  docVersion: string | null;
+  created: StageRoundRowRef[];
+  existing: StageRoundRowRef[];
+  replayed: boolean;
+}
+
+export type StageRoundOpenExit = StageRoundOpenSuccess | FeatureToolFailure;
+
+/**
+ * **开一轮**（§2.5 写口 1）：一次事务物化「本轮应收 = 本轮物化行」，**不改主链**。
+ *
+ * 幂等的**两道索引闩**（判据 3 要求「端到端走索引、不是应用层 `if`」，本函数据此成形）：
+ * 1. `idx_events_idempotency_key` —— 开轮事件键 = `(featureId, stage, basisRev)`（内容定义，
+ *    见 {@link stageRoundOpenKey}）⇒ **同一口径 = 同一轮**：重放必命中既有事件、拿到它的 `round`，
+ *    而不是静默 +1 开出内容相同的第二轮；
+ * 2. `idx_tasks_stage_round` —— 行键 = `(feature_id, stage, task_key, project_id, round)` ⇒
+ *    物化**逐行真插**，已存在的行由**索引**拒（`isUniqueConstraintError` 是唯一被吞的错误类，
+ *    其余原样上抛回滚事务）。本函数**不**先查「行在不在」再决定插不插 —— 那样判据 3 就没了。
+ *
+ * 应收集口径（§2.5 / §2.2）：`targetProjects` 缺省 ⇒ **本组全员**（含上轮答 `not_involved` 的，
+ * **不预筛**）；给定 ⇒ 只物化那几位（定向轮），但仍必须是本组成员（否则整单拒、零写入）。
+ * `reachability` 是**观测位**（读面现算，§2.5），与「要不要给它建行」正交 ⇒ 离线成员照样建行、
+ * 照样计入分母。
+ *
+ * ⚠️ **本函数零派发**：只 `enqueueTask`（写 `queue_state='queued'` + `dispatch_guard` 入队幂等
+ * 占位，§3.1「物化即写 dispatchGuard」）。唤起 Runner 是 I/O，留在 `bridge/index.ts` 的出口做
+ * （本文件是纯数据层，不 import `index.js` —— 那是反向成环）。
+ *
+ * @param memberProjectIds 本组成员清单（由调用方经 machines 配置解析后传入：feature-tools 不读
+ *   配置面，且 `identity → group` 的解析单点在 `bridge/index.ts#resolveEventScope` 同一条路上）
+ */
+export function handleStageRoundOpen(
+  args: StageRoundOpenArgs,
+  memberProjectIds: readonly string[],
+  identity: string | null = null,
+): StageRoundOpenExit {
+  const feature = getFeature(args.featureId);
+  if (feature === null) {
+    return { ok: false, code: "feature_not_found", error: `未知 Feature ${args.featureId}` };
+  }
+  const denied = ownershipFailure(feature, identity);
+  if (denied !== null) return denied;
+  // `stage` 闭集 fail-fast（§2.1 点名：脏值会让整条读口的 `readTaskStage` 炸掉 ⇒ 必须在写前拒）
+  if (!isFeatureStage(args.stage)) {
+    return {
+      ok: false,
+      code: ERR_STAGE_ROUND_INVALID_STAGE,
+      error:
+        `阶段轮入参 \`stage\`=${JSON.stringify(args.stage)} 越出 FEATURE_STAGES 闭集（${FEATURE_STAGES.join(" / ")}）：` +
+        `本口**必须显式传闭集原值**，不得取 Feature 的派生 stage（waiting_approval 派生为 null），也不得自造阶段名。`,
+    };
+  }
+  const stage = args.stage;
+  const members = Array.from(new Set(memberProjectIds.filter((p) => p.trim() !== ""))).sort();
+  if (members.length === 0) {
+    return {
+      ok: false,
+      code: ERR_STAGE_ROUND_NO_MEMBERS,
+      error: `Feature ${args.featureId} 的本组成员清单为空 ⇒ 阶段轮无应收对象，不开空轮（应收集恒等于本轮物化行，零成员即零行）。`,
+    };
+  }
+  const requested = args.targetProjects === undefined || args.targetProjects.length === 0
+    ? members
+    : Array.from(new Set(args.targetProjects)).sort();
+  const strays = requested.filter((p) => !members.includes(p));
+  if (strays.length > 0) {
+    return {
+      ok: false,
+      code: ERR_STAGE_ROUND_TARGET_NOT_MEMBER,
+      error:
+        `定向轮的 targetProjects 越出本组成员：${strays.join(", ")}（本组成员 = ${members.join(", ")}）⇒ ` +
+        `整单拒绝、零写入（不部分物化：半轮没有可核对的应收集）。`,
+    };
+  }
+  const basisRev = computeBasisRev({
+    requirement: feature.requirement,
+    memberProjectIds: members,
+    stage,
+    ...(args.basisRevInput !== undefined ? { basisRevInput: args.basisRevInput } : {}),
+  });
+  const docVersion = (args.basisRevInput ?? "").trim() === "" ? null : (args.basisRevInput ?? "").trim();
+  const suppliedSources = (args.sources ?? []).filter((s) => s.trim() !== "");
+  // 尚未被后续开轮接续的异议自动并入 sources；新 docVersion 正是旧异议的接续轮，
+  // 故这里跨版本收集，不要求异议版本与新轮版本相同。每条都保留段落定位与正文。
+  const objectionSources =
+    docVersion === null
+      ? []
+      : unresolvedDocObjections(readAllFeatureEvents(feature.featureId)).map(
+          (objection) => `${objection.sectionId}：${objection.objectionText}`,
+        );
+  const sources = Array.from(new Set([...suppliedSources, ...objectionSources]));
+  const key = stageRoundOpenKey(feature.featureId, stage, basisRev);
+
+  // —— 闩①：开轮事件（= 本轮口径的登记处，也是「同一口径 = 同一轮」的裁决处）
+  const readRound = (): { round: number; replayed: boolean } | FeatureToolFailure => {
+    const hit = getEventByIdempotencyKey(key);
+    const parsed = parseStageRoundOpenPayload(hit?.payload ?? null);
+    if (hit === null || parsed === null) {
+      return {
+        ok: false,
+        code: ERR_STAGE_ROUND_OPEN_DIRTY,
+        error: `开轮登记（kind=${EVENT_STAGE_ROUND_OPEN}）在幂等键 ${key} 上缺失或 payload 不可解析 ⇒ 拒绝物化（不猜轮次，猜错会写出一整轮脏行）。`,
+      };
+    }
+    return { round: parsed.round, replayed: true };
+  };
+  let round: number;
+  let replayed: boolean;
+  const existingEvent = getEventByIdempotencyKey(key);
+  if (existingEvent !== null) {
+    const resolved = readRound();
+    if ("ok" in resolved && resolved.ok === false) return resolved;
+    round = (resolved as { round: number }).round;
+    replayed = true;
+  } else {
+    const candidate = maxStageRound(listStageRows(feature.featureId), stage) + 1;
+    const payload: StageRoundOpenPayload = {
+      featureId: feature.featureId,
+      stage,
+      round: candidate,
+      basisRev,
+      docVersion,
+      sources,
+      targetProjects: requested,
+    };
+    try {
+      appendEvent({
+        featureId: feature.featureId,
+        taskId: null,
+        kind: EVENT_STAGE_ROUND_OPEN,
+        // `state` 列既有语义 = 「变化后的状态串」；开轮不是状态变化 ⇒ 恒 NULL（不冒充态）
+        state: null,
+        payload: stageRoundOpenPayload(payload),
+        idempotencyKey: key,
+      });
+      round = candidate;
+      replayed = false;
+    } catch (err) {
+      // 并发窗口：另一路同口径的开轮刚写了事件 ⇒ 与本口 `existingEvent !== null` 同解（返回既有轮）
+      if (!isUniqueConstraintError(err)) throw err;
+      const resolved = readRound();
+      if ("ok" in resolved && resolved.ok === false) return resolved;
+      round = (resolved as { round: number }).round;
+      replayed = true;
+    }
+  }
+
+  // —— 闩②：逐行真插（同轮同键已存在 ⇒ partial 唯一索引拒；本函数不预判、不跳过）
+  const store = getDefaultStore();
+  const created: StageRoundRowRef[] = [];
+  const existing: StageRoundRowRef[] = [];
+  store.runInTransaction(() => {
+    for (const projectId of requested) {
+      const taskId = randomUUID();
+      const message = buildStageRowMessage({
+        featureId: feature.featureId,
+        title: feature.title,
+        requirement: feature.requirement,
+        stage,
+        round,
+        projectId,
+        basisRev,
+        sources,
+      });
+      try {
+        createTask({
+          taskId,
+          projectId,
+          contextId: stageRowContextId(feature.featureId, stage, round, projectId),
+          state: "working",
+          featureId: feature.featureId,
+          // 通道位 = `stage`（§2.1：不复用 `inquiry` —— 那条会被 v0.10.8「待澄清收口」谓词
+          // 把上一轮挂起的行自动置 completed，直接击穿「长期 pending 可见」）
+          mode: "stage",
+          // PM 三值回执是只读语义 ⇒ 恒 read 档（与 inquiry 的 O-N4 同一条理由）
+          lane: "read",
+          taskType: "product_manager",
+          stage,
+          taskKey: STAGE_ROUND_TASK_KEY,
+          round,
+          // 三值初态 = `pending`（§2.1 写入者列：物化写 `relevance` / `answer_state` 的缺省档）
+          relevance: "pending",
+          answerState: "pending",
+          // 本轮口径指纹（`stale` 派生的唯一基准，§2.4）
+          basedOnRev: basisRev,
+          prompt: message,
+          dispatchMessage: message,
+        });
+        created.push({ projectId, taskId });
+      } catch (err) {
+        if (!isUniqueConstraintError(err)) throw err;
+        const hit = listStageRoundRows(feature.featureId, stage, round).find(
+          (row) => row.projectId === projectId,
+        );
+        if (hit !== undefined) existing.push({ projectId, taskId: hit.taskId });
+      }
+    }
+  });
+
+  // —— 入队（事务外，照 `dispatchTask` ④ 的先例：体内不跨长 I/O 持锁）
+  for (const row of created) enqueueTask(row.taskId);
+
+  return {
+    ok: true,
+    featureId: feature.featureId,
+    stage,
+    round,
+    basisRev,
+    docVersion,
+    created,
+    existing,
+    replayed,
+  };
+}
+
+/** `doc_objection` 入参（§2.5 写口 2 签名七枚） */
+export interface DocObjectionArgs {
+  featureId: string;
+  docVersion: string;
+  sectionId: string;
+  objectionText: string;
+  /** 闭集见 {@link STAGE_OBJECTION_TARGETS}；缺省由 `projectIds` 推导 */
+  targetType?: string | null;
+  projectIds?: readonly string[];
+}
+
+/**
+ * `doc_objection` 成功出参（§2.5 两枚 + 留痕可观测三枚）。
+ * `staleRevPending` = **本次被异议的那个版本上，是否已有一轮答复**（口径漂移的提示位）：
+ * `true` ⇒ 该版本上已开的轮需要在新口径上重答 ⇒ **提示**宿主重开一轮；本口**不自动开轮**
+ * （§2.4 末句 + §2.5 签名条），也不动任何行的 `answer_state`。
+ */
+export interface DocObjectionSuccess {
+  ok: true;
+  featureId: string;
+  docVersion: string;
+  sectionId: string;
+  objectionId: string;
+  targetType: StageObjectionTarget;
+  staleRevPending: boolean;
+  replayed: boolean;
+}
+
+export type DocObjectionExit = DocObjectionSuccess | FeatureToolFailure;
+
+/**
+ * **记一段异议**（§2.5 写口 2）：只落一枚 `stage.doc_objection` 事件，**不自动开轮**、
+ * **不触主链**、不改任何阶段行。
+ *
+ * 幂等 = §2.5 点名的 `(docVersion, sectionId, objectionId)`：签名里没有 `objectionId` 入参 ⇒
+ * 由**异议正文内容**派生（{@link stageObjectionIdOf}），同段同文必得同一 id ⇒
+ * `idx_events_idempotency_key` 真拒重（重放返回同一枚留痕、`replayed=true`，不新写一条）。
+ */
+export function handleDocObjection(args: DocObjectionArgs, identity: string | null = null): DocObjectionExit {
+  const feature = getFeature(args.featureId);
+  if (feature === null) {
+    return { ok: false, code: "feature_not_found", error: `未知 Feature ${args.featureId}` };
+  }
+  const denied = ownershipFailure(feature, identity);
+  if (denied !== null) return denied;
+  const docVersion = args.docVersion.trim();
+  const sectionId = args.sectionId.trim();
+  const objectionText = args.objectionText.trim();
+  if (docVersion === "" || sectionId === "" || objectionText === "") {
+    return {
+      ok: false,
+      code: ERR_STAGE_OBJECTION_FIELD_REQUIRED,
+      error: `doc_objection 的 docVersion / sectionId / objectionText 三枚均必填非空（收到 docVersion=${JSON.stringify(docVersion)} sectionId=${JSON.stringify(sectionId)} objectionText=${objectionText === "" ? "空" : "非空"}）：确认对象是**具体版本的具体段落**，缺一枚就无法定位被异议的依据。`,
+    };
+  }
+  const projectIds = Array.from(
+    new Set((args.projectIds ?? []).map((p) => p.trim()).filter((p) => p !== "")),
+  ).sort();
+  let targetType: StageObjectionTarget;
+  if (args.targetType === undefined || args.targetType === null || args.targetType.trim() === "") {
+    targetType = projectIds.length > 0 ? "project" : "basis";
+  } else {
+    const given = args.targetType.trim();
+    if (!(STAGE_OBJECTION_TARGETS as readonly string[]).includes(given)) {
+      return {
+        ok: false,
+        code: ERR_STAGE_OBJECTION_INVALID_TARGET,
+        error: `targetType=${JSON.stringify(given)} 越出闭集（${STAGE_OBJECTION_TARGETS.join(" / ")}）：值域归引擎，板侧只原样转发。`,
+      };
+    }
+    targetType = given as StageObjectionTarget;
+  }
+  const objectionId = stageObjectionIdOf(objectionText);
+  const key = stageDocObjectionKey(feature.featureId, docVersion, sectionId, objectionId);
+  let replayed = getEventByIdempotencyKey(key) !== null;
+  if (!replayed) {
+    try {
+      appendEvent({
+        featureId: feature.featureId,
+        taskId: null,
+        kind: EVENT_STAGE_DOC_OBJECTION,
+        state: null,
+        // camelCase 单形（§2.5 命名条）；`raisedAt` 由调用方给串，缺省交 store 补落库时刻
+        payload: JSON.stringify({
+          featureId: feature.featureId,
+          docVersion,
+          sectionId,
+          objectionId,
+          objectionText,
+          targetType,
+          projectIds,
+        }),
+        idempotencyKey: key,
+      });
+    } catch (err) {
+      if (!isUniqueConstraintError(err)) throw err;
+      replayed = true; // 并发同键：与 pre 命中同解（一条留痕，不双写）
+    }
+  }
+  // 提示位：该版本上**已有轮次**在答 ⇒ 口径漂移需重开（本口只提示，不开轮）
+  const staleRevPending = buildStageRuns(feature).some((cell) => cell.docVersion === docVersion);
+  return {
+    ok: true,
+    featureId: feature.featureId,
+    docVersion,
+    sectionId,
+    objectionId,
+    targetType,
+    staleRevPending,
+    replayed,
+  };
+}
+
+/** `gate1_confirm` 入参（§2.5 写口 3 签名三枚 + N6 增补的可选 `docVersion`） */
+export interface Gate1ConfirmArgs {
+  featureId: string;
+  round: number;
+  docHash: string;
+  /**
+   * 被确认的确认单版本（A7 冻结口径 `docVersion = v{round}`）。**可缺省** ⇒ 本口按 `v{round}`
+   * 归一后照做等价校验：板侧漏传不会退化成「只认哈希」，只会认「那一轮的当前版」。
+   */
+  docVersion?: string | null;
+  /**
+   * 可选 Group Version。传入即请求“确认并过门”：在同一事务内写排期、确认留痕并迁
+   * `需求分析 → 改造方案`；省略时保持既有“只确认、不推进”的行为。
+   */
+  version?: string;
+}
+
+/** 传 `version` 但本次未迁移阶段时的结构化原因（缺哪报哪）。 */
+export interface Gate1AdvanceReason {
+  code: string;
+  error: string;
+  missing: "version" | "sealed_round" | "confirmation_doc" | "stage";
+}
+
+/** `gate1_confirm` 成功出参（`confirmedAt` = **首次**确认时刻，重放不改写） */
+export interface Gate1ConfirmSuccess {
+  ok: true;
+  featureId: string;
+  /** 命中合成行所在阶段（`round` 可跨阶段重号 ⇒ 回给调用方指名是哪一格） */
+  stage: FeatureStage;
+  round: number;
+  /** 校验通过的版本号（缺省入参经 `v{round}` 归一后的现值） */
+  docVersion: string;
+  docHash: string;
+  confirmedAt: string;
+  replayed: boolean;
+  /** 本次是否真的把 Feature 阶段迁入「改造方案」；仅传 `version` 时下发。 */
+  stageAdvanced?: boolean;
+  /** 确认/排期后 Feature 的阶段；仅传 `version` 时下发。 */
+  featureStage?: FeatureStage;
+  /** 本次未推进时的结构化原因；仅传 `version` 时可能出现。 */
+  reason?: Gate1AdvanceReason;
+  /** 本次确认绑定并落库的 Group Version；仅传 `version` 时下发。 */
+  version?: string;
+}
+
+export type Gate1ConfirmExit = Gate1ConfirmSuccess | FeatureToolFailure;
+
+/**
+ * **门① 确认留痕**（§2.5 写口 3）：校验通过 ⇒ 写一枚 `stage.gate1_confirm` 事件 + 把确认落到
+ * 当轮合成行的 `confirmed_doc_hash` / `confirmed_at`，**只记录、不流转**。
+ *
+ * ★ 判据 2 的静态锚 = 本函数体（含其调用的每一枚被调函数）**零状态机触达**：只读 `features`
+ * 一行做归属校验、只写 `events` 与那一枚 `tasks` 合成行。真推进仍走 `a2a_feature_approve`
+ * —— 两口错误码与文案互不复用（见 {@link ERR_STAGE_GATE1_INVALID_ROUND} 组），防执行侧混用。
+ *
+ * **N6 补的三枚断言**（裁决 A9）：本轮格必须在册、`docHash` 必等于该在册合成行的 `doc_hash`、
+ * `docVersion`（缺省按 `v{round}` 归一）必等于那一行正文头部 ⇒ 任一不符**结构化拒**（不留痕、
+ * 不落列）。「确认了一份没在册的文档」因此在机制上不可能。
+ *
+ * 幂等 = `(featureId, round, docHash)`：同一版确认两次 ⇒ 同一串 ⇒ 索引真拒重 ⇒ 返回**首次**那条
+ * 事件的 `created_at`（`confirmedAt` 稳定；落列侧另有一道同值守卫）。
+ */
+export function handleGate1Confirm(args: Gate1ConfirmArgs, identity: string | null = null): Gate1ConfirmExit {
+  const feature = getFeature(args.featureId);
+  if (feature === null) {
+    return { ok: false, code: "feature_not_found", error: `未知 Feature ${args.featureId}` };
+  }
+  const denied = ownershipFailure(feature, identity);
+  if (denied !== null) return denied;
+  if (!Number.isInteger(args.round) || args.round < 1) {
+    return {
+      ok: false,
+      code: ERR_STAGE_GATE1_INVALID_ROUND,
+      error: `round=${String(args.round)} 不是正整数（阶段轮次从 1 起，§2.1 round 值域）：确认必须指向一格具体的轮，不接受 0 / 负数 / 小数。`,
+    };
+  }
+  const docHash = args.docHash.trim();
+  if (docHash === "") {
+    return {
+      ok: false,
+      code: ERR_STAGE_OBJECTION_FIELD_REQUIRED,
+      error: "gate1_confirm 的 docHash 必填非空：确认对象是**具体版本**（§5 用户语言 4），空哈希等于「确认了一份不存在的文档」。",
+    };
+  }
+  // `docVersion` 缺省 = 按 A7 冻结口径 `v{round}` 归一（给了就原样 trim，不做二次推导）
+  const given = args.docVersion?.trim() ?? "";
+  const docVersion = given === "" ? synthesisDocVersion(args.round) : given;
+  // 断言 1 · 本轮格必须在册（合成行 = 当轮文档的唯一登记处）
+  const rows = listStageSynthesisRows(feature.featureId).filter((row) => row.round === args.round);
+  if (rows.length === 0) {
+    return {
+      ok: false,
+      code: ERR_STAGE_GATE1_ROUND_NOT_FOUND,
+      error: `第 ${String(args.round)} 轮在本 Feature 没有在册的合成行（引擎尚未产出本轮《需求确认单》）：确认只能指向「已产出」的那一版，无格可确认 ⇒ 拒。`,
+    };
+  }
+  // 断言 2 · docHash 必等于在册那一枚（`round` 可跨阶段重号 ⇒ 逐格比到命中为止）
+  const hit = rows.find((row) => (row.docHash ?? "").trim() === docHash) ?? null;
+  if (hit === null) {
+    return {
+      ok: false,
+      code: ERR_STAGE_GATE1_DOC_HASH_MISMATCH,
+      error:
+        `docHash=${docHash} 不等于第 ${String(args.round)} 轮在册合成行的 doc_hash（在册 = ` +
+        `${rows.map((row) => row.docHash ?? "无").join(" / ")}）：文档已换版或传入的是另一版的哈希，` +
+        "确认必须先对齐**当前在册那一版**（§5 用户语言 4）。",
+    };
+  }
+  // 断言 3 · docVersion 必等于那一行正文头部（正文不可读 ⇒ 无从确认，一并拒）
+  const onFile = parseStageSynthesisDocVersion(hit.synthesisJson);
+  if (onFile !== docVersion) {
+    return {
+      ok: false,
+      code: ERR_STAGE_GATE1_DOC_VERSION_MISMATCH,
+      error:
+        `docVersion=${docVersion} 与第 ${String(args.round)} 轮在册确认单的版本不符（在册 = ` +
+        `${onFile ?? "无（正文未在册）"}）：版本口径归引擎（A7 ` +
+        "`docVersion = v{round}`），板侧不得自造版本号。",
+    };
+  }
+  const key = stageGate1ConfirmKey(feature.featureId, args.round, docHash);
+  const { stage } = hit;
+  const advanceRequested = args.version !== undefined;
+  const version = (args.version ?? "").trim();
+
+  // 传入 version 时先完成“可排期”判据；任一不过都在任何写入之前拒，保持零写入。
+  if (advanceRequested && version !== "") {
+    if (!isVersionShapeValid(version)) {
+      return {
+        ok: false,
+        code: "feature_invalid_version_shape",
+        error: `非法 version "${version}"：期望 semver 形状 vX.Y.Z（可省 v、可带 -prerelease/+build）`,
+      };
+    }
+    const ledger = versionLedgerHas(feature.ownerGroup, version);
+    if (ledger.ledgerReady && !ledger.exists) {
+      return {
+        ok: false,
+        code: "orch_version_unknown",
+        error:
+          `version "${version}" 不在引擎版本台账（owner_group=` +
+          `${feature.ownerGroup === null ? "NULL" : `"${feature.ownerGroup}"`}）：` +
+          "先建版或改传台账内版号；本次零写入。",
+      };
+    }
+    const status = versionLedgerStatus(feature.ownerGroup, version);
+    if (status.ledgerReady && status.status === "released") {
+      return {
+        ok: false,
+        code: "orch_version_released_locked",
+        error: `version "${version}" 已在版本台账 released ⇒ 不可排入或据此过门；本次零写入。`,
+      };
+    }
+  }
+
+  // 异议互斥：同 docVersion 的异议若尚未被后续开轮接续，确认整单拒绝且零写入。
+  const pendingObjections = unresolvedDocObjections(
+    readAllFeatureEvents(feature.featureId),
+    docVersion,
+  );
+  if (pendingObjections.length > 0) {
+    return {
+      ok: false,
+      code: "stage_objection_pending",
+      error:
+        `docVersion=${docVersion} 存在 ${String(pendingObjections.length)} 条未处置异议` +
+        `（${pendingObjections.map((item) => item.sectionId).join(", ")}）：` +
+        "先记录修正并开新一轮，使异议被新轮 basisRev/docVersion 接续后再确认；本次零写入。",
+    };
+  }
+
+  const sealedRound = gate1SettledRound(feature);
+  const docPresent = gate1DocPresent(feature) !== null;
+  const advanceReason: Gate1AdvanceReason | null = !advanceRequested || feature.stage !== "需求分析"
+    ? {
+        code: "stage_gate1_stage_not_requirement_analysis",
+        error:
+          `Feature 当前阶段为「${feature.stage}」，本次不重复推进；` +
+          "传 version 的过门仅从「需求分析」迁往「改造方案」。",
+        missing: "stage",
+      }
+    : version === ""
+      ? {
+          code: ERR_GROUP_VERSION_REQUIRED,
+          error: "version 为空（未排期）⇒ 本次只确认，不推进阶段；请传版本台账内非空版号。",
+          missing: "version",
+        }
+      : !docPresent
+        ? {
+            code: ERR_CONFIRMATION_DOC_REQUIRED,
+            error: "《需求确认单》未登记（decisions 档名与合成行双档均未命中）⇒ 本次不推进阶段。",
+            missing: "confirmation_doc",
+          }
+        : sealedRound === null
+          ? {
+              code: ERR_STAGE_ROUND_REQUIRED,
+              error: "「需求分析」尚无 settled=true 的阶段轮（轮未封口）⇒ 本次不推进阶段。",
+              missing: "sealed_round",
+            }
+          : null;
+  const shouldAdvance = advanceRequested && advanceReason === null;
+
+  const store = getDefaultStore();
+  const outcome = store.runInTransaction(() => {
+    const pre = getEventByIdempotencyKey(key);
+    let confirmedAt: string;
+    let replayed: boolean;
+    if (pre !== null) {
+      confirmedAt = pre.createdAt;
+      replayed = true;
+    } else {
+      let event: EventRecord;
+      try {
+        event = appendEvent({
+          featureId: feature.featureId,
+          taskId: null,
+          kind: EVENT_STAGE_GATE1_CONFIRM,
+          state: null,
+          payload: JSON.stringify({
+            featureId: feature.featureId,
+            round: args.round,
+            docHash,
+            featureState: feature.state,
+            ...(advanceRequested ? { version, stageAdvanced: shouldAdvance } : {}),
+          }),
+          idempotencyKey: key,
+        });
+        confirmedAt = event.createdAt;
+        replayed = false;
+      } catch (err) {
+        if (!isUniqueConstraintError(err)) throw err;
+        const concurrent = getEventByIdempotencyKey(key);
+        if (concurrent === null) throw err;
+        confirmedAt = concurrent.createdAt;
+        replayed = true;
+      }
+    }
+    // 留痕与列值同事务；重放时同值守卫不改首次确认时刻。
+    confirmStageSynthesis(hit.taskId, docHash, confirmedAt);
+    if (shouldAdvance) {
+      updateFeatureRegistration(feature.featureId, {
+        version,
+        stage: "改造方案",
+      });
+    }
+    const stored = getFeature(feature.featureId) ?? feature;
+    return { confirmedAt, replayed, stored };
+  });
+
+  const success: Gate1ConfirmSuccess = {
+    ok: true,
+    featureId: feature.featureId,
+    stage,
+    round: args.round,
+    docVersion,
+    docHash,
+    confirmedAt: outcome.confirmedAt,
+    replayed: outcome.replayed,
+  };
+  if (advanceRequested) {
+    success.stageAdvanced = shouldAdvance;
+    success.featureStage = outcome.stored.stage;
+    success.version = version;
+    if (advanceReason !== null) success.reason = advanceReason;
+  }
+  return success;
+}
+
+/**
+ * **读面装配**（§2.5 `stageRuns[]`）—— ★ **纯读**（判据 4）：只走五枚读口
+ * （{@link listStageRows} / {@link listStageSynthesisRows} / {@link listEvents} /
+ * {@link listRunners} / {@link listRunnerProjects}），**零写**：
+ * `listStageRows` 因此**刻意不接** `warnIfListTruncated`（那条触顶会 `appendEvent` 写一条
+ * `list.truncated`，读面带写 = 断言破功）；`listEvents` 走 store 的纯读过滤侧，
+ * **不碰** `a2a_events` 的按身份游标（那条会推进游标、静默吃掉宿主的事件）。
+ *
+ * 口径单点：分子/分母、`settled` 三态、`unanswered[]`、`allowedActions[]` 全在
+ * `bridge/stage-round.ts` 里算（与 N4 结算钩子、N8 收口判定器**共用同一条** §2.2 判据）；
+ * 本函数只做「取行 → 分组 → 装配」，**不再算第二份判据**。
+ *
+ * `basisRev` / `docVersion` 取值序（强档在前）：开轮事件 payload → 行集众数推断
+ * （{@link resolveStageRoundBasisRev}，N8 的弱档）→ `""`（无从判定，板侧照实显形、不猜）。
+ */
+export function buildStageRuns(feature: FeatureRecord): StageRunCellView[] {
+  const rows = listStageRows(feature.featureId);
+  const groups = groupStageRoundRows(rows);
+  const events = readAllFeatureEvents(feature.featureId);
+  // 本轮口径的**强档凭据**：开轮事件（`tasks.based_on_rev` 会被回执覆写，事件不会）
+  const opens = new Map<string, StageRoundOpenPayload>();
+  for (const e of events) {
+    if (e.kind !== EVENT_STAGE_ROUND_OPEN) continue;
+    const parsed = parseStageRoundOpenPayload(e.payload);
+    if (parsed !== null && parsed.featureId === feature.featureId) {
+      opens.set(stageRoundKey(parsed.stage, parsed.round), parsed);
+    }
+  }
+  const runners = listRunners();
+  const projectsByRunner = new Map<string, ReturnType<typeof listRunnerProjects>>();
+  for (const runner of runners) projectsByRunner.set(runner.runnerId, listRunnerProjects(runner.runnerId));
+  const reachabilityOf = (projectId: string) =>
+    projectStageReachability(projectId, runners, projectsByRunner);
+  // 合成行按 `(stage, round)` 挂格（N5 · A8）：一格至多一枚（partial 唯一索引保证），取不到 ⇒ null。
+  const synthesisByKey = new Map<string, ReturnType<typeof listStageSynthesisRows>[number]>();
+  // 轮次谱系 = 行集 ∪ 开轮事件 ∪ 合成行去重后的 `(stage, round)` 数（进 `synthesis.rounds`）。
+  const roundsOfStage = new Map<string, Set<number>>();
+  const noteRound = (stage: string, round: number): void => {
+    const set = roundsOfStage.get(stage) ?? new Set<number>();
+    set.add(round);
+    roundsOfStage.set(stage, set);
+  };
+  for (const group of groups) noteRound(group.stage, group.round);
+  for (const open of opens.values()) noteRound(open.stage, open.round);
+  for (const row of listStageSynthesisRows(feature.featureId)) {
+    synthesisByKey.set(stageRoundKey(row.stage, row.round), row);
+    noteRound(row.stage, row.round);
+  }
+  const synthesisOf = (stage: string, round: number) => {
+    const row = synthesisByKey.get(stageRoundKey(stage, round));
+    return row === undefined ? null : { row, rounds: roundsOfStage.get(stage)?.size ?? 0 };
+  };
+  const cells: StageRunCellView[] = [];
+  const covered = new Set<string>();
+  for (const group of groups) {
+    const key = stageRoundKey(group.stage, group.round);
+    covered.add(key);
+    const open = opens.get(key);
+    cells.push(
+      buildStageRunCell({
+        stage: group.stage,
+        round: group.round,
+        basisRev: open?.basisRev ?? resolveStageRoundBasisRev(group.rows) ?? "",
+        docVersion: open !== undefined ? open.docVersion : null,
+        rows: group.rows,
+        reachabilityOf,
+        synthesis: synthesisOf(group.stage, group.round),
+        events,
+      }),
+    );
+  }
+  // 开轮在册、行集为空（崩在物化前半 / 手工删过行）⇒ 仍出一格（`expected=0` + `settled=null`）：
+  // 「一轮存在但没收齐任何东西」必须可见，不许从读面凭空消失。
+  for (const [key, open] of opens) {
+    if (covered.has(key)) continue;
+    cells.push(
+      buildStageRunCell({
+        stage: open.stage,
+        round: open.round,
+        basisRev: open.basisRev,
+        docVersion: open.docVersion,
+        rows: [],
+        reachabilityOf,
+        synthesis: synthesisOf(open.stage, open.round),
+        events,
+      }),
+    );
+  }
+  // 格序 = (stage, round) 升序（旧轮在前、本轮在末位）；`groupStageRoundRows` 已按行集排好，
+  // 事件补的空格可能插在任何位置 ⇒ 这里统一再排一次（出参确定性不取决于 Map 插入序）。
+  return cells.sort((a, b) =>
+    a.stage === b.stage ? a.round - b.round : a.stage < b.stage ? -1 : 1,
+  );
+}
+
+/**
+ * **门① 第三前提「需求分析至少收口一轮」判据单点**（v0.11.0 O1）—— ★ **与读面同源**：
+ * 直接吃 {@link buildStageRuns} 的格（= `a2a_feature_status.stageRuns[]` 那一份装配，同一趟
+ * `listStageRows` + `groupStageRoundRows`），整格 `settled` 由 `bridge/stage-round.ts` 的
+ * {@link isQualifiedStageRow} 单点决定 ⇒ **执法面看到的「收没收到」与板上看到的逐字一致**，
+ * 不引入第二套收口判据、不引新表、**不读 synthesis、不看 `confirmedDocHash`**。
+ *
+ * 取值 = 最小的满足 `round ≥ 1 ∧ settled === true` 的「需求分析」轮次（**任意一轮即可**，
+ * 轮次数量不设上限判据）；一格都没有 / 有格但全未收口 / 零行格（`settled = null` 三态）
+ * ⇒ `null`（**空集合不构成一轮**，与 {@link buildStageRunCell} 的「零行 ⇒ null 而不是 true」同锁）。
+ */
+export function gate1SettledRound(feature: FeatureRecord): number | null {
+  for (const cell of buildStageRuns(feature)) {
+    if (cell.stage === "需求分析" && cell.round >= 1 && cell.settled === true) return cell.round;
+  }
+  return null;
 }
 
 // ---------------------------------------------------------------------------
@@ -1783,7 +2722,8 @@ const PENDING_NOT_TRACKED: Record<FeatureState, boolean> = {
 
 /**
  * 登记欠账**全清单**（增补 `6cc46dd2` N2）—— 固定序逐项查五枚欠账，报**首个未清项**；
- * **不按当前格过滤**（本函数内不引入第二套判据：欠账的有无只由登记字段与 `decisions` 决定）。
+ * **不按当前格过滤**（本函数内不引入第二套判据：欠账的有无只由登记字段、`decisions` 与
+ * 确认单双档的**同源谓词** {@link gate1DocPresent} 决定 · v0.11.0 orch-N7）。
  *
  * 顺序 = 流程的实际前置：确认单 → 排期 → 门① 抬 `stage` → 改造文档 → `approval` 置待审批。
  * 数组形态保留（当前各行至多 1 枚，将来「两件事同时等」不必改形状）。
@@ -1793,13 +2733,13 @@ function derivePendingItems(
   stage: FeatureStage,
   version: string,
   approval: FeatureApproval,
-  decisions: string | null,
+  feature: Pick<FeatureRecord, "featureId" | "decisions">,
 ): FeaturePendingItem[] {
   if (PENDING_NOT_TRACKED[state]) return [];
-  if (!docRegistered(decisions, undefined, CONFIRMATION_DOC_MARKER)) return ["requirement-doc"];
+  if (gate1DocPresent(feature) === null) return ["requirement-doc"];
   if (version === "") return ["version"];
   if (stage === "需求分析") return ["stage"];
-  if (!docRegistered(decisions, undefined, DESIGN_DOC_MARKER)) return ["design-doc"];
+  if (!docRegistered(feature.decisions, undefined, DESIGN_DOC_MARKER)) return ["design-doc"];
   if (approval === "未发起") return ["approval"];
   return [];
 }
@@ -1838,7 +2778,7 @@ export function deriveStageDetail(feature: FeatureRecord): FeatureStageDetail {
     feature.stage,
     feature.version,
     feature.approval,
-    feature.decisions,
+    feature,
   );
   const actorKind = ACTOR_BY_STATE[feature.state];
   return {
@@ -2021,14 +2961,12 @@ export function handleFeatureAdvance(
     };
   }
 
-  // ---- 门①（需求确认）《需求确认单》已登记守卫（增补 bbc7ea28 O3 / 引擎映射 §3 门表 案 (a)）------
+  // ---- 门①（需求确认）《需求确认单》已登记守卫（增补 bbc7ea28 O3 / v0.11.0 orch-N7 双档 / 引擎映射 §3 门表 案 (a)）------
   // **第二前提**，叠在同一条 version 守卫的判据面上：前三条件逐字相同（「本次携带 `stage` 写」∧
-  // 「写的目标值 ≠ 需求分析」∧「当前 stage = 需求分析」），第四条件换为「可见 `decisions` 含确认单档名」。
-  // 判据 = {@link docRegistered}（已落库 ∪ 本单同写，**并集不可省**；增补 6cc46dd2 N1 由
-  // confirmationDocRegistered 泛化而来，本调用点固定传 CONFIRMATION_DOC_MARKER ⇒ 行为逐字不变）；
-  // 引擎唯一能看到的
-  // 「文档存在」信号就是 `decisions`（产物登记，由调用方自报）—— 确认**内容**仍是文件事实源，
-  // 本前提只堵「登记特例直写 `stage`」这条把门① 变成一次纯记账动作的旁路。
+  // 「写的目标值 ≠ 需求分析」∧「当前 stage = 需求分析」），第四条件换为「确认单**双档**任一命中」
+  // = {@link gate1DocPresent}（旧档 `decisions` 文件名 ∪ 本单同写；新档 = 本轮合成行在册且
+  // sections 非空。**旧档必须保留** —— 存量卡的 `decisions` 只有文件路径）。approve 条件 ④ 与
+  // derivePendingItems 的确认单欠项**同源引本函数**，文件名子串判断不再各处各判一遍。
   // **两前提顺序 = version 在前、本前提在后**（缺哪报哪，不合并成一个错误码）。
   // 位置同样在三条分叉**之前** ⇒ 登记特例 / 合法流转两路同受；**唯一豁免 = `retryTaskIds` 重派路径**
   // （那是派发语义操作、不是过门，携 `stage` 写的行为逐字不变）—— 与 version 守卫的「三路同受」不同。
@@ -2038,16 +2976,45 @@ export function handleFeatureAdvance(
     reg.patch.stage !== undefined &&
     reg.patch.stage !== "需求分析" &&
     feature.stage === "需求分析" &&
-    !docRegistered(feature.decisions, args.decisions, CONFIRMATION_DOC_MARKER)
+    gate1DocPresent(feature, args.decisions) === null
   ) {
     return {
       ok: false,
       code: ERR_CONFIRMATION_DOC_REQUIRED,
       error:
-        `门①（需求确认）第二前提：Feature ${feature.featureId} 的 decisions 未登记本需求的《需求确认单》路径` +
-        `（已落库与本单同写的并集内无 "${CONFIRMATION_DOC_MARKER}" 档名）⇒ 不得把 stage 由「需求分析」迁往 "${reg.patch.stage}"；` +
+        `门①（需求确认）第二前提：Feature ${feature.featureId} 的《需求确认单》两档均未命中` +
+        `（已落库与本单同写的并集内无 "${CONFIRMATION_DOC_MARKER}" 档名 ∧ 本轮「需求分析」无在册合成行或其 sections 为空）` +
+        `⇒ 不得把 stage 由「需求分析」迁往 "${reg.patch.stage}"；` +
         "整单拒绝、零写入（state / stage / approval / version 全不动）。" +
-        "先把 doc/{版本}/{topic}-需求确认单.md 经同一 advance 的 decisions 登记（「to = 当前态」登记写，不属迁移），再重试本迁移",
+        "先把 doc/{版本}/{topic}-需求确认单.md 经同一 advance 的 decisions 登记（「to = 当前态」登记写，不属迁移）、" +
+        "或等引擎产出本轮合成《需求确认单》，再重试本迁移",
+    };
+  }
+
+  // ---- 门①（需求确认）第三前提：「需求分析」至少存在一轮 `settled=true`（v0.11.0 O1 / 引擎映射 §3 门表）------
+  // **硬判据（不可跳步）**：用户裁定 2026-10-20「未来一律通过板操作、板也不允许跳步」⇒ 板不画按钮
+  // 也挡不住宿主直调本口 ⇒ 由引擎执法。**前三条件与上面两条前提逐字相同**（同一触发面、同一
+  // `retryTaskIds` 豁免形状 ⇒ ①② 的既有负锚逐字不翻），第四条件 = {@link gate1SettledRound} 为空。
+  // **序 = 版本 → 确认单 → 阶段轮**（缺哪报哪，三枚独立码不合并 ⇒ 三笔善后动作各是不同一件事）。
+  // **零迁移**：本 `return` 早于下面所有写入（`applyFeatureContext` / `updateFeatureRegistration` /
+  // 归属 / 版本激活）⇒ 拒后 `state` / `stage` / `version` 逐字不动，卡仍 `需求分析` 可善后重试。
+  // **无豁免名单**（本卡裁定）：补丁卡同样要开轮；历史已跳步的卡只登记、不回填、不加旁路。
+  if (
+    args.retryTaskIds === undefined &&
+    reg.patch.stage !== undefined &&
+    reg.patch.stage !== "需求分析" &&
+    feature.stage === "需求分析" &&
+    gate1SettledRound(feature) === null
+  ) {
+    return {
+      ok: false,
+      code: ERR_STAGE_ROUND_REQUIRED,
+      error:
+        `门①（需求确认）第三前提：Feature ${feature.featureId} 在「需求分析」阶段不存在任何一轮 \`settled=true\` 的阶段轮` +
+        `（读面 \`stageRuns[]\` 同口径：零格 / 零行格（\`settled=null\`）/ 有格但未收口，三态都不算一轮）` +
+        `⇒ 不得把 stage 由「需求分析」迁往 "${reg.patch.stage}"；` +
+        "整单拒绝、零写入（state / stage / approval / version 全不动）。" +
+        "先经 a2a_stage_round_open 开一轮（需求分析）、等全员回执到齐使该轮 settled=true（口径见 stageRuns[].settled），再重试本迁移；**本前提无豁免名单**",
     };
   }
 
@@ -2473,8 +3440,9 @@ export function handleFeatureApprove(
   // **后人不得把任何判据插进这三笔之间**：`feature` 是写前快照、三笔写非事务，中途回头返工会留下
   // 「态已迁、门没过」的**不可回滚半态**（`approval` 已单向落「已通过」，无回边可撤）。
   // **序 = ③ → ④ → ⑤ → ⑥**（与门① 两前提同序）⇒ ①② 的既有负锚逐字不翻；**缺哪报哪、不合并**。
-  // ③④ **照抄门① 的两条前提**（同一批码、同一 {@link docRegistered}，不造第二套判据）：本串堵的洞是
-  // 「**登记写 `approval = 待审批` 不要求先过门①**」⇒ 只做门②、省略门① 的卡此前能直行至此并放行。
+  // ③④ **照抄门① 的两条前提**（同一批码、同一 {@link gate1DocPresent} 双档单源 · v0.11.0 orch-N7，
+  // 不造第二套判据）：本串堵的洞是「**登记写 `approval = 待审批` 不要求先过门①**」⇒ 只做门②、
+  // 省略门① 的卡此前能直行至此并放行。
   if ((feature.version ?? "") === "") {
     return {
       ok: false,
@@ -2485,17 +3453,19 @@ export function handleFeatureApprove(
         "先经引擎排期写口写定 version（advance 的「to = 当前态 ∧ 带 version」特例），再重试过门",
     };
   }
-  // **第二入参恒传 `undefined`**：{@link docRegistered} 的并集豁免是为门① 服务的（宿主「同一单先登记
+  // **第二入参恒不传**：{@link gate1DocPresent} 旧档的并集豁免是为门① 服务的（宿主「同一单先登记
   // 路径、再抬 `stage`」是既有合法用法）；**approve 无 `decisions` 入参 ⇒ 并集豁免在本侧不存在**，
   // 本串只看已落库的那一行（改造文档 §C.2「当场查」）。
-  if (!docRegistered(feature.decisions, undefined, CONFIRMATION_DOC_MARKER)) {
+  if (gate1DocPresent(feature) === null) {
     return {
       ok: false,
       code: ERR_CONFIRMATION_DOC_REQUIRED,
       error:
-        `门②（改造文档确认）条件 ④：Feature ${feature.featureId} 的 decisions 未登记本需求的《需求确认单》档名` +
-        `（已落库值内无 "${CONFIRMATION_DOC_MARKER}"）⇒ 不得过 approve；零迁移（state / approval 逐字不动）。` +
-        "门② 的 ③④ 照抄门① 两条前提 ⇒ 未过门① 的卡不得直接过门②；先用 advance 的登记写把确认单路径登记进去",
+        `门②（改造文档确认）条件 ④：Feature ${feature.featureId} 的《需求确认单》两档均未命中` +
+        `（已落库值内无 "${CONFIRMATION_DOC_MARKER}" 档名 ∧ 本轮「需求分析」无在册合成行或其 sections 为空）` +
+        `⇒ 不得过 approve；零迁移（state / approval 逐字不动）。` +
+        "门② 的 ③④ 照抄门① 两条前提 ⇒ 未过门① 的卡不得直接过门②；" +
+        "先用 advance 的登记写把确认单路径登记进去，或等引擎产出本轮合成《需求确认单》",
     };
   }
   if (feature.stage === "需求分析") {

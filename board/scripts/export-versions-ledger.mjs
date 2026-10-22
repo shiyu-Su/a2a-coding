@@ -19,7 +19,7 @@ import { dirname, join, resolve } from "node:path";
 import { fileURLToPath } from "node:url";
 
 import { VersionsLedgerStore, exportVersionsLedger, serializeVersionsExport } from "../dist/versions-ledger.js";
-import { writeFileAtomic } from "../dist/host-bridge-ledger.js";
+import { writeFileAtomic } from "../dist/atomic-write.js";
 
 const boardRoot = resolve(dirname(fileURLToPath(import.meta.url)), "..");
 

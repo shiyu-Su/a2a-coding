@@ -62,6 +62,25 @@
  * `input-required` 不把 Feature 翻成 `needs_input`、inquiry 的 `failed` 不冻结真 DAG 下游也不进
  * 失败账单、在飞 inquiry 不被 `recover()` 强置 `failed`。**只改节点集合判据，不改 Feature
  * 状态机流转**；存量 `mode` NULL 已由 orch-N1 读侧归一为 `dag` ⇒ 恒判 DAG 节点 = 零行为变化。
+ *
+ * R1 · v0.11.0（orch-N2）：判据**由取反式 `mode !== "inquiry"` 翻正为肯定式 `mode === "dag"`**
+ * （`TASK_MODES` 引入第三档 `stage` 后，取反式要随值域扩张逐处改，肯定式不用）。⇒ `stage`
+ * 阶段轮行自引入即被本模块全部读集剔出；且**就绪集**（{@link computeReadyNodes}）另加同一条
+ * mode 判据 —— 它是唯一的派发入口，且 `dispatchGuard` 会被 `rearmTask` 清空（guard 兜不住
+ * mode，故此处不依赖 guard）。零迁移、零回填：本节点不动协议、不动主链转移表与门①/门②。
+ *
+ * R1 · v0.11.0（orch-N5，本节点）：**消费点补批** —— N2 只翻了判据本身，本模块仍有若干处
+ * 「取 `listFeatureTasks` 集合 → 直接判据」**没过 `isDagNode`**（`mode` 翻正后它们对 `stage`
+ * 行的处置从「被谓词放行」变成「被语义误用」，是同一枚硬币的另一面）。逐处收窄到 DAG 节点集：
+ * ① `advanceExecuting` 的**零节点早退**（原读 `nodes.length` ⇒ 一张只有阶段行的 Feature 顶不掉
+ * 早退、整条判据链空跑）；② {@link validateDag} 的**被校验集合**（阶段行自身的 `dependencies`
+ * 声明不再当 DAG 合法性判据 ⇒ 不再因阶段行把整单 `failFeature`；依赖**指向**非 DAG 行仍是响亮
+ * 报错，且文案按行值点名 mode）；③ {@link FeatureScheduler.propagateFailure} 的**反向闭包集**
+ * （阶段行 `working ∧ remoteTaskId === null` 是设计常态 ⇒ 绝不被失败传播冻成 `blocked`）；
+ * ④ `isFeatureSealed` 的读集（与 `featureAtRest` 同一口径）；⑤ `recover()` 的**派发窗口集**
+ * （阶段行天生命中该判据 ⇒ 不过滤就虚报「派发窗口 N 个保留 working」）。
+ * 两处纯函数（{@link reduceConvergence} / {@link computeReadyNodes}）内部早已各自收窄 ⇒ 本节点
+ * 不动它们，也不改 Feature 状态机流转。
  */
 import {
   appendEvent,
@@ -80,7 +99,7 @@ import {
 } from "../feature/state-machine.js";
 import { bridgeLog } from "./bridge-log.js";
 import type { CoreRole } from "../runtime/core-lease.js";
-import type { FeatureRecord, TaskRecord, TaskState } from "../types.js";
+import type { FeatureRecord, TaskMode, TaskRecord, TaskState } from "../types.js";
 
 /** 桥重启后对账在飞任务时写入的结果文本（对齐本单元 C11 派发占位语义「已发出即有占位 ⇒ 保守不重派」） */
 export const FEATURE_INTERRUPTED_TEXT =
@@ -225,21 +244,29 @@ export function isUnhandledFailure(node: Pick<TaskRecord, "state">): boolean {
 }
 
 /**
- * **是否 Feature DAG 节点**（v0.10.8 O-4 · orch-N5）：调度器**节点集合判据**的单一事实源。
+ * **是否 Feature DAG 节点**（v0.10.8 O-4 · orch-N5 引入；判据翻转 = R1 · v0.11.0 orch-N2）：
+ * 调度器**节点集合判据**的单一事实源。
  *
  * 背景：`mode="inquiry"` 自 v0.10.8 O-2 起亦携带 `featureId`（归属声明，落 `tasks.feature_id`）
  * ⇒ inquiry 行会落进全部「按 Feature 取节点」的读集。它**不是 DAG 节点**（不由调度器派发、
  * 不参与依赖拓扑），若混进判据即产生改造文档 §2.1 O-4 的五条后果（本节点处理 ①②③，
  * ④⑤ 在 `feature-tools.ts` = orch-N6）。
  *
- * **判据取反式 `mode !== "inquiry"`**（而非 `=== "dag"`）：`tasks.mode` 存量 NULL 已由 orch-N1
- * 在读侧归一为 `"dag"` ⇒ 存量行**恒判为 DAG 节点** = 零行为变化；闭集外的脏值已在读侧
- * fail-fast，不会静默落进本判据。
+ * **判据取肯定式 `mode === "dag"`**（v0.11.0 起 `TASK_MODES` 有三档：`dag` / `inquiry` /
+ * `stage` ⇒ 任何取反式都要随值域扩张逐处改一遍，肯定式不用）：闭集内非 `dag` 者一律**不是**
+ * DAG 节点，`stage` 阶段轮行自引入即被剔出节点集（不进收敛 / 传播 / 账单 / 恢复 / 就绪集）。
+ *
+ * ⚠️ **入参类型收紧 = 翻转的承重前提**（本卡唯一不可自愈风险面的执法点）：形参声明为
+ * **归一后的 `{ readonly mode: TaskMode }`**，不接受裸 row / `unknown` ⇒ 「凡进本函数的行
+ * 必已过 `readMode`（NULL → `dag`）」由编译期保证。取反式时期该前提靠本函数兜底
+ * （`undefined !== "inquiry"` = 放行）；翻正后**未过读口的裸对象会被静默剔出节点集**，
+ * 与「零迁移」叠加即无声的行为变化。新增调用点若手里是 `Record<string, unknown>`，必须先走
+ * 读侧再进本函数，**不得**在本函数里重新兜底（那等于把 mode 归一拆成两处事实源）。
  *
  * ⚠️ 只用于「**节点集合**」筛选；**不改 Feature 状态机流转**（流转表 / `canTransition` 零触达）。
  */
-export function isDagNode(node: Pick<TaskRecord, "mode">): boolean {
-  return node.mode !== "inquiry";
+export function isDagNode(node: { readonly mode: TaskMode }): boolean {
+  return node.mode === "dag";
 }
 
 /**
@@ -287,7 +314,8 @@ export function depStateOf(
 
 /**
  * 计算**同批可并发派发**的就绪节点集合（同层无依赖节点一并返回）。
- * 就绪 = `working` 且尚未派发（`remoteTaskId === null`）且不在在飞标记内、依赖全部 completed。
+ * 就绪 = **是 DAG 节点**（{@link isDagNode}，R1 · v0.11.0 orch-N2 加判）且 `working` 且尚未派发
+ * （`remoteTaskId === null`）且无派发占位、不在在飞标记内、依赖全部 completed。
  *
  * v0.6.1 REQ-05：`!isNeutered` 与 `isPastNotBefore` 两条判据随五层删除一并移除
  * （中性化列与 `not_before` 门都已停止读写，不再有「登记后先不派」的持久化挡板）。
@@ -312,6 +340,16 @@ export function computeReadyNodes(
   const claimed = new Set<string>();
   const ready: TaskRecord[] = [];
   for (const n of nodes) {
+    /**
+     * **只有 DAG 节点参与就绪计算**（R1 · v0.11.0 orch-N2，**第二道保险**）。
+     *
+     * 调用点侧本就应先过 {@link isDagNode}（`advanceExecuting` 的其余读集已收窄），但就绪集是
+     * **唯一的派发入口** ⇒ 此处独立再判一次。原因 = 占位（`dispatchGuard`）会被 `rearmTask` /
+     * `rearmForRetry` **清空**（那是「回到待派发」的显式动作、不区分 mode）⇒ 一旦某条非 DAG 行
+     * （`inquiry` / `stage`）被重排成 `working` 且占位为空，本函数就会把它当就绪节点**派发出去**。
+     * mode 判据不依赖占位，故占位被清也拦得住（阶段行「长期可见、被指名」全靠这条不派）。
+     */
+    if (!isDagNode(n)) continue;
     if (n.state !== "working") continue;
     if (n.remoteTaskId !== null) continue;
     /**
@@ -676,6 +714,9 @@ export class FeatureScheduler {
     // 节点** ⇒ 其结算**只落库任务态**（由调用方 `persist` / `updateTaskState` 完成），在此不传播、
     // 不改 Feature 态、不 kick（否则 inquiry 失败会冻结真 DAG 下游并写进失败账单）。
     // 置于封存判定**之前**：本处的「零动作」理由是「节点集合不含它」，而非「Feature 已静止」。
+    // **R1 · v0.11.0 orch-N5**：本早退对 `mode="stage"` 的阶段行**同样生效**（判据是 `isDagNode`，
+    // 不点名档位）⇒ 单条阶段行 `failed` 走「只落库」这条口，**不进** {@link propagateFailure}；
+    // 即便上游漏判，propagateFailure 内部还有一道闭包收窄（消费点 ③）兜住。
     const settled = getTask(taskId);
     if (settled !== null && !isDagNode(settled)) {
       bridgeLog.info(
@@ -773,13 +814,13 @@ export class FeatureScheduler {
     // ⚠️ `scanned` 语义随之**重定义为「executing 数」**（旧 =「非终态数」）—— 见 `FeatureRecoverySummary`。
     for (const feature of listFeatures({ state: "executing", limit: 1000 })) {
       summary.scanned += 1;
-      const nodes = listFeatureTasks(feature.featureId, { limit: 1000 });
+      const nodes = listFeatureTasks(feature.featureId, { limit: 1000 }).filter(isDagNode);
       // 已在飞（远端 id 已知）：既有恢复路径
       // **v0.10.8 O-4（③）**：在飞集只取 DAG 节点 ⇒ 重启**不**把在飞 inquiry 强置 `failed`
       // （只读询问的终态由 machine 补结算 / 看护自然落，与 Feature 的 DAG 恢复无关）。
-      const inFlight = nodes.filter(
-        (n) => isDagNode(n) && n.remoteTaskId !== null && n.state === "working",
-      );
+      // **R1 · v0.11.0 orch-N5（消费点 ⑤）**：收窄点**上移到读集** ⇒ 同一段读出的两份判据
+      // （在飞集 / 派发窗口集）共用同一个「DAG 节点集」口径，不再一处过、一处不过。
+      const inFlight = nodes.filter((n) => n.remoteTaskId !== null && n.state === "working");
       /**
        * **C11 派发窗口**：占位已写（`dispatchGuard !== null`）、远端 id 未回填
        * （`remoteTaskId === null`）且仍 `working` ⇒ 崩溃点落在「send 前占位 → send 返回后回填」之间。
@@ -792,6 +833,11 @@ export class FeatureScheduler {
        * 重连后的**补结算回填终态**；真失败由孤儿的**墙钟出口**（30 min `failOrphanedTask`）兜底。
        * 因此**失败账单（`feature.failure_report`）的时点从「启动即刻」后移到「补结算 / 墙钟」之后**
        * —— 这是刻意的取舍（宁可账单晚到，不可误杀补结算），后人勿再改回启动即置 `failed`。
+       *
+       * **R1 · v0.11.0 orch-N5（消费点 ⑤ 的后半）**：本判据（`dispatchGuard !== null ∧
+       * remoteTaskId === null ∧ working`）阶段行**天生命中** —— 开轮物化写占位、且它不由调度器
+       * 派发 ⇒ 远端 id 永不回填。读集不过 `isDagNode` 时，一张只有阶段行的 Feature 会被算成
+       * 「派发窗口 N 个」并打出 warn（**零处置**却虚报「保留 working」，把真窗口埋进噪声里）。
        */
       const dispatchWindow = nodes.filter(
         (n) => n.dispatchGuard !== null && n.remoteTaskId === null && n.state === "working",
@@ -885,10 +931,19 @@ export class FeatureScheduler {
    */
   private async advanceExecuting(feature: FeatureRecord): Promise<void> {
     if (this.dispatching.has(feature.featureId)) return; // 批门闩：本 Feature 派发进行中
-    let nodes = listFeatureTasks(feature.featureId, { limit: 1000 });
+    // **R1 · v0.11.0 orch-N5（消费点 ①）**：早退判据读的是 **DAG 节点集**，不是「按 Feature 取到的
+    // 全部行」。阶段行与 `dag` 行同处一张读集 ⇒ 若仍看全量行数，一张**只有阶段行**的 Feature
+    // （开轮物化后、首批 DAG 节点尚未登记的窗口是真实形态）顶不掉早退，把下面整条判据链空跑一遍，
+    // 并且**阶段行自己的 `dependencies` 声明**会进 DAG 合法性校验（见 {@link validateDag} 口径）。
+    const rows = listFeatureTasks(feature.featureId, { limit: 1000 });
+    let nodes = rows.filter(isDagNode);
     if (nodes.length === 0) return;
 
-    const dagError = validateDag(nodes);
+    // 全量读集**只**交给 validateDag 一处：它的「依赖目标」判据需要非 DAG 行的**实际 `mode`**
+    // 才能报准文案（只喂 DAG 节点集会把「依赖指向阶段行」误报成「悬空引用」—— 两种处置含义不同：
+    // 前者是数据被绕过登记口写坏，后者才是真的引用不到）。N6 后读面已剔阶段行 ⇒ 这里能报准的
+    // 只剩 `inquiry` 档，其余口径详见 {@link validateDag} 末段「与 orch-N6 读面过滤的口径差」。
+    const dagError = validateDag(rows);
     if (dagError !== null) {
       this.failFeature(feature, dagError);
       return;
@@ -908,7 +963,10 @@ export class FeatureScheduler {
       for (const failedId of failedIds) {
         if (this.propagateFailure(feature, failedId).length > 0) blockedAny = true;
       }
-      if (blockedAny) nodes = listFeatureTasks(feature.featureId, { limit: 1000 });
+      // 重读同样收窄（消费点 ① 的第二处取集）⇒ 下面 `reduceConvergence` / `computeReadyNodes` /
+      // 静止判据拿到的始终是同一口径的 DAG 节点集。
+      if (blockedAny)
+        nodes = listFeatureTasks(feature.featureId, { limit: 1000 }).filter(isDagNode);
     }
 
     const convergence = reduceConvergence(nodes);
@@ -1008,12 +1066,27 @@ export class FeatureScheduler {
   }
 
   /**
-   * 失败传播：把 `failedTaskId` 的全部下游（传递闭包）`working` 节点置 `blocked`，
-   * 返回被阻塞的节点 id 列表。
+   * 失败传播：把 `failedTaskId` 的全部下游（传递闭包）`working` **且未派发**的 **DAG 节点**
+   * 置 `blocked`，返回被阻塞的节点 id 列表。
+   *
+   * ⚠️ 入参集合与种子都限 **DAG 节点集**（R1 · v0.11.0 orch-N5）—— 非 DAG 行既不被冻、
+   * 也不能当种子。`propagateBlocked` / `descendantClosure` 本身保持 mode 无关（纯函数、
+   * 与 `planResume` 共用同一份反向边构造 ⇒ 判据留在消费侧，不在纯函数里开第二处 mode 比较）。
    */
   private propagateFailure(feature: FeatureRecord, failedTaskId: string): string[] {
-    const nodes = listFeatureTasks(feature.featureId, { limit: 1000 });
-    const blocked = propagateBlocked(failedTaskId, nodes);
+    // **R1 · v0.11.0 orch-N5（消费点 ③）**：反向闭包只在 **DAG 节点集**内算。两条后果：
+    // - **阶段行不被冻**：`propagateBlocked` 的冻结核算是 `working ∧ remoteTaskId === null`，
+    //   而阶段轮行的**常态形状恰好就是这一条**（长期待回执、永不派发 ⇒ 远端 id 恒空）⇒ 不过滤
+    //   时，任一 DAG 失败会把它冻成 `blocked`（写 `finished_at`），R1 的「长期可见、被指名」当场失效。
+    // - **非 DAG 的 `failedTaskId` 进来也零动作**：除了闭包不含它，还有一条**种子判定** ——
+    //   种子行本身必须在节点集内（见下 `dag.some(...)`）。不这么写的后果：`buildDownstreamIndex`
+    //   的反向边取自 **DAG 行自己的 `dependencies` 声明**，一条被（绕过闸①）写坏的 DAG 行若恰好
+    //   声明依赖某阶段行，该阶段行就成了反向边的键 ⇒ 拿它当种子照样能冻真节点。种子判定把这条
+    //   口子也从「靠调用方自觉」变成「本函数自证」。调用点侧两处（`advanceExecuting` 的失败集 /
+    //   `notifyTaskSettled` 的早退）本卡之前就已各自拦下 ⇒ 这里是**第三道保险**。
+    const dag = listFeatureTasks(feature.featureId, { limit: 1000 }).filter(isDagNode);
+    if (!dag.some((n) => n.taskId === failedTaskId)) return [];
+    const blocked = propagateBlocked(failedTaskId, dag);
     for (const id of blocked) updateTaskState(id, "blocked");
     return blocked;
   }
@@ -1056,9 +1129,13 @@ export class FeatureScheduler {
   private isFeatureSealed(feature: FeatureRecord): boolean {
     if (feature.state === "needs_input") return true;
     if (feature.state !== "executing") return false;
+    // **R1 · v0.11.0 orch-N5（消费点 ④）**：取集处显式过 `isDagNode`，与 `advanceExecuting`
+    // 交给 `featureAtRest` 的那份集合**同口径**（此前一处传收窄集、一处传全量集，靠 `featureAtRest`
+    // 内部再滤才没出岔 ⇒ 本处把口径写进取数行，不再依赖被调方兜底）。阶段行既不构成「在飞拖延
+    // 静止」，也不构成「存在 failed/blocked 的静止理由」⇒ 含阶段行不破坏封存判定。
     return this.featureAtRest(
       feature.featureId,
-      listFeatureTasks(feature.featureId, { limit: 1000 }),
+      listFeatureTasks(feature.featureId, { limit: 1000 }).filter(isDagNode),
     );
   }
 
@@ -1241,7 +1318,8 @@ export class FeatureScheduler {
 }
 
 /**
- * DAG 合法性校验：悬空引用 / 依赖指向只读询问行 / 环 → 返回错误说明（调度器据此置 Feature failed）。
+ * DAG 合法性校验：**只在 DAG 节点集上**查 悬空引用 / 依赖指向非 DAG 行（`inquiry` / `stage`）/ 环
+ * → 返回错误说明（调度器据此置 Feature failed）。
  * 依赖引用的是**同一 Feature 内的本地 taskId**。
  *
  * **v0.10.8 orch-N7 · dep 双闸的闸②**：`dependencies` 指向 `mode="inquiry"` 的行即报错，
@@ -1252,9 +1330,35 @@ export class FeatureScheduler {
  * （只读行 `failed` / `blocked` ⇒ 下游恒 `upstreamFailed`、**永不派发**）⇒ 必须响亮报错而非静默放行。
  *
  * ⚠️ 存量行 `mode` NULL 已由读侧归一为 `"dag"` ⇒ 本判据对存量**恒不触发**（零行为变化）。
+ * R1 · v0.11.0 orch-N2：判据翻正后本闸同时拦下 `mode="stage"` 的阶段轮行（它长期停在待回执态
+ * ⇒ 下游恒 `pending`，比只读行的静默挡更隐蔽）；错误文案的 mode 值**取行本身**，不硬编码
+ * `inquiry`。闸的**判据本身未动**（仍是 {@link isDagNode} 单一事实源，不开第三口子）。
+ *
+ * **R1 · v0.11.0 orch-N5（消费点 ②）—— 入参口径与「被校验集合」分离**：
+ * - 入参 `rows` = 按 Feature 取到的**全量读集**（含非 DAG 行）。这是刻意的：依赖目标要靠它查
+ *   `mode`，只喂 DAG 节点集就退化成「悬空引用」文案，把「有人绕过登记口写了非法 dep」与
+ *   「引用了一个根本不存在的 id」两种处置混成一条。
+ * - **被校验的节点集** = `rows.filter(isDagNode)`。判据（悬空 / 非 DAG 依赖 / 环）只跑在 DAG 行
+ *   的 `dependencies` 声明上 ⇒ **阶段行自己的依赖声明不再当 DAG 合法性判据**。旧形态的实际后果：
+ *   一张只有阶段行的 Feature（`advanceExecuting` 顶不掉早退时）会因某条阶段行的 `dependencies`
+ *   指向阶段行 / 悬空 ⇒ `validateDag` 报错 ⇒ `failFeature` **把整单打死** —— 而阶段行根本不在
+ *   DAG 里，它写了什么不该由 Feature 的 DAG 合法性买单。
+ * - **仍然拒收阶段行**：非 DAG 行**作为依赖目标**出现 ⇒ 响亮报错（上面那条闸），文案点名其
+ *   实际 `mode`。两道判据合起来 = 「阶段行既不被拉进 DAG 校验，也不许被别人拉进 DAG」。
+ *
+ * ⚠️ **与 orch-N6 读面过滤的口径差**（行为不变、措辞降级）：N6 起 `listFeatureTasks` 拼
+ * `NON_STAGE_MODE_SQL` ⇒ 传入的 `rows` 里**已经没有阶段行**（只剩 `inquiry` 与存量 NULL 归一行）。
+ * 于是「dag 行依赖阶段行」这条现在落**悬空引用**文案，而不是 `mode="stage"` 精确点名 ——
+ * 两者都是响亮拒收 + `failFeature`，只是可对账精度下降；精确点名的责任回到**闸①**
+ * （`bridge/index.ts` 挂载侧 `dependency_is_inquiry`，改 `mode` 值域时那里才是第一现场）。
+ * 本闸的 `mode` 插值文案仍由 `test/v0110-n5-*.test.ts` 直接喂集合取证（第二道保险不能因为
+ * 第一道保险生效就成为测不到的死代码）。
  */
-export function validateDag(nodes: readonly TaskRecord[]): string | null {
-  const byId = new Map(nodes.map((n) => [n.taskId, n]));
+export function validateDag(rows: readonly TaskRecord[]): string | null {
+  /** 依赖目标查表用**全量读集**（要能报出非 DAG 行的实际 `mode`） */
+  const byId = new Map(rows.map((n) => [n.taskId, n]));
+  /** 被校验集合 = DAG 节点集（消费点 ② 的收窄处） */
+  const nodes = rows.filter(isDagNode);
   for (const node of nodes) {
     for (const dep of node.dependencies ?? []) {
       const depNode = byId.get(dep);
@@ -1262,11 +1366,12 @@ export function validateDag(nodes: readonly TaskRecord[]): string | null {
         return `任务 ${node.taskId} 依赖悬空引用 ${dep}（不在本 Feature 任务集内）`;
       }
       if (!isDagNode(depNode)) {
-        return `任务 ${node.taskId} 依赖 ${dep} 是只读询问节点（mode="inquiry"），不可作为 DAG 依赖`;
+        return `任务 ${node.taskId} 依赖 ${dep} 不是 DAG 节点（mode="${depNode.mode}"），不可作为 DAG 依赖`;
       }
     }
   }
-  // DFS 三色环检测
+  // DFS 三色环检测。起点集与遍历面都是 DAG 节点集：上面已保证「dag 行的依赖目标必为 dag 行」
+  // （否则当场返回错误），故 `byId` 取到的后继不会越出节点集，无需在递归内再判一次 mode。
   const color = new Map<string, 1 | 2>();
   const visit = (id: string): boolean => {
     const c = color.get(id);

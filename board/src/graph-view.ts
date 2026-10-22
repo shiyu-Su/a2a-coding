@@ -91,7 +91,8 @@
  * {@link taskOrdinalMap} 全集算号**（{@link buildTaskGraph} 本体与 `taskOrdinalMap` 入参一字不动，
  * server 侧调用不预过滤——喂子集 ⇒ 子集重编号 `1..M` ⇒ 砸穿「表/图同号」审计契约），**剔除只发生在
  * 节点渲染层**：{@link groupPipelines} 出组的节点表、喂 ELK 的边集、卡头任务数与 chip 落 DOM 一族消费面
- * （{@link drawSubsetExcludingInquiry}）。判据 = 唯一正向 `mode === "inquiry"`；`mode` 纯透传可 null、
+ * （{@link drawSubsetExcludingNonDag}）。判据 = 排除式正向 `mode !== "stage" && mode !== "inquiry"`
+ * （v0.11.0 B1：stage 回执与 inquiry 提问双双剔除）；`mode` 纯透传可 null、
  * **不 `?? "dag"` 兜底** ⇒ `null` / 未知值一律进图（fail-conservative，不吞不猜；不用 `taskType` / `lane`）。
  * **chip 号 = 全集号、可不连续 = 特性非缺陷**。`readOccupants` 类消费面不动；h2 声明计数 / `dangling`·
  * `cycleEdges` 提示行 / `renderChip` 的 `依赖：` 段仍吃账面原值。
@@ -768,30 +769,33 @@ interface RenderCtx {
 }
 
 /**
- * B-2 剔除判据（v0.10.8 · 改造文档 §2.3）：**唯一正向 `mode === "inquiry"`**。`mode` 纯透传可 null
- * （老桥缺键 ⇒ null / undefined），**不 `?? "dag"` 兜底** ⇒ `null` / 未知值一律**进图**
- * （fail-conservative，不吞不猜）；**不用 `taskType`**（职责位）/ **`lane`**（默认值造反）当判据。
+ * B-2 剔除判据（v0.11.0 B1 · 改造文档 §3.1）：**排除式** —— `mode` 为 `"stage"` 或 `"inquiry"` ⇒ 剔除，
+ * 即正向 `mode !== "stage" && mode !== "inquiry"`（只画 DAG）。`mode` 纯透传可 null（老桥缺键 ⇒
+ * null / undefined），**不 `?? "dag"` 兜底**、**不写成肯定式 `mode === "dag"`**（老桥可能不带 `mode` 键，
+ * 肯定式会让 v0.10.x 老卡整图变空）⇒ `null` / 缺键 / 未知值一律**进图**（fail-conservative，不吞不猜）；
+ * **不用 `taskType`**（职责位）/ **`lane`**（默认值造反）当判据。
  */
-const isInquiryNode = (task: FeatureTaskItem): boolean => task.mode === "inquiry";
+const isNonDagNode = (task: FeatureTaskItem): boolean => task.mode === "stage" || task.mode === "inquiry";
 
 /**
- * 节点渲染层剔除（B-2/B-4）：从 {@link groupPipelines} 出组的节点表剔去 inquiry 节点（框被剔空 ⇒ 整框退役），
- * 并把**端点落在被剔节点上**的 kept 边一并剔出喂 ELK 的边集（否则 ELK 按未知端点原样引 port id，线会指向幽灵）。
+ * 节点渲染层剔除（B-2/B-4）：从 {@link groupPipelines} 出组的节点表剔去非 DAG 节点（stage / inquiry；
+ * 框被剔空 ⇒ 整框退役），并把**端点落在被剔节点上**的 kept 边一并剔出喂 ELK 的边集（否则 ELK 按未知端点
+ * 原样引 port id，线会指向幽灵）。
  * **不二次约简** —— `kept` 仍由全集单次 {@link transitiveReduce} 而来（§2.3-2 共用同一份的事实源不动）；
- * 编号表也不重算（chip 号 = 全集号、可不连续）。全集零 inquiry ⇒ 原样返回同一引用（零行为变化）。
+ * 编号表也不重算（chip 号 = 全集号、可不连续）。全集零非 DAG 节点 ⇒ 原样返回同一引用（零行为变化）。
  */
-function drawSubsetExcludingInquiry(
+function drawSubsetExcludingNonDag(
   pipelines: readonly GraphPipeline[],
   kept: readonly { from: string; to: string }[],
 ): ElkGraphSource {
-  const inquiryIds = new Set<string>();
-  for (const p of pipelines) for (const n of p.nodes) if (isInquiryNode(n)) inquiryIds.add(n.taskId);
-  if (inquiryIds.size === 0) return { pipelines, edges: kept };
+  const nonDagIds = new Set<string>();
+  for (const p of pipelines) for (const n of p.nodes) if (isNonDagNode(n)) nonDagIds.add(n.taskId);
+  if (nonDagIds.size === 0) return { pipelines, edges: kept };
   return {
     pipelines: pipelines
-      .map((p) => ({ ...p, nodes: p.nodes.filter((n) => !isInquiryNode(n)) }))
+      .map((p) => ({ ...p, nodes: p.nodes.filter((n) => !isNonDagNode(n)) }))
       .filter((p) => p.nodes.length > 0),
-    edges: kept.filter((e) => !inquiryIds.has(e.from) && !inquiryIds.has(e.to)),
+    edges: kept.filter((e) => !nonDagIds.has(e.from) && !nonDagIds.has(e.to)),
   };
 }
 
@@ -810,7 +814,7 @@ function drawSubsetExcludingInquiry(
  * `layout` 仅供测试注入抛错桩，生产侧不传（缺省 {@link layoutGraphGuarded}）。
  *
  * **v0.10.8 B-4**：入参 `tasks` = **全集**（server 不预过滤）；{@link taskOrdinalMap} 全集算号后，
- * 剔除只发生在渲染消费面（{@link drawSubsetExcludingInquiry} 与卡头任务数）⇒ 图 chip 号可不连续、与表同号。
+ * 剔除只发生在渲染消费面（{@link drawSubsetExcludingNonDag} 与卡头任务数）⇒ 图 chip 号可不连续、与表同号。
  */
 export async function renderDependencyGraphSection(
   tasks: readonly FeatureTaskItem[],
@@ -831,7 +835,7 @@ export async function renderDependencyGraphSection(
   const pipelines = groupPipelines(graph, ordinals);
 
   // B-2/B-4：剔除只在节点渲染层消费面（喂 ELK 的节点表与边集 + 卡头任务数）；h2 声明计数 / notes 行 / chip 依赖段仍吃原值
-  const drawn = drawSubsetExcludingInquiry(pipelines, kept);
+  const drawn = drawSubsetExcludingNonDag(pipelines, kept);
 
   const laid = await layout(drawn);
   if (laid.flat === null) {
@@ -893,7 +897,7 @@ function renderSectionHtml(
   }
 
   return (
-    `<h2>依赖图（${graph.nodes.filter((n) => !isInquiryNode(n)).length} 任务 · ${pipelines.length} 管道 · 声明 ${graph.edges.length} 边（本质 ${kept.length} · 传递省略 ${dropped.length}））</h2>\n` +
+    `<h2>依赖图（${graph.nodes.filter((n) => !isNonDagNode(n)).length} 任务 · ${pipelines.length} 管道 · 声明 ${graph.edges.length} 边（本质 ${kept.length} · 传递省略 ${dropped.length}））</h2>\n` +
     `<p class="hint dg-legend-row">${renderGraphLegend()}</p>\n` +
     (notes.length > 0 ? `<p class="hint warn">${notes.join(" · ")}</p>\n` : "") +
     `<div class="dep-graph">\n` +

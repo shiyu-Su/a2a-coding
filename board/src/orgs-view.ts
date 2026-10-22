@@ -15,8 +15,8 @@ import { readdirSync } from "node:fs";
 import { resolve } from "node:path";
 import { callToolRaw, McpConfigError } from "./mcp-client.js";
 import type { FeatureListItem, RegistryProjectsView } from "./bridge-client.js";
-import type { DirKindProbeFn } from "./host-runtime.js";
-import { statDirKind } from "./host-runtime.js";
+import type { DirKindProbeFn } from "./org-workspace.js";
+import { statDirKind } from "./org-workspace.js";
 
 /** 逐组 `a2a_projects` 查询的只读工具名（口径扫描锚点：本文件不含任何状态推进工具名）。 */
 export const PROJECTS_QUERY_TOOL = "a2a_projects";

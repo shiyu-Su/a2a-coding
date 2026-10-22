@@ -1,6 +1,6 @@
 # orch —— 编排薄桥单元
 
-> 线协议 2.3（Runner ⇄ Bridge 契约全文见 [PROTOCOL.md](../PROTOCOL.md)）；执行面归执行机侧 —— Runner 拉起**仓内 ACP 桥**驱动底层 CLI，桥自己只解析 / 入队 / 落库。
+> 线协议 2.4（Runner ⇄ Bridge 契约全文见 [PROTOCOL.md](../PROTOCOL.md)）；执行面归执行机侧 —— Runner 拉起**仓内 ACP 桥**驱动底层 CLI，桥自己只解析 / 入队 / 落库。
 
 ## 是什么
 

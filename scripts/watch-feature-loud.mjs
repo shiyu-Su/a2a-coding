@@ -46,6 +46,13 @@ const EXIT_FAILED_EARLY = 30;
 const COMPLETED_SIDE_STATES = new Set(["integrating", "testing", "reviewing", "completed"]);
 const SETTLED_TASK_STATES = new Set(["completed", "failed", "blocked", "cancelled"]);
 
+// ★ 2026-10-18：两条失败判据（早退 30 / 静止 10）**只对 DAG 节点**计（`mode !== 'inquiry'`；缺省按 DAG 解释），
+// 与引擎收敛判据同源。起因同 watch-feature.mjs：v0.10.8 起询问行也进 `tasks[]`，且会长期停在 `input-required`。
+// 显示用的计数（countsLine / failureBlock）仍按**全部任务**统计，只改判据面。
+function isDagTask(task) {
+  return task.mode !== "inquiry";
+}
+
 function out(line) {
   try {
     fs.writeSync(1, `${line}\n`);
@@ -190,15 +197,17 @@ async function run(options) {
       return EXIT_ERROR;
     }
     const counts = countsOf(snap.tasks);
+    const dagTasks = snap.tasks.filter(isDagTask);
+    const dagCounts = countsOf(dagTasks);
     const line = countsLine(counts);
     if (line !== lastCounts || snap.state !== lastState) {
-      out(`[watch-loud] #${i} ${new Date().toISOString()} state=${snap.state} ${line} atRest=${counts.failed || counts.blocked ? !snap.tasks.some((t) => !SETTLED_TASK_STATES.has(t.state)) : false}`);
+      out(`[watch-loud] #${i} ${new Date().toISOString()} state=${snap.state} ${line} atRest=${dagCounts.failed || dagCounts.blocked ? !dagTasks.some((t) => !SETTLED_TASK_STATES.has(t.state)) : false}`);
       lastCounts = line;
       lastState = snap.state;
     }
     // ① 失败即叫（本脚本与 watch-feature.mjs 的唯一语义差异）：只对**新增**失败早退
-    if (baselineFailed === null) baselineFailed = counts.failed ?? 0;
-    if ((counts.failed ?? 0) > baselineFailed) {
+    if (baselineFailed === null) baselineFailed = dagCounts.failed ?? 0;
+    if ((dagCounts.failed ?? 0) > baselineFailed) {
       out(failureBlock(snap.tasks));
       out(`[watch-loud] 完成：state=${snap.state} 判定=failed-early exit=${EXIT_FAILED_EARLY}`);
       return EXIT_FAILED_EARLY;
@@ -221,8 +230,8 @@ async function run(options) {
       return EXIT_FEATURE_FAILED;
     }
     // ③ 静止且有失败（保留既有语义，作兜底）
-    const anyActive = snap.tasks.some((t) => !SETTLED_TASK_STATES.has(t.state));
-    if (!anyActive && ((counts.failed ?? 0) > 0 || (counts.blocked ?? 0) > 0)) {
+    const anyActive = dagTasks.some((t) => !SETTLED_TASK_STATES.has(t.state));
+    if (!anyActive && ((dagCounts.failed ?? 0) > 0 || (dagCounts.blocked ?? 0) > 0)) {
       out(failureBlock(snap.tasks));
       out(`[watch-loud] 完成：state=${snap.state} 判定=failure-at-rest exit=${EXIT_FAILURE_AT_REST}`);
       return EXIT_FAILURE_AT_REST;
